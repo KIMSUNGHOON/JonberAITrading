@@ -106,24 +106,47 @@ winget install Ollama.Ollama
 ollama --version
 ```
 
-## Step 3: Download LLM Model
+## Step 3: Configure and Start Ollama
 
 ```powershell
-# Start Ollama (runs automatically after install)
-ollama serve
+# Set environment variables (optional but recommended)
+# Run these BEFORE starting ollama serve
 
+# Allow connections from backend (CORS)
+$env:OLLAMA_ORIGINS="http://localhost:5173,http://localhost:8000"
+
+# Enable flash attention for better performance (RTX 3090)
+$env:OLLAMA_FLASH_ATTENTION="1"
+
+# Set context length (default 4096)
+$env:OLLAMA_CONTEXT_LENGTH="8192"
+
+# Keep model loaded longer (default 5m)
+$env:OLLAMA_KEEP_ALIVE="30m"
+
+# Start Ollama server
+ollama serve
+```
+
+> **Tip**: To make these permanent, add them to System Environment Variables via Control Panel.
+
+## Step 4: Download LLM Model
+
+```powershell
+# Open a NEW terminal while ollama serve is running
 # Download model (choose one based on your VRAM)
+
 # RTX 3090 24GB - Best quality
 ollama pull deepseek-r1:32b
 
 # RTX 3080 10GB or less VRAM
 ollama pull deepseek-r1:14b
 
-# Verify model
+# Verify model downloaded
 ollama list
 ```
 
-## Step 4: Start Redis
+## Step 5: Start Redis
 
 ```powershell
 # Using Docker (requires Docker Desktop running)
@@ -136,7 +159,7 @@ docker ps  # Should show redis container running
 docker start redis
 ```
 
-## Step 5: Clone and Setup Project
+## Step 6: Clone and Setup Project
 
 ```powershell
 # Clone repository
@@ -159,7 +182,7 @@ notepad .env
 # LLM_MODEL=deepseek-r1:32b
 ```
 
-## Step 6: Install Frontend Dependencies
+## Step 7: Install Frontend Dependencies
 
 ```powershell
 # Navigate to frontend directory
@@ -172,12 +195,15 @@ npm install
 cd ..
 ```
 
-## Step 7: Start Application
+## Step 8: Start Application
 
 Open 3 separate terminals (PowerShell or Anaconda Prompt):
 
 ```powershell
-# Terminal 1: Ollama (if not already running)
+# Terminal 1: Ollama (should already be running from Step 3)
+# If not running, start with environment variables:
+$env:OLLAMA_ORIGINS="http://localhost:5173,http://localhost:8000"
+$env:OLLAMA_FLASH_ATTENTION="1"
 ollama serve
 
 # Terminal 2: Backend
@@ -190,7 +216,7 @@ cd frontend
 npm run dev
 ```
 
-## Step 8: Access Application
+## Step 9: Access Application
 
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000
@@ -451,14 +477,35 @@ redis-cli ping
 ```zsh
 brew install ollama
 
-# Start Ollama service
-ollama serve &
-
 # Verify installation
 ollama --version
 ```
 
-## Step 2: Download LLM Model
+## Step 2: Configure and Start Ollama
+
+```zsh
+# Set environment variables (optional but recommended)
+# Add to ~/.zshrc for persistence
+
+# Allow connections from backend (CORS)
+export OLLAMA_ORIGINS="http://localhost:5173,http://localhost:8000"
+
+# Enable flash attention for better performance (Apple Silicon)
+export OLLAMA_FLASH_ATTENTION="1"
+
+# Set context length (default 4096)
+export OLLAMA_CONTEXT_LENGTH="8192"
+
+# Keep model loaded longer (default 5m)
+export OLLAMA_KEEP_ALIVE="30m"
+
+# Start Ollama server
+ollama serve &
+```
+
+> **Tip**: Add these exports to `~/.zshrc` to make them permanent.
+
+## Step 3: Download LLM Model
 
 ```zsh
 # Download model (choose based on RAM)
@@ -472,7 +519,7 @@ ollama pull deepseek-r1:7b
 ollama list
 ```
 
-## Step 3: Clone and Setup Project
+## Step 4: Clone and Setup Project
 
 ```zsh
 # Clone repository
@@ -495,7 +542,7 @@ nano .env
 # LLM_MODEL=deepseek-r1:14b
 ```
 
-## Step 4: Install Frontend Dependencies
+## Step 5: Install Frontend Dependencies
 
 ```zsh
 # Navigate to frontend directory
@@ -508,12 +555,15 @@ npm install
 cd ..
 ```
 
-## Step 5: Start Application
+## Step 6: Start Application
 
 Open 3 separate terminal windows:
 
 ```zsh
-# Terminal 1: Ollama (if not already running)
+# Terminal 1: Ollama (should already be running from Step 2)
+# If not running, start with environment variables:
+export OLLAMA_ORIGINS="http://localhost:5173,http://localhost:8000"
+export OLLAMA_FLASH_ATTENTION="1"
 ollama serve
 
 # Terminal 2: Backend
@@ -526,7 +576,7 @@ cd frontend
 npm run dev
 ```
 
-## Step 6: Access Application
+## Step 7: Access Application
 
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000
