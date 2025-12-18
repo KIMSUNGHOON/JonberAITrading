@@ -167,18 +167,25 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     })
                     proposal_sent = True
 
-                # Send position updates
+                # Send position updates (position is now a dict after serialization)
                 if state.get("active_position"):
                     position = state["active_position"]
+                    # Calculate PnL since Position is now a dict
+                    entry_price = position.get("entry_price", 0)
+                    current_price = position.get("current_price", 0)
+                    quantity = position.get("quantity", 0)
+                    pnl = (current_price - entry_price) * quantity
+                    pnl_percent = ((current_price / entry_price) - 1) * 100 if entry_price else 0
+
                     await websocket.send_json({
                         "type": "position",
                         "data": {
-                            "ticker": position.ticker,
-                            "quantity": position.quantity,
-                            "entry_price": position.entry_price,
-                            "current_price": position.current_price,
-                            "pnl": position.pnl,
-                            "pnl_percent": position.pnl_percent,
+                            "ticker": position.get("ticker", ""),
+                            "quantity": quantity,
+                            "entry_price": entry_price,
+                            "current_price": current_price,
+                            "pnl": round(pnl, 2),
+                            "pnl_percent": round(pnl_percent, 2),
                         },
                     })
 

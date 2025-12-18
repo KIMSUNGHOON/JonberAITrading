@@ -278,7 +278,7 @@ class TradingState(TypedDict, total=False):
 
     # Execution state
     execution_status: Optional[str]
-    active_position: Optional[Position]
+    active_position: Optional[dict]  # Position as dict for serialization
 
     # Reasoning trace - accumulates across nodes
     reasoning_log: Annotated[list[str], append_list]

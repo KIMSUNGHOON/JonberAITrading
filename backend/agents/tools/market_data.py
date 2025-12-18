@@ -312,6 +312,7 @@ def _get_mock_ticker_info(ticker: str) -> dict:
     sectors = ["Technology", "Healthcare", "Finance", "Consumer", "Energy", "Industrial"]
     sector = sectors[hash(ticker) % len(sectors)]
 
+    # Convert all numpy types to Python native types
     return {
         "symbol": ticker,
         "shortName": f"Mock Company ({ticker})",
@@ -319,13 +320,13 @@ def _get_mock_ticker_info(ticker: str) -> dict:
         "sector": sector,
         "industry": f"{sector} Services",
         "marketCap": int(np.random.uniform(1e9, 1e12)),
-        "trailingPE": round(np.random.uniform(10, 50), 2),
-        "forwardPE": round(np.random.uniform(8, 40), 2),
-        "priceToBook": round(np.random.uniform(1, 10), 2),
-        "dividendYield": round(np.random.uniform(0, 0.05), 4),
-        "beta": round(np.random.uniform(0.5, 2.0), 2),
-        "52WeekHigh": round(np.random.uniform(100, 600), 2),
-        "52WeekLow": round(np.random.uniform(50, 300), 2),
+        "trailingPE": float(round(np.random.uniform(10, 50), 2)),
+        "forwardPE": float(round(np.random.uniform(8, 40), 2)),
+        "priceToBook": float(round(np.random.uniform(1, 10), 2)),
+        "dividendYield": float(round(np.random.uniform(0, 0.05), 4)),
+        "beta": float(round(np.random.uniform(0.5, 2.0), 2)),
+        "52WeekHigh": float(round(np.random.uniform(100, 600), 2)),
+        "52WeekLow": float(round(np.random.uniform(50, 300), 2)),
         "averageVolume": int(np.random.uniform(1e6, 50e6)),
     }
 
@@ -437,13 +438,22 @@ def save_to_cache(ticker: str, df: pd.DataFrame) -> None:
     try:
         for idx, row in df.iterrows():
             date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)
+            # Convert all numpy types to Python native types for SQLite
             conn.execute(
                 """
                 INSERT OR REPLACE INTO price_history
                 (ticker, date, open, high, low, close, volume)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (ticker, date_str, row["Open"], row["High"], row["Low"], row["Close"], int(row["Volume"])),
+                (
+                    ticker,
+                    date_str,
+                    float(row["Open"]),
+                    float(row["High"]),
+                    float(row["Low"]),
+                    float(row["Close"]),
+                    int(row["Volume"]),
+                ),
             )
 
         # Update metadata

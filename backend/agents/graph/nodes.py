@@ -585,16 +585,16 @@ async def execution_node(state: dict) -> dict:
 
     # Determine quantity sign based on action
     is_buy = proposal_action == "BUY" or proposal_action == TradeAction.BUY
-    quantity_with_sign = proposal_quantity if is_buy else -proposal_quantity
+    quantity_with_sign = int(proposal_quantity) if is_buy else -int(proposal_quantity)
 
-    # Create position record
+    # Create position record with Python native types
     position = Position(
         ticker=proposal_ticker,
         quantity=quantity_with_sign,
-        entry_price=current_price,
-        current_price=current_price,
-        stop_loss=proposal_stop_loss,
-        take_profit=proposal_take_profit,
+        entry_price=float(current_price),
+        current_price=float(current_price),
+        stop_loss=float(proposal_stop_loss) if proposal_stop_loss else None,
+        take_profit=float(proposal_take_profit) if proposal_take_profit else None,
     )
 
     reasoning = (
@@ -604,7 +604,7 @@ async def execution_node(state: dict) -> dict:
 
     return {
         "execution_status": "completed",
-        "active_position": position,
+        "active_position": position.model_dump(),  # Convert to dict for serialization
         "current_stage": AnalysisStage.COMPLETE,
         "reasoning_log": add_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
