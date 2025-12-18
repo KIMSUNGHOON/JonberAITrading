@@ -68,19 +68,7 @@ conda --version
 python --version  # Should show 3.12.x
 ```
 
-### 1.4 Install Docker Desktop (for Redis)
-
-```powershell
-# Option 1: Download from https://www.docker.com/products/docker-desktop
-# Option 2: Using winget
-winget install Docker.DockerDesktop
-
-# After installation, restart Windows and start Docker Desktop
-# Verify installation
-docker --version
-```
-
-### 1.5 Install NVIDIA CUDA Toolkit (for GPU)
+### 1.4 Install NVIDIA CUDA Toolkit (for GPU)
 
 ```powershell
 # 1. Update NVIDIA Driver first
@@ -146,18 +134,22 @@ ollama pull deepseek-r1:14b
 ollama list
 ```
 
-## Step 5: Start Redis
+## Step 5: Install Redis (Memurai)
 
 ```powershell
-# Using Docker (requires Docker Desktop running)
-docker run -d --name redis -p 6379:6379 redis:7-alpine
+# Install Memurai (Windows-native Redis alternative)
+winget install Memurai.MemuraiDeveloper
 
-# Verify Redis is running
-docker ps  # Should show redis container running
+# Memurai starts automatically as a Windows service
+# Verify it's running:
+redis-cli ping
+# Should return: PONG
 
-# If redis already exists but stopped:
-docker start redis
+# If not working, start the service manually:
+net start memurai
 ```
+
+> **Note**: Memurai is 100% Redis-compatible. No Docker required!
 
 ## Step 6: Clone and Setup Project
 
