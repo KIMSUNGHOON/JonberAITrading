@@ -143,6 +143,11 @@ async def websocket_session(websocket: WebSocket, session_id: str):
     proposal_sent = False
 
     try:
+        logger.debug(
+            "websocket_loop_started",
+            session_id=session_id,
+        )
+
         while True:
             session = active_sessions.get(session_id)
 
@@ -150,6 +155,17 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                 state = session["state"]
                 current_status = session["status"]
                 reasoning_log = state.get("reasoning_log", [])
+
+                # Debug logging for status tracking
+                if current_status != last_status:
+                    logger.debug(
+                        "websocket_status_change_detected",
+                        session_id=session_id,
+                        old_status=last_status,
+                        new_status=current_status,
+                        awaiting_approval=state.get("awaiting_approval"),
+                        has_proposal=bool(state.get("trade_proposal")),
+                    )
 
                 # Send new reasoning log entries
                 if len(reasoning_log) > last_log_index:
@@ -159,6 +175,11 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                             "type": "reasoning",
                             "data": entry,
                         })
+                    logger.debug(
+                        "websocket_reasoning_sent",
+                        session_id=session_id,
+                        count=len(new_entries),
+                    )
                     last_log_index = len(reasoning_log)
 
                 # Send status updates
