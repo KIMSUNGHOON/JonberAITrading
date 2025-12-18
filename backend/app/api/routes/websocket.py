@@ -149,20 +149,24 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     last_status = current_status
 
                 # Send trade proposal when available (once)
+                # proposal is now a dict after serialization fix
                 if state.get("trade_proposal") and state.get("awaiting_approval") and not proposal_sent:
                     proposal = state["trade_proposal"]
+                    action = proposal.get("action", "HOLD")
+                    if hasattr(action, "value"):
+                        action = action.value
                     await websocket.send_json({
                         "type": "proposal",
                         "data": {
-                            "id": proposal.id,
-                            "ticker": proposal.ticker,
-                            "action": proposal.action.value if hasattr(proposal.action, "value") else proposal.action,
-                            "quantity": proposal.quantity,
-                            "entry_price": proposal.entry_price,
-                            "stop_loss": proposal.stop_loss,
-                            "take_profit": proposal.take_profit,
-                            "risk_score": proposal.risk_score,
-                            "rationale": proposal.rationale[:500] if proposal.rationale else "",
+                            "id": proposal.get("id", ""),
+                            "ticker": proposal.get("ticker", ""),
+                            "action": action,
+                            "quantity": proposal.get("quantity", 0),
+                            "entry_price": proposal.get("entry_price"),
+                            "stop_loss": proposal.get("stop_loss"),
+                            "take_profit": proposal.get("take_profit"),
+                            "risk_score": proposal.get("risk_score", 0.5),
+                            "rationale": (proposal.get("rationale", "") or "")[:500],
                         },
                     })
                     proposal_sent = True
