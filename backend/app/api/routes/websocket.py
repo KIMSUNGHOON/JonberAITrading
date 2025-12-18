@@ -140,6 +140,7 @@ async def websocket_session(websocket: WebSocket, session_id: str):
     # Track what we've sent to avoid duplicates
     last_log_index = 0
     last_status: Optional[str] = None
+    last_stage: Optional[str] = None
     proposal_sent = False
 
     try:
@@ -156,17 +157,6 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                 current_status = session["status"]
                 reasoning_log = state.get("reasoning_log", [])
 
-                # Debug logging for status tracking
-                if current_status != last_status:
-                    logger.debug(
-                        "websocket_status_change_detected",
-                        session_id=session_id,
-                        old_status=last_status,
-                        new_status=current_status,
-                        awaiting_approval=state.get("awaiting_approval"),
-                        has_proposal=bool(state.get("trade_proposal")),
-                    )
-
                 # Send new reasoning log entries
                 if len(reasoning_log) > last_log_index:
                     new_entries = reasoning_log[last_log_index:]
@@ -182,17 +172,31 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     )
                     last_log_index = len(reasoning_log)
 
-                # Send status updates
-                if current_status != last_status:
+                # Extract stage value from enum or string
+                stage = state.get("current_stage", "")
+                if hasattr(stage, "value"):
+                    stage = stage.value
+                else:
+                    stage = str(stage) if stage else ""
+
+                # Send status updates when status OR stage changes
+                if current_status != last_status or stage != last_stage:
                     await websocket.send_json({
                         "type": "status",
                         "data": {
                             "status": current_status,
-                            "stage": str(state.get("current_stage", "")),
+                            "stage": stage,
                             "awaiting_approval": state.get("awaiting_approval", False),
                         },
                     })
+                    logger.debug(
+                        "websocket_status_sent",
+                        session_id=session_id,
+                        status=current_status,
+                        stage=stage,
+                    )
                     last_status = current_status
+                    last_stage = stage
 
                 # Send trade proposal when available (once)
                 # proposal is now a dict after serialization fix
