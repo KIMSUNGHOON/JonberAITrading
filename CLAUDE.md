@@ -55,22 +55,22 @@ npm run dev
 
 ### LLM Server
 
-#### Windows (vLLM)
+#### Windows (vLLM + RTX 3090 24GB)
 ```powershell
-# PowerShell
+# PowerShell - DeepSeek-R1-Distill-Qwen-32B (AWQ ~17GB)
 python -m vllm.entrypoints.openai.api_server `
-  --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B `
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B `
   --quantization awq `
-  --max-model-len 8192 `
-  --gpu-memory-utilization 0.95 `
+  --max-model-len 4096 `
+  --gpu-memory-utilization 0.90 `
   --port 8080
 ```
 
-#### macOS (Ollama)
+#### macOS (Ollama + M1 Pro 24GB)
 ```zsh
 # zsh
 ollama serve &
-ollama pull deepseek-r1:7b  # or larger model if RAM permits
+ollama pull deepseek-r1:14b  # ~8GB RAM, good balance
 ```
 
 ### Tests
@@ -89,7 +89,7 @@ cd backend && pytest -v
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `LLM_BASE_URL` | OpenAI-compatible endpoint | `http://localhost:8080/v1` |
-| `LLM_MODEL` | Model name | `deepseek-r1-distill-llama-70b` |
+| `LLM_MODEL` | Model name | `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B` |
 | `LLM_PROVIDER` | Provider type | `vllm` or `ollama` |
 | `MARKET_DATA_MODE` | Data source | `live` or `mock` |
 | `REDIS_URL` | Redis connection | `redis://localhost:6379` |

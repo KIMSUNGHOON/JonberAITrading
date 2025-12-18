@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # -------------------------------------------
     LLM_PROVIDER: Literal["vllm", "ollama"] = "vllm"
     LLM_BASE_URL: str = "http://localhost:8080/v1"
-    LLM_MODEL: str = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
+    LLM_MODEL: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
     LLM_TEMPERATURE: float = Field(default=0.7, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int = Field(default=4096, ge=1, le=32768)
     LLM_TIMEOUT: int = Field(default=120, ge=10, le=600)

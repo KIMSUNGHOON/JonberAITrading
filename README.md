@@ -95,14 +95,24 @@ Copy-Item .env.example .env
 # Install vLLM (requires CUDA 12.1+)
 pip install vllm
 
-# Start vLLM server with AWQ quantization for RTX 3090
+# Start vLLM server with AWQ quantization for RTX 3090 (24GB)
+# Option 1: DeepSeek-R1-Distill-Qwen-32B (Recommended - Best performance)
 python -m vllm.entrypoints.openai.api_server `
-    --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B `
+    --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B `
     --quantization awq `
-    --max-model-len 8192 `
-    --gpu-memory-utilization 0.95 `
+    --max-model-len 4096 `
+    --gpu-memory-utilization 0.90 `
     --host 0.0.0.0 `
     --port 8080
+
+# Option 2: DeepSeek-R1-Distill-Qwen-14B (More stable, longer context)
+# python -m vllm.entrypoints.openai.api_server `
+#     --model deepseek-ai/DeepSeek-R1-Distill-Qwen-14B `
+#     --quantization awq `
+#     --max-model-len 8192 `
+#     --gpu-memory-utilization 0.90 `
+#     --host 0.0.0.0 `
+#     --port 8080
 ```
 
 ### 3. Start Backend (New Terminal)
@@ -253,20 +263,20 @@ redis-cli ping
 
 Edit `.env` file based on your platform:
 
-### Windows (vLLM + RTX 3090)
+### Windows (vLLM + RTX 3090 24GB)
 ```env
 LLM_PROVIDER=vllm
 LLM_BASE_URL=http://localhost:8080/v1
-LLM_MODEL=deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+LLM_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 MARKET_DATA_MODE=live
 REDIS_URL=redis://localhost:6379
 ```
 
-### macOS (Ollama + M1 Pro)
+### macOS (Ollama + M1 Pro 24GB)
 ```env
 LLM_PROVIDER=ollama
 LLM_BASE_URL=http://localhost:11434/v1
-LLM_MODEL=deepseek-r1:7b
+LLM_MODEL=deepseek-r1:14b
 MARKET_DATA_MODE=live
 REDIS_URL=redis://localhost:6379
 ```
