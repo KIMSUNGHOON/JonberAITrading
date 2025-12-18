@@ -2,10 +2,16 @@
 Market Data Tool
 
 Provides market data fetching with yfinance and fallback to mock data.
-Supports both live and mock modes for development/testing.
+Supports:
+- Live data from yfinance (free, no API key needed)
+- Cached historical data for offline development
+- Mock data generation for testing
+- Local SQLite storage for downloaded data
 """
 
 import json
+import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -16,8 +22,16 @@ import structlog
 
 logger = structlog.get_logger()
 
-# Data directory for mock data
-DATA_DIR = Path(__file__).parent.parent.parent / "data" / "mock"
+# Data directories
+DATA_DIR = Path(__file__).parent.parent.parent / "data"
+MOCK_DIR = DATA_DIR / "mock"
+CACHE_DIR = DATA_DIR / "cache"
+CACHE_DB = CACHE_DIR / "market_data.db"
+
+# Ensure directories exist
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+MOCK_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_market_data_mode() -> str:
@@ -359,3 +373,262 @@ def format_market_data_for_llm(df: pd.DataFrame, ticker: str) -> str:
         )
 
     return "\n".join(lines)
+
+
+# -------------------------------------------
+# Data Caching System
+# -------------------------------------------
+
+def _init_cache_db() -> None:
+    """Initialize SQLite cache database."""
+    conn = sqlite3.connect(CACHE_DB)
+    cursor = conn.cursor()
+
+    # Create tables for cached data
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS price_history (
+            ticker TEXT,
+            date TEXT,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume INTEGER,
+            PRIMARY KEY (ticker, date)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ticker_info (
+            ticker TEXT PRIMARY KEY,
+            info_json TEXT,
+            updated_at TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cache_metadata (
+            ticker TEXT PRIMARY KEY,
+            last_updated TEXT,
+            period TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+    logger.debug("cache_db_initialized", db_path=str(CACHE_DB))
+
+
+def save_to_cache(ticker: str, df: pd.DataFrame) -> None:
+    """Save market data to local cache."""
+    _init_cache_db()
+    conn = sqlite3.connect(CACHE_DB)
+
+    try:
+        for idx, row in df.iterrows():
+            date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO price_history
+                (ticker, date, open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ticker, date_str, row["Open"], row["High"], row["Low"], row["Close"], int(row["Volume"])),
+            )
+
+        # Update metadata
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO cache_metadata (ticker, last_updated, period)
+            VALUES (?, ?, ?)
+            """,
+            (ticker, datetime.now().isoformat(), f"{len(df)} days"),
+        )
+
+        conn.commit()
+        logger.info("cache_saved", ticker=ticker, rows=len(df))
+
+    except Exception as e:
+        logger.error("cache_save_error", ticker=ticker, error=str(e))
+    finally:
+        conn.close()
+
+
+def load_from_cache(ticker: str, days: int = 90) -> Optional[pd.DataFrame]:
+    """Load market data from local cache."""
+    if not CACHE_DB.exists():
+        return None
+
+    conn = sqlite3.connect(CACHE_DB)
+    try:
+        query = """
+            SELECT date, open, high, low, close, volume
+            FROM price_history
+            WHERE ticker = ?
+            ORDER BY date DESC
+            LIMIT ?
+        """
+        df = pd.read_sql_query(query, conn, params=(ticker, days))
+
+        if df.empty:
+            return None
+
+        # Convert to standard OHLCV format
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+        df.columns = ["Open", "High", "Low", "Close", "Volume"]
+        df.sort_index(inplace=True)
+
+        logger.info("cache_loaded", ticker=ticker, rows=len(df))
+        return df
+
+    except Exception as e:
+        logger.error("cache_load_error", ticker=ticker, error=str(e))
+        return None
+    finally:
+        conn.close()
+
+
+def get_cached_tickers() -> list[str]:
+    """Get list of tickers in cache."""
+    if not CACHE_DB.exists():
+        return []
+
+    conn = sqlite3.connect(CACHE_DB)
+    try:
+        cursor = conn.execute("SELECT DISTINCT ticker FROM price_history")
+        return [row[0] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+# -------------------------------------------
+# Data Download Utilities
+# -------------------------------------------
+
+async def download_historical_data(
+    tickers: list[str],
+    period: str = "2y",
+    save_to_db: bool = True,
+) -> dict[str, pd.DataFrame]:
+    """
+    Download historical data for multiple tickers.
+
+    This is useful for:
+    - Pre-loading data for offline development
+    - Building a local database for testing
+    - Reducing API calls during development
+
+    Args:
+        tickers: List of stock symbols
+        period: Time period to download (1y, 2y, 5y, max)
+        save_to_db: Whether to save to SQLite cache
+
+    Returns:
+        Dictionary mapping ticker to DataFrame
+    """
+    import yfinance as yf
+
+    results = {}
+
+    logger.info("download_started", tickers=tickers, period=period)
+
+    for ticker in tickers:
+        try:
+            logger.info("downloading_ticker", ticker=ticker)
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=period, interval="1d")
+
+            if not df.empty:
+                results[ticker] = df
+
+                if save_to_db:
+                    save_to_cache(ticker, df)
+
+                logger.info(
+                    "ticker_downloaded",
+                    ticker=ticker,
+                    rows=len(df),
+                    start=df.index.min().strftime("%Y-%m-%d"),
+                    end=df.index.max().strftime("%Y-%m-%d"),
+                )
+            else:
+                logger.warning("ticker_empty", ticker=ticker)
+
+            # Rate limiting to avoid API throttling
+            time.sleep(0.5)
+
+        except Exception as e:
+            logger.error("download_error", ticker=ticker, error=str(e))
+
+    logger.info("download_completed", total=len(results))
+    return results
+
+
+# Popular tickers for testing and development
+POPULAR_TICKERS = [
+    # Tech Giants
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
+    # Finance
+    "JPM", "BAC", "GS", "V", "MA",
+    # Healthcare
+    "JNJ", "UNH", "PFE", "ABBV",
+    # Consumer
+    "WMT", "KO", "PEP", "MCD",
+    # Energy
+    "XOM", "CVX",
+    # ETFs
+    "SPY", "QQQ", "IWM",
+]
+
+
+async def download_popular_tickers(period: str = "2y") -> dict[str, pd.DataFrame]:
+    """Download historical data for popular tickers."""
+    return await download_historical_data(POPULAR_TICKERS, period=period)
+
+
+def export_cache_to_csv(output_dir: Optional[Path] = None) -> None:
+    """Export cached data to CSV files for analysis."""
+    output_dir = output_dir or DATA_DIR / "exports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tickers = get_cached_tickers()
+
+    for ticker in tickers:
+        df = load_from_cache(ticker, days=10000)  # Load all data
+        if df is not None:
+            filepath = output_dir / f"{ticker}.csv"
+            df.to_csv(filepath)
+            logger.info("exported_to_csv", ticker=ticker, path=str(filepath))
+
+
+def get_cache_stats() -> dict:
+    """Get statistics about cached data."""
+    if not CACHE_DB.exists():
+        return {"status": "no_cache", "tickers": 0}
+
+    conn = sqlite3.connect(CACHE_DB)
+    try:
+        cursor = conn.execute("""
+            SELECT ticker, COUNT(*) as days, MIN(date) as start, MAX(date) as end
+            FROM price_history
+            GROUP BY ticker
+        """)
+
+        stats = {
+            "status": "ok",
+            "tickers": {},
+        }
+
+        for row in cursor.fetchall():
+            stats["tickers"][row[0]] = {
+                "days": row[1],
+                "start": row[2],
+                "end": row[3],
+            }
+
+        stats["total_tickers"] = len(stats["tickers"])
+        return stats
+
+    finally:
+        conn.close()
