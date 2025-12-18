@@ -134,24 +134,7 @@ ollama pull deepseek-r1:14b
 ollama list
 ```
 
-## Step 5: Install Redis (Memurai)
-
-```powershell
-# Install Memurai (Windows-native Redis alternative)
-winget install Memurai.MemuraiDeveloper
-
-# Memurai starts automatically as a Windows service
-# Verify it's running:
-redis-cli ping
-# Should return: PONG
-
-# If not working, start the service manually:
-net start memurai
-```
-
-> **Note**: Memurai is 100% Redis-compatible. No Docker required!
-
-## Step 6: Clone and Setup Project
+## Step 5: Clone and Setup Project
 
 ```powershell
 # Clone repository
@@ -174,7 +157,7 @@ notepad .env
 # LLM_MODEL=deepseek-r1:32b
 ```
 
-## Step 7: Install Frontend Dependencies
+## Step 6: Install Frontend Dependencies
 
 ```powershell
 # Navigate to frontend directory
@@ -187,28 +170,24 @@ npm install
 cd ..
 ```
 
-## Step 8: Start Application
+## Step 7: Start Application
 
-Open 3 separate terminals (PowerShell or Anaconda Prompt):
+Open 2 separate terminals (PowerShell or Anaconda Prompt):
 
 ```powershell
-# Terminal 1: Ollama (should already be running from Step 3)
-# If not running, start with environment variables:
-$env:OLLAMA_ORIGINS="http://localhost:5173,http://localhost:8000"
-$env:OLLAMA_FLASH_ATTENTION="1"
-ollama serve
-
-# Terminal 2: Backend
+# Terminal 1: Backend
 conda activate agentic-trading
 cd backend
 uvicorn app.main:app --reload --port 8000
 
-# Terminal 3: Frontend
+# Terminal 2: Frontend
 cd frontend
 npm run dev
 ```
 
-## Step 9: Access Application
+> **Note**: Ollama should already be running from Step 3. State is stored locally in SQLite (no Redis required).
+
+## Step 8: Access Application
 
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000
@@ -287,20 +266,7 @@ export LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64:$LD_LIBRARY_PATH
 nvcc --version
 ```
 
-## Step 3: Install Redis
-
-```bash
-sudo apt update
-sudo apt install -y redis-server
-sudo systemctl enable redis-server
-sudo systemctl start redis-server
-
-# Verify
-redis-cli ping
-# Should return: PONG
-```
-
-## Step 4: Clone and Setup Project
+## Step 3: Clone and Setup Project
 
 ```bash
 # Clone repository
@@ -323,7 +289,7 @@ nano .env
 # LLM_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 ```
 
-## Step 5: Install Frontend Dependencies
+## Step 4: Install Frontend Dependencies
 
 ```bash
 # Navigate to frontend directory
@@ -336,7 +302,7 @@ npm install
 cd ..
 ```
 
-## Step 6: Install and Start vLLM
+## Step 5: Install and Start vLLM
 
 ```bash
 # Install vLLM (in conda environment)
@@ -362,12 +328,12 @@ python -m vllm.entrypoints.openai.api_server \
 #     --port 8080
 ```
 
-## Step 7: Start Application
+## Step 6: Start Application
 
 Open 3 separate terminals:
 
 ```bash
-# Terminal 1: vLLM (keep running from Step 6)
+# Terminal 1: vLLM (keep running from Step 5)
 # Already running
 
 # Terminal 2: Backend
@@ -380,7 +346,9 @@ cd frontend
 npm run dev
 ```
 
-## Step 8: Access Application
+> **Note**: State is stored locally in SQLite (no Redis required).
+
+## Step 7: Access Application
 
 - **Frontend**: http://localhost:5173
 - **Backend API**: http://localhost:8000
@@ -453,18 +421,7 @@ conda --version
 python --version  # Should show 3.12.x
 ```
 
-### 1.5 Install Redis
-
-```zsh
-brew install redis
-brew services start redis
-
-# Verify Redis is running
-redis-cli ping
-# Should return: PONG
-```
-
-### 1.6 Install Ollama
+### 1.5 Install Ollama
 
 ```zsh
 brew install ollama
@@ -549,24 +506,20 @@ cd ..
 
 ## Step 6: Start Application
 
-Open 3 separate terminal windows:
+Open 2 separate terminal windows:
 
 ```zsh
-# Terminal 1: Ollama (should already be running from Step 2)
-# If not running, start with environment variables:
-export OLLAMA_ORIGINS="http://localhost:5173,http://localhost:8000"
-export OLLAMA_FLASH_ATTENTION="1"
-ollama serve
-
-# Terminal 2: Backend
+# Terminal 1: Backend
 conda activate agentic-trading
 cd backend
 uvicorn app.main:app --reload --port 8000
 
-# Terminal 3: Frontend
+# Terminal 2: Frontend
 cd frontend
 npm run dev
 ```
+
+> **Note**: Ollama should already be running from Step 2. State is stored locally in SQLite (no Redis required).
 
 ## Step 7: Access Application
 
@@ -657,7 +610,7 @@ LLM_MODEL=deepseek-r1:14b
 
 # === Other Settings ===
 MARKET_DATA_MODE=live
-REDIS_URL=redis://localhost:6379
+STORAGE_DB_PATH=data/storage.db
 ENVIRONMENT=development
 DEBUG=true
 ```
@@ -692,7 +645,7 @@ DEBUG=true
 
 | Endpoint | Description |
 |----------|-------------|
-| `/health` | Health check (API, LLM, Redis) |
+| `/health` | Health check (API, LLM, Storage) |
 | `/docs` | Swagger documentation |
 
 ---
@@ -719,7 +672,7 @@ curl http://localhost:8000/health
   "services": {
     "api": "healthy",
     "llm": {"status": "healthy"},
-    "redis": {"status": "healthy"}
+    "storage": {"status": "healthy", "type": "sqlite"}
   }
 }
 ```
@@ -738,22 +691,6 @@ ollama list
 
 # Restart Ollama
 ollama serve
-```
-
-### Redis Connection Failed
-
-```bash
-# Check Redis status
-redis-cli ping
-
-# Windows (Docker)
-docker start redis
-
-# macOS
-brew services restart redis
-
-# Linux
-sudo systemctl restart redis-server
 ```
 
 ### CUDA Not Available (Linux)
@@ -812,7 +749,7 @@ JonberAITrading/
 | **Frontend** | React 18, Vite, TypeScript, Zustand, TailwindCSS |
 | **Charts** | TradingView Lightweight Charts |
 | **LLM** | vLLM (Linux), Ollama (All platforms) |
-| **Database** | Redis (session persistence) |
+| **Storage** | SQLite (embedded, no server required) |
 
 ---
 

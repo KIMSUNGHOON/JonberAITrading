@@ -42,10 +42,9 @@ class Settings(BaseSettings):
     MARKET_DATA_MODE: Literal["live", "mock"] = "live"
 
     # -------------------------------------------
-    # Redis Configuration (State Persistence)
+    # Storage Configuration (SQLite - no server required)
     # -------------------------------------------
-    REDIS_URL: str = "redis://localhost:6379"
-    REDIS_DB: int = Field(default=0, ge=0, le=15)
+    STORAGE_DB_PATH: str = "data/storage.db"
 
     # -------------------------------------------
     # API Server Configuration
