@@ -28,11 +28,12 @@ class Settings(BaseSettings):
 
     # -------------------------------------------
     # LLM Configuration
+    # DeepSeek-R1 recommended: temperature 0.5-0.7 (0.6 optimal)
     # -------------------------------------------
     LLM_PROVIDER: Literal["vllm", "ollama"] = "ollama"
     LLM_BASE_URL: str = "http://localhost:11434/v1"
     LLM_MODEL: str = "deepseek-r1:14b"
-    LLM_TEMPERATURE: float = Field(default=0.7, ge=0.0, le=2.0)
+    LLM_TEMPERATURE: float = Field(default=0.6, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int = Field(default=4096, ge=1, le=32768)
     LLM_TIMEOUT: int = Field(default=120, ge=10, le=600)
 

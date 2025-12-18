@@ -26,6 +26,13 @@ from agents.graph.state import (
     get_all_analyses,
 )
 from agents.llm_provider import get_llm_provider
+from agents.prompts import (
+    FUNDAMENTAL_ANALYST_PROMPT,
+    RISK_ASSESSOR_PROMPT,
+    SENTIMENT_ANALYST_PROMPT,
+    STRATEGIC_DECISION_PROMPT,
+    TECHNICAL_ANALYST_PROMPT,
+)
 from agents.tools.market_data import (
     calculate_technical_indicators,
     format_market_data_for_llm,
@@ -108,22 +115,6 @@ async def task_decomposition_node(state: dict) -> dict:
 # -------------------------------------------
 # Stage 1B: Technical Analysis
 # -------------------------------------------
-
-TECHNICAL_ANALYST_PROMPT = """You are an expert technical analyst. Analyze the provided market data and identify:
-
-1. **Trend Analysis**: Current trend direction and strength
-2. **Key Levels**: Support and resistance levels
-3. **Indicators**: RSI, MACD, Moving Averages interpretation
-4. **Chart Patterns**: Any identifiable patterns (if discernible)
-5. **Volume Analysis**: Volume trends and significance
-6. **Entry/Exit Points**: Suggested levels based on technicals
-
-Based on your analysis, provide:
-- A trading signal: STRONG_BUY, BUY, HOLD, SELL, or STRONG_SELL
-- A confidence score from 0.0 to 1.0
-- Key factors supporting your view (3-5 bullet points)
-
-Be specific with numbers and levels. Focus on actionable insights."""
 
 
 async def technical_analysis_node(state: dict) -> dict:
@@ -210,21 +201,6 @@ async def technical_analysis_node(state: dict) -> dict:
 # Stage 1C: Fundamental Analysis
 # -------------------------------------------
 
-FUNDAMENTAL_ANALYST_PROMPT = """You are an expert fundamental analyst. Evaluate the company based on:
-
-1. **Valuation Metrics**: P/E, P/B, EV/EBITDA relative to peers and history
-2. **Financial Health**: Balance sheet strength, debt levels, cash position
-3. **Growth Metrics**: Revenue growth, earnings growth, margin trends
-4. **Competitive Position**: Market share, moat, industry dynamics
-5. **Catalysts & Risks**: Upcoming events, regulatory issues, macro factors
-
-Based on your analysis, provide:
-- A trading signal: STRONG_BUY, BUY, HOLD, SELL, or STRONG_SELL
-- A confidence score from 0.0 to 1.0
-- Key factors supporting your view (3-5 bullet points)
-
-Focus on intrinsic value and business quality."""
-
 
 async def fundamental_analysis_node(state: dict) -> dict:
     """
@@ -291,22 +267,6 @@ async def fundamental_analysis_node(state: dict) -> dict:
 # Stage 1D: Sentiment Analysis
 # -------------------------------------------
 
-SENTIMENT_ANALYST_PROMPT = """You are a sentiment analysis expert. Evaluate market sentiment based on:
-
-1. **News Sentiment**: Recent news tone and impact
-2. **Social Media**: Retail investor sentiment, trending discussions
-3. **Analyst Views**: Recent rating changes, price target adjustments
-4. **Institutional Activity**: Large holder changes, 13F filings
-5. **Options Flow**: Unusual options activity, put/call ratios
-6. **Insider Trading**: Recent insider buys/sells
-
-Based on your analysis, provide:
-- A trading signal: STRONG_BUY, BUY, HOLD, SELL, or STRONG_SELL
-- A confidence score from 0.0 to 1.0
-- Key factors supporting your view (3-5 bullet points)
-
-Note: In this simulation, provide your best assessment based on general market knowledge."""
-
 
 async def sentiment_analysis_node(state: dict) -> dict:
     """
@@ -370,23 +330,6 @@ async def sentiment_analysis_node(state: dict) -> dict:
 # -------------------------------------------
 # Stage 1E: Risk Assessment
 # -------------------------------------------
-
-RISK_ASSESSOR_PROMPT = """You are a risk management expert. Based on the analyses provided, evaluate:
-
-1. **Volatility Risk**: Historical and implied volatility assessment
-2. **Downside Risk**: Maximum drawdown scenarios, stop-loss levels
-3. **Position Sizing**: Recommended position size (% of portfolio)
-4. **Correlation Risk**: Portfolio concentration, sector exposure
-5. **Event Risk**: Upcoming events that could impact position
-6. **Exit Strategy**: Take-profit levels, trailing stop recommendations
-
-Provide:
-- An overall risk score from 0.0 (low risk) to 1.0 (high risk)
-- Recommended stop-loss level
-- Recommended position size (1-10% of portfolio)
-- Key risk factors (3-5 bullet points)
-
-Be conservative and prioritize capital preservation."""
 
 
 async def risk_assessment_node(state: dict) -> dict:
@@ -457,23 +400,6 @@ async def risk_assessment_node(state: dict) -> dict:
 # -------------------------------------------
 # Stage 1F: Strategic Decision (Synthesis)
 # -------------------------------------------
-
-STRATEGIC_DECISION_PROMPT = """You are a senior portfolio manager. Based on all analyses provided, make a final trading decision.
-
-Synthesize the findings from:
-- Technical Analysis: Price patterns and indicators
-- Fundamental Analysis: Company valuation and financials
-- Sentiment Analysis: Market mood and news
-- Risk Assessment: Risk factors and position sizing
-
-Your decision should:
-1. Clearly state BUY, SELL, or HOLD
-2. If BUY/SELL, specify quantity and price levels
-3. Provide clear rationale weighing all factors
-4. Present both bull and bear cases
-5. Include specific entry, stop-loss, and take-profit levels
-
-Be decisive but prudent. If signals conflict significantly, HOLD may be appropriate."""
 
 
 async def strategic_decision_node(state: dict) -> dict:

@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.graph.state import SubTask
 from agents.llm_provider import get_llm_provider
+from agents.prompts import TASK_DECOMPOSITION_PROMPT
 
 logger = structlog.get_logger()
 
@@ -39,28 +40,6 @@ DEFAULT_ANALYSIS_TASKS = [
         priority=4,
     ),
 ]
-
-TASK_DECOMPOSITION_PROMPT = """You are a task planning agent for a trading analysis system.
-
-Break down the trading analysis request into specific subtasks that can be delegated to specialist agents.
-
-Available specialist agents:
-1. technical_analyst: Analyzes price patterns, indicators (RSI, MACD, Moving Averages), chart patterns, support/resistance levels, volume analysis
-2. fundamental_analyst: Analyzes financials, valuations (P/E, P/B), revenue growth, profit margins, balance sheet, competitive position
-3. sentiment_analyst: Analyzes news sentiment, social media buzz, analyst ratings, insider trading, institutional flows
-4. risk_assessor: Evaluates portfolio risk, position sizing, stop-loss levels, correlation risk, max drawdown scenarios
-
-Create 3-6 focused tasks. Each task should be specific and actionable.
-
-Output format (JSON array):
-[
-    {"task": "specific task description", "assigned_to": "agent_name", "priority": 1},
-    {"task": "another task", "assigned_to": "agent_name", "priority": 2}
-]
-
-Priority: 1 = highest (do first), 5 = lowest
-
-Only output the JSON array, no other text."""
 
 
 async def decompose_task(
