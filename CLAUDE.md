@@ -55,22 +55,30 @@ npm run dev
 
 ### LLM Server
 
-#### Windows (vLLM + RTX 3090 24GB)
+#### Windows (Ollama - Recommended)
 ```powershell
-# PowerShell - DeepSeek-R1-Distill-Qwen-32B (AWQ ~17GB)
-python -m vllm.entrypoints.openai.api_server `
-  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B `
-  --quantization awq `
-  --max-model-len 4096 `
-  --gpu-memory-utilization 0.90 `
+# Install: winget install Ollama.Ollama
+ollama serve
+ollama pull deepseek-r1:32b  # RTX 3090 24GB
+# or: ollama pull deepseek-r1:14b  # Less VRAM
+```
+
+#### Linux (vLLM + RTX 3090 24GB)
+```bash
+pip install vllm
+python -m vllm.entrypoints.openai.api_server \
+  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
+  --quantization awq \
+  --max-model-len 4096 \
+  --gpu-memory-utilization 0.90 \
   --port 8080
 ```
 
 #### macOS (Ollama + M1 Pro 24GB)
 ```zsh
-# zsh
+brew install ollama
 ollama serve &
-ollama pull deepseek-r1:14b  # ~8GB RAM, good balance
+ollama pull deepseek-r1:14b  # ~8GB RAM
 ```
 
 ### Tests
@@ -88,9 +96,9 @@ cd backend && pytest -v
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LLM_BASE_URL` | OpenAI-compatible endpoint | `http://localhost:8080/v1` |
-| `LLM_MODEL` | Model name | `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B` |
-| `LLM_PROVIDER` | Provider type | `vllm` or `ollama` |
+| `LLM_PROVIDER` | Provider type | `ollama` (Win/macOS) or `vllm` (Linux) |
+| `LLM_BASE_URL` | OpenAI-compatible endpoint | `http://localhost:11434/v1` |
+| `LLM_MODEL` | Model name | `deepseek-r1:14b` |
 | `MARKET_DATA_MODE` | Data source | `live` or `mock` |
 | `REDIS_URL` | Redis connection | `redis://localhost:6379` |
 

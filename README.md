@@ -7,9 +7,311 @@ AI-powered trading analysis system with autonomous multi-agent analysis and huma
 - **Multi-Agent Analysis**: Technical, Fundamental, Sentiment, and Risk analysis
 - **Human-in-the-Loop**: Trade proposals require human approval before execution
 - **Real-time Streaming**: Live reasoning logs via WebSocket
-- **Cross-Platform**: Supports Windows (NVIDIA GPU) and macOS (Apple Silicon)
+- **Cross-Platform**: Supports Windows, Linux, and macOS
 
-## Architecture
+---
+
+## Quick Start (Choose Your Platform)
+
+| Platform | LLM Server | GPU Support |
+|----------|------------|-------------|
+| [Windows](#windows-setup) | Ollama (recommended) | NVIDIA CUDA |
+| [Linux](#linux-setup) | vLLM (recommended) | NVIDIA CUDA |
+| [macOS](#macos-setup) | Ollama | Apple Metal |
+
+---
+
+# Windows Setup
+
+> **Note**: vLLM does not support Windows natively. Use **Ollama** (recommended) or **WSL2 + vLLM**.
+
+## Prerequisites
+
+- Windows 10/11
+- NVIDIA GPU with CUDA support (RTX 3090 recommended)
+- [Anaconda](https://www.anaconda.com/download) or Miniconda
+- [Node.js 18+](https://nodejs.org/)
+- [Git](https://git-scm.com/)
+
+## Step 1: Install Ollama
+
+```powershell
+# Option 1: Download from https://ollama.ai
+# Option 2: Using winget
+winget install Ollama.Ollama
+```
+
+## Step 2: Download Model
+
+```powershell
+# Start Ollama (runs automatically after install)
+ollama serve
+
+# Download model (choose one based on your VRAM)
+# RTX 3090 24GB - Best quality
+ollama pull deepseek-r1:32b
+
+# RTX 3080 10GB or less VRAM
+ollama pull deepseek-r1:14b
+
+# Verify model
+ollama list
+```
+
+## Step 3: Install Redis (Choose One)
+
+```powershell
+# Option 1: Docker (Recommended)
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+
+# Option 2: WSL2
+wsl --install -d Ubuntu
+wsl -d Ubuntu -e bash -c "sudo apt update && sudo apt install -y redis-server && sudo service redis-server start"
+```
+
+## Step 4: Clone and Setup Project
+
+```powershell
+# Clone repository
+git clone <repository-url>
+cd JonberAITrading
+
+# Create conda environment
+conda env create -f environment.yml
+conda activate agentic-trading
+
+# Setup environment variables
+Copy-Item .env.example .env
+
+# Edit .env file - set these values:
+# LLM_PROVIDER=ollama
+# LLM_BASE_URL=http://localhost:11434/v1
+# LLM_MODEL=deepseek-r1:32b
+```
+
+## Step 5: Start Application
+
+```powershell
+# Terminal 1: Backend
+conda activate agentic-trading
+cd backend
+uvicorn app.main:app --reload --port 8000
+
+# Terminal 2: Frontend
+cd frontend
+npm install
+npm run dev
+```
+
+## Step 6: Access Application
+
+- **Frontend**: http://localhost:5173
+- **Backend API**: http://localhost:8000
+- **API Docs**: http://localhost:8000/docs
+
+---
+
+# Linux Setup
+
+> **Recommended**: Use vLLM for best performance with NVIDIA GPUs.
+
+## Prerequisites
+
+- Ubuntu 20.04+ or similar Linux distribution
+- NVIDIA GPU with CUDA 12.1+ support
+- Anaconda or Miniconda
+- Node.js 18+
+- Git
+
+## Step 1: Install CUDA Toolkit
+
+```bash
+# Check GPU
+nvidia-smi
+
+# Install CUDA 12.1+ (Ubuntu example)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install cuda-toolkit-12-1
+
+# Verify
+nvcc --version
+```
+
+## Step 2: Install Redis
+
+```bash
+sudo apt update
+sudo apt install redis-server
+sudo systemctl enable redis-server
+sudo systemctl start redis-server
+
+# Verify
+redis-cli ping
+# Should return: PONG
+```
+
+## Step 3: Clone and Setup Project
+
+```bash
+# Clone repository
+git clone <repository-url>
+cd JonberAITrading
+
+# Create conda environment
+conda env create -f environment.yml
+conda activate agentic-trading
+
+# Setup environment variables
+cp .env.example .env
+
+# Edit .env file - default values work for Linux:
+# LLM_PROVIDER=vllm
+# LLM_BASE_URL=http://localhost:8080/v1
+# LLM_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+```
+
+## Step 4: Install and Start vLLM
+
+```bash
+# Install vLLM
+pip install vllm
+
+# Start vLLM server (RTX 3090 24GB)
+python -m vllm.entrypoints.openai.api_server \
+    --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
+    --quantization awq \
+    --max-model-len 4096 \
+    --gpu-memory-utilization 0.90 \
+    --host 0.0.0.0 \
+    --port 8080
+
+# Alternative: Smaller model for less VRAM
+# python -m vllm.entrypoints.openai.api_server \
+#     --model deepseek-ai/DeepSeek-R1-Distill-Qwen-14B \
+#     --quantization awq \
+#     --max-model-len 8192 \
+#     --gpu-memory-utilization 0.90 \
+#     --port 8080
+```
+
+## Step 5: Start Application
+
+```bash
+# Terminal 1: Backend (new terminal)
+conda activate agentic-trading
+cd backend
+uvicorn app.main:app --reload --port 8000
+
+# Terminal 2: Frontend (new terminal)
+cd frontend
+npm install
+npm run dev
+```
+
+## Step 6: Access Application
+
+- **Frontend**: http://localhost:5173
+- **Backend API**: http://localhost:8000
+- **API Docs**: http://localhost:8000/docs
+
+---
+
+# macOS Setup
+
+> **Note**: Use Ollama with Metal acceleration for Apple Silicon.
+
+## Prerequisites
+
+- macOS 12+ (Monterey or later)
+- Apple Silicon (M1/M2/M3) or Intel Mac
+- [Homebrew](https://brew.sh/)
+- Node.js 18+
+
+## Step 1: Install Homebrew (if not installed)
+
+```zsh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+## Step 2: Install Dependencies
+
+```zsh
+# Install Anaconda
+brew install --cask anaconda
+
+# Install Node.js
+brew install node
+
+# Install Redis
+brew install redis
+brew services start redis
+
+# Install Ollama
+brew install ollama
+```
+
+## Step 3: Download Model
+
+```zsh
+# Start Ollama service
+ollama serve &
+
+# Download model (choose based on RAM)
+# M1 Pro/Max 24GB+ - Best quality
+ollama pull deepseek-r1:14b
+
+# M1 8GB - Lighter model
+ollama pull deepseek-r1:7b
+
+# Verify
+ollama list
+```
+
+## Step 4: Clone and Setup Project
+
+```zsh
+# Clone repository
+git clone <repository-url>
+cd JonberAITrading
+
+# Create conda environment
+conda env create -f environment.yml
+conda activate agentic-trading
+
+# Setup environment variables
+cp .env.example .env
+
+# Edit .env file:
+# LLM_PROVIDER=ollama
+# LLM_BASE_URL=http://localhost:11434/v1
+# LLM_MODEL=deepseek-r1:14b
+```
+
+## Step 5: Start Application
+
+```zsh
+# Terminal 1: Backend
+conda activate agentic-trading
+cd backend
+uvicorn app.main:app --reload --port 8000
+
+# Terminal 2: Frontend
+cd frontend
+npm install
+npm run dev
+```
+
+## Step 6: Access Application
+
+- **Frontend**: http://localhost:5173
+- **Backend API**: http://localhost:8000
+- **API Docs**: http://localhost:8000/docs
+
+---
+
+# Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -34,7 +336,7 @@ AI-powered trading analysis system with autonomous multi-agent analysis and huma
 │  │              └──────────┬──────────┘                │   │
 │  │                         ▼                            │   │
 │  │              ┌─────────────────────┐                │   │
-│  │              │   HITL Approval     │ ← Interrupt    │   │
+│  │              │   HITL Approval     │ ← Human Review │   │
 │  │              └──────────┬──────────┘                │   │
 │  │                         ▼                            │   │
 │  │              ┌─────────────────────┐                │   │
@@ -45,571 +347,211 @@ AI-powered trading analysis system with autonomous multi-agent analysis and huma
                          │
 ┌────────────────────────▼────────────────────────────────────┐
 │                    LLM Server                                │
-│         vLLM (Windows/Linux) │ Ollama (All Platforms)       │
+│    vLLM (Linux) │ Ollama (Windows/macOS/Linux)              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Prerequisites
+# Model Recommendations
 
-- **Anaconda** or Miniconda (recommended)
-- **Node.js** 18+
-- **Redis** 7.0+ (for session persistence and caching)
-- **NVIDIA GPU** (Windows) or **Apple Silicon** (macOS)
-- **CUDA 12.1+** (Windows/Linux with NVIDIA GPU only)
+## By VRAM/RAM
 
----
+| VRAM/RAM | Platform | Model | Command |
+|----------|----------|-------|---------|
+| 24GB+ | Linux | DeepSeek-R1-Distill-Qwen-32B | vLLM (AWQ) |
+| 24GB+ | Windows/macOS | deepseek-r1:32b | `ollama pull deepseek-r1:32b` |
+| 10-16GB | All | deepseek-r1:14b | `ollama pull deepseek-r1:14b` |
+| 8GB | All | deepseek-r1:7b | `ollama pull deepseek-r1:7b` |
 
-## CUDA Installation (Windows - NVIDIA GPU)
+## Performance Benchmarks
 
-vLLM requires CUDA 12.1 or higher. Follow these steps:
-
-### 1. Check GPU Compatibility
-
-```powershell
-# Check if NVIDIA driver is installed
-nvidia-smi
-```
-
-### 2. Install CUDA Toolkit
-
-1. Download CUDA Toolkit 12.1+ from [NVIDIA CUDA Downloads](https://developer.nvidia.com/cuda-downloads)
-2. Select: Windows → x86_64 → 11/10 → exe (local)
-3. Run installer with default options
-4. Verify installation:
-
-```powershell
-nvcc --version
-# Should show: release 12.1 or higher
-```
-
-### 3. Install cuDNN (Optional but Recommended)
-
-1. Download cuDNN from [NVIDIA cuDNN](https://developer.nvidia.com/cudnn) (requires NVIDIA account)
-2. Extract and copy files to CUDA installation directory
-3. Add to PATH if needed
-
-### 4. Environment Variables
-
-Ensure these are in your system PATH:
-```
-C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin
-C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\libnvvp
-```
-
-### 5. Verify CUDA for PyTorch
-
-```powershell
-conda activate agentic-trading
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}')"
-```
-
-Expected output:
-```
-CUDA available: True
-CUDA version: 12.1
-```
+| Model | AIME 2024 | MATH-500 | VRAM (4-bit) |
+|-------|-----------|----------|--------------|
+| Qwen-32B | 72.6% | 94.3% | ~17GB |
+| Qwen-14B | 69.7% | 93.9% | ~8GB |
+| Qwen-7B | 55.5% | 92.8% | ~4GB |
 
 ---
 
-## Setup Options (Priority Order)
+# Environment Configuration
 
-1. **Anaconda** (Recommended) - Best for development
-2. **Docker** - Best for deployment
+## .env File Settings
 
----
-
-# Option 1: Anaconda Setup (Recommended)
-
-## Windows Setup (Windows Terminal + PowerShell)
-
-### 1. Create Conda Environment
-
-```powershell
-# Clone repository
-git clone <repository-url>
-cd JonberAITrading
-
-# Create conda environment from environment.yml
-conda env create -f environment.yml
-
-# Activate environment
-conda activate agentic-trading
-
-# Setup environment variables
-Copy-Item .env.example .env
-# Edit .env with your configuration (use notepad, vscode, etc.)
-```
-
-### 2. Start LLM Server (vLLM)
-
-```powershell
-# Install vLLM (requires CUDA 12.1+)
-pip install vllm
-
-# Start vLLM server with AWQ quantization for RTX 3090 (24GB)
-# Option 1: DeepSeek-R1-Distill-Qwen-32B (Recommended - Best performance)
-python -m vllm.entrypoints.openai.api_server `
-    --model deepseek-ai/DeepSeek-R1-Distill-Qwen-32B `
-    --quantization awq `
-    --max-model-len 4096 `
-    --gpu-memory-utilization 0.90 `
-    --host 0.0.0.0 `
-    --port 8080
-
-# Option 2: DeepSeek-R1-Distill-Qwen-14B (More stable, longer context)
-# python -m vllm.entrypoints.openai.api_server `
-#     --model deepseek-ai/DeepSeek-R1-Distill-Qwen-14B `
-#     --quantization awq `
-#     --max-model-len 8192 `
-#     --gpu-memory-utilization 0.90 `
-#     --host 0.0.0.0 `
-#     --port 8080
-```
-
-### 3. Start Backend (New Terminal)
-
-```powershell
-conda activate agentic-trading
-cd backend
-uvicorn app.main:app --reload --port 8000
-```
-
-### 4. Start Frontend (New Terminal)
-
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-
-### 5. Access Application
-
-- Frontend: http://localhost:5173
-- Backend API: http://localhost:8000
-- API Docs: http://localhost:8000/docs
-
----
-
-## macOS Setup (iTerm2 + zsh)
-
-### 1. Create Conda Environment
-
-```zsh
-# Clone repository
-git clone <repository-url>
-cd JonberAITrading
-
-# Create conda environment from environment.yml
-conda env create -f environment.yml
-
-# Activate environment
-conda activate agentic-trading
-
-# Setup environment variables
-cp .env.example .env
-
-# Edit .env for macOS/Ollama:
-# LLM_PROVIDER=ollama
-# LLM_BASE_URL=http://localhost:11434/v1
-# LLM_MODEL=deepseek-r1:7b
-```
-
-### 2. Install and Start Ollama
-
-```zsh
-# Install Ollama
-brew install ollama
-
-# Start Ollama server (runs in background)
-ollama serve &
-
-# Pull model (choose based on available RAM)
-# For M1 Pro 24GB RAM:
-ollama pull deepseek-r1:7b      # ~4GB, fast
-ollama pull deepseek-r1:14b     # ~8GB, balanced
-ollama pull llama3.1:8b         # ~5GB, good alternative
-
-# Verify installation
-curl http://localhost:11434/v1/models
-```
-
-### 3. Start Backend (New Terminal Tab)
-
-```zsh
-conda activate agentic-trading
-cd backend
-uvicorn app.main:app --reload --port 8000
-```
-
-### 4. Start Frontend (New Terminal Tab)
-
-```zsh
-cd frontend
-npm install
-npm run dev
-```
-
-### 5. Access Application
-
-- Frontend: http://localhost:5173
-- Backend API: http://localhost:8000
-- API Docs: http://localhost:8000/docs
-
----
-
-# Option 2: Docker Setup
-
-```bash
-# Start all services (uses Ollama by default)
-docker-compose up backend frontend redis
-
-# With NVIDIA GPU support (vLLM)
-docker-compose --profile gpu up
-
-# Or start specific services
-docker-compose up backend
-
-# Rebuild and start
-docker-compose up --build
-```
-
----
-
-## Redis Setup
-
-Redis is used for session persistence and caching. Install and start Redis:
-
-### Windows (WSL2 or Docker)
-```powershell
-# Option 1: Docker
-docker run -d --name redis -p 6379:6379 redis:7-alpine
-
-# Option 2: WSL2
-wsl -d Ubuntu
-sudo apt update && sudo apt install redis-server
-sudo service redis-server start
-```
-
-### macOS
-```zsh
-# Install via Homebrew
-brew install redis
-
-# Start Redis service
-brew services start redis
-
-# Or run directly
-redis-server
-```
-
-### Verify Redis Connection
-```bash
-redis-cli ping
-# Should return: PONG
-```
-
----
-
-## Environment Configuration
-
-Edit `.env` file based on your platform:
-
-### Windows (vLLM + RTX 3090 24GB)
 ```env
-LLM_PROVIDER=vllm
-LLM_BASE_URL=http://localhost:8080/v1
-LLM_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
-MARKET_DATA_MODE=live
-REDIS_URL=redis://localhost:6379
-```
-
-### macOS (Ollama + M1 Pro 24GB)
-```env
+# === LLM Configuration ===
+# Windows/macOS: ollama, Linux: vllm
 LLM_PROVIDER=ollama
+
+# Ollama: http://localhost:11434/v1
+# vLLM: http://localhost:8080/v1
 LLM_BASE_URL=http://localhost:11434/v1
+
+# Model name
 LLM_MODEL=deepseek-r1:14b
+
+# === Other Settings ===
 MARKET_DATA_MODE=live
 REDIS_URL=redis://localhost:6379
+ENVIRONMENT=development
+DEBUG=true
 ```
 
 ---
 
-## Conda Environment Management
+# API Reference
 
-```bash
-# Create environment
-conda env create -f environment.yml
+## Analysis Endpoints
 
-# Activate environment
-conda activate agentic-trading
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/analysis/start` | POST | Start new analysis |
+| `/api/analysis/status/{id}` | GET | Get session status |
+| `/api/analysis/sessions` | GET | List all sessions |
+| `/api/analysis/cancel/{id}` | POST | Cancel session |
 
-# Update environment (after modifying environment.yml)
-conda env update -f environment.yml --prune
+## Approval Endpoints
 
-# Deactivate environment
-conda deactivate
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/approval/pending/{id}` | GET | Get pending proposal |
+| `/api/approval/decide` | POST | Submit decision |
 
-# Remove environment
-conda env remove -n agentic-trading
+## WebSocket
 
-# Export current environment
-conda env export > environment.yml
-```
+| Endpoint | Description |
+|----------|-------------|
+| `/ws/session/{id}` | Real-time session updates |
+
+## System
+
+| Endpoint | Description |
+|----------|-------------|
+| `/health` | Health check (API, LLM, Redis) |
+| `/docs` | Swagger documentation |
 
 ---
 
-## API Endpoints
+# Testing
 
-### Analysis
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/analysis/start` | POST | Start new analysis session |
-| `/api/analysis/status/{session_id}` | GET | Get session status |
-| `/api/analysis/state/{session_id}` | GET | Get full session state |
-| `/api/analysis/sessions` | GET | List all active sessions |
-| `/api/analysis/cancel/{session_id}` | POST | Cancel a session |
+## Run Backend Tests
 
-### Approval (HITL)
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/approval/pending/{session_id}` | GET | Get pending proposal |
-| `/api/approval/decide` | POST | Submit approval decision |
-
-### WebSocket
-| Endpoint | Protocol | Description |
-|----------|----------|-------------|
-| `/ws/session/{session_id}` | WS | Real-time session updates |
-| `/ws/broadcast` | WS | System-wide broadcasts |
-
-### Authentication (Not Yet Implemented)
-| Endpoint | Method | Description | Status |
-|----------|--------|-------------|--------|
-| `/api/auth/login` | POST | User login | 501 |
-| `/api/auth/register` | POST | User registration | 501 |
-| `/api/auth/logout` | POST | User logout | 501 |
-| `/api/auth/me` | GET | Current user profile | 501 |
-| `/api/auth/refresh` | POST | Refresh access token | 501 |
-| `/api/auth/api-keys` | POST/GET | API key management | 501 |
-
-### System
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | API information |
-| `/health` | GET | Health check (API, LLM, Redis) |
-| `/docs` | GET | Swagger documentation (debug only) |
-
----
-
-## Development
-
-### Run Tests
 ```bash
 conda activate agentic-trading
 cd backend
 pytest -v
 ```
 
-### Code Formatting
+## Health Check
+
 ```bash
-# Python
-black backend/
-isort backend/
+# Check all services
+curl http://localhost:8000/health
 
-# TypeScript
-cd frontend
-npm run lint
-npm run format
-```
-
-### Type Checking
-```bash
-# Python
-cd backend
-mypy app/
-
-# TypeScript
-cd frontend
-npx tsc --noEmit
+# Expected response
+{
+  "status": "healthy",
+  "services": {
+    "api": "healthy",
+    "llm": {"status": "healthy"},
+    "redis": {"status": "healthy"}
+  }
+}
 ```
 
 ---
 
-## Troubleshooting
+# Troubleshooting
 
-### Conda Environment Issues
+## Common Issues
+
+### LLM Connection Failed
+
 ```bash
-# If environment creation fails, try:
-conda clean --all
-conda env create -f environment.yml
+# Check if Ollama is running
+ollama list
 
-# Or create manually:
-conda create -n agentic-trading python=3.12
-conda activate agentic-trading
-pip install -r backend/requirements.txt
+# Restart Ollama
+ollama serve
 ```
 
-### vLLM Out of Memory (Windows)
-- Reduce `--max-model-len` to 4096
-- Increase `--gpu-memory-utilization` to 0.98
-- Use smaller quantization or model
+### Redis Connection Failed
 
-### Ollama Slow Response (macOS)
-- Ensure Metal acceleration is enabled
-- Try smaller model variant
-- Check Activity Monitor for memory pressure
+```bash
+# Check Redis status
+redis-cli ping
 
-### WebSocket Connection Failed
-- Verify backend is running on port 8000
-- Check CORS settings in backend
-- Ensure firewall allows connection
+# Windows (Docker)
+docker start redis
+
+# macOS
+brew services restart redis
+
+# Linux
+sudo systemctl restart redis-server
+```
+
+### CUDA Not Available (Linux)
+
+```bash
+# Verify CUDA installation
+nvcc --version
+nvidia-smi
+
+# Check PyTorch CUDA
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+### Frontend Build Errors
+
+```bash
+# Clear node_modules and reinstall
+cd frontend
+rm -rf node_modules package-lock.json
+npm install
+```
 
 ---
 
-## Project Structure
+# Project Structure
 
 ```
 JonberAITrading/
 ├── backend/
 │   ├── app/                    # FastAPI application
-│   │   ├── api/
-│   │   │   ├── routes/         # API endpoints
-│   │   │   │   ├── analysis.py
-│   │   │   │   ├── approval.py
-│   │   │   │   ├── auth.py     # Auth interface (placeholder)
-│   │   │   │   └── websocket.py
-│   │   │   └── schemas/        # Pydantic models
+│   │   ├── api/routes/         # API endpoints
 │   │   ├── config.py           # Settings
-│   │   ├── dependencies.py     # DI providers
 │   │   └── main.py             # Entry point
-│   ├── agents/
-│   │   ├── graph/
-│   │   │   ├── nodes.py        # LangGraph nodes
-│   │   │   ├── state.py        # State definitions
-│   │   │   ├── trading_graph.py
-│   │   │   └── redis_checkpointer.py
-│   │   ├── tools/              # Agent tools
+│   ├── agents/                 # LangGraph agents
+│   │   ├── graph/              # Workflow definition
 │   │   └── llm_provider.py     # LLM abstraction
-│   ├── services/
-│   │   └── redis_service.py    # Redis client
+│   ├── services/               # Business logic
 │   └── tests/                  # Pytest tests
 ├── frontend/
 │   ├── src/
-│   │   ├── api/                # API & WebSocket clients
-│   │   ├── components/
-│   │   │   ├── analysis/       # Analysis components
-│   │   │   ├── approval/       # HITL approval UI
-│   │   │   ├── chart/          # TradingView charts
-│   │   │   ├── chat/           # Chat interface
-│   │   │   ├── layout/         # Layout components
-│   │   │   └── position/       # Position display
+│   │   ├── components/         # React components
 │   │   ├── store/              # Zustand state
-│   │   └── types/              # TypeScript types
-│   ├── tailwind.config.js
+│   │   └── api/                # API clients
 │   └── vite.config.ts
-├── docker/                     # Docker configurations
-├── data/mock/                  # Mock data for testing
 ├── environment.yml             # Conda environment
-└── CLAUDE.md                   # AI assistant instructions
+└── README.md
 ```
 
 ---
 
-## Authentication Roadmap
+# Tech Stack
 
-Authentication is currently **not implemented**. The `/api/auth/*` endpoints return `501 Not Implemented`.
-
-### Planned Implementation Phases
-
-#### Phase 1: Basic JWT Authentication
-- [ ] User registration with email verification
-- [ ] Password hashing with bcrypt
-- [ ] JWT token generation (RS256)
-- [ ] Token refresh mechanism
-- [ ] Session management with Redis
-
-#### Phase 2: OAuth2 Integration
-- [ ] Google OAuth2
-- [ ] GitHub OAuth2
-- [ ] Microsoft OAuth2
-
-#### Phase 3: API Key Management
-- [ ] API key generation for programmatic access
-- [ ] Key rotation and expiration
-- [ ] Rate limiting per key
-- [ ] Scoped permissions
-
-#### Phase 4: RBAC (Role-Based Access Control)
-- [ ] Role definitions: Admin, Trader, Viewer
-- [ ] Permission system
-- [ ] Team/Organization support
-
-### Security Considerations (Planned)
-- Passwords stored with bcrypt (work factor 12)
-- JWT signed with RS256 algorithm
-- Refresh tokens stored in Redis with TTL
-- Rate limiting on authentication endpoints
-- Audit logging for all auth events
-- HTTPS required in production
-
-### Temporary Workaround
-Until authentication is implemented:
-1. Run in development mode (DEBUG=true)
-2. API is open without authentication
-3. Use network-level security (firewall, VPN)
+| Layer | Technologies |
+|-------|--------------|
+| **Backend** | Python 3.12, FastAPI, LangGraph, Pydantic |
+| **Frontend** | React 18, Vite, TypeScript, Zustand, TailwindCSS |
+| **Charts** | TradingView Lightweight Charts |
+| **LLM** | vLLM (Linux), Ollama (All platforms) |
+| **Database** | Redis (session persistence) |
 
 ---
 
-## Tech Stack
-
-### Backend
-- Python 3.12
-- FastAPI 0.115+
-- LangChain 0.3+
-- LangGraph 0.2+
-- Pydantic 2.10+
-- Redis 5.0+ (async client)
-
-### Frontend
-- React 18.3
-- Vite 6.0
-- TypeScript 5.7
-- Zustand 5.0
-- TailwindCSS 3.4
-- Lightweight Charts 4.2 (TradingView)
-
-### LLM
-- vLLM (Windows/Linux with NVIDIA GPU)
-- Ollama (All platforms)
-
-### Infrastructure
-- Redis 7.0+ (session persistence)
-- Docker (optional deployment)
-
----
-
-## Chart Features
-
-The frontend includes TradingView Lightweight Charts with:
-
-### Timeframes
-- 1분봉 (1 Minute)
-- 5분봉 (5 Minutes)
-- 15분봉 (15 Minutes)
-- 1시간봉 (1 Hour)
-- 일봉 (Daily)
-- 주봉 (Weekly)
-- 월봉 (Monthly)
-
-### Indicators
-- 50일 이동평균선 (SMA 50)
-- 200일 이동평균선 (SMA 200)
-- 거래량 (Volume)
-
----
-
-## Contributing
+# Contributing
 
 1. Fork the repository
 2. Create a feature branch
@@ -619,6 +561,6 @@ The frontend includes TradingView Lightweight Charts with:
 
 ---
 
-## License
+# License
 
 MIT License
