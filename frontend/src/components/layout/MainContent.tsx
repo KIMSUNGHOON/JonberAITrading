@@ -9,16 +9,18 @@ import { useStore } from '@/store';
 import { ChartPanel } from '@/components/chart/ChartPanel';
 import { AnalysisPanel } from '@/components/analysis/AnalysisPanel';
 import { ReasoningLog } from '@/components/analysis/ReasoningLog';
+import { WorkflowProgress } from '@/components/analysis/WorkflowProgress';
 import { ProposalCard } from '@/components/approval/ProposalCard';
 import { PositionCard } from '@/components/position/PositionCard';
 import { WelcomePanel } from '@/components/analysis/WelcomePanel';
 
 export function MainContent() {
-  const { sessionId, ticker, status } = useStore(
+  const { sessionId, ticker, status, currentStage } = useStore(
     useShallow((state) => ({
       sessionId: state.activeSessionId,
       ticker: state.ticker,
       status: state.status,
+      currentStage: state.currentStage,
     }))
   );
   const { analyses, reasoningLog } = useStore(
@@ -43,6 +45,17 @@ export function MainContent() {
 
   return (
     <div className="p-4 md:p-6 space-y-6">
+      {/* Workflow Progress - Shows during analysis */}
+      {ticker && status !== 'idle' && (
+        <section>
+          <WorkflowProgress
+            currentStage={currentStage}
+            status={status}
+            ticker={ticker}
+          />
+        </section>
+      )}
+
       {/* Chart Section */}
       {showChartPanel && ticker && (
         <section>
@@ -75,7 +88,6 @@ export function MainContent() {
       {/* Reasoning Log */}
       {reasoningLog.length > 0 && (
         <section>
-          <h2 className="text-lg font-semibold mb-4">Agent Reasoning</h2>
           <ReasoningLog entries={reasoningLog} />
         </section>
       )}
