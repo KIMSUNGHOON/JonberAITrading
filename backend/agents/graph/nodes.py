@@ -5,6 +5,7 @@ Each node function receives the current state and returns state updates.
 Nodes are executed in sequence or parallel as defined in the graph.
 """
 
+import time
 import uuid
 from datetime import datetime
 from typing import Literal
@@ -37,6 +38,20 @@ from agents.tools.write_todos import decompose_task, format_tasks_for_log
 logger = structlog.get_logger()
 
 
+def _get_ticker_safely(state: dict, node_name: str) -> str:
+    """Safely get ticker from state with detailed error logging."""
+    ticker = state.get("ticker")
+    if not ticker:
+        logger.error(
+            "state_missing_ticker",
+            node=node_name,
+            state_keys=list(state.keys()),
+            state_preview={k: str(v)[:100] for k, v in list(state.items())[:5]},
+        )
+        raise ValueError(f"State missing 'ticker' in {node_name}. State keys: {list(state.keys())}")
+    return ticker
+
+
 # -------------------------------------------
 # Stage 1A: Task Decomposition
 # -------------------------------------------
@@ -47,17 +62,40 @@ async def task_decomposition_node(state: dict) -> dict:
     Decompose the analysis task into subtasks for subagents.
     Uses the write_todos pattern from DeepAgents.
     """
-    ticker = state["ticker"]
+    start_time = time.perf_counter()
+
+    # Safe ticker access with detailed error logging
+    ticker = _get_ticker_safely(state, "task_decomposition")
     query = state.get("user_query", f"Analyze {ticker} for trading opportunity")
 
-    logger.info("task_decomposition_start", ticker=ticker)
+    logger.info(
+        "node_started",
+        node="task_decomposition",
+        ticker=ticker,
+        query_preview=query[:100] if query else None,
+    )
 
     # Decompose task into subtasks
     todos = await decompose_task(ticker, query, use_llm=True)
 
+    logger.debug(
+        "task_decomposition_result",
+        ticker=ticker,
+        task_count=len(todos),
+        tasks=[t.task[:50] for t in todos],
+    )
+
     # Format for log
     tasks_log = format_tasks_for_log(todos)
     reasoning = f"[Task Decomposition] Breaking down analysis for {ticker}:\n{tasks_log}"
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    logger.info(
+        "node_completed",
+        node="task_decomposition",
+        ticker=ticker,
+        duration_ms=round(duration_ms, 2),
+    )
 
     return {
         "todos": [t.model_dump() for t in todos],
@@ -93,22 +131,40 @@ async def technical_analysis_node(state: dict) -> dict:
     Technical analysis subagent.
     Analyzes price patterns, indicators, and trends.
     """
-    ticker = state["ticker"]
+    start_time = time.perf_counter()
+    ticker = _get_ticker_safely(state, "technical_analysis")
     llm = get_llm_provider()
 
-    logger.info("technical_analysis_start", ticker=ticker)
+    logger.info("node_started", node="technical_analysis", ticker=ticker)
 
     # Fetch market data
+    logger.debug("fetching_market_data", ticker=ticker, period="3mo")
     df = await get_market_data(ticker, period="3mo")
     market_context = format_market_data_for_llm(df, ticker)
     indicators = calculate_technical_indicators(df)
+
+    logger.debug(
+        "market_data_fetched",
+        ticker=ticker,
+        data_points=len(df) if df is not None else 0,
+        indicators_keys=list(indicators.keys()) if indicators else [],
+    )
 
     messages = [
         SystemMessage(content=TECHNICAL_ANALYST_PROMPT),
         HumanMessage(content=f"Analyze {ticker}:\n\n{market_context}"),
     ]
 
+    logger.debug("llm_request", node="technical_analysis", message_count=len(messages))
+    llm_start = time.perf_counter()
     response = await llm.generate(messages)
+    llm_duration = (time.perf_counter() - llm_start) * 1000
+    logger.debug(
+        "llm_response",
+        node="technical_analysis",
+        response_length=len(response),
+        duration_ms=round(llm_duration, 2),
+    )
 
     # Determine signal from indicators
     signal = _determine_technical_signal(indicators)
@@ -117,7 +173,7 @@ async def technical_analysis_node(state: dict) -> dict:
         agent_type="technical",
         ticker=ticker,
         signal=signal,
-        confidence=0.75,  # Base confidence, could be parsed from LLM
+        confidence=0.75,
         summary=response[:500] if len(response) > 500 else response,
         reasoning=response,
         key_factors=_extract_key_factors(response),
@@ -131,6 +187,16 @@ async def technical_analysis_node(state: dict) -> dict:
     )
 
     reasoning = f"[Technical Analysis] {ticker}: {signal.value} (Confidence: {result.confidence:.0%})"
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    logger.info(
+        "node_completed",
+        node="technical_analysis",
+        ticker=ticker,
+        signal=signal.value,
+        confidence=result.confidence,
+        duration_ms=round(duration_ms, 2),
+    )
 
     return {
         "technical_analysis": result,
@@ -165,13 +231,15 @@ async def fundamental_analysis_node(state: dict) -> dict:
     Fundamental analysis subagent.
     Analyzes company financials, valuation, and business metrics.
     """
-    ticker = state["ticker"]
+    start_time = time.perf_counter()
+    ticker = _get_ticker_safely(state, "fundamental_analysis")
     llm = get_llm_provider()
 
-    logger.info("fundamental_analysis_start", ticker=ticker)
+    logger.info("node_started", node="fundamental_analysis", ticker=ticker)
 
     # Fetch company info
     info = await get_ticker_info(ticker)
+    logger.debug("ticker_info_fetched", ticker=ticker, info_keys=list(info.keys())[:10] if info else [])
 
     # Format fundamental data
     fundamental_context = _format_fundamental_data(info)
@@ -181,7 +249,11 @@ async def fundamental_analysis_node(state: dict) -> dict:
         HumanMessage(content=f"Analyze fundamentals for {ticker}:\n\n{fundamental_context}"),
     ]
 
+    logger.debug("llm_request", node="fundamental_analysis", message_count=len(messages))
+    llm_start = time.perf_counter()
     response = await llm.generate(messages)
+    llm_duration = (time.perf_counter() - llm_start) * 1000
+    logger.debug("llm_response", node="fundamental_analysis", response_length=len(response), duration_ms=round(llm_duration, 2))
 
     # Determine signal from fundamentals
     signal = _determine_fundamental_signal(info)
@@ -203,6 +275,9 @@ async def fundamental_analysis_node(state: dict) -> dict:
     )
 
     reasoning = f"[Fundamental Analysis] {ticker}: {signal.value} (Confidence: {result.confidence:.0%})"
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    logger.info("node_completed", node="fundamental_analysis", ticker=ticker, signal=signal.value, duration_ms=round(duration_ms, 2))
 
     return {
         "fundamental_analysis": result,
@@ -238,10 +313,11 @@ async def sentiment_analysis_node(state: dict) -> dict:
     Sentiment analysis subagent.
     Analyzes market sentiment from various sources.
     """
-    ticker = state["ticker"]
+    start_time = time.perf_counter()
+    ticker = _get_ticker_safely(state, "sentiment_analysis")
     llm = get_llm_provider()
 
-    logger.info("sentiment_analysis_start", ticker=ticker)
+    logger.info("node_started", node="sentiment_analysis", ticker=ticker)
 
     # Get company info for context
     info = await get_ticker_info(ticker)
@@ -254,7 +330,11 @@ async def sentiment_analysis_node(state: dict) -> dict:
         ),
     ]
 
+    logger.debug("llm_request", node="sentiment_analysis", message_count=len(messages))
+    llm_start = time.perf_counter()
     response = await llm.generate(messages)
+    llm_duration = (time.perf_counter() - llm_start) * 1000
+    logger.debug("llm_response", node="sentiment_analysis", response_length=len(response), duration_ms=round(llm_duration, 2))
 
     # Default to neutral sentiment (would be parsed from real data)
     signal = SignalType.HOLD
@@ -263,7 +343,7 @@ async def sentiment_analysis_node(state: dict) -> dict:
         agent_type="sentiment",
         ticker=ticker,
         signal=signal,
-        confidence=0.60,  # Lower confidence for simulated sentiment
+        confidence=0.60,
         summary=response[:500] if len(response) > 500 else response,
         reasoning=response,
         key_factors=_extract_key_factors(response),
@@ -275,6 +355,9 @@ async def sentiment_analysis_node(state: dict) -> dict:
     )
 
     reasoning = f"[Sentiment Analysis] {ticker}: {signal.value} (Confidence: {result.confidence:.0%})"
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    logger.info("node_completed", node="sentiment_analysis", ticker=ticker, signal=signal.value, duration_ms=round(duration_ms, 2))
 
     return {
         "sentiment_analysis": result,
@@ -311,17 +394,20 @@ async def risk_assessment_node(state: dict) -> dict:
     Risk assessment subagent.
     Evaluates portfolio risk and position sizing.
     """
-    ticker = state["ticker"]
+    start_time = time.perf_counter()
+    ticker = _get_ticker_safely(state, "risk_assessment")
     llm = get_llm_provider()
 
-    logger.info("risk_assessment_start", ticker=ticker)
+    logger.info("node_started", node="risk_assessment", ticker=ticker)
 
     # Gather all previous analyses
     analyses = get_all_analyses(state)
+    logger.debug("analyses_gathered", ticker=ticker, analysis_count=len(analyses))
     analyses_context = "\n\n".join(a.to_context_string() for a in analyses)
 
     # Get current price for stop-loss calculation
     current_price = await get_current_price(ticker)
+    logger.debug("current_price_fetched", ticker=ticker, price=current_price)
 
     messages = [
         SystemMessage(content=RISK_ASSESSOR_PROMPT),
@@ -330,7 +416,11 @@ async def risk_assessment_node(state: dict) -> dict:
         ),
     ]
 
+    logger.debug("llm_request", node="risk_assessment", message_count=len(messages))
+    llm_start = time.perf_counter()
     response = await llm.generate(messages)
+    llm_duration = (time.perf_counter() - llm_start) * 1000
+    logger.debug("llm_response", node="risk_assessment", response_length=len(response), duration_ms=round(llm_duration, 2))
 
     # Calculate risk score based on analysis disagreement
     risk_score = _calculate_risk_score(analyses)
@@ -338,7 +428,7 @@ async def risk_assessment_node(state: dict) -> dict:
     result = AnalysisResult(
         agent_type="risk",
         ticker=ticker,
-        signal=SignalType.HOLD,  # Risk assessor doesn't give buy/sell signals
+        signal=SignalType.HOLD,
         confidence=0.80,
         summary=response[:500] if len(response) > 500 else response,
         reasoning=response,
@@ -346,12 +436,15 @@ async def risk_assessment_node(state: dict) -> dict:
         signals={
             "risk_score": risk_score,
             "max_position_pct": 5.0 if risk_score < 0.5 else 3.0,
-            "suggested_stop_loss": round(current_price * 0.95, 2),  # 5% stop-loss
-            "suggested_take_profit": round(current_price * 1.10, 2),  # 10% take-profit
+            "suggested_stop_loss": round(current_price * 0.95, 2),
+            "suggested_take_profit": round(current_price * 1.10, 2),
         },
     )
 
     reasoning = f"[Risk Assessment] {ticker}: Risk Score {risk_score:.0%}, Max Position {result.signals['max_position_pct']}%"
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    logger.info("node_completed", node="risk_assessment", ticker=ticker, risk_score=risk_score, duration_ms=round(duration_ms, 2))
 
     return {
         "risk_assessment": result,
@@ -388,17 +481,20 @@ async def strategic_decision_node(state: dict) -> dict:
     Synthesize all analyses into a trade proposal.
     This is where the final decision is made before human approval.
     """
-    ticker = state["ticker"]
+    start_time = time.perf_counter()
+    ticker = _get_ticker_safely(state, "strategic_decision")
     llm = get_llm_provider()
 
-    logger.info("strategic_decision_start", ticker=ticker)
+    logger.info("node_started", node="strategic_decision", ticker=ticker)
 
     # Collect all analyses
     analyses = get_all_analyses(state)
+    logger.debug("synthesizing_analyses", ticker=ticker, analysis_count=len(analyses))
     analyses_context = "\n\n".join(a.to_context_string() for a in analyses)
 
     # Calculate consensus
     consensus_signal, avg_confidence = calculate_consensus_signal(analyses)
+    logger.debug("consensus_calculated", ticker=ticker, signal=consensus_signal.value, confidence=avg_confidence)
 
     messages = [
         SystemMessage(content=STRATEGIC_DECISION_PROMPT),
@@ -409,7 +505,11 @@ async def strategic_decision_node(state: dict) -> dict:
         ),
     ]
 
+    logger.debug("llm_request", node="strategic_decision", message_count=len(messages))
+    llm_start = time.perf_counter()
     response = await llm.generate(messages)
+    llm_duration = (time.perf_counter() - llm_start) * 1000
+    logger.debug("llm_response", node="strategic_decision", response_length=len(response), duration_ms=round(llm_duration, 2))
 
     # Determine action from consensus
     action = _signal_to_action(consensus_signal)
@@ -425,7 +525,7 @@ async def strategic_decision_node(state: dict) -> dict:
         id=str(uuid.uuid4()),
         ticker=ticker,
         action=action,
-        quantity=100,  # Default quantity, would be calculated based on portfolio
+        quantity=100,
         entry_price=current_price,
         stop_loss=risk_signals.get("suggested_stop_loss"),
         take_profit=risk_signals.get("suggested_take_profit"),
@@ -438,6 +538,16 @@ async def strategic_decision_node(state: dict) -> dict:
     )
 
     reasoning = f"[Strategic Decision] Proposal: {action.value} {proposal.quantity} {ticker} @ ${current_price:.2f}"
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    logger.info(
+        "node_completed",
+        node="strategic_decision",
+        ticker=ticker,
+        action=action.value,
+        proposal_id=proposal.id[:8],
+        duration_ms=round(duration_ms, 2),
+    )
 
     return {
         "trade_proposal": proposal,
@@ -463,16 +573,26 @@ async def human_approval_node(state: dict) -> dict:
     Human-in-the-loop approval checkpoint.
     This node is an interrupt point - execution pauses here.
     """
+    ticker = _get_ticker_safely(state, "human_approval")
     proposal = state.get("trade_proposal")
 
     logger.info(
-        "awaiting_human_approval",
-        ticker=state["ticker"],
-        proposal_id=proposal.id if proposal else None,
+        "node_started",
+        node="human_approval",
+        ticker=ticker,
+        proposal_id=proposal.id[:8] if proposal else None,
         action=proposal.action.value if proposal else None,
     )
 
-    reasoning = f"[HITL] Awaiting human approval for {proposal.action.value} {proposal.ticker}..."
+    reasoning = f"[HITL] Awaiting human approval for {proposal.action.value} {proposal.ticker}..." if proposal else "[HITL] No proposal to approve"
+
+    logger.info(
+        "awaiting_human_approval",
+        ticker=ticker,
+        proposal_id=proposal.id[:8] if proposal else None,
+        action=proposal.action.value if proposal else None,
+        entry_price=proposal.entry_price if proposal else None,
+    )
 
     return {
         "awaiting_approval": True,

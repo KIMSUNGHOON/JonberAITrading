@@ -6,6 +6,7 @@ Main application setup with:
 - Lifespan events (startup/shutdown)
 - API router inclusion
 - Health check endpoint
+- Enhanced logging for development
 """
 
 from contextlib import asynccontextmanager
@@ -17,25 +18,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from agents.llm_provider import get_llm_provider, reset_llm_provider
 from app.api.routes import analysis, approval, websocket, auth
 from app.config import settings
+from app.logging_config import configure_logging, RequestLoggingMiddleware
 from services.storage_service import get_storage_service, close_storage_service
 
-# Configure structlog
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.dev.ConsoleRenderer() if settings.DEBUG else structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.stdlib.BoundLogger,
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    cache_logger_on_first_use=True,
+# Configure enhanced logging
+configure_logging(
+    log_level="DEBUG" if settings.DEBUG else "INFO",
+    json_logs=not settings.DEBUG,
 )
 
 logger = structlog.get_logger()
@@ -125,6 +114,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Request logging middleware (development only)
+if settings.DEBUG:
+    app.add_middleware(RequestLoggingMiddleware, log_request_body=True)
 
 # Include API routers
 app.include_router(
