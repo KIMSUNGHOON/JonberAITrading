@@ -25,7 +25,7 @@ from agents.graph.nodes import (
     task_decomposition_node,
     technical_analysis_node,
 )
-from agents.graph.state import create_initial_state
+from agents.graph.state import TradingState, create_initial_state
 
 logger = structlog.get_logger()
 
@@ -62,8 +62,8 @@ def create_trading_graph() -> StateGraph:
                                                  [End]
     ```
     """
-    # Initialize graph with dict state (LangGraph standard)
-    workflow = StateGraph(dict)
+    # Initialize graph with TradingState TypedDict for proper state accumulation
+    workflow = StateGraph(TradingState)
 
     # -------------------------------------------
     # Add Nodes

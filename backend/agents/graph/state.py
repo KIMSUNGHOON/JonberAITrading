@@ -5,9 +5,10 @@ Defines all state objects, data models, and type definitions
 for the multi-agent trading workflow.
 """
 
+import operator
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional, TypedDict
 
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
@@ -212,52 +213,75 @@ class SubTask(BaseModel):
 
 
 # -------------------------------------------
+# Custom Reducers
+# -------------------------------------------
+
+
+def replace_value(current: Any, new: Any) -> Any:
+    """Replace current value with new value (default LangGraph behavior)."""
+    return new if new is not None else current
+
+
+def append_list(current: list, new: list) -> list:
+    """Append new items to existing list."""
+    if current is None:
+        current = []
+    if new is None:
+        new = []
+    return current + new
+
+
+# -------------------------------------------
 # Main Trading State (LangGraph TypedDict)
 # -------------------------------------------
 
 
-class TradingState(dict):
+class TradingState(TypedDict, total=False):
     """
     Main state object for the LangGraph trading workflow.
 
     This state flows through all nodes in the graph and accumulates
     results from each analysis stage.
 
-    Note: Using dict base for LangGraph compatibility.
-    For type hints, access via typed getters or use TypedDict pattern.
+    Using TypedDict with Annotated reducers for proper state accumulation.
+    - Fields without reducers are replaced on each update
+    - Fields with append_list reducer accumulate across nodes
+    - messages uses add_messages for proper conversation handling
     """
 
-    # Type hints for IDE support (actual access is via dict keys)
+    # Input - these are passed through unchanged
     ticker: str
     user_query: str
+
+    # Messages for conversation tracking (uses LangGraph's add_messages)
     messages: Annotated[list, add_messages]
 
-    # Task decomposition
-    todos: list[SubTask]
+    # Task decomposition (replaced on update)
+    todos: list[dict]
 
-    # Analysis results
+    # Analysis results (replaced on update)
     technical_analysis: Optional[AnalysisResult]
     fundamental_analysis: Optional[AnalysisResult]
     sentiment_analysis: Optional[AnalysisResult]
     risk_assessment: Optional[AnalysisResult]
 
     # Synthesis for debate pattern
-    synthesis: Optional[dict]  # Combined analysis with conflicts identified
+    synthesis: Optional[dict]
 
     # Strategic decision
     trade_proposal: Optional[TradeProposal]
 
     # HITL state
     awaiting_approval: bool
-    approval_status: Optional[Literal["approved", "rejected", "modified"]]
+    approval_status: Optional[str]
     user_feedback: Optional[str]
 
     # Execution state
-    execution_status: Optional[Literal["pending", "executing", "completed", "failed", "cancelled"]]
+    execution_status: Optional[str]
     active_position: Optional[Position]
 
-    # Reasoning trace for live log
-    reasoning_log: list[str]
+    # Reasoning trace - accumulates across nodes
+    reasoning_log: Annotated[list[str], append_list]
 
     # Error handling
     error: Optional[str]
