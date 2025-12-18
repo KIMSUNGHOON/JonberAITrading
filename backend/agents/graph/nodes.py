@@ -738,7 +738,7 @@ def _calculate_risk_score(analyses: list[dict]) -> float:
     # Calculate variance in signals (disagreement = risk)
     import numpy as np
 
-    variance = np.var(signals)
+    variance = float(np.var(signals))  # Convert to Python float
     # Normalize to 0-1 range (max variance is 4 for signals from -2 to 2)
     risk_score = min(variance / 4.0, 1.0)
 
@@ -746,7 +746,7 @@ def _calculate_risk_score(analyses: list[dict]) -> float:
     avg_confidence = sum(a.get("confidence", 0.5) for a in analyses) / len(analyses)
     risk_score = (risk_score + (1 - avg_confidence)) / 2
 
-    return round(risk_score, 2)
+    return round(float(risk_score), 2)  # Ensure Python float for serialization
 
 
 def _signal_to_action(signal: SignalType) -> TradeAction:
