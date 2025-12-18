@@ -19,7 +19,6 @@ dependencies:
   - pip
   - numpy>=1.26.0
   - pandas>=2.2.0
-  - redis-py>=5.0.0
 
   # Development tools
   - pytest>=8.0.0
@@ -34,7 +33,7 @@ dependencies:
       # Web Framework
       - fastapi>=0.115.0
       - uvicorn[standard]>=0.32.0
-      - pydantic>=2.10.0
+      - pydantic[email]>=2.10.0
       - pydantic-settings>=2.6.0
 
       # LangChain & LangGraph
@@ -51,7 +50,8 @@ dependencies:
       # Market Data
       - yfinance>=0.2.50
 
-      # Caching & State
+      # Storage & State
+      - aiosqlite>=0.20.0
       - diskcache>=5.6.0
 
       # Utilities
