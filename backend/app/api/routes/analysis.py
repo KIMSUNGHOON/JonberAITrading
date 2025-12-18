@@ -173,39 +173,52 @@ async def get_analysis_status(session_id: str):
     session = get_session(session_id)
     state = session["state"]
 
-    # Build analyses summary
+    # Build analyses summary (analyses are now dicts from model_dump())
     analyses = []
     for key in ["technical_analysis", "fundamental_analysis", "sentiment_analysis", "risk_assessment"]:
         analysis = state.get(key)
         if analysis:
+            signal = analysis.get("signal", "hold")
+            # Handle both enum value and string
+            if hasattr(signal, "value"):
+                signal = signal.value
+            summary = analysis.get("summary", "")
+            key_factors = analysis.get("key_factors", [])
             analyses.append(
                 AnalysisSummary(
-                    agent_type=analysis.agent_type,
-                    signal=analysis.signal.value if hasattr(analysis.signal, "value") else str(analysis.signal),
-                    confidence=analysis.confidence,
-                    summary=analysis.summary[:300] if analysis.summary else "",
-                    key_factors=analysis.key_factors[:5] if analysis.key_factors else [],
+                    agent_type=analysis.get("agent_type", key),
+                    signal=str(signal),
+                    confidence=analysis.get("confidence", 0.5),
+                    summary=summary[:300] if summary else "",
+                    key_factors=key_factors[:5] if key_factors else [],
                 )
             )
 
-    # Build trade proposal response
+    # Build trade proposal response (proposal is now a dict from model_dump())
     trade_proposal = None
     proposal = state.get("trade_proposal")
     if proposal:
+        action = proposal.get("action", "HOLD")
+        # Handle both enum value and string
+        if hasattr(action, "value"):
+            action = action.value
+        rationale = proposal.get("rationale", "")
+        bull_case = proposal.get("bull_case", "")
+        bear_case = proposal.get("bear_case", "")
         trade_proposal = TradeProposalResponse(
-            id=proposal.id,
-            ticker=proposal.ticker,
-            action=proposal.action.value if hasattr(proposal.action, "value") else proposal.action,
-            quantity=proposal.quantity,
-            entry_price=proposal.entry_price,
-            stop_loss=proposal.stop_loss,
-            take_profit=proposal.take_profit,
-            risk_score=proposal.risk_score,
-            position_size_pct=proposal.position_size_pct,
-            rationale=proposal.rationale[:1000] if proposal.rationale else "",
-            bull_case=proposal.bull_case[:500] if proposal.bull_case else "",
-            bear_case=proposal.bear_case[:500] if proposal.bear_case else "",
-            created_at=proposal.created_at,
+            id=proposal.get("id", ""),
+            ticker=proposal.get("ticker", ""),
+            action=str(action),
+            quantity=proposal.get("quantity", 0),
+            entry_price=proposal.get("entry_price"),
+            stop_loss=proposal.get("stop_loss"),
+            take_profit=proposal.get("take_profit"),
+            risk_score=proposal.get("risk_score", 0.5),
+            position_size_pct=proposal.get("position_size_pct", 5.0),
+            rationale=rationale[:1000] if rationale else "",
+            bull_case=bull_case[:500] if bull_case else "",
+            bear_case=bear_case[:500] if bear_case else "",
+            created_at=proposal.get("created_at"),
         )
 
     return AnalysisStatusResponse(

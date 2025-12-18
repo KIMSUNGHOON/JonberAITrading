@@ -70,13 +70,13 @@ async def submit_approval(request: ApprovalRequest):
     state["user_feedback"] = request.feedback
     state["awaiting_approval"] = False
 
-    # Apply modifications if provided
+    # Apply modifications if provided (proposal is now a dict)
     if request.decision == "modified" and request.modifications:
         proposal = state.get("trade_proposal")
         if proposal:
             for key, value in request.modifications.items():
-                if hasattr(proposal, key):
-                    setattr(proposal, key, value)
+                if key in proposal:
+                    proposal[key] = value
                     logger.debug(
                         "proposal_modified",
                         session_id=request.session_id,
@@ -165,7 +165,7 @@ async def list_pending_approvals():
         if not proposal:
             continue
 
-        # Build analyses summary
+        # Build analyses summary (analyses are now dicts)
         analyses_summary = PendingProposalSummary(
             technical=_get_analysis_summary(state.get("technical_analysis")),
             fundamental=_get_analysis_summary(state.get("fundamental_analysis")),
@@ -173,16 +173,20 @@ async def list_pending_approvals():
             risk=_get_analysis_summary(state.get("risk_assessment")),
         )
 
+        # Handle proposal as dict
+        action = proposal.get("action", "HOLD")
+        rationale = proposal.get("rationale", "")
+
         pending.append(
             PendingApprovalItem(
                 session_id=session_id,
                 ticker=session["ticker"],
-                action=proposal.action.value if hasattr(proposal.action, "value") else proposal.action,
-                quantity=proposal.quantity,
-                risk_score=proposal.risk_score,
-                rationale_preview=proposal.rationale[:200] if proposal.rationale else "",
+                action=str(action),
+                quantity=proposal.get("quantity", 0),
+                risk_score=proposal.get("risk_score", 0.5),
+                rationale_preview=rationale[:200] if rationale else "",
                 analyses_summary=analyses_summary,
-                created_at=proposal.created_at,
+                created_at=proposal.get("created_at"),
             )
         )
 
@@ -225,22 +229,25 @@ async def get_pending_approval(session_id: str):
 
     proposal = state.get("trade_proposal")
 
+    # Handle proposal as dict
+    action = proposal.get("action", "HOLD") if proposal else "HOLD"
+
     return {
         "session_id": session_id,
         "ticker": session["ticker"],
         "trade_proposal": {
-            "id": proposal.id,
-            "action": proposal.action.value if hasattr(proposal.action, "value") else proposal.action,
-            "quantity": proposal.quantity,
-            "entry_price": proposal.entry_price,
-            "stop_loss": proposal.stop_loss,
-            "take_profit": proposal.take_profit,
-            "risk_score": proposal.risk_score,
-            "position_size_pct": proposal.position_size_pct,
-            "rationale": proposal.rationale,
-            "bull_case": proposal.bull_case,
-            "bear_case": proposal.bear_case,
-        },
+            "id": proposal.get("id", ""),
+            "action": str(action),
+            "quantity": proposal.get("quantity", 0),
+            "entry_price": proposal.get("entry_price"),
+            "stop_loss": proposal.get("stop_loss"),
+            "take_profit": proposal.get("take_profit"),
+            "risk_score": proposal.get("risk_score", 0.5),
+            "position_size_pct": proposal.get("position_size_pct", 5.0),
+            "rationale": proposal.get("rationale", ""),
+            "bull_case": proposal.get("bull_case", ""),
+            "bear_case": proposal.get("bear_case", ""),
+        } if proposal else None,
         "analyses": {
             "technical": _format_analysis(state.get("technical_analysis")),
             "fundamental": _format_analysis(state.get("fundamental_analysis")),
@@ -258,28 +265,30 @@ async def get_pending_approval(session_id: str):
 
 
 def _get_analysis_summary(analysis) -> str | None:
-    """Get brief summary from analysis result."""
+    """Get brief summary from analysis result (now a dict)."""
     if not analysis:
         return None
 
-    signal = analysis.signal.value if hasattr(analysis.signal, "value") else str(analysis.signal)
-    confidence = f"{analysis.confidence:.0%}"
-    summary = analysis.summary[:100] if analysis.summary else ""
+    signal = analysis.get("signal", "hold")
+    confidence = analysis.get("confidence", 0.5)
+    summary = analysis.get("summary", "")
 
-    return f"{signal} ({confidence}): {summary}"
+    return f"{signal} ({confidence:.0%}): {summary[:100]}"
 
 
 def _format_analysis(analysis) -> dict | None:
-    """Format analysis for API response."""
+    """Format analysis for API response (now a dict)."""
     if not analysis:
         return None
 
+    reasoning = analysis.get("reasoning", "")
+
     return {
-        "agent_type": analysis.agent_type,
-        "signal": analysis.signal.value if hasattr(analysis.signal, "value") else str(analysis.signal),
-        "confidence": analysis.confidence,
-        "summary": analysis.summary,
-        "key_factors": analysis.key_factors,
-        "signals": analysis.signals,
-        "reasoning": analysis.reasoning[:1000] if analysis.reasoning else "",
+        "agent_type": analysis.get("agent_type", "unknown"),
+        "signal": str(analysis.get("signal", "hold")),
+        "confidence": analysis.get("confidence", 0.5),
+        "summary": analysis.get("summary", ""),
+        "key_factors": analysis.get("key_factors", []),
+        "signals": analysis.get("signals", {}),
+        "reasoning": reasoning[:1000] if reasoning else "",
     }

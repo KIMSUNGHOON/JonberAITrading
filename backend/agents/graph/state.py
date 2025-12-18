@@ -168,8 +168,8 @@ class TradeProposal(BaseModel):
     bull_case: str = Field(default="", description="Bull case arguments")
     bear_case: str = Field(default="", description="Bear case arguments")
 
-    # Metadata
-    analyses: list[AnalysisResult] = Field(default_factory=list)
+    # Metadata (analyses stored as dicts for serialization)
+    analyses: list[dict] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -259,17 +259,17 @@ class TradingState(TypedDict, total=False):
     # Task decomposition (replaced on update)
     todos: list[dict]
 
-    # Analysis results (replaced on update)
-    technical_analysis: Optional[AnalysisResult]
-    fundamental_analysis: Optional[AnalysisResult]
-    sentiment_analysis: Optional[AnalysisResult]
-    risk_assessment: Optional[AnalysisResult]
+    # Analysis results (stored as dicts for serialization)
+    technical_analysis: Optional[dict]
+    fundamental_analysis: Optional[dict]
+    sentiment_analysis: Optional[dict]
+    risk_assessment: Optional[dict]
 
     # Synthesis for debate pattern
     synthesis: Optional[dict]
 
-    # Strategic decision
-    trade_proposal: Optional[TradeProposal]
+    # Strategic decision (stored as dict for serialization)
+    trade_proposal: Optional[dict]
 
     # HITL state
     awaiting_approval: bool

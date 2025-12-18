@@ -190,7 +190,7 @@ async def technical_analysis_node(state: dict) -> dict:
     )
 
     return {
-        "technical_analysis": result,
+        "technical_analysis": result.model_dump(),
         "reasoning_log": add_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
         "current_stage": AnalysisStage.FUNDAMENTAL,
@@ -256,7 +256,7 @@ async def fundamental_analysis_node(state: dict) -> dict:
     logger.info("node_completed", node="fundamental_analysis", ticker=ticker, signal=signal.value, duration_ms=round(duration_ms, 2))
 
     return {
-        "fundamental_analysis": result,
+        "fundamental_analysis": result.model_dump(),
         "reasoning_log": add_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
         "current_stage": AnalysisStage.SENTIMENT,
@@ -320,7 +320,7 @@ async def sentiment_analysis_node(state: dict) -> dict:
     logger.info("node_completed", node="sentiment_analysis", ticker=ticker, signal=signal.value, duration_ms=round(duration_ms, 2))
 
     return {
-        "sentiment_analysis": result,
+        "sentiment_analysis": result.model_dump(),
         "reasoning_log": add_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
         "current_stage": AnalysisStage.RISK,
@@ -390,7 +390,7 @@ async def risk_assessment_node(state: dict) -> dict:
     logger.info("node_completed", node="risk_assessment", ticker=ticker, risk_score=risk_score, duration_ms=round(duration_ms, 2))
 
     return {
-        "risk_assessment": result,
+        "risk_assessment": result.model_dump(),
         "reasoning_log": add_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
         "current_stage": AnalysisStage.SYNTHESIS,
@@ -440,13 +440,16 @@ async def strategic_decision_node(state: dict) -> dict:
     # Determine action from consensus
     action = _signal_to_action(consensus_signal)
 
-    # Get risk parameters
+    # Get risk parameters (risk is a dict from model_dump())
     risk = state.get("risk_assessment")
-    risk_signals = risk.signals if risk else {}
+    risk_signals = risk.get("signals", {}) if risk else {}
 
     current_price = await get_current_price(ticker)
 
     # Create trade proposal
+    # Convert AnalysisResult objects to dicts for serialization
+    analyses_dicts = [a.model_dump() for a in analyses]
+
     proposal = TradeProposal(
         id=str(uuid.uuid4()),
         ticker=ticker,
@@ -460,7 +463,7 @@ async def strategic_decision_node(state: dict) -> dict:
         rationale=response,
         bull_case=_extract_bull_case(response),
         bear_case=_extract_bear_case(response),
-        analyses=analyses,
+        analyses=analyses_dicts,
     )
 
     reasoning = f"[Strategic Decision] Proposal: {action.value} {proposal.quantity} {ticker} @ ${current_price:.2f}"
@@ -476,7 +479,7 @@ async def strategic_decision_node(state: dict) -> dict:
     )
 
     return {
-        "trade_proposal": proposal,
+        "trade_proposal": proposal.model_dump(),
         "synthesis": {
             "consensus_signal": consensus_signal.value,
             "average_confidence": avg_confidence,
@@ -502,22 +505,28 @@ async def human_approval_node(state: dict) -> dict:
     ticker = _get_ticker_safely(state, "human_approval")
     proposal = state.get("trade_proposal")
 
+    # Handle proposal as dict (from model_dump())
+    proposal_id = proposal.get("id", "")[:8] if proposal else None
+    proposal_action = proposal.get("action") if proposal else None
+    proposal_ticker = proposal.get("ticker") if proposal else None
+    proposal_entry_price = proposal.get("entry_price") if proposal else None
+
     logger.info(
         "node_started",
         node="human_approval",
         ticker=ticker,
-        proposal_id=proposal.id[:8] if proposal else None,
-        action=proposal.action.value if proposal else None,
+        proposal_id=proposal_id,
+        action=proposal_action,
     )
 
-    reasoning = f"[HITL] Awaiting human approval for {proposal.action.value} {proposal.ticker}..." if proposal else "[HITL] No proposal to approve"
+    reasoning = f"[HITL] Awaiting human approval for {proposal_action} {proposal_ticker}..." if proposal else "[HITL] No proposal to approve"
 
     logger.info(
         "awaiting_human_approval",
         ticker=ticker,
-        proposal_id=proposal.id[:8] if proposal else None,
-        action=proposal.action.value if proposal else None,
-        entry_price=proposal.entry_price if proposal else None,
+        proposal_id=proposal_id,
+        action=proposal_action,
+        entry_price=proposal_entry_price,
     )
 
     return {
@@ -548,38 +557,49 @@ async def execution_node(state: dict) -> dict:
             "reasoning_log": add_reasoning_log(state, reasoning),
         }
 
+    # Handle proposal as dict (from model_dump())
+    proposal_ticker = proposal.get("ticker", "")
+    proposal_action = proposal.get("action", "HOLD")
+    proposal_quantity = proposal.get("quantity", 0)
+    proposal_stop_loss = proposal.get("stop_loss")
+    proposal_take_profit = proposal.get("take_profit")
+
     logger.info(
         "trade_execution_start",
-        ticker=proposal.ticker,
-        action=proposal.action.value,
-        quantity=proposal.quantity,
+        ticker=proposal_ticker,
+        action=proposal_action,
+        quantity=proposal_quantity,
     )
 
     # Simulate trade execution
     # In production: broker_api.execute_order(proposal)
-    current_price = await get_current_price(proposal.ticker)
+    current_price = await get_current_price(proposal_ticker)
 
-    if proposal.action == TradeAction.HOLD:
-        reasoning = f"[Execution] HOLD decision - no trade executed for {proposal.ticker}"
+    if proposal_action == "HOLD" or proposal_action == TradeAction.HOLD:
+        reasoning = f"[Execution] HOLD decision - no trade executed for {proposal_ticker}"
         return {
             "execution_status": "completed",
             "current_stage": AnalysisStage.COMPLETE,
             "reasoning_log": add_reasoning_log(state, reasoning),
         }
 
+    # Determine quantity sign based on action
+    is_buy = proposal_action == "BUY" or proposal_action == TradeAction.BUY
+    quantity_with_sign = proposal_quantity if is_buy else -proposal_quantity
+
     # Create position record
     position = Position(
-        ticker=proposal.ticker,
-        quantity=proposal.quantity if proposal.action == TradeAction.BUY else -proposal.quantity,
+        ticker=proposal_ticker,
+        quantity=quantity_with_sign,
         entry_price=current_price,
         current_price=current_price,
-        stop_loss=proposal.stop_loss,
-        take_profit=proposal.take_profit,
+        stop_loss=proposal_stop_loss,
+        take_profit=proposal_take_profit,
     )
 
     reasoning = (
-        f"[Execution] Trade executed: {proposal.action.value} {proposal.quantity} "
-        f"{proposal.ticker} @ ${current_price:.2f}"
+        f"[Execution] Trade executed: {proposal_action} {proposal_quantity} "
+        f"{proposal_ticker} @ ${current_price:.2f}"
     )
 
     return {
