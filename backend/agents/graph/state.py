@@ -355,8 +355,8 @@ def add_reasoning_log(state: dict, message: str) -> list[str]:
     return current_log + [f"[{datetime.utcnow().strftime('%H:%M:%S')}] {message}"]
 
 
-def get_all_analyses(state: dict) -> list[AnalysisResult]:
-    """Get all completed analyses from state."""
+def get_all_analyses(state: dict) -> list[dict]:
+    """Get all completed analyses from state (as dicts)."""
     analyses = []
     for key in ["technical_analysis", "fundamental_analysis", "sentiment_analysis", "risk_assessment"]:
         if state.get(key) is not None:
@@ -364,9 +364,51 @@ def get_all_analyses(state: dict) -> list[AnalysisResult]:
     return analyses
 
 
-def calculate_consensus_signal(analyses: list[AnalysisResult]) -> tuple[SignalType, float]:
+def analysis_dict_to_context_string(analysis: dict) -> str:
+    """Convert analysis dict to string for LLM context."""
+    agent_type = analysis.get("agent_type", "unknown")
+    ticker = analysis.get("ticker", "N/A")
+    signal = analysis.get("signal", "hold")
+    confidence = analysis.get("confidence", 0.5)
+    summary = analysis.get("summary", "")
+    key_factors = analysis.get("key_factors", [])
+    reasoning = analysis.get("reasoning", "")
+
+    return f"""
+=== {agent_type.upper()} ANALYSIS ===
+Ticker: {ticker}
+Signal: {signal} (Confidence: {confidence:.0%})
+
+Summary: {summary}
+
+Key Factors:
+{chr(10).join(f'- {f}' for f in key_factors)}
+
+Detailed Reasoning:
+{reasoning}
+"""
+
+
+def _parse_signal(signal_value) -> SignalType:
+    """Parse signal from string or enum to SignalType."""
+    if isinstance(signal_value, SignalType):
+        return signal_value
+    if isinstance(signal_value, str):
+        # Handle string values
+        signal_map = {
+            "strong_buy": SignalType.STRONG_BUY,
+            "buy": SignalType.BUY,
+            "hold": SignalType.HOLD,
+            "sell": SignalType.SELL,
+            "strong_sell": SignalType.STRONG_SELL,
+        }
+        return signal_map.get(signal_value.lower(), SignalType.HOLD)
+    return SignalType.HOLD
+
+
+def calculate_consensus_signal(analyses: list[dict]) -> tuple[SignalType, float]:
     """
-    Calculate consensus signal from multiple analyses.
+    Calculate consensus signal from multiple analyses (now dicts).
 
     Uses confidence-weighted voting.
 
@@ -386,12 +428,12 @@ def calculate_consensus_signal(analyses: list[AnalysisResult]) -> tuple[SignalTy
     }
 
     # Confidence-weighted average
-    total_weight = sum(a.confidence for a in analyses)
+    total_weight = sum(a.get("confidence", 0.5) for a in analyses)
     if total_weight == 0:
         return SignalType.HOLD, 0.0
 
     weighted_sum = sum(
-        signal_values[a.signal] * a.confidence
+        signal_values[_parse_signal(a.get("signal", "hold"))] * a.get("confidence", 0.5)
         for a in analyses
     )
     avg_signal = weighted_sum / total_weight

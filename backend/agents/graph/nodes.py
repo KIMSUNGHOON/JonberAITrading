@@ -22,6 +22,7 @@ from agents.graph.state import (
     TradeAction,
     TradeProposal,
     add_reasoning_log,
+    analysis_dict_to_context_string,
     calculate_consensus_signal,
     get_all_analyses,
 )
@@ -343,10 +344,10 @@ async def risk_assessment_node(state: dict) -> dict:
 
     logger.info("node_started", node="risk_assessment", ticker=ticker)
 
-    # Gather all previous analyses
+    # Gather all previous analyses (now dicts after serialization fix)
     analyses = get_all_analyses(state)
     logger.debug("analyses_gathered", ticker=ticker, analysis_count=len(analyses))
-    analyses_context = "\n\n".join(a.to_context_string() for a in analyses)
+    analyses_context = "\n\n".join(analysis_dict_to_context_string(a) for a in analyses)
 
     # Get current price for stop-loss calculation
     current_price = await get_current_price(ticker)
@@ -413,10 +414,10 @@ async def strategic_decision_node(state: dict) -> dict:
 
     logger.info("node_started", node="strategic_decision", ticker=ticker)
 
-    # Collect all analyses
+    # Collect all analyses (now dicts after serialization fix)
     analyses = get_all_analyses(state)
     logger.debug("synthesizing_analyses", ticker=ticker, analysis_count=len(analyses))
-    analyses_context = "\n\n".join(a.to_context_string() for a in analyses)
+    analyses_context = "\n\n".join(analysis_dict_to_context_string(a) for a in analyses)
 
     # Calculate consensus
     consensus_signal, avg_confidence = calculate_consensus_signal(analyses)
@@ -447,9 +448,7 @@ async def strategic_decision_node(state: dict) -> dict:
     current_price = await get_current_price(ticker)
 
     # Create trade proposal
-    # Convert AnalysisResult objects to dicts for serialization
-    analyses_dicts = [a.model_dump() for a in analyses]
-
+    # analyses are already dicts after serialization fix
     proposal = TradeProposal(
         id=str(uuid.uuid4()),
         ticker=ticker,
@@ -463,7 +462,7 @@ async def strategic_decision_node(state: dict) -> dict:
         rationale=response,
         bull_case=_extract_bull_case(response),
         bear_case=_extract_bear_case(response),
-        analyses=analyses_dicts,
+        analyses=analyses,  # Already dicts after serialization fix
     )
 
     reasoning = f"[Strategic Decision] Proposal: {action.value} {proposal.quantity} {ticker} @ ${current_price:.2f}"
@@ -705,21 +704,33 @@ def _determine_fundamental_signal(info: dict) -> SignalType:
     return SignalType.HOLD
 
 
-def _calculate_risk_score(analyses: list[AnalysisResult]) -> float:
-    """Calculate risk score based on analysis disagreement."""
+def _calculate_risk_score(analyses: list[dict]) -> float:
+    """Calculate risk score based on analysis disagreement (analyses are dicts)."""
     if not analyses:
         return 0.5
 
-    # Signal values
-    signal_map = {
-        SignalType.STRONG_BUY: 2,
-        SignalType.BUY: 1,
-        SignalType.HOLD: 0,
-        SignalType.SELL: -1,
-        SignalType.STRONG_SELL: -2,
+    # Signal string to numeric mapping
+    signal_str_map = {
+        "strong_buy": 2,
+        "buy": 1,
+        "hold": 0,
+        "sell": -1,
+        "strong_sell": -2,
     }
 
-    signals = [signal_map[a.signal] for a in analyses if a.agent_type != "risk"]
+    def parse_signal_value(signal) -> int:
+        """Parse signal to numeric value."""
+        if isinstance(signal, str):
+            return signal_str_map.get(signal.lower(), 0)
+        if hasattr(signal, "value"):
+            return signal_str_map.get(signal.value.lower(), 0)
+        return 0
+
+    signals = [
+        parse_signal_value(a.get("signal", "hold"))
+        for a in analyses
+        if a.get("agent_type") != "risk"
+    ]
 
     if len(signals) < 2:
         return 0.5
@@ -732,7 +743,7 @@ def _calculate_risk_score(analyses: list[AnalysisResult]) -> float:
     risk_score = min(variance / 4.0, 1.0)
 
     # Also factor in average confidence (lower confidence = higher risk)
-    avg_confidence = sum(a.confidence for a in analyses) / len(analyses)
+    avg_confidence = sum(a.get("confidence", 0.5) for a in analyses) / len(analyses)
     risk_score = (risk_score + (1 - avg_confidence)) / 2
 
     return round(risk_score, 2)
