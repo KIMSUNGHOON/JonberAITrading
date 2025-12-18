@@ -20,6 +20,7 @@ import {
 import { useShallow } from 'zustand/shallow';
 import { useStore } from '@/store';
 import { submitApproval } from '@/api/client';
+import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
 
 export function ApprovalDialog() {
   const { proposal } = useStore(
@@ -180,9 +181,9 @@ export function ApprovalDialog() {
               <h3 className="text-sm font-medium text-gray-400 mb-2">
                 Rationale
               </h3>
-              <p className="text-sm text-gray-300 bg-surface rounded-lg p-3">
-                {proposal.rationale}
-              </p>
+              <div className="text-sm bg-surface rounded-lg p-4 max-h-48 overflow-y-auto">
+                <MarkdownRenderer content={proposal.rationale} compact />
+              </div>
             </div>
           )}
 
