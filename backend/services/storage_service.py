@@ -10,12 +10,11 @@ No external server required - uses embedded SQLite database.
 """
 
 import json
-import sqlite3
-import aiosqlite
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
+import aiosqlite
 import structlog
 
 logger = structlog.get_logger()
@@ -41,61 +40,59 @@ class StorageService:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialized = False
 
-    async def _get_connection(self) -> aiosqlite.Connection:
-        """Get async database connection."""
-        conn = await aiosqlite.connect(str(self.db_path))
-        conn.row_factory = aiosqlite.Row
-        return conn
-
     async def initialize(self):
         """Initialize database tables."""
         if self._initialized:
             return
 
-        async with await self._get_connection() as conn:
-            # Sessions table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS sessions (
-                    session_id TEXT PRIMARY KEY,
-                    data TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                # Sessions table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        session_id TEXT PRIMARY KEY,
+                        data TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TIMESTAMP
+                    )
+                """)
+
+                # Checkpoints table (for LangGraph)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS checkpoints (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        thread_id TEXT NOT NULL,
+                        data TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(session_id, thread_id)
+                    )
+                """)
+
+                # Cache table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS cache (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        expires_at TIMESTAMP
+                    )
+                """)
+
+                # Create indexes
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
                 )
-            """)
-
-            # Checkpoints table (for LangGraph)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    thread_id TEXT NOT NULL,
-                    data TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(session_id, thread_id)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at)"
                 )
-            """)
 
-            # Cache table
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at TIMESTAMP
-                )
-            """)
-
-            # Create indexes
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
-            )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at)"
-            )
-
-            await conn.commit()
-            self._initialized = True
-            logger.info("storage_initialized", db_path=str(self.db_path))
+                await conn.commit()
+                self._initialized = True
+                logger.info("storage_initialized", db_path=str(self.db_path))
+        except Exception as e:
+            logger.error("storage_init_failed", error=str(e))
+            raise
 
     # -------------------------------------------
     # Session Management
@@ -123,7 +120,7 @@ class StorageService:
         expires_at = datetime.now() + ttl
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
                 await conn.execute(
                     """
                     INSERT OR REPLACE INTO sessions (session_id, data, expires_at)
@@ -151,7 +148,8 @@ class StorageService:
         await self.initialize()
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
                 cursor = await conn.execute(
                     """
                     SELECT data FROM sessions
@@ -172,7 +170,7 @@ class StorageService:
         await self.initialize()
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
                 await conn.execute(
                     "DELETE FROM sessions WHERE session_id = ?", (session_id,)
                 )
@@ -196,7 +194,8 @@ class StorageService:
         await self.initialize()
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
                 # Convert glob pattern to SQL LIKE pattern
                 sql_pattern = pattern.replace("*", "%").replace("?", "_")
                 cursor = await conn.execute(
@@ -236,7 +235,7 @@ class StorageService:
         await self.initialize()
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
                 await conn.execute(
                     """
                     INSERT OR REPLACE INTO checkpoints (session_id, thread_id, data)
@@ -278,7 +277,8 @@ class StorageService:
         await self.initialize()
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
                 cursor = await conn.execute(
                     "SELECT data FROM checkpoints WHERE session_id = ? AND thread_id = ?",
                     (session_id, thread_id),
@@ -301,7 +301,8 @@ class StorageService:
         await self.initialize()
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
                 cursor = await conn.execute(
                     "SELECT thread_id FROM checkpoints WHERE session_id = ?",
                     (session_id,),
@@ -317,7 +318,7 @@ class StorageService:
         await self.initialize()
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
                 await conn.execute(
                     "DELETE FROM checkpoints WHERE session_id = ?", (session_id,)
                 )
@@ -350,7 +351,7 @@ class StorageService:
         expires_at = datetime.now() + ttl
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
                 await conn.execute(
                     """
                     INSERT OR REPLACE INTO cache (key, value, expires_at)
@@ -369,7 +370,8 @@ class StorageService:
         await self.initialize()
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
                 cursor = await conn.execute(
                     """
                     SELECT value FROM cache
@@ -390,7 +392,7 @@ class StorageService:
         await self.initialize()
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
                 await conn.execute("DELETE FROM cache WHERE key = ?", (key,))
                 await conn.commit()
                 return True
@@ -409,7 +411,7 @@ class StorageService:
         deleted = 0
 
         try:
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
                 # Clean expired sessions
                 cursor = await conn.execute(
                     "DELETE FROM sessions WHERE expires_at < ?", (datetime.now(),)
@@ -443,17 +445,20 @@ class StorageService:
         try:
             await self.initialize()
 
-            async with await self._get_connection() as conn:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
                 # Get database stats
                 cursor = await conn.execute(
                     "SELECT COUNT(*) as count FROM sessions"
                 )
-                session_count = (await cursor.fetchone())["count"]
+                row = await cursor.fetchone()
+                session_count = row["count"] if row else 0
 
                 cursor = await conn.execute(
                     "SELECT COUNT(*) as count FROM checkpoints"
                 )
-                checkpoint_count = (await cursor.fetchone())["count"]
+                row = await cursor.fetchone()
+                checkpoint_count = row["count"] if row else 0
 
             # Get file size
             db_size = self.db_path.stat().st_size if self.db_path.exists() else 0
@@ -462,7 +467,7 @@ class StorageService:
             return {
                 "status": "healthy",
                 "type": "sqlite",
-                "database": str(self.db_path),
+                "db_path": str(self.db_path),
                 "size_mb": db_size_mb,
                 "sessions": session_count,
                 "checkpoints": checkpoint_count,
