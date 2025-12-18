@@ -56,26 +56,26 @@ LLMDep = Annotated[LLMProvider, Depends(get_llm)]
 
 
 # -------------------------------------------
-# Redis Service Dependency
+# Storage Service Dependency
 # -------------------------------------------
 
 
-async def get_redis() -> "RedisService":
+async def get_storage() -> "StorageService":
     """
-    Dependency to get Redis service instance.
+    Dependency to get SQLite storage service instance.
 
     Usage:
         @router.post("/example")
-        async def example(redis: Annotated[RedisService, Depends(get_redis)]):
-            await redis.cache_set("key", "value")
+        async def example(storage: Annotated[StorageService, Depends(get_storage)]):
+            await storage.save_session("session_id", {"key": "value"})
             ...
     """
-    from services.redis_service import RedisService, get_redis_service
-    return await get_redis_service()
+    from services.storage_service import StorageService, get_storage_service
+    return await get_storage_service()
 
 
 # Type alias for cleaner annotations
-RedisDep = Annotated["RedisService", Depends(get_redis)]
+StorageDep = Annotated["StorageService", Depends(get_storage)]
 
 
 # -------------------------------------------

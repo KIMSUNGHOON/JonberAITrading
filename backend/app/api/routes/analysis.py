@@ -27,7 +27,7 @@ logger = structlog.get_logger()
 router = APIRouter()
 
 # In-memory session store
-# Production: Use Redis or database
+# TODO: Use SQLite storage service for persistence
 active_sessions: dict[str, dict] = {}
 
 

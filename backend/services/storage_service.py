@@ -494,7 +494,16 @@ async def get_storage_service() -> StorageService:
     return _storage_service
 
 
+async def close_storage_service():
+    """Close storage service connections."""
+    global _storage_service
+    if _storage_service is not None:
+        # SQLite connections are closed automatically via context manager
+        # Just reset the singleton
+        _storage_service = None
+        logger.info("storage_service_closed")
+
+
 async def reset_storage_service():
     """Reset storage service (for testing)."""
-    global _storage_service
-    _storage_service = None
+    await close_storage_service()

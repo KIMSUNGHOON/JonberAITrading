@@ -271,7 +271,7 @@ AUTH_IMPLEMENTATION_NOTES = """
 ### Security Considerations
 - Passwords stored with bcrypt (work factor 12)
 - JWT signed with RS256
-- Refresh tokens stored in Redis
+- Refresh tokens stored in SQLite
 - Rate limiting on auth endpoints
 - Audit logging for all auth events
 """

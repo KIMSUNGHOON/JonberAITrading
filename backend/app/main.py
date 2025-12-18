@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from agents.llm_provider import get_llm_provider, reset_llm_provider
 from app.api.routes import analysis, approval, websocket, auth
 from app.config import settings
-from services.redis_service import get_redis_service, close_redis_client
+from services.storage_service import get_storage_service, close_storage_service
 
 # Configure structlog
 structlog.configure(
@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
     Startup:
     - Initialize LLM provider
     - Health check LLM server
-    - Initialize Redis connection
+    - Initialize SQLite storage
 
     Shutdown:
     - Clean up resources
@@ -78,24 +78,25 @@ async def lifespan(app: FastAPI):
             error=health.get("error"),
         )
 
-    # Initialize and health check Redis
+    # Initialize and health check SQLite storage
     try:
-        redis_service = await get_redis_service()
-        redis_health = await redis_service.health_check()
+        storage_service = await get_storage_service()
+        storage_health = await storage_service.health_check()
 
-        if redis_health["status"] == "healthy":
+        if storage_health["status"] == "healthy":
             logger.info(
-                "redis_connected",
-                memory_used=redis_health.get("memory_used"),
+                "storage_connected",
+                type=storage_health.get("type"),
+                db_path=storage_health.get("db_path"),
             )
         else:
             logger.warning(
-                "redis_unavailable",
-                status=redis_health["status"],
-                error=redis_health.get("error"),
+                "storage_unavailable",
+                status=storage_health["status"],
+                error=storage_health.get("error"),
             )
     except Exception as e:
-        logger.warning("redis_connection_failed", error=str(e))
+        logger.warning("storage_connection_failed", error=str(e))
 
     yield
 
@@ -103,7 +104,7 @@ async def lifespan(app: FastAPI):
     logger.info("application_shutdown")
     await llm.close()
     reset_llm_provider()
-    await close_redis_client()
+    await close_storage_service()
 
 
 # Create FastAPI application
@@ -175,17 +176,17 @@ async def health_check():
     llm = get_llm_provider()
     llm_health = await llm.health_check()
 
-    # Redis health check
+    # Storage health check
     try:
-        redis_service = await get_redis_service()
-        redis_health = await redis_service.health_check()
+        storage_service = await get_storage_service()
+        storage_health = await storage_service.health_check()
     except Exception as e:
-        redis_health = {"status": "unhealthy", "error": str(e)}
+        storage_health = {"status": "unhealthy", "error": str(e)}
 
     # Determine overall status
     all_healthy = (
         llm_health["status"] == "healthy" and
-        redis_health["status"] == "healthy"
+        storage_health["status"] == "healthy"
     )
     overall_status = "healthy" if all_healthy else "degraded"
 
@@ -195,7 +196,7 @@ async def health_check():
         "services": {
             "api": "healthy",
             "llm": llm_health,
-            "redis": redis_health,
+            "storage": storage_health,
         },
     }
 

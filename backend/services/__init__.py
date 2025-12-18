@@ -4,18 +4,16 @@ Services Package
 Business logic and external service integrations.
 """
 
-from services.redis_service import (
-    RedisService,
-    get_redis_client,
-    get_redis_service,
-    close_redis_client,
-    reset_redis_service,
+from services.storage_service import (
+    StorageService,
+    get_storage_service,
+    close_storage_service,
+    reset_storage_service,
 )
 
 __all__ = [
-    "RedisService",
-    "get_redis_client",
-    "get_redis_service",
-    "close_redis_client",
-    "reset_redis_service",
+    "StorageService",
+    "get_storage_service",
+    "close_storage_service",
+    "reset_storage_service",
 ]
