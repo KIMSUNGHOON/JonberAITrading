@@ -54,9 +54,8 @@ Create 3-6 focused tasks. Each task should be specific and actionable.
 
 Output format (JSON array):
 [
-    {{"task": "specific task description", "assigned_to": "agent_name", "priority": 1}},
-    {{"task": "another task", "assigned_to": "agent_name", "priority": 2}},
-    ...
+    {"task": "specific task description", "assigned_to": "agent_name", "priority": 1},
+    {"task": "another task", "assigned_to": "agent_name", "priority": 2}
 ]
 
 Priority: 1 = highest (do first), 5 = lowest
