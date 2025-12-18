@@ -160,10 +160,13 @@ export interface AnalysisRequest {
   ticker: string;
 }
 
+export type ApprovalDecision = 'approved' | 'rejected' | 'modified';
+
 export interface ApprovalRequest {
   session_id: string;
-  approved: boolean;
-  reason?: string;
+  decision: ApprovalDecision;
+  feedback?: string;
+  modifications?: Record<string, unknown>;
 }
 
 // -------------------------------------------

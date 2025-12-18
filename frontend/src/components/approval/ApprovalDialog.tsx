@@ -40,26 +40,26 @@ export function ApprovalDialog() {
 
   if (!proposal || !sessionId) return null;
 
-  const handleDecision = async (approved: boolean) => {
+  const handleDecision = async (decision: 'approved' | 'rejected') => {
     setIsSubmitting(true);
 
     try {
       await submitApproval({
         session_id: sessionId,
-        approved,
-        reason: feedback.trim() || undefined,
+        decision,
+        feedback: feedback.trim() || undefined,
       });
 
       // Update state
       setAwaitingApproval(false);
-      if (!approved) {
+      if (decision === 'rejected') {
         setTradeProposal(null);
       }
 
       // Add chat message
       addChatMessage({
         role: 'system',
-        content: approved
+        content: decision === 'approved'
           ? `Trade approved: ${proposal.action.toUpperCase()} ${proposal.quantity} ${proposal.ticker}`
           : `Trade rejected${feedback ? `: ${feedback}` : ''}`,
       });
@@ -202,34 +202,43 @@ export function ApprovalDialog() {
           </div>
 
           {/* Action Buttons */}
-          <div className="flex gap-3">
+          <div className="flex flex-col gap-3">
+            <div className="flex gap-3">
+              <button
+                onClick={() => handleDecision('rejected')}
+                disabled={isSubmitting}
+                className="btn-danger flex-1 flex items-center justify-center gap-2"
+              >
+                {isSubmitting ? (
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                ) : (
+                  <>
+                    <XCircle className="w-5 h-5" />
+                    Reject
+                  </>
+                )}
+              </button>
+              <button
+                onClick={() => handleDecision('approved')}
+                disabled={isSubmitting}
+                className="btn-success flex-1 flex items-center justify-center gap-2"
+              >
+                {isSubmitting ? (
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                ) : (
+                  <>
+                    <CheckCircle2 className="w-5 h-5" />
+                    Approve
+                  </>
+                )}
+              </button>
+            </div>
             <button
-              onClick={() => handleDecision(false)}
+              onClick={() => setShowApprovalDialog(false)}
               disabled={isSubmitting}
-              className="btn-danger flex-1 flex items-center justify-center gap-2"
+              className="w-full py-2 text-sm text-gray-400 hover:text-gray-300 hover:bg-surface rounded-lg transition-colors"
             >
-              {isSubmitting ? (
-                <Loader2 className="w-5 h-5 animate-spin" />
-              ) : (
-                <>
-                  <XCircle className="w-5 h-5" />
-                  Reject
-                </>
-              )}
-            </button>
-            <button
-              onClick={() => handleDecision(true)}
-              disabled={isSubmitting}
-              className="btn-success flex-1 flex items-center justify-center gap-2"
-            >
-              {isSubmitting ? (
-                <Loader2 className="w-5 h-5 animate-spin" />
-              ) : (
-                <>
-                  <CheckCircle2 className="w-5 h-5" />
-                  Approve
-                </>
-              )}
+              Cancel (Decide Later)
             </button>
           </div>
         </div>

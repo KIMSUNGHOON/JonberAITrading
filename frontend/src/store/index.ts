@@ -24,11 +24,21 @@ import type {
 // Store Types
 // -------------------------------------------
 
+interface TickerHistoryItem {
+  ticker: string;
+  sessionId: string;
+  timestamp: Date;
+  status: SessionStatus | 'idle';
+}
+
 interface AnalysisState {
   // Session
   activeSessionId: string | null;
   ticker: string;
   status: SessionStatus | 'idle';
+
+  // Ticker history
+  tickerHistory: TickerHistoryItem[];
 
   // Analysis results
   analyses: AnalysisSummary[];
@@ -110,6 +120,7 @@ const initialAnalysisState: AnalysisState = {
   activeSessionId: null,
   ticker: '',
   status: 'idle',
+  tickerHistory: [],
   analyses: [],
   currentStage: null,
   reasoningLog: [],
@@ -150,18 +161,46 @@ export const useStore = create<Store>()(
 
       // Session actions
       startSession: (sessionId, ticker) =>
-        set({
-          activeSessionId: sessionId,
-          ticker: ticker.toUpperCase(),
-          status: 'running',
-          analyses: [],
-          reasoningLog: [],
-          tradeProposal: null,
-          awaitingApproval: false,
-          error: null,
+        set((state) => {
+          const upperTicker = ticker.toUpperCase();
+          // Add to history (avoid duplicates for same session)
+          const existingIndex = state.tickerHistory.findIndex(
+            (h) => h.sessionId === sessionId
+          );
+          let newHistory = [...state.tickerHistory];
+          if (existingIndex === -1) {
+            // Add new entry at the beginning
+            newHistory = [
+              {
+                ticker: upperTicker,
+                sessionId,
+                timestamp: new Date(),
+                status: 'running',
+              },
+              ...state.tickerHistory,
+            ].slice(0, 20); // Keep last 20 entries
+          }
+          return {
+            activeSessionId: sessionId,
+            ticker: upperTicker,
+            status: 'running',
+            tickerHistory: newHistory,
+            analyses: [],
+            reasoningLog: [],
+            tradeProposal: null,
+            awaitingApproval: false,
+            error: null,
+          };
         }),
 
-      setStatus: (status) => set({ status }),
+      setStatus: (status) =>
+        set((state) => {
+          // Update history status for current session
+          const newHistory = state.tickerHistory.map((h) =>
+            h.sessionId === state.activeSessionId ? { ...h, status } : h
+          );
+          return { status, tickerHistory: newHistory };
+        }),
 
       setCurrentStage: (stage) => set({ currentStage: stage }),
 
@@ -236,11 +275,12 @@ export const useStore = create<Store>()(
 
       // Reset
       reset: () =>
-        set({
+        set((state) => ({
           ...initialAnalysisState,
           ...initialChatState,
-          // Keep UI state
-        }),
+          // Keep ticker history and UI state
+          tickerHistory: state.tickerHistory,
+        })),
     }),
     { name: 'agentic-trading-store' }
   )
@@ -273,3 +313,8 @@ export const selectChat = (state: Store) => ({
 });
 
 export const selectChartConfig = (state: Store) => state.chartConfig;
+
+export const selectTickerHistory = (state: Store) => state.tickerHistory;
+
+// Export types
+export type { TickerHistoryItem };

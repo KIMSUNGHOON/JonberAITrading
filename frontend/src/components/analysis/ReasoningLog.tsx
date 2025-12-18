@@ -1,7 +1,7 @@
 /**
  * Reasoning Log Component
  *
- * Displays real-time agent reasoning process with enhanced formatting.
+ * Displays real-time agent reasoning process with auto-collapse for completed entries.
  */
 
 import { useRef, useEffect, useState, useMemo } from 'react';
@@ -18,6 +18,8 @@ import {
   Copy,
   Check,
   X,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
 
@@ -61,11 +63,12 @@ const AGENT_CONFIG: Record<string, {
   'HITL': { color: 'text-amber-400', bgColor: 'bg-amber-500/10', icon: Shield, agentType: 'HITL' },
 };
 
-export function ReasoningLog({ entries, maxHeight = 400, showFilters = true }: ReasoningLogProps) {
+export function ReasoningLog({ entries, maxHeight, showFilters = false }: ReasoningLogProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [isExpanded, setIsExpanded] = useState(true);
   const [copied, setCopied] = useState(false);
-  const [activeFilters, setActiveFilters] = useState<Set<AgentType>>(new Set());
+  const [showAll, setShowAll] = useState(false);
+  const [expandedEntries, setExpandedEntries] = useState<Set<number>>(new Set());
   const [autoScroll, setAutoScroll] = useState(true);
 
   // Parse all entries
@@ -73,25 +76,38 @@ export function ReasoningLog({ entries, maxHeight = 400, showFilters = true }: R
     return entries.map(entry => parseEntry(entry));
   }, [entries]);
 
-  // Filter entries
-  const filteredEntries = useMemo(() => {
-    if (activeFilters.size === 0) return parsedEntries;
-    return parsedEntries.filter(entry => activeFilters.has(entry.agentType));
-  }, [parsedEntries, activeFilters]);
-
-  // Get unique agent types for filter buttons
-  const availableAgentTypes = useMemo(() => {
-    const types = new Set<AgentType>();
-    parsedEntries.forEach(entry => types.add(entry.agentType));
-    return Array.from(types);
+  // Group entries by agent type
+  const groupedEntries = useMemo(() => {
+    const groups = new Map<AgentType, { entries: ParsedEntry[]; indices: number[] }>();
+    parsedEntries.forEach((entry, index) => {
+      const existing = groups.get(entry.agentType);
+      if (existing) {
+        existing.entries.push(entry);
+        existing.indices.push(index);
+      } else {
+        groups.set(entry.agentType, { entries: [entry], indices: [index] });
+      }
+    });
+    return groups;
   }, [parsedEntries]);
+
+  // Get the latest entry for display
+  const latestEntry = parsedEntries.length > 0 ? parsedEntries[parsedEntries.length - 1] : null;
+  const latestIndex = parsedEntries.length - 1;
 
   // Auto-scroll to bottom on new entries
   useEffect(() => {
-    if (containerRef.current && autoScroll) {
+    if (containerRef.current && autoScroll && isExpanded) {
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
-  }, [entries, autoScroll]);
+  }, [entries, autoScroll, isExpanded]);
+
+  // Auto-expand latest entry
+  useEffect(() => {
+    if (parsedEntries.length > 0) {
+      setExpandedEntries(new Set([parsedEntries.length - 1]));
+    }
+  }, [parsedEntries.length]);
 
   // Handle scroll to detect manual scrolling
   const handleScroll = () => {
@@ -109,32 +125,31 @@ export function ReasoningLog({ entries, maxHeight = 400, showFilters = true }: R
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // Toggle filter
-  const toggleFilter = (agentType: AgentType) => {
-    setActiveFilters(prev => {
+  // Toggle entry expansion
+  const toggleEntry = (index: number) => {
+    setExpandedEntries(prev => {
       const next = new Set(prev);
-      if (next.has(agentType)) {
-        next.delete(agentType);
+      if (next.has(index)) {
+        next.delete(index);
       } else {
-        next.add(agentType);
+        next.add(index);
       }
       return next;
     });
-  };
-
-  // Clear all filters
-  const clearFilters = () => {
-    setActiveFilters(new Set());
   };
 
   if (entries.length === 0) {
     return null;
   }
 
+  const containerStyle = maxHeight !== undefined
+    ? { maxHeight }
+    : { flex: 1 };
+
   return (
-    <div className="card">
+    <div className="card h-full flex flex-col">
       {/* Header */}
-      <div className="flex items-center gap-2 mb-3">
+      <div className="flex items-center gap-2 mb-2 flex-shrink-0">
         <button
           onClick={() => setIsExpanded(!isExpanded)}
           className="flex items-center gap-2 hover:opacity-80"
@@ -144,100 +159,150 @@ export function ReasoningLog({ entries, maxHeight = 400, showFilters = true }: R
           ) : (
             <ChevronRight className="w-4 h-4 text-gray-400" />
           )}
-          <Brain className="w-5 h-5 text-purple-400" />
-          <h3 className="font-medium">Agent Reasoning</h3>
+          <Brain className="w-4 h-4 text-purple-400" />
+          <h3 className="font-medium text-sm">Agent Reasoning</h3>
         </button>
 
         <span className="text-xs text-gray-400 ml-auto">
-          {filteredEntries.length}{activeFilters.size > 0 ? ` / ${entries.length}` : ''} entries
+          {entries.length} entries
         </span>
 
         <button
+          onClick={() => setShowAll(!showAll)}
+          className="p-1 hover:bg-surface rounded transition-colors"
+          title={showAll ? 'Show latest only' : 'Show all entries'}
+        >
+          {showAll ? (
+            <EyeOff className="w-3.5 h-3.5 text-gray-400" />
+          ) : (
+            <Eye className="w-3.5 h-3.5 text-gray-400" />
+          )}
+        </button>
+
+        <button
           onClick={copyToClipboard}
-          className="p-1.5 hover:bg-surface-light rounded-lg transition-colors"
+          className="p-1 hover:bg-surface rounded transition-colors"
           title="Copy to clipboard"
         >
           {copied ? (
-            <Check className="w-4 h-4 text-green-400" />
+            <Check className="w-3.5 h-3.5 text-green-400" />
           ) : (
-            <Copy className="w-4 h-4 text-gray-400" />
+            <Copy className="w-3.5 h-3.5 text-gray-400" />
           )}
         </button>
       </div>
 
       {isExpanded && (
-        <>
-          {/* Filter Buttons */}
-          {showFilters && availableAgentTypes.length > 1 && (
-            <div className="flex flex-wrap gap-1.5 mb-3">
-              {availableAgentTypes.map(agentType => {
-                const config = Object.values(AGENT_CONFIG).find(c => c.agentType === agentType) || {
-                  color: 'text-gray-400',
-                  bgColor: 'bg-gray-500/10',
-                  icon: Brain,
-                };
-                const Icon = config.icon;
-                const isActive = activeFilters.has(agentType);
+        <div
+          ref={containerRef}
+          onScroll={handleScroll}
+          className="flex-1 overflow-y-auto space-y-1.5 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-gray-700"
+          style={containerStyle}
+        >
+          {showAll ? (
+            // Show all entries with collapse/expand
+            parsedEntries.map((parsed, index) => (
+              <CollapsibleLogEntry
+                key={index}
+                parsed={parsed}
+                index={index}
+                isExpanded={expandedEntries.has(index)}
+                onToggle={() => toggleEntry(index)}
+                isLatest={index === latestIndex}
+              />
+            ))
+          ) : (
+            // Show summary by agent type + latest entry
+            <>
+              {/* Agent Summary Pills */}
+              <div className="flex flex-wrap gap-1 mb-2">
+                {Array.from(groupedEntries.entries()).map(([agentType, { entries: agentEntries }]) => {
+                  const config = Object.values(AGENT_CONFIG).find(c => c.agentType === agentType) || {
+                    color: 'text-gray-400',
+                    bgColor: 'bg-gray-500/10',
+                    icon: Brain,
+                  };
+                  const Icon = config.icon;
+                  return (
+                    <div
+                      key={agentType}
+                      className={`flex items-center gap-1 px-2 py-0.5 rounded text-xs ${config.bgColor} ${config.color}`}
+                    >
+                      <Icon className="w-3 h-3" />
+                      <span>{agentType}</span>
+                      <span className="opacity-60">({agentEntries.length})</span>
+                    </div>
+                  );
+                })}
+              </div>
 
-                return (
-                  <button
-                    key={agentType}
-                    onClick={() => toggleFilter(agentType)}
-                    className={`
-                      flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium
-                      transition-all duration-200
-                      ${isActive
-                        ? `${config.bgColor} ${config.color} ring-1 ring-current`
-                        : 'bg-surface hover:bg-surface-light text-gray-400'
-                      }
-                    `}
-                  >
-                    <Icon className="w-3 h-3" />
-                    {agentType}
-                  </button>
-                );
-              })}
-              {activeFilters.size > 0 && (
-                <button
-                  onClick={clearFilters}
-                  className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium
-                    bg-surface hover:bg-surface-light text-gray-400"
-                >
-                  <X className="w-3 h-3" />
-                  Clear
-                </button>
+              {/* Latest Entry - Always Expanded */}
+              {latestEntry && (
+                <div className="animate-slide-in">
+                  <LogEntry parsed={latestEntry} index={latestIndex} />
+                </div>
               )}
-            </div>
+            </>
           )}
+        </div>
+      )}
 
-          {/* Log Entries */}
-          <div
-            ref={containerRef}
-            onScroll={handleScroll}
-            className="space-y-2 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-gray-700"
-            style={{ maxHeight }}
-          >
-            {filteredEntries.map((parsed, index) => (
-              <LogEntry key={index} parsed={parsed} index={index} />
-            ))}
-          </div>
+      {/* Show more indicator when collapsed */}
+      {!isExpanded && entries.length > 0 && (
+        <div className="text-xs text-gray-500 mt-1">
+          Click to expand {entries.length} reasoning entries
+        </div>
+      )}
+    </div>
+  );
+}
 
-          {/* Auto-scroll indicator */}
-          {!autoScroll && (
-            <button
-              onClick={() => {
-                setAutoScroll(true);
-                if (containerRef.current) {
-                  containerRef.current.scrollTop = containerRef.current.scrollHeight;
-                }
-              }}
-              className="mt-2 w-full py-1.5 text-xs text-center text-gray-400 hover:text-white
-                bg-surface-light rounded-lg transition-colors"
-            >
-              ↓ New entries available - click to scroll down
-            </button>
-          )}
-        </>
+interface CollapsibleLogEntryProps {
+  parsed: ParsedEntry;
+  index: number;
+  isExpanded: boolean;
+  onToggle: () => void;
+  isLatest: boolean;
+}
+
+function CollapsibleLogEntry({ parsed, index, isExpanded, onToggle, isLatest }: CollapsibleLogEntryProps) {
+  const Icon = parsed.icon;
+
+  return (
+    <div
+      className={`
+        rounded-lg transition-all duration-200
+        ${parsed.bgColor}
+        ${isLatest ? 'ring-1 ring-blue-500/50' : ''}
+      `}
+    >
+      {/* Header - Always visible */}
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-2 p-2 text-left hover:brightness-110"
+      >
+        {isExpanded ? (
+          <ChevronDown className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+        ) : (
+          <ChevronRight className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+        )}
+        <Icon className={`w-4 h-4 flex-shrink-0 ${parsed.prefixColor}`} />
+        <span className={`text-xs font-medium ${parsed.prefixColor}`}>
+          {parsed.prefix || 'System'}
+        </span>
+        <span className="text-xs text-gray-500">#{index + 1}</span>
+        {isLatest && (
+          <span className="ml-auto text-xs text-blue-400 bg-blue-500/20 px-1.5 py-0.5 rounded">
+            Latest
+          </span>
+        )}
+      </button>
+
+      {/* Content - Collapsible */}
+      {isExpanded && (
+        <div className="px-3 pb-2 pl-9">
+          <MarkdownRenderer content={parsed.content} compact />
+        </div>
       )}
     </div>
   );
@@ -254,19 +319,17 @@ function LogEntry({ parsed, index }: LogEntryProps) {
   return (
     <div
       className={`
-        flex items-start gap-3 text-sm p-3 rounded-lg
-        animate-slide-in transition-colors
-        ${parsed.bgColor} hover:brightness-110
+        flex items-start gap-2 text-sm p-2.5 rounded-lg
+        ${parsed.bgColor}
       `}
-      style={{ animationDelay: `${index * 50}ms` }}
     >
-      <div className="flex flex-col items-center gap-1">
-        <Icon className={`w-5 h-5 flex-shrink-0 ${parsed.prefixColor}`} />
+      <div className="flex flex-col items-center gap-1 flex-shrink-0">
+        <Icon className={`w-4 h-4 ${parsed.prefixColor}`} />
         <span className="text-xs text-gray-500">#{index + 1}</span>
       </div>
       <div className="flex-1 min-w-0">
         {parsed.prefix && (
-          <div className={`font-semibold mb-1 ${parsed.prefixColor}`}>
+          <div className={`font-semibold text-xs mb-1 ${parsed.prefixColor}`}>
             {parsed.prefix}
           </div>
         )}

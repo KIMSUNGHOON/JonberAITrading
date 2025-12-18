@@ -27,8 +27,8 @@ function App() {
   }, [error, setError]);
 
   return (
-    <div className="min-h-screen bg-surface flex flex-col">
-      {/* Header */}
+    <div className="h-screen bg-surface flex flex-col overflow-hidden">
+      {/* Header - Fixed height */}
       <Header />
 
       {/* Error Toast */}
@@ -38,22 +38,22 @@ function App() {
         </div>
       )}
 
-      {/* Main Layout */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* Sidebar - Hidden on mobile */}
-        <aside className="hidden lg:block w-64 border-r border-border">
+      {/* Main Layout - Takes remaining height */}
+      <div className="flex-1 flex min-h-0">
+        {/* Sidebar - Hidden on mobile, fixed width */}
+        <aside className="hidden lg:flex lg:flex-col w-56 border-r border-border flex-shrink-0">
           <Sidebar />
         </aside>
 
         {/* Main Content Area */}
-        <main className="flex-1 flex flex-col lg:flex-row overflow-hidden">
-          {/* Dashboard Panel */}
-          <div className="flex-1 overflow-auto">
+        <main className="flex-1 flex flex-col lg:flex-row min-h-0 min-w-0">
+          {/* Dashboard Panel - Scrollable */}
+          <div className="flex-1 overflow-y-auto min-h-0">
             <MainContent />
           </div>
 
-          {/* Chat Panel - Collapsible on desktop, bottom sheet on mobile */}
-          <div className="hidden md:block w-96 border-l border-border">
+          {/* Chat Panel - Fixed width, hidden on mobile */}
+          <div className="hidden md:flex md:flex-col w-80 border-l border-border flex-shrink-0">
             <ChatPanel />
           </div>
         </main>

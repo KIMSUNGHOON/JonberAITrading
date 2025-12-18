@@ -44,10 +44,10 @@ export function MainContent() {
   }
 
   return (
-    <div className="p-4 md:p-6 space-y-6">
-      {/* Workflow Progress - Shows during analysis */}
+    <div className="p-3 md:p-4 space-y-3 h-full flex flex-col">
+      {/* Workflow Progress - Compact at top */}
       {ticker && status !== 'idle' && (
-        <section>
+        <section className="flex-shrink-0">
           <WorkflowProgress
             currentStage={currentStage}
             status={status}
@@ -56,41 +56,47 @@ export function MainContent() {
         </section>
       )}
 
-      {/* Chart Section */}
-      {showChartPanel && ticker && (
-        <section>
-          <ChartPanel ticker={ticker} />
-        </section>
-      )}
+      {/* Main Content Grid - Flexible height */}
+      <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-3 min-h-0">
+        {/* Left Column */}
+        <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
+          {/* Chart Section */}
+          {showChartPanel && ticker && (
+            <section className="flex-shrink-0">
+              <ChartPanel ticker={ticker} />
+            </section>
+          )}
 
-      {/* Active Position */}
-      {activePosition && (
-        <section>
-          <PositionCard position={activePosition} />
-        </section>
-      )}
+          {/* Active Position */}
+          {activePosition && (
+            <section className="flex-shrink-0">
+              <PositionCard position={activePosition} />
+            </section>
+          )}
 
-      {/* Trade Proposal */}
-      {proposal && awaitingApproval && (
-        <section>
-          <ProposalCard proposal={proposal} />
-        </section>
-      )}
+          {/* Trade Proposal */}
+          {proposal && awaitingApproval && (
+            <section className="flex-shrink-0">
+              <ProposalCard proposal={proposal} />
+            </section>
+          )}
 
-      {/* Analysis Grid */}
-      {analyses.length > 0 && (
-        <section>
-          <h2 className="text-lg font-semibold mb-4">Analysis Results</h2>
-          <AnalysisPanel analyses={analyses} />
-        </section>
-      )}
+          {/* Analysis Grid */}
+          {analyses.length > 0 && (
+            <section className="flex-shrink-0">
+              <h2 className="text-sm font-semibold mb-2">Analysis Results</h2>
+              <AnalysisPanel analyses={analyses} />
+            </section>
+          )}
+        </div>
 
-      {/* Reasoning Log */}
-      {reasoningLog.length > 0 && (
-        <section>
-          <ReasoningLog entries={reasoningLog} />
-        </section>
-      )}
+        {/* Right Column - Reasoning Log */}
+        {reasoningLog.length > 0 && (
+          <div className="min-h-0 overflow-hidden">
+            <ReasoningLog entries={reasoningLog} maxHeight={undefined} />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
