@@ -17,12 +17,17 @@ import {
   Target,
   Loader2,
 } from 'lucide-react';
-import { useStore, selectProposal, selectSession } from '@/store';
+import { useShallow } from 'zustand/shallow';
+import { useStore } from '@/store';
 import { submitApproval } from '@/api/client';
 
 export function ApprovalDialog() {
-  const { proposal } = useStore(selectProposal);
-  const { sessionId } = useStore(selectSession);
+  const { proposal } = useStore(
+    useShallow((state) => ({
+      proposal: state.tradeProposal,
+    }))
+  );
+  const sessionId = useStore((state) => state.activeSessionId);
   const setShowApprovalDialog = useStore((state) => state.setShowApprovalDialog);
   const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
   const setTradeProposal = useStore((state) => state.setTradeProposal);
