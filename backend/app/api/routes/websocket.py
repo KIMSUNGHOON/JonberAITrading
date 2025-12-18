@@ -89,6 +89,31 @@ manager = ConnectionManager()
 
 
 # -------------------------------------------
+# Safe Type Conversion Helpers
+# -------------------------------------------
+
+
+def safe_float(val, default=None):
+    """Convert value to float safely, handling numpy types."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(val, default=0):
+    """Convert value to int safely, handling numpy types."""
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+# -------------------------------------------
 # WebSocket Endpoints
 # -------------------------------------------
 
@@ -155,41 +180,49 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     action = proposal.get("action", "HOLD")
                     if hasattr(action, "value"):
                         action = action.value
+
                     await websocket.send_json({
                         "type": "proposal",
                         "data": {
-                            "id": proposal.get("id", ""),
-                            "ticker": proposal.get("ticker", ""),
-                            "action": action,
-                            "quantity": proposal.get("quantity", 0),
-                            "entry_price": proposal.get("entry_price"),
-                            "stop_loss": proposal.get("stop_loss"),
-                            "take_profit": proposal.get("take_profit"),
-                            "risk_score": proposal.get("risk_score", 0.5),
-                            "rationale": (proposal.get("rationale", "") or "")[:500],
+                            "id": str(proposal.get("id", "")),
+                            "ticker": str(proposal.get("ticker", "")),
+                            "action": str(action),
+                            "quantity": safe_int(proposal.get("quantity"), 0),
+                            "entry_price": safe_float(proposal.get("entry_price")),
+                            "stop_loss": safe_float(proposal.get("stop_loss")),
+                            "take_profit": safe_float(proposal.get("take_profit")),
+                            "risk_score": safe_float(proposal.get("risk_score"), 0.5),
+                            "rationale": str(proposal.get("rationale", "") or "")[:500],
                         },
                     })
                     proposal_sent = True
+                    logger.info(
+                        "websocket_proposal_sent",
+                        session_id=session_id,
+                        ticker=proposal.get("ticker"),
+                        action=action,
+                    )
 
                 # Send position updates (position is now a dict after serialization)
                 if state.get("active_position"):
                     position = state["active_position"]
                     # Calculate PnL since Position is now a dict
-                    entry_price = position.get("entry_price", 0)
-                    current_price = position.get("current_price", 0)
-                    quantity = position.get("quantity", 0)
+                    # Use safe conversion for numpy types
+                    entry_price = safe_float(position.get("entry_price"), 0)
+                    current_price = safe_float(position.get("current_price"), 0)
+                    quantity = safe_int(position.get("quantity"), 0)
                     pnl = (current_price - entry_price) * quantity
                     pnl_percent = ((current_price / entry_price) - 1) * 100 if entry_price else 0
 
                     await websocket.send_json({
                         "type": "position",
                         "data": {
-                            "ticker": position.get("ticker", ""),
+                            "ticker": str(position.get("ticker", "")),
                             "quantity": quantity,
                             "entry_price": entry_price,
                             "current_price": current_price,
-                            "pnl": round(pnl, 2),
-                            "pnl_percent": round(pnl_percent, 2),
+                            "pnl": round(float(pnl), 2),
+                            "pnl_percent": round(float(pnl_percent), 2),
                         },
                     })
 
