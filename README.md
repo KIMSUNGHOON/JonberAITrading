@@ -57,6 +57,59 @@ AI-powered trading analysis system with autonomous multi-agent analysis and huma
 - **Node.js** 18+
 - **Redis** 7.0+ (for session persistence and caching)
 - **NVIDIA GPU** (Windows) or **Apple Silicon** (macOS)
+- **CUDA 12.1+** (Windows/Linux with NVIDIA GPU only)
+
+---
+
+## CUDA Installation (Windows - NVIDIA GPU)
+
+vLLM requires CUDA 12.1 or higher. Follow these steps:
+
+### 1. Check GPU Compatibility
+
+```powershell
+# Check if NVIDIA driver is installed
+nvidia-smi
+```
+
+### 2. Install CUDA Toolkit
+
+1. Download CUDA Toolkit 12.1+ from [NVIDIA CUDA Downloads](https://developer.nvidia.com/cuda-downloads)
+2. Select: Windows → x86_64 → 11/10 → exe (local)
+3. Run installer with default options
+4. Verify installation:
+
+```powershell
+nvcc --version
+# Should show: release 12.1 or higher
+```
+
+### 3. Install cuDNN (Optional but Recommended)
+
+1. Download cuDNN from [NVIDIA cuDNN](https://developer.nvidia.com/cudnn) (requires NVIDIA account)
+2. Extract and copy files to CUDA installation directory
+3. Add to PATH if needed
+
+### 4. Environment Variables
+
+Ensure these are in your system PATH:
+```
+C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin
+C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\libnvvp
+```
+
+### 5. Verify CUDA for PyTorch
+
+```powershell
+conda activate agentic-trading
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}')"
+```
+
+Expected output:
+```
+CUDA available: True
+CUDA version: 12.1
+```
 
 ---
 
