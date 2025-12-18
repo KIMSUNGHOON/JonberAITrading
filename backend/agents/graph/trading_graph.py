@@ -18,6 +18,7 @@ from agents.graph.nodes import (
     execution_node,
     fundamental_analysis_node,
     human_approval_node,
+    re_analyze_node,
     risk_assessment_node,
     sentiment_analysis_node,
     should_continue_to_execution,
@@ -85,6 +86,9 @@ def create_trading_graph() -> StateGraph:
     # Stage 4: Human Approval
     workflow.add_node("approval", human_approval_node)
 
+    # Stage 4.5: Re-analysis (when user rejects)
+    workflow.add_node("re_analyze", re_analyze_node)
+
     # Stage 5: Execution
     workflow.add_node("execute", execution_node)
 
@@ -109,9 +113,13 @@ def create_trading_graph() -> StateGraph:
         should_continue_to_execution,
         {
             "execute": "execute",
+            "re_analyze": "re_analyze",
             "end": END,
         },
     )
+
+    # Re-analysis loops back to decompose for fresh analysis
+    workflow.add_edge("re_analyze", "decompose")
 
     # Execution leads to end
     workflow.add_edge("execute", END)

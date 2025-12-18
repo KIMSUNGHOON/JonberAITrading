@@ -536,6 +536,52 @@ async def human_approval_node(state: dict) -> dict:
     }
 
 
+async def re_analyze_node(state: dict) -> dict:
+    """
+    Prepare for re-analysis after rejection.
+    Clears previous analysis results and incorporates user feedback.
+    """
+    ticker = _get_ticker_safely(state, "re_analyze")
+    user_feedback = state.get("user_feedback", "")
+    re_analyze_count = state.get("re_analyze_count", 0) + 1
+
+    logger.info(
+        "node_started",
+        node="re_analyze",
+        ticker=ticker,
+        re_analyze_count=re_analyze_count,
+        has_feedback=bool(user_feedback),
+    )
+
+    reasoning = f"[RE-ANALYSIS] User requested re-analysis (attempt #{re_analyze_count})"
+    if user_feedback:
+        reasoning += f"\nUser feedback: {user_feedback}"
+
+    logger.info(
+        "re_analysis_started",
+        ticker=ticker,
+        feedback=user_feedback[:200] if user_feedback else None,
+        attempt=re_analyze_count,
+    )
+
+    # Clear previous analysis results for fresh re-analysis
+    # Keep ticker and user_input, but reset analyses
+    return {
+        "current_stage": AnalysisStage.DECOMPOSE,
+        "technical_analysis": None,
+        "fundamental_analysis": None,
+        "sentiment_analysis": None,
+        "risk_assessment": None,
+        "synthesis": None,
+        "trade_proposal": None,
+        "awaiting_approval": False,
+        "approval_status": None,
+        "re_analyze_count": re_analyze_count,
+        "re_analyze_feedback": user_feedback,
+        "reasoning_log": add_reasoning_log(state, reasoning),
+    }
+
+
 # -------------------------------------------
 # Stage 3: Trade Execution
 # -------------------------------------------
@@ -616,11 +662,18 @@ async def execution_node(state: dict) -> dict:
 # -------------------------------------------
 
 
-def should_continue_to_execution(state: dict) -> Literal["execute", "end"]:
-    """Conditional edge: Check if trade was approved."""
-    if state.get("approval_status") == "approved":
+def should_continue_to_execution(state: dict) -> Literal["execute", "re_analyze", "end"]:
+    """Conditional edge: Check if trade was approved, rejected for re-analysis, or cancelled."""
+    approval_status = state.get("approval_status")
+
+    if approval_status == "approved":
         return "execute"
-    return "end"
+    elif approval_status == "rejected":
+        # Rejected means user wants re-analysis with feedback
+        return "re_analyze"
+    else:
+        # cancelled or modified without re-analysis
+        return "end"
 
 
 # -------------------------------------------

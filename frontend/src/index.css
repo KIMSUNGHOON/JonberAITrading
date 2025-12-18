@@ -56,6 +56,10 @@
     @apply btn bg-bear hover:bg-bear-dark text-white;
   }
 
+  .btn-warning {
+    @apply btn bg-amber-600 hover:bg-amber-700 text-white;
+  }
+
   .btn-ghost {
     @apply btn bg-transparent hover:bg-surface-light text-gray-300;
   }

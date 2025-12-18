@@ -103,7 +103,12 @@ async def submit_approval(request: ApprovalRequest):
         if request.decision == "approved":
             session["status"] = "completed"
             execution_status = state.get("execution_status", "completed")
+        elif request.decision == "rejected":
+            # Re-analysis requested - session continues running
+            session["status"] = "running"
+            execution_status = "re_analyzing"
         else:
+            # modified or cancelled
             session["status"] = "cancelled"
             execution_status = "cancelled"
 
@@ -131,7 +136,7 @@ async def submit_approval(request: ApprovalRequest):
     if request.decision == "approved":
         message = "Trade approved and executed successfully."
     elif request.decision == "rejected":
-        message = "Trade rejected. No action taken."
+        message = "Trade rejected. Re-analyzing with your feedback..."
     else:  # modified
         message = "Trade modified and executed with changes."
 

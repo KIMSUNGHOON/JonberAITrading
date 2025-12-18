@@ -276,6 +276,10 @@ class TradingState(TypedDict, total=False):
     approval_status: Optional[str]
     user_feedback: Optional[str]
 
+    # Re-analysis state
+    re_analyze_count: int
+    re_analyze_feedback: Optional[str]
+
     # Execution state
     execution_status: Optional[str]
     active_position: Optional[dict]  # Position as dict for serialization
@@ -328,6 +332,10 @@ def create_initial_state(ticker: str, user_query: Optional[str] = None) -> dict:
         "awaiting_approval": False,
         "approval_status": None,
         "user_feedback": None,
+
+        # Re-analysis state
+        "re_analyze_count": 0,
+        "re_analyze_feedback": None,
 
         # Execution state
         "execution_status": None,

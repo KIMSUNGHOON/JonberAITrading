@@ -8,7 +8,7 @@ import { useState } from 'react';
 import {
   X,
   CheckCircle2,
-  XCircle,
+  RefreshCw,
   AlertTriangle,
   TrendingUp,
   TrendingDown,
@@ -53,6 +53,7 @@ export function ApprovalDialog() {
       // Update state
       setAwaitingApproval(false);
       if (decision === 'rejected') {
+        // Re-analysis: clear proposal, analysis continues
         setTradeProposal(null);
       }
 
@@ -61,7 +62,7 @@ export function ApprovalDialog() {
         role: 'system',
         content: decision === 'approved'
           ? `Trade approved: ${proposal.action.toUpperCase()} ${proposal.quantity} ${proposal.ticker}`
-          : `Trade rejected${feedback ? `: ${feedback}` : ''}`,
+          : `Trade rejected - Re-analyzing with feedback${feedback ? `: "${feedback}"` : '...'}`,
       });
 
       setShowApprovalDialog(false);
@@ -207,14 +208,14 @@ export function ApprovalDialog() {
               <button
                 onClick={() => handleDecision('rejected')}
                 disabled={isSubmitting}
-                className="btn-danger flex-1 flex items-center justify-center gap-2"
+                className="btn-warning flex-1 flex items-center justify-center gap-2"
               >
                 {isSubmitting ? (
                   <Loader2 className="w-5 h-5 animate-spin" />
                 ) : (
                   <>
-                    <XCircle className="w-5 h-5" />
-                    Reject
+                    <RefreshCw className="w-5 h-5" />
+                    Re-analyze
                   </>
                 )}
               </button>
