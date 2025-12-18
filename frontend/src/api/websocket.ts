@@ -8,7 +8,7 @@
  * - Position updates
  */
 
-import type { TradeProposal, Position } from '@/types';
+import type { TradeProposal, Position, SessionStatus } from '@/types';
 
 // -------------------------------------------
 // Types
@@ -314,7 +314,7 @@ export function createStoreWebSocket(
   sessionId: string,
   store: {
     addReasoningEntry: (entry: string) => void;
-    setStatus: (status: string) => void;
+    setStatus: (status: SessionStatus) => void;
     setCurrentStage: (stage: string) => void;
     setTradeProposal: (proposal: TradeProposal | null) => void;
     setAwaitingApproval: (awaiting: boolean) => void;
@@ -327,7 +327,7 @@ export function createStoreWebSocket(
       store.addReasoningEntry(entry);
     },
     onStatus: (data) => {
-      store.setStatus(data.status as 'running' | 'awaiting_approval' | 'completed' | 'error' | 'cancelled');
+      store.setStatus(data.status as SessionStatus);
       store.setCurrentStage(data.stage);
       store.setAwaitingApproval(data.awaiting_approval);
     },
@@ -335,30 +335,34 @@ export function createStoreWebSocket(
       store.setTradeProposal({
         id: data.id,
         ticker: data.ticker,
-        action: data.action as 'buy' | 'sell' | 'hold',
+        action: data.action.toUpperCase() as 'BUY' | 'SELL' | 'HOLD',
         quantity: data.quantity,
-        entryPrice: data.entry_price,
-        stopLoss: data.stop_loss,
-        takeProfit: data.take_profit,
-        riskScore: data.risk_score,
+        entry_price: data.entry_price,
+        stop_loss: data.stop_loss,
+        take_profit: data.take_profit,
+        risk_score: data.risk_score,
+        position_size_pct: 0,
         rationale: data.rationale,
+        bull_case: '',
+        bear_case: '',
+        created_at: new Date().toISOString(),
       });
     },
     onPosition: (data) => {
       store.setActivePosition({
         ticker: data.ticker,
         quantity: data.quantity,
-        entryPrice: data.entry_price,
-        currentPrice: data.current_price,
+        entry_price: data.entry_price,
+        current_price: data.current_price,
         pnl: data.pnl,
-        pnlPercent: data.pnl_percent,
+        pnl_percent: data.pnl_percent,
       });
     },
     onComplete: (data) => {
       if (data.error) {
         store.setError(data.error);
       }
-      store.setStatus(data.status as 'completed' | 'error' | 'cancelled');
+      store.setStatus(data.status as SessionStatus);
     },
     onError: () => {
       store.setError('WebSocket connection error');

@@ -356,7 +356,7 @@ function generateVolumeData(
   return data;
 }
 
-function calculateSMA(period: number): LineData[] {
+function calculateSMA(_period: number): LineData[] {
   // Mock SMA calculation
   const data: LineData[] = [];
   const now = new Date();

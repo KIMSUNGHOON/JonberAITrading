@@ -40,9 +40,8 @@ export function ApprovalDialog() {
     try {
       await submitApproval({
         session_id: sessionId,
-        proposal_id: proposal.id,
         approved,
-        feedback: feedback.trim() || undefined,
+        reason: feedback.trim() || undefined,
       });
 
       // Update state
@@ -67,8 +66,8 @@ export function ApprovalDialog() {
     }
   };
 
-  const isBuy = proposal.action === 'buy';
-  const riskLevel = getRiskLevel(proposal.riskScore);
+  const isBuy = proposal.action === 'BUY';
+  const riskLevel = getRiskLevel(proposal.risk_score);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -132,24 +131,24 @@ export function ApprovalDialog() {
             <DetailRow
               icon={<Target className="w-4 h-4" />}
               label="Entry Price"
-              value={`$${proposal.entryPrice.toFixed(2)}`}
+              value={`$${proposal.entry_price?.toFixed(2) ?? 'N/A'}`}
             />
             <DetailRow
               icon={<AlertTriangle className="w-4 h-4" />}
               label="Stop Loss"
-              value={`$${proposal.stopLoss.toFixed(2)}`}
+              value={`$${proposal.stop_loss?.toFixed(2) ?? 'N/A'}`}
               valueColor="text-bear"
             />
             <DetailRow
               icon={<CheckCircle2 className="w-4 h-4" />}
               label="Take Profit"
-              value={`$${proposal.takeProfit.toFixed(2)}`}
+              value={`$${proposal.take_profit?.toFixed(2) ?? 'N/A'}`}
               valueColor="text-bull"
             />
             <DetailRow
               icon={<Shield className="w-4 h-4" />}
               label="Risk Score"
-              value={`${proposal.riskScore}/10`}
+              value={`${proposal.risk_score}/10`}
               valueColor={riskLevel.color}
             />
           </div>
@@ -165,7 +164,7 @@ export function ApprovalDialog() {
             <div className="h-2 bg-surface rounded-full overflow-hidden">
               <div
                 className={`h-full rounded-full transition-all duration-500 ${riskLevel.barColor}`}
-                style={{ width: `${(proposal.riskScore / 10) * 100}%` }}
+                style={{ width: `${(proposal.risk_score / 10) * 100}%` }}
               />
             </div>
           </div>

@@ -23,7 +23,7 @@ export function AnalysisPanel({ analyses }: AnalysisPanelProps) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
       {analyses.map((analysis) => (
-        <AnalysisCard key={analysis.agent} analysis={analysis} />
+        <AnalysisCard key={analysis.agent_type} analysis={analysis} />
       ))}
     </div>
   );
@@ -34,9 +34,9 @@ interface AnalysisCardProps {
 }
 
 function AnalysisCard({ analysis }: AnalysisCardProps) {
-  const { agent, signal, confidence, summary } = analysis;
+  const { agent_type, signal, confidence, summary } = analysis;
 
-  const agentConfig = getAgentConfig(agent);
+  const agentConfig = getAgentConfig(agent_type);
   const signalConfig = getSignalConfig(signal);
 
   return (

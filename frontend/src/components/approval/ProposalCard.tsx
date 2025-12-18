@@ -20,8 +20,8 @@ interface ProposalCardProps {
 export function ProposalCard({ proposal }: ProposalCardProps) {
   const setShowApprovalDialog = useStore((state) => state.setShowApprovalDialog);
 
-  const isBuy = proposal.action === 'buy';
-  const riskLevel = proposal.riskScore <= 3 ? 'Low' : proposal.riskScore <= 6 ? 'Medium' : 'High';
+  const isBuy = proposal.action === 'BUY';
+  const riskLevel = proposal.risk_score <= 3 ? 'Low' : proposal.risk_score <= 6 ? 'Medium' : 'High';
 
   return (
     <div
@@ -59,11 +59,11 @@ export function ProposalCard({ proposal }: ProposalCardProps) {
               {proposal.ticker}
             </span>
             <span>{proposal.quantity} shares</span>
-            <span>${proposal.entryPrice.toFixed(2)}</span>
+            <span>${proposal.entry_price?.toFixed(2) ?? 'N/A'}</span>
             <span className={
-              proposal.riskScore <= 3
+              proposal.risk_score <= 3
                 ? 'text-bull'
-                : proposal.riskScore <= 6
+                : proposal.risk_score <= 6
                 ? 'text-yellow-500'
                 : 'text-bear'
             }>

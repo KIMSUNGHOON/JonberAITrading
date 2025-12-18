@@ -20,10 +20,10 @@ export function PositionCard({ position }: PositionCardProps) {
   const {
     ticker,
     quantity,
-    entryPrice,
-    currentPrice,
+    entry_price,
+    current_price,
     pnl,
-    pnlPercent,
+    pnl_percent,
   } = position;
 
   const isProfit = pnl >= 0;
@@ -60,7 +60,7 @@ export function PositionCard({ position }: PositionCardProps) {
           )}
           <span className="font-semibold">
             {isProfit ? '+' : ''}
-            {pnlPercent.toFixed(2)}%
+            {pnl_percent.toFixed(2)}%
           </span>
         </div>
       </div>
@@ -74,14 +74,14 @@ export function PositionCard({ position }: PositionCardProps) {
         />
         <DetailBox
           label="Entry Price"
-          value={`$${entryPrice.toFixed(2)}`}
+          value={`$${entry_price.toFixed(2)}`}
           icon={<TrendingUp className="w-4 h-4" />}
         />
         <DetailBox
           label="Current Price"
-          value={`$${currentPrice.toFixed(2)}`}
+          value={`$${current_price.toFixed(2)}`}
           icon={<Activity className="w-4 h-4" />}
-          valueColor={currentPrice >= entryPrice ? 'text-bull' : 'text-bear'}
+          valueColor={current_price >= entry_price ? 'text-bull' : 'text-bear'}
         />
         <DetailBox
           label="P&L"

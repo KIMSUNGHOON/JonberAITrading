@@ -153,6 +153,20 @@ export interface ChartConfig {
 }
 
 // -------------------------------------------
+// API Request Types
+// -------------------------------------------
+
+export interface AnalysisRequest {
+  ticker: string;
+}
+
+export interface ApprovalRequest {
+  session_id: string;
+  approved: boolean;
+  reason?: string;
+}
+
+// -------------------------------------------
 // API Response Types
 // -------------------------------------------
 
@@ -167,6 +181,9 @@ export interface StartAnalysisResponse {
   status: string;
   message: string;
 }
+
+// Alias for backward compatibility
+export type AnalysisResponse = StartAnalysisResponse;
 
 export interface ApprovalResponse {
   session_id: string;
