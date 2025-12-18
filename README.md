@@ -51,44 +51,48 @@ AI-powered trading analysis system with autonomous multi-agent analysis and huma
 
 ---
 
-## Quick Start
+## Prerequisites
 
-### Prerequisites
-
-- Python 3.11+
-- Node.js 18+
-- Redis (optional, for state persistence)
-- NVIDIA GPU (Windows) or Apple Silicon (macOS)
+- **Anaconda** or Miniconda (recommended)
+- **Node.js** 18+
+- **Redis** (optional, for state persistence)
+- **NVIDIA GPU** (Windows) or **Apple Silicon** (macOS)
 
 ---
 
+## Setup Options (Priority Order)
+
+1. **Anaconda** (Recommended) - Best for development
+2. **Docker** - Best for deployment
+
+---
+
+# Option 1: Anaconda Setup (Recommended)
+
 ## Windows Setup (Windows Terminal + PowerShell)
 
-### 1. Clone and Setup Environment
+### 1. Create Conda Environment
 
 ```powershell
 # Clone repository
 git clone <repository-url>
 cd JonberAITrading
 
-# Create Python virtual environment
-python -m venv venv
-.\venv\Scripts\Activate.ps1
+# Create conda environment from environment.yml
+conda env create -f environment.yml
 
-# Install backend dependencies
-cd backend
-pip install -r requirements.txt
-cd ..
+# Activate environment
+conda activate agentic-trading
 
 # Setup environment variables
 Copy-Item .env.example .env
-# Edit .env with your configuration
+# Edit .env with your configuration (use notepad, vscode, etc.)
 ```
 
 ### 2. Start LLM Server (vLLM)
 
 ```powershell
-# Install vLLM (requires CUDA)
+# Install vLLM (requires CUDA 12.1+)
 pip install vllm
 
 # Start vLLM server with AWQ quantization for RTX 3090
@@ -104,7 +108,7 @@ python -m vllm.entrypoints.openai.api_server `
 ### 3. Start Backend (New Terminal)
 
 ```powershell
-.\venv\Scripts\Activate.ps1
+conda activate agentic-trading
 cd backend
 uvicorn app.main:app --reload --port 8000
 ```
@@ -127,25 +131,23 @@ npm run dev
 
 ## macOS Setup (iTerm2 + zsh)
 
-### 1. Clone and Setup Environment
+### 1. Create Conda Environment
 
 ```zsh
 # Clone repository
 git clone <repository-url>
 cd JonberAITrading
 
-# Create Python virtual environment
-python3 -m venv venv
-source venv/bin/activate
+# Create conda environment from environment.yml
+conda env create -f environment.yml
 
-# Install backend dependencies
-cd backend
-pip install -r requirements.txt
-cd ..
+# Activate environment
+conda activate agentic-trading
 
 # Setup environment variables
 cp .env.example .env
-# Edit .env - change LLM settings for Ollama:
+
+# Edit .env for macOS/Ollama:
 # LLM_PROVIDER=ollama
 # LLM_BASE_URL=http://localhost:11434/v1
 # LLM_MODEL=deepseek-r1:7b
@@ -161,7 +163,7 @@ brew install ollama
 ollama serve &
 
 # Pull model (choose based on available RAM)
-# For 24GB RAM, you can try larger models
+# For M1 Pro 24GB RAM:
 ollama pull deepseek-r1:7b      # ~4GB, fast
 ollama pull deepseek-r1:14b     # ~8GB, balanced
 ollama pull llama3.1:8b         # ~5GB, good alternative
@@ -173,7 +175,7 @@ curl http://localhost:11434/v1/models
 ### 3. Start Backend (New Terminal Tab)
 
 ```zsh
-source venv/bin/activate
+conda activate agentic-trading
 cd backend
 uvicorn app.main:app --reload --port 8000
 ```
@@ -194,14 +196,20 @@ npm run dev
 
 ---
 
-## Docker Setup (Both Platforms)
+# Option 2: Docker Setup
 
 ```bash
-# Build and start all services
-docker-compose up --build
+# Start all services (uses Ollama by default)
+docker-compose up backend frontend redis
+
+# With NVIDIA GPU support (vLLM)
+docker-compose --profile gpu up
 
 # Or start specific services
-docker-compose up backend frontend redis
+docker-compose up backend
+
+# Rebuild and start
+docker-compose up --build
 ```
 
 ---
@@ -215,6 +223,7 @@ Edit `.env` file based on your platform:
 LLM_PROVIDER=vllm
 LLM_BASE_URL=http://localhost:8080/v1
 LLM_MODEL=deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+MARKET_DATA_MODE=live
 ```
 
 ### macOS (Ollama + M1 Pro)
@@ -222,6 +231,31 @@ LLM_MODEL=deepseek-ai/DeepSeek-R1-Distill-Llama-70B
 LLM_PROVIDER=ollama
 LLM_BASE_URL=http://localhost:11434/v1
 LLM_MODEL=deepseek-r1:7b
+MARKET_DATA_MODE=live
+```
+
+---
+
+## Conda Environment Management
+
+```bash
+# Create environment
+conda env create -f environment.yml
+
+# Activate environment
+conda activate agentic-trading
+
+# Update environment (after modifying environment.yml)
+conda env update -f environment.yml --prune
+
+# Deactivate environment
+conda deactivate
+
+# Remove environment
+conda env remove -n agentic-trading
+
+# Export current environment
+conda env export > environment.yml
 ```
 
 ---
@@ -243,6 +277,7 @@ LLM_MODEL=deepseek-r1:7b
 
 ### Run Tests
 ```bash
+conda activate agentic-trading
 cd backend
 pytest -v
 ```
@@ -256,11 +291,35 @@ isort backend/
 # TypeScript
 cd frontend
 npm run lint
+npm run format
+```
+
+### Type Checking
+```bash
+# Python
+cd backend
+mypy app/
+
+# TypeScript
+cd frontend
+npx tsc --noEmit
 ```
 
 ---
 
 ## Troubleshooting
+
+### Conda Environment Issues
+```bash
+# If environment creation fails, try:
+conda clean --all
+conda env create -f environment.yml
+
+# Or create manually:
+conda create -n agentic-trading python=3.12
+conda activate agentic-trading
+pip install -r backend/requirements.txt
+```
 
 ### vLLM Out of Memory (Windows)
 - Reduce `--max-model-len` to 4096
@@ -276,6 +335,28 @@ npm run lint
 - Verify backend is running on port 8000
 - Check CORS settings in backend
 - Ensure firewall allows connection
+
+---
+
+## Tech Stack
+
+### Backend
+- Python 3.12
+- FastAPI 0.115+
+- LangChain 0.3+
+- LangGraph 0.2+
+- Pydantic 2.10+
+
+### Frontend
+- React 18.3
+- Vite 6.0
+- TypeScript 5.7
+- Zustand 5.0
+- TailwindCSS 3.4
+
+### LLM
+- vLLM (Windows/Linux with NVIDIA GPU)
+- Ollama (All platforms)
 
 ---
 

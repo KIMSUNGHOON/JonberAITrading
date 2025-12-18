@@ -1,0 +1,25 @@
+# Frontend Dockerfile
+# Node.js 20 with Vite + React
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY frontend/package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy application code
+COPY frontend/ .
+
+# Expose Vite dev server port
+EXPOSE 5173
+
+# Default command (development)
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+
+# For production build, use:
+# RUN npm run build
+# CMD ["npm", "run", "preview", "--", "--host", "0.0.0.0"]

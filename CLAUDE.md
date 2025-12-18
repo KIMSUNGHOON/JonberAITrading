@@ -9,14 +9,14 @@ The system provides autonomous market analysis with human-in-the-loop (HITL) app
 ### Windows (Primary - GPU)
 - **GPU**: NVIDIA RTX 3090 (24GB VRAM)
 - **LLM Server**: vLLM (recommended) or Ollama
-- **Terminal**: Windows Terminal
-- **Python**: 3.11+
+- **Terminal**: Windows Terminal (PowerShell)
+- **Python**: 3.12 (Anaconda)
 
 ### macOS (Secondary - Apple Silicon)
 - **Hardware**: M1 Pro MacBook Pro (24GB RAM)
 - **LLM Server**: Ollama with Metal acceleration
 - **Terminal**: iTerm2 (zsh)
-- **Python**: 3.11+
+- **Python**: 3.12 (Anaconda)
 
 ## Key Architecture Decisions
 
@@ -32,10 +32,17 @@ The system provides autonomous market analysis with human-in-the-loop (HITL) app
 
 ## Development Commands
 
+### Setup (Anaconda - Recommended)
+```bash
+# Create and activate conda environment
+conda env create -f environment.yml
+conda activate agentic-trading
+```
+
 ### Backend
 ```bash
+conda activate agentic-trading
 cd backend
-pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 

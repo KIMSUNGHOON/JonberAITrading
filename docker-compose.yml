@@ -1,0 +1,99 @@
+# Docker Compose Configuration
+# Usage: docker-compose up --build
+# Note: Anaconda environment is preferred for development
+
+version: '3.8'
+
+services:
+  # LLM Server (vLLM with NVIDIA GPU)
+  llm-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.llm
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    ports:
+      - "8080:8080"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: >
+      python -m vllm.entrypoints.openai.api_server
+      --model deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+      --quantization awq
+      --max-model-len 8192
+      --gpu-memory-utilization 0.95
+      --host 0.0.0.0
+      --port 8080
+    profiles:
+      - gpu
+
+  # Backend API Server
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-r1:7b}
+      - MARKET_DATA_MODE=${MARKET_DATA_MODE:-live}
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./backend:/app
+      - ./data:/app/data
+    depends_on:
+      - redis
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend Dev Server
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api
+      - VITE_WS_BASE_URL=ws://localhost:8000/ws
+    depends_on:
+      - backend
+    command: npm run dev -- --host 0.0.0.0
+
+  # Redis (State Persistence)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+volumes:
+  redis_data:
+
+# Usage Examples:
+#
+# Start all services (without GPU):
+#   docker-compose up backend frontend redis
+#
+# Start with GPU support (requires nvidia-docker):
+#   docker-compose --profile gpu up
+#
+# Start specific service:
+#   docker-compose up backend
+#
+# Rebuild and start:
+#   docker-compose up --build
