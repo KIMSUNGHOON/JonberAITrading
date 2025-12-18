@@ -56,16 +56,31 @@ LLMDep = Annotated[LLMProvider, Depends(get_llm)]
 
 
 # -------------------------------------------
-# Future Dependencies (placeholders)
+# Redis Service Dependency
 # -------------------------------------------
 
-# Redis client dependency (to be implemented with actual Redis integration)
-# async def get_redis() -> AsyncGenerator[Redis, None]:
-#     client = Redis.from_url(settings.REDIS_URL)
-#     try:
-#         yield client
-#     finally:
-#         await client.close()
+
+async def get_redis() -> "RedisService":
+    """
+    Dependency to get Redis service instance.
+
+    Usage:
+        @router.post("/example")
+        async def example(redis: Annotated[RedisService, Depends(get_redis)]):
+            await redis.cache_set("key", "value")
+            ...
+    """
+    from services.redis_service import RedisService, get_redis_service
+    return await get_redis_service()
+
+
+# Type alias for cleaner annotations
+RedisDep = Annotated["RedisService", Depends(get_redis)]
+
+
+# -------------------------------------------
+# Future Dependencies (placeholders)
+# -------------------------------------------
 
 # Market data service dependency
 # def get_market_data_service() -> MarketDataService:

@@ -15,8 +15,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.llm_provider import get_llm_provider, reset_llm_provider
-from app.api.routes import analysis, approval, websocket
+from app.api.routes import analysis, approval, websocket, auth
 from app.config import settings
+from services.redis_service import get_redis_service, close_redis_client
 
 # Configure structlog
 structlog.configure(
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI):
     Startup:
     - Initialize LLM provider
     - Health check LLM server
+    - Initialize Redis connection
 
     Shutdown:
     - Clean up resources
@@ -76,12 +78,32 @@ async def lifespan(app: FastAPI):
             error=health.get("error"),
         )
 
+    # Initialize and health check Redis
+    try:
+        redis_service = await get_redis_service()
+        redis_health = await redis_service.health_check()
+
+        if redis_health["status"] == "healthy":
+            logger.info(
+                "redis_connected",
+                memory_used=redis_health.get("memory_used"),
+            )
+        else:
+            logger.warning(
+                "redis_unavailable",
+                status=redis_health["status"],
+                error=redis_health.get("error"),
+            )
+    except Exception as e:
+        logger.warning("redis_connection_failed", error=str(e))
+
     yield
 
     # Shutdown
     logger.info("application_shutdown")
     await llm.close()
     reset_llm_provider()
+    await close_redis_client()
 
 
 # Create FastAPI application
@@ -119,6 +141,11 @@ app.include_router(
     prefix="/ws",
     tags=["WebSocket"],
 )
+app.include_router(
+    auth.router,
+    prefix="/api/auth",
+    tags=["Authentication"],
+)
 
 
 # -------------------------------------------
@@ -148,7 +175,19 @@ async def health_check():
     llm = get_llm_provider()
     llm_health = await llm.health_check()
 
-    overall_status = "healthy" if llm_health["status"] == "healthy" else "degraded"
+    # Redis health check
+    try:
+        redis_service = await get_redis_service()
+        redis_health = await redis_service.health_check()
+    except Exception as e:
+        redis_health = {"status": "unhealthy", "error": str(e)}
+
+    # Determine overall status
+    all_healthy = (
+        llm_health["status"] == "healthy" and
+        redis_health["status"] == "healthy"
+    )
+    overall_status = "healthy" if all_healthy else "degraded"
 
     return {
         "status": overall_status,
@@ -156,6 +195,7 @@ async def health_check():
         "services": {
             "api": "healthy",
             "llm": llm_health,
+            "redis": redis_health,
         },
     }
 
