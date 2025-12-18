@@ -380,8 +380,8 @@ async def risk_assessment_node(state: dict) -> dict:
         signals={
             "risk_score": risk_score,
             "max_position_pct": 5.0 if risk_score < 0.5 else 3.0,
-            "suggested_stop_loss": round(current_price * 0.95, 2),
-            "suggested_take_profit": round(current_price * 1.10, 2),
+            "suggested_stop_loss": round(float(current_price) * 0.95, 2),
+            "suggested_take_profit": round(float(current_price) * 1.10, 2),
         },
     )
 
@@ -449,16 +449,17 @@ async def strategic_decision_node(state: dict) -> dict:
 
     # Create trade proposal
     # analyses are already dicts after serialization fix
+    # Ensure all numeric values are Python floats for serialization
     proposal = TradeProposal(
         id=str(uuid.uuid4()),
         ticker=ticker,
         action=action,
         quantity=100,
-        entry_price=current_price,
-        stop_loss=risk_signals.get("suggested_stop_loss"),
-        take_profit=risk_signals.get("suggested_take_profit"),
-        risk_score=risk_signals.get("risk_score", 0.5),
-        position_size_pct=risk_signals.get("max_position_pct", 5.0),
+        entry_price=float(current_price),
+        stop_loss=float(risk_signals.get("suggested_stop_loss")) if risk_signals.get("suggested_stop_loss") else None,
+        take_profit=float(risk_signals.get("suggested_take_profit")) if risk_signals.get("suggested_take_profit") else None,
+        risk_score=float(risk_signals.get("risk_score", 0.5)),
+        position_size_pct=float(risk_signals.get("max_position_pct", 5.0)),
         rationale=response,
         bull_case=_extract_bull_case(response),
         bear_case=_extract_bear_case(response),

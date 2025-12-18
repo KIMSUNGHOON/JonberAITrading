@@ -28,6 +28,15 @@ MOCK_DIR = DATA_DIR / "mock"
 CACHE_DIR = DATA_DIR / "cache"
 CACHE_DB = CACHE_DIR / "market_data.db"
 
+
+def _to_python_float(value, default: float = 0.0) -> float:
+    """Convert numpy/pandas float to Python float for serialization."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return default
+    if pd.isna(value):
+        return default
+    return float(value)
+
 # Ensure directories exist
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MOCK_DIR.mkdir(parents=True, exist_ok=True)
@@ -135,7 +144,7 @@ async def get_current_price(ticker: str) -> float:
     if mode == "mock":
         # Generate consistent mock price based on ticker
         np.random.seed(hash(ticker) % 2**32)
-        return round(np.random.uniform(50, 500), 2)
+        return float(round(np.random.uniform(50, 500), 2))
 
     try:
         import yfinance as yf
@@ -144,12 +153,12 @@ async def get_current_price(ticker: str) -> float:
         # Try to get real-time price, fall back to last close
         info = stock.info
         price = info.get("regularMarketPrice") or info.get("previousClose", 100.0)
-        return float(price)
+        return _to_python_float(price, 100.0)
 
     except Exception as e:
         logger.error("current_price_error", ticker=ticker, error=str(e))
         np.random.seed(hash(ticker) % 2**32)
-        return round(np.random.uniform(50, 500), 2)
+        return float(round(np.random.uniform(50, 500), 2))
 
 
 def calculate_technical_indicators(df: pd.DataFrame) -> dict:
@@ -204,25 +213,26 @@ def calculate_technical_indicators(df: pd.DataFrame) -> dict:
     recent_low = close.tail(20).min()
     recent_high = close.tail(20).max()
 
+    # Convert all values to Python native types for serialization
     return {
-        "current_price": round(current_price, 2),
-        "sma_20": round(sma_20, 2) if pd.notna(sma_20) else None,
-        "sma_50": round(sma_50, 2) if sma_50 and pd.notna(sma_50) else None,
-        "rsi": round(rsi, 2) if pd.notna(rsi) else None,
+        "current_price": round(_to_python_float(current_price), 2),
+        "sma_20": round(_to_python_float(sma_20), 2) if pd.notna(sma_20) else None,
+        "sma_50": round(_to_python_float(sma_50), 2) if sma_50 and pd.notna(sma_50) else None,
+        "rsi": round(_to_python_float(rsi), 2) if pd.notna(rsi) else None,
         "macd": {
-            "line": round(macd_line.iloc[-1], 4) if pd.notna(macd_line.iloc[-1]) else None,
-            "signal": round(signal_line.iloc[-1], 4) if pd.notna(signal_line.iloc[-1]) else None,
-            "histogram": round(macd_histogram.iloc[-1], 4) if pd.notna(macd_histogram.iloc[-1]) else None,
+            "line": round(_to_python_float(macd_line.iloc[-1]), 4) if pd.notna(macd_line.iloc[-1]) else None,
+            "signal": round(_to_python_float(signal_line.iloc[-1]), 4) if pd.notna(signal_line.iloc[-1]) else None,
+            "histogram": round(_to_python_float(macd_histogram.iloc[-1]), 4) if pd.notna(macd_histogram.iloc[-1]) else None,
         },
         "bollinger": {
-            "upper": round(bb_upper.iloc[-1], 2) if pd.notna(bb_upper.iloc[-1]) else None,
-            "middle": round(bb_middle.iloc[-1], 2) if pd.notna(bb_middle.iloc[-1]) else None,
-            "lower": round(bb_lower.iloc[-1], 2) if pd.notna(bb_lower.iloc[-1]) else None,
+            "upper": round(_to_python_float(bb_upper.iloc[-1]), 2) if pd.notna(bb_upper.iloc[-1]) else None,
+            "middle": round(_to_python_float(bb_middle.iloc[-1]), 2) if pd.notna(bb_middle.iloc[-1]) else None,
+            "lower": round(_to_python_float(bb_lower.iloc[-1]), 2) if pd.notna(bb_lower.iloc[-1]) else None,
         },
-        "volume_ratio": round(volume_ratio, 2),
-        "price_vs_sma20_pct": round(price_vs_sma20, 2),
-        "support": round(recent_low, 2),
-        "resistance": round(recent_high, 2),
+        "volume_ratio": round(_to_python_float(volume_ratio), 2),
+        "price_vs_sma20_pct": round(_to_python_float(price_vs_sma20), 2),
+        "support": round(_to_python_float(recent_low), 2),
+        "resistance": round(_to_python_float(recent_high), 2),
         "trend": "bullish" if price_vs_sma20 > 2 else "bearish" if price_vs_sma20 < -2 else "neutral",
     }
 
