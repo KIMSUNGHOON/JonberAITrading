@@ -3,6 +3,7 @@
  *
  * TradingView Lightweight Charts implementation.
  * Supports candlestick, moving averages, and volume.
+ * Connects to real Upbit API for coin markets.
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -18,6 +19,7 @@ import {
 } from 'lightweight-charts';
 import { Loader2 } from 'lucide-react';
 import type { TimeFrame } from '@/types';
+import { getCoinCandles } from '@/api/client';
 
 interface TradingChartProps {
   ticker: string;
@@ -133,13 +135,47 @@ export function TradingChart({
       setError(null);
 
       try {
-        // Generate mock data for now (in production, fetch from API)
-        const data = generateMockData(ticker, timeframe);
+        // Check if ticker is a coin market (e.g., KRW-BTC)
+        const isCoinMarket = ticker.includes('-');
+
+        let candles: CandlestickData[];
+
+        if (isCoinMarket) {
+          // Fetch real data from Upbit API for coin markets
+          const intervalMap: Record<TimeFrame, string> = {
+            '1m': '1m',
+            '5m': '5m',
+            '15m': '15m',
+            '1h': '1h',
+            '1d': '1d',
+            '1w': '1w',
+            '1M': '1M',
+          };
+
+          const interval = intervalMap[timeframe] || '1d';
+          const response = await getCoinCandles(ticker, interval, 200);
+
+          // Transform API response to lightweight-charts format
+          // Upbit returns newest first, so reverse for chronological order
+          candles = response.candles
+            .map((c) => ({
+              time: Math.floor(new Date(c.datetime).getTime() / 1000) as any,
+              open: c.open,
+              high: c.high,
+              low: c.low,
+              close: c.close,
+            }))
+            .reverse();
+        } else {
+          // Fall back to mock data for stock tickers
+          const data = generateMockData(ticker, timeframe);
+          candles = data.candles;
+        }
 
         if (!isMounted || !chartRef.current || !candlestickSeriesRef.current) return;
 
         // Update candlestick data
-        candlestickSeriesRef.current.setData(data.candles);
+        candlestickSeriesRef.current.setData(candles);
 
         // Fit content
         chartRef.current.timeScale().fitContent();
@@ -147,6 +183,7 @@ export function TradingChart({
         setIsLoading(false);
       } catch (err) {
         if (isMounted) {
+          console.error('Failed to fetch chart data:', err);
           setError('Failed to load chart data');
           setIsLoading(false);
         }
@@ -234,9 +271,43 @@ export function TradingChart({
         volumeSeriesRef.current = volumeSeries;
       }
 
-      // Generate volume data
-      const volumeData = generateVolumeData(ticker, timeframe);
-      volumeSeriesRef.current.setData(volumeData);
+      // Check if coin market - fetch real volume data
+      const isCoinMarket = ticker.includes('-');
+
+      if (isCoinMarket) {
+        // Fetch real volume from Upbit API
+        const intervalMap: Record<TimeFrame, string> = {
+          '1m': '1m',
+          '5m': '5m',
+          '15m': '15m',
+          '1h': '1h',
+          '1d': '1d',
+          '1w': '1w',
+          '1M': '1M',
+        };
+
+        const interval = intervalMap[timeframe] || '1d';
+
+        getCoinCandles(ticker, interval, 200)
+          .then((response) => {
+            const volumeData = response.candles
+              .map((c) => ({
+                time: Math.floor(new Date(c.datetime).getTime() / 1000) as any,
+                value: c.volume,
+                color:
+                  c.close >= c.open
+                    ? 'rgba(34, 197, 94, 0.5)'
+                    : 'rgba(239, 68, 68, 0.5)',
+              }))
+              .reverse();
+            volumeSeriesRef.current?.setData(volumeData);
+          })
+          .catch(console.error);
+      } else {
+        // Fall back to mock volume data for stocks
+        const volumeData = generateVolumeData(ticker, timeframe);
+        volumeSeriesRef.current.setData(volumeData);
+      }
     } else {
       if (volumeSeriesRef.current) {
         chartRef.current.removeSeries(volumeSeriesRef.current);

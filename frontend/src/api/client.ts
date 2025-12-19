@@ -246,6 +246,70 @@ class ApiClient {
   }
 
   // -------------------------------------------
+  // Coin Market Data Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get candle (OHLCV) data for a coin market.
+   */
+  async getCoinCandles(
+    market: string,
+    interval: string = '1d',
+    count: number = 200
+  ): Promise<{
+    market: string;
+    interval: string;
+    candles: Array<{
+      datetime: string;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }>;
+  }> {
+    const response = await this.client.get(`/coin/candles/${market}`, {
+      params: { interval, count },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get current ticker for a coin market.
+   */
+  async getCoinTicker(market: string): Promise<{
+    market: string;
+    trade_price: number;
+    change: string;
+    change_rate: number;
+    change_price: number;
+    high_price: number;
+    low_price: number;
+    trade_volume: number;
+    acc_trade_price_24h: number;
+    timestamp: string;
+  }> {
+    const response = await this.client.get(`/coin/ticker/${market}`);
+    return response.data;
+  }
+
+  /**
+   * Get orderbook for a coin market.
+   */
+  async getCoinOrderbook(market: string): Promise<{
+    market: string;
+    total_ask_size: number;
+    total_bid_size: number;
+    bid_ask_ratio: number;
+    asks: Array<{ price: number; size: number }>;
+    bids: Array<{ price: number; size: number }>;
+    timestamp: string;
+  }> {
+    const response = await this.client.get(`/coin/orderbook/${market}`);
+    return response.data;
+  }
+
+  // -------------------------------------------
   // Health Check
   // -------------------------------------------
 
@@ -358,6 +422,14 @@ export const getCoinSessionStatus = (sessionId: string) =>
 
 export const cancelCoinSession = (sessionId: string) =>
   apiClient.cancelCoinSession(sessionId);
+
+// Coin Market Data API
+export const getCoinCandles = (market: string, interval?: string, count?: number) =>
+  apiClient.getCoinCandles(market, interval, count);
+
+export const getCoinTicker = (market: string) => apiClient.getCoinTicker(market);
+
+export const getCoinOrderbook = (market: string) => apiClient.getCoinOrderbook(market);
 
 // Settings API
 export const getSettings = () => apiClient.getSettings();

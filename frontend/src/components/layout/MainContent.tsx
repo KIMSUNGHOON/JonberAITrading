@@ -19,6 +19,7 @@ import { WorkflowProgress } from '@/components/analysis/WorkflowProgress';
 import { ProposalCard } from '@/components/approval/ProposalCard';
 import { PositionCard } from '@/components/position/PositionCard';
 import { WelcomePanel } from '@/components/analysis/WelcomePanel';
+import { CoinInfo } from '@/components/coin/CoinInfo';
 
 export function MainContent() {
   const { sessionId, ticker, status } = useStore(useShallow(selectSession));
@@ -56,6 +57,13 @@ export function MainContent() {
           {showChartPanel && ticker && (
             <section className="flex-shrink-0">
               <ChartPanel ticker={ticker} />
+            </section>
+          )}
+
+          {/* Coin Info - Show for coin markets */}
+          {ticker && ticker.includes('-') && (
+            <section className="flex-shrink-0">
+              <CoinInfo market={ticker} />
             </section>
           )}
 

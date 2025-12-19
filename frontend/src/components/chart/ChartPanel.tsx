@@ -2,6 +2,7 @@
  * Chart Panel Component
  *
  * Container for TradingView Lightweight Charts with controls.
+ * Shows real-time price for coin markets.
  */
 
 import { useState, useCallback } from 'react';
@@ -13,6 +14,7 @@ import {
 } from 'lucide-react';
 import { useStore, selectChartConfig } from '@/store';
 import { TradingChart } from './TradingChart';
+import { CoinPriceTicker } from '@/components/coin/CoinPriceTicker';
 import type { TimeFrame } from '@/types';
 
 interface ChartPanelProps {
@@ -54,8 +56,15 @@ export function ChartPanel({ ticker }: ChartPanelProps) {
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-3">
-          <h2 className="font-semibold text-lg">{ticker}</h2>
-          <span className="live-indicator text-sm text-bull">Live</span>
+          {/* Show real-time price ticker for coin markets */}
+          {ticker.includes('-') ? (
+            <CoinPriceTicker market={ticker} showDetails />
+          ) : (
+            <>
+              <h2 className="font-semibold text-lg">{ticker}</h2>
+              <span className="live-indicator text-sm text-bull">Live</span>
+            </>
+          )}
         </div>
 
         {/* Controls */}
