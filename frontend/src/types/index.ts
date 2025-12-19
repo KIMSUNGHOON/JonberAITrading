@@ -195,3 +195,56 @@ export interface ApprovalResponse {
   message: string;
   execution_status?: string;
 }
+
+// -------------------------------------------
+// Coin (Cryptocurrency) Types
+// -------------------------------------------
+
+export interface CoinMarketInfo {
+  market: string;
+  korean_name: string;
+  english_name: string;
+  market_warning: string | null;
+}
+
+export interface CoinAnalysisRequest {
+  market: string;
+  query?: string;
+}
+
+export interface CoinAnalysisResponse {
+  session_id: string;
+  market: string;
+  status: string;
+  message: string;
+}
+
+export interface CoinTradeProposal {
+  id: string;
+  market: string;
+  korean_name: string | null;
+  action: TradeAction;
+  quantity: number;
+  entry_price: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  risk_score: number;
+  position_size_pct: number;
+  rationale: string;
+  bull_case: string;
+  bear_case: string;
+  created_at: string;
+}
+
+export interface CoinAnalysisStatus {
+  session_id: string;
+  market: string;
+  korean_name: string | null;
+  status: SessionStatus;
+  current_stage: string | null;
+  awaiting_approval: boolean;
+  trade_proposal: CoinTradeProposal | null;
+  analyses: AnalysisSummary[];
+  reasoning_log: string[];
+  error: string | null;
+}

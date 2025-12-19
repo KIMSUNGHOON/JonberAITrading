@@ -63,7 +63,12 @@ interface ChatState {
   isTyping: boolean;
 }
 
+type MarketType = 'stock' | 'coin';
+
 interface UIState {
+  // Market selection
+  activeMarket: MarketType;
+
   // Panels
   showApprovalDialog: boolean;
   showChartPanel: boolean;
@@ -97,6 +102,7 @@ interface Actions {
   clearChat: () => void;
 
   // UI actions
+  setActiveMarket: (market: MarketType) => void;
   setShowApprovalDialog: (show: boolean) => void;
   setShowChartPanel: (show: boolean) => void;
   setMobileMenuOpen: (open: boolean) => void;
@@ -136,6 +142,7 @@ const initialChatState: ChatState = {
 };
 
 const initialUIState: UIState = {
+  activeMarket: 'stock',
   showApprovalDialog: false,
   showChartPanel: true,
   isMobileMenuOpen: false,
@@ -175,7 +182,7 @@ export const useStore = create<Store>()(
                 ticker: upperTicker,
                 sessionId,
                 timestamp: new Date(),
-                status: 'running',
+                status: 'running' as const,
               },
               ...state.tickerHistory,
             ].slice(0, 20); // Keep last 20 entries
@@ -251,6 +258,8 @@ export const useStore = create<Store>()(
       clearChat: () => set({ messages: [] }),
 
       // UI actions
+      setActiveMarket: (market) => set({ activeMarket: market }),
+
       setShowApprovalDialog: (show) => set({ showApprovalDialog: show }),
 
       setShowChartPanel: (show) => set({ showChartPanel: show }),
@@ -317,4 +326,4 @@ export const selectChartConfig = (state: Store) => state.chartConfig;
 export const selectTickerHistory = (state: Store) => state.tickerHistory;
 
 // Export types
-export type { TickerHistoryItem };
+export type { TickerHistoryItem, MarketType };

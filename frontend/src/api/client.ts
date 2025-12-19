@@ -11,6 +11,9 @@ import type {
   ApprovalRequest,
   ApprovalResponse,
   SessionStatus,
+  CoinAnalysisRequest,
+  CoinAnalysisResponse,
+  CoinMarketInfo,
 } from '@/types';
 
 // -------------------------------------------
@@ -173,6 +176,71 @@ class ApiClient {
   }
 
   // -------------------------------------------
+  // Coin Analysis Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get available coin markets.
+   */
+  async getCoinMarkets(quoteCurrency?: string): Promise<{
+    markets: CoinMarketInfo[];
+    total: number;
+  }> {
+    const params = quoteCurrency ? { quote_currency: quoteCurrency } : {};
+    const response = await this.client.get('/coin/markets', { params });
+    return response.data;
+  }
+
+  /**
+   * Search coin markets by name or code.
+   */
+  async searchCoinMarkets(query: string, limit = 10): Promise<{
+    markets: CoinMarketInfo[];
+    total: number;
+  }> {
+    const response = await this.client.post('/coin/markets/search', {
+      query,
+      limit,
+    });
+    return response.data;
+  }
+
+  /**
+   * Start a new coin analysis session.
+   */
+  async startCoinAnalysis(request: CoinAnalysisRequest): Promise<CoinAnalysisResponse> {
+    const response = await this.client.post<CoinAnalysisResponse>(
+      '/coin/analysis/start',
+      request
+    );
+    return response.data;
+  }
+
+  /**
+   * Get coin analysis session status.
+   */
+  async getCoinSessionStatus(sessionId: string): Promise<{
+    session_id: string;
+    market: string;
+    korean_name: string | null;
+    status: SessionStatus;
+    current_stage: string | null;
+    awaiting_approval: boolean;
+    error: string | null;
+  }> {
+    const response = await this.client.get(`/coin/analysis/status/${sessionId}`);
+    return response.data;
+  }
+
+  /**
+   * Cancel a coin analysis session.
+   */
+  async cancelCoinSession(sessionId: string): Promise<{ message: string }> {
+    const response = await this.client.post(`/coin/analysis/cancel/${sessionId}`);
+    return response.data;
+  }
+
+  // -------------------------------------------
   // Health Check
   // -------------------------------------------
 
@@ -220,3 +288,19 @@ export const submitApproval = (request: ApprovalRequest) =>
   apiClient.submitApproval(request);
 
 export const healthCheck = () => apiClient.healthCheck();
+
+// Coin API
+export const getCoinMarkets = (quoteCurrency?: string) =>
+  apiClient.getCoinMarkets(quoteCurrency);
+
+export const searchCoinMarkets = (query: string, limit?: number) =>
+  apiClient.searchCoinMarkets(query, limit);
+
+export const startCoinAnalysis = (request: CoinAnalysisRequest) =>
+  apiClient.startCoinAnalysis(request);
+
+export const getCoinSessionStatus = (sessionId: string) =>
+  apiClient.getCoinSessionStatus(sessionId);
+
+export const cancelCoinSession = (sessionId: string) =>
+  apiClient.cancelCoinSession(sessionId);

@@ -22,6 +22,8 @@ import {
 } from 'lucide-react';
 import { useStore, selectTickerHistory, type TickerHistoryItem } from '@/store';
 import { TickerInput } from '@/components/analysis/TickerInput';
+import { CoinTickerInput } from '@/components/coin/CoinTickerInput';
+import { MarketTabs } from '@/components/layout/MarketTabs';
 
 interface NavItemProps {
   icon: React.ReactNode;
@@ -117,12 +119,18 @@ export function Sidebar() {
   const analyses = useStore((state) => state.analyses);
   const tickerHistory = useStore(selectTickerHistory);
   const activeSessionId = useStore((state) => state.activeSessionId);
+  const activeMarket = useStore((state) => state.activeMarket);
 
   return (
     <div className="h-full flex flex-col p-4">
-      {/* Ticker Input */}
+      {/* Market Tabs */}
       <div className="mb-4">
-        <TickerInput />
+        <MarketTabs />
+      </div>
+
+      {/* Ticker Input - Stock or Coin based on active market */}
+      <div className="mb-4">
+        {activeMarket === 'stock' ? <TickerInput /> : <CoinTickerInput />}
       </div>
 
       {/* Navigation */}
