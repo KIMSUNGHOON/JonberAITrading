@@ -433,11 +433,14 @@ async def start_coin_analysis(
 
 async def run_coin_analysis_task(session_id: str):
     """
-    Background task to run coin analysis.
+    Background task to run coin analysis using LangGraph workflow.
 
-    TODO: Integrate with LangGraph coin trading workflow
-    For now, fetches market data and stores for future analysis.
+    Runs the coin trading graph through all analysis stages until
+    it reaches the approval interrupt point.
     """
+    from agents.graph.coin_trading_graph import get_coin_trading_graph
+    from agents.graph.coin_state import create_coin_initial_state
+
     session = coin_sessions.get(session_id)
     if not session:
         logger.error("coin_session_not_found", session_id=session_id)
@@ -445,69 +448,49 @@ async def run_coin_analysis_task(session_id: str):
 
     try:
         market = session["market"]
+        korean_name = session.get("korean_name")
 
-        # Fetch comprehensive market data
-        async with get_upbit_client() as client:
-            session["state"]["reasoning_log"].append(
-                f"[Data] Fetching market data for {market}..."
-            )
-            session["state"]["current_stage"] = "data_collection"
+        # Get the coin trading graph
+        graph = get_coin_trading_graph()
 
-            analysis_data = await client.get_analysis_data(
-                market=market,
-                candle_count=100,
-                trade_count=50,
-            )
+        # Create initial state
+        initial_state = create_coin_initial_state(
+            market=market,
+            korean_name=korean_name,
+            user_query=session["state"].get("query"),
+        )
 
-            # Store analysis data
-            session["state"]["market_data"] = {
-                "current_price": analysis_data.current_price,
-                "change_rate_24h": analysis_data.change_rate_24h,
-                "volume_24h": analysis_data.volume_24h,
-                "high_24h": analysis_data.high_24h,
-                "low_24h": analysis_data.low_24h,
-                "bid_ask_ratio": analysis_data.bid_ask_ratio,
-            }
+        config = {"configurable": {"thread_id": session_id}}
 
-            session["state"]["reasoning_log"].append(
-                f"[Data] Current price: {analysis_data.current_price:,.0f} KRW"
-            )
-            session["state"]["reasoning_log"].append(
-                f"[Data] 24h change: {analysis_data.change_rate_24h:+.2f}%"
-            )
-            session["state"]["reasoning_log"].append(
-                f"[Data] Bid/Ask ratio: {analysis_data.bid_ask_ratio:.2f}"
-            )
+        # Run until interrupt (approval node)
+        async for event in graph.astream(initial_state, config):
+            for node_name, node_output in event.items():
+                if node_name != "__end__":
+                    # Update session state with node output
+                    if isinstance(node_output, dict):
+                        session["state"].update(node_output)
+                    session["last_node"] = node_name
 
-            # TODO: Send to LangGraph for AI analysis
-            # For now, mark as awaiting approval with placeholder proposal
-            session["state"]["current_stage"] = "awaiting_approval"
-            session["state"]["awaiting_approval"] = True
+                    logger.debug(
+                        "coin_graph_node_completed",
+                        session_id=session_id,
+                        node=node_name,
+                    )
 
-            # Create placeholder proposal
-            session["state"]["trade_proposal"] = {
-                "id": str(uuid.uuid4()),
-                "market": market,
-                "korean_name": session.get("korean_name"),
-                "action": "HOLD",
-                "quantity": 0,
-                "entry_price": analysis_data.current_price,
-                "risk_score": 0.5,
-                "position_size_pct": 5.0,
-                "rationale": "AI analysis pending. Market data collected successfully.",
-                "bull_case": f"Price is at {analysis_data.current_price:,.0f} KRW with {analysis_data.change_rate_24h:+.2f}% 24h change.",
-                "bear_case": "Full AI analysis not yet implemented.",
-                "created_at": datetime.utcnow().isoformat(),
-            }
-
+        # Check if we hit the approval interrupt
+        state = session["state"]
+        if state.get("awaiting_approval"):
             session["status"] = "awaiting_approval"
-
             logger.info(
-                "coin_analysis_data_collected",
+                "coin_analysis_awaiting_approval",
                 session_id=session_id,
                 market=market,
-                price=analysis_data.current_price,
             )
+        elif state.get("error"):
+            session["status"] = "error"
+            session["error"] = state.get("error")
+        else:
+            session["status"] = "completed"
 
     except Exception as e:
         logger.error(
@@ -517,7 +500,9 @@ async def run_coin_analysis_task(session_id: str):
         )
         session["status"] = "error"
         session["error"] = str(e)
-        session["state"]["reasoning_log"].append(f"[Error] Analysis failed: {str(e)}")
+        session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
+            f"[Error] Analysis failed: {str(e)}"
+        ]
 
 
 @router.get("/analysis/status/{session_id}", response_model=CoinAnalysisStatusResponse)
