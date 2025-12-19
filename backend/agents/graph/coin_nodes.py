@@ -97,7 +97,8 @@ async def coin_data_collection_node(state: dict) -> dict:
             "timestamp": datetime.utcnow().isoformat(),
         }
 
-        candles = [c.model_dump() for c in analysis_data.candles] if analysis_data.candles else []
+        # analysis_data.candles is already a list of dicts from get_analysis_data()
+        candles = analysis_data.candles if analysis_data.candles else []
         orderbook_dict = orderbook.model_dump() if orderbook else None
         trades_list = [t.model_dump() for t in trades] if trades else []
 
@@ -664,16 +665,16 @@ def _format_coin_market_context(market_data: dict, candles: list, orderbook: dic
         "",
     ]
 
-    # Recent candles summary
+    # Recent candles summary (keys from CoinAnalysisData: date, open, high, low, close, volume)
     if candles and len(candles) >= 5:
         lines.append("=== Recent Price Action (Last 5 candles) ===")
         for c in candles[:5]:
             lines.append(
-                f"{c.get('candle_date_time_kst', 'N/A')}: "
-                f"O={c.get('opening_price', 0):,.0f} "
-                f"H={c.get('high_price', 0):,.0f} "
-                f"L={c.get('low_price', 0):,.0f} "
-                f"C={c.get('trade_price', 0):,.0f}"
+                f"{c.get('date', 'N/A')}: "
+                f"O={c.get('open', 0):,.0f} "
+                f"H={c.get('high', 0):,.0f} "
+                f"L={c.get('low', 0):,.0f} "
+                f"C={c.get('close', 0):,.0f}"
             )
         lines.append("")
 
@@ -692,8 +693,8 @@ def _calculate_crypto_indicators(candles: list) -> dict:
         return {"trend": "neutral"}
 
     try:
-        # Extract close prices
-        closes = [c.get("trade_price", 0) for c in candles]
+        # Extract close prices (key is 'close' from CoinAnalysisData)
+        closes = [c.get("close", 0) for c in candles]
 
         # Simple trend detection
         recent_avg = sum(closes[:10]) / 10
