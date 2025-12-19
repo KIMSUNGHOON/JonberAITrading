@@ -53,28 +53,31 @@
 
 ---
 
-## Phase 2: Analysis Pipeline [P0] (2 weeks)
+## Phase 2: Analysis Pipeline [P0] ✅ MOSTLY COMPLETED
 
 ### LangGraph - Coin Trading Graph
-- [ ] `agents/graph/coin_trading_graph.py` - 코인 분석 워크플로우
-- [ ] `agents/graph/coin_nodes.py` - 코인 전용 노드
-- [ ] `agents/graph/coin_state.py` - 코인 상태 정의
+- [x] `agents/graph/coin_trading_graph.py` - 코인 분석 워크플로우
+- [x] `agents/graph/coin_nodes.py` - 코인 전용 노드
+- [x] `agents/graph/coin_state.py` - 코인 상태 정의
 
 ### Agent Modifications
-- [ ] Technical Agent - 크립토 지표 추가
-  - [ ] 24시간 거래량/변동률
-  - [ ] 호가 불균형 분석
-  - [ ] 체결 속도 분석
-- [ ] Sentiment Agent - 크립토 소스 추가
-  - [ ] Crypto Twitter 감성
-  - [ ] Reddit 분석
-  - [ ] Fear & Greed Index
-- [ ] Risk Agent - 크립토 리스크 요소
-  - [ ] 24시간 변동성
-  - [ ] 유동성 점수
-  - [ ] BTC 상관관계
+- [x] Technical Agent - 크립토 지표 추가
+  - [x] 24시간 거래량/변동률
+  - [x] 호가 불균형 분석 (bid/ask ratio)
+  - [x] RSI, 트렌드 분석
+- [x] Market Agent - 시장 분석 (Fundamental 대체)
+  - [x] 24h 거래량 분석
+  - [x] BTC 상관관계 고려
+- [x] Sentiment Agent - 크립토 소스 추가
+  - [x] 일반 감성 분석 프롬프트
+  - [ ] Crypto Twitter 감성 (외부 API 필요)
+  - [ ] Fear & Greed Index (외부 API 필요)
+- [x] Risk Agent - 크립토 리스크 요소
+  - [x] 24시간 변동성 기반 리스크 점수
+  - [x] 보수적 포지션 사이징 (3-5%)
+  - [x] 넓은 스탑로스 (8-12%)
 
-### WebSocket Integration
+### WebSocket Integration (Phase 4로 이동)
 - [ ] `services/upbit/websocket.py` - 실시간 시세 스트리밍
 - [ ] Frontend WebSocket 연결 (코인 전용)
 - [ ] 실시간 가격 업데이트 UI
