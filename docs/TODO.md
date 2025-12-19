@@ -1,207 +1,178 @@
-# Development TodoList - Agentic AI Trading Application
+# Development TodoList - Coin Trading Feature
 
 > Last Updated: 2025-12-19
+> Focus: Upbit API 기반 암호화폐 트레이딩 모듈
 
 ---
 
 ## Priority Legend
-- **P0**: Critical - Must have for MVP
+- **P0**: Critical - Must have for feature launch
 - **P1**: High - Important for user experience
 - **P2**: Medium - Nice to have
-- **P3**: Low - Future enhancement
 
 ---
 
-## 1. Multi-Ticker Simultaneous Analysis [P1]
+## Current Focus: Coin Trading Module
 
-현재 한 번에 하나의 티커만 분석 가능. 여러 티커를 동시에 분석할 수 있도록 개선 필요.
-
-### Backend Tasks
-- [ ] `POST /api/analysis/start` 엔드포인트 수정 - 여러 티커 배열 지원
-- [ ] 세션 매니저 병렬 처리 지원
-- [ ] 여러 WebSocket 연결 동시 관리
-
-### Frontend Tasks
-- [ ] TickerInput 컴포넌트 수정 - 콤마 구분 다중 입력 지원
-- [ ] 사이드바에 활성 세션 목록 표시
-- [ ] 세션 간 전환 UI
-- [ ] 각 세션별 상태 표시 (running, awaiting_approval 등)
-
-### Store Changes
-- [ ] `activeSessions: Map<sessionId, SessionState>` 형태로 변경
-- [ ] 현재 선택된 세션 추적: `selectedSessionId`
-- [ ] 각 세션별 독립적인 WebSocket 연결 관리
+> 상세 명세: [FEATURE_SPEC_COIN_TRADING.md](FEATURE_SPEC_COIN_TRADING.md)
 
 ---
 
-## 2. Real-Time Agent Trading System [P0]
+## Phase 1: Market Data Integration [P0] (1-2 weeks)
 
-AI에게 트레이딩을 위임할 때 에이전트들이 실시간으로 대화하고 포지션을 관리하는 기능.
+### Backend - Upbit API Client
+- [ ] `services/upbit/client.py` - Upbit API 클라이언트 구현
+- [ ] `services/upbit/auth.py` - JWT 인증 모듈
+- [ ] `services/upbit/quotation.py` - 시세 조회 메서드
+  - [ ] `get_markets()` - 마켓 코드 조회
+  - [ ] `get_ticker()` - 현재가 조회
+  - [ ] `get_candles_minutes()` - 분봉 조회
+  - [ ] `get_candles_days()` - 일봉 조회
+  - [ ] `get_orderbook()` - 호가 조회
+  - [ ] `get_trades()` - 체결 내역 조회
 
-> 상세 명세: [FEATURE_SPEC_REALTIME_AGENT_TRADING.md](docs/FEATURE_SPEC_REALTIME_AGENT_TRADING.md)
+### Backend - API Routes
+- [ ] `app/api/routes/coin_analysis.py` - 코인 분석 라우트
+  - [ ] `POST /api/coin/analysis/start` - 분석 시작
+  - [ ] `GET /api/coin/markets` - 마켓 목록
+  - [ ] `GET /api/coin/ticker/{market}` - 현재가
+  - [ ] `GET /api/coin/candles/{market}` - 캔들 데이터
 
-### Phase 1: Foundation (2-3 weeks)
-- [ ] Redis PubSub 기반 AgentMessageBus 구현
-- [ ] AgentMessage 데이터 모델 정의
-- [ ] TradingState에 agent_messages 필드 추가
-- [ ] 노드 간 기본 메시지 전송 구현
-- [ ] WebSocket을 통한 에이전트 메시지 스트리밍
+### Frontend - Tab Navigation
+- [ ] `components/layout/MarketTabs.tsx` - 증권/코인 탭 컴포넌트
+- [ ] Store에 `activeMarket` 상태 추가
+- [ ] App.tsx에서 탭 기반 라우팅
 
-### Phase 2: Decision Protocol (2 weeks)
-- [ ] Proposal 생성 로직 구현
-- [ ] 투표 메커니즘 구현 (approve/reject/abstain)
-- [ ] Risk Agent 거부권 구현
-- [ ] AgentOrchestrator 서비스 생성
-- [ ] 결정 타임아웃 처리
-
-### Phase 3: Market Monitoring (2 weeks)
-- [ ] MarketMonitor 서비스 구현
-- [ ] 가격 알림 트리거 추가
-- [ ] 뉴스 피드 모니터링 연동
-- [ ] 이벤트 기반 에이전트 활성화
-
-### Phase 4: Position Management (2 weeks)
-- [ ] PositionManager 서비스 구현
-- [ ] Stop-loss/Take-profit 자동 실행
-- [ ] 포지션 추적 데이터베이스 생성
-- [ ] P&L 계산 로직
-
-### Phase 5: Frontend UI (2-3 weeks)
-- [ ] AgentChatPanel 컴포넌트 개발
-- [ ] AutoTradingControl 패널 생성
-- [ ] PositionsDashboard 구현
-- [ ] 알림 시스템 추가
-- [ ] 모바일 반응형 디자인
-
-### Phase 6: Testing & Polish (1-2 weeks)
-- [ ] 통합 테스트
-- [ ] 실시간 업데이트 로드 테스트
-- [ ] 보안 감사
-- [ ] 문서화
-- [ ] 사용자 수용 테스트
+### Frontend - Coin Input
+- [ ] `components/coin/CoinTickerInput.tsx` - 코인 검색/선택
+- [ ] 마켓 자동완성 드롭다운
+- [ ] 한글/영문 검색 지원
 
 ---
 
-## 3. UI/UX Improvements [P1]
+## Phase 2: Analysis Pipeline [P0] (2 weeks)
 
-### Completed ✅
-- [x] 반응형 레이아웃 (뷰포트 맞춤)
-- [x] ReasoningLog 자동 접기
-- [x] Approval Dialog Cancel 옵션
-- [x] Ticker History 사이드바
-- [x] Markdown 렌더링 (Rationale)
-- [x] Re-analyze 버튼 (Reject → Re-analyze)
+### LangGraph - Coin Trading Graph
+- [ ] `agents/graph/coin_trading_graph.py` - 코인 분석 워크플로우
+- [ ] `agents/graph/coin_nodes.py` - 코인 전용 노드
+- [ ] `agents/graph/coin_state.py` - 코인 상태 정의
 
-### Pending
-- [ ] 다크/라이트 테마 전환
-- [ ] 차트 인디케이터 커스터마이징
-- [ ] 키보드 단축키 지원
-- [ ] 분석 진행률 표시 개선 (WorkflowProgress)
-- [ ] 에러 토스트 알림
-- [ ] 로딩 스켈레톤 UI
+### Agent Modifications
+- [ ] Technical Agent - 크립토 지표 추가
+  - [ ] 24시간 거래량/변동률
+  - [ ] 호가 불균형 분석
+  - [ ] 체결 속도 분석
+- [ ] Sentiment Agent - 크립토 소스 추가
+  - [ ] Crypto Twitter 감성
+  - [ ] Reddit 분석
+  - [ ] Fear & Greed Index
+- [ ] Risk Agent - 크립토 리스크 요소
+  - [ ] 24시간 변동성
+  - [ ] 유동성 점수
+  - [ ] BTC 상관관계
 
----
-
-## 4. Backend Enhancements [P2]
-
-### API Improvements
-- [ ] GraphQL 엔드포인트 추가 (선택적)
-- [ ] Rate limiting 구현
-- [ ] API 버전 관리 (/v1/, /v2/)
-- [ ] 배치 분석 엔드포인트
-
-### Data & Storage
-- [ ] 분석 히스토리 영구 저장
-- [ ] 사용자 설정 저장
-- [ ] 분석 결과 캐싱 (Redis)
-- [ ] 데이터 내보내기 (CSV, JSON)
-
-### Performance
-- [ ] 분석 노드 병렬 실행 (현재 순차)
-- [ ] LLM 응답 캐싱
-- [ ] Connection pooling 최적화
-- [ ] 벤치마킹 및 프로파일링
+### WebSocket Integration
+- [ ] `services/upbit/websocket.py` - 실시간 시세 스트리밍
+- [ ] Frontend WebSocket 연결 (코인 전용)
+- [ ] 실시간 가격 업데이트 UI
 
 ---
 
-## 5. Security & Compliance [P1]
+## Phase 3: Trading Execution [P1] (1-2 weeks)
 
-- [ ] 사용자 인증 시스템 (JWT)
-- [ ] API 키 관리
-- [ ] 거래 감사 로그
-- [ ] 위험 공시 동의 플로우
-- [ ] HTTPS 강제
-- [ ] 입력 검증 강화
+### Backend - Exchange API
+- [ ] `services/upbit/exchange.py` - 거래 메서드
+  - [ ] `get_accounts()` - 잔고 조회
+  - [ ] `place_order()` - 주문 생성 (지정가/시장가)
+  - [ ] `cancel_order()` - 주문 취소
+  - [ ] `get_order()` - 주문 조회
+  - [ ] `get_orders()` - 주문 목록
 
----
+### HITL Integration
+- [ ] Approval API 코인 지원 수정
+- [ ] 코인 Trade Proposal 표시
+- [ ] 주문 실행 연동
 
-## 6. Testing [P2]
-
-### Backend Tests
-- [ ] 단위 테스트 커버리지 80% 이상
-- [ ] 통합 테스트 (API 엔드포인트)
-- [ ] LLM 응답 모킹
-- [ ] WebSocket 테스트
-
-### Frontend Tests
-- [ ] Vitest 설정
-- [ ] 컴포넌트 단위 테스트
-- [ ] E2E 테스트 (Playwright)
-- [ ] 시각적 회귀 테스트
+### Order Monitoring
+- [ ] 주문 상태 추적
+- [ ] 체결 알림
+- [ ] 미체결 주문 관리
 
 ---
 
-## 7. DevOps & Deployment [P2]
+## Phase 4: UI/UX Polish [P1] (1 week)
 
-- [ ] Docker Compose 개선 (GPU 지원)
-- [ ] CI/CD 파이프라인 (GitHub Actions)
-- [ ] 환경별 설정 분리 (dev/staging/prod)
-- [ ] 헬스체크 대시보드
-- [ ] 로그 수집 (ELK Stack)
-- [ ] 모니터링 (Prometheus + Grafana)
+### Components
+- [ ] `CoinChart.tsx` - 코인 차트 (TradingView)
+- [ ] `CoinPosition.tsx` - 코인 포지션 카드
+- [ ] `CoinProposal.tsx` - 코인 거래 제안
+- [ ] `CoinHistory.tsx` - 코인 분석 히스토리
 
----
+### Real-time Updates
+- [ ] 실시간 가격 표시
+- [ ] P&L 계산 및 표시
+- [ ] 호가창 시각화
 
-## 8. Documentation [P2]
-
-### Completed ✅
-- [x] README.md 개선 (overview)
-- [x] OS별 설치 가이드 분리
-- [x] 실시간 에이전트 트레이딩 기능 명세
-
-### Pending
-- [ ] API 문서 자동 생성 (OpenAPI → Postman)
-- [ ] 개발자 가이드
-- [ ] 아키텍처 다이어그램
-- [ ] 기여 가이드라인
-- [ ] 변경 로그 (CHANGELOG.md)
+### Responsive Design
+- [ ] 모바일 탭 네비게이션
+- [ ] 코인 UI 반응형 검증
 
 ---
 
-## 9. Future Enhancements [P3]
+## Environment Setup
 
-- [ ] 다중 자산 포트폴리오 관리
-- [ ] 커스텀 트레이딩 전략 (모멘텀, 평균회귀)
-- [ ] 백테스팅 기능
-- [ ] 소셜 트레이딩 (성공적인 설정 팔로우)
-- [ ] 고급 리스크 모델 (VaR, 스트레스 테스트)
-- [ ] 다중 브로커 연동
-- [ ] 모바일 앱 (React Native)
+### Required Environment Variables
+```env
+# Upbit API Keys (Phase 3에서 필요)
+UPBIT_ACCESS_KEY=your_access_key
+UPBIT_SECRET_KEY=your_secret_key
+UPBIT_TRADING_MODE=paper  # paper | live
+```
+
+### Dependencies to Add
+```
+# backend/requirements.txt
+httpx>=0.25.0
+PyJWT>=2.8.0
+```
 
 ---
 
-## Immediate Next Steps (권장 순서)
+## Upbit API Quick Reference
 
-1. **Multi-Ticker Analysis** - 사용자 편의성 즉시 개선
-2. **Real-Time Agent Trading Phase 1** - 핵심 기능 기반 구축
-3. **Security (인증)** - 프로덕션 준비
-4. **Testing** - 안정성 확보
-5. **Real-Time Agent Trading Phase 2-6** - 전체 기능 완성
+### Rate Limits
+| Type | Per Second | Per Minute |
+|------|------------|------------|
+| 주문 API | 8회 | 200회 |
+| 기타 API | 30회 | 900회 |
+
+### Market Code Format
+- KRW 마켓: `KRW-BTC`, `KRW-ETH`
+- BTC 마켓: `BTC-ETH`, `BTC-XRP`
+- USDT 마켓: `USDT-BTC`
+
+### Key Endpoints
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `/v1/market/all` | No | 마켓 목록 |
+| `/v1/ticker` | No | 현재가 |
+| `/v1/candles/*` | No | 캔들 데이터 |
+| `/v1/orderbook` | No | 호가 |
+| `/v1/accounts` | Yes | 잔고 조회 |
+| `/v1/orders` | Yes | 주문 생성/조회 |
+
+---
+
+## Related Documents
+
+- [Coin Trading Feature Spec](FEATURE_SPEC_COIN_TRADING.md)
+- [Stock Features Archive](archive/TODO_STOCK_FEATURES.md)
+- [Real-Time Agent Trading Spec](FEATURE_SPEC_REALTIME_AGENT_TRADING.md)
 
 ---
 
 ## Notes
 
-- 각 작업 완료 시 체크박스 업데이트
-- 새로운 요구사항 발생 시 해당 섹션에 추가
-- 우선순위 변경 시 문서 업데이트
+- Phase 1-2는 인증 없이 QUOTATION API만 사용
+- Phase 3부터 Upbit API 키 필요
+- `paper` 모드에서 먼저 테스트 후 `live` 전환
