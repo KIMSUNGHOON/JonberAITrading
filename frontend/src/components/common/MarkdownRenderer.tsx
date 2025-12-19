@@ -24,7 +24,7 @@ export function MarkdownRenderer({ content, className = '', compact = false }: M
       .replace(/>/g, '&gt;');
 
     // Code blocks (```...```)
-    html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, _lang, code) => {
       const padding = compact ? 'p-2' : 'p-3';
       return `<pre class="bg-surface rounded-lg ${padding} my-2 overflow-x-auto text-xs font-mono text-gray-300 border border-gray-700"><code>${code.trim()}</code></pre>`;
     });

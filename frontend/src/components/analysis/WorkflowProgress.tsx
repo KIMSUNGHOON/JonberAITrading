@@ -132,7 +132,7 @@ interface StageItemProps {
   isLast: boolean;
 }
 
-function StageItem({ stage, status, icon: Icon, isLast }: StageItemProps) {
+function StageItem({ stage, status, icon: Icon }: StageItemProps) {
   const statusColors = {
     pending: 'bg-surface-light text-gray-500 border-gray-700',
     in_progress: 'bg-blue-500/20 text-blue-400 border-blue-500 ring-2 ring-blue-500/30',
@@ -187,8 +187,6 @@ interface CurrentStageDetailProps {
 
 function CurrentStageDetail({ stage }: CurrentStageDetailProps) {
   if (!stage) return null;
-
-  const Icon = stage.icon;
 
   return (
     <div className="mt-4 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">

@@ -17,7 +17,6 @@ import {
   Rocket,
   Copy,
   Check,
-  X,
   Eye,
   EyeOff,
 } from 'lucide-react';
@@ -63,7 +62,7 @@ const AGENT_CONFIG: Record<string, {
   'HITL': { color: 'text-amber-400', bgColor: 'bg-amber-500/10', icon: Shield, agentType: 'HITL' },
 };
 
-export function ReasoningLog({ entries, maxHeight, showFilters = false }: ReasoningLogProps) {
+export function ReasoningLog({ entries, maxHeight, showFilters: _showFilters = false }: ReasoningLogProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [isExpanded, setIsExpanded] = useState(true);
   const [copied, setCopied] = useState(false);
