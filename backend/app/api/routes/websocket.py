@@ -15,6 +15,7 @@ import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.api.routes.analysis import get_active_sessions
+from app.api.routes.coin import get_coin_sessions
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -135,7 +136,9 @@ async def websocket_session(websocket: WebSocket, session_id: str):
     """
     await manager.connect(session_id, websocket)
 
-    active_sessions = get_active_sessions()
+    # Get both stock and coin sessions
+    stock_sessions = get_active_sessions()
+    coin_sessions = get_coin_sessions()
 
     # Track what we've sent to avoid duplicates
     last_log_index = 0
@@ -150,7 +153,8 @@ async def websocket_session(websocket: WebSocket, session_id: str):
         )
 
         while True:
-            session = active_sessions.get(session_id)
+            # Check both stock and coin sessions
+            session = stock_sessions.get(session_id) or coin_sessions.get(session_id)
 
             if session:
                 state = session["state"]
@@ -206,11 +210,14 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     if hasattr(action, "value"):
                         action = action.value
 
+                    # Support both stock (ticker) and coin (market) proposals
+                    ticker_or_market = proposal.get("ticker") or proposal.get("market", "")
+
                     await websocket.send_json({
                         "type": "proposal",
                         "data": {
                             "id": str(proposal.get("id", "")),
-                            "ticker": str(proposal.get("ticker", "")),
+                            "ticker": str(ticker_or_market),
                             "action": str(action),
                             "quantity": safe_int(proposal.get("quantity"), 0),
                             "entry_price": safe_float(proposal.get("entry_price")),
@@ -224,7 +231,7 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     logger.info(
                         "websocket_proposal_sent",
                         session_id=session_id,
-                        ticker=proposal.get("ticker"),
+                        ticker=ticker_or_market,
                         action=action,
                     )
 
@@ -239,10 +246,13 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     pnl = (current_price - entry_price) * quantity
                     pnl_percent = ((current_price / entry_price) - 1) * 100 if entry_price else 0
 
+                    # Support both stock (ticker) and coin (market) positions
+                    position_ticker = position.get("ticker") or position.get("market", "")
+
                     await websocket.send_json({
                         "type": "position",
                         "data": {
-                            "ticker": str(position.get("ticker", "")),
+                            "ticker": str(position_ticker),
                             "quantity": quantity,
                             "entry_price": entry_price,
                             "current_price": current_price,
@@ -328,20 +338,31 @@ async def websocket_broadcast(websocket: WebSocket):
                 if data == "ping":
                     await websocket.send_text("pong")
                 elif data == "sessions":
-                    # Send current sessions summary
-                    active_sessions = get_active_sessions()
+                    # Send current sessions summary (both stock and coin)
+                    stock_sessions = get_active_sessions()
+                    coin_sessions_dict = get_coin_sessions()
+
+                    all_sessions = []
+                    for sid, s in list(stock_sessions.items())[:5]:
+                        all_sessions.append({
+                            "id": sid,
+                            "ticker": s["ticker"],
+                            "status": s["status"],
+                            "type": "stock",
+                        })
+                    for sid, s in list(coin_sessions_dict.items())[:5]:
+                        all_sessions.append({
+                            "id": sid,
+                            "ticker": s.get("market", ""),
+                            "status": s["status"],
+                            "type": "coin",
+                        })
+
                     await websocket.send_json({
                         "type": "sessions",
                         "data": {
-                            "total": len(active_sessions),
-                            "sessions": [
-                                {
-                                    "id": sid,
-                                    "ticker": s["ticker"],
-                                    "status": s["status"],
-                                }
-                                for sid, s in list(active_sessions.items())[:10]
-                            ],
+                            "total": len(stock_sessions) + len(coin_sessions_dict),
+                            "sessions": all_sessions[:10],
                         },
                     })
 
