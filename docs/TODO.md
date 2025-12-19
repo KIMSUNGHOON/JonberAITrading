@@ -18,35 +18,38 @@
 
 ---
 
-## Phase 1: Market Data Integration [P0] (1-2 weeks)
+## Phase 1: Market Data Integration [P0] ✅ COMPLETED
 
 ### Backend - Upbit API Client
-- [ ] `services/upbit/client.py` - Upbit API 클라이언트 구현
-- [ ] `services/upbit/auth.py` - JWT 인증 모듈
-- [ ] `services/upbit/quotation.py` - 시세 조회 메서드
-  - [ ] `get_markets()` - 마켓 코드 조회
-  - [ ] `get_ticker()` - 현재가 조회
-  - [ ] `get_candles_minutes()` - 분봉 조회
-  - [ ] `get_candles_days()` - 일봉 조회
-  - [ ] `get_orderbook()` - 호가 조회
-  - [ ] `get_trades()` - 체결 내역 조회
+- [x] `services/upbit/client.py` - Upbit API 클라이언트 구현
+- [x] `services/upbit/auth.py` - JWT 인증 모듈
+- [x] `services/upbit/models.py` - Pydantic 모델 정의
+  - [x] `get_markets()` - 마켓 코드 조회
+  - [x] `get_ticker()` - 현재가 조회
+  - [x] `get_candles_minutes()` - 분봉 조회
+  - [x] `get_candles_days()` - 일봉 조회
+  - [x] `get_orderbook()` - 호가 조회
+  - [x] `get_trades()` - 체결 내역 조회
 
 ### Backend - API Routes
-- [ ] `app/api/routes/coin_analysis.py` - 코인 분석 라우트
-  - [ ] `POST /api/coin/analysis/start` - 분석 시작
-  - [ ] `GET /api/coin/markets` - 마켓 목록
-  - [ ] `GET /api/coin/ticker/{market}` - 현재가
-  - [ ] `GET /api/coin/candles/{market}` - 캔들 데이터
+- [x] `app/api/routes/coin.py` - 코인 분석 라우트
+  - [x] `POST /api/coin/analysis/start` - 분석 시작
+  - [x] `GET /api/coin/markets` - 마켓 목록
+  - [x] `GET /api/coin/ticker/{market}` - 현재가
+  - [x] `GET /api/coin/candles/{market}` - 캔들 데이터
+  - [x] `GET /api/coin/orderbook/{market}` - 호가 조회
+  - [x] `POST /api/coin/markets/search` - 마켓 검색
 
 ### Frontend - Tab Navigation
-- [ ] `components/layout/MarketTabs.tsx` - 증권/코인 탭 컴포넌트
-- [ ] Store에 `activeMarket` 상태 추가
-- [ ] App.tsx에서 탭 기반 라우팅
+- [x] `components/layout/MarketTabs.tsx` - 증권/코인 탭 컴포넌트
+- [x] Store에 `activeMarket` 상태 추가
+- [x] Sidebar에서 탭 기반 입력 컴포넌트 전환
 
 ### Frontend - Coin Input
-- [ ] `components/coin/CoinTickerInput.tsx` - 코인 검색/선택
-- [ ] 마켓 자동완성 드롭다운
-- [ ] 한글/영문 검색 지원
+- [x] `components/coin/CoinTickerInput.tsx` - 코인 검색/선택
+- [x] 마켓 자동완성 드롭다운
+- [x] 한글/영문 검색 지원
+- [x] 인기 코인 빠른 선택
 
 ---
 
