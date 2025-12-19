@@ -24,6 +24,7 @@ import { useStore, selectTickerHistory, type TickerHistoryItem } from '@/store';
 import { TickerInput } from '@/components/analysis/TickerInput';
 import { CoinTickerInput } from '@/components/coin/CoinTickerInput';
 import { MarketTabs } from '@/components/layout/MarketTabs';
+import { SettingsModal } from '@/components/settings/SettingsModal';
 
 interface NavItemProps {
   icon: React.ReactNode;
@@ -115,11 +116,18 @@ function HistoryItem({ item, isActive }: HistoryItemProps) {
 
 export function Sidebar() {
   const [showHistory, setShowHistory] = useState(true);
-  const activePosition = useStore((state) => state.activePosition);
-  const analyses = useStore((state) => state.analyses);
-  const tickerHistory = useStore(selectTickerHistory);
-  const activeSessionId = useStore((state) => state.activeSessionId);
+  const [showSettings, setShowSettings] = useState(false);
   const activeMarket = useStore((state) => state.activeMarket);
+  const activePosition = useStore((state) =>
+    state.activeMarket === 'stock' ? state.stock.activePosition : state.coin.activePosition
+  );
+  const analyses = useStore((state) =>
+    state.activeMarket === 'stock' ? state.stock.analyses : state.coin.analyses
+  );
+  const tickerHistory = useStore(selectTickerHistory);
+  const activeSessionId = useStore((state) =>
+    state.activeMarket === 'stock' ? state.stock.activeSessionId : state.coin.activeSessionId
+  );
 
   return (
     <div className="h-full flex flex-col p-4">
@@ -199,6 +207,7 @@ export function Sidebar() {
         <NavItem
           icon={<Settings className="w-5 h-5" />}
           label="Settings"
+          onClick={() => setShowSettings(true)}
         />
       </nav>
 
@@ -206,6 +215,12 @@ export function Sidebar() {
       <div className="mt-4 px-3 py-2 text-xs text-gray-500 flex-shrink-0">
         v1.0.0 - Beta
       </div>
+
+      {/* Settings Modal */}
+      <SettingsModal
+        isOpen={showSettings}
+        onClose={() => setShowSettings(false)}
+      />
     </div>
   );
 }

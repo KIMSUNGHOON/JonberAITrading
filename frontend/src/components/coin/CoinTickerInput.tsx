@@ -32,15 +32,16 @@ export function CoinTickerInput() {
   const inputRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  const status = useStore((state) => state.status);
-  const startSession = useStore((state) => state.startSession);
-  const addReasoningEntry = useStore((state) => state.addReasoningEntry);
-  const setStatus = useStore((state) => state.setStatus);
-  const setCurrentStage = useStore((state) => state.setCurrentStage);
-  const setTradeProposal = useStore((state) => state.setTradeProposal);
-  const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
-  const setActivePosition = useStore((state) => state.setActivePosition);
-  const setError = useStore((state) => state.setError);
+  // Use coin-specific state and actions
+  const status = useStore((state) => state.coin.status);
+  const startCoinSession = useStore((state) => state.startCoinSession);
+  const addCoinReasoning = useStore((state) => state.addCoinReasoning);
+  const setCoinStatus = useStore((state) => state.setCoinStatus);
+  const setCoinStage = useStore((state) => state.setCoinStage);
+  const setCoinProposal = useStore((state) => state.setCoinProposal);
+  const setCoinAwaitingApproval = useStore((state) => state.setCoinAwaitingApproval);
+  const setCoinPosition = useStore((state) => state.setCoinPosition);
+  const setCoinError = useStore((state) => state.setCoinError);
   const addChatMessage = useStore((state) => state.addChatMessage);
 
   const isDisabled = status === 'running' || status === 'awaiting_approval';
@@ -103,8 +104,8 @@ export function CoinTickerInput() {
       // Start coin analysis via API
       const response = await startCoinAnalysis({ market });
 
-      // Update store with market code as ticker
-      startSession(response.session_id, market);
+      // Update store with coin-specific session
+      startCoinSession(response.session_id, market, koreanName);
 
       // Add system message
       addChatMessage({
@@ -117,24 +118,23 @@ export function CoinTickerInput() {
         activeCoinWebSocket.disconnect();
       }
 
-      // Connect WebSocket for real-time updates
-      // Note: Using same WebSocket handler as stock for now
-      // TODO: Create coin-specific WebSocket handler if needed
+      // Connect WebSocket for real-time updates (using coin-specific handlers)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       activeCoinWebSocket = createStoreWebSocket(response.session_id, {
-        addReasoningEntry,
-        setStatus,
-        setCurrentStage,
-        setTradeProposal,
-        setAwaitingApproval,
-        setActivePosition,
-        setError,
+        addReasoningEntry: addCoinReasoning,
+        setStatus: setCoinStatus,
+        setCurrentStage: setCoinStage,
+        setTradeProposal: setCoinProposal as any,
+        setAwaitingApproval: setCoinAwaitingApproval,
+        setActivePosition: setCoinPosition,
+        setError: setCoinError,
       });
 
       activeCoinWebSocket.connect();
 
       setQuery('');
     } catch (error) {
-      setError(
+      setCoinError(
         error instanceof Error ? error.message : 'Failed to start coin analysis'
       );
     } finally {

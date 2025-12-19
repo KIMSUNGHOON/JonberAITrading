@@ -5,7 +5,13 @@
  */
 
 import { useShallow } from 'zustand/shallow';
-import { useStore } from '@/store';
+import {
+  useStore,
+  selectSession,
+  selectAnalysis,
+  selectProposal,
+  selectActivePosition,
+} from '@/store';
 import { ChartPanel } from '@/components/chart/ChartPanel';
 import { AnalysisPanel } from '@/components/analysis/AnalysisPanel';
 import { ReasoningLog } from '@/components/analysis/ReasoningLog';
@@ -15,27 +21,13 @@ import { PositionCard } from '@/components/position/PositionCard';
 import { WelcomePanel } from '@/components/analysis/WelcomePanel';
 
 export function MainContent() {
-  const { sessionId, ticker, status, currentStage } = useStore(
-    useShallow((state) => ({
-      sessionId: state.activeSessionId,
-      ticker: state.ticker,
-      status: state.status,
-      currentStage: state.currentStage,
-    }))
+  const { sessionId, ticker, status } = useStore(useShallow(selectSession));
+  const currentStage = useStore((state) =>
+    state.activeMarket === 'stock' ? state.stock.currentStage : state.coin.currentStage
   );
-  const { analyses, reasoningLog } = useStore(
-    useShallow((state) => ({
-      analyses: state.analyses,
-      reasoningLog: state.reasoningLog,
-    }))
-  );
-  const { proposal, awaitingApproval } = useStore(
-    useShallow((state) => ({
-      proposal: state.tradeProposal,
-      awaitingApproval: state.awaitingApproval,
-    }))
-  );
-  const activePosition = useStore((state) => state.activePosition);
+  const { analyses, reasoningLog } = useStore(useShallow(selectAnalysis));
+  const { proposal, awaitingApproval } = useStore(useShallow(selectProposal));
+  const activePosition = useStore(selectActivePosition);
   const showChartPanel = useStore((state) => state.showChartPanel);
 
   // Show welcome panel when idle

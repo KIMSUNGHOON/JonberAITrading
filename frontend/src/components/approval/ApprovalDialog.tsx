@@ -17,18 +17,22 @@ import {
   Target,
   Loader2,
 } from 'lucide-react';
-import { useShallow } from 'zustand/shallow';
-import { useStore } from '@/store';
+import { useStore, selectTradeProposal, selectActiveSessionId } from '@/store';
 import { submitApproval } from '@/api/client';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
+import type { TradeProposal, CoinTradeProposal } from '@/types';
+
+// Helper to get symbol from either stock or coin proposal
+function getProposalSymbol(proposal: TradeProposal | CoinTradeProposal): string {
+  if ('ticker' in proposal) {
+    return proposal.ticker;
+  }
+  return proposal.market;
+}
 
 export function ApprovalDialog() {
-  const { proposal } = useStore(
-    useShallow((state) => ({
-      proposal: state.tradeProposal,
-    }))
-  );
-  const sessionId = useStore((state) => state.activeSessionId);
+  const proposal = useStore(selectTradeProposal);
+  const sessionId = useStore(selectActiveSessionId);
   const setShowApprovalDialog = useStore((state) => state.setShowApprovalDialog);
   const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
   const setTradeProposal = useStore((state) => state.setTradeProposal);
@@ -58,10 +62,11 @@ export function ApprovalDialog() {
       }
 
       // Add chat message
+      const symbol = getProposalSymbol(proposal);
       addChatMessage({
         role: 'system',
         content: decision === 'approved'
-          ? `Trade approved: ${proposal.action.toUpperCase()} ${proposal.quantity} ${proposal.ticker}`
+          ? `Trade approved: ${proposal.action.toUpperCase()} ${proposal.quantity} ${symbol}`
           : `Trade rejected - Re-analyzing with feedback${feedback ? `: "${feedback}"` : '...'}`,
       });
 
@@ -127,8 +132,8 @@ export function ApprovalDialog() {
           <div className="grid grid-cols-2 gap-4 mb-6">
             <DetailRow
               icon={<DollarSign className="w-4 h-4" />}
-              label="Ticker"
-              value={proposal.ticker}
+              label="Symbol"
+              value={getProposalSymbol(proposal)}
             />
             <DetailRow
               icon={<Shield className="w-4 h-4" />}

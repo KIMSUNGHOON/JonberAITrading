@@ -5,11 +5,11 @@
  */
 
 import { Menu, Settings, Bell, Activity } from 'lucide-react';
-import { useStore } from '@/store';
+import { useStore, selectStatus, selectTicker } from '@/store';
 
 export function Header() {
-  const status = useStore((state) => state.status);
-  const ticker = useStore((state) => state.ticker);
+  const status = useStore(selectStatus);
+  const ticker = useStore(selectTicker);
   const setMobileMenuOpen = useStore((state) => state.setMobileMenuOpen);
 
   const isActive = status === 'running' || status === 'awaiting_approval';

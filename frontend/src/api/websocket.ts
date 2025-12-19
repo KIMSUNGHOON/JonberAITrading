@@ -8,7 +8,7 @@
  * - Position updates
  */
 
-import type { TradeProposal, Position, SessionStatus } from '@/types';
+import type { TradeProposal, CoinTradeProposal, Position, SessionStatus } from '@/types';
 
 // -------------------------------------------
 // Types
@@ -317,7 +317,7 @@ export function createStoreWebSocket(
     addReasoningEntry: (entry: string) => void;
     setStatus: (status: SessionStatus) => void;
     setCurrentStage: (stage: string) => void;
-    setTradeProposal: (proposal: TradeProposal | null) => void;
+    setTradeProposal: (proposal: TradeProposal | CoinTradeProposal | null) => void;
     setAwaitingApproval: (awaiting: boolean) => void;
     setActivePosition: (position: Position | null) => void;
     setError: (error: string | null) => void;

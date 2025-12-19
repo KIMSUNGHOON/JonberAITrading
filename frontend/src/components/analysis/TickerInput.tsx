@@ -17,15 +17,16 @@ export function TickerInput() {
   const [ticker, setTicker] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
-  const status = useStore((state) => state.status);
-  const startSession = useStore((state) => state.startSession);
-  const addReasoningEntry = useStore((state) => state.addReasoningEntry);
-  const setStatus = useStore((state) => state.setStatus);
-  const setCurrentStage = useStore((state) => state.setCurrentStage);
-  const setTradeProposal = useStore((state) => state.setTradeProposal);
-  const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
-  const setActivePosition = useStore((state) => state.setActivePosition);
-  const setError = useStore((state) => state.setError);
+  // Use stock-specific state and actions
+  const status = useStore((state) => state.stock.status);
+  const startStockSession = useStore((state) => state.startStockSession);
+  const addStockReasoning = useStore((state) => state.addStockReasoning);
+  const setStockStatus = useStore((state) => state.setStockStatus);
+  const setStockStage = useStore((state) => state.setStockStage);
+  const setStockProposal = useStore((state) => state.setStockProposal);
+  const setStockAwaitingApproval = useStore((state) => state.setStockAwaitingApproval);
+  const setStockPosition = useStore((state) => state.setStockPosition);
+  const setStockError = useStore((state) => state.setStockError);
   const addChatMessage = useStore((state) => state.addChatMessage);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -40,13 +41,13 @@ export function TickerInput() {
       // Start analysis via API
       const response = await startAnalysis({ ticker: cleanTicker });
 
-      // Update store
-      startSession(response.session_id, cleanTicker);
+      // Update store with stock-specific action
+      startStockSession(response.session_id, cleanTicker);
 
       // Add system message
       addChatMessage({
         role: 'system',
-        content: `Analysis started for ${cleanTicker}`,
+        content: `Stock analysis started for ${cleanTicker}`,
       });
 
       // Disconnect existing WebSocket
@@ -54,22 +55,23 @@ export function TickerInput() {
         activeWebSocket.disconnect();
       }
 
-      // Connect WebSocket for real-time updates
+      // Connect WebSocket for real-time updates (using stock-specific handlers)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       activeWebSocket = createStoreWebSocket(response.session_id, {
-        addReasoningEntry,
-        setStatus,
-        setCurrentStage,
-        setTradeProposal,
-        setAwaitingApproval,
-        setActivePosition,
-        setError,
+        addReasoningEntry: addStockReasoning,
+        setStatus: setStockStatus,
+        setCurrentStage: setStockStage,
+        setTradeProposal: setStockProposal as any,
+        setAwaitingApproval: setStockAwaitingApproval,
+        setActivePosition: setStockPosition,
+        setError: setStockError,
       });
 
       activeWebSocket.connect();
 
       setTicker('');
     } catch (error) {
-      setError(error instanceof Error ? error.message : 'Failed to start analysis');
+      setStockError(error instanceof Error ? error.message : 'Failed to start analysis');
     } finally {
       setIsLoading(false);
     }

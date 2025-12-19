@@ -5,7 +5,7 @@
  */
 
 import { useEffect } from 'react';
-import { useStore } from '@/store';
+import { useStore, selectError } from '@/store';
 import { Header } from '@/components/layout/Header';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { MainContent } from '@/components/layout/MainContent';
@@ -15,7 +15,7 @@ import { MobileNav } from '@/components/layout/MobileNav';
 
 function App() {
   const showApprovalDialog = useStore((state) => state.showApprovalDialog);
-  const error = useStore((state) => state.error);
+  const error = useStore(selectError);
   const setError = useStore((state) => state.setError);
 
   // Clear error after 5 seconds

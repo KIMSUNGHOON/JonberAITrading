@@ -248,3 +248,39 @@ export interface CoinAnalysisStatus {
   reasoning_log: string[];
   error: string | null;
 }
+
+// -------------------------------------------
+// Settings Types
+// -------------------------------------------
+
+export interface UpbitApiKeyStatus {
+  is_configured: boolean;
+  access_key_masked: string | null;
+  trading_mode: string;
+  is_valid: boolean | null;
+  last_validated: string | null;
+}
+
+export interface UpbitApiKeyRequest {
+  access_key: string;
+  secret_key: string;
+}
+
+export interface UpbitApiKeyResponse {
+  success: boolean;
+  message: string;
+  status: UpbitApiKeyStatus;
+}
+
+export interface UpbitValidateResponse {
+  is_valid: boolean;
+  message: string;
+  account_count: number | null;
+}
+
+export interface SettingsStatus {
+  upbit: UpbitApiKeyStatus;
+  llm_provider: string;
+  llm_model: string;
+  market_data_mode: string;
+}

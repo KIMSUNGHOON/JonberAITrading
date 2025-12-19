@@ -12,7 +12,7 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
-import { useStore } from '@/store';
+import { useStore, selectStatus, selectAwaitingApproval } from '@/store';
 import { ChatPanel } from '@/components/chat/ChatPanel';
 import { Sidebar } from './Sidebar';
 
@@ -22,8 +22,8 @@ export function MobileNav() {
   const [activeView, setActiveView] = useState<MobileView>('none');
   const isMobileMenuOpen = useStore((state) => state.isMobileMenuOpen);
   const setMobileMenuOpen = useStore((state) => state.setMobileMenuOpen);
-  const status = useStore((state) => state.status);
-  const awaitingApproval = useStore((state) => state.awaitingApproval);
+  const status = useStore(selectStatus);
+  const awaitingApproval = useStore(selectAwaitingApproval);
 
   const toggleView = (view: MobileView) => {
     setActiveView((current) => (current === view ? 'none' : view));

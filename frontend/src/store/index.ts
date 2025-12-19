@@ -1,11 +1,16 @@
 /**
  * Zustand Store for Agentic Trading
  *
- * Manages global application state including:
- * - Active session and analysis status
- * - Chat messages (hybrid UI)
- * - Trade proposals and positions
- * - UI state (modals, panels)
+ * Manages global application state with COMPLETE ISOLATION between:
+ * - Stock analysis (stocks via yfinance)
+ * - Coin analysis (cryptocurrency via Upbit)
+ *
+ * Each market type has its own:
+ * - Session state
+ * - Analysis results
+ * - Trade proposals
+ * - Positions
+ * - History
  */
 
 import { create } from 'zustand';
@@ -18,44 +23,60 @@ import type {
   TradeProposal,
   ChartConfig,
   TimeFrame,
+  CoinTradeProposal,
 } from '@/types';
 
 // -------------------------------------------
 // Store Types
 // -------------------------------------------
 
-interface TickerHistoryItem {
-  ticker: string;
+interface HistoryItem {
+  ticker: string;  // Stock ticker or coin market code
   sessionId: string;
   timestamp: Date;
   status: SessionStatus | 'idle';
 }
 
-interface AnalysisState {
-  // Session
+// Stock-specific history
+interface StockHistoryItem extends HistoryItem {
+  type: 'stock';
+}
+
+// Coin-specific history
+interface CoinHistoryItem extends HistoryItem {
+  type: 'coin';
+  koreanName?: string;
+}
+
+// Combined ticker history (for backward compatibility)
+type TickerHistoryItem = StockHistoryItem | CoinHistoryItem;
+
+// Base analysis state (shared structure)
+interface BaseAnalysisState {
   activeSessionId: string | null;
-  ticker: string;
   status: SessionStatus | 'idle';
-
-  // Ticker history
-  tickerHistory: TickerHistoryItem[];
-
-  // Analysis results
-  analyses: AnalysisSummary[];
   currentStage: string | null;
-
-  // Reasoning log
   reasoningLog: string[];
-
-  // Trade proposal
-  tradeProposal: TradeProposal | null;
+  analyses: AnalysisSummary[];
   awaitingApproval: boolean;
-
-  // Position
-  activePosition: Position | null;
-
-  // Error
   error: string | null;
+}
+
+// Stock-specific state
+interface StockState extends BaseAnalysisState {
+  ticker: string;
+  tradeProposal: TradeProposal | null;
+  activePosition: Position | null;
+  history: StockHistoryItem[];
+}
+
+// Coin-specific state
+interface CoinState extends BaseAnalysisState {
+  market: string;           // e.g., "KRW-BTC"
+  koreanName: string | null;
+  tradeProposal: CoinTradeProposal | null;
+  activePosition: Position | null;
+  history: CoinHistoryItem[];
 }
 
 interface ChatState {
@@ -78,62 +99,102 @@ interface UIState {
   chartConfig: ChartConfig;
 }
 
-interface Actions {
-  // Session actions
-  startSession: (sessionId: string, ticker: string) => void;
-  setStatus: (status: SessionStatus) => void;
-  setCurrentStage: (stage: string) => void;
+interface StockActions {
+  // Stock session actions
+  startStockSession: (sessionId: string, ticker: string) => void;
+  setStockStatus: (status: SessionStatus) => void;
+  setStockStage: (stage: string) => void;
+  addStockReasoning: (entry: string) => void;
+  setStockAnalyses: (analyses: AnalysisSummary[]) => void;
+  addStockAnalysis: (analysis: AnalysisSummary) => void;
+  setStockProposal: (proposal: TradeProposal | null) => void;
+  setStockAwaitingApproval: (awaiting: boolean) => void;
+  setStockPosition: (position: Position | null) => void;
+  setStockError: (error: string | null) => void;
+  resetStock: () => void;
+}
 
-  // Analysis actions
-  addReasoningEntry: (entry: string) => void;
-  setAnalyses: (analyses: AnalysisSummary[]) => void;
-  addAnalysis: (analysis: AnalysisSummary) => void;
+interface CoinActions {
+  // Coin session actions
+  startCoinSession: (sessionId: string, market: string, koreanName?: string) => void;
+  setCoinStatus: (status: SessionStatus) => void;
+  setCoinStage: (stage: string) => void;
+  addCoinReasoning: (entry: string) => void;
+  setCoinAnalyses: (analyses: AnalysisSummary[]) => void;
+  addCoinAnalysis: (analysis: AnalysisSummary) => void;
+  setCoinProposal: (proposal: CoinTradeProposal | null) => void;
+  setCoinAwaitingApproval: (awaiting: boolean) => void;
+  setCoinPosition: (position: Position | null) => void;
+  setCoinError: (error: string | null) => void;
+  resetCoin: () => void;
+}
 
-  // Proposal actions
-  setTradeProposal: (proposal: TradeProposal | null) => void;
-  setAwaitingApproval: (awaiting: boolean) => void;
-
-  // Position actions
-  setActivePosition: (position: Position | null) => void;
-
-  // Chat actions
+interface ChatActions {
   addChatMessage: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => void;
   setIsTyping: (typing: boolean) => void;
   clearChat: () => void;
+}
 
-  // UI actions
+interface UIActions {
   setActiveMarket: (market: MarketType) => void;
   setShowApprovalDialog: (show: boolean) => void;
   setShowChartPanel: (show: boolean) => void;
   setMobileMenuOpen: (open: boolean) => void;
   setChartTimeframe: (timeframe: TimeFrame) => void;
   toggleChartIndicator: (indicator: 'showSMA50' | 'showSMA200' | 'showVolume') => void;
+}
 
-  // Error handling
+// Legacy actions for backward compatibility
+interface LegacyActions {
+  startSession: (sessionId: string, ticker: string) => void;
+  setStatus: (status: SessionStatus) => void;
+  setCurrentStage: (stage: string) => void;
+  addReasoningEntry: (entry: string) => void;
+  setAnalyses: (analyses: AnalysisSummary[]) => void;
+  addAnalysis: (analysis: AnalysisSummary) => void;
+  setTradeProposal: (proposal: TradeProposal | null) => void;
+  setAwaitingApproval: (awaiting: boolean) => void;
+  setActivePosition: (position: Position | null) => void;
   setError: (error: string | null) => void;
-
-  // Reset
   reset: () => void;
 }
 
-type Store = AnalysisState & ChatState & UIState & Actions;
+type Store = {
+  stock: StockState;
+  coin: CoinState;
+} & ChatState & UIState & StockActions & CoinActions & ChatActions & UIActions & LegacyActions;
 
 // -------------------------------------------
-// Initial State
+// Initial States
 // -------------------------------------------
 
-const initialAnalysisState: AnalysisState = {
+const initialStockState: StockState = {
   activeSessionId: null,
   ticker: '',
   status: 'idle',
-  tickerHistory: [],
-  analyses: [],
   currentStage: null,
   reasoningLog: [],
+  analyses: [],
   tradeProposal: null,
   awaitingApproval: false,
   activePosition: null,
   error: null,
+  history: [],
+};
+
+const initialCoinState: CoinState = {
+  activeSessionId: null,
+  market: '',
+  koreanName: null,
+  status: 'idle',
+  currentStage: null,
+  reasoningLog: [],
+  analyses: [],
+  tradeProposal: null,
+  awaitingApproval: false,
+  activePosition: null,
+  error: null,
+  history: [],
 };
 
 const initialChatState: ChatState = {
@@ -161,86 +222,223 @@ const initialUIState: UIState = {
 export const useStore = create<Store>()(
   devtools(
     (set, get) => ({
-      // Initial state
-      ...initialAnalysisState,
+      // Initial states
+      stock: initialStockState,
+      coin: initialCoinState,
       ...initialChatState,
       ...initialUIState,
 
-      // Session actions
-      startSession: (sessionId, ticker) =>
+      // -------------------------------------------
+      // Stock Actions
+      // -------------------------------------------
+      startStockSession: (sessionId, ticker) =>
         set((state) => {
           const upperTicker = ticker.toUpperCase();
-          // Add to history (avoid duplicates for same session)
-          const existingIndex = state.tickerHistory.findIndex(
+          const existingIndex = state.stock.history.findIndex(
             (h) => h.sessionId === sessionId
           );
-          let newHistory = [...state.tickerHistory];
+          let newHistory = [...state.stock.history];
           if (existingIndex === -1) {
-            // Add new entry at the beginning
             newHistory = [
               {
+                type: 'stock' as const,
                 ticker: upperTicker,
                 sessionId,
                 timestamp: new Date(),
                 status: 'running' as const,
               },
-              ...state.tickerHistory,
-            ].slice(0, 20); // Keep last 20 entries
+              ...state.stock.history,
+            ].slice(0, 20);
           }
           return {
-            activeSessionId: sessionId,
-            ticker: upperTicker,
-            status: 'running',
-            tickerHistory: newHistory,
-            analyses: [],
-            reasoningLog: [],
-            tradeProposal: null,
-            awaitingApproval: false,
-            error: null,
+            stock: {
+              ...initialStockState,
+              activeSessionId: sessionId,
+              ticker: upperTicker,
+              status: 'running',
+              history: newHistory,
+            },
           };
         }),
 
-      setStatus: (status) =>
+      setStockStatus: (status) =>
         set((state) => {
-          // Update history status for current session
-          const newHistory = state.tickerHistory.map((h) =>
-            h.sessionId === state.activeSessionId ? { ...h, status } : h
+          const newHistory = state.stock.history.map((h) =>
+            h.sessionId === state.stock.activeSessionId ? { ...h, status } : h
           );
-          return { status, tickerHistory: newHistory };
+          return {
+            stock: { ...state.stock, status, history: newHistory },
+          };
         }),
 
-      setCurrentStage: (stage) => set({ currentStage: stage }),
-
-      // Analysis actions
-      addReasoningEntry: (entry) =>
+      setStockStage: (stage) =>
         set((state) => ({
-          reasoningLog: [...state.reasoningLog, entry],
+          stock: { ...state.stock, currentStage: stage },
         })),
 
-      setAnalyses: (analyses) => set({ analyses }),
-
-      addAnalysis: (analysis) =>
+      addStockReasoning: (entry) =>
         set((state) => ({
-          analyses: [...state.analyses, analysis],
+          stock: {
+            ...state.stock,
+            reasoningLog: [...state.stock.reasoningLog, entry],
+          },
         })),
 
-      // Proposal actions
-      setTradeProposal: (proposal) =>
-        set({
-          tradeProposal: proposal,
+      setStockAnalyses: (analyses) =>
+        set((state) => ({
+          stock: { ...state.stock, analyses },
+        })),
+
+      addStockAnalysis: (analysis) =>
+        set((state) => ({
+          stock: {
+            ...state.stock,
+            analyses: [...state.stock.analyses, analysis],
+          },
+        })),
+
+      setStockProposal: (proposal) =>
+        set((state) => ({
+          stock: { ...state.stock, tradeProposal: proposal },
           showApprovalDialog: proposal !== null,
-        }),
+        })),
 
-      setAwaitingApproval: (awaiting) =>
-        set({
-          awaitingApproval: awaiting,
+      setStockAwaitingApproval: (awaiting) =>
+        set((state) => ({
+          stock: { ...state.stock, awaitingApproval: awaiting },
           showApprovalDialog: awaiting,
+        })),
+
+      setStockPosition: (position) =>
+        set((state) => ({
+          stock: { ...state.stock, activePosition: position },
+        })),
+
+      setStockError: (error) =>
+        set((state) => ({
+          stock: {
+            ...state.stock,
+            error,
+            status: error ? 'error' : state.stock.status,
+          },
+        })),
+
+      resetStock: () =>
+        set((state) => ({
+          stock: {
+            ...initialStockState,
+            history: state.stock.history,
+          },
+        })),
+
+      // -------------------------------------------
+      // Coin Actions
+      // -------------------------------------------
+      startCoinSession: (sessionId, market, koreanName) =>
+        set((state) => {
+          const upperMarket = market.toUpperCase();
+          const existingIndex = state.coin.history.findIndex(
+            (h) => h.sessionId === sessionId
+          );
+          let newHistory = [...state.coin.history];
+          if (existingIndex === -1) {
+            newHistory = [
+              {
+                type: 'coin' as const,
+                ticker: upperMarket,
+                koreanName,
+                sessionId,
+                timestamp: new Date(),
+                status: 'running' as const,
+              },
+              ...state.coin.history,
+            ].slice(0, 20);
+          }
+          return {
+            coin: {
+              ...initialCoinState,
+              activeSessionId: sessionId,
+              market: upperMarket,
+              koreanName: koreanName || null,
+              status: 'running',
+              history: newHistory,
+            },
+          };
         }),
 
-      // Position actions
-      setActivePosition: (position) => set({ activePosition: position }),
+      setCoinStatus: (status) =>
+        set((state) => {
+          const newHistory = state.coin.history.map((h) =>
+            h.sessionId === state.coin.activeSessionId ? { ...h, status } : h
+          );
+          return {
+            coin: { ...state.coin, status, history: newHistory },
+          };
+        }),
 
-      // Chat actions
+      setCoinStage: (stage) =>
+        set((state) => ({
+          coin: { ...state.coin, currentStage: stage },
+        })),
+
+      addCoinReasoning: (entry) =>
+        set((state) => ({
+          coin: {
+            ...state.coin,
+            reasoningLog: [...state.coin.reasoningLog, entry],
+          },
+        })),
+
+      setCoinAnalyses: (analyses) =>
+        set((state) => ({
+          coin: { ...state.coin, analyses },
+        })),
+
+      addCoinAnalysis: (analysis) =>
+        set((state) => ({
+          coin: {
+            ...state.coin,
+            analyses: [...state.coin.analyses, analysis],
+          },
+        })),
+
+      setCoinProposal: (proposal) =>
+        set((state) => ({
+          coin: { ...state.coin, tradeProposal: proposal },
+          showApprovalDialog: proposal !== null,
+        })),
+
+      setCoinAwaitingApproval: (awaiting) =>
+        set((state) => ({
+          coin: { ...state.coin, awaitingApproval: awaiting },
+          showApprovalDialog: awaiting,
+        })),
+
+      setCoinPosition: (position) =>
+        set((state) => ({
+          coin: { ...state.coin, activePosition: position },
+        })),
+
+      setCoinError: (error) =>
+        set((state) => ({
+          coin: {
+            ...state.coin,
+            error,
+            status: error ? 'error' : state.coin.status,
+          },
+        })),
+
+      resetCoin: () =>
+        set((state) => ({
+          coin: {
+            ...initialCoinState,
+            history: state.coin.history,
+          },
+        })),
+
+      // -------------------------------------------
+      // Chat Actions
+      // -------------------------------------------
       addChatMessage: (message) =>
         set((state) => ({
           messages: [
@@ -257,7 +455,9 @@ export const useStore = create<Store>()(
 
       clearChat: () => set({ messages: [] }),
 
-      // UI actions
+      // -------------------------------------------
+      // UI Actions
+      // -------------------------------------------
       setActiveMarket: (market) => set({ activeMarket: market }),
 
       setShowApprovalDialog: (show) => set({ showApprovalDialog: show }),
@@ -279,42 +479,145 @@ export const useStore = create<Store>()(
           },
         })),
 
-      // Error handling
-      setError: (error) => set({ error, status: error ? 'error' : get().status }),
+      // -------------------------------------------
+      // Legacy Actions (for backward compatibility)
+      // These delegate to stock or coin based on activeMarket
+      // -------------------------------------------
+      startSession: (sessionId, ticker) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().startStockSession(sessionId, ticker);
+        } else {
+          get().startCoinSession(sessionId, ticker);
+        }
+      },
 
-      // Reset
-      reset: () =>
-        set((state) => ({
-          ...initialAnalysisState,
-          ...initialChatState,
-          // Keep ticker history and UI state
-          tickerHistory: state.tickerHistory,
-        })),
+      setStatus: (status) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().setStockStatus(status);
+        } else {
+          get().setCoinStatus(status);
+        }
+      },
+
+      setCurrentStage: (stage) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().setStockStage(stage);
+        } else {
+          get().setCoinStage(stage);
+        }
+      },
+
+      addReasoningEntry: (entry) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().addStockReasoning(entry);
+        } else {
+          get().addCoinReasoning(entry);
+        }
+      },
+
+      setAnalyses: (analyses) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().setStockAnalyses(analyses);
+        } else {
+          get().setCoinAnalyses(analyses);
+        }
+      },
+
+      addAnalysis: (analysis) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().addStockAnalysis(analysis);
+        } else {
+          get().addCoinAnalysis(analysis);
+        }
+      },
+
+      setTradeProposal: (proposal) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().setStockProposal(proposal);
+        }
+        // Coin proposals use different type, so skip
+      },
+
+      setAwaitingApproval: (awaiting) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().setStockAwaitingApproval(awaiting);
+        } else {
+          get().setCoinAwaitingApproval(awaiting);
+        }
+      },
+
+      setActivePosition: (position) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().setStockPosition(position);
+        } else {
+          get().setCoinPosition(position);
+        }
+      },
+
+      setError: (error) => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().setStockError(error);
+        } else {
+          get().setCoinError(error);
+        }
+      },
+
+      reset: () => {
+        const market = get().activeMarket;
+        if (market === 'stock') {
+          get().resetStock();
+        } else {
+          get().resetCoin();
+        }
+      },
     }),
     { name: 'agentic-trading-store' }
   )
 );
 
 // -------------------------------------------
-// Selectors (for performance)
+// Selectors
 // -------------------------------------------
 
-export const selectSession = (state: Store) => ({
-  sessionId: state.activeSessionId,
-  ticker: state.ticker,
-  status: state.status,
-});
+// Get current market's session info
+export const selectSession = (state: Store) => {
+  const isStock = state.activeMarket === 'stock';
+  const data = isStock ? state.stock : state.coin;
+  return {
+    sessionId: data.activeSessionId,
+    ticker: isStock ? state.stock.ticker : state.coin.market,
+    status: data.status,
+  };
+};
 
-export const selectAnalysis = (state: Store) => ({
-  analyses: state.analyses,
-  currentStage: state.currentStage,
-  reasoningLog: state.reasoningLog,
-});
+// Get current market's analysis state
+export const selectAnalysis = (state: Store) => {
+  const data = state.activeMarket === 'stock' ? state.stock : state.coin;
+  return {
+    analyses: data.analyses,
+    currentStage: data.currentStage,
+    reasoningLog: data.reasoningLog,
+  };
+};
 
-export const selectProposal = (state: Store) => ({
-  proposal: state.tradeProposal,
-  awaitingApproval: state.awaitingApproval,
-});
+// Get current market's proposal
+export const selectProposal = (state: Store) => {
+  const data = state.activeMarket === 'stock' ? state.stock : state.coin;
+  return {
+    proposal: data.tradeProposal,
+    awaitingApproval: data.awaitingApproval,
+  };
+};
 
 export const selectChat = (state: Store) => ({
   messages: state.messages,
@@ -323,7 +626,72 @@ export const selectChat = (state: Store) => ({
 
 export const selectChartConfig = (state: Store) => state.chartConfig;
 
-export const selectTickerHistory = (state: Store) => state.tickerHistory;
+// Get current market's history
+export const selectTickerHistory = (state: Store): TickerHistoryItem[] => {
+  const isStock = state.activeMarket === 'stock';
+  return isStock ? state.stock.history : state.coin.history;
+};
+
+// Select stock-specific state
+export const selectStock = (state: Store) => state.stock;
+
+// Select coin-specific state
+export const selectCoin = (state: Store) => state.coin;
+
+// Legacy selectors for backward compatibility
+export const selectActiveSessionId = (state: Store) => {
+  return state.activeMarket === 'stock'
+    ? state.stock.activeSessionId
+    : state.coin.activeSessionId;
+};
+
+export const selectTicker = (state: Store) => {
+  return state.activeMarket === 'stock'
+    ? state.stock.ticker
+    : state.coin.market;
+};
+
+export const selectStatus = (state: Store) => {
+  return state.activeMarket === 'stock'
+    ? state.stock.status
+    : state.coin.status;
+};
+
+export const selectAnalyses = (state: Store) => {
+  return state.activeMarket === 'stock'
+    ? state.stock.analyses
+    : state.coin.analyses;
+};
+
+export const selectReasoningLog = (state: Store) => {
+  return state.activeMarket === 'stock'
+    ? state.stock.reasoningLog
+    : state.coin.reasoningLog;
+};
+
+export const selectTradeProposal = (state: Store) => {
+  return state.activeMarket === 'stock'
+    ? state.stock.tradeProposal
+    : state.coin.tradeProposal;
+};
+
+export const selectAwaitingApproval = (state: Store) => {
+  return state.activeMarket === 'stock'
+    ? state.stock.awaitingApproval
+    : state.coin.awaitingApproval;
+};
+
+export const selectActivePosition = (state: Store) => {
+  return state.activeMarket === 'stock'
+    ? state.stock.activePosition
+    : state.coin.activePosition;
+};
+
+export const selectError = (state: Store) => {
+  return state.activeMarket === 'stock'
+    ? state.stock.error
+    : state.coin.error;
+};
 
 // Export types
-export type { TickerHistoryItem, MarketType };
+export type { TickerHistoryItem, StockHistoryItem, CoinHistoryItem, MarketType };

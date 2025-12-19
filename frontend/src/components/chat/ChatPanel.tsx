@@ -7,18 +7,13 @@
 import { useState, useRef, useEffect } from 'react';
 import { Send, Bot, User, Loader2 } from 'lucide-react';
 import { useShallow } from 'zustand/shallow';
-import { useStore } from '@/store';
+import { useStore, selectStatus, selectChat } from '@/store';
 import { format } from 'date-fns';
 
 export function ChatPanel() {
-  const { messages, isTyping } = useStore(
-    useShallow((state) => ({
-      messages: state.messages,
-      isTyping: state.isTyping,
-    }))
-  );
+  const { messages, isTyping } = useStore(useShallow(selectChat));
   const addChatMessage = useStore((state) => state.addChatMessage);
-  const status = useStore((state) => state.status);
+  const status = useStore(selectStatus);
 
   const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);

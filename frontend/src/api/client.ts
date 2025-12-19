@@ -14,6 +14,11 @@ import type {
   CoinAnalysisRequest,
   CoinAnalysisResponse,
   CoinMarketInfo,
+  SettingsStatus,
+  UpbitApiKeyRequest,
+  UpbitApiKeyResponse,
+  UpbitApiKeyStatus,
+  UpbitValidateResponse,
 } from '@/types';
 
 // -------------------------------------------
@@ -255,6 +260,55 @@ class ApiClient {
     const response = await this.client.get('/health');
     return response.data;
   }
+
+  // -------------------------------------------
+  // Settings Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get current settings status.
+   */
+  async getSettings(): Promise<SettingsStatus> {
+    const response = await this.client.get<SettingsStatus>('/settings');
+    return response.data;
+  }
+
+  /**
+   * Get Upbit API key status.
+   */
+  async getUpbitApiStatus(): Promise<UpbitApiKeyStatus> {
+    const response = await this.client.get<UpbitApiKeyStatus>('/settings/upbit');
+    return response.data;
+  }
+
+  /**
+   * Update Upbit API keys.
+   */
+  async updateUpbitApiKeys(request: UpbitApiKeyRequest): Promise<UpbitApiKeyResponse> {
+    const response = await this.client.post<UpbitApiKeyResponse>(
+      '/settings/upbit',
+      request
+    );
+    return response.data;
+  }
+
+  /**
+   * Validate Upbit API keys.
+   */
+  async validateUpbitApiKeys(): Promise<UpbitValidateResponse> {
+    const response = await this.client.post<UpbitValidateResponse>(
+      '/settings/upbit/validate'
+    );
+    return response.data;
+  }
+
+  /**
+   * Clear Upbit API keys.
+   */
+  async clearUpbitApiKeys(): Promise<{ message: string }> {
+    const response = await this.client.delete('/settings/upbit');
+    return response.data;
+  }
 }
 
 // -------------------------------------------
@@ -304,3 +358,15 @@ export const getCoinSessionStatus = (sessionId: string) =>
 
 export const cancelCoinSession = (sessionId: string) =>
   apiClient.cancelCoinSession(sessionId);
+
+// Settings API
+export const getSettings = () => apiClient.getSettings();
+
+export const getUpbitApiStatus = () => apiClient.getUpbitApiStatus();
+
+export const updateUpbitApiKeys = (request: UpbitApiKeyRequest) =>
+  apiClient.updateUpbitApiKeys(request);
+
+export const validateUpbitApiKeys = () => apiClient.validateUpbitApiKeys();
+
+export const clearUpbitApiKeys = () => apiClient.clearUpbitApiKeys();

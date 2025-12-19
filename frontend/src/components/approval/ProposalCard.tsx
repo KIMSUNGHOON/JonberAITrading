@@ -11,10 +11,23 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { useStore } from '@/store';
-import type { TradeProposal } from '@/types';
+import type { TradeProposal, CoinTradeProposal } from '@/types';
 
 interface ProposalCardProps {
-  proposal: TradeProposal;
+  proposal: TradeProposal | CoinTradeProposal;
+}
+
+// Helper to get symbol from either stock or coin proposal
+function getProposalSymbol(proposal: TradeProposal | CoinTradeProposal): string {
+  if ('ticker' in proposal) {
+    return proposal.ticker;
+  }
+  return proposal.market;
+}
+
+// Helper to check if it's a coin proposal
+function isCoinProposal(proposal: TradeProposal | CoinTradeProposal): proposal is CoinTradeProposal {
+  return 'market' in proposal;
 }
 
 export function ProposalCard({ proposal }: ProposalCardProps) {
@@ -22,6 +35,8 @@ export function ProposalCard({ proposal }: ProposalCardProps) {
 
   const isBuy = proposal.action === 'BUY';
   const riskLevel = proposal.risk_score <= 3 ? 'Low' : proposal.risk_score <= 6 ? 'Medium' : 'High';
+  const isCoin = isCoinProposal(proposal);
+  const symbol = getProposalSymbol(proposal);
 
   return (
     <div
@@ -39,7 +54,7 @@ export function ProposalCard({ proposal }: ProposalCardProps) {
         {/* Content */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
-            <span className="font-semibold">Trade Proposal</span>
+            <span className="font-semibold">{isCoin ? 'Coin' : 'Stock'} Trade Proposal</span>
             <span
               className={`px-2 py-0.5 rounded text-xs font-medium ${
                 isBuy ? 'signal-buy' : 'signal-sell'
@@ -56,10 +71,10 @@ export function ProposalCard({ proposal }: ProposalCardProps) {
               ) : (
                 <TrendingDown className="w-4 h-4 text-bear" />
               )}
-              {proposal.ticker}
+              {symbol}
             </span>
-            <span>{proposal.quantity} shares</span>
-            <span>${proposal.entry_price?.toFixed(2) ?? 'N/A'}</span>
+            <span>{proposal.quantity} {isCoin ? 'KRW' : 'shares'}</span>
+            <span>{isCoin ? '' : '$'}{proposal.entry_price?.toFixed(2) ?? 'N/A'}{isCoin ? ' KRW' : ''}</span>
             <span className={
               proposal.risk_score <= 3
                 ? 'text-bull'

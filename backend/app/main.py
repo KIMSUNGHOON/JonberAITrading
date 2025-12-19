@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.llm_provider import get_llm_provider, reset_llm_provider
-from app.api.routes import analysis, approval, websocket, auth, coin
+from app.api.routes import analysis, approval, websocket, auth, coin, settings as settings_routes
 from app.config import settings
 from app.logging_config import configure_logging, RequestLoggingMiddleware
 from services.storage_service import get_storage_service, close_storage_service
@@ -144,6 +144,11 @@ app.include_router(
     coin.router,
     prefix="/api/coin",
     tags=["Coin"],
+)
+app.include_router(
+    settings_routes.router,
+    prefix="/api/settings",
+    tags=["Settings"],
 )
 
 
