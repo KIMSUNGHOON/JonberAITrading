@@ -7,9 +7,9 @@
  * - Market trends
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { TrendingUp, TrendingDown, BarChart3, RefreshCw, Loader2 } from 'lucide-react';
-import { getCoinTickers } from '@/api/client';
+import { getCoinTickers, getCoinMarkets } from '@/api/client';
 
 interface TickerData {
   market: string;
@@ -30,18 +30,29 @@ export function CoinMarketDashboard({ compact = false }: CoinMarketDashboardProp
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
-  // Popular KRW markets to track
-  const popularMarkets = [
-    'KRW-BTC', 'KRW-ETH', 'KRW-XRP', 'KRW-SOL', 'KRW-DOGE',
-    'KRW-ADA', 'KRW-AVAX', 'KRW-DOT', 'KRW-MATIC', 'KRW-LINK',
-    'KRW-ATOM', 'KRW-ETC', 'KRW-BCH', 'KRW-XLM', 'KRW-SAND',
-    'KRW-APT', 'KRW-ARB', 'KRW-SUI', 'KRW-NEAR', 'KRW-AAVE',
-  ];
+  // Cache valid KRW markets from Upbit
+  const validMarketsRef = useRef<string[]>([]);
 
+  // Fetch valid markets first, then tickers
   const fetchTickers = async () => {
     try {
       setIsLoading(true);
-      const response = await getCoinTickers(popularMarkets);
+
+      // If we don't have valid markets cached, fetch them first
+      if (validMarketsRef.current.length === 0) {
+        const marketsResponse = await getCoinMarkets();
+        // Filter to only KRW markets and take top 20 by name
+        validMarketsRef.current = marketsResponse.markets
+          .filter((m) => m.market.startsWith('KRW-'))
+          .slice(0, 20)
+          .map((m) => m.market);
+      }
+
+      if (validMarketsRef.current.length === 0) {
+        throw new Error('No valid markets found');
+      }
+
+      const response = await getCoinTickers(validMarketsRef.current);
       setTickers(response.tickers);
       setLastUpdated(new Date());
       setError(null);
