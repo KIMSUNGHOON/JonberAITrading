@@ -6,9 +6,11 @@ Provides real-time streaming of:
 - Status updates
 - Trade proposals
 - Position updates
+- Real-time market data (ticker, trade)
 """
 
 import asyncio
+import json
 from typing import Optional
 
 import structlog
@@ -395,3 +397,141 @@ async def broadcast_to_session(session_id: str, message_type: str, data: dict):
         "type": message_type,
         "data": data,
     })
+
+
+# -------------------------------------------
+# Real-time Market Data WebSocket
+# -------------------------------------------
+
+
+@router.websocket("/ticker")
+async def websocket_ticker(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time ticker data.
+
+    Streams real-time price updates from Upbit via WebSocket.
+    Much more efficient than polling the REST API.
+
+    Client can send:
+    - {"action": "subscribe", "markets": ["KRW-BTC", "KRW-ETH"]}
+    - {"action": "unsubscribe", "markets": ["KRW-BTC"]}
+    - "ping": Heartbeat (server responds with "pong")
+
+    Server sends:
+    - {"type": "ticker", "market": "KRW-BTC", "trade_price": 12345, ...}
+    - {"type": "subscribed", "markets": ["KRW-BTC", "KRW-ETH"]}
+    - {"type": "error", "message": "..."}
+    """
+    from services.realtime_service import get_realtime_service
+
+    await websocket.accept()
+    logger.info("ticker_websocket_connected")
+
+    # Get realtime service
+    try:
+        service = await get_realtime_service()
+    except Exception as e:
+        logger.error("realtime_service_unavailable", error=str(e))
+        await websocket.send_json({
+            "type": "error",
+            "message": "Realtime service unavailable",
+        })
+        await websocket.close()
+        return
+
+    # Track subscribed markets for cleanup
+    subscribed_markets: set[str] = set()
+
+    # Callback to send ticker data to this client
+    async def send_ticker(data: dict):
+        try:
+            await websocket.send_json(data)
+        except Exception:
+            pass  # Will be handled in disconnect
+
+    # Sync wrapper for async callback
+    def ticker_callback(data: dict):
+        try:
+            asyncio.create_task(send_ticker(data))
+        except RuntimeError:
+            pass  # Event loop closed
+
+    try:
+        while True:
+            try:
+                # Wait for client message with timeout
+                data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=30.0,
+                )
+
+                # Handle ping/pong
+                if data == "ping":
+                    await websocket.send_text("pong")
+                    continue
+
+                # Parse JSON message
+                try:
+                    message = json.loads(data)
+                except json.JSONDecodeError:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Invalid JSON",
+                    })
+                    continue
+
+                action = message.get("action")
+                markets = message.get("markets", [])
+
+                if not isinstance(markets, list):
+                    markets = [markets] if markets else []
+
+                # Normalize market codes
+                markets = [m.upper() for m in markets if m]
+
+                if action == "subscribe" and markets:
+                    await service.subscribe_ticker(markets, ticker_callback)
+                    subscribed_markets.update(markets)
+
+                    await websocket.send_json({
+                        "type": "subscribed",
+                        "markets": list(subscribed_markets),
+                    })
+                    logger.debug(
+                        "ticker_client_subscribed",
+                        markets=markets,
+                    )
+
+                elif action == "unsubscribe" and markets:
+                    await service.unsubscribe_ticker(markets, ticker_callback)
+                    subscribed_markets.difference_update(markets)
+
+                    await websocket.send_json({
+                        "type": "unsubscribed",
+                        "markets": markets,
+                    })
+
+                else:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Unknown action: {action}",
+                    })
+
+            except asyncio.TimeoutError:
+                # Send heartbeat
+                try:
+                    await websocket.send_json({"type": "heartbeat"})
+                except Exception:
+                    break
+
+    except WebSocketDisconnect:
+        logger.info("ticker_websocket_disconnected")
+    except Exception as e:
+        logger.error("ticker_websocket_error", error=str(e))
+    finally:
+        # Cleanup: unsubscribe from all markets
+        if subscribed_markets:
+            try:
+                await service.unsubscribe_all(ticker_callback)
+            except Exception as e:
+                logger.warning("ticker_cleanup_error", error=str(e))

@@ -19,7 +19,8 @@ from agents.llm_provider import get_llm_provider, reset_llm_provider
 from app.api.routes import analysis, approval, websocket, auth, coin, settings as settings_routes
 from app.config import settings
 from app.logging_config import configure_logging, RequestLoggingMiddleware
-from services.storage_service import get_storage_service, close_storage_service
+from services.realtime_service import close_realtime_service, get_realtime_service
+from services.storage_service import close_storage_service, get_storage_service
 
 # Configure enhanced logging
 configure_logging(
@@ -87,10 +88,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("storage_connection_failed", error=str(e))
 
+    # Initialize realtime service (Upbit WebSocket)
+    try:
+        realtime_service = await get_realtime_service()
+        await realtime_service.start()
+        logger.info("realtime_service_started")
+    except Exception as e:
+        logger.warning("realtime_service_start_failed", error=str(e))
+
     yield
 
     # Shutdown
     logger.info("application_shutdown")
+    await close_realtime_service()
     await llm.close()
     reset_llm_provider()
     await close_storage_service()
