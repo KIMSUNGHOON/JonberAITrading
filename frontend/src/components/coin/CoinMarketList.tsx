@@ -90,8 +90,8 @@ export function CoinMarketList({
         setMarkets(response.markets);
         setFilteredMarkets(response.markets);
 
-        // Fetch prices for top 20 markets
-        const topMarkets = response.markets.slice(0, 20);
+        // Fetch prices for top 50 markets (increased from 20)
+        const topMarkets = response.markets.slice(0, 50);
         await fetchPricesForMarkets(topMarkets, response.markets);
       } catch (err) {
         setError('Failed to load markets');
@@ -195,7 +195,7 @@ export function CoinMarketList({
 
       {/* Market List */}
       <div className="flex-1 overflow-y-auto p-2 space-y-1">
-        {filteredMarkets.slice(0, 50).map((market) => (
+        {filteredMarkets.map((market) => (
           <MarketRow
             key={market.market}
             market={market}
@@ -205,12 +205,6 @@ export function CoinMarketList({
 
         {filteredMarkets.length === 0 && (
           <div className="text-center text-gray-500 py-8">No coins found</div>
-        )}
-
-        {filteredMarkets.length > 50 && (
-          <div className="text-center text-gray-500 py-4 text-sm">
-            Showing 50 of {filteredMarkets.length} results
-          </div>
         )}
       </div>
     </div>

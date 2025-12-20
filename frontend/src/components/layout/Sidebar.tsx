@@ -104,13 +104,15 @@ function formatTime(date: Date): string {
 interface HistoryItemProps {
   item: TickerHistoryItem;
   isActive: boolean;
+  onClick?: () => void;
 }
 
-function HistoryItem({ item, isActive, collapsed }: HistoryItemProps & { collapsed?: boolean }) {
+function HistoryItem({ item, isActive, collapsed, onClick }: HistoryItemProps & { collapsed?: boolean }) {
   return (
-    <div
+    <button
+      onClick={onClick}
       title={collapsed ? `${item.ticker} - ${item.status}` : undefined}
-      className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+      className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer ${
         isActive
           ? 'bg-blue-600/20 text-blue-400'
           : 'text-gray-400 hover:bg-surface hover:text-gray-300'
@@ -125,7 +127,7 @@ function HistoryItem({ item, isActive, collapsed }: HistoryItemProps & { collaps
           </span>
         </>
       )}
-    </div>
+    </button>
   );
 }
 
@@ -147,6 +149,23 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
   const activeSessionId = useStore((state) =>
     state.activeMarket === 'stock' ? state.stock.activeSessionId : state.coin.activeSessionId
   );
+
+  // Actions for restoring sessions from history
+  const startStockSession = useStore((state) => state.startStockSession);
+  const startCoinSession = useStore((state) => state.startCoinSession);
+
+  // Handle clicking on a history item to restore the session
+  const handleHistoryClick = (item: TickerHistoryItem) => {
+    // Don't do anything if already the active session
+    if (item.sessionId === activeSessionId) return;
+
+    // Restore the session based on type
+    if ('type' in item && item.type === 'coin') {
+      startCoinSession(item.sessionId, item.ticker, (item as { koreanName?: string }).koreanName);
+    } else {
+      startStockSession(item.sessionId, item.ticker);
+    }
+  };
 
   return (
     <div className={`h-full flex flex-col ${collapsed ? 'p-2' : 'p-4'}`}>
@@ -204,6 +223,7 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
               item={item}
               isActive={item.sessionId === activeSessionId}
               collapsed={collapsed}
+              onClick={() => handleHistoryClick(item)}
             />
           ))}
         </div>
