@@ -36,7 +36,7 @@ class LLMConfig(BaseModel):
     # DeepSeek-R1 recommended: 0.5-0.7 (0.6 optimal) to prevent repetitions
     temperature: float = Field(default=0.6, ge=0.0, le=2.0)
     max_tokens: int = Field(default=4096, ge=1, le=32768)
-    timeout: int = Field(default=120, ge=10, le=600)
+    timeout: int = Field(default=300, ge=10, le=600)  # 5 minutes for complex LLM analysis
     api_key: str = Field(default="not-needed-for-local")
 
     @classmethod

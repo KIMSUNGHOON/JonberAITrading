@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "deepseek-r1:14b"
     LLM_TEMPERATURE: float = Field(default=0.6, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int = Field(default=4096, ge=1, le=32768)
-    LLM_TIMEOUT: int = Field(default=120, ge=10, le=600)
+    LLM_TIMEOUT: int = Field(default=300, ge=10, le=600)  # Increased for complex LLM analysis
 
     # -------------------------------------------
     # Market Data Configuration
