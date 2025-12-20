@@ -1,6 +1,6 @@
 # Development TodoList - Coin Trading Feature
 
-> Last Updated: 2025-12-19
+> Last Updated: 2025-12-20
 > Focus: Upbit API 기반 암호화폐 트레이딩 모듈
 
 ---
@@ -28,6 +28,7 @@
   - [x] `get_ticker()` - 현재가 조회
   - [x] `get_candles_minutes()` - 분봉 조회
   - [x] `get_candles_days()` - 일봉 조회
+  - [x] `get_candles_seconds()` - 초봉 조회 (NEW)
   - [x] `get_orderbook()` - 호가 조회
   - [x] `get_trades()` - 체결 내역 조회
 
@@ -35,7 +36,8 @@
 - [x] `app/api/routes/coin.py` - 코인 분석 라우트
   - [x] `POST /api/coin/analysis/start` - 분석 시작
   - [x] `GET /api/coin/markets` - 마켓 목록
-  - [x] `GET /api/coin/ticker/{market}` - 현재가
+  - [x] `GET /api/coin/ticker/{market}` - 현재가 (단일)
+  - [x] `GET /api/coin/tickers` - 현재가 (배치) ✅ NEW
   - [x] `GET /api/coin/candles/{market}` - 캔들 데이터
   - [x] `GET /api/coin/orderbook/{market}` - 호가 조회
   - [x] `POST /api/coin/markets/search` - 마켓 검색
@@ -53,7 +55,7 @@
 
 ---
 
-## Phase 2: Analysis Pipeline [P0] ✅ MOSTLY COMPLETED
+## Phase 2: Analysis Pipeline [P0] ✅ COMPLETED
 
 ### LangGraph - Coin Trading Graph
 - [x] `agents/graph/coin_trading_graph.py` - 코인 분석 워크플로우
@@ -77,22 +79,42 @@
   - [x] 보수적 포지션 사이징 (3-5%)
   - [x] 넓은 스탑로스 (8-12%)
 
-### WebSocket Integration (Phase 4로 이동)
-- [ ] `services/upbit/websocket.py` - 실시간 시세 스트리밍
-- [ ] Frontend WebSocket 연결 (코인 전용)
-- [ ] 실시간 가격 업데이트 UI
+---
+
+## Phase 2.5: Real-time & Performance [P0] ✅ COMPLETED
+
+### Upbit WebSocket Client ✅ NEW
+- [x] `services/upbit/websocket.py` - 실시간 데이터 스트리밍
+  - [x] Ticker 스트리밍 (현재가)
+  - [x] Trade 스트리밍 (체결)
+  - [x] Orderbook 스트리밍 (호가)
+  - [x] Auto-reconnect with exponential backoff
+  - [x] Callback 기반 데이터 전달
+
+### WebSocket Integration ✅ NEW
+- [x] `app/api/routes/websocket.py` - 코인 WebSocket 라우트
+- [x] `frontend/src/api/websocket.ts` - 코인 WebSocket 클라이언트
+- [x] `frontend/src/hooks/useCoinTicker.ts` - 실시간 티커 훅
+
+### Rate Limit Optimization ✅ NEW
+- [x] 배치 Ticker API 추가 (`GET /api/coin/tickers`)
+  - 기존: 개별 API 호출 (20+ requests/sec)
+  - 개선: 단일 배치 호출 (1 request/sec)
+- [x] `CoinMarketList.tsx` 배치 API 사용으로 변경
+- [x] 429 Too Many Requests 에러 해결
 
 ---
 
 ## Phase 3: Trading Execution [P1] (1-2 weeks)
 
 ### Backend - Exchange API
-- [ ] `services/upbit/exchange.py` - 거래 메서드
-  - [ ] `get_accounts()` - 잔고 조회
-  - [ ] `place_order()` - 주문 생성 (지정가/시장가)
-  - [ ] `cancel_order()` - 주문 취소
-  - [ ] `get_order()` - 주문 조회
-  - [ ] `get_orders()` - 주문 목록
+- [x] `services/upbit/client.py` - 기본 구현 완료
+  - [x] `get_accounts()` - 잔고 조회
+  - [x] `place_order()` - 주문 생성 (지정가/시장가)
+  - [x] `cancel_order()` - 주문 취소
+  - [x] `get_order()` - 주문 조회
+  - [x] `get_orders()` - 주문 목록
+- [ ] API 라우트 추가 (`/api/coin/accounts`, `/api/coin/orders`)
 
 ### HITL Integration
 - [ ] Approval API 코인 지원 수정
@@ -109,19 +131,31 @@
 ## Phase 4: UI/UX Polish [P1] (1 week)
 
 ### Components
-- [ ] `CoinChart.tsx` - 코인 차트 (TradingView)
+- [x] `CoinPriceTicker.tsx` - 실시간 가격 티커 ✅
+- [x] `CoinInfo.tsx` - 코인 상세 정보 ✅
+- [x] `CoinMarketList.tsx` - 마켓 리스트 ✅
+- [x] `CoinChart.tsx` - 코인 차트 (간단 버전) ✅
 - [ ] `CoinPosition.tsx` - 코인 포지션 카드
 - [ ] `CoinProposal.tsx` - 코인 거래 제안
 - [ ] `CoinHistory.tsx` - 코인 분석 히스토리
 
 ### Real-time Updates
-- [ ] 실시간 가격 표시
+- [x] 실시간 가격 표시 ✅
 - [ ] P&L 계산 및 표시
 - [ ] 호가창 시각화
 
 ### Responsive Design
 - [ ] 모바일 탭 네비게이션
 - [ ] 코인 UI 반응형 검증
+
+---
+
+## Bug Fixes (Completed)
+
+- [x] JWT encode 에러 수정 (`jwt` → `PyJWT` 패키지)
+- [x] MinuteCandle duplicate 'unit' keyword argument 에러 수정
+- [x] 429 Rate Limit 에러 수정 (배치 API 도입)
+- [x] WebSocket 연결 안정화
 
 ---
 
@@ -135,11 +169,12 @@ UPBIT_SECRET_KEY=your_secret_key
 UPBIT_TRADING_MODE=paper  # paper | live
 ```
 
-### Dependencies to Add
+### Dependencies
 ```
 # backend/requirements.txt
 httpx>=0.25.0
 PyJWT>=2.8.0
+websockets>=12.0
 ```
 
 ---
@@ -150,7 +185,8 @@ PyJWT>=2.8.0
 | Type | Per Second | Per Minute |
 |------|------------|------------|
 | 주문 API | 8회 | 200회 |
-| 기타 API | 30회 | 900회 |
+| 기타 API (ticker) | 10회 | - |
+| WebSocket 메시지 | 5회 | 100회 |
 
 ### Market Code Format
 - KRW 마켓: `KRW-BTC`, `KRW-ETH`
@@ -161,7 +197,7 @@ PyJWT>=2.8.0
 | Endpoint | Auth | Description |
 |----------|------|-------------|
 | `/v1/market/all` | No | 마켓 목록 |
-| `/v1/ticker` | No | 현재가 |
+| `/v1/ticker` | No | 현재가 (배치 지원) |
 | `/v1/candles/*` | No | 캔들 데이터 |
 | `/v1/orderbook` | No | 호가 |
 | `/v1/accounts` | Yes | 잔고 조회 |
@@ -180,5 +216,6 @@ PyJWT>=2.8.0
 ## Notes
 
 - Phase 1-2는 인증 없이 QUOTATION API만 사용
+- Phase 2.5에서 WebSocket 실시간 데이터 완성
 - Phase 3부터 Upbit API 키 필요
 - `paper` 모드에서 먼저 테스트 후 `live` 전환
