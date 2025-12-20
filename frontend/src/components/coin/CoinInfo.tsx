@@ -45,7 +45,7 @@ export function CoinInfo({ market, koreanName }: CoinInfoProps) {
     }
 
     fetchOrderbook();
-    const interval = setInterval(fetchOrderbook, 10000); // Every 10 seconds
+    const interval = setInterval(fetchOrderbook, 30000); // Every 30 seconds
     return () => clearInterval(interval);
   }, [market]);
 

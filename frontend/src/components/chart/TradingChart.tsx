@@ -46,6 +46,9 @@ export function TradingChart({
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Cache candle data to avoid duplicate API calls for volume
+  const candleDataRef = useRef<{ time: any; open: number; high: number; low: number; close: number; volume: number }[]>([]);
+
   // Initialize chart
   useEffect(() => {
     if (!containerRef.current) return;
@@ -162,7 +165,7 @@ export function TradingChart({
 
           // Transform API response to lightweight-charts format
           // Upbit returns newest first, so reverse for chronological order
-          candles = response.candles
+          const transformedCandles = response.candles
             .filter((c) => c.datetime && c.open && c.high && c.low && c.close)
             .map((c) => ({
               time: Math.floor(new Date(c.datetime).getTime() / 1000) as any,
@@ -170,12 +173,18 @@ export function TradingChart({
               high: c.high,
               low: c.low,
               close: c.close,
+              volume: c.volume,
             }))
             .reverse();
 
-          if (candles.length === 0) {
+          if (transformedCandles.length === 0) {
             throw new Error('Invalid candle data received');
           }
+
+          // Cache candle data for volume chart (avoid duplicate API call)
+          candleDataRef.current = transformedCandles;
+
+          candles = transformedCandles.map(({ volume, ...rest }) => rest);
         } else {
           // Fall back to mock data for stock tickers
           const data = generateMockData(ticker, timeframe);
@@ -281,39 +290,21 @@ export function TradingChart({
         volumeSeriesRef.current = volumeSeries;
       }
 
-      // Check if coin market - fetch real volume data
+      // Check if coin market - use cached data (already fetched for candlestick)
       const isCoinMarket = ticker.includes('-');
 
-      if (isCoinMarket) {
-        // Fetch real volume from Upbit API
-        const intervalMap: Record<TimeFrame, string> = {
-          '1m': '1m',
-          '5m': '5m',
-          '15m': '15m',
-          '1h': '1h',
-          '1d': '1d',
-          '1w': '1w',
-          '1M': '1M',
-        };
-
-        const interval = intervalMap[timeframe] || '1d';
-
-        getCoinCandles(ticker, interval, 200)
-          .then((response) => {
-            const volumeData = response.candles
-              .map((c) => ({
-                time: Math.floor(new Date(c.datetime).getTime() / 1000) as any,
-                value: c.volume,
-                color:
-                  c.close >= c.open
-                    ? 'rgba(34, 197, 94, 0.5)'
-                    : 'rgba(239, 68, 68, 0.5)',
-              }))
-              .reverse();
-            volumeSeriesRef.current?.setData(volumeData);
-          })
-          .catch(console.error);
-      } else {
+      if (isCoinMarket && candleDataRef.current.length > 0) {
+        // Use cached candle data for volume (avoid duplicate API call)
+        const volumeData = candleDataRef.current.map((c) => ({
+          time: c.time,
+          value: c.volume,
+          color:
+            c.close >= c.open
+              ? 'rgba(34, 197, 94, 0.5)'
+              : 'rgba(239, 68, 68, 0.5)',
+        }));
+        volumeSeriesRef.current?.setData(volumeData);
+      } else if (!isCoinMarket) {
         // Fall back to mock volume data for stocks
         const volumeData = generateVolumeData(ticker, timeframe);
         volumeSeriesRef.current.setData(volumeData);
