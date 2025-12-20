@@ -294,6 +294,31 @@ class ApiClient {
   }
 
   /**
+   * Get current tickers for multiple coin markets in a single request.
+   * This batch endpoint avoids rate limiting by reducing API calls.
+   */
+  async getCoinTickers(markets: string[]): Promise<{
+    tickers: Array<{
+      market: string;
+      trade_price: number;
+      change: string;
+      change_rate: number;
+      change_price: number;
+      high_price: number;
+      low_price: number;
+      trade_volume: number;
+      acc_trade_price_24h: number;
+      timestamp: string;
+    }>;
+    total: number;
+  }> {
+    const response = await this.client.get('/coin/tickers', {
+      params: { markets: markets.join(',') },
+    });
+    return response.data;
+  }
+
+  /**
    * Get orderbook for a coin market.
    */
   async getCoinOrderbook(market: string): Promise<{
@@ -428,6 +453,8 @@ export const getCoinCandles = (market: string, interval?: string, count?: number
   apiClient.getCoinCandles(market, interval, count);
 
 export const getCoinTicker = (market: string) => apiClient.getCoinTicker(market);
+
+export const getCoinTickers = (markets: string[]) => apiClient.getCoinTickers(markets);
 
 export const getCoinOrderbook = (market: string) => apiClient.getCoinOrderbook(market);
 

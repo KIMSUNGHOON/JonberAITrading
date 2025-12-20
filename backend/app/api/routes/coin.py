@@ -24,6 +24,7 @@ from app.api.schemas.coin import (
     MarketSearchRequest,
     OrderbookResponse,
     OrderbookUnit,
+    TickerListResponse,
     TickerResponse,
 )
 from app.config import settings
@@ -220,12 +221,78 @@ async def get_ticker(market: str):
             )
 
 
+@router.get("/tickers", response_model=TickerListResponse)
+async def get_tickers(
+    markets: str = Query(
+        ...,
+        description="Comma-separated market codes (e.g., KRW-BTC,KRW-ETH,KRW-XRP)",
+    ),
+):
+    """
+    Get current tickers for multiple markets in a single request.
+
+    This batch endpoint reduces API calls and avoids rate limiting.
+    Upbit allows querying multiple markets in one request.
+
+    Args:
+        markets: Comma-separated market codes (max ~100 markets)
+
+    Returns:
+        List of ticker data for all requested markets
+    """
+    market_list = [m.strip().upper() for m in markets.split(",") if m.strip()]
+
+    if not market_list:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one market code is required",
+        )
+
+    if len(market_list) > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Maximum 100 markets per request",
+        )
+
+    async with get_upbit_client() as client:
+        try:
+            tickers = await client.get_ticker(market_list)
+
+            ticker_responses = [
+                TickerResponse(
+                    market=t.market,
+                    trade_price=t.trade_price,
+                    change=t.change,
+                    change_rate=t.signed_change_rate * 100,
+                    change_price=t.signed_change_price,
+                    high_price=t.high_price,
+                    low_price=t.low_price,
+                    trade_volume=t.acc_trade_volume_24h,
+                    acc_trade_price_24h=t.acc_trade_price_24h,
+                    timestamp=datetime.utcnow(),
+                )
+                for t in tickers
+            ]
+
+            return TickerListResponse(
+                tickers=ticker_responses,
+                total=len(ticker_responses),
+            )
+
+        except Exception as e:
+            logger.error("get_tickers_failed", markets=markets, error=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to fetch tickers: {str(e)}",
+            )
+
+
 @router.get("/candles/{market}", response_model=CandleListResponse)
 async def get_candles(
     market: str,
     interval: str = Query(
         default="1d",
-        description="Candle interval (1m, 5m, 15m, 30m, 1h, 4h, 1d)",
+        description="Candle interval (1s, 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M). Note: 1s only available for last 3 months.",
     ),
     count: int = Query(
         default=100,
@@ -244,11 +311,15 @@ async def get_candles(
 
     Returns:
         List of candles (newest first)
+
+    Note:
+        Second candles (1s) are only available for the most recent 3 months.
     """
     market = market.upper()
 
     # Map interval to API params
     interval_map = {
+        "1s": ("seconds", None),
         "1m": ("minutes", 1),
         "3m": ("minutes", 3),
         "5m": ("minutes", 5),
@@ -272,7 +343,9 @@ async def get_candles(
 
     async with get_upbit_client() as client:
         try:
-            if candle_type == "minutes":
+            if candle_type == "seconds":
+                candles = await client.get_candles_seconds(market=market, count=count)
+            elif candle_type == "minutes":
                 candles = await client.get_candles_minutes(
                     market=market, unit=unit, count=count
                 )

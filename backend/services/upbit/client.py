@@ -203,6 +203,35 @@ class UpbitClient:
         response = await self._request("GET", "/candles/months", params=params)
         return [Candle(**c) for c in response]
 
+    async def get_candles_seconds(
+        self,
+        market: str,
+        count: int = 200,
+        to: Optional[str] = None,
+    ) -> list[Candle]:
+        """
+        Get second candles.
+
+        Note: Second candle API only provides data for up to the most recent 3 months.
+        If you request data outside of this retention period, the API will return
+        an empty array or fewer items than requested.
+
+        Args:
+            market: Market code (e.g., "KRW-BTC")
+            count: Number of candles (max 200, default 1)
+            to: End time of the query period (ISO 8601 format)
+                If omitted, the most recent candle is returned.
+
+        Returns:
+            List of Candle objects (newest first)
+        """
+        params = {"market": market, "count": min(count, 200)}
+        if to:
+            params["to"] = to
+
+        response = await self._request("GET", "/candles/seconds", params=params)
+        return [Candle(**c) for c in response]
+
     async def get_orderbook(self, markets: list[str]) -> list[Orderbook]:
         """
         Get orderbook for markets.

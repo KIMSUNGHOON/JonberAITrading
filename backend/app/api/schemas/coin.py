@@ -46,6 +46,13 @@ class TickerResponse(BaseModel):
     timestamp: datetime
 
 
+class TickerListResponse(BaseModel):
+    """List of ticker information for multiple markets."""
+
+    tickers: list[TickerResponse]
+    total: int
+
+
 class CandleData(BaseModel):
     """Candle (OHLCV) data."""
 

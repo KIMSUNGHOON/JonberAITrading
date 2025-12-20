@@ -7,7 +7,7 @@
 
 import { useState, useEffect } from 'react';
 import { Search, TrendingUp, TrendingDown, Bitcoin } from 'lucide-react';
-import { getCoinMarkets, getCoinTicker } from '@/api/client';
+import { getCoinMarkets, getCoinTickers } from '@/api/client';
 import type { CoinMarketInfo } from '@/types';
 
 interface CoinMarketListProps {
@@ -102,31 +102,31 @@ export function CoinMarketList({
     fetchMarkets();
   }, [quoteCurrency]);
 
-  // Fetch prices for a list of markets
+  // Fetch prices for a list of markets using batch API
   async function fetchPricesForMarkets(
     marketsToFetch: CoinMarketInfo[],
     allMarkets: MarketWithPrice[]
   ) {
     try {
-      const pricePromises = marketsToFetch.map(async (m) => {
-        try {
-          const ticker = await getCoinTicker(m.market);
-          return {
-            market: m.market,
-            price: ticker.trade_price,
-            change: ticker.change as 'RISE' | 'EVEN' | 'FALL',
-            changeRate: ticker.change_rate,
-          };
-        } catch {
-          return null;
-        }
-      });
+      // Use batch API to fetch all tickers in a single request
+      const marketCodes = marketsToFetch.map((m) => m.market);
+      const response = await getCoinTickers(marketCodes);
 
-      const results = await Promise.all(pricePromises);
+      // Create a map for quick lookup
+      const priceMap = new Map(
+        response.tickers.map((t) => [
+          t.market,
+          {
+            price: t.trade_price,
+            change: t.change as 'RISE' | 'EVEN' | 'FALL',
+            changeRate: t.change_rate,
+          },
+        ])
+      );
 
       // Update markets with prices
       const updatedMarkets = allMarkets.map((m) => {
-        const priceData = results.find((r) => r?.market === m.market);
+        const priceData = priceMap.get(m.market);
         if (priceData) {
           return { ...m, ...priceData };
         }
