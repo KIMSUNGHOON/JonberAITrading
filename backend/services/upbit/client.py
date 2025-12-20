@@ -144,7 +144,8 @@ class UpbitClient:
             params["to"] = to
 
         response = await self._request("GET", f"/candles/minutes/{unit}", params=params)
-        return [MinuteCandle(**c, unit=unit) for c in response]
+        # Note: Upbit API already includes 'unit' in the response, no need to add it
+        return [MinuteCandle(**c) for c in response]
 
     async def get_candles_days(
         self,
