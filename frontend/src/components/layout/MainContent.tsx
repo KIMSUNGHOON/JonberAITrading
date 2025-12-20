@@ -20,6 +20,7 @@ import { ProposalCard } from '@/components/approval/ProposalCard';
 import { PositionCard } from '@/components/position/PositionCard';
 import { WelcomePanel } from '@/components/analysis/WelcomePanel';
 import { CoinInfo } from '@/components/coin/CoinInfo';
+import { CoinMarketDashboard } from '@/components/dashboard/CoinMarketDashboard';
 
 export function MainContent() {
   const { sessionId, ticker, status } = useStore(useShallow(selectSession));
@@ -30,9 +31,19 @@ export function MainContent() {
   const { proposal, awaitingApproval } = useStore(useShallow(selectProposal));
   const activePosition = useStore(selectActivePosition);
   const showChartPanel = useStore((state) => state.showChartPanel);
+  const activeMarket = useStore((state) => state.activeMarket);
 
   // Show welcome panel when idle
   if (status === 'idle' && !sessionId) {
+    // For coin market, show market dashboard alongside welcome
+    if (activeMarket === 'coin') {
+      return (
+        <div className="p-3 md:p-4 space-y-4">
+          <WelcomePanel />
+          <CoinMarketDashboard />
+        </div>
+      );
+    }
     return <WelcomePanel />;
   }
 
@@ -86,6 +97,13 @@ export function MainContent() {
             <section className="flex-shrink-0">
               <h2 className="text-sm font-semibold mb-2">Analysis Results</h2>
               <AnalysisPanel analyses={analyses} />
+            </section>
+          )}
+
+          {/* Coin Market Overview - Show during analysis for coin markets */}
+          {activeMarket === 'coin' && status === 'running' && (
+            <section className="flex-shrink-0">
+              <CoinMarketDashboard compact />
             </section>
           )}
         </div>

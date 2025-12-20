@@ -4,13 +4,15 @@
  * Top navigation bar with branding and controls.
  */
 
-import { Menu, Settings, Bell, Activity } from 'lucide-react';
+import { Menu, Settings, Bell, Activity, PanelLeftClose, PanelLeft } from 'lucide-react';
 import { useStore, selectStatus, selectTicker } from '@/store';
 
 export function Header() {
   const status = useStore(selectStatus);
   const ticker = useStore(selectTicker);
   const setMobileMenuOpen = useStore((state) => state.setMobileMenuOpen);
+  const sidebarCollapsed = useStore((state) => state.sidebarCollapsed);
+  const toggleSidebar = useStore((state) => state.toggleSidebar);
 
   const isActive = status === 'running' || status === 'awaiting_approval';
 
@@ -24,6 +26,19 @@ export function Header() {
           onClick={() => setMobileMenuOpen(true)}
         >
           <Menu className="w-5 h-5" />
+        </button>
+
+        {/* Sidebar Toggle Button (Desktop) */}
+        <button
+          className="hidden lg:flex p-2 hover:bg-surface rounded-lg transition-colors"
+          onClick={toggleSidebar}
+          title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+        >
+          {sidebarCollapsed ? (
+            <PanelLeft className="w-5 h-5" />
+          ) : (
+            <PanelLeftClose className="w-5 h-5" />
+          )}
         </button>
 
         {/* Logo */}

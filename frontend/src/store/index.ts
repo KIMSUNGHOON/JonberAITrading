@@ -108,6 +108,7 @@ interface UIState {
   showChartPanel: boolean;
   showSettingsModal: boolean;
   isMobileMenuOpen: boolean;
+  sidebarCollapsed: boolean;
 
   // Upbit API status
   upbitApiConfigured: boolean;
@@ -158,6 +159,8 @@ interface UIActions {
   setShowChartPanel: (show: boolean) => void;
   setShowSettingsModal: (show: boolean) => void;
   setMobileMenuOpen: (open: boolean) => void;
+  setSidebarCollapsed: (collapsed: boolean) => void;
+  toggleSidebar: () => void;
   setUpbitApiConfigured: (configured: boolean) => void;
   setChartTimeframe: (timeframe: TimeFrame) => void;
   toggleChartIndicator: (indicator: 'showSMA50' | 'showSMA200' | 'showVolume') => void;
@@ -227,6 +230,7 @@ const initialUIState: UIState = {
   showChartPanel: true,
   showSettingsModal: false,
   isMobileMenuOpen: false,
+  sidebarCollapsed: false,
   upbitApiConfigured: false,
   chartConfig: {
     timeframe: '1d',
@@ -488,6 +492,10 @@ export const useStore = create<Store>()(
       setShowSettingsModal: (show) => set({ showSettingsModal: show }),
 
       setMobileMenuOpen: (open) => set({ isMobileMenuOpen: open }),
+
+      setSidebarCollapsed: (collapsed) => set({ sidebarCollapsed: collapsed }),
+
+      toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
 
       setUpbitApiConfigured: (configured) => set({ upbitApiConfigured: configured }),
 

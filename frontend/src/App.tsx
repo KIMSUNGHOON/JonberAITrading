@@ -20,6 +20,7 @@ function App() {
   const showSettingsModal = useStore((state) => state.showSettingsModal);
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
   const setUpbitApiConfigured = useStore((state) => state.setUpbitApiConfigured);
+  const sidebarCollapsed = useStore((state) => state.sidebarCollapsed);
   const error = useStore(selectError);
   const setError = useStore((state) => state.setError);
 
@@ -70,9 +71,13 @@ function App() {
 
       {/* Main Layout - Takes remaining height */}
       <div className="flex-1 flex min-h-0">
-        {/* Sidebar - Hidden on mobile, fixed width */}
-        <aside className="hidden lg:flex lg:flex-col w-56 border-r border-border flex-shrink-0">
-          <Sidebar />
+        {/* Sidebar - Hidden on mobile, collapsible */}
+        <aside
+          className={`hidden lg:flex lg:flex-col border-r border-border flex-shrink-0 transition-all duration-300 ${
+            sidebarCollapsed ? 'w-16' : 'w-56'
+          }`}
+        >
+          <Sidebar collapsed={sidebarCollapsed} />
         </aside>
 
         {/* Main Content Area */}
