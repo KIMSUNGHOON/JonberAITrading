@@ -6,10 +6,11 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Search, Loader2, Bitcoin } from 'lucide-react';
+import { Search, Loader2, Bitcoin, List } from 'lucide-react';
 import { useStore } from '@/store';
 import { searchCoinMarkets, startCoinAnalysis } from '@/api/client';
 import { createStoreWebSocket, type TradingWebSocket } from '@/api/websocket';
+import { CoinMarketList } from './CoinMarketList';
 import type { CoinMarketInfo } from '@/types';
 
 // Store WebSocket reference for coin sessions
@@ -28,6 +29,7 @@ export function CoinTickerInput() {
   const [isLoading, setIsLoading] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
+  const [showMarketList, setShowMarketList] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const inputRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -191,6 +193,12 @@ export function CoinTickerInput() {
     handleStartAnalysis(suggestion.market, suggestion.korean_name);
   };
 
+  // Handle market selection from CoinMarketList modal
+  const handleMarketSelect = (market: string, koreanName?: string) => {
+    setShowMarketList(false);
+    handleStartAnalysis(market, koreanName);
+  };
+
   return (
     <div className="relative">
       <form onSubmit={handleSubmit}>
@@ -304,9 +312,9 @@ export function CoinTickerInput() {
         </div>
       )}
 
-      {/* Quick select popular coins */}
+      {/* Quick select popular coins + Browse all button */}
       {!isDisabled && !showDropdown && (
-        <div className="flex flex-wrap gap-1 mt-2">
+        <div className="flex flex-wrap items-center gap-1 mt-2">
           {POPULAR_COINS.slice(0, 3).map((market) => (
             <button
               key={market}
@@ -317,6 +325,43 @@ export function CoinTickerInput() {
               {market.replace('KRW-', '')}
             </button>
           ))}
+          <button
+            type="button"
+            onClick={() => setShowMarketList(true)}
+            className="text-xs px-2 py-1 bg-blue-600/20 hover:bg-blue-600/30 rounded text-blue-400 hover:text-blue-300 transition-colors flex items-center gap-1"
+          >
+            <List className="w-3 h-3" />
+            전체
+          </button>
+        </div>
+      )}
+
+      {/* Coin Market List Modal */}
+      {showMarketList && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          {/* Backdrop */}
+          <div
+            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={() => setShowMarketList(false)}
+          />
+          {/* Modal */}
+          <div className="relative bg-background border border-border rounded-xl shadow-2xl w-full max-w-md max-h-[80vh] overflow-hidden">
+            <div className="flex items-center justify-between p-4 border-b border-border">
+              <h2 className="text-lg font-semibold">코인 마켓</h2>
+              <button
+                onClick={() => setShowMarketList(false)}
+                className="p-1.5 rounded-lg hover:bg-surface text-gray-400 hover:text-white transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="h-[60vh]">
+              <CoinMarketList
+                onSelectMarket={handleMarketSelect}
+                quoteCurrency="KRW"
+              />
+            </div>
+          </div>
         </div>
       )}
     </div>

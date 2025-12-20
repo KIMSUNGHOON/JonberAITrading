@@ -20,8 +20,8 @@ import {
 } from 'lucide-react';
 import type { SessionStatus } from '@/types';
 
-// Workflow stages matching backend AnalysisStage enum
-const WORKFLOW_STAGES = [
+// Workflow stages for Stock analysis (matching backend AnalysisStage enum)
+const STOCK_WORKFLOW_STAGES = [
   { id: 'decomposition', label: 'Task Decomposition', icon: GitBranch, description: 'Breaking down analysis tasks' },
   { id: 'technical', label: 'Technical Analysis', icon: LineChart, description: 'Price patterns & indicators' },
   { id: 'fundamental', label: 'Fundamental Analysis', icon: Building2, description: 'Company financials & metrics' },
@@ -32,6 +32,28 @@ const WORKFLOW_STAGES = [
   { id: 'execution', label: 'Execution', icon: Rocket, description: 'Trade execution' },
 ] as const;
 
+// Workflow stages for Coin analysis (matching backend CoinAnalysisStage enum)
+const COIN_WORKFLOW_STAGES = [
+  { id: 'data_collection', label: 'Data Collection', icon: GitBranch, description: 'Collecting market data' },
+  { id: 'technical', label: 'Technical Analysis', icon: LineChart, description: 'Price patterns & indicators' },
+  { id: 'market_analysis', label: 'Market Analysis', icon: Building2, description: 'Market trends & orderbook' },
+  { id: 'sentiment', label: 'Sentiment Analysis', icon: MessageSquare, description: 'Market sentiment & news' },
+  { id: 'risk', label: 'Risk Assessment', icon: Shield, description: 'Risk evaluation & position sizing' },
+  { id: 'synthesis', label: 'Synthesis', icon: Brain, description: 'Combining all analyses' },
+  { id: 'approval', label: 'Human Approval', icon: UserCheck, description: 'Awaiting your decision' },
+  { id: 'execution', label: 'Execution', icon: Rocket, description: 'Trade execution' },
+] as const;
+
+// Helper to detect if ticker is coin market (contains '-')
+function isCoinMarket(ticker: string): boolean {
+  return ticker.includes('-');
+}
+
+// Get appropriate workflow stages based on ticker
+function getWorkflowStages(ticker: string) {
+  return isCoinMarket(ticker) ? COIN_WORKFLOW_STAGES : STOCK_WORKFLOW_STAGES;
+}
+
 type StageStatus = 'pending' | 'in_progress' | 'completed';
 
 interface WorkflowProgressProps {
@@ -41,6 +63,9 @@ interface WorkflowProgressProps {
 }
 
 export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgressProps) {
+  // Get appropriate stages based on ticker type
+  const WORKFLOW_STAGES = useMemo(() => getWorkflowStages(ticker), [ticker]);
+
   // Calculate stage statuses
   const stageStatuses = useMemo(() => {
     const statuses = new Map<string, StageStatus>();
@@ -59,7 +84,7 @@ export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgr
     });
 
     return statuses;
-  }, [currentStage, status]);
+  }, [currentStage, status, WORKFLOW_STAGES]);
 
   // Calculate progress percentage
   const progressPercent = useMemo(() => {
@@ -67,7 +92,7 @@ export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgr
     const currentIndex = WORKFLOW_STAGES.findIndex(s => s.id === currentStage);
     if (currentIndex === -1) return 0;
     return Math.round(((currentIndex + 0.5) / WORKFLOW_STAGES.length) * 100);
-  }, [currentStage, status]);
+  }, [currentStage, status, WORKFLOW_STAGES]);
 
   if (status === 'idle') return null;
 
@@ -126,7 +151,7 @@ export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgr
 }
 
 interface StageItemProps {
-  stage: typeof WORKFLOW_STAGES[number];
+  stage: { id: string; label: string; description: string };
   status: StageStatus;
   icon: React.ComponentType<{ className?: string }>;
   isLast: boolean;
@@ -182,7 +207,7 @@ function StageItem({ stage, status, icon: Icon }: StageItemProps) {
 }
 
 interface CurrentStageDetailProps {
-  stage?: typeof WORKFLOW_STAGES[number];
+  stage?: { id: string; label: string; description: string };
 }
 
 function CurrentStageDetail({ stage }: CurrentStageDetailProps) {
@@ -204,14 +229,15 @@ function CurrentStageDetail({ stage }: CurrentStageDetailProps) {
 }
 
 // Compact version for sidebar/header
-export function WorkflowProgressCompact({ currentStage, status }: { currentStage: string | null; status: SessionStatus | 'idle' }) {
+export function WorkflowProgressCompact({ currentStage, status, ticker = '' }: { currentStage: string | null; status: SessionStatus | 'idle'; ticker?: string }) {
   if (status === 'idle') return null;
 
-  const currentIndex = WORKFLOW_STAGES.findIndex(s => s.id === currentStage);
-  const stage = WORKFLOW_STAGES[currentIndex];
+  const stages = getWorkflowStages(ticker);
+  const currentIndex = stages.findIndex(s => s.id === currentStage);
+  const stage = stages[currentIndex];
   const progressPercent = status === 'completed' ? 100 :
     currentIndex === -1 ? 0 :
-    Math.round(((currentIndex + 0.5) / WORKFLOW_STAGES.length) * 100);
+    Math.round(((currentIndex + 0.5) / stages.length) * 100);
 
   return (
     <div className="flex items-center gap-3 px-3 py-2 bg-surface-light rounded-lg">
