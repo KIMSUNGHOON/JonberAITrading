@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from agents.graph.trading_graph import get_trading_graph
 from app.api.routes.analysis import get_active_sessions
+from app.api.routes.coin import get_coin_sessions
 from app.api.schemas.approval import (
     ApprovalRequest,
     ApprovalResponse,
@@ -41,8 +42,10 @@ async def submit_approval(request: ApprovalRequest):
     Returns:
         Updated status after decision is processed
     """
-    active_sessions = get_active_sessions()
-    session = active_sessions.get(request.session_id)
+    # Search both stock and coin sessions
+    stock_sessions = get_active_sessions()
+    coin_sessions = get_coin_sessions()
+    session = stock_sessions.get(request.session_id) or coin_sessions.get(request.session_id)
 
     if not session:
         raise HTTPException(
@@ -107,10 +110,14 @@ async def submit_approval(request: ApprovalRequest):
             # Re-analysis requested - session continues running
             session["status"] = "running"
             execution_status = "re_analyzing"
-        else:
-            # modified or cancelled
+        elif request.decision == "cancelled":
+            # User cancelled the workflow
             session["status"] = "cancelled"
             execution_status = "cancelled"
+        else:
+            # modified
+            session["status"] = "completed"
+            execution_status = state.get("execution_status", "completed")
 
         logger.info(
             "approval_processed",
@@ -137,6 +144,8 @@ async def submit_approval(request: ApprovalRequest):
         message = "Trade approved and executed successfully."
     elif request.decision == "rejected":
         message = "Trade rejected. Re-analyzing with your feedback..."
+    elif request.decision == "cancelled":
+        message = "Analysis cancelled by user."
     else:  # modified
         message = "Trade modified and executed with changes."
 
@@ -157,10 +166,13 @@ async def list_pending_approvals():
     Returns:
         List of pending approvals with trade proposal details
     """
-    active_sessions = get_active_sessions()
+    # Combine stock and coin sessions
+    stock_sessions = get_active_sessions()
+    coin_sessions = get_coin_sessions()
+    all_sessions = {**stock_sessions, **coin_sessions}
     pending = []
 
-    for session_id, session in active_sessions.items():
+    for session_id, session in all_sessions.items():
         state = session["state"]
 
         if not state.get("awaiting_approval"):
@@ -215,8 +227,10 @@ async def get_pending_approval(session_id: str):
     Returns:
         Detailed trade proposal and analyses
     """
-    active_sessions = get_active_sessions()
-    session = active_sessions.get(session_id)
+    # Search both stock and coin sessions
+    stock_sessions = get_active_sessions()
+    coin_sessions = get_coin_sessions()
+    session = stock_sessions.get(session_id) or coin_sessions.get(session_id)
 
     if not session:
         raise HTTPException(

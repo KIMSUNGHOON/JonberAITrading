@@ -41,10 +41,11 @@ export function ApprovalDialog() {
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [feedback, setFeedback] = useState('');
+  const setStatus = useStore((state) => state.setStatus);
 
   if (!proposal || !sessionId) return null;
 
-  const handleDecision = async (decision: 'approved' | 'rejected') => {
+  const handleDecision = async (decision: 'approved' | 'rejected' | 'cancelled') => {
     setIsSubmitting(true);
 
     try {
@@ -59,15 +60,25 @@ export function ApprovalDialog() {
       if (decision === 'rejected') {
         // Re-analysis: clear proposal, analysis continues
         setTradeProposal(null);
+      } else if (decision === 'cancelled') {
+        // Cancel: clear proposal and set status to cancelled
+        setTradeProposal(null);
+        setStatus('cancelled');
       }
 
       // Add chat message
       const symbol = getProposalSymbol(proposal);
+      let chatContent = '';
+      if (decision === 'approved') {
+        chatContent = `Trade approved: ${proposal.action.toUpperCase()} ${proposal.quantity} ${symbol}`;
+      } else if (decision === 'rejected') {
+        chatContent = `Trade rejected - Re-analyzing with feedback${feedback ? `: "${feedback}"` : '...'}`;
+      } else {
+        chatContent = `Analysis cancelled for ${symbol}`;
+      }
       addChatMessage({
         role: 'system',
-        content: decision === 'approved'
-          ? `Trade approved: ${proposal.action.toUpperCase()} ${proposal.quantity} ${symbol}`
-          : `Trade rejected - Re-analyzing with feedback${feedback ? `: "${feedback}"` : '...'}`,
+        content: chatContent,
       });
 
       setShowApprovalDialog(false);
@@ -240,11 +251,11 @@ export function ApprovalDialog() {
               </button>
             </div>
             <button
-              onClick={() => setShowApprovalDialog(false)}
+              onClick={() => handleDecision('cancelled')}
               disabled={isSubmitting}
               className="w-full py-2 text-sm text-gray-400 hover:text-gray-300 hover:bg-surface rounded-lg transition-colors"
             >
-              Cancel (Decide Later)
+              Cancel Analysis
             </button>
           </div>
         </div>

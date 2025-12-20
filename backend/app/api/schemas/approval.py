@@ -22,7 +22,7 @@ class ApprovalRequest(BaseModel):
         ...,
         description="Session ID of the pending approval",
     )
-    decision: Literal["approved", "rejected", "modified"] = Field(
+    decision: Literal["approved", "rejected", "modified", "cancelled"] = Field(
         ...,
         description="Approval decision",
     )
