@@ -17,7 +17,9 @@ import {
   CheckCircle2,
   Circle,
   Loader2,
+  Home,
 } from 'lucide-react';
+import { useStore } from '@/store';
 import type { SessionStatus } from '@/types';
 
 // Workflow stages for Stock analysis (matching backend AnalysisStage enum)
@@ -63,8 +65,15 @@ interface WorkflowProgressProps {
 }
 
 export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgressProps) {
+  const reset = useStore((state) => state.reset);
+
   // Get appropriate stages based on ticker type
   const WORKFLOW_STAGES = useMemo(() => getWorkflowStages(ticker), [ticker]);
+
+  // Handle cancel/return to home
+  const handleCancel = () => {
+    reset();
+  };
 
   // Calculate stage statuses
   const stageStatuses = useMemo(() => {
@@ -106,11 +115,19 @@ export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgr
             Analyzing <span className="text-blue-400 font-medium">{ticker}</span>
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
           <div className="text-right">
             <span className="text-2xl font-bold text-blue-400">{progressPercent}%</span>
             <p className="text-xs text-gray-400">Complete</p>
           </div>
+          {/* Cancel/Home Button */}
+          <button
+            onClick={handleCancel}
+            className="p-2 rounded-lg bg-surface hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-colors"
+            title="Cancel and return to home"
+          >
+            <Home className="w-5 h-5" />
+          </button>
         </div>
       </div>
 

@@ -160,7 +160,7 @@ export interface AnalysisRequest {
   ticker: string;
 }
 
-export type ApprovalDecision = 'approved' | 'rejected' | 'modified';
+export type ApprovalDecision = 'approved' | 'rejected' | 'modified' | 'cancelled';
 
 export interface ApprovalRequest {
   session_id: string;

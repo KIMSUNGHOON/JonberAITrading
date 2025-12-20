@@ -14,7 +14,7 @@ import { getCoinTickers, getCoinMarkets } from '@/api/client';
 interface TickerData {
   market: string;
   trade_price: number;
-  change: 'RISE' | 'EVEN' | 'FALL';
+  change: string;
   change_rate: number;
   change_price: number;
   acc_trade_price_24h: number;
