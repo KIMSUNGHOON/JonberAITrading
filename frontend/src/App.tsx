@@ -23,6 +23,18 @@ function App() {
   const error = useStore(selectError);
   const setError = useStore((state) => state.setError);
 
+  // Get status for conditional ChatPanel display
+  const status = useStore((state) =>
+    state.activeMarket === 'stock' ? state.stock.status : state.coin.status
+  );
+  const awaitingApproval = useStore((state) =>
+    state.activeMarket === 'stock' ? state.stock.awaitingApproval : state.coin.awaitingApproval
+  );
+
+  // Show ChatPanel when: idle, awaiting approval, completed, or cancelled
+  const showChatPanel = status === 'idle' || status === 'awaiting_approval' ||
+    status === 'completed' || status === 'cancelled' || awaitingApproval;
+
   // Check Upbit API status on mount
   useEffect(() => {
     async function checkUpbitStatus() {
@@ -70,10 +82,12 @@ function App() {
             <MainContent />
           </div>
 
-          {/* Chat Panel - Fixed width, hidden on mobile */}
-          <div className="hidden md:flex md:flex-col w-80 border-l border-border flex-shrink-0">
-            <ChatPanel />
-          </div>
+          {/* Chat Panel - Conditionally shown after workflow completes or for approval */}
+          {showChatPanel && (
+            <div className="hidden md:flex md:flex-col w-80 border-l border-border flex-shrink-0">
+              <ChatPanel />
+            </div>
+          )}
         </main>
       </div>
 
