@@ -403,14 +403,15 @@ export interface TickerWebSocketHandlers {
 /**
  * WebSocket client for real-time ticker data from Upbit.
  *
+ * Supports multiple subscribers with callback-based architecture.
+ * The WebSocket stays connected as long as there are active subscribers
+ * or until explicitly closed.
+ *
  * Usage:
- *   const ws = new TickerWebSocket({
- *     onTicker: (data) => console.log(data),
- *   });
- *   ws.connect();
- *   ws.subscribe(['KRW-BTC', 'KRW-ETH']);
+ *   const ws = getTickerWebSocket();
+ *   const unsubscribe = ws.addTickerCallback(['KRW-BTC'], (data) => console.log(data));
  *   // later...
- *   ws.disconnect();
+ *   unsubscribe(); // Remove this callback
  */
 export class TickerWebSocket {
   private ws: WebSocket | null = null;
@@ -422,8 +423,71 @@ export class TickerWebSocket {
   private isClosing = false;
   private pendingSubscriptions: string[] = [];
 
+  // Track subscriptions per market with reference counting
+  private marketSubscribers: Map<string, Set<(ticker: TickerData) => void>> = new Map();
+
   constructor(handlers: TickerWebSocketHandlers = {}) {
     this.handlers = handlers;
+  }
+
+  /**
+   * Add a ticker callback for specific markets.
+   * Returns an unsubscribe function to remove the callback.
+   */
+  addTickerCallback(
+    markets: string[],
+    callback: (ticker: TickerData) => void
+  ): () => void {
+    const normalizedMarkets = markets.map(m => m.toUpperCase());
+    const newMarkets: string[] = [];
+
+    for (const market of normalizedMarkets) {
+      if (!this.marketSubscribers.has(market)) {
+        this.marketSubscribers.set(market, new Set());
+        newMarkets.push(market);
+      }
+      this.marketSubscribers.get(market)!.add(callback);
+    }
+
+    // Subscribe to new markets
+    if (newMarkets.length > 0) {
+      this.subscribe(newMarkets);
+    }
+
+    // Return unsubscribe function
+    return () => {
+      const marketsToUnsubscribe: string[] = [];
+
+      for (const market of normalizedMarkets) {
+        const subscribers = this.marketSubscribers.get(market);
+        if (subscribers) {
+          subscribers.delete(callback);
+          // Only unsubscribe from market if no more callbacks
+          if (subscribers.size === 0) {
+            this.marketSubscribers.delete(market);
+            marketsToUnsubscribe.push(market);
+          }
+        }
+      }
+
+      if (marketsToUnsubscribe.length > 0) {
+        this.unsubscribe(marketsToUnsubscribe);
+      }
+    };
+  }
+
+  /**
+   * Get the number of active subscribers for a market.
+   */
+  getSubscriberCount(market: string): number {
+    return this.marketSubscribers.get(market.toUpperCase())?.size || 0;
+  }
+
+  /**
+   * Check if there are any active subscriptions.
+   */
+  hasActiveSubscriptions(): boolean {
+    return this.marketSubscribers.size > 0;
   }
 
   /**
@@ -509,9 +573,23 @@ export class TickerWebSocket {
       const message = JSON.parse(event.data);
 
       switch (message.type) {
-        case 'ticker':
-          this.handlers.onTicker?.(message as TickerData);
+        case 'ticker': {
+          const ticker = message as TickerData;
+          // Call all registered callbacks for this market
+          const subscribers = this.marketSubscribers.get(ticker.market);
+          if (subscribers) {
+            for (const callback of subscribers) {
+              try {
+                callback(ticker);
+              } catch (err) {
+                console.error('Ticker callback error:', err);
+              }
+            }
+          }
+          // Also call the legacy handler if set
+          this.handlers.onTicker?.(ticker);
           break;
+        }
 
         case 'subscribed':
           this.handlers.onSubscribed?.(message.markets);
@@ -655,4 +733,15 @@ export function getTickerWebSocket(): TickerWebSocket {
     tickerWebSocketInstance = new TickerWebSocket();
   }
   return tickerWebSocketInstance;
+}
+
+/**
+ * Explicitly close the ticker WebSocket.
+ * Only call this on logout or when the user explicitly wants to disconnect.
+ */
+export function closeTickerWebSocket(): void {
+  if (tickerWebSocketInstance) {
+    tickerWebSocketInstance.disconnect();
+    tickerWebSocketInstance = null;
+  }
 }

@@ -102,51 +102,43 @@ export function useCoinTicker(
     const ws = getTickerWebSocket();
     wsRef.current = ws;
 
-    // Handler for ticker updates
+    // Handler for ticker updates (specific to this market)
     const handleTicker = (ticker: TickerData) => {
-      if (ticker.market === market.toUpperCase()) {
-        setData(convertTickerData(ticker));
-        setError(null);
-        setIsLoading(false);
-      }
+      setData(convertTickerData(ticker));
+      setError(null);
+      setIsLoading(false);
     };
-
-    // Setup handlers
-    ws.setHandlers({
-      onTicker: handleTicker,
-      onConnect: () => {
-        setIsConnected(true);
-        // Subscribe when connected
-        if (market) {
-          ws.subscribe([market]);
-          subscribedMarketRef.current = market;
-        }
-      },
-      onDisconnect: () => {
-        setIsConnected(false);
-      },
-      onError: (err) => {
-        setError(typeof err === 'string' ? err : 'WebSocket error');
-      },
-    });
 
     // Connect if not already connected
     if (!ws.isConnected()) {
       setIsLoading(true);
       ws.connect();
+
+      // Setup connection handlers (only needed once, but safe to call multiple times)
+      ws.setHandlers({
+        onConnect: () => {
+          setIsConnected(true);
+        },
+        onDisconnect: () => {
+          setIsConnected(false);
+        },
+        onError: (err) => {
+          setError(typeof err === 'string' ? err : 'WebSocket error');
+        },
+      });
     } else {
-      // Already connected, just subscribe
-      ws.subscribe([market]);
-      subscribedMarketRef.current = market;
       setIsConnected(true);
     }
 
+    // Register callback for this market - returns cleanup function
+    const unsubscribe = ws.addTickerCallback([market], handleTicker);
+    subscribedMarketRef.current = market;
+
     return () => {
-      // Unsubscribe when unmounting or market changes
-      if (subscribedMarketRef.current && wsRef.current) {
-        wsRef.current.unsubscribe([subscribedMarketRef.current]);
-        subscribedMarketRef.current = null;
-      }
+      // Cleanup: remove our callback (handles unsubscribe if no other callbacks)
+      unsubscribe();
+      subscribedMarketRef.current = null;
+      // Note: WebSocket stays connected for other subscribers
     };
   }, [market, enabled, usePolling, convertTickerData]);
 
@@ -242,38 +234,35 @@ export function useCoinTickers(
       setError(null);
     };
 
-    ws.setHandlers({
-      onTicker: handleTicker,
-      onConnect: () => {
-        setIsConnected(true);
-        // Subscribe to all markets
-        const marketsToSubscribe = markets.map(m => m.toUpperCase());
-        ws.subscribe(marketsToSubscribe);
-        subscribedMarketsRef.current = new Set(marketsToSubscribe);
-      },
-      onDisconnect: () => {
-        setIsConnected(false);
-      },
-      onError: (err) => {
-        setError(typeof err === 'string' ? err : 'WebSocket error');
-      },
-    });
-
+    // Connect if not already connected
     if (!ws.isConnected()) {
       ws.connect();
+
+      ws.setHandlers({
+        onConnect: () => {
+          setIsConnected(true);
+        },
+        onDisconnect: () => {
+          setIsConnected(false);
+        },
+        onError: (err) => {
+          setError(typeof err === 'string' ? err : 'WebSocket error');
+        },
+      });
     } else {
-      const marketsToSubscribe = markets.map(m => m.toUpperCase());
-      ws.subscribe(marketsToSubscribe);
-      subscribedMarketsRef.current = new Set(marketsToSubscribe);
       setIsConnected(true);
     }
 
+    // Register callback for all markets - returns cleanup function
+    const normalizedMarkets = markets.map(m => m.toUpperCase());
+    const unsubscribe = ws.addTickerCallback(normalizedMarkets, handleTicker);
+    subscribedMarketsRef.current = new Set(normalizedMarkets);
+
     return () => {
-      // Unsubscribe from all markets
-      if (wsRef.current && subscribedMarketsRef.current.size > 0) {
-        wsRef.current.unsubscribe(Array.from(subscribedMarketsRef.current));
-        subscribedMarketsRef.current.clear();
-      }
+      // Cleanup: remove our callback (handles unsubscribe if no other callbacks)
+      unsubscribe();
+      subscribedMarketsRef.current.clear();
+      // Note: WebSocket stays connected for other subscribers
     };
   }, [markets.join(','), enabled, convertTickerData]);
 
