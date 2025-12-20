@@ -155,9 +155,15 @@ export function TradingChart({
           const interval = intervalMap[timeframe] || '1d';
           const response = await getCoinCandles(ticker, interval, 200);
 
+          // Check if we got valid data
+          if (!response.candles || response.candles.length === 0) {
+            throw new Error('No candle data available');
+          }
+
           // Transform API response to lightweight-charts format
           // Upbit returns newest first, so reverse for chronological order
           candles = response.candles
+            .filter((c) => c.datetime && c.open && c.high && c.low && c.close)
             .map((c) => ({
               time: Math.floor(new Date(c.datetime).getTime() / 1000) as any,
               open: c.open,
@@ -166,6 +172,10 @@ export function TradingChart({
               close: c.close,
             }))
             .reverse();
+
+          if (candles.length === 0) {
+            throw new Error('Invalid candle data received');
+          }
         } else {
           // Fall back to mock data for stock tickers
           const data = generateMockData(ticker, timeframe);

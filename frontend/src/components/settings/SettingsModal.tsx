@@ -25,6 +25,7 @@ import {
   clearUpbitApiKeys,
   getSettings,
 } from '@/api/client';
+import { useStore } from '@/store';
 import type { UpbitApiKeyStatus, SettingsStatus } from '@/types';
 
 interface SettingsModalProps {
@@ -46,6 +47,9 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [showAccessKey, setShowAccessKey] = useState(false);
   const [showSecretKey, setShowSecretKey] = useState(false);
   const [validating, setValidating] = useState(false);
+
+  // Store actions for updating global API status
+  const setUpbitApiConfigured = useStore((state) => state.setUpbitApiConfigured);
 
   // Load settings on open
   useEffect(() => {
@@ -90,6 +94,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
       if (response.success) {
         setUpbitStatus(response.status);
+        setUpbitApiConfigured(response.status.is_configured);
         setAccessKey('');
         setSecretKey('');
         setSuccess('API keys updated. Click "Validate" to test them.');
@@ -141,6 +146,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       await clearUpbitApiKeys();
       const status = await getUpbitApiStatus();
       setUpbitStatus(status);
+      setUpbitApiConfigured(status.is_configured);
       setSuccess('API keys cleared');
     } catch (err) {
       setError('Failed to clear API keys');

@@ -12,11 +12,29 @@ import { MainContent } from '@/components/layout/MainContent';
 import { ChatPanel } from '@/components/chat/ChatPanel';
 import { ApprovalDialog } from '@/components/approval/ApprovalDialog';
 import { MobileNav } from '@/components/layout/MobileNav';
+import { SettingsModal } from '@/components/settings/SettingsModal';
+import { getUpbitApiStatus } from '@/api/client';
 
 function App() {
   const showApprovalDialog = useStore((state) => state.showApprovalDialog);
+  const showSettingsModal = useStore((state) => state.showSettingsModal);
+  const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
+  const setUpbitApiConfigured = useStore((state) => state.setUpbitApiConfigured);
   const error = useStore(selectError);
   const setError = useStore((state) => state.setError);
+
+  // Check Upbit API status on mount
+  useEffect(() => {
+    async function checkUpbitStatus() {
+      try {
+        const status = await getUpbitApiStatus();
+        setUpbitApiConfigured(status.is_configured);
+      } catch (err) {
+        console.error('Failed to check Upbit API status:', err);
+      }
+    }
+    checkUpbitStatus();
+  }, [setUpbitApiConfigured]);
 
   // Clear error after 5 seconds
   useEffect(() => {
@@ -64,6 +82,12 @@ function App() {
 
       {/* Approval Dialog */}
       {showApprovalDialog && <ApprovalDialog />}
+
+      {/* Settings Modal */}
+      <SettingsModal
+        isOpen={showSettingsModal}
+        onClose={() => setShowSettingsModal(false)}
+      />
     </div>
   );
 }

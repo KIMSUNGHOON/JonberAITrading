@@ -26,6 +26,19 @@ import type {
   CoinTradeProposal,
 } from '@/types';
 
+// UUID 생성 함수 (crypto.randomUUID 폴백)
+function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  // Fallback for older browsers or non-secure contexts
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 // -------------------------------------------
 // Store Types
 // -------------------------------------------
@@ -93,7 +106,11 @@ interface UIState {
   // Panels
   showApprovalDialog: boolean;
   showChartPanel: boolean;
+  showSettingsModal: boolean;
   isMobileMenuOpen: boolean;
+
+  // Upbit API status
+  upbitApiConfigured: boolean;
 
   // Chart config
   chartConfig: ChartConfig;
@@ -139,7 +156,9 @@ interface UIActions {
   setActiveMarket: (market: MarketType) => void;
   setShowApprovalDialog: (show: boolean) => void;
   setShowChartPanel: (show: boolean) => void;
+  setShowSettingsModal: (show: boolean) => void;
   setMobileMenuOpen: (open: boolean) => void;
+  setUpbitApiConfigured: (configured: boolean) => void;
   setChartTimeframe: (timeframe: TimeFrame) => void;
   toggleChartIndicator: (indicator: 'showSMA50' | 'showSMA200' | 'showVolume') => void;
 }
@@ -206,7 +225,9 @@ const initialUIState: UIState = {
   activeMarket: 'stock',
   showApprovalDialog: false,
   showChartPanel: true,
+  showSettingsModal: false,
   isMobileMenuOpen: false,
+  upbitApiConfigured: false,
   chartConfig: {
     timeframe: '1d',
     showSMA50: true,
@@ -445,7 +466,7 @@ export const useStore = create<Store>()(
             ...state.messages,
             {
               ...message,
-              id: crypto.randomUUID(),
+              id: generateUUID(),
               timestamp: new Date(),
             },
           ],
@@ -464,7 +485,11 @@ export const useStore = create<Store>()(
 
       setShowChartPanel: (show) => set({ showChartPanel: show }),
 
+      setShowSettingsModal: (show) => set({ showSettingsModal: show }),
+
       setMobileMenuOpen: (open) => set({ isMobileMenuOpen: open }),
+
+      setUpbitApiConfigured: (configured) => set({ upbitApiConfigured: configured }),
 
       setChartTimeframe: (timeframe) =>
         set((state) => ({

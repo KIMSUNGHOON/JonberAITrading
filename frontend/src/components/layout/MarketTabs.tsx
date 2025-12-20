@@ -2,9 +2,10 @@
  * MarketTabs Component
  *
  * Tab navigation for switching between Stock and Coin markets.
+ * Coin tab requires Upbit API key configuration.
  */
 
-import { TrendingUp, Bitcoin } from 'lucide-react';
+import { TrendingUp, Bitcoin, Lock } from 'lucide-react';
 import { useStore, type MarketType } from '@/store';
 
 interface TabProps {
@@ -13,10 +14,11 @@ interface TabProps {
   label: string;
   sublabel: string;
   isActive: boolean;
+  locked?: boolean;
   onClick: () => void;
 }
 
-function Tab({ icon, label, sublabel, isActive, onClick }: TabProps) {
+function Tab({ icon, label, sublabel, isActive, locked, onClick }: TabProps) {
   return (
     <button
       onClick={onClick}
@@ -26,14 +28,21 @@ function Tab({ icon, label, sublabel, isActive, onClick }: TabProps) {
         ${
           isActive
             ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30'
-            : 'text-gray-400 hover:bg-surface hover:text-gray-200 border border-transparent'
+            : locked
+              ? 'text-gray-500 hover:bg-surface border border-transparent cursor-pointer'
+              : 'text-gray-400 hover:bg-surface hover:text-gray-200 border border-transparent'
         }
       `}
     >
       {icon}
       <div className="text-left">
-        <div className="text-sm font-medium">{label}</div>
-        <div className="text-xs opacity-60">{sublabel}</div>
+        <div className="text-sm font-medium flex items-center gap-1">
+          {label}
+          {locked && <Lock className="w-3 h-3 text-yellow-500" />}
+        </div>
+        <div className="text-xs opacity-60">
+          {locked ? 'API Key 필요' : sublabel}
+        </div>
       </div>
     </button>
   );
@@ -42,6 +51,17 @@ function Tab({ icon, label, sublabel, isActive, onClick }: TabProps) {
 export function MarketTabs() {
   const activeMarket = useStore((state) => state.activeMarket);
   const setActiveMarket = useStore((state) => state.setActiveMarket);
+  const upbitApiConfigured = useStore((state) => state.upbitApiConfigured);
+  const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
+
+  const handleCoinTabClick = () => {
+    if (!upbitApiConfigured) {
+      // API KEY가 없으면 설정 모달 열기
+      setShowSettingsModal(true);
+    } else {
+      setActiveMarket('coin');
+    }
+  };
 
   return (
     <div className="flex gap-2 p-1 bg-surface rounded-lg">
@@ -59,7 +79,8 @@ export function MarketTabs() {
         label="Coin"
         sublabel="코인"
         isActive={activeMarket === 'coin'}
-        onClick={() => setActiveMarket('coin')}
+        locked={!upbitApiConfigured}
+        onClick={handleCoinTabClick}
       />
     </div>
   );
