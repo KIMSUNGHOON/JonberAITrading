@@ -426,6 +426,10 @@ export class TickerWebSocket {
   // Track subscriptions per market with reference counting
   private marketSubscribers: Map<string, Set<(ticker: TickerData) => void>> = new Map();
 
+  // Debounce unsubscription to prevent rapid subscribe/unsubscribe cycles during page navigation
+  private pendingUnsubscriptions: Map<string, number> = new Map();
+  private readonly unsubscribeDelay = 150; // ms to wait before actually unsubscribing
+
   constructor(handlers: TickerWebSocketHandlers = {}) {
     this.handlers = handlers;
   }
@@ -442,6 +446,13 @@ export class TickerWebSocket {
     const newMarkets: string[] = [];
 
     for (const market of normalizedMarkets) {
+      // Cancel any pending unsubscription for this market
+      const pendingTimeout = this.pendingUnsubscriptions.get(market);
+      if (pendingTimeout) {
+        clearTimeout(pendingTimeout);
+        this.pendingUnsubscriptions.delete(market);
+      }
+
       if (!this.marketSubscribers.has(market)) {
         this.marketSubscribers.set(market, new Set());
         newMarkets.push(market);
@@ -456,24 +467,42 @@ export class TickerWebSocket {
 
     // Return unsubscribe function
     return () => {
-      const marketsToUnsubscribe: string[] = [];
-
       for (const market of normalizedMarkets) {
         const subscribers = this.marketSubscribers.get(market);
         if (subscribers) {
           subscribers.delete(callback);
-          // Only unsubscribe from market if no more callbacks
+          // Only schedule unsubscription if no more callbacks
           if (subscribers.size === 0) {
             this.marketSubscribers.delete(market);
-            marketsToUnsubscribe.push(market);
+            // Debounce the unsubscription to prevent thrashing during page navigation
+            this.scheduleUnsubscribe(market);
           }
         }
       }
-
-      if (marketsToUnsubscribe.length > 0) {
-        this.unsubscribe(marketsToUnsubscribe);
-      }
     };
+  }
+
+  /**
+   * Schedule a debounced unsubscription for a market.
+   * If a new subscription comes in before the delay, the unsubscription is cancelled.
+   */
+  private scheduleUnsubscribe(market: string): void {
+    // Cancel any existing pending unsubscription for this market
+    const existingTimeout = this.pendingUnsubscriptions.get(market);
+    if (existingTimeout) {
+      clearTimeout(existingTimeout);
+    }
+
+    // Schedule the unsubscription
+    const timeoutId = window.setTimeout(() => {
+      this.pendingUnsubscriptions.delete(market);
+      // Only unsubscribe if still no subscribers
+      if (!this.marketSubscribers.has(market)) {
+        this.unsubscribe([market]);
+      }
+    }, this.unsubscribeDelay);
+
+    this.pendingUnsubscriptions.set(market, timeoutId);
   }
 
   /**
@@ -700,6 +729,12 @@ export class TickerWebSocket {
   disconnect(): void {
     this.isClosing = true;
     this.stopPingInterval();
+
+    // Clear all pending unsubscriptions
+    for (const timeoutId of this.pendingUnsubscriptions.values()) {
+      clearTimeout(timeoutId);
+    }
+    this.pendingUnsubscriptions.clear();
 
     if (this.ws) {
       this.ws.close(1000, 'Client disconnect');
