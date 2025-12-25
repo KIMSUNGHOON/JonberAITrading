@@ -5,7 +5,7 @@ Endpoints for starting and monitoring trading analysis sessions.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
@@ -87,7 +87,7 @@ async def start_analysis(
         "ticker": ticker,
         "status": "running",
         "state": initial_state,
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
         "error": None,
     }
 
