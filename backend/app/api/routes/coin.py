@@ -12,18 +12,28 @@ import structlog
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 
 from app.api.schemas.coin import (
+    AccountBalance,
+    AccountListResponse,
     CandleData,
     CandleListResponse,
     CoinAnalysisRequest,
     CoinAnalysisResponse,
     CoinAnalysisStatusResponse,
     CoinAnalysisSummary,
+    CoinPosition,
+    CoinPositionListResponse,
+    CoinTradeListResponse,
     CoinTradeProposalResponse,
+    CoinTradeRecord,
     MarketInfo,
     MarketListResponse,
     MarketSearchRequest,
     OrderbookResponse,
     OrderbookUnit,
+    OrderCancelResponse,
+    OrderListResponse,
+    OrderRequest,
+    OrderResponse,
     TickerListResponse,
     TickerResponse,
 )
@@ -674,6 +684,779 @@ async def cancel_coin_analysis(session_id: str):
     logger.info("coin_analysis_cancelled", session_id=session_id)
 
     return {"message": f"Session {session_id} cancelled"}
+
+
+# -------------------------------------------
+# Account & Order Endpoints
+# -------------------------------------------
+
+
+def _check_api_keys():
+    """Check if Upbit API keys are configured."""
+    if not settings.UPBIT_ACCESS_KEY or not settings.UPBIT_SECRET_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Upbit API keys not configured. Set UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY.",
+        )
+
+
+@router.get("/accounts", response_model=AccountListResponse)
+async def get_accounts():
+    """
+    Get account balances.
+
+    Requires Upbit API keys to be configured.
+
+    Returns:
+        List of account balances for all currencies
+    """
+    _check_api_keys()
+
+    async with get_upbit_client() as client:
+        try:
+            accounts = await client.get_accounts()
+
+            account_balances = [
+                AccountBalance(
+                    currency=acc.currency,
+                    balance=float(acc.balance),
+                    locked=float(acc.locked),
+                    avg_buy_price=float(acc.avg_buy_price),
+                    avg_buy_price_modified=acc.avg_buy_price_modified,
+                    unit_currency=acc.unit_currency,
+                )
+                for acc in accounts
+            ]
+
+            # Calculate total KRW value (optional enhancement)
+            total_krw = None
+            krw_account = next(
+                (a for a in account_balances if a.currency == "KRW"), None
+            )
+            if krw_account:
+                total_krw = krw_account.balance + krw_account.locked
+
+            return AccountListResponse(
+                accounts=account_balances,
+                total_krw_value=total_krw,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("get_accounts_failed", error=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to fetch accounts: {str(e)}",
+            )
+
+
+@router.get("/orders", response_model=OrderListResponse)
+async def get_orders(
+    market: Optional[str] = Query(
+        default=None,
+        description="Filter by market code (e.g., KRW-BTC)",
+    ),
+    state: Optional[str] = Query(
+        default=None,
+        description="Filter by state (wait, watch, done, cancel)",
+    ),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=100,
+        description="Maximum number of orders to return",
+    ),
+):
+    """
+    Get list of orders.
+
+    Requires Upbit API keys to be configured.
+
+    Args:
+        market: Filter by market code
+        state: Filter by order state
+        limit: Maximum number of orders (default 100)
+
+    Returns:
+        List of orders
+    """
+    _check_api_keys()
+
+    async with get_upbit_client() as client:
+        try:
+            orders = await client.get_orders(
+                market=market.upper() if market else None,
+                state=state,
+                limit=limit,
+            )
+
+            order_responses = [
+                OrderResponse(
+                    uuid=order.uuid,
+                    side=order.side,
+                    ord_type=order.ord_type,
+                    price=float(order.price) if order.price else None,
+                    state=order.state,
+                    market=order.market,
+                    created_at=order.created_at,
+                    volume=float(order.volume) if order.volume else None,
+                    remaining_volume=float(order.remaining_volume)
+                    if order.remaining_volume
+                    else None,
+                    reserved_fee=float(order.reserved_fee)
+                    if order.reserved_fee
+                    else None,
+                    remaining_fee=float(order.remaining_fee)
+                    if order.remaining_fee
+                    else None,
+                    paid_fee=float(order.paid_fee) if order.paid_fee else None,
+                    locked=float(order.locked) if order.locked else None,
+                    executed_volume=float(order.executed_volume)
+                    if order.executed_volume
+                    else None,
+                    trades_count=order.trades_count,
+                )
+                for order in orders
+            ]
+
+            return OrderListResponse(
+                orders=order_responses,
+                total=len(order_responses),
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("get_orders_failed", error=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to fetch orders: {str(e)}",
+            )
+
+
+@router.get("/orders/{order_id}", response_model=OrderResponse)
+async def get_order(order_id: str):
+    """
+    Get a single order by UUID.
+
+    Requires Upbit API keys to be configured.
+
+    Args:
+        order_id: Order UUID
+
+    Returns:
+        Order details
+    """
+    _check_api_keys()
+
+    async with get_upbit_client() as client:
+        try:
+            order = await client.get_order(uuid=order_id)
+
+            if not order:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Order {order_id} not found",
+                )
+
+            return OrderResponse(
+                uuid=order.uuid,
+                side=order.side,
+                ord_type=order.ord_type,
+                price=float(order.price) if order.price else None,
+                state=order.state,
+                market=order.market,
+                created_at=order.created_at,
+                volume=float(order.volume) if order.volume else None,
+                remaining_volume=float(order.remaining_volume)
+                if order.remaining_volume
+                else None,
+                reserved_fee=float(order.reserved_fee) if order.reserved_fee else None,
+                remaining_fee=float(order.remaining_fee)
+                if order.remaining_fee
+                else None,
+                paid_fee=float(order.paid_fee) if order.paid_fee else None,
+                locked=float(order.locked) if order.locked else None,
+                executed_volume=float(order.executed_volume)
+                if order.executed_volume
+                else None,
+                trades_count=order.trades_count,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("get_order_failed", order_id=order_id, error=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to fetch order: {str(e)}",
+            )
+
+
+@router.post("/orders", response_model=OrderResponse)
+async def create_order(request: OrderRequest):
+    """
+    Create a new order.
+
+    Requires Upbit API keys to be configured.
+
+    Order types:
+    - limit: Limit order (requires price and volume)
+    - price: Market buy order (requires price as total KRW amount)
+    - market: Market sell order (requires volume)
+
+    Args:
+        request: Order request
+
+    Returns:
+        Created order details
+    """
+    _check_api_keys()
+
+    # Validate order parameters
+    if request.ord_type == "limit":
+        if not request.price or not request.volume:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Limit orders require both price and volume",
+            )
+    elif request.ord_type == "price":
+        if not request.price:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Market buy orders require price (total KRW amount)",
+            )
+    elif request.ord_type == "market":
+        if not request.volume:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Market sell orders require volume",
+            )
+
+    # Check trading mode
+    if settings.UPBIT_TRADING_MODE == "paper":
+        logger.info(
+            "paper_trade_order",
+            market=request.market,
+            side=request.side,
+            ord_type=request.ord_type,
+            price=request.price,
+            volume=request.volume,
+        )
+        # Return simulated order for paper trading
+        from datetime import datetime
+
+        return OrderResponse(
+            uuid=f"paper-{uuid.uuid4()}",
+            side=request.side,
+            ord_type=request.ord_type,
+            price=request.price,
+            state="done" if request.ord_type in ["price", "market"] else "wait",
+            market=request.market.upper(),
+            created_at=datetime.utcnow(),
+            volume=request.volume,
+            remaining_volume=0 if request.ord_type in ["price", "market"] else request.volume,
+            executed_volume=request.volume if request.ord_type in ["price", "market"] else 0,
+            trades_count=1 if request.ord_type in ["price", "market"] else 0,
+        )
+
+    # Live trading
+    async with get_upbit_client() as client:
+        try:
+            order = await client.place_order(
+                market=request.market.upper(),
+                side=request.side,
+                ord_type=request.ord_type,
+                price=request.price,
+                volume=request.volume,
+            )
+
+            logger.info(
+                "order_created",
+                uuid=order.uuid,
+                market=order.market,
+                side=order.side,
+            )
+
+            return OrderResponse(
+                uuid=order.uuid,
+                side=order.side,
+                ord_type=order.ord_type,
+                price=float(order.price) if order.price else None,
+                state=order.state,
+                market=order.market,
+                created_at=order.created_at,
+                volume=float(order.volume) if order.volume else None,
+                remaining_volume=float(order.remaining_volume)
+                if order.remaining_volume
+                else None,
+                reserved_fee=float(order.reserved_fee) if order.reserved_fee else None,
+                remaining_fee=float(order.remaining_fee)
+                if order.remaining_fee
+                else None,
+                paid_fee=float(order.paid_fee) if order.paid_fee else None,
+                locked=float(order.locked) if order.locked else None,
+                executed_volume=float(order.executed_volume)
+                if order.executed_volume
+                else None,
+                trades_count=order.trades_count,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(
+                "create_order_failed",
+                market=request.market,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to create order: {str(e)}",
+            )
+
+
+@router.delete("/orders/{order_id}", response_model=OrderCancelResponse)
+async def cancel_order(order_id: str):
+    """
+    Cancel an order.
+
+    Requires Upbit API keys to be configured.
+    Only orders in 'wait' state can be cancelled.
+
+    Args:
+        order_id: Order UUID to cancel
+
+    Returns:
+        Cancelled order details
+    """
+    _check_api_keys()
+
+    # Check for paper trading
+    if order_id.startswith("paper-"):
+        logger.info("paper_trade_cancel", order_id=order_id)
+        return OrderCancelResponse(
+            uuid=order_id,
+            side="bid",
+            ord_type="limit",
+            state="cancel",
+            market="KRW-PAPER",
+        )
+
+    async with get_upbit_client() as client:
+        try:
+            order = await client.cancel_order(uuid=order_id)
+
+            logger.info("order_cancelled", uuid=order.uuid)
+
+            return OrderCancelResponse(
+                uuid=order.uuid,
+                side=order.side,
+                ord_type=order.ord_type,
+                price=float(order.price) if order.price else None,
+                state=order.state,
+                market=order.market,
+                volume=float(order.volume) if order.volume else None,
+                remaining_volume=float(order.remaining_volume)
+                if order.remaining_volume
+                else None,
+                executed_volume=float(order.executed_volume)
+                if order.executed_volume
+                else None,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("cancel_order_failed", order_id=order_id, error=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to cancel order: {str(e)}",
+            )
+
+
+# -------------------------------------------
+# Position Endpoints
+# -------------------------------------------
+
+
+@router.get("/positions", response_model=CoinPositionListResponse)
+async def get_positions():
+    """
+    Get all open positions with real-time P&L.
+
+    Combines stored positions with live ticker data to calculate
+    unrealized profit/loss.
+
+    Returns:
+        List of positions with portfolio summary
+    """
+    from services.storage_service import get_storage_service
+
+    storage = await get_storage_service()
+    positions_data = await storage.get_coin_positions()
+
+    if not positions_data:
+        return CoinPositionListResponse(
+            positions=[],
+            total_value_krw=0,
+            total_pnl=0,
+            total_pnl_pct=0,
+        )
+
+    # Get current prices for all position markets
+    markets = [p["market"] for p in positions_data]
+
+    async with get_upbit_client() as client:
+        try:
+            tickers = await client.get_ticker(markets)
+            price_map = {t.market: t.trade_price for t in tickers}
+        except Exception as e:
+            logger.warning("failed_to_fetch_tickers_for_positions", error=str(e))
+            price_map = {}
+
+    positions = []
+    total_value = 0
+    total_pnl = 0
+    total_cost = 0
+
+    for p in positions_data:
+        market = p["market"]
+        quantity = p["quantity"]
+        avg_entry = p["avg_entry_price"]
+        current_price = price_map.get(market, avg_entry)
+
+        position_value = quantity * current_price
+        position_cost = quantity * avg_entry
+        unrealized_pnl = position_value - position_cost
+        unrealized_pnl_pct = (
+            (unrealized_pnl / position_cost * 100) if position_cost > 0 else 0
+        )
+
+        total_value += position_value
+        total_cost += position_cost
+        total_pnl += unrealized_pnl
+
+        positions.append(
+            CoinPosition(
+                market=market,
+                currency=p["currency"],
+                quantity=quantity,
+                avg_entry_price=avg_entry,
+                current_price=current_price,
+                unrealized_pnl=unrealized_pnl,
+                unrealized_pnl_pct=unrealized_pnl_pct,
+                stop_loss=p.get("stop_loss"),
+                take_profit=p.get("take_profit"),
+                session_id=p.get("session_id"),
+                created_at=p["created_at"],
+            )
+        )
+
+    total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+
+    return CoinPositionListResponse(
+        positions=positions,
+        total_value_krw=total_value,
+        total_pnl=total_pnl,
+        total_pnl_pct=total_pnl_pct,
+    )
+
+
+@router.get("/positions/{market}", response_model=CoinPosition)
+async def get_position(market: str):
+    """
+    Get a single position by market with real-time P&L.
+
+    Args:
+        market: Market code (e.g., KRW-BTC)
+
+    Returns:
+        Position details with current P&L
+    """
+    from services.storage_service import get_storage_service
+
+    market = market.upper()
+    storage = await get_storage_service()
+    position = await storage.get_coin_position(market)
+
+    if not position:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No position found for {market}",
+        )
+
+    # Get current price
+    current_price = position["avg_entry_price"]
+    async with get_upbit_client() as client:
+        try:
+            tickers = await client.get_ticker([market])
+            if tickers:
+                current_price = tickers[0].trade_price
+        except Exception as e:
+            logger.warning("failed_to_fetch_ticker", market=market, error=str(e))
+
+    quantity = position["quantity"]
+    avg_entry = position["avg_entry_price"]
+    position_value = quantity * current_price
+    position_cost = quantity * avg_entry
+    unrealized_pnl = position_value - position_cost
+    unrealized_pnl_pct = (
+        (unrealized_pnl / position_cost * 100) if position_cost > 0 else 0
+    )
+
+    return CoinPosition(
+        market=market,
+        currency=position["currency"],
+        quantity=quantity,
+        avg_entry_price=avg_entry,
+        current_price=current_price,
+        unrealized_pnl=unrealized_pnl,
+        unrealized_pnl_pct=unrealized_pnl_pct,
+        stop_loss=position.get("stop_loss"),
+        take_profit=position.get("take_profit"),
+        session_id=position.get("session_id"),
+        created_at=position["created_at"],
+    )
+
+
+@router.post("/positions/{market}/close", response_model=OrderResponse)
+async def close_position(market: str):
+    """
+    Close a position by selling all holdings at market price.
+
+    Args:
+        market: Market code to close
+
+    Returns:
+        Order response from the sell order
+    """
+    from services.storage_service import get_storage_service
+
+    _check_api_keys()
+    market = market.upper()
+
+    storage = await get_storage_service()
+    position = await storage.get_coin_position(market)
+
+    if not position:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No position found for {market}",
+        )
+
+    quantity = position["quantity"]
+    if quantity <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Position quantity is zero for {market}",
+        )
+
+    # Check trading mode
+    if settings.UPBIT_TRADING_MODE == "paper":
+        logger.info(
+            "paper_trade_close_position",
+            market=market,
+            quantity=quantity,
+        )
+
+        # Get current price for paper trade
+        async with get_upbit_client() as client:
+            tickers = await client.get_ticker([market])
+            current_price = tickers[0].trade_price if tickers else position["avg_entry_price"]
+
+        # Save closing trade
+        trade_id = f"paper-close-{uuid.uuid4()}"
+        await storage.save_coin_trade({
+            "id": trade_id,
+            "session_id": position.get("session_id"),
+            "market": market,
+            "side": "ask",
+            "order_type": "market",
+            "price": current_price,
+            "volume": quantity,
+            "executed_volume": quantity,
+            "fee": 0,
+            "total_krw": quantity * current_price,
+            "state": "done",
+            "order_uuid": trade_id,
+        })
+
+        # Delete position
+        await storage.delete_coin_position(market)
+
+        return OrderResponse(
+            uuid=trade_id,
+            side="ask",
+            ord_type="market",
+            price=current_price,
+            state="done",
+            market=market,
+            created_at=datetime.utcnow(),
+            volume=quantity,
+            remaining_volume=0,
+            executed_volume=quantity,
+            trades_count=1,
+        )
+
+    # Live trading
+    async with get_upbit_client() as client:
+        try:
+            order = await client.place_order(
+                market=market,
+                side="ask",
+                ord_type="market",
+                volume=quantity,
+            )
+
+            # Save closing trade
+            await storage.save_coin_trade({
+                "id": f"close-{order.uuid}",
+                "session_id": position.get("session_id"),
+                "market": market,
+                "side": "ask",
+                "order_type": "market",
+                "price": float(order.price) if order.price else 0,
+                "volume": quantity,
+                "executed_volume": float(order.executed_volume) if order.executed_volume else quantity,
+                "fee": float(order.paid_fee) if order.paid_fee else 0,
+                "total_krw": quantity * (float(order.price) if order.price else 0),
+                "state": order.state,
+                "order_uuid": order.uuid,
+            })
+
+            # Delete position if order is done
+            if order.state == "done":
+                await storage.delete_coin_position(market)
+
+            logger.info("position_closed", market=market, order_uuid=order.uuid)
+
+            return OrderResponse(
+                uuid=order.uuid,
+                side=order.side,
+                ord_type=order.ord_type,
+                price=float(order.price) if order.price else None,
+                state=order.state,
+                market=order.market,
+                created_at=order.created_at,
+                volume=float(order.volume) if order.volume else None,
+                remaining_volume=float(order.remaining_volume) if order.remaining_volume else None,
+                executed_volume=float(order.executed_volume) if order.executed_volume else None,
+                trades_count=order.trades_count,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("close_position_failed", market=market, error=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to close position: {str(e)}",
+            )
+
+
+# -------------------------------------------
+# Trade History Endpoints
+# -------------------------------------------
+
+
+@router.get("/trades", response_model=CoinTradeListResponse)
+async def get_trades(
+    market: Optional[str] = Query(default=None, description="Filter by market code"),
+    page: int = Query(default=1, ge=1, description="Page number (1-indexed)"),
+    limit: int = Query(default=20, ge=1, le=100, description="Results per page"),
+):
+    """
+    Get trade history with pagination.
+
+    Args:
+        market: Filter by market code (optional)
+        page: Page number (1-indexed)
+        limit: Results per page (max 100)
+
+    Returns:
+        Paginated list of trade records
+    """
+    from services.storage_service import get_storage_service
+
+    storage = await get_storage_service()
+    offset = (page - 1) * limit
+
+    trades_data = await storage.get_coin_trades(
+        market=market.upper() if market else None,
+        limit=limit,
+        offset=offset,
+    )
+
+    total = await storage.get_coin_trades_count(
+        market=market.upper() if market else None
+    )
+
+    trades = [
+        CoinTradeRecord(
+            id=t["id"],
+            session_id=t.get("session_id"),
+            market=t["market"],
+            side=t["side"],
+            order_type=t["order_type"],
+            price=t["price"],
+            volume=t["volume"],
+            executed_volume=t["executed_volume"],
+            fee=t.get("fee", 0),
+            total_krw=t["total_krw"],
+            state=t["state"],
+            order_uuid=t.get("order_uuid"),
+            created_at=t["created_at"],
+        )
+        for t in trades_data
+    ]
+
+    return CoinTradeListResponse(
+        trades=trades,
+        total=total,
+        page=page,
+        limit=limit,
+    )
+
+
+@router.get("/trades/{trade_id}", response_model=CoinTradeRecord)
+async def get_trade(trade_id: str):
+    """
+    Get a single trade by ID.
+
+    Args:
+        trade_id: Trade ID
+
+    Returns:
+        Trade record details
+    """
+    from services.storage_service import get_storage_service
+
+    storage = await get_storage_service()
+    trade = await storage.get_coin_trade(trade_id)
+
+    if not trade:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Trade {trade_id} not found",
+        )
+
+    return CoinTradeRecord(
+        id=trade["id"],
+        session_id=trade.get("session_id"),
+        market=trade["market"],
+        side=trade["side"],
+        order_type=trade["order_type"],
+        price=trade["price"],
+        volume=trade["volume"],
+        executed_volume=trade["executed_volume"],
+        fee=trade.get("fee", 0),
+        total_krw=trade["total_krw"],
+        state=trade["state"],
+        order_uuid=trade.get("order_uuid"),
+        created_at=trade["created_at"],
+    )
 
 
 # -------------------------------------------

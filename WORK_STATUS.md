@@ -1,11 +1,48 @@
 # Work Status - JonberAITrading
 
-> Last Updated: 2025-12-21
+> Last Updated: 2025-12-26
 > Branch: `claude/read-trading-prompt-dgm5U`
 
 ---
 
 ## 완료된 작업 ✅
+
+### Phase 3: Trading Execution (2025-12-26)
+
+#### Backend - Storage & API
+| # | Task | 상태 |
+|---|------|------|
+| 1 | `coin_trades` 테이블 추가 | ✅ 완료 |
+| 2 | `coin_positions` 테이블 추가 | ✅ 완료 |
+| 3 | Position/Trade CRUD 메서드 추가 | ✅ 완료 |
+| 4 | `CoinPosition`, `CoinTradeRecord` 스키마 | ✅ 완료 |
+| 5 | `GET /api/coin/positions` 엔드포인트 | ✅ 완료 |
+| 6 | `POST /api/coin/positions/{market}/close` | ✅ 완료 |
+| 7 | `GET /api/coin/trades` 엔드포인트 | ✅ 완료 |
+| 8 | Execution Node DB 저장 로직 | ✅ 완료 |
+
+#### Frontend - Trading Components
+| # | Task | 상태 |
+|---|------|------|
+| 9 | `CoinAccountBalance` 컴포넌트 | ✅ 완료 |
+| 10 | `CoinPositionPanel` 컴포넌트 | ✅ 완료 |
+| 11 | `CoinOpenOrders` 컴포넌트 | ✅ 완료 |
+| 12 | `CoinTradeHistory` 컴포넌트 | ✅ 완료 |
+| 13 | MainContent 레이아웃 통합 | ✅ 완료 |
+| 14 | TypeScript 타입 추가 | ✅ 완료 |
+| 15 | API Client 메서드 추가 | ✅ 완료 |
+
+#### Tests - 수정 및 통과
+| # | Task | 상태 |
+|---|------|------|
+| 16 | LLM Provider 테스트 (async 수정) | ✅ 완료 |
+| 17 | Trading Graph 테스트 (stage 수정) | ✅ 완료 |
+| 18 | Analysis API 테스트 (응답 형식) | ✅ 완료 |
+| 19 | Approval API 테스트 (스키마 수정) | ✅ 완료 |
+
+**테스트 결과**: 46 passed, 0 failed
+
+---
 
 ### Phase A: Critical Bug Fixes
 | # | Task | Commit | 상태 |
@@ -38,51 +75,54 @@
 
 ---
 
-## 수정된 파일 목록
+## Phase 3 수정된 파일 목록
 
 ### Backend
 ```
-backend/app/api/routes/approval.py     - Coin 세션 지원 추가
-backend/app/api/schemas/approval.py    - 'cancelled' decision 타입 추가
-backend/app/config.py                  - LLM_TIMEOUT 300초로 증가
-backend/agents/llm_provider.py         - timeout 기본값 300초
-backend/services/realtime_service.py   - 자동 시작 기능 추가
+backend/services/storage_service.py       - coin_trades, coin_positions 테이블/메서드
+backend/app/api/schemas/coin.py           - CoinPosition, CoinTradeRecord 스키마
+backend/app/api/routes/coin.py            - positions, trades 엔드포인트
+backend/app/api/routes/approval.py        - 마이너 수정
+backend/agents/graph/coin_nodes.py        - 실행 시 DB 저장 로직
+backend/tests/conftest.py                 - mock_approval_request 수정
+backend/tests/test_agents/test_llm_provider.py   - async 테스트로 수정
+backend/tests/test_agents/test_trading_graph.py  - AnalysisStage 수정
+backend/tests/test_api/test_analysis.py          - sessions 응답 형식
+backend/tests/test_api/test_approval.py          - decision 스키마 반영
 ```
 
 ### Frontend
 ```
-frontend/src/store/index.ts                              - sidebarCollapsed 상태 추가
-frontend/src/App.tsx                                     - Sidebar collapse 지원
-frontend/src/api/websocket.ts                            - 구독 debounce 추가
-frontend/src/types/index.ts                              - ApprovalDecision에 'cancelled' 추가
-frontend/src/components/layout/Header.tsx                - Sidebar 토글 버튼
-frontend/src/components/layout/Sidebar.tsx               - Collapse 모드, History 클릭
-frontend/src/components/layout/MainContent.tsx           - CoinMarketDashboard 통합
-frontend/src/components/chart/TradingChart.tsx           - API 중복 호출 제거
-frontend/src/components/coin/CoinInfo.tsx                - 폴링 간격 30초
-frontend/src/components/coin/CoinMarketList.tsx          - 50개 제한 해제
-frontend/src/components/approval/ApprovalDialog.tsx      - cancelled 처리
-frontend/src/components/analysis/WorkflowProgress.tsx    - Home 버튼 추가
-frontend/src/components/dashboard/CoinMarketDashboard.tsx - 신규 컴포넌트
+frontend/src/types/index.ts                           - CoinPosition, CoinTradeRecord 등
+frontend/src/api/client.ts                            - position/trade API 메서드
+frontend/src/components/coin/CoinAccountBalance.tsx   - 신규 (계좌 잔고)
+frontend/src/components/coin/CoinPositionPanel.tsx    - 신규 (포지션 + P&L)
+frontend/src/components/coin/CoinOpenOrders.tsx       - 신규 (미체결 주문)
+frontend/src/components/coin/CoinTradeHistory.tsx     - 신규 (거래 이력)
+frontend/src/components/coin/index.ts                 - 신규 (컴포넌트 export)
+frontend/src/components/layout/MainContent.tsx        - Trading 컴포넌트 통합
 ```
 
 ---
 
-## 남은 작업 (Phase D)
+## 남은 작업
 
-### 다국어 지원 [LOW]
+### Phase 4: 다국어 지원 [LOW]
 - i18n 프레임워크 도입 (`react-i18next`)
 - 번역 파일 구조 생성
 - 언어 선택 UI 추가
 - 모든 하드코딩 문자열 번역 키로 변경
 
-**예상 시간**: 2시간+
+### 향후 개선사항
+- Live Trading 모드 활성화 (현재 Paper Trading만)
+- WebSocket을 통한 실시간 Position 업데이트
+- Stop-Loss/Take-Profit 자동 실행
 
 ---
 
 ## 알려진 이슈
 
-현재 알려진 버그 없음. 모든 피드백 이슈 해결됨.
+현재 알려진 버그 없음.
 
 ---
 
@@ -114,18 +154,13 @@ git log --oneline -10
 claude/read-trading-prompt-dgm5U
 ```
 
-### 4. 최신 커밋
-```
-f56d17d Fix History click navigation and coin list display limits
-```
-
 ---
 
 ## 참고 문서
 
 - `CLAUDE.md` - 프로젝트 컨텍스트 및 개발 가이드
 - `Feedback.md` - 사용자 피드백 (모두 해결됨)
-- `.claude/plans/refactored-fluttering-flame.md` - 상세 계획 문서
+- `.claude/plans/polished-prancing-pizza.md` - Phase 3 계획 문서
 
 ---
 

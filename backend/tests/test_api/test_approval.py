@@ -27,30 +27,17 @@ class TestApprovalEndpoints:
         response = client.post(
             "/api/approval/decide",
             json={
-                "proposal_id": "test-proposal",
-                "approved": True,
+                "decision": "approved",
             },
         )
         assert response.status_code == 422
 
-    def test_decide_requires_proposal_id(self, client: TestClient):
-        """Decide endpoint should require proposal_id."""
+    def test_decide_requires_decision(self, client: TestClient):
+        """Decide endpoint should require decision field."""
         response = client.post(
             "/api/approval/decide",
             json={
                 "session_id": "test-session",
-                "approved": True,
-            },
-        )
-        assert response.status_code == 422
-
-    def test_decide_requires_approved(self, client: TestClient):
-        """Decide endpoint should require approved field."""
-        response = client.post(
-            "/api/approval/decide",
-            json={
-                "session_id": "test-session",
-                "proposal_id": "test-proposal",
             },
         )
         assert response.status_code == 422
@@ -69,8 +56,7 @@ class TestApprovalEndpoints:
             "/api/approval/decide",
             json={
                 "session_id": "test-session",
-                "proposal_id": "test-proposal",
-                "approved": False,
+                "decision": "rejected",
                 "feedback": "Risk is too high",
             },
         )
@@ -81,14 +67,13 @@ class TestApprovalEndpoints:
 class TestApprovalValidation:
     """Tests for approval input validation."""
 
-    def test_approved_must_be_boolean(self, client: TestClient):
-        """Approved field must be boolean."""
+    def test_decision_must_be_valid_literal(self, client: TestClient):
+        """Decision field must be valid literal value."""
         response = client.post(
             "/api/approval/decide",
             json={
                 "session_id": "test-session",
-                "proposal_id": "test-proposal",
-                "approved": "yes",  # Should be boolean
+                "decision": "invalid_decision",  # Should be approved/rejected/modified/cancelled
             },
         )
         assert response.status_code == 422
@@ -99,10 +84,37 @@ class TestApprovalValidation:
             "/api/approval/decide",
             json={
                 "session_id": "test-session",
-                "proposal_id": "test-proposal",
-                "approved": True,
+                "decision": "approved",
                 "feedback": "",
             },
         )
         # Should be 404 (session not found) not 422 (validation error)
         assert response.status_code == 404
+
+    def test_feedback_can_be_null(self, client: TestClient):
+        """Feedback field can be null/None."""
+        response = client.post(
+            "/api/approval/decide",
+            json={
+                "session_id": "test-session",
+                "decision": "approved",
+                "feedback": None,
+            },
+        )
+        # Should be 404 (session not found) not 422 (validation error)
+        assert response.status_code == 404
+
+    def test_valid_decision_values(self, client: TestClient):
+        """Test all valid decision values pass validation."""
+        valid_decisions = ["approved", "rejected", "modified", "cancelled"]
+
+        for decision in valid_decisions:
+            response = client.post(
+                "/api/approval/decide",
+                json={
+                    "session_id": "test-session",
+                    "decision": decision,
+                },
+            )
+            # Should be 404 (session not found) not 422 (validation error)
+            assert response.status_code == 404, f"Decision '{decision}' should be valid"

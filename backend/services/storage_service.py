@@ -79,12 +79,55 @@ class StorageService:
                     )
                 """)
 
+                # Coin trades table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS coin_trades (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT,
+                        market TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        order_type TEXT NOT NULL,
+                        price REAL NOT NULL,
+                        volume REAL NOT NULL,
+                        executed_volume REAL NOT NULL,
+                        fee REAL DEFAULT 0,
+                        total_krw REAL NOT NULL,
+                        state TEXT NOT NULL,
+                        order_uuid TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Coin positions table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS coin_positions (
+                        market TEXT PRIMARY KEY,
+                        currency TEXT NOT NULL,
+                        quantity REAL NOT NULL,
+                        avg_entry_price REAL NOT NULL,
+                        stop_loss REAL,
+                        take_profit REAL,
+                        session_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # Create indexes
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_market ON coin_trades(market)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_session ON coin_trades(session_id)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_created ON coin_trades(created_at DESC)"
                 )
 
                 await conn.commit()
@@ -430,6 +473,285 @@ class StorageService:
         except Exception as e:
             logger.error("cleanup_failed", error=str(e))
             return 0
+
+    # -------------------------------------------
+    # Coin Trading Operations
+    # -------------------------------------------
+
+    async def save_coin_trade(self, trade: dict[str, Any]) -> bool:
+        """
+        Save a coin trade record.
+
+        Args:
+            trade: Trade data dictionary with keys:
+                - id, session_id, market, side, order_type, price,
+                - volume, executed_volume, fee, total_krw, state, order_uuid
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO coin_trades
+                    (id, session_id, market, side, order_type, price, volume,
+                     executed_volume, fee, total_krw, state, order_uuid, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade["id"],
+                        trade.get("session_id"),
+                        trade["market"],
+                        trade["side"],
+                        trade["order_type"],
+                        trade["price"],
+                        trade["volume"],
+                        trade["executed_volume"],
+                        trade.get("fee", 0),
+                        trade["total_krw"],
+                        trade["state"],
+                        trade.get("order_uuid"),
+                        trade.get("created_at", datetime.now()),
+                    ),
+                )
+                await conn.commit()
+                logger.debug("coin_trade_saved", trade_id=trade["id"])
+                return True
+        except Exception as e:
+            logger.error("coin_trade_save_failed", trade_id=trade.get("id"), error=str(e))
+            return False
+
+    async def get_coin_trades(
+        self,
+        market: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        Get coin trade history.
+
+        Args:
+            market: Filter by market code (optional)
+            limit: Maximum records to return
+            offset: Offset for pagination
+
+        Returns:
+            List of trade records
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                if market:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM coin_trades
+                        WHERE market = ?
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (market.upper(), limit, offset),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM coin_trades
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (limit, offset),
+                    )
+
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("coin_trades_get_failed", error=str(e))
+            return []
+
+    async def get_coin_trade(self, trade_id: str) -> Optional[dict[str, Any]]:
+        """Get a single trade by ID."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM coin_trades WHERE id = ?",
+                    (trade_id,),
+                )
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error("coin_trade_get_failed", trade_id=trade_id, error=str(e))
+            return None
+
+    async def get_coin_trades_count(self, market: Optional[str] = None) -> int:
+        """Get total count of trades for pagination."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                if market:
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM coin_trades WHERE market = ?",
+                        (market.upper(),),
+                    )
+                else:
+                    cursor = await conn.execute("SELECT COUNT(*) FROM coin_trades")
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error("coin_trades_count_failed", error=str(e))
+            return 0
+
+    async def save_coin_position(self, position: dict[str, Any]) -> bool:
+        """
+        Save or update a coin position.
+
+        Args:
+            position: Position data with keys:
+                - market, currency, quantity, avg_entry_price,
+                - stop_loss, take_profit, session_id
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO coin_positions
+                    (market, currency, quantity, avg_entry_price, stop_loss,
+                     take_profit, session_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?,
+                            COALESCE((SELECT created_at FROM coin_positions WHERE market = ?), ?),
+                            ?)
+                    """,
+                    (
+                        position["market"],
+                        position["currency"],
+                        position["quantity"],
+                        position["avg_entry_price"],
+                        position.get("stop_loss"),
+                        position.get("take_profit"),
+                        position.get("session_id"),
+                        position["market"],
+                        datetime.now(),
+                        datetime.now(),
+                    ),
+                )
+                await conn.commit()
+                logger.debug("coin_position_saved", market=position["market"])
+                return True
+        except Exception as e:
+            logger.error(
+                "coin_position_save_failed",
+                market=position.get("market"),
+                error=str(e),
+            )
+            return False
+
+    async def get_coin_positions(self) -> list[dict[str, Any]]:
+        """Get all open coin positions."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM coin_positions
+                    WHERE quantity > 0
+                    ORDER BY updated_at DESC
+                    """
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("coin_positions_get_failed", error=str(e))
+            return []
+
+    async def get_coin_position(self, market: str) -> Optional[dict[str, Any]]:
+        """Get a single position by market."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM coin_positions WHERE market = ?",
+                    (market.upper(),),
+                )
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error("coin_position_get_failed", market=market, error=str(e))
+            return None
+
+    async def update_coin_position(
+        self, market: str, updates: dict[str, Any]
+    ) -> bool:
+        """
+        Update specific fields of a position.
+
+        Args:
+            market: Market code
+            updates: Dict of fields to update
+
+        Returns:
+            True if updated successfully
+        """
+        await self.initialize()
+
+        allowed_fields = {"quantity", "avg_entry_price", "stop_loss", "take_profit"}
+        update_fields = {k: v for k, v in updates.items() if k in allowed_fields}
+
+        if not update_fields:
+            return False
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                set_clause = ", ".join(f"{k} = ?" for k in update_fields)
+                values = list(update_fields.values()) + [datetime.now(), market.upper()]
+
+                await conn.execute(
+                    f"""
+                    UPDATE coin_positions
+                    SET {set_clause}, updated_at = ?
+                    WHERE market = ?
+                    """,
+                    values,
+                )
+                await conn.commit()
+                logger.debug("coin_position_updated", market=market)
+                return True
+        except Exception as e:
+            logger.error("coin_position_update_failed", market=market, error=str(e))
+            return False
+
+    async def delete_coin_position(self, market: str) -> bool:
+        """Delete a position (when closed)."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "DELETE FROM coin_positions WHERE market = ?",
+                    (market.upper(),),
+                )
+                await conn.commit()
+                logger.debug("coin_position_deleted", market=market)
+                return True
+        except Exception as e:
+            logger.error("coin_position_delete_failed", market=market, error=str(e))
+            return False
 
     # -------------------------------------------
     # Health Check

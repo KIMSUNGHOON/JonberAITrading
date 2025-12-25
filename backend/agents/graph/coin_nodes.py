@@ -33,6 +33,7 @@ from agents.prompts import (
     COIN_STRATEGIC_DECISION_PROMPT,
     COIN_TECHNICAL_ANALYST_PROMPT,
 )
+from app.config import settings
 from services.upbit import UpbitClient
 
 logger = structlog.get_logger()
@@ -577,7 +578,10 @@ async def coin_re_analyze_node(state: dict) -> dict:
 async def coin_execution_node(state: dict) -> dict:
     """
     Execute the approved coin trade.
-    In production, this would connect to Upbit Exchange API.
+
+    Supports two modes based on UPBIT_TRADING_MODE:
+    - paper: Simulates trade execution (creates CoinPosition only)
+    - live: Executes actual orders via Upbit API
     """
     proposal = state.get("trade_proposal", {})
     approval_status = state.get("approval_status")
@@ -593,11 +597,13 @@ async def coin_execution_node(state: dict) -> dict:
     market = proposal.get("market", "")
     action = proposal.get("action", "HOLD")
     entry_price = proposal.get("entry_price", 0)
+    quantity = proposal.get("quantity", 0)
 
     logger.info(
         "coin_trade_execution_start",
         market=market,
         action=action,
+        trading_mode=getattr(settings, "UPBIT_TRADING_MODE", "paper"),
     )
 
     if action == "HOLD" or action == TradeAction.HOLD:
@@ -608,26 +614,232 @@ async def coin_execution_node(state: dict) -> dict:
             "reasoning_log": add_coin_reasoning_log(state, reasoning),
         }
 
-    # Simulate trade execution
-    # In production: Use UpbitClient.place_order()
+    # Check trading mode
+    trading_mode = getattr(settings, "UPBIT_TRADING_MODE", "paper")
+
+    if trading_mode == "live":
+        # Live trading mode - execute actual order via Upbit API
+        return await _execute_live_order(state, proposal, market, action, entry_price, quantity)
+    else:
+        # Paper trading mode - simulate trade execution
+        return await _execute_paper_order(state, proposal, market, action, entry_price, quantity)
+
+
+async def _execute_paper_order(
+    state: dict,
+    proposal: dict,
+    market: str,
+    action: str,
+    entry_price: float,
+    quantity: float,
+) -> dict:
+    """Execute simulated paper trade and save to storage."""
+    from services.storage_service import get_storage_service
+
+    # Extract currency from market (e.g., "KRW-BTC" -> "BTC")
+    currency = market.split("-")[1] if "-" in market else market
+
+    # Determine side based on action
+    side = "bid" if action in ("BUY", TradeAction.BUY) else "ask"
+
+    # Generate trade ID
+    trade_id = f"paper-{uuid.uuid4()}"
+    session_id = state.get("session_id")
+
+    # Save trade to storage
+    storage = await get_storage_service()
+    await storage.save_coin_trade({
+        "id": trade_id,
+        "session_id": session_id,
+        "market": market,
+        "side": side,
+        "order_type": "paper",
+        "price": float(entry_price),
+        "volume": float(quantity),
+        "executed_volume": float(quantity),
+        "fee": 0,
+        "total_krw": float(entry_price * quantity),
+        "state": "done",
+        "order_uuid": trade_id,
+    })
+
+    # Save or update position for BUY orders
+    if side == "bid":
+        await storage.save_coin_position({
+            "market": market,
+            "currency": currency,
+            "quantity": float(quantity),
+            "avg_entry_price": float(entry_price),
+            "stop_loss": proposal.get("stop_loss"),
+            "take_profit": proposal.get("take_profit"),
+            "session_id": session_id,
+        })
+
     position = CoinPosition(
         market=market,
-        quantity=proposal.get("quantity", 0),
+        quantity=quantity,
         entry_price=float(entry_price),
         current_price=float(entry_price),
         stop_loss=proposal.get("stop_loss"),
         take_profit=proposal.get("take_profit"),
     )
 
-    reasoning = f"[Execution] Trade executed: {action} {market} @ {entry_price:,.0f} KRW"
+    reasoning = f"[Execution] (Paper) Trade simulated: {action} {market} @ {entry_price:,.0f} KRW, qty: {quantity}"
+
+    logger.info(
+        "paper_trade_executed",
+        market=market,
+        action=action,
+        quantity=quantity,
+        entry_price=entry_price,
+        trade_id=trade_id,
+    )
 
     return {
         "execution_status": "completed",
         "active_position": position.model_dump(),
+        "trade_id": trade_id,
         "current_stage": CoinAnalysisStage.COMPLETE,
         "reasoning_log": add_coin_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
     }
+
+
+async def _execute_live_order(
+    state: dict,
+    proposal: dict,
+    market: str,
+    action: str,
+    entry_price: float,
+    quantity: float,
+) -> dict:
+    """Execute live trade via Upbit API and save to storage."""
+    from services.storage_service import get_storage_service
+
+    # Extract currency from market (e.g., "KRW-BTC" -> "BTC")
+    currency = market.split("-")[1] if "-" in market else market
+    session_id = state.get("session_id")
+
+    try:
+        # Determine order parameters based on action
+        if action == "BUY" or action == TradeAction.BUY:
+            side = "bid"
+            ord_type = "limit"
+            price = entry_price
+            volume = quantity
+        elif action == "SELL" or action == TradeAction.SELL:
+            side = "ask"
+            ord_type = "limit"
+            price = entry_price
+            volume = quantity
+        else:
+            reasoning = f"[Execution] Unknown action: {action}"
+            return {
+                "execution_status": "failed",
+                "error": f"Unknown action: {action}",
+                "current_stage": CoinAnalysisStage.COMPLETE,
+                "reasoning_log": add_coin_reasoning_log(state, reasoning),
+            }
+
+        # Create Upbit client and execute order
+        async with UpbitClient(
+            access_key=settings.UPBIT_ACCESS_KEY,
+            secret_key=settings.UPBIT_SECRET_KEY,
+        ) as client:
+            # Place the order
+            order = await client.place_order(
+                market=market,
+                side=side,
+                ord_type=ord_type,
+                price=price,
+                volume=volume,
+            )
+
+            logger.info(
+                "live_order_placed",
+                order_uuid=order.uuid,
+                market=order.market,
+                side=order.side,
+                state=order.state,
+            )
+
+            # Save trade to storage
+            storage = await get_storage_service()
+            trade_id = f"live-{order.uuid}"
+            executed_volume = float(order.executed_volume) if order.executed_volume else 0
+            exec_price = float(order.price) if order.price else float(entry_price)
+
+            await storage.save_coin_trade({
+                "id": trade_id,
+                "session_id": session_id,
+                "market": market,
+                "side": side,
+                "order_type": ord_type,
+                "price": exec_price,
+                "volume": float(quantity),
+                "executed_volume": executed_volume,
+                "fee": float(order.paid_fee) if order.paid_fee else 0,
+                "total_krw": exec_price * executed_volume if executed_volume else exec_price * quantity,
+                "state": order.state,
+                "order_uuid": order.uuid,
+            })
+
+            # Save or update position for BUY orders (if order executed)
+            if side == "bid" and order.state in ("done", "wait"):
+                await storage.save_coin_position({
+                    "market": market,
+                    "currency": currency,
+                    "quantity": executed_volume if executed_volume else float(quantity),
+                    "avg_entry_price": exec_price,
+                    "stop_loss": proposal.get("stop_loss"),
+                    "take_profit": proposal.get("take_profit"),
+                    "session_id": session_id,
+                })
+
+            # Create position record for state
+            position = CoinPosition(
+                market=market,
+                quantity=quantity,
+                entry_price=float(entry_price),
+                current_price=float(entry_price),
+                stop_loss=proposal.get("stop_loss"),
+                take_profit=proposal.get("take_profit"),
+            )
+
+            reasoning = (
+                f"[Execution] (Live) Order placed: {action} {market} @ {entry_price:,.0f} KRW, "
+                f"qty: {quantity}, order_id: {order.uuid}, state: {order.state}"
+            )
+
+            return {
+                "execution_status": "completed",
+                "active_position": position.model_dump(),
+                "order_uuid": order.uuid,
+                "trade_id": trade_id,
+                "order_state": order.state,
+                "current_stage": CoinAnalysisStage.COMPLETE,
+                "reasoning_log": add_coin_reasoning_log(state, reasoning),
+                "messages": [AIMessage(content=reasoning)],
+            }
+
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(
+            "live_order_failed",
+            market=market,
+            action=action,
+            error=error_msg,
+        )
+
+        reasoning = f"[Execution] Order failed: {error_msg}"
+
+        return {
+            "execution_status": "failed",
+            "error": error_msg,
+            "current_stage": CoinAnalysisStage.COMPLETE,
+            "reasoning_log": add_coin_reasoning_log(state, reasoning),
+            "messages": [AIMessage(content=reasoning)],
+        }
 
 
 # -------------------------------------------

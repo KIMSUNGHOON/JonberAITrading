@@ -14,6 +14,14 @@ import type {
   CoinAnalysisRequest,
   CoinAnalysisResponse,
   CoinMarketInfo,
+  CoinAccountListResponse,
+  CoinPositionListResponse,
+  CoinPosition,
+  CoinOrderListResponse,
+  CoinOrder,
+  CoinOrderRequest,
+  CoinTradeListResponse,
+  CoinTradeRecord,
   SettingsStatus,
   UpbitApiKeyRequest,
   UpbitApiKeyResponse,
@@ -335,6 +343,98 @@ class ApiClient {
   }
 
   // -------------------------------------------
+  // Coin Trading Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get account balances.
+   */
+  async getCoinAccounts(): Promise<CoinAccountListResponse> {
+    const response = await this.client.get<CoinAccountListResponse>('/coin/accounts');
+    return response.data;
+  }
+
+  /**
+   * Get all open positions with real-time P&L.
+   */
+  async getCoinPositions(): Promise<CoinPositionListResponse> {
+    const response = await this.client.get<CoinPositionListResponse>('/coin/positions');
+    return response.data;
+  }
+
+  /**
+   * Get a single position by market.
+   */
+  async getCoinPosition(market: string): Promise<CoinPosition> {
+    const response = await this.client.get<CoinPosition>(`/coin/positions/${market}`);
+    return response.data;
+  }
+
+  /**
+   * Close a position by selling all holdings at market price.
+   */
+  async closeCoinPosition(market: string): Promise<CoinOrder> {
+    const response = await this.client.post<CoinOrder>(`/coin/positions/${market}/close`);
+    return response.data;
+  }
+
+  /**
+   * Get list of orders.
+   */
+  async getCoinOrders(params?: {
+    market?: string;
+    state?: string;
+    limit?: number;
+  }): Promise<CoinOrderListResponse> {
+    const response = await this.client.get<CoinOrderListResponse>('/coin/orders', { params });
+    return response.data;
+  }
+
+  /**
+   * Get a single order by UUID.
+   */
+  async getCoinOrder(orderId: string): Promise<CoinOrder> {
+    const response = await this.client.get<CoinOrder>(`/coin/orders/${orderId}`);
+    return response.data;
+  }
+
+  /**
+   * Create a new order.
+   */
+  async createCoinOrder(request: CoinOrderRequest): Promise<CoinOrder> {
+    const response = await this.client.post<CoinOrder>('/coin/orders', request);
+    return response.data;
+  }
+
+  /**
+   * Cancel an order.
+   */
+  async cancelCoinOrder(orderId: string): Promise<CoinOrder> {
+    const response = await this.client.delete<CoinOrder>(`/coin/orders/${orderId}`);
+    return response.data;
+  }
+
+  /**
+   * Get trade history with pagination.
+   */
+  async getCoinTrades(params?: {
+    market?: string;
+    page?: number;
+    limit?: number;
+  }): Promise<CoinTradeListResponse> {
+    const response = await this.client.get<CoinTradeListResponse>('/coin/trades', { params });
+    return response.data;
+  }
+
+  /**
+   * Get a single trade by ID.
+   */
+  async getCoinTrade(tradeId: string): Promise<CoinTradeRecord> {
+    const response = await this.client.get<CoinTradeRecord>(`/coin/trades/${tradeId}`);
+    return response.data;
+  }
+
+  // -------------------------------------------
   // Health Check
   // -------------------------------------------
 
@@ -469,3 +569,27 @@ export const updateUpbitApiKeys = (request: UpbitApiKeyRequest) =>
 export const validateUpbitApiKeys = () => apiClient.validateUpbitApiKeys();
 
 export const clearUpbitApiKeys = () => apiClient.clearUpbitApiKeys();
+
+// Coin Trading API
+export const getCoinAccounts = () => apiClient.getCoinAccounts();
+
+export const getCoinPositions = () => apiClient.getCoinPositions();
+
+export const getCoinPosition = (market: string) => apiClient.getCoinPosition(market);
+
+export const closeCoinPosition = (market: string) => apiClient.closeCoinPosition(market);
+
+export const getCoinOrders = (params?: { market?: string; state?: string; limit?: number }) =>
+  apiClient.getCoinOrders(params);
+
+export const getCoinOrder = (orderId: string) => apiClient.getCoinOrder(orderId);
+
+export const createCoinOrder = (request: CoinOrderRequest) =>
+  apiClient.createCoinOrder(request);
+
+export const cancelCoinOrder = (orderId: string) => apiClient.cancelCoinOrder(orderId);
+
+export const getCoinTrades = (params?: { market?: string; page?: number; limit?: number }) =>
+  apiClient.getCoinTrades(params);
+
+export const getCoinTrade = (tradeId: string) => apiClient.getCoinTrade(tradeId);

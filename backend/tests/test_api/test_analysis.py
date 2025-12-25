@@ -45,12 +45,16 @@ class TestAnalysisEndpoints:
         assert response.status_code == 404
 
     def test_list_sessions(self, client: TestClient):
-        """List sessions should return array."""
+        """List sessions should return paginated response."""
         response = client.get("/api/analysis/sessions")
         assert response.status_code == 200
 
         data = response.json()
-        assert isinstance(data, list)
+        assert isinstance(data, dict)
+        assert "sessions" in data
+        assert "total" in data
+        assert isinstance(data["sessions"], list)
+        assert isinstance(data["total"], int)
 
     def test_cancel_invalid_session(self, client: TestClient):
         """Cancel invalid session should return 404."""

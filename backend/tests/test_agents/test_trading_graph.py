@@ -15,17 +15,17 @@ class TestTradingState:
         """TradingState should have required fields."""
         state = TradingState(
             ticker="AAPL",
-            current_stage=AnalysisStage.INITIALIZATION,
+            current_stage=AnalysisStage.DECOMPOSITION,
         )
 
         assert state["ticker"] == "AAPL"
-        assert state["current_stage"] == AnalysisStage.INITIALIZATION
+        assert state["current_stage"] == AnalysisStage.DECOMPOSITION
 
     def test_state_default_values(self):
         """TradingState should have sensible defaults."""
         state = TradingState(
             ticker="AAPL",
-            current_stage=AnalysisStage.INITIALIZATION,
+            current_stage=AnalysisStage.DECOMPOSITION,
         )
 
         assert state.get("analyses", []) == [] or "analyses" in state
@@ -38,13 +38,13 @@ class TestAnalysisStage:
     def test_all_stages_exist(self):
         """All expected analysis stages should exist."""
         expected_stages = [
-            "INITIALIZATION",
-            "TECHNICAL_ANALYSIS",
-            "FUNDAMENTAL_ANALYSIS",
-            "SENTIMENT_ANALYSIS",
-            "RISK_ASSESSMENT",
-            "STRATEGIC_DECISION",
-            "AWAITING_APPROVAL",
+            "DECOMPOSITION",
+            "TECHNICAL",
+            "FUNDAMENTAL",
+            "SENTIMENT",
+            "RISK",
+            "SYNTHESIS",
+            "APPROVAL",
             "EXECUTION",
             "COMPLETE",
         ]
@@ -62,10 +62,10 @@ class TestGraphNodes:
     """Tests for graph node functions."""
 
     @pytest.mark.asyncio
-    async def test_initialization_node_exists(self):
-        """Initialization node function should exist."""
-        from agents.graph.nodes import initialization_node
-        assert callable(initialization_node)
+    async def test_task_decomposition_node_exists(self):
+        """Task decomposition node function should exist."""
+        from agents.graph.nodes import task_decomposition_node
+        assert callable(task_decomposition_node)
 
     @pytest.mark.asyncio
     async def test_technical_analysis_node_exists(self):
@@ -96,3 +96,15 @@ class TestGraphNodes:
         """Strategic decision node function should exist."""
         from agents.graph.nodes import strategic_decision_node
         assert callable(strategic_decision_node)
+
+    @pytest.mark.asyncio
+    async def test_human_approval_node_exists(self):
+        """Human approval node function should exist."""
+        from agents.graph.nodes import human_approval_node
+        assert callable(human_approval_node)
+
+    @pytest.mark.asyncio
+    async def test_execution_node_exists(self):
+        """Execution node function should exist."""
+        from agents.graph.nodes import execution_node
+        assert callable(execution_node)

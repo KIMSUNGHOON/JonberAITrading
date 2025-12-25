@@ -9,6 +9,7 @@ from datetime import datetime
 import structlog
 from fastapi import APIRouter, HTTPException, status
 
+from agents.graph.coin_trading_graph import get_coin_trading_graph
 from agents.graph.trading_graph import get_trading_graph
 from app.api.routes.analysis import get_active_sessions
 from app.api.routes.coin import get_coin_sessions
@@ -87,8 +88,9 @@ async def submit_approval(request: ApprovalRequest):
                         value=value,
                     )
 
-    # Resume graph execution
-    graph = get_trading_graph()
+    # Resume graph execution - select appropriate graph based on session type
+    is_coin_session = request.session_id in coin_sessions
+    graph = get_coin_trading_graph() if is_coin_session else get_trading_graph()
     config = {"configurable": {"thread_id": request.session_id}}
 
     execution_status = None
@@ -194,10 +196,13 @@ async def list_pending_approvals():
         action = proposal.get("action", "HOLD")
         rationale = proposal.get("rationale", "")
 
+        # Get ticker/market - stock sessions use "ticker", coin sessions use "market"
+        ticker = session.get("ticker") or session.get("market", "UNKNOWN")
+
         pending.append(
             PendingApprovalItem(
                 session_id=session_id,
-                ticker=session["ticker"],
+                ticker=ticker,
                 action=str(action),
                 quantity=proposal.get("quantity", 0),
                 risk_score=proposal.get("risk_score", 0.5),
@@ -251,9 +256,12 @@ async def get_pending_approval(session_id: str):
     # Handle proposal as dict
     action = proposal.get("action", "HOLD") if proposal else "HOLD"
 
+    # Get ticker/market - stock sessions use "ticker", coin sessions use "market"
+    ticker = session.get("ticker") or session.get("market", "UNKNOWN")
+
     return {
         "session_id": session_id,
-        "ticker": session["ticker"],
+        "ticker": ticker,
         "trade_proposal": {
             "id": proposal.get("id", ""),
             "action": str(action),

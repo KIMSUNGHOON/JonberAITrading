@@ -3,15 +3,25 @@ LLM Provider Tests
 """
 
 import pytest
+import asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from agents.llm_provider import LLMProvider, get_llm_provider, reset_llm_provider
 
 
+@pytest.fixture
+def event_loop():
+    """Create event loop for tests."""
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
 class TestLLMProviderInit:
     """Tests for LLMProvider initialization."""
 
-    def test_provider_singleton(self):
+    @pytest.mark.asyncio
+    async def test_provider_singleton(self):
         """LLM provider should be singleton."""
         reset_llm_provider()
         provider1 = get_llm_provider()
@@ -19,18 +29,20 @@ class TestLLMProviderInit:
         assert provider1 is provider2
         reset_llm_provider()
 
-    def test_provider_has_model(self):
+    @pytest.mark.asyncio
+    async def test_provider_has_model(self):
         """LLM provider should have model configured."""
         reset_llm_provider()
         provider = get_llm_provider()
-        assert provider.model is not None
+        assert provider.config.model is not None
         reset_llm_provider()
 
-    def test_provider_has_base_url(self):
+    @pytest.mark.asyncio
+    async def test_provider_has_base_url(self):
         """LLM provider should have base URL configured."""
         reset_llm_provider()
         provider = get_llm_provider()
-        assert provider.base_url is not None
+        assert provider.config.base_url is not None
         reset_llm_provider()
 
 

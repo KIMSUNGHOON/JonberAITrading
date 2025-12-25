@@ -284,3 +284,113 @@ export interface SettingsStatus {
   llm_model: string;
   market_data_mode: string;
 }
+
+// -------------------------------------------
+// Coin Trading Types
+// -------------------------------------------
+
+export interface CoinAccount {
+  currency: string;
+  balance: number;
+  locked: number;
+  avg_buy_price: number;
+  avg_buy_price_modified: boolean;
+  unit_currency: string;
+}
+
+export interface CoinAccountListResponse {
+  accounts: CoinAccount[];
+  total_krw_value: number | null;
+}
+
+export interface CoinPosition {
+  market: string;
+  currency: string;
+  quantity: number;
+  avg_entry_price: number;
+  current_price: number;
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number;
+  stop_loss: number | null;
+  take_profit: number | null;
+  session_id: string | null;
+  created_at: string;
+}
+
+export interface CoinPositionListResponse {
+  positions: CoinPosition[];
+  total_value_krw: number;
+  total_pnl: number;
+  total_pnl_pct: number;
+}
+
+export type OrderSide = 'bid' | 'ask';
+export type OrderType = 'limit' | 'price' | 'market';
+export type OrderState = 'wait' | 'watch' | 'done' | 'cancel';
+
+export interface CoinOrder {
+  uuid: string;
+  side: OrderSide;
+  ord_type: OrderType;
+  price: number | null;
+  state: OrderState;
+  market: string;
+  created_at: string;
+  volume: number | null;
+  remaining_volume: number | null;
+  reserved_fee: number | null;
+  remaining_fee: number | null;
+  paid_fee: number | null;
+  locked: number | null;
+  executed_volume: number | null;
+  trades_count: number | null;
+}
+
+export interface CoinOrderListResponse {
+  orders: CoinOrder[];
+  total: number;
+}
+
+export interface CoinOrderRequest {
+  market: string;
+  side: OrderSide;
+  ord_type: OrderType;
+  price?: number;
+  volume?: number;
+}
+
+export interface CoinTradeRecord {
+  id: string;
+  session_id: string | null;
+  market: string;
+  side: OrderSide;
+  order_type: string;
+  price: number;
+  volume: number;
+  executed_volume: number;
+  fee: number;
+  total_krw: number;
+  state: string;
+  order_uuid: string | null;
+  created_at: string;
+}
+
+export interface CoinTradeListResponse {
+  trades: CoinTradeRecord[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface CoinTicker {
+  market: string;
+  trade_price: number;
+  change: string;
+  change_rate: number;
+  change_price: number;
+  high_price: number;
+  low_price: number;
+  trade_volume: number;
+  acc_trade_price_24h: number;
+  timestamp: string;
+}

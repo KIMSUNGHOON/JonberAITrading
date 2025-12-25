@@ -21,6 +21,10 @@ import { PositionCard } from '@/components/position/PositionCard';
 import { WelcomePanel } from '@/components/analysis/WelcomePanel';
 import { CoinInfo } from '@/components/coin/CoinInfo';
 import { CoinMarketDashboard } from '@/components/dashboard/CoinMarketDashboard';
+import { CoinAccountBalance } from '@/components/coin/CoinAccountBalance';
+import { CoinPositionPanel } from '@/components/coin/CoinPositionPanel';
+import { CoinOpenOrders } from '@/components/coin/CoinOpenOrders';
+import { CoinTradeHistory } from '@/components/coin/CoinTradeHistory';
 
 export function MainContent() {
   const { sessionId, ticker, status } = useStore(useShallow(selectSession));
@@ -40,6 +44,22 @@ export function MainContent() {
       return (
         <div className="p-3 md:p-4 space-y-4">
           <WelcomePanel />
+
+          {/* Trading Dashboard - Two column layout */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {/* Left Column - Account & Positions */}
+            <div className="space-y-4">
+              <CoinAccountBalance />
+              <CoinPositionPanel />
+            </div>
+
+            {/* Right Column - Orders & History */}
+            <div className="space-y-4">
+              <CoinOpenOrders />
+              <CoinTradeHistory pageSize={5} />
+            </div>
+          </div>
+
           <CoinMarketDashboard />
         </div>
       );
@@ -105,6 +125,18 @@ export function MainContent() {
             <section className="flex-shrink-0">
               <CoinMarketDashboard compact />
             </section>
+          )}
+
+          {/* Coin Trading Panels - Show for coin markets */}
+          {activeMarket === 'coin' && (
+            <>
+              <section className="flex-shrink-0">
+                <CoinPositionPanel />
+              </section>
+              <section className="flex-shrink-0">
+                <CoinOpenOrders />
+              </section>
+            </>
           )}
         </div>
 
