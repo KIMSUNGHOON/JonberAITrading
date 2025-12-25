@@ -6,7 +6,7 @@
 # Update existing environment:
 #   conda env update -f environment.yml --prune
 
-name: agentic-trading
+name: codex-agentic-trading
 channels:
   - conda-forge
   - defaults

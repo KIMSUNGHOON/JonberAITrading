@@ -27,30 +27,17 @@ class TestApprovalEndpoints:
         response = client.post(
             "/api/approval/decide",
             json={
-                "proposal_id": "test-proposal",
-                "approved": True,
+                "decision": "approved",
             },
         )
         assert response.status_code == 422
 
-    def test_decide_requires_proposal_id(self, client: TestClient):
-        """Decide endpoint should require proposal_id."""
+    def test_decide_requires_decision(self, client: TestClient):
+        """Decide endpoint should require decision."""
         response = client.post(
             "/api/approval/decide",
             json={
                 "session_id": "test-session",
-                "approved": True,
-            },
-        )
-        assert response.status_code == 422
-
-    def test_decide_requires_approved(self, client: TestClient):
-        """Decide endpoint should require approved field."""
-        response = client.post(
-            "/api/approval/decide",
-            json={
-                "session_id": "test-session",
-                "proposal_id": "test-proposal",
             },
         )
         assert response.status_code == 422
@@ -69,8 +56,7 @@ class TestApprovalEndpoints:
             "/api/approval/decide",
             json={
                 "session_id": "test-session",
-                "proposal_id": "test-proposal",
-                "approved": False,
+                "decision": "rejected",
                 "feedback": "Risk is too high",
             },
         )
@@ -82,13 +68,12 @@ class TestApprovalValidation:
     """Tests for approval input validation."""
 
     def test_approved_must_be_boolean(self, client: TestClient):
-        """Approved field must be boolean."""
+        """Decision must be a valid literal."""
         response = client.post(
             "/api/approval/decide",
             json={
                 "session_id": "test-session",
-                "proposal_id": "test-proposal",
-                "approved": "yes",  # Should be boolean
+                "decision": "yes",  # Invalid decision
             },
         )
         assert response.status_code == 422
@@ -99,8 +84,7 @@ class TestApprovalValidation:
             "/api/approval/decide",
             json={
                 "session_id": "test-session",
-                "proposal_id": "test-proposal",
-                "approved": True,
+                "decision": "approved",
                 "feedback": "",
             },
         )

@@ -95,6 +95,16 @@ class LLMProvider:
         )
 
     @property
+    def model(self) -> str:
+        """Expose configured model name."""
+        return self.config.model
+
+    @property
+    def base_url(self) -> str:
+        """Expose configured base URL."""
+        return self.config.base_url
+
+    @property
     def client(self) -> ChatOpenAI:
         """
         Lazy-load LangChain ChatOpenAI client.
@@ -333,7 +343,12 @@ def reset_llm_provider() -> None:
     """
     global _llm_provider
     if _llm_provider is not None:
-        asyncio.create_task(_llm_provider.close())
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(_llm_provider.close())
+        else:
+            loop.create_task(_llm_provider.close())
     _llm_provider = None
 
 

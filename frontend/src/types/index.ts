@@ -51,6 +51,11 @@ export interface SessionInfo {
   created_at?: string;
 }
 
+export interface SessionListResponse {
+  sessions: SessionInfo[];
+  total: number;
+}
+
 export interface AnalysisStatus {
   session_id: string;
   ticker: string;
@@ -194,6 +199,20 @@ export interface ApprovalResponse {
   status: string;
   message: string;
   execution_status?: string;
+}
+
+export interface PendingApprovalDetail {
+  session_id: string;
+  ticker: string;
+  trade_proposal: TradeProposal | null;
+  analyses: {
+    technical?: Record<string, unknown> | null;
+    fundamental?: Record<string, unknown> | null;
+    sentiment?: Record<string, unknown> | null;
+    risk?: Record<string, unknown> | null;
+  };
+  synthesis?: unknown;
+  reasoning_log: string[];
 }
 
 // -------------------------------------------

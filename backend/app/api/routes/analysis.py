@@ -276,6 +276,35 @@ async def list_sessions(
     )
 
 
+@router.post("/cancel/{session_id}")
+async def cancel_session(session_id: str):
+    """
+    Cancel an analysis session.
+
+    Args:
+        session_id: Session identifier
+
+    Returns:
+        Confirmation message
+    """
+    session = get_session(session_id)
+
+    if session["status"] in ["completed", "cancelled"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Session already {session['status']}",
+        )
+
+    session["status"] = "cancelled"
+    session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
+        "[System] Analysis cancelled by user"
+    ]
+
+    logger.info("analysis_cancelled", session_id=session_id)
+
+    return {"message": f"Session {session_id} cancelled"}
+
+
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
     """

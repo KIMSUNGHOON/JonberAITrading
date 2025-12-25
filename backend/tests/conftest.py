@@ -86,8 +86,7 @@ def mock_approval_request() -> dict:
     """Sample approval request payload."""
     return {
         "session_id": "test-session-123",
-        "proposal_id": "test-proposal-456",
-        "approved": True,
+        "decision": "approved",
         "feedback": "Looks good",
     }
 

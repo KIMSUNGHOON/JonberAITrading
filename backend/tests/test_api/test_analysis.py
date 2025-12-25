@@ -3,7 +3,15 @@ Analysis API Endpoint Tests
 """
 
 import pytest
+from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture
+def mock_run_analysis_task():
+    """Prevent long-running analysis tasks during API tests."""
+    with patch("app.api.routes.analysis.run_analysis_task", new=AsyncMock()) as mock_task:
+        yield mock_task
 
 
 class TestAnalysisEndpoints:
@@ -18,7 +26,12 @@ class TestAnalysisEndpoints:
         # Should return 422 Unprocessable Entity for missing required field
         assert response.status_code == 422
 
-    def test_start_analysis_with_valid_ticker(self, client: TestClient, mock_analysis_request):
+    def test_start_analysis_with_valid_ticker(
+        self,
+        client: TestClient,
+        mock_analysis_request,
+        mock_run_analysis_task,
+    ):
         """Start analysis should accept valid ticker."""
         response = client.post(
             "/api/analysis/start",
@@ -27,7 +40,12 @@ class TestAnalysisEndpoints:
         # Either 200 (success) or 503 (if LLM not available)
         assert response.status_code in [200, 503]
 
-    def test_start_analysis_returns_session_id(self, client: TestClient, mock_analysis_request):
+    def test_start_analysis_returns_session_id(
+        self,
+        client: TestClient,
+        mock_analysis_request,
+        mock_run_analysis_task,
+    ):
         """Start analysis should return session_id."""
         response = client.post(
             "/api/analysis/start",
@@ -45,12 +63,14 @@ class TestAnalysisEndpoints:
         assert response.status_code == 404
 
     def test_list_sessions(self, client: TestClient):
-        """List sessions should return array."""
+        """List sessions should return payload with sessions array."""
         response = client.get("/api/analysis/sessions")
         assert response.status_code == 200
 
         data = response.json()
-        assert isinstance(data, list)
+        assert isinstance(data, dict)
+        assert "sessions" in data
+        assert isinstance(data["sessions"], list)
 
     def test_cancel_invalid_session(self, client: TestClient):
         """Cancel invalid session should return 404."""
@@ -61,7 +81,7 @@ class TestAnalysisEndpoints:
 class TestAnalysisValidation:
     """Tests for analysis input validation."""
 
-    def test_ticker_uppercase(self, client: TestClient):
+    def test_ticker_uppercase(self, client: TestClient, mock_run_analysis_task):
         """Ticker should be case insensitive."""
         response = client.post(
             "/api/analysis/start",

@@ -117,7 +117,10 @@ export class TradingWebSocket {
   private getWebSocketUrl(): string {
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     // Backend WebSocket is mounted at /ws, not /api/ws
-    const wsHost = import.meta.env.VITE_WS_URL || `${wsProtocol}//${window.location.host}`;
+    const wsHost =
+      import.meta.env.VITE_WS_BASE_URL ||
+      import.meta.env.VITE_WS_URL ||
+      `${wsProtocol}//${window.location.host}`;
     return `${wsHost}/ws/session/${this.sessionId}`;
   }
 
@@ -524,7 +527,10 @@ export class TickerWebSocket {
    */
   private getWebSocketUrl(): string {
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = import.meta.env.VITE_WS_URL || `${wsProtocol}//${window.location.host}`;
+    const wsHost =
+      import.meta.env.VITE_WS_BASE_URL ||
+      import.meta.env.VITE_WS_URL ||
+      `${wsProtocol}//${window.location.host}`;
     return `${wsHost}/ws/ticker`;
   }
 

@@ -11,6 +11,7 @@ import type {
   ApprovalRequest,
   ApprovalResponse,
   SessionStatus,
+  SessionListResponse,
   CoinAnalysisRequest,
   CoinAnalysisResponse,
   CoinMarketInfo,
@@ -19,13 +20,15 @@ import type {
   UpbitApiKeyResponse,
   UpbitApiKeyStatus,
   UpbitValidateResponse,
+  PendingApprovalDetail,
 } from '@/types';
 
 // -------------------------------------------
 // Configuration
 // -------------------------------------------
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_URL || '/api';
 
 // -------------------------------------------
 // API Client Class
@@ -132,14 +135,7 @@ class ApiClient {
   /**
    * List all active sessions.
    */
-  async listSessions(): Promise<
-    Array<{
-      session_id: string;
-      ticker: string;
-      status: SessionStatus;
-      created_at: string;
-    }>
-  > {
+  async listSessions(): Promise<SessionListResponse> {
     const response = await this.client.get('/analysis/sessions');
     return response.data;
   }
@@ -151,20 +147,7 @@ class ApiClient {
   /**
    * Get pending trade proposal for approval.
    */
-  async getPendingProposal(sessionId: string): Promise<{
-    has_pending: boolean;
-    proposal: {
-      id: string;
-      ticker: string;
-      action: string;
-      quantity: number;
-      entry_price: number;
-      stop_loss: number;
-      take_profit: number;
-      risk_score: number;
-      rationale: string;
-    } | null;
-  }> {
+  async getPendingProposal(sessionId: string): Promise<PendingApprovalDetail> {
     const response = await this.client.get(`/approval/pending/${sessionId}`);
     return response.data;
   }
