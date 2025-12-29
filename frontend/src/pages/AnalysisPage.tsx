@@ -10,7 +10,6 @@
 
 import { useState, useMemo } from 'react';
 import {
-  ArrowLeft,
   BarChart3,
   Loader2,
   CheckCircle2,
@@ -22,12 +21,13 @@ import {
   Building2,
   Clock,
   Eye,
+  Trash2,
 } from 'lucide-react';
 import { useStore, selectTickerHistory, type MarketType, type ActiveSession, type TickerHistoryItem } from '@/store';
 import type { SessionStatus } from '@/types';
 
 interface AnalysisPageProps {
-  onBack?: () => void;
+  // No props needed - navigation handled by sidebar
 }
 
 // Market type icon component
@@ -118,7 +118,7 @@ function getAction(item: TickerHistoryItem): string | null {
 
 type FilterStatus = 'all' | 'running' | 'completed';
 
-export function AnalysisPage({ onBack }: AnalysisPageProps) {
+export function AnalysisPage(_props: AnalysisPageProps) {
   const [filterStatus, setFilterStatus] = useState<FilterStatus>('all');
 
   // Store state - use global selectedSessionId for navigation between pages
@@ -136,6 +136,11 @@ export function AnalysisPage({ onBack }: AnalysisPageProps) {
 
   // Get history
   const history = useStore(selectTickerHistory);
+
+  // Get remove actions for delete functionality
+  const removeStockHistoryItem = useStore((state) => state.removeStockHistoryItem);
+  const removeCoinHistoryItem = useStore((state) => state.removeCoinHistoryItem);
+  const removeKiwoomHistoryItem = useStore((state) => state.removeKiwoomHistoryItem);
 
   // Build active sessions list
   const activeSessions = useMemo((): ActiveSession[] => {
@@ -228,14 +233,6 @@ export function AnalysisPage({ onBack }: AnalysisPageProps) {
     ).slice(0, 20); // Show last 20
   }, [history, filterStatus]);
 
-  const handleBack = () => {
-    if (onBack) {
-      onBack();
-    } else {
-      setCurrentView('dashboard');
-    }
-  };
-
   // Handle clicking on a running session - navigate to workflow view
   const handleSelectRunning = (session: ActiveSession) => {
     setActiveMarket(session.marketType);
@@ -261,6 +258,28 @@ export function AnalysisPage({ onBack }: AnalysisPageProps) {
     setSelectedSessionId(item.sessionId);
   };
 
+  // Handle delete completed analysis item
+  const handleDeleteItem = (e: React.MouseEvent, item: TickerHistoryItem) => {
+    e.stopPropagation(); // Prevent triggering the row click
+
+    const displayName = getDisplayName(item);
+    if (!confirm(`"${displayName}" 분석 내역을 삭제하시겠습니까?`)) {
+      return;
+    }
+
+    // Determine market type and call appropriate remove action
+    if ('market' in item) {
+      // Coin history item
+      removeCoinHistoryItem(item.sessionId);
+    } else if ('stk_cd' in item) {
+      // Kiwoom history item
+      removeKiwoomHistoryItem(item.sessionId);
+    } else {
+      // Stock history item
+      removeStockHistoryItem(item.sessionId);
+    }
+  };
+
   // Count running vs completed
   const runningCount = activeSessions.filter(
     (s) => s.status === 'running' || s.status === 'awaiting_approval'
@@ -271,74 +290,52 @@ export function AnalysisPage({ onBack }: AnalysisPageProps) {
 
   return (
     <div className="h-full flex flex-col bg-surface">
-      {/* Header */}
-      <div className="flex items-center gap-3 px-6 py-4 border-b border-border bg-surface-dark">
-        <button
-          onClick={handleBack}
-          className="p-2 rounded-lg hover:bg-surface transition-colors"
-          title="Back to Dashboard"
-        >
-          <ArrowLeft className="w-5 h-5 text-gray-400" />
-        </button>
-        <div className="flex-1">
-          <h1 className="text-xl font-semibold flex items-center gap-2">
-            <BarChart3 className="w-6 h-6 text-blue-400" />
-            Analysis
-          </h1>
-          <p className="text-sm text-gray-500">
-            {runningCount > 0 && (
-              <span className="text-blue-400">{runningCount} running</span>
-            )}
-            {runningCount > 0 && completedCount > 0 && ' · '}
-            {completedCount > 0 && (
-              <span className="text-gray-400">{completedCount} completed</span>
-            )}
-          </p>
-        </div>
-
-        {/* Filter Tabs */}
-        <div className="flex items-center gap-1 bg-surface rounded-lg p-1">
-          <button
-            onClick={() => setFilterStatus('all')}
-            className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
-              filterStatus === 'all'
-                ? 'bg-blue-600 text-white'
-                : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            All
-          </button>
-          <button
-            onClick={() => setFilterStatus('running')}
-            className={`px-3 py-1.5 text-sm rounded-md transition-colors flex items-center gap-1 ${
-              filterStatus === 'running'
-                ? 'bg-blue-600 text-white'
-                : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            Running
-            {runningCount > 0 && (
-              <span className="px-1.5 py-0.5 text-xs bg-blue-500/50 rounded-full">
-                {runningCount}
-              </span>
-            )}
-          </button>
-          <button
-            onClick={() => setFilterStatus('completed')}
-            className={`px-3 py-1.5 text-sm rounded-md transition-colors ${
-              filterStatus === 'completed'
-                ? 'bg-blue-600 text-white'
-                : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            Completed
-          </button>
-        </div>
-      </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto p-6">
-        <div className="max-w-4xl mx-auto space-y-6">
+      <div className="flex-1 overflow-y-auto p-4">
+        <div className="max-w-4xl mx-auto space-y-4">
+          {/* Inline Header */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <BarChart3 className="w-5 h-5 text-blue-400" />
+              <h1 className="text-lg font-semibold">Analysis</h1>
+              <span className="text-sm text-gray-500">
+                {runningCount > 0 && <span className="text-blue-400">{runningCount} running</span>}
+                {runningCount > 0 && completedCount > 0 && ' · '}
+                {completedCount > 0 && <span className="text-gray-400">{completedCount} completed</span>}
+              </span>
+            </div>
+            {/* Filter Tabs */}
+            <div className="flex items-center gap-1 bg-surface-dark rounded-lg p-1">
+              <button
+                onClick={() => setFilterStatus('all')}
+                className={`px-2.5 py-1 text-xs rounded-md transition-colors ${
+                  filterStatus === 'all' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                All
+              </button>
+              <button
+                onClick={() => setFilterStatus('running')}
+                className={`px-2.5 py-1 text-xs rounded-md transition-colors flex items-center gap-1 ${
+                  filterStatus === 'running' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                Running
+                {runningCount > 0 && (
+                  <span className="px-1 py-0.5 text-[10px] bg-blue-500/50 rounded-full">{runningCount}</span>
+                )}
+              </button>
+              <button
+                onClick={() => setFilterStatus('completed')}
+                className={`px-2.5 py-1 text-xs rounded-md transition-colors ${
+                  filterStatus === 'completed' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                Completed
+              </button>
+            </div>
+          </div>
           {/* Running Analyses Section */}
           {filteredActiveSessions.length > 0 && (
             <section>
@@ -472,6 +469,15 @@ export function AnalysisPage({ onBack }: AnalysisPageProps) {
                       >
                         {item.status}
                       </span>
+
+                      {/* Delete Button */}
+                      <button
+                        onClick={(e) => handleDeleteItem(e, item)}
+                        className="p-1.5 rounded-md text-gray-500 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                        title="삭제"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
 
                       <ChevronRight className="w-5 h-5 text-gray-500" />
                     </button>

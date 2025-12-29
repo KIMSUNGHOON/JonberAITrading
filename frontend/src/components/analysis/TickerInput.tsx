@@ -4,11 +4,12 @@
  * Input field for starting new analysis.
  */
 
-import { useState } from 'react';
-import { Search, Loader2 } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Search, Loader2, AlertTriangle, Clock } from 'lucide-react';
 import { useStore } from '@/store';
 import { startAnalysis } from '@/api/client';
 import { createStoreWebSocket, type TradingWebSocket } from '@/api/websocket';
+import { getMarketStatus, isTradingAllowed, type MarketStatus } from '@/utils/marketHours';
 
 // Store WebSocket reference
 let activeWebSocket: TradingWebSocket | null = null;
@@ -16,6 +17,22 @@ let activeWebSocket: TradingWebSocket | null = null;
 export function TickerInput() {
   const [ticker, setTicker] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null);
+  const [tradingWarning, setTradingWarning] = useState<string | null>(null);
+
+  // Update market status periodically
+  useEffect(() => {
+    const updateMarketStatus = () => {
+      const status = getMarketStatus('stock');
+      setMarketStatus(status);
+      const tradingCheck = isTradingAllowed('stock');
+      setTradingWarning(tradingCheck.warning || null);
+    };
+
+    updateMarketStatus();
+    const interval = setInterval(updateMarketStatus, 60000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Use stock-specific state and actions
   const status = useStore((state) => state.stock.status);
@@ -78,31 +95,57 @@ export function TickerInput() {
   };
 
   const isDisabled = status === 'running' || status === 'awaiting_approval';
+  const isMarketClosed = marketStatus?.status === 'closed';
 
   return (
-    <form onSubmit={handleSubmit}>
-      <div className="relative">
-        <input
-          type="text"
-          value={ticker}
-          onChange={(e) => setTicker(e.target.value.toUpperCase())}
-          placeholder={isDisabled ? 'Analysis in progress...' : 'Enter ticker (e.g., AAPL)'}
-          disabled={isDisabled}
-          className="input pr-12"
-          maxLength={10}
-        />
-        <button
-          type="submit"
-          disabled={isDisabled || !ticker.trim() || isLoading}
-          className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-gray-400 hover:text-white disabled:opacity-50"
+    <div>
+      {/* Market Status Warning Banner */}
+      {tradingWarning && (
+        <div
+          className={`mb-2 px-3 py-2 rounded-lg flex items-center gap-2 text-sm ${
+            isMarketClosed
+              ? 'bg-red-500/10 border border-red-500/30 text-red-400'
+              : 'bg-yellow-500/10 border border-yellow-500/30 text-yellow-400'
+          }`}
         >
-          {isLoading ? (
-            <Loader2 className="w-5 h-5 animate-spin" />
+          {isMarketClosed ? (
+            <Clock className="w-4 h-4 flex-shrink-0" />
           ) : (
-            <Search className="w-5 h-5" />
+            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
           )}
-        </button>
-      </div>
-    </form>
+          <span className="flex-1">{tradingWarning}</span>
+          {marketStatus && (
+            <span className="text-xs opacity-75">
+              ({marketStatus.openTime}-{marketStatus.closeTime} {marketStatus.timezone})
+            </span>
+          )}
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit}>
+        <div className="relative">
+          <input
+            type="text"
+            value={ticker}
+            onChange={(e) => setTicker(e.target.value.toUpperCase())}
+            placeholder={isDisabled ? 'Analysis in progress...' : 'Enter ticker (e.g., AAPL)'}
+            disabled={isDisabled}
+            className="input pr-12"
+            maxLength={10}
+          />
+          <button
+            type="submit"
+            disabled={isDisabled || !ticker.trim() || isLoading}
+            className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-gray-400 hover:text-white disabled:opacity-50"
+          >
+            {isLoading ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : (
+              <Search className="w-5 h-5" />
+            )}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }

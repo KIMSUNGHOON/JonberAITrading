@@ -1,11 +1,12 @@
 /**
  * Header Component
  *
- * Top navigation bar with branding and controls.
+ * Top navigation bar with branding, market status, and controls.
  */
 
 import { Menu, Settings, Bell, Activity, PanelLeftClose, PanelLeft } from 'lucide-react';
 import { useStore, selectStatus, selectTicker } from '@/store';
+import { MarketStatusBadge, MarketStatusCompact } from './MarketStatusBadge';
 
 export function Header() {
   const status = useStore(selectStatus);
@@ -61,6 +62,15 @@ export function Header() {
 
       {/* Right Section */}
       <div className="flex items-center gap-2">
+        {/* Market Status (Desktop) */}
+        <MarketStatusBadge />
+
+        {/* Market Status (Mobile) */}
+        <MarketStatusCompact />
+
+        {/* Divider */}
+        <div className="hidden md:block w-px h-6 bg-border" />
+
         {/* Status Indicator */}
         <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 bg-surface rounded-lg">
           <div

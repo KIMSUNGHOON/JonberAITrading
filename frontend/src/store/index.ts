@@ -140,6 +140,7 @@ interface ChatState {
 
 type MarketType = 'stock' | 'coin' | 'kiwoom';
 type StockRegion = 'us' | 'kr';
+type Language = 'en' | 'ko';
 
 type ChatPopupSize = 'small' | 'medium' | 'large';
 
@@ -177,6 +178,9 @@ interface UIState {
 
   // Selected session for detail view
   selectedSessionId: string | null;
+
+  // Language preference for UI and analysis reports
+  language: Language;
 }
 
 // -------------------------------------------
@@ -227,6 +231,8 @@ interface StockActions {
   setStockPosition: (position: Position | null) => void;
   setStockError: (error: string | null) => void;
   resetStock: () => void;
+  // History management
+  removeStockHistoryItem: (sessionId: string) => void;
 }
 
 interface CoinActions {
@@ -242,6 +248,8 @@ interface CoinActions {
   setCoinPosition: (position: Position | null) => void;
   setCoinError: (error: string | null) => void;
   resetCoin: () => void;
+  // History management
+  removeCoinHistoryItem: (sessionId: string) => void;
 }
 
 interface KiwoomActions {
@@ -280,6 +288,9 @@ interface KiwoomActions {
       reasoningSummary?: string;
     }
   ) => void;
+
+  // History management
+  removeKiwoomHistoryItem: (sessionId: string) => void;
 }
 
 interface ChatActions {
@@ -310,6 +321,8 @@ interface UIActions {
   // View/Page navigation
   setCurrentView: (view: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'workflow' | 'analysis-detail') => void;
   setSelectedSessionId: (sessionId: string | null) => void;
+  // Language preference
+  setLanguage: (language: Language) => void;
 }
 
 // Legacy actions for backward compatibility
@@ -425,6 +438,8 @@ const initialUIState: UIState = {
   // View/Page navigation
   currentView: 'dashboard',
   selectedSessionId: null,
+  // Language preference (default: Korean)
+  language: 'ko',
 };
 
 // -------------------------------------------
@@ -440,6 +455,7 @@ interface PersistedState {
   hasVisited: boolean;
   chartConfig: ChartConfig;
   sidebarCollapsed: boolean;
+  language: Language;
 }
 
 export const useStore = create<Store>()(
@@ -539,18 +555,25 @@ export const useStore = create<Store>()(
               ]
             : state.messages;
 
+          // Open approval dialog when proposal is set AND already awaiting approval
+          const shouldOpenDialog = proposal !== null && state.stock.awaitingApproval && !state.showApprovalDialog;
+
           return {
             stock: { ...state.stock, tradeProposal: proposal },
             messages: newMessages,
             chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
+            ...(shouldOpenDialog ? { showApprovalDialog: true } : {}),
           };
         }),
 
       setStockAwaitingApproval: (awaiting) =>
-        set((state) => ({
-          stock: { ...state.stock, awaitingApproval: awaiting },
-          showApprovalDialog: awaiting,
-        })),
+        set((state) => {
+          // NOTE: Dialog opening is handled ONLY by setStockProposal to prevent race conditions
+          // When both status and proposal messages arrive close together, only proposal setter opens dialog
+          return {
+            stock: { ...state.stock, awaitingApproval: awaiting },
+          };
+        }),
 
       setStockPosition: (position) =>
         set((state) => ({
@@ -571,6 +594,14 @@ export const useStore = create<Store>()(
           stock: {
             ...initialStockState,
             history: state.stock.history,
+          },
+        })),
+
+      removeStockHistoryItem: (sessionId) =>
+        set((state) => ({
+          stock: {
+            ...state.stock,
+            history: state.stock.history.filter(h => h.sessionId !== sessionId),
           },
         })),
 
@@ -661,18 +692,25 @@ export const useStore = create<Store>()(
               ]
             : state.messages;
 
+          // Open approval dialog when proposal is set AND already awaiting approval
+          const shouldOpenDialog = proposal !== null && state.coin.awaitingApproval && !state.showApprovalDialog;
+
           return {
             coin: { ...state.coin, tradeProposal: proposal },
             messages: newMessages,
             chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
+            ...(shouldOpenDialog ? { showApprovalDialog: true } : {}),
           };
         }),
 
       setCoinAwaitingApproval: (awaiting) =>
-        set((state) => ({
-          coin: { ...state.coin, awaitingApproval: awaiting },
-          showApprovalDialog: awaiting,
-        })),
+        set((state) => {
+          // NOTE: Dialog opening is handled ONLY by setCoinProposal to prevent race conditions
+          // When both status and proposal messages arrive close together, only proposal setter opens dialog
+          return {
+            coin: { ...state.coin, awaitingApproval: awaiting },
+          };
+        }),
 
       setCoinPosition: (position) =>
         set((state) => ({
@@ -693,6 +731,14 @@ export const useStore = create<Store>()(
           coin: {
             ...initialCoinState,
             history: state.coin.history,
+          },
+        })),
+
+      removeCoinHistoryItem: (sessionId) =>
+        set((state) => ({
+          coin: {
+            ...state.coin,
+            history: state.coin.history.filter(h => h.sessionId !== sessionId),
           },
         })),
 
@@ -876,10 +922,15 @@ export const useStore = create<Store>()(
               : s
           );
 
+          // Only open dialog if BOTH proposal is set AND already awaiting approval
+          // This prevents opening dialog before proposal data arrives
+          const shouldOpenDialog = proposal !== null && state.kiwoom.awaitingApproval && !state.showApprovalDialog;
+
           return {
             kiwoom: { ...state.kiwoom, tradeProposal: proposal, sessions: newSessions },
             messages: newMessages,
             chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
+            ...(shouldOpenDialog ? { showApprovalDialog: true } : {}),
           };
         }),
 
@@ -891,9 +942,11 @@ export const useStore = create<Store>()(
               ? { ...s, awaitingApproval: awaiting, updatedAt: new Date() }
               : s
           );
+
+          // NOTE: Dialog opening is handled ONLY by setKiwoomProposal to prevent race conditions
+          // When both status and proposal messages arrive close together, only proposal setter opens dialog
           return {
             kiwoom: { ...state.kiwoom, awaitingApproval: awaiting, sessions: newSessions },
-            showApprovalDialog: awaiting,
           };
         }),
 
@@ -1162,6 +1215,7 @@ export const useStore = create<Store>()(
               : s
           );
           const isActive = state.kiwoom.activeSessionId === sessionId;
+          const session = newSessions.find(s => s.sessionId === sessionId);
 
           // Add proposal message to chat if proposal exists
           const newMessages = proposal
@@ -1177,6 +1231,10 @@ export const useStore = create<Store>()(
               ]
             : state.messages;
 
+          // Open approval dialog ONLY when proposal is set AND session is awaiting approval
+          // This ensures dialog opens with complete data, not when awaitingApproval status arrives first
+          const shouldOpenDialog = isActive && proposal !== null && session?.awaitingApproval && !state.showApprovalDialog;
+
           return {
             kiwoom: {
               ...state.kiwoom,
@@ -1185,6 +1243,7 @@ export const useStore = create<Store>()(
             },
             messages: newMessages,
             chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
+            ...(shouldOpenDialog ? { showApprovalDialog: true } : {}),
           };
         }),
 
@@ -1196,13 +1255,15 @@ export const useStore = create<Store>()(
               : s
           );
           const isActive = state.kiwoom.activeSessionId === sessionId;
+
+          // NOTE: Dialog opening is handled ONLY by setKiwoomSessionProposal to prevent race conditions
+          // When both status and proposal messages arrive close together, only proposal setter opens dialog
           return {
             kiwoom: {
               ...state.kiwoom,
               sessions: newSessions,
               ...(isActive ? { awaitingApproval: awaiting } : {}),
             },
-            ...(isActive ? { showApprovalDialog: awaiting } : {}),
           };
         }),
 
@@ -1287,6 +1348,14 @@ export const useStore = create<Store>()(
           };
         }),
 
+      removeKiwoomHistoryItem: (sessionId) =>
+        set((state) => ({
+          kiwoom: {
+            ...state.kiwoom,
+            history: state.kiwoom.history.filter(h => h.sessionId !== sessionId),
+          },
+        })),
+
       // -------------------------------------------
       // Chat Actions
       // -------------------------------------------
@@ -1347,6 +1416,8 @@ export const useStore = create<Store>()(
       setCurrentView: (view) => set({ currentView: view }),
 
       setSelectedSessionId: (sessionId) => set({ selectedSessionId: sessionId }),
+
+      setLanguage: (language) => set({ language }),
 
       setChartTimeframe: (timeframe) =>
         set((state) => ({
@@ -1595,6 +1666,7 @@ export const useStore = create<Store>()(
           hasVisited: state.hasVisited,
           chartConfig: state.chartConfig,
           sidebarCollapsed: state.sidebarCollapsed,
+          language: state.language,
         }),
         // Merge persisted state with initial state
         merge: (persistedState, currentState) => {
@@ -1633,6 +1705,7 @@ export const useStore = create<Store>()(
             hasVisited: persisted.hasVisited ?? currentState.hasVisited,
             chartConfig: persisted.chartConfig ?? currentState.chartConfig,
             sidebarCollapsed: persisted.sidebarCollapsed ?? currentState.sidebarCollapsed,
+            language: persisted.language ?? currentState.language,
           };
         },
       }
@@ -1952,5 +2025,5 @@ export const selectRecentCompletedAnalyses = (state: Store): RecentAnalysisItem[
 };
 
 // Export types
-export type { TickerHistoryItem, StockHistoryItem, CoinHistoryItem, KiwoomHistoryItem, MarketType, StockRegion, ChatPopupSize };
+export type { TickerHistoryItem, StockHistoryItem, CoinHistoryItem, KiwoomHistoryItem, MarketType, StockRegion, ChatPopupSize, Language };
 export type { SessionData } from '@/types';

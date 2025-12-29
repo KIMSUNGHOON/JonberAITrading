@@ -34,6 +34,7 @@ from agents.prompts import (
     COIN_TECHNICAL_ANALYST_PROMPT,
 )
 from app.config import settings
+from app.api.routes.settings import get_upbit_access_key, get_upbit_secret_key
 from services.upbit import UpbitClient
 
 logger = structlog.get_logger()
@@ -466,9 +467,9 @@ async def coin_strategic_decision_node(state: dict) -> dict:
     quantity = 0.0
     if action in (TradeAction.BUY, "BUY") and current_price > 0:
         try:
-            # Get Upbit API credentials
-            access_key = getattr(settings, "UPBIT_ACCESS_KEY", None)
-            secret_key = getattr(settings, "UPBIT_SECRET_KEY", None)
+            # Get Upbit API credentials (runtime or environment)
+            access_key = get_upbit_access_key()
+            secret_key = get_upbit_secret_key()
 
             if access_key and secret_key:
                 client = UpbitClient(access_key=access_key, secret_key=secret_key)
@@ -784,10 +785,10 @@ async def _execute_live_order(
                 "reasoning_log": add_coin_reasoning_log(state, reasoning),
             }
 
-        # Create Upbit client and execute order
+        # Create Upbit client and execute order (using runtime or environment keys)
         async with UpbitClient(
-            access_key=settings.UPBIT_ACCESS_KEY,
-            secret_key=settings.UPBIT_SECRET_KEY,
+            access_key=get_upbit_access_key(),
+            secret_key=get_upbit_secret_key(),
         ) as client:
             # Place the order
             order = await client.place_order(

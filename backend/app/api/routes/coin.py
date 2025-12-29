@@ -44,6 +44,7 @@ from app.core.analysis_limiter import (
     register_session,
     update_session_status,
 )
+from app.api.routes.settings import get_upbit_access_key, get_upbit_secret_key
 from services.upbit import UpbitClient
 
 logger = structlog.get_logger()
@@ -65,10 +66,10 @@ CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
 def get_upbit_client() -> UpbitClient:
-    """Get Upbit client instance."""
+    """Get Upbit client instance using runtime keys or environment variables."""
     return UpbitClient(
-        access_key=getattr(settings, "UPBIT_ACCESS_KEY", None),
-        secret_key=getattr(settings, "UPBIT_SECRET_KEY", None),
+        access_key=get_upbit_access_key(),
+        secret_key=get_upbit_secret_key(),
     )
 
 
@@ -735,8 +736,8 @@ async def cancel_coin_analysis(session_id: str):
 
 
 def _check_api_keys():
-    """Check if Upbit API keys are configured."""
-    if not settings.UPBIT_ACCESS_KEY or not settings.UPBIT_SECRET_KEY:
+    """Check if Upbit API keys are configured (runtime or environment)."""
+    if not get_upbit_access_key() or not get_upbit_secret_key():
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Upbit API keys not configured. Set UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY.",

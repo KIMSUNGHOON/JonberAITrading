@@ -66,6 +66,7 @@ export interface ProposalMessage {
   data: {
     id: string;
     ticker: string;
+    display_name?: string;  // Stock name / Korean name for display
     action: string;
     quantity: number;
     entry_price: number;
@@ -420,6 +421,16 @@ export function createStoreWebSocket(
     setAwaitingApproval: (awaiting: boolean) => void;
     setActivePosition: (position: Position | null) => void;
     setError: (error: string | null) => void;
+    // Optional: For saving detailed analysis results (Kiwoom sessions)
+    completeKiwoomSession?: (
+      sessionId: string,
+      data: {
+        analysisResults?: DetailedAnalysisResults | null;
+        tradeProposal?: KRStockTradeProposal | null;
+        reasoningSummary?: string | null;
+        completedAt?: Date;
+      }
+    ) => void;
   },
   marketType: MarketType = 'stock'
 ): TradingWebSocket {
@@ -503,10 +514,43 @@ export function createStoreWebSocket(
       });
     },
     onComplete: (data) => {
+      console.log('[createStoreWebSocket] onComplete received:', {
+        sessionId,
+        marketType,
+        hasAnalysisResults: !!data.analysis_results,
+        hasProposal: !!data.trade_proposal,
+        hasCompleteKiwoomSession: !!store.completeKiwoomSession,
+      });
+
       if (data.error) {
         store.setError(data.error);
       }
       store.setStatus(data.status as SessionStatus);
+
+      // Save detailed analysis results for Kiwoom sessions
+      if (marketType === 'kiwoom' && store.completeKiwoomSession && data.status === 'completed') {
+        store.completeKiwoomSession(sessionId, {
+          analysisResults: data.analysis_results || null,
+          tradeProposal: data.trade_proposal ? {
+            id: data.trade_proposal.id,
+            stk_cd: data.trade_proposal.ticker,
+            stk_nm: null,
+            action: data.trade_proposal.action as 'BUY' | 'SELL' | 'HOLD',
+            quantity: data.trade_proposal.quantity,
+            entry_price: data.trade_proposal.entry_price,
+            stop_loss: data.trade_proposal.stop_loss,
+            take_profit: data.trade_proposal.take_profit,
+            risk_score: data.trade_proposal.risk_score,
+            position_size_pct: 0,
+            rationale: data.trade_proposal.rationale,
+            bull_case: data.trade_proposal.bull_case || '',
+            bear_case: data.trade_proposal.bear_case || '',
+            created_at: new Date().toISOString(),
+          } : null,
+          reasoningSummary: data.reasoning_summary || null,
+          completedAt: data.completed_at ? new Date(data.completed_at) : new Date(),
+        });
+      }
     },
     onError: () => {
       store.setError('WebSocket connection error');

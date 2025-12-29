@@ -19,7 +19,6 @@ import {
   BarChart3,
   Brain,
   Shield,
-  MessageSquare,
   AlertTriangle,
   CheckCircle2,
   XCircle,
@@ -29,10 +28,11 @@ import {
   Activity,
   DollarSign,
   Newspaper,
-  AlertOctagon,
+  Languages,
 } from 'lucide-react';
-import { useStore, selectTickerHistory, selectKiwoomHistoryById, type MarketType, type TickerHistoryItem } from '@/store';
+import { useStore, selectTickerHistory, type MarketType, type TickerHistoryItem } from '@/store';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
+import { useTranslations } from '@/utils/translations';
 import type {
   DetailedAnalysisResults,
   TechnicalAnalysisResult,
@@ -165,7 +165,9 @@ function AnalysisCard({
           )}
 
           {summary && (
-            <p className="text-sm text-gray-300 mb-3">{summary}</p>
+            <div className="text-sm text-gray-300 mb-3 bg-surface/50 rounded-lg p-3 max-h-64 overflow-y-auto">
+              <MarkdownRenderer content={summary} compact />
+            </div>
           )}
 
           {indicators && (
@@ -195,6 +197,8 @@ function AnalysisCard({
 // Technical Indicators Component
 function TechnicalIndicators({ data }: { data: TechnicalAnalysisResult }) {
   const { indicators, priceAction } = data;
+  const language = useStore((state) => state.language);
+  const t = useTranslations(language);
 
   return (
     <div className="grid grid-cols-2 gap-2 text-xs">
@@ -229,7 +233,7 @@ function TechnicalIndicators({ data }: { data: TechnicalAnalysisResult }) {
       )}
       {priceAction && (
         <div className="bg-surface rounded p-2">
-          <span className="text-gray-500">변동</span>
+          <span className="text-gray-500">{t('price_change')}</span>
           <span className={`ml-2 font-medium ${
             priceAction.changePercent24h > 0 ? 'text-green-400' :
             priceAction.changePercent24h < 0 ? 'text-red-400' : 'text-gray-300'
@@ -246,19 +250,14 @@ function TechnicalIndicators({ data }: { data: TechnicalAnalysisResult }) {
 function FundamentalMetrics({ data }: { data: FundamentalAnalysisResult }) {
   const { metrics } = data;
   const financialHealth = data.financialHealth || 'unknown';
+  const language = useStore((state) => state.language);
+  const t = useTranslations(language);
 
   const healthColor: Record<string, string> = {
     strong: 'text-green-400',
     moderate: 'text-yellow-400',
     weak: 'text-red-400',
     unknown: 'text-gray-400',
-  };
-
-  const healthLabel: Record<string, string> = {
-    strong: '양호',
-    moderate: '보통',
-    weak: '취약',
-    unknown: '알 수 없음',
   };
 
   const hasMetrics = metrics && (metrics.per != null || metrics.pbr != null || metrics.roe != null);
@@ -288,9 +287,9 @@ function FundamentalMetrics({ data }: { data: FundamentalAnalysisResult }) {
         </div>
       )}
       <div className="flex items-center gap-2 text-sm">
-        <span className="text-gray-500">재무 건전성:</span>
+        <span className="text-gray-500">{t('financial_health')}:</span>
         <span className={`font-medium ${healthColor[financialHealth] || healthColor.unknown}`}>
-          {healthLabel[financialHealth] || '알 수 없음'}
+          {t(financialHealth as 'strong' | 'moderate' | 'weak' | 'unknown')}
         </span>
       </div>
     </div>
@@ -299,16 +298,13 @@ function FundamentalMetrics({ data }: { data: FundamentalAnalysisResult }) {
 
 // Sentiment Indicators Component
 function SentimentIndicators({ data }: { data: SentimentAnalysisResult }) {
+  const language = useStore((state) => state.language);
+  const t = useTranslations(language);
+
   const sentimentColor: Record<string, string> = {
     positive: 'text-green-400',
     neutral: 'text-gray-400',
     negative: 'text-red-400',
-  };
-
-  const sentimentLabel: Record<string, string> = {
-    positive: '긍정적',
-    neutral: '중립',
-    negative: '부정적',
   };
 
   const sentiment = data.sentiment || 'neutral';
@@ -317,14 +313,14 @@ function SentimentIndicators({ data }: { data: SentimentAnalysisResult }) {
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between text-sm">
-        <span className="text-gray-500">시장 심리:</span>
+        <span className="text-gray-500">{t('market_sentiment')}:</span>
         <span className={`font-medium ${sentimentColor[sentiment] || sentimentColor.neutral}`}>
-          {sentimentLabel[sentiment] || '중립'} {score !== 0 && `(${score > 0 ? '+' : ''}${score.toFixed(0)})`}
+          {t(sentiment as 'positive' | 'neutral' | 'negative')} {score !== 0 && `(${score > 0 ? '+' : ''}${score.toFixed(0)})`}
         </span>
       </div>
       {data.newsCount > 0 && (
         <div className="text-xs text-gray-500">
-          최근 뉴스 {data.newsCount}건 분석
+          {language === 'ko' ? `최근 뉴스 ${data.newsCount}건 분석` : `${data.newsCount} news articles analyzed`}
         </div>
       )}
       {data.recentNews && data.recentNews.length > 0 && (
@@ -342,6 +338,9 @@ function SentimentIndicators({ data }: { data: SentimentAnalysisResult }) {
 
 // Risk Factors Component
 function RiskFactors({ data }: { data: RiskAssessmentResult }) {
+  const language = useStore((state) => state.language);
+  const t = useTranslations(language);
+
   const riskColor: Record<string, string> = {
     low: 'text-green-400 bg-green-500/20',
     medium: 'text-yellow-400 bg-yellow-500/20',
@@ -349,27 +348,20 @@ function RiskFactors({ data }: { data: RiskAssessmentResult }) {
     very_high: 'text-red-400 bg-red-500/20',
   };
 
-  const riskLabel: Record<string, string> = {
-    low: '낮음',
-    medium: '보통',
-    high: '높음',
-    very_high: '매우 높음',
-  };
-
   const riskLevel = data.riskLevel || 'medium';
 
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <span className="text-sm text-gray-500">리스크 수준:</span>
+        <span className="text-sm text-gray-500">{t('risk_level')}:</span>
         <span className={`px-2 py-0.5 text-xs font-medium rounded ${riskColor[riskLevel] || riskColor.medium}`}>
-          {riskLabel[riskLevel] || '보통'}
+          {t(riskLevel as 'low' | 'medium' | 'high')}
         </span>
       </div>
       <div className="grid grid-cols-2 gap-2 text-xs">
         {data.suggestedStopLoss != null && (
           <div className="bg-surface rounded p-2">
-            <span className="text-gray-500">손절가</span>
+            <span className="text-gray-500">{t('suggested_stop_loss')}</span>
             <span className="ml-2 font-medium text-red-400">
               ₩{data.suggestedStopLoss.toLocaleString('ko-KR')}
             </span>
@@ -377,7 +369,7 @@ function RiskFactors({ data }: { data: RiskAssessmentResult }) {
         )}
         {data.suggestedTakeProfit != null && (
           <div className="bg-surface rounded p-2">
-            <span className="text-gray-500">목표가</span>
+            <span className="text-gray-500">{t('suggested_take_profit')}</span>
             <span className="ml-2 font-medium text-green-400">
               ₩{data.suggestedTakeProfit.toLocaleString('ko-KR')}
             </span>
@@ -407,9 +399,17 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
   const setCurrentView = useStore((state) => state.setCurrentView);
   const storeSessionId = useStore((state) => state.selectedSessionId);
   const history = useStore(selectTickerHistory);
+  const language = useStore((state) => state.language);
+  const setLanguage = useStore((state) => state.setLanguage);
+  const t = useTranslations(language);
 
   // Use prop sessionId if provided, otherwise use store's selectedSessionId
   const sessionId = propSessionId || storeSessionId;
+
+  // Toggle language between 'ko' and 'en'
+  const toggleLanguage = () => {
+    setLanguage(language === 'ko' ? 'en' : 'ko');
+  };
 
   // Find the analysis by session ID
   const analysis = useMemo(() => {
@@ -429,23 +429,11 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
   if (!analysis) {
     return (
       <div className="h-full flex flex-col bg-surface">
-        <div className="flex items-center gap-3 px-6 py-4 border-b border-border bg-surface-dark">
-          <button
-            onClick={handleBack}
-            className="p-2 rounded-lg hover:bg-surface transition-colors"
-          >
-            <ArrowLeft className="w-5 h-5 text-gray-400" />
-          </button>
-          <h1 className="text-xl font-semibold">Analysis Detail</h1>
-        </div>
-
-        <div className="flex-1 flex items-center justify-center">
+        <div className="flex-1 flex items-center justify-center p-4">
           <div className="text-center text-gray-500">
             <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
             <p className="text-lg">Analysis not found</p>
-            <p className="text-sm mt-2">
-              The analysis may have been removed or expired
-            </p>
+            <p className="text-sm mt-2">The analysis may have been removed or expired</p>
             <button
               onClick={handleBack}
               className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white text-sm"
@@ -466,6 +454,15 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
   const analysisResults = 'analysisResults' in analysis
     ? (analysis as { analysisResults?: DetailedAnalysisResults }).analysisResults
     : null;
+
+  // Debug logging for analysis data
+  console.log('[AnalysisDetailPage] Analysis data:', {
+    sessionId,
+    hasAnalysisResultsKey: 'analysisResults' in analysis,
+    analysisResults,
+    analysisResultsKeys: analysisResults ? Object.keys(analysisResults) : [],
+    status: analysis.status,
+  });
 
   // Extract individual analyses
   const technicalAnalysis = analysisResults?.technical ?? null;
@@ -488,93 +485,81 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
 
   return (
     <div className="h-full flex flex-col bg-surface">
-      {/* Header */}
-      <div className="flex items-center gap-3 px-6 py-4 border-b border-border bg-surface-dark">
-        <button
-          onClick={handleBack}
-          className="p-2 rounded-lg hover:bg-surface transition-colors"
-          title="Back to Analysis"
-        >
-          <ArrowLeft className="w-5 h-5 text-gray-400" />
-        </button>
-        <div className="flex-1">
-          <div className="flex items-center gap-3">
-            <MarketIcon marketType={marketType} />
-            <div>
-              <h1 className="text-xl font-semibold">{displayName}</h1>
-              <div className="flex items-center gap-2 text-sm text-gray-500">
-                {displayName !== analysis.ticker && (
-                  <span>{analysis.ticker}</span>
-                )}
-                <span className="px-2 py-0.5 text-xs bg-surface rounded">
-                  {getMarketLabel(marketType)}
-                </span>
-                <span>·</span>
-                <span>{formatDate(analysis.timestamp)}</span>
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto p-4">
+        <div className="max-w-4xl mx-auto space-y-4">
+          {/* Inline Header */}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleBack}
+                className="p-1.5 rounded-lg hover:bg-surface-dark transition-colors text-gray-400 hover:text-white"
+                title="Back to Analysis"
+              >
+                <ArrowLeft className="w-4 h-4" />
+              </button>
+              <MarketIcon marketType={marketType} />
+              <div>
+                <h1 className="text-lg font-semibold">{displayName}</h1>
+                <div className="flex items-center gap-2 text-xs text-gray-500">
+                  {displayName !== analysis.ticker && <span>{analysis.ticker}</span>}
+                  <span className="px-1.5 py-0.5 bg-surface rounded">{getMarketLabel(marketType)}</span>
+                  <span>·</span>
+                  <span>{formatDate(analysis.timestamp)}</span>
+                </div>
               </div>
             </div>
+            {/* Status & Action Badge + Language Toggle */}
+            <div className="flex items-center gap-2">
+              {/* Language Toggle */}
+              <button
+                onClick={toggleLanguage}
+                className="px-2 py-1 text-xs rounded-lg bg-surface-dark hover:bg-surface flex items-center gap-1 text-gray-400 hover:text-white transition-colors"
+                title={language === 'ko' ? 'Switch to English' : '한국어로 변경'}
+              >
+                <Languages className="w-3 h-3" />
+                {language === 'ko' ? 'EN' : 'KO'}
+              </button>
+              {action && (
+                <span className={`px-2 py-1 text-xs font-medium rounded-lg flex items-center gap-1 ${
+                  action === 'BUY' ? 'bg-green-500/20 text-green-400' :
+                  action === 'SELL' ? 'bg-red-500/20 text-red-400' : 'bg-gray-500/20 text-gray-400'
+                }`}>
+                  {action === 'BUY' ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+                  {action}
+                </span>
+              )}
+              <span className={`px-2 py-1 text-xs rounded-lg flex items-center gap-1 ${
+                analysis.status === 'completed' ? 'bg-green-500/20 text-green-400' :
+                analysis.status === 'cancelled' ? 'bg-yellow-500/20 text-yellow-400' : 'bg-red-500/20 text-red-400'
+              }`}>
+                {analysis.status === 'completed' ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
+                {analysis.status}
+              </span>
+            </div>
           </div>
-        </div>
 
-        {/* Status & Action Badge */}
-        <div className="flex items-center gap-2">
-          {action && (
-            <span
-              className={`px-3 py-1.5 text-sm font-medium rounded-lg flex items-center gap-1 ${
-                action === 'BUY'
-                  ? 'bg-green-500/20 text-green-400'
-                  : action === 'SELL'
-                    ? 'bg-red-500/20 text-red-400'
-                    : 'bg-gray-500/20 text-gray-400'
-              }`}
-            >
-              {action === 'BUY' ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
-              {action}
-            </span>
-          )}
-          <span
-            className={`px-3 py-1.5 text-sm rounded-lg flex items-center gap-1 ${
-              analysis.status === 'completed'
-                ? 'bg-green-500/20 text-green-400'
-                : analysis.status === 'cancelled'
-                  ? 'bg-yellow-500/20 text-yellow-400'
-                  : 'bg-red-500/20 text-red-400'
-            }`}
-          >
-            {analysis.status === 'completed' ? (
-              <CheckCircle2 className="w-4 h-4" />
-            ) : (
-              <XCircle className="w-4 h-4" />
-            )}
-            {analysis.status}
-          </span>
-        </div>
-      </div>
-
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-6">
-        <div className="max-w-4xl mx-auto space-y-6">
           {/* Summary Card */}
           <div className="card bg-gradient-to-r from-blue-600/10 to-purple-600/10 border-blue-500/30">
-            <h2 className="text-lg font-semibold mb-4">Analysis Summary</h2>
+            <h2 className="text-lg font-semibold mb-4">{t('analysis_summary')}</h2>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div className="text-center">
                 <div className="text-2xl font-bold text-blue-400">
                   {action || 'HOLD'}
                 </div>
-                <div className="text-xs text-gray-500 mt-1">Recommendation</div>
+                <div className="text-xs text-gray-500 mt-1">{t('recommendation')}</div>
               </div>
               <div className="text-center">
                 <div className="text-2xl font-bold text-green-400">
                   {analysis.status === 'completed' ? '100%' : '-'}
                 </div>
-                <div className="text-xs text-gray-500 mt-1">Complete</div>
+                <div className="text-xs text-gray-500 mt-1">{t('complete')}</div>
               </div>
               <div className="text-center">
                 <div className="text-2xl font-bold text-purple-400">
                   {getMarketLabel(marketType)}
                 </div>
-                <div className="text-xs text-gray-500 mt-1">Market</div>
+                <div className="text-xs text-gray-500 mt-1">{t('market')}</div>
               </div>
               <div className="text-center">
                 <div className="flex items-center justify-center gap-1 text-2xl font-bold text-gray-400">
@@ -592,7 +577,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
             <div className="card bg-gradient-to-r from-green-600/10 to-blue-600/10 border-green-500/30">
               <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
                 <Activity className="w-5 h-5 text-green-400" />
-                거래 제안
+                {t('trade_proposal')}
               </h2>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
                 {tradeProposal.entry_price && (
@@ -600,7 +585,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
                     <div className="text-lg font-bold text-blue-400">
                       ₩{tradeProposal.entry_price.toLocaleString('ko-KR')}
                     </div>
-                    <div className="text-xs text-gray-500">진입가</div>
+                    <div className="text-xs text-gray-500">{t('entry_price')}</div>
                   </div>
                 )}
                 {tradeProposal.stop_loss && (
@@ -608,7 +593,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
                     <div className="text-lg font-bold text-red-400">
                       ₩{tradeProposal.stop_loss.toLocaleString('ko-KR')}
                     </div>
-                    <div className="text-xs text-gray-500">손절가</div>
+                    <div className="text-xs text-gray-500">{t('stop_loss')}</div>
                   </div>
                 )}
                 {tradeProposal.take_profit && (
@@ -616,14 +601,14 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
                     <div className="text-lg font-bold text-green-400">
                       ₩{tradeProposal.take_profit.toLocaleString('ko-KR')}
                     </div>
-                    <div className="text-xs text-gray-500">목표가</div>
+                    <div className="text-xs text-gray-500">{t('take_profit')}</div>
                   </div>
                 )}
               </div>
               {tradeProposal.rationale && (
                 <div className="text-sm text-gray-300 bg-surface rounded-lg p-3">
-                  <p className="font-medium text-gray-400 mb-1">분석 근거:</p>
-                  {tradeProposal.rationale}
+                  <p className="font-medium text-gray-400 mb-2">{t('analysis_rationale')}:</p>
+                  <MarkdownRenderer content={tradeProposal.rationale} compact />
                 </div>
               )}
             </div>
@@ -634,7 +619,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
             {/* Technical Analysis */}
             <AnalysisCard
               icon={<BarChart3 className="w-5 h-5 text-blue-400" />}
-              title="기술적 분석"
+              title={t('technical_analysis')}
               signal={technicalAnalysis?.recommendation}
               confidence={technicalAnalysis?.confidence}
               summary={technicalAnalysis?.summary}
@@ -646,7 +631,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
             {/* Fundamental Analysis */}
             <AnalysisCard
               icon={<DollarSign className="w-5 h-5 text-green-400" />}
-              title="펀더멘털 분석"
+              title={t('fundamental_analysis')}
               signal={fundamentalAnalysis?.recommendation}
               confidence={fundamentalAnalysis?.confidence}
               summary={fundamentalAnalysis?.summary}
@@ -658,7 +643,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
             {/* Sentiment Analysis */}
             <AnalysisCard
               icon={<Newspaper className="w-5 h-5 text-purple-400" />}
-              title="심리 분석"
+              title={t('sentiment_analysis')}
               signal={sentimentAnalysis?.recommendation}
               confidence={sentimentAnalysis?.confidence}
               summary={sentimentAnalysis?.summary}
@@ -669,7 +654,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
             {/* Risk Assessment */}
             <AnalysisCard
               icon={<Shield className="w-5 h-5 text-yellow-400" />}
-              title="리스크 평가"
+              title={t('risk_assessment')}
               signal={riskAssessment?.riskLevel}
               confidence={riskAssessment?.confidence}
               summary={riskAssessment?.summary}
@@ -683,7 +668,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
             <div className="card">
               <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
                 <Brain className="w-5 h-5 text-gray-400" />
-                분석 요약
+                {t('reasoning_summary')}
               </h2>
               <div className="text-sm text-gray-300 bg-surface rounded-lg p-4 whitespace-pre-wrap">
                 {reasoningSummary}
@@ -696,10 +681,10 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
             <div className="card text-center py-8">
               <AlertTriangle className="w-8 h-8 mx-auto mb-3 text-yellow-400" />
               <p className="text-gray-400">
-                상세 분석 데이터가 없습니다.
+                {t('no_data_available')}
               </p>
               <p className="text-sm text-gray-500 mt-1">
-                이전 버전에서 완료된 분석일 수 있습니다.
+                {t('legacy_analysis_note')}
               </p>
             </div>
           )}

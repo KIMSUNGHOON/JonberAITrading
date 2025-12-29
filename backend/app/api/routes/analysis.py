@@ -256,9 +256,9 @@ async def get_analysis_status(session_id: str):
             take_profit=proposal.get("take_profit"),
             risk_score=proposal.get("risk_score", 0.5),
             position_size_pct=proposal.get("position_size_pct", 5.0),
-            rationale=rationale[:1000] if rationale else "",
-            bull_case=bull_case[:500] if bull_case else "",
-            bear_case=bear_case[:500] if bear_case else "",
+            rationale=rationale if rationale else "",  # Removed truncation
+            bull_case=bull_case if bull_case else "",   # Removed truncation
+            bear_case=bear_case if bear_case else "",   # Removed truncation
             created_at=proposal.get("created_at"),
         )
 

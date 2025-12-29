@@ -65,11 +65,16 @@ async def submit_approval(request: ApprovalRequest):
             detail="Session is not awaiting approval",
         )
 
+    # Log state BEFORE approval to verify analysis results exist
     logger.info(
-        "approval_submitted",
+        "approval_state_before",
         session_id=request.session_id,
         decision=request.decision,
-        has_feedback=bool(request.feedback),
+        has_technical=state.get("technical_analysis") is not None,
+        has_fundamental=state.get("fundamental_analysis") is not None,
+        has_sentiment=state.get("sentiment_analysis") is not None,
+        has_risk=state.get("risk_assessment") is not None,
+        state_keys=list(state.keys()),
     )
 
     # Update state with approval decision
@@ -127,6 +132,17 @@ async def submit_approval(request: ApprovalRequest):
             # modified
             session["status"] = "completed"
             execution_status = state.get("execution_status", "completed")
+
+        # Log state AFTER approval to verify analysis results are preserved
+        logger.info(
+            "approval_state_after",
+            session_id=request.session_id,
+            has_technical=state.get("technical_analysis") is not None,
+            has_fundamental=state.get("fundamental_analysis") is not None,
+            has_sentiment=state.get("sentiment_analysis") is not None,
+            has_risk=state.get("risk_assessment") is not None,
+            execution_status=execution_status,
+        )
 
         logger.info(
             "approval_processed",
@@ -326,5 +342,5 @@ def _format_analysis(analysis) -> dict | None:
         "summary": analysis.get("summary", ""),
         "key_factors": analysis.get("key_factors", []),
         "signals": analysis.get("signals", {}),
-        "reasoning": reasoning[:1000] if reasoning else "",
+        "reasoning": reasoning if reasoning else "",  # Removed truncation
     }

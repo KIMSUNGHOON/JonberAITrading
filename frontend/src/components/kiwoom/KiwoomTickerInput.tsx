@@ -6,11 +6,12 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Search, Loader2, Building2 } from 'lucide-react';
+import { Search, Loader2, Building2, AlertTriangle, Clock } from 'lucide-react';
 import { useStore } from '@/store';
 import { searchKRStocks, startKRStockAnalysis } from '@/api/client';
 import { createStoreWebSocket, type TradingWebSocket } from '@/api/websocket';
 import type { KRStockInfo } from '@/types';
+import { getMarketStatus, isTradingAllowed, type MarketStatus } from '@/utils/marketHours';
 
 // Store WebSocket reference for Kiwoom sessions
 let activeKiwoomWebSocket: TradingWebSocket | null = null;
@@ -35,8 +36,24 @@ export function KiwoomTickerInput() {
   const [isSearching, setIsSearching] = useState(false);
   const [showDropdown, setShowDropdown] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(-1);
+  const [marketStatus, setMarketStatus] = useState<MarketStatus | null>(null);
+  const [tradingWarning, setTradingWarning] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Update market status periodically
+  useEffect(() => {
+    const updateMarketStatus = () => {
+      const status = getMarketStatus('kiwoom');
+      setMarketStatus(status);
+      const tradingCheck = isTradingAllowed('kiwoom');
+      setTradingWarning(tradingCheck.warning || null);
+    };
+
+    updateMarketStatus();
+    const interval = setInterval(updateMarketStatus, 60000); // Update every minute
+    return () => clearInterval(interval);
+  }, []);
 
   // Use kiwoom-specific state and actions
   const kiwoomSessions = useStore((state) => state.kiwoom.sessions);
@@ -48,6 +65,7 @@ export function KiwoomTickerInput() {
   const setKiwoomAwaitingApproval = useStore((state) => state.setKiwoomAwaitingApproval);
   const setKiwoomPosition = useStore((state) => state.setKiwoomPosition);
   const setKiwoomError = useStore((state) => state.setKiwoomError);
+  const completeKiwoomSession = useStore((state) => state.completeKiwoomSession);
   const addChatMessage = useStore((state) => state.addChatMessage);
 
   // Count active sessions (running or awaiting approval)
@@ -140,6 +158,7 @@ export function KiwoomTickerInput() {
           setAwaitingApproval: setKiwoomAwaitingApproval,
           setActivePosition: setKiwoomPosition,
           setError: setKiwoomError,
+          completeKiwoomSession, // Pass for saving analysis results
         },
         'kiwoom' // Market type for correct proposal format (₩ currency)
       );
@@ -217,8 +236,34 @@ export function KiwoomTickerInput() {
     return 'text-gray-500';
   };
 
+  // Check if market is open for trading
+  const isMarketClosed = marketStatus?.status === 'closed';
+
   return (
     <div className="relative">
+      {/* Market Status Warning Banner */}
+      {tradingWarning && (
+        <div
+          className={`mb-2 px-3 py-2 rounded-lg flex items-center gap-2 text-sm ${
+            isMarketClosed
+              ? 'bg-red-500/10 border border-red-500/30 text-red-400'
+              : 'bg-yellow-500/10 border border-yellow-500/30 text-yellow-400'
+          }`}
+        >
+          {isMarketClosed ? (
+            <Clock className="w-4 h-4 flex-shrink-0" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+          )}
+          <span className="flex-1">{tradingWarning}</span>
+          {marketStatus && (
+            <span className="text-xs opacity-75">
+              ({marketStatus.openTime}-{marketStatus.closeTime} {marketStatus.timezone})
+            </span>
+          )}
+        </div>
+      )}
+
       <form onSubmit={handleSubmit}>
         <div className="relative">
           <div className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">

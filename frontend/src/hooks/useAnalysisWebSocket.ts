@@ -9,7 +9,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useStore, type MarketType } from '@/store';
 import { wsManager, type WebSocketHandlers, type CompleteMessage } from '@/api/websocket';
-import type { KRStockTradeProposal, SessionStatus, DetailedAnalysisResults } from '@/types';
+import type { KRStockTradeProposal, SessionStatus } from '@/types';
 
 interface UseAnalysisWebSocketOptions {
   /** Session ID to connect to */
@@ -133,11 +133,12 @@ export function useAnalysisWebSocket({
       },
       onProposal: (data) => {
         // Convert proposal data to the appropriate type based on market type
+        // Use display_name from backend if available, otherwise fallback to ticker
         if (actions.marketType === 'kiwoom') {
           const proposal: KRStockTradeProposal = {
             id: data.id,
             stk_cd: data.ticker,
-            stk_nm: null,
+            stk_nm: data.display_name || data.ticker || null,  // Use display_name from backend
             action: data.action.toUpperCase() as 'BUY' | 'SELL' | 'HOLD',
             quantity: data.quantity,
             entry_price: data.entry_price,
@@ -156,7 +157,7 @@ export function useAnalysisWebSocket({
           const proposal = {
             id: data.id,
             market: data.ticker,
-            korean_name: null,
+            korean_name: data.display_name || null,  // Use display_name from backend
             action: data.action.toUpperCase() as 'BUY' | 'SELL' | 'HOLD',
             quantity: data.quantity,
             entry_price: data.entry_price,
@@ -191,6 +192,16 @@ export function useAnalysisWebSocket({
         }
       },
       onComplete: (data: CompleteMessage['data']) => {
+        // Debug logging to trace analysis results
+        console.log('[WebSocket] Complete message received:', {
+          sessionId,
+          status: data.status,
+          hasAnalysisResults: !!data.analysis_results,
+          analysisResultsKeys: data.analysis_results ? Object.keys(data.analysis_results) : [],
+          hasProposal: !!data.trade_proposal,
+          hasReasoningSummary: !!data.reasoning_summary,
+        });
+
         if (data.error) {
           actions.setError(data.error);
         }
@@ -198,6 +209,7 @@ export function useAnalysisWebSocket({
 
         // Save detailed analysis results for Kiwoom sessions
         if (sessionId && actions.marketType === 'kiwoom' && data.status === 'completed') {
+          console.log('[WebSocket] Calling completeKiwoomSession with analysis_results:', data.analysis_results);
           store.completeKiwoomSession(sessionId, {
             analysisResults: data.analysis_results || null,
             tradeProposal: data.trade_proposal ? {

@@ -27,14 +27,18 @@ type AnyTradeProposal = TradeProposal | CoinTradeProposal | KRStockTradeProposal
 
 // Helper to get symbol from stock, coin, or kiwoom proposal
 function getProposalSymbol(proposal: AnyTradeProposal): string {
-  if ('ticker' in proposal) {
-    return proposal.ticker;
+  // Check for kiwoom proposals first (Korean stocks use stk_cd)
+  if ('stk_cd' in proposal && proposal.stk_cd) {
+    const kiwoomProposal = proposal as KRStockTradeProposal;
+    return kiwoomProposal.stk_nm || kiwoomProposal.stk_cd;
   }
-  if ('market' in proposal) {
+  // Coin proposals use market
+  if ('market' in proposal && proposal.market) {
     return proposal.market;
   }
-  if ('stk_cd' in proposal) {
-    return proposal.stk_cd;
+  // US stock proposals use ticker
+  if ('ticker' in proposal && proposal.ticker) {
+    return proposal.ticker;
   }
   return 'UNKNOWN';
 }
@@ -76,7 +80,16 @@ export function ApprovalDialog() {
   const [feedback, setFeedback] = useState('');
   const setStatus = useStore((state) => state.setStatus);
 
+  // Don't render if no proposal or session
   if (!proposal || !sessionId) return null;
+
+  // Check if proposal has a valid identifier (not UNKNOWN)
+  // This prevents showing the dialog with incomplete data
+  const symbol = getProposalSymbol(proposal);
+  if (symbol === 'UNKNOWN') {
+    console.log('[ApprovalDialog] Skipping render - proposal has no valid identifier:', proposal);
+    return null;
+  }
 
   const handleDecision = async (decision: 'approved' | 'rejected' | 'cancelled') => {
     setIsSubmitting(true);
@@ -87,7 +100,7 @@ export function ApprovalDialog() {
     setAwaitingApproval(false);
 
     // Store proposal info for chat message before potentially clearing it
-    const symbol = getProposalSymbol(proposal);
+    // Note: symbol is already computed above and validated (not UNKNOWN)
     const action = proposal.action.toUpperCase();
     const quantity = proposal.quantity;
 

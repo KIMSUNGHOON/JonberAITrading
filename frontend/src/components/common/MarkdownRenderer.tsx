@@ -54,8 +54,21 @@ export function MarkdownRenderer({ content, className = '', compact = false }: M
     // Numbered lists (1. ...)
     html = html.replace(/^(\d+)\. (.+)$/gm, '<li class="ml-4 text-gray-300 flex items-start gap-2"><span class="text-gray-500 min-w-[1.5rem]">$1.</span><span>$2</span></li>');
 
-    // Line breaks
-    html = html.replace(/\n/g, '<br/>');
+    // Horizontal rules (--- or ***)
+    html = html.replace(/^[-*]{3,}$/gm, '<hr class="border-gray-700 my-2" />');
+
+    // Clean up line breaks - multiple newlines become a single paragraph break
+    // First, collapse multiple newlines into double newlines (paragraph marker)
+    html = html.replace(/\n{3,}/g, '\n\n');
+
+    // Single newlines after block elements (headers, lists, hr) should be removed
+    html = html.replace(/<\/(h[1-4]|p|li|pre|hr)>\n/g, '</$1>');
+
+    // Double newlines become paragraph breaks (single <br/>)
+    html = html.replace(/\n\n/g, '<br/>');
+
+    // Single newlines within text become spaces (for proper line wrapping)
+    html = html.replace(/\n/g, ' ');
 
     // Trading-specific highlights
     const patterns = [

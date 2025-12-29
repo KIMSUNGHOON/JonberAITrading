@@ -139,7 +139,7 @@ def _extract_analysis_results(state: dict) -> dict | None:
         tech_signals = tech.get("signals", {})
 
         results["technical"] = {
-            "summary": tech.get("summary", ""),
+            "summary": tech.get("reasoning", "") or tech.get("summary", ""),  # Use full reasoning, fallback to summary
             "recommendation": _normalize_action(tech.get("signal", "HOLD")),
             "confidence": safe_float(tech.get("confidence", 0.5)) * 100,  # Convert to 0-100
             "indicators": {
@@ -164,7 +164,7 @@ def _extract_analysis_results(state: dict) -> dict | None:
         fund_signals = fund.get("signals", {})
 
         results["fundamental"] = {
-            "summary": fund.get("summary", ""),
+            "summary": fund.get("reasoning", "") or fund.get("summary", ""),  # Use full reasoning, fallback to summary
             "recommendation": _normalize_action(fund.get("signal", "HOLD")),
             "confidence": safe_float(fund.get("confidence", 0.5)) * 100,
             "metrics": {
@@ -187,7 +187,7 @@ def _extract_analysis_results(state: dict) -> dict | None:
         sent_signals = sent.get("signals", {})
 
         results["sentiment"] = {
-            "summary": sent.get("summary", ""),
+            "summary": sent.get("reasoning", "") or sent.get("summary", ""),  # Use full reasoning, fallback to summary
             "recommendation": _normalize_action(sent.get("signal", "HOLD")),
             "confidence": safe_float(sent.get("confidence", 0.5)) * 100,
             "sentiment": _normalize_sentiment(sent_signals.get("news_sentiment") or sent.get("sentiment", "neutral")),
@@ -206,7 +206,7 @@ def _extract_analysis_results(state: dict) -> dict | None:
         risk_score = safe_float(risk_signals.get("risk_score", risk.get("risk_score", 0.5)))
 
         results["risk"] = {
-            "summary": risk.get("summary", ""),
+            "summary": risk.get("reasoning", "") or risk.get("summary", ""),  # Use full reasoning, fallback to summary
             "riskLevel": _get_risk_level(risk_score),
             "confidence": safe_float(risk.get("confidence", 0.5)) * 100,
             "riskScore": risk_score * 100,  # Convert to 0-100
@@ -365,24 +365,48 @@ def _extract_bollinger(tech: dict) -> dict | None:
     }
 
 
-def _serialize_proposal(proposal: dict) -> dict:
-    """Serialize trade proposal for WebSocket transmission."""
+def _serialize_proposal(proposal: dict, full: bool = False) -> dict:
+    """
+    Serialize trade proposal for WebSocket transmission.
+
+    Args:
+        proposal: Trade proposal dict
+        full: If True, include full content without truncation (for complete messages).
+              If False, truncate for smaller notification messages.
+    """
     action = proposal.get("action", "HOLD")
     if hasattr(action, "value"):
         action = action.value
 
+    rationale = str(proposal.get("rationale", "") or "")
+    bull_case = str(proposal.get("bull_case", "") or "")
+    bear_case = str(proposal.get("bear_case", "") or "")
+
+    # Apply truncation only for notification messages (not full/complete messages)
+    if not full:
+        rationale = rationale[:2000]  # Increased from 1000
+        bull_case = bull_case[:1000]   # Increased from 500
+        bear_case = bear_case[:1000]   # Increased from 500
+
+    # Get ticker/symbol with fallbacks for different market types
+    ticker = proposal.get("ticker") or proposal.get("market") or proposal.get("stk_cd", "")
+
+    # Get display name (stock name or korean name) for UI display
+    display_name = proposal.get("stk_nm") or proposal.get("korean_name") or ""
+
     return {
         "id": str(proposal.get("id", "")),
-        "ticker": proposal.get("ticker") or proposal.get("market") or proposal.get("stk_cd", ""),
+        "ticker": ticker,
+        "display_name": display_name,  # Add display name for proper UI rendering
         "action": str(action),
         "quantity": safe_int(proposal.get("quantity"), 0),
         "entry_price": safe_float(proposal.get("entry_price")),
         "stop_loss": safe_float(proposal.get("stop_loss")),
         "take_profit": safe_float(proposal.get("take_profit")),
         "risk_score": safe_float(proposal.get("risk_score"), 0.5),
-        "rationale": str(proposal.get("rationale", "") or "")[:1000],
-        "bull_case": str(proposal.get("bull_case", "") or "")[:500],
-        "bear_case": str(proposal.get("bear_case", "") or "")[:500],
+        "rationale": rationale,
+        "bull_case": bull_case,
+        "bear_case": bear_case,
     }
 
 
@@ -405,7 +429,7 @@ def _create_reasoning_summary(reasoning_log: list) -> str:
     if not summary_entries:
         summary_entries = [str(e) for e in reasoning_log[-3:]]
 
-    return "\n".join(summary_entries)[:2000]
+    return "\n".join(summary_entries)[:5000]  # Increased from 2000
 
 
 # -------------------------------------------
@@ -510,15 +534,17 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     if hasattr(action, "value"):
                         action = action.value
 
-                    # Support both stock (ticker) and coin (market) proposals
-                    ticker_or_market = proposal.get("ticker") or proposal.get("market", "")
+                    # Support stock (ticker), coin (market), and Korean stock (stk_cd) proposals
+                    ticker_or_market = proposal.get("ticker") or proposal.get("market") or proposal.get("stk_cd", "")
+                    display_name = proposal.get("stk_nm") or proposal.get("korean_name") or ""
 
                     await websocket.send_json({
                         "type": "proposal",
                         "data": {
-                        "session_id": session_id,
+                            "session_id": session_id,
                             "id": str(proposal.get("id", "")),
                             "ticker": str(ticker_or_market),
+                            "display_name": display_name,  # Include display name
                             "action": str(action),
                             "quantity": safe_int(proposal.get("quantity"), 0),
                             "entry_price": safe_float(proposal.get("entry_price")),
@@ -574,15 +600,45 @@ async def websocket_session(websocket: WebSocket, session_id: str):
 
                     # Include analysis results if completed successfully
                     if current_status == "completed":
+                        # INFO level logging for troubleshooting (visible in console)
+                        tech_data = state.get("technical_analysis")
+                        fund_data = state.get("fundamental_analysis")
+                        sent_data = state.get("sentiment_analysis")
+                        risk_data = state.get("risk_assessment")
+
+                        logger.info(
+                            "websocket_complete_state_check",
+                            session_id=session_id,
+                            state_keys=list(state.keys()) if state else [],
+                            has_technical=tech_data is not None,
+                            has_fundamental=fund_data is not None,
+                            has_sentiment=sent_data is not None,
+                            has_risk=risk_data is not None,
+                            tech_type=type(tech_data).__name__ if tech_data else None,
+                        )
+
                         # Extract analysis results from state
                         analysis_results = _extract_analysis_results(state)
+                        logger.info(
+                            "websocket_analysis_results_extracted",
+                            session_id=session_id,
+                            has_results=analysis_results is not None,
+                            result_keys=list(analysis_results.keys()) if analysis_results else [],
+                        )
                         if analysis_results:
                             complete_data["analysis_results"] = analysis_results
+                        else:
+                            # Log warning if no analysis results were extracted
+                            logger.warning(
+                                "websocket_no_analysis_results",
+                                session_id=session_id,
+                                state_keys=list(state.keys()) if state else [],
+                            )
 
                         # Include trade proposal
                         proposal = state.get("trade_proposal")
                         if proposal:
-                            complete_data["trade_proposal"] = _serialize_proposal(proposal)
+                            complete_data["trade_proposal"] = _serialize_proposal(proposal, full=True)
 
                         # Include reasoning summary (last few entries)
                         reasoning_log = state.get("reasoning_log", [])
