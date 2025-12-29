@@ -126,8 +126,9 @@ def _format_trading_context(ctx: TradingContext) -> str:
         ]
         if a.recommendation:
             lines.append(f"- 추천: {a.recommendation}" + (f" (신뢰도: {a.confidence:.0f}%)" if a.confidence else ""))
+        # Define currency symbol based on market type
+        currency = "₩" if a.marketType in ("kiwoom", "coin") else "$"
         if a.currentPrice:
-            currency = "₩" if a.marketType == "kiwoom" else "$"
             lines.append(f"- 현재가: {currency}{a.currentPrice:,.0f}")
         if a.entryPrice:
             lines.append(f"- 진입가: {currency}{a.entryPrice:,.0f}")
