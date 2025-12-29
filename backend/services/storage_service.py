@@ -113,7 +113,7 @@ class StorageService:
                     )
                 """)
 
-                # Create indexes
+                # Create indexes for better query performance
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
                 )
@@ -128,6 +128,17 @@ class StorageService:
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_coin_trades_created ON coin_trades(created_at DESC)"
+                )
+
+                # Additional indexes for common query patterns
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_positions_quantity ON coin_positions(quantity)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_positions_updated ON coin_positions(updated_at DESC)"
                 )
 
                 await conn.commit()
