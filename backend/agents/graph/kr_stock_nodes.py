@@ -343,7 +343,12 @@ async def kr_stock_fundamental_analysis_node(state: dict) -> dict:
 async def kr_stock_sentiment_analysis_node(state: dict) -> dict:
     """
     Korean stock sentiment analysis.
-    Analyzes news, disclosures, and market sentiment.
+    Analyzes news, disclosures, and market sentiment using real news data.
+
+    Enhanced with:
+    - Real news fetching via Naver News API
+    - LLM-based sentiment analysis
+    - Structured sentiment output
     """
     start_time = time.perf_counter()
     stk_cd = _get_stk_cd_safely(state, "sentiment_analysis")
@@ -354,38 +359,131 @@ async def kr_stock_sentiment_analysis_node(state: dict) -> dict:
 
     market_data = state.get("market_data", {})
 
+    # Try to fetch and analyze real news
+    news_sentiment = None
+    news_articles = []
+
+    try:
+        from app.dependencies import get_news_service
+        from services.news import NewsSentimentAnalyzer
+
+        news_service = await get_news_service()
+
+        # Fetch news for this stock
+        if news_service.providers:
+            search_result = await news_service.search_stock_news(
+                stock_code=stk_cd,
+                stock_name=stk_nm,
+                count=10,
+            )
+            news_articles = search_result.articles
+
+            if news_articles:
+                # Analyze sentiment using LLM
+                analyzer = NewsSentimentAnalyzer(llm)
+                news_sentiment = await analyzer.analyze(
+                    articles=news_articles,
+                    stock_name=stk_nm,
+                    stock_code=stk_cd,
+                )
+
+                logger.info(
+                    "news_sentiment_analyzed",
+                    stk_cd=stk_cd,
+                    article_count=len(news_articles),
+                    sentiment=news_sentiment.sentiment,
+                    score=news_sentiment.score,
+                )
+
+    except Exception as e:
+        logger.warning(
+            "news_fetch_failed",
+            stk_cd=stk_cd,
+            error=str(e),
+        )
+
+    # Determine signal based on news sentiment
+    if news_sentiment:
+        if news_sentiment.recommendation == "BUY":
+            signal = SignalType.BUY
+        elif news_sentiment.recommendation == "SELL":
+            signal = SignalType.SELL
+        else:
+            signal = SignalType.HOLD
+
+        confidence = news_sentiment.confidence
+        summary = news_sentiment.summary
+        key_factors = (
+            news_sentiment.positive_factors[:3] +
+            news_sentiment.risk_factors[:2] +
+            news_sentiment.key_topics[:2]
+        )
+        sentiment_value = news_sentiment.sentiment
+        sentiment_score = news_sentiment.score
+
+        # Build detailed reasoning with news context
+        reasoning_parts = [
+            f"[시장심리 분석] {stk_nm}",
+            f"뉴스 {len(news_articles)}건 분석 완료",
+            f"감성: {sentiment_value} (점수: {sentiment_score})",
+            f"추천: {signal.value} (신뢰도: {confidence:.0%})",
+        ]
+        if news_sentiment.key_topics:
+            reasoning_parts.append(f"주요 토픽: {', '.join(news_sentiment.key_topics[:3])}")
+        if news_sentiment.risk_factors:
+            reasoning_parts.append(f"리스크: {', '.join(news_sentiment.risk_factors[:2])}")
+
+        detailed_reasoning = "\n".join(reasoning_parts)
+
+    else:
+        # Fallback to basic LLM analysis without news
+        signal = SignalType.HOLD
+        confidence = 0.50
+        summary = f"{stk_nm} 관련 뉴스 조회 불가. 중립적 심리 가정."
+        key_factors = ["뉴스 데이터 없음"]
+        sentiment_value = "neutral"
+        sentiment_score = 0
+        detailed_reasoning = f"[시장심리 분석] {stk_nm}: 뉴스 데이터 없음, 중립 가정"
+
+    # Also run LLM for additional context analysis
     messages = [
         SystemMessage(content=KR_STOCK_SENTIMENT_ANALYST_PROMPT),
         HumanMessage(
-            content=f"{stk_nm} ({stk_cd}) 시장심리 분석. "
-            f"현재가: {market_data.get('cur_prc', 0):,}원, "
-            f"전일대비: {market_data.get('prdy_ctrt', 0):+.2f}%"
+            content=f"{stk_nm} ({stk_cd}) 시장심리 분석.\n"
+            f"현재가: {market_data.get('cur_prc', 0):,}원\n"
+            f"전일대비: {market_data.get('prdy_ctrt', 0):+.2f}%\n"
+            f"뉴스 감성: {sentiment_value} (점수: {sentiment_score})\n"
+            f"최근 뉴스 수: {len(news_articles)}건"
         ),
     ]
 
     logger.debug("llm_request", node="kr_stock_sentiment_analysis")
-    response = await llm.generate(messages)
+    llm_response = await llm.generate(messages)
 
-    # Default to neutral sentiment
-    signal = SignalType.HOLD
+    # Combine news sentiment with LLM analysis
+    combined_summary = summary
+    if llm_response and len(llm_response) > 50:
+        combined_summary = f"{summary}\n\n추가 분석: {llm_response[:400]}"
 
     result = KRStockAnalysisResult(
         agent_type="sentiment",
         stk_cd=stk_cd,
         stk_nm=stk_nm,
         signal=signal,
-        confidence=0.60,
-        summary=response[:500] if len(response) > 500 else response,
-        reasoning=response,
-        key_factors=_extract_key_factors(response),
+        confidence=confidence,
+        summary=combined_summary[:800] if len(combined_summary) > 800 else combined_summary,
+        reasoning=detailed_reasoning + "\n\n" + llm_response if llm_response else detailed_reasoning,
+        key_factors=key_factors[:5] + _extract_key_factors(llm_response)[:3],
         signals={
-            "news_sentiment": "neutral",
+            "news_sentiment": sentiment_value,
+            "news_score": sentiment_score,
+            "news_count": len(news_articles),
             "disclosure_impact": "neutral",
-            "analyst_consensus": "hold",
+            "analyst_consensus": signal.value.lower(),
         },
     )
 
-    reasoning = f"[시장심리 분석] {stk_nm}: {signal.value} (신뢰도: {result.confidence:.0%})"
+    reasoning = f"[시장심리 분석] {stk_nm}: {signal.value} (신뢰도: {result.confidence:.0%}, 뉴스 {len(news_articles)}건)"
 
     duration_ms = (time.perf_counter() - start_time) * 1000
     logger.info("node_completed", node="kr_stock_sentiment_analysis", stk_cd=stk_cd, duration_ms=round(duration_ms, 2))

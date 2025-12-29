@@ -22,6 +22,7 @@ from app.api.schemas.approval import (
     PendingApprovalsResponse,
     PendingProposalSummary,
 )
+from app.dependencies import get_trading_coordinator
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -120,6 +121,52 @@ async def submit_approval(request: ApprovalRequest):
         if request.decision == "approved":
             session["status"] = "completed"
             execution_status = state.get("execution_status", "completed")
+
+            # Connect to auto-trading system
+            proposal = state.get("trade_proposal")
+            if proposal:
+                try:
+                    coordinator = await get_trading_coordinator()
+
+                    # Get ticker and stock name from session
+                    ticker = session.get("stk_cd") or session.get("ticker") or session.get("market")
+                    stock_name = session.get("stk_nm") or session.get("stock_name")
+
+                    # Extract proposal data
+                    action = proposal.get("action", "HOLD")
+                    if action not in ("BUY", "SELL"):
+                        action = None  # Skip HOLD actions
+
+                    if ticker and action:
+                        allocation = await coordinator.on_trade_approved(
+                            session_id=request.session_id,
+                            ticker=ticker,
+                            stock_name=stock_name,
+                            action=action,
+                            entry_price=proposal.get("entry_price", 0),
+                            stop_loss=proposal.get("stop_loss"),
+                            take_profit=proposal.get("take_profit"),
+                            risk_score=int(proposal.get("risk_score", 5) * 10),  # Convert 0-1 to 1-10
+                            quantity_override=proposal.get("quantity"),
+                        )
+
+                        logger.info(
+                            "auto_trading_connected",
+                            session_id=request.session_id,
+                            ticker=ticker,
+                            action=action,
+                            quantity=allocation.quantity,
+                            rationale=allocation.rationale,
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        "auto_trading_connection_failed",
+                        session_id=request.session_id,
+                        error=str(e),
+                    )
+                    # Don't fail the approval, just log the error
+
         elif request.decision == "rejected":
             # Re-analysis requested - session continues running
             session["status"] = "running"

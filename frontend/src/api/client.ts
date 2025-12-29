@@ -921,6 +921,214 @@ class ApiClient {
     });
     return response.data;
   }
+
+  // -------------------------------------------
+  // Auto-Trading Endpoints
+  // -------------------------------------------
+
+  /**
+   * Start the auto-trading system.
+   */
+  async startTrading(riskParams?: Record<string, unknown>): Promise<{
+    status: string;
+    mode: string;
+    message: string;
+  }> {
+    const response = await this.client.post('/trading/start', {
+      risk_params: riskParams,
+    });
+    return response.data;
+  }
+
+  /**
+   * Stop the auto-trading system.
+   */
+  async stopTrading(): Promise<{
+    status: string;
+    mode: string;
+    message: string;
+  }> {
+    const response = await this.client.post('/trading/stop');
+    return response.data;
+  }
+
+  /**
+   * Pause the auto-trading system.
+   */
+  async pauseTrading(reason?: string): Promise<{
+    status: string;
+    mode: string;
+    message: string;
+  }> {
+    const response = await this.client.post('/trading/pause', null, {
+      params: { reason },
+    });
+    return response.data;
+  }
+
+  /**
+   * Resume the auto-trading system.
+   */
+  async resumeTrading(): Promise<{
+    status: string;
+    mode: string;
+    message: string;
+  }> {
+    const response = await this.client.post('/trading/resume');
+    return response.data;
+  }
+
+  /**
+   * Get trading system status.
+   */
+  async getTradingStatus(): Promise<{
+    mode: string;
+    is_active: boolean;
+    started_at: string | null;
+    daily_trades: number;
+    max_daily_trades: number;
+    pending_alerts_count: number;
+  }> {
+    const response = await this.client.get('/trading/status');
+    return response.data;
+  }
+
+  /**
+   * Get portfolio summary.
+   */
+  async getTradingPortfolio(): Promise<{
+    total_equity: number;
+    cash: number;
+    cash_ratio: number;
+    stock_value: number;
+    stock_ratio: number;
+    positions: unknown[];
+    total_unrealized_pnl: number;
+    total_unrealized_pnl_pct: number;
+    daily_trades: number;
+    max_daily_trades: number;
+  }> {
+    const response = await this.client.get('/trading/portfolio');
+    return response.data;
+  }
+
+  /**
+   * Get full trading state.
+   */
+  async getTradingState(): Promise<Record<string, unknown>> {
+    const response = await this.client.get('/trading/state');
+    return response.data;
+  }
+
+  /**
+   * Get pending alerts.
+   */
+  async getTradingAlerts(): Promise<{
+    alerts: unknown[];
+    count: number;
+  }> {
+    const response = await this.client.get('/trading/alerts');
+    return response.data;
+  }
+
+  /**
+   * Handle alert action.
+   */
+  async handleTradingAlertAction(
+    alertId: string,
+    action: string,
+    data?: Record<string, unknown>
+  ): Promise<{
+    status: string;
+    message: string;
+  }> {
+    const response = await this.client.post('/trading/alerts/action', {
+      alert_id: alertId,
+      action,
+      data,
+    });
+    return response.data;
+  }
+
+  /**
+   * Get risk parameters.
+   */
+  async getTradingRiskParams(): Promise<Record<string, unknown>> {
+    const response = await this.client.get('/trading/risk-params');
+    return response.data;
+  }
+
+  /**
+   * Update risk parameters.
+   */
+  async updateTradingRiskParams(params: Record<string, unknown>): Promise<{
+    status: string;
+    risk_params: Record<string, unknown>;
+  }> {
+    const response = await this.client.put('/trading/risk-params', params);
+    return response.data;
+  }
+
+  /**
+   * Get managed positions.
+   */
+  async getTradingPositions(): Promise<{
+    positions: unknown[];
+    count: number;
+  }> {
+    const response = await this.client.get('/trading/positions');
+    return response.data;
+  }
+
+  /**
+   * Close a position.
+   */
+  async closeTradingPosition(ticker: string): Promise<{
+    status: string;
+    ticker: string;
+    message: string;
+  }> {
+    const response = await this.client.delete(`/trading/positions/${ticker}`);
+    return response.data;
+  }
+
+  /**
+   * Update position stop-loss.
+   */
+  async updatePositionStopLoss(
+    ticker: string,
+    stopLoss: number
+  ): Promise<{
+    status: string;
+    ticker: string;
+    stop_loss: number;
+  }> {
+    const response = await this.client.put(
+      `/trading/positions/${ticker}/stop-loss`,
+      null,
+      { params: { stop_loss: stopLoss } }
+    );
+    return response.data;
+  }
+
+  /**
+   * Update position take-profit.
+   */
+  async updatePositionTakeProfit(
+    ticker: string,
+    takeProfit: number
+  ): Promise<{
+    status: string;
+    ticker: string;
+    take_profit: number;
+  }> {
+    const response = await this.client.put(
+      `/trading/positions/${ticker}/take-profit`,
+      null,
+      { params: { take_profit: takeProfit } }
+    );
+    return response.data;
+  }
 }
 
 // -------------------------------------------
@@ -1081,3 +1289,43 @@ export const sendChatMessage = (
   message: string,
   options?: Parameters<typeof apiClient.sendChatMessage>[1]
 ) => apiClient.sendChatMessage(message, options);
+
+// Auto-Trading API
+export const startTrading = (riskParams?: Record<string, unknown>) =>
+  apiClient.startTrading(riskParams);
+
+export const stopTrading = () => apiClient.stopTrading();
+
+export const pauseTrading = (reason?: string) => apiClient.pauseTrading(reason);
+
+export const resumeTrading = () => apiClient.resumeTrading();
+
+export const getTradingStatus = () => apiClient.getTradingStatus();
+
+export const getTradingPortfolio = () => apiClient.getTradingPortfolio();
+
+export const getTradingState = () => apiClient.getTradingState();
+
+export const getTradingAlerts = () => apiClient.getTradingAlerts();
+
+export const handleTradingAlertAction = (
+  alertId: string,
+  action: string,
+  data?: Record<string, unknown>
+) => apiClient.handleTradingAlertAction(alertId, action, data);
+
+export const getTradingRiskParams = () => apiClient.getTradingRiskParams();
+
+export const updateTradingRiskParams = (params: Record<string, unknown>) =>
+  apiClient.updateTradingRiskParams(params);
+
+export const getTradingPositions = () => apiClient.getTradingPositions();
+
+export const closeTradingPosition = (ticker: string) =>
+  apiClient.closeTradingPosition(ticker);
+
+export const updatePositionStopLoss = (ticker: string, stopLoss: number) =>
+  apiClient.updatePositionStopLoss(ticker, stopLoss);
+
+export const updatePositionTakeProfit = (ticker: string, takeProfit: number) =>
+  apiClient.updatePositionTakeProfit(ticker, takeProfit);

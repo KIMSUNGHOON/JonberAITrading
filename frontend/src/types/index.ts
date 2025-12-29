@@ -913,3 +913,127 @@ export interface IndicatorsSummaryResponse {
   key_signals: string[];
   summary: string;
 }
+
+// -------------------------------------------
+// Auto-Trading Types
+// -------------------------------------------
+
+export type TradingMode = 'active' | 'paused' | 'stopped';
+export type StopLossMode = 'user_approval' | 'agent_auto';
+export type PositionStatus = 'pending' | 'partial' | 'filled' | 'closing' | 'closed';
+export type AlertType =
+  | 'stop_loss_triggered'
+  | 'take_profit_triggered'
+  | 'sudden_move_up'
+  | 'sudden_move_down'
+  | 'trading_paused'
+  | 'trading_resumed'
+  | 'order_filled'
+  | 'order_failed'
+  | 'rebalance_suggested'
+  | 'news_alert';
+
+export interface TradingRiskParameters {
+  max_single_position_pct: number;
+  min_cash_ratio: number;
+  max_total_stock_pct: number;
+  sudden_move_threshold_pct: number;
+  max_daily_trades: number;
+  stop_loss_mode: StopLossMode;
+  take_profit_mode: StopLossMode;
+}
+
+export interface TradingAccountInfo {
+  total_equity: number;
+  available_cash: number;
+  total_stock_value: number;
+  cash_ratio: number;
+  stock_ratio: number;
+}
+
+export interface ManagedPosition {
+  ticker: string;
+  stock_name: string;
+  quantity: number;
+  avg_price: number;
+  current_price: number;
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number;
+  stop_loss: number | null;
+  take_profit: number | null;
+  stop_loss_mode: StopLossMode;
+  status: PositionStatus;
+  entry_time: string;
+  last_updated: string;
+  analysis_session_id: string | null;
+  risk_score: number | null;
+}
+
+export interface TradingAlert {
+  id: string;
+  alert_type: AlertType;
+  ticker: string | null;
+  title: string;
+  message: string;
+  data: Record<string, unknown>;
+  action_required: boolean;
+  options: string[];
+  acknowledged: boolean;
+  resolved: boolean;
+  created_at: string;
+  acknowledged_at: string | null;
+}
+
+export interface TradingState {
+  mode: TradingMode;
+  account: TradingAccountInfo;
+  positions: ManagedPosition[];
+  pending_orders: unknown[];
+  daily_trades_count: number;
+  daily_pnl: number;
+  risk_params: TradingRiskParameters;
+  pending_alerts: TradingAlert[];
+  last_updated: string;
+  started_at: string | null;
+  total_unrealized_pnl: number;
+  total_unrealized_pnl_pct: number;
+  can_trade: boolean;
+}
+
+export interface TradingStatusResponse {
+  mode: string;
+  is_active: boolean;
+  started_at: string | null;
+  daily_trades: number;
+  max_daily_trades: number;
+  pending_alerts_count: number;
+}
+
+export interface TradingPortfolioResponse {
+  total_equity: number;
+  cash: number;
+  cash_ratio: number;
+  stock_value: number;
+  stock_ratio: number;
+  positions: ManagedPosition[];
+  total_unrealized_pnl: number;
+  total_unrealized_pnl_pct: number;
+  daily_trades: number;
+  max_daily_trades: number;
+}
+
+export interface TradingAlertActionRequest {
+  alert_id: string;
+  action: string;
+  data?: Record<string, unknown>;
+}
+
+export interface TradingRiskParamsUpdateRequest {
+  max_single_position_pct?: number;
+  min_cash_ratio?: number;
+  max_total_stock_pct?: number;
+  sudden_move_threshold_pct?: number;
+  max_daily_trades?: number;
+  stop_loss_mode?: string;
+  take_profit_mode?: string;
+}
