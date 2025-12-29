@@ -10,13 +10,13 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from backend.services.news import (
+from services.news import (
     NewsService,
     NewsSearchResult,
     QuotaExceededError,
     NewsProviderError,
 )
-from backend.app.dependencies import get_news_service
+from app.dependencies import get_news_service
 
 logger = logging.getLogger(__name__)
 

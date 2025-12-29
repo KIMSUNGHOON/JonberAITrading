@@ -10,7 +10,7 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from backend.services.trading import (
+from services.trading import (
     TradingMode,
     TradingState,
     TradingAlert,
@@ -18,7 +18,7 @@ from backend.services.trading import (
     StopLossMode,
     AllocationPlan,
 )
-from backend.app.dependencies import get_trading_coordinator
+from app.dependencies import get_trading_coordinator
 
 logger = logging.getLogger(__name__)
 
