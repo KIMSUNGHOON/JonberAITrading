@@ -4,18 +4,22 @@
  * Hybrid chat interface for user-agent communication.
  */
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, Bot, User, Loader2 } from 'lucide-react';
 import { useShallow } from 'zustand/shallow';
-import { useStore, selectStatus, selectChat } from '@/store';
+import { useStore, selectChat } from '@/store';
 import { format } from 'date-fns';
+import { ProposalChatMessage } from './ProposalChatMessage';
+import { sendChatMessage } from '@/api/client';
+import type { ChatMessageRole } from '@/types';
 
 export function ChatPanel() {
   const { messages, isTyping } = useStore(useShallow(selectChat));
   const addChatMessage = useStore((state) => state.addChatMessage);
-  const status = useStore(selectStatus);
+  const setIsTyping = useStore((state) => state.setIsTyping);
 
   const [input, setInput] = useState('');
+  const [isSending, setIsSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to bottom on new messages
@@ -23,18 +27,155 @@ export function ChatPanel() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isTyping]);
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim()) return;
+  // Build structured trading context (Phase 13)
+  const buildTradingContext = useCallback(() => {
+    const state = useStore.getState();
 
-    addChatMessage({
-      role: 'user',
-      content: input.trim(),
+    // Find active or most recent analysis
+    let activeAnalysis: {
+      ticker: string;
+      displayName: string;
+      marketType: string;
+      status: string;
+      recommendation?: string;
+      confidence?: number;
+      currentPrice?: number;
+      entryPrice?: number;
+      stopLoss?: number;
+      takeProfit?: number;
+      keySignals?: string[];
+    } | undefined;
+
+    // Check Kiwoom (Korean stock) session
+    const kiwoomSession = state.kiwoom.sessions.find(
+      s => s.sessionId === state.kiwoom.activeSessionId
+    );
+    if (kiwoomSession) {
+      activeAnalysis = {
+        ticker: kiwoomSession.ticker,
+        displayName: kiwoomSession.displayName,
+        marketType: 'kiwoom',
+        status: kiwoomSession.status,
+        recommendation: kiwoomSession.tradeProposal?.action,
+        entryPrice: kiwoomSession.tradeProposal?.entry_price,
+        stopLoss: kiwoomSession.tradeProposal?.stop_loss,
+        takeProfit: kiwoomSession.tradeProposal?.take_profit,
+        keySignals: kiwoomSession.reasoningLog?.slice(-3),
+      };
+    }
+
+    // Check Coin session
+    if (!activeAnalysis && state.coin.activeSessionId) {
+      activeAnalysis = {
+        ticker: state.coin.market,
+        displayName: state.coin.market,
+        marketType: 'coin',
+        status: state.coin.status,
+        recommendation: state.coin.tradeProposal?.action,
+        entryPrice: state.coin.tradeProposal?.entry_price,
+        stopLoss: state.coin.tradeProposal?.stop_loss,
+        takeProfit: state.coin.tradeProposal?.take_profit,
+      };
+    }
+
+    // Check Stock (US) session
+    if (!activeAnalysis && state.stock.activeSessionId) {
+      activeAnalysis = {
+        ticker: state.stock.ticker,
+        displayName: state.stock.ticker,
+        marketType: 'stock',
+        status: state.stock.status,
+        recommendation: state.stock.tradeProposal?.action,
+        entryPrice: state.stock.tradeProposal?.entry_price,
+        stopLoss: state.stock.tradeProposal?.stop_loss,
+        takeProfit: state.stock.tradeProposal?.take_profit,
+      };
+    }
+
+    // Get recent trade decisions from history
+    const recentDecisions: Array<{
+      ticker: string;
+      displayName: string;
+      action: string;
+      tradeAction: string;
+      timestamp: string;
+      quantity?: number;
+      price?: number;
+    }> = [];
+
+    // Check Kiwoom history for approved/rejected decisions
+    state.kiwoom.history.slice(-5).forEach(h => {
+      if (h.status === 'completed' && h.tradeProposal) {
+        recentDecisions.push({
+          ticker: h.ticker,
+          displayName: h.stk_nm || h.ticker,
+          action: 'approved',  // If completed with proposal, it was approved
+          tradeAction: h.tradeProposal.action || 'HOLD',
+          timestamp: new Date(h.timestamp).toISOString(),
+          quantity: h.tradeProposal.quantity,
+          price: h.tradeProposal.entry_price,
+        });
+      }
     });
 
+    return {
+      activeAnalysis,
+      recentDecisions,
+    };
+  }, []);
+
+  // Build chat history for context
+  const buildHistory = useCallback(() => {
+    return messages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({
+        role: m.role,
+        content: m.content,
+      }));
+  }, [messages]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isSending) return;
+
+    const userMessage = input.trim();
     setInput('');
 
-    // TODO: Send to backend for processing
+    // Add user message
+    addChatMessage({
+      role: 'user',
+      content: userMessage,
+    });
+
+    // Send to backend
+    setIsSending(true);
+    setIsTyping(true);
+
+    try {
+      const tradingContext = buildTradingContext();
+      const history = buildHistory();
+
+      // Phase 13: Send structured trading context
+      const response = await sendChatMessage(userMessage, {
+        tradingContext,
+        history,
+      });
+
+      // Add assistant response
+      addChatMessage({
+        role: 'assistant',
+        content: response.message,
+      });
+    } catch (error) {
+      console.error('Chat failed:', error);
+      addChatMessage({
+        role: 'system',
+        content: '응답 생성에 실패했습니다. 다시 시도해 주세요.',
+      });
+    } finally {
+      setIsSending(false);
+      setIsTyping(false);
+    }
   };
 
   return (
@@ -58,9 +199,19 @@ export function ChatPanel() {
             <p>Start a conversation or begin analysis</p>
           </div>
         ) : (
-          messages.map((message) => (
-            <ChatMessage key={message.id} message={message} />
-          ))
+          messages.map((message) => {
+            // Render proposal messages differently
+            if (message.role === 'proposal' && message.metadata?.proposal) {
+              return (
+                <ProposalChatMessage
+                  key={message.id}
+                  proposal={message.metadata.proposal}
+                  timestamp={message.timestamp}
+                />
+              );
+            }
+            return <ChatMessage key={message.id} message={message} />;
+          })
         )}
 
         {/* Typing Indicator */}
@@ -89,19 +240,23 @@ export function ChatPanel() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder={
-              status === 'running'
-                ? 'Analysis in progress...'
-                : 'Ask about analysis or enter a ticker...'
+              isSending
+                ? 'Generating response...'
+                : 'Ask about analysis or trading...'
             }
-            disabled={status === 'running'}
+            disabled={isSending}
             className="input flex-1"
           />
           <button
             type="submit"
-            disabled={!input.trim() || status === 'running'}
+            disabled={!input.trim() || isSending}
             className="btn-primary p-3"
           >
-            <Send className="w-5 h-5" />
+            {isSending ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : (
+              <Send className="w-5 h-5" />
+            )}
           </button>
         </div>
       </form>
@@ -112,7 +267,7 @@ export function ChatPanel() {
 interface ChatMessageProps {
   message: {
     id: string;
-    role: 'user' | 'assistant' | 'system';
+    role: ChatMessageRole;
     content: string;
     timestamp: Date;
   };

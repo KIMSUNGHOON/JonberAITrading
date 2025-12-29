@@ -27,6 +27,24 @@ import type {
   UpbitApiKeyResponse,
   UpbitApiKeyStatus,
   UpbitValidateResponse,
+  // Korean Stock (Kiwoom) Types
+  KRStockListResponse,
+  KRStockTickerResponse,
+  KRStockAnalysisRequest,
+  KRStockAnalysisResponse,
+  KRStockAnalysisStatus,
+  KRStockPosition,
+  KRStockPositionListResponse,
+  KRStockOrder,
+  KRStockOrderListResponse,
+  KRStockOrderRequest,
+  KRStockTradeRecord,
+  KRStockTradeListResponse,
+  KRStockAccountResponse,
+  KiwoomApiKeyStatus,
+  KiwoomApiKeyRequest,
+  KiwoomApiKeyResponse,
+  KiwoomValidateResponse,
 } from '@/types';
 
 // -------------------------------------------
@@ -34,6 +52,59 @@ import type {
 // -------------------------------------------
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
+
+// -------------------------------------------
+// Request Queue for Rate-Limited APIs
+// -------------------------------------------
+
+/**
+ * Simple request queue to prevent overwhelming the Kiwoom API.
+ * Ensures requests are made sequentially with a minimum delay.
+ */
+class RequestQueue {
+  private queue: Array<() => Promise<void>> = [];
+  private isProcessing = false;
+  private minDelay: number;
+
+  constructor(minDelayMs = 800) {
+    this.minDelay = minDelayMs;
+  }
+
+  async enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          const result = await fn();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      this.process();
+    });
+  }
+
+  private async process() {
+    if (this.isProcessing || this.queue.length === 0) return;
+    this.isProcessing = true;
+
+    while (this.queue.length > 0) {
+      const task = this.queue.shift();
+      if (task) {
+        await task();
+        // Wait before next request to respect rate limits
+        if (this.queue.length > 0) {
+          await new Promise((resolve) => setTimeout(resolve, this.minDelay));
+        }
+      }
+    }
+
+    this.isProcessing = false;
+  }
+}
+
+// Singleton queue for Kiwoom API requests (800ms delay = ~1.25 req/sec)
+const kiwoomRequestQueue = new RequestQueue(800);
 
 // -------------------------------------------
 // API Client Class
@@ -498,6 +569,358 @@ class ApiClient {
     const response = await this.client.delete('/settings/upbit');
     return response.data;
   }
+
+  // -------------------------------------------
+  // Korean Stock (Kiwoom) Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get Korean stock list.
+   */
+  async getKRStocks(limit = 100): Promise<KRStockListResponse> {
+    const response = await this.client.get<KRStockListResponse>('/kr_stocks/stocks', {
+      params: { limit },
+    });
+    return response.data;
+  }
+
+  /**
+   * Search Korean stocks by code or name.
+   */
+  async searchKRStocks(query: string, limit = 20): Promise<KRStockListResponse> {
+    const response = await this.client.post<KRStockListResponse>('/kr_stocks/stocks/search', {
+      query,
+      limit,
+    });
+    return response.data;
+  }
+
+  /**
+   * Get current ticker for a Korean stock.
+   * Uses request queue to prevent rate limit errors.
+   */
+  async getKRStockTicker(stk_cd: string): Promise<KRStockTickerResponse> {
+    // Queue the request to prevent overwhelming the Kiwoom API
+    return kiwoomRequestQueue.enqueue(async () => {
+      const response = await this.client.get<KRStockTickerResponse>(`/kr_stocks/ticker/${stk_cd}`);
+      return response.data;
+    });
+  }
+
+  /**
+   * Get candle (OHLCV) data for a Korean stock.
+   * Uses request queue to prevent rate limit errors.
+   */
+  async getKRStockCandles(
+    stk_cd: string,
+    period: string = 'D',
+    count: number = 100
+  ): Promise<{
+    stk_cd: string;
+    period: string;
+    candles: Array<{
+      datetime: string;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+      volume: number;
+    }>;
+  }> {
+    // Queue the request to prevent overwhelming the Kiwoom API
+    return kiwoomRequestQueue.enqueue(async () => {
+      const response = await this.client.get(`/kr_stocks/candles/${stk_cd}`, {
+        params: { period, count },
+      });
+
+      // Transform Kiwoom API field names to standard format
+      // Backend returns: stck_bsop_date, stck_oprc, stck_hgpr, stck_lwpr, stck_clpr, acml_vol
+      // Frontend expects: datetime, open, high, low, close, volume
+      const transformedCandles = response.data.candles.map((candle: {
+        stck_bsop_date: string;
+        stck_oprc: number;
+        stck_hgpr: number;
+        stck_lwpr: number;
+        stck_clpr: number;
+        acml_vol: number;
+      }) => ({
+        // Convert YYYYMMDD to ISO date string
+        datetime: `${candle.stck_bsop_date.slice(0, 4)}-${candle.stck_bsop_date.slice(4, 6)}-${candle.stck_bsop_date.slice(6, 8)}`,
+        open: candle.stck_oprc,
+        high: candle.stck_hgpr,
+        low: candle.stck_lwpr,
+        close: candle.stck_clpr,
+        volume: candle.acml_vol,
+      }));
+
+      return {
+        stk_cd: response.data.stk_cd,
+        period: response.data.period,
+        candles: transformedCandles,
+      };
+    });
+  }
+
+  /**
+   * Get orderbook for a Korean stock.
+   * Uses request queue to prevent rate limit errors.
+   */
+  async getKRStockOrderbook(stk_cd: string): Promise<{
+    stk_cd: string;
+    asks: Array<{ price: number; volume: number }>;
+    bids: Array<{ price: number; volume: number }>;
+    timestamp: string;
+  }> {
+    // Queue the request to prevent overwhelming the Kiwoom API
+    return kiwoomRequestQueue.enqueue(async () => {
+      const response = await this.client.get(`/kr_stocks/orderbook/${stk_cd}`);
+      return response.data;
+    });
+  }
+
+  // -------------------------------------------
+  // Korean Stock Analysis Endpoints
+  // -------------------------------------------
+
+  /**
+   * Start a new Korean stock analysis session.
+   */
+  async startKRStockAnalysis(request: KRStockAnalysisRequest): Promise<KRStockAnalysisResponse> {
+    const response = await this.client.post<KRStockAnalysisResponse>(
+      '/kr_stocks/analysis/start',
+      request
+    );
+    return response.data;
+  }
+
+  /**
+   * Get Korean stock analysis session status.
+   */
+  async getKRStockSessionStatus(sessionId: string): Promise<KRStockAnalysisStatus> {
+    const response = await this.client.get<KRStockAnalysisStatus>(
+      `/kr_stocks/analysis/status/${sessionId}`
+    );
+    return response.data;
+  }
+
+  /**
+   * Cancel a Korean stock analysis session.
+   */
+  async cancelKRStockSession(sessionId: string): Promise<{ message: string }> {
+    const response = await this.client.post(`/kr_stocks/analysis/cancel/${sessionId}`);
+    return response.data;
+  }
+
+  // -------------------------------------------
+  // Korean Stock Trading Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get Kiwoom account information.
+   */
+  async getKRStockAccount(): Promise<KRStockAccountResponse> {
+    const response = await this.client.get<KRStockAccountResponse>('/kr_stocks/accounts');
+    return response.data;
+  }
+
+  /**
+   * Get all Korean stock positions.
+   */
+  async getKRStockPositions(): Promise<KRStockPositionListResponse> {
+    const response = await this.client.get<KRStockPositionListResponse>('/kr_stocks/positions');
+    return response.data;
+  }
+
+  /**
+   * Get a single Korean stock position.
+   */
+  async getKRStockPosition(stk_cd: string): Promise<KRStockPosition> {
+    const response = await this.client.get<KRStockPosition>(`/kr_stocks/positions/${stk_cd}`);
+    return response.data;
+  }
+
+  /**
+   * Close a Korean stock position.
+   */
+  async closeKRStockPosition(stk_cd: string): Promise<KRStockOrder> {
+    const response = await this.client.post<KRStockOrder>(`/kr_stocks/positions/${stk_cd}/close`);
+    return response.data;
+  }
+
+  /**
+   * Get list of Korean stock orders.
+   */
+  async getKRStockOrders(params?: {
+    stk_cd?: string;
+    status?: string;
+    limit?: number;
+  }): Promise<KRStockOrderListResponse> {
+    const response = await this.client.get<KRStockOrderListResponse>('/kr_stocks/orders', {
+      params,
+    });
+    return response.data;
+  }
+
+  /**
+   * Get a single Korean stock order.
+   */
+  async getKRStockOrder(orderId: string): Promise<KRStockOrder> {
+    const response = await this.client.get<KRStockOrder>(`/kr_stocks/orders/${orderId}`);
+    return response.data;
+  }
+
+  /**
+   * Create a new Korean stock order.
+   */
+  async createKRStockOrder(request: KRStockOrderRequest): Promise<KRStockOrder> {
+    const response = await this.client.post<KRStockOrder>('/kr_stocks/orders', request);
+    return response.data;
+  }
+
+  /**
+   * Cancel a Korean stock order.
+   */
+  async cancelKRStockOrder(orderId: string): Promise<KRStockOrder> {
+    const response = await this.client.delete<KRStockOrder>(`/kr_stocks/orders/${orderId}`);
+    return response.data;
+  }
+
+  /**
+   * Get Korean stock trade history.
+   */
+  async getKRStockTrades(params?: {
+    stk_cd?: string;
+    page?: number;
+    limit?: number;
+  }): Promise<KRStockTradeListResponse> {
+    const response = await this.client.get<KRStockTradeListResponse>('/kr_stocks/trades', {
+      params,
+    });
+    return response.data;
+  }
+
+  /**
+   * Get a single Korean stock trade.
+   */
+  async getKRStockTrade(tradeId: string): Promise<KRStockTradeRecord> {
+    const response = await this.client.get<KRStockTradeRecord>(`/kr_stocks/trades/${tradeId}`);
+    return response.data;
+  }
+
+  // -------------------------------------------
+  // Kiwoom Settings Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get Kiwoom API key status.
+   */
+  async getKiwoomApiStatus(): Promise<KiwoomApiKeyStatus> {
+    const response = await this.client.get<KiwoomApiKeyStatus>('/settings/kiwoom');
+    return response.data;
+  }
+
+  /**
+   * Update Kiwoom API keys.
+   */
+  async updateKiwoomApiKeys(request: KiwoomApiKeyRequest): Promise<KiwoomApiKeyResponse> {
+    const response = await this.client.post<KiwoomApiKeyResponse>('/settings/kiwoom', request);
+    return response.data;
+  }
+
+  /**
+   * Validate Kiwoom API keys.
+   */
+  async validateKiwoomApiKeys(): Promise<KiwoomValidateResponse> {
+    const response = await this.client.post<KiwoomValidateResponse>('/settings/kiwoom/validate');
+    return response.data;
+  }
+
+  /**
+   * Clear Kiwoom API keys.
+   */
+  async clearKiwoomApiKeys(): Promise<{ message: string }> {
+    const response = await this.client.delete('/settings/kiwoom');
+    return response.data;
+  }
+
+  // -------------------------------------------
+  // Translation Endpoints
+  // -------------------------------------------
+
+  /**
+   * Translate text between Korean and English.
+   */
+  async translateText(
+    text: string,
+    targetLanguage: 'en' | 'ko' = 'en'
+  ): Promise<{
+    original: string;
+    translated: string;
+    target_language: string;
+  }> {
+    const response = await this.client.post('/analysis/translate', {
+      text,
+      target_language: targetLanguage,
+    });
+    return response.data;
+  }
+
+  // -------------------------------------------
+  // Chat Endpoints
+  // -------------------------------------------
+
+  /**
+   * Send a message to the Trading Assistant.
+   * Phase 13: Now supports structured trading context.
+   */
+  async sendChatMessage(
+    message: string,
+    options?: {
+      context?: string;  // Legacy simple context
+      tradingContext?: {  // Phase 13 structured context
+        activeAnalysis?: {
+          ticker: string;
+          displayName: string;
+          marketType: string;
+          status: string;
+          recommendation?: string;
+          confidence?: number;
+          currentPrice?: number;
+          entryPrice?: number;
+          stopLoss?: number;
+          takeProfit?: number;
+          keySignals?: string[];
+        };
+        recentDecisions?: Array<{
+          ticker: string;
+          displayName: string;
+          action: string;
+          tradeAction: string;
+          timestamp: string;
+          quantity?: number;
+          price?: number;
+          rationale?: string;
+        }>;
+        positions?: Array<{
+          ticker: string;
+          displayName?: string;
+          quantity: number;
+        }>;
+      };
+      history?: Array<{ role: string; content: string }>;
+    }
+  ): Promise<{
+    message: string;
+    role: string;
+  }> {
+    const response = await this.client.post('/chat/', {
+      message,
+      context: options?.context,
+      tradingContext: options?.tradingContext,
+      history: options?.history,
+    });
+    return response.data;
+  }
 }
 
 // -------------------------------------------
@@ -593,3 +1016,68 @@ export const getCoinTrades = (params?: { market?: string; page?: number; limit?:
   apiClient.getCoinTrades(params);
 
 export const getCoinTrade = (tradeId: string) => apiClient.getCoinTrade(tradeId);
+
+// Korean Stock (Kiwoom) API
+export const getKRStocks = (limit?: number) => apiClient.getKRStocks(limit);
+
+export const searchKRStocks = (query: string, limit?: number) =>
+  apiClient.searchKRStocks(query, limit);
+
+export const getKRStockTicker = (stk_cd: string) => apiClient.getKRStockTicker(stk_cd);
+
+export const getKRStockCandles = (stk_cd: string, period?: string, count?: number) =>
+  apiClient.getKRStockCandles(stk_cd, period, count);
+
+export const getKRStockOrderbook = (stk_cd: string) => apiClient.getKRStockOrderbook(stk_cd);
+
+export const startKRStockAnalysis = (request: KRStockAnalysisRequest) =>
+  apiClient.startKRStockAnalysis(request);
+
+export const getKRStockSessionStatus = (sessionId: string) =>
+  apiClient.getKRStockSessionStatus(sessionId);
+
+export const cancelKRStockSession = (sessionId: string) =>
+  apiClient.cancelKRStockSession(sessionId);
+
+export const getKRStockAccount = () => apiClient.getKRStockAccount();
+
+export const getKRStockPositions = () => apiClient.getKRStockPositions();
+
+export const getKRStockPosition = (stk_cd: string) => apiClient.getKRStockPosition(stk_cd);
+
+export const closeKRStockPosition = (stk_cd: string) => apiClient.closeKRStockPosition(stk_cd);
+
+export const getKRStockOrders = (params?: { stk_cd?: string; status?: string; limit?: number }) =>
+  apiClient.getKRStockOrders(params);
+
+export const getKRStockOrder = (orderId: string) => apiClient.getKRStockOrder(orderId);
+
+export const createKRStockOrder = (request: KRStockOrderRequest) =>
+  apiClient.createKRStockOrder(request);
+
+export const cancelKRStockOrder = (orderId: string) => apiClient.cancelKRStockOrder(orderId);
+
+export const getKRStockTrades = (params?: { stk_cd?: string; page?: number; limit?: number }) =>
+  apiClient.getKRStockTrades(params);
+
+export const getKRStockTrade = (tradeId: string) => apiClient.getKRStockTrade(tradeId);
+
+// Kiwoom Settings API
+export const getKiwoomApiStatus = () => apiClient.getKiwoomApiStatus();
+
+export const updateKiwoomApiKeys = (request: KiwoomApiKeyRequest) =>
+  apiClient.updateKiwoomApiKeys(request);
+
+export const validateKiwoomApiKeys = () => apiClient.validateKiwoomApiKeys();
+
+export const clearKiwoomApiKeys = () => apiClient.clearKiwoomApiKeys();
+
+// Translation API
+export const translateText = (text: string, targetLanguage: 'en' | 'ko' = 'en') =>
+  apiClient.translateText(text, targetLanguage);
+
+// Chat API
+export const sendChatMessage = (
+  message: string,
+  options?: Parameters<typeof apiClient.sendChatMessage>[1]
+) => apiClient.sendChatMessage(message, options);
