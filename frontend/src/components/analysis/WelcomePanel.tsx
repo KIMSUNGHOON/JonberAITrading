@@ -91,7 +91,9 @@ export function WelcomePanel() {
               <span>
                 {activeMarket === 'coin'
                   ? 'Enter a coin ticker in the sidebar (e.g., BTC, ETH) or click a coin below'
-                  : 'Enter a stock ticker in the sidebar (e.g., AAPL, TSLA, NVDA)'}
+                  : activeMarket === 'kiwoom'
+                    ? '종목 검색창에서 종목명이나 종목코드를 입력하세요 (예: 삼성전자, 005930)'
+                    : 'Enter a stock ticker in the sidebar (e.g., AAPL, TSLA, NVDA)'}
               </span>
             </li>
             <li className="flex items-start gap-2">
@@ -152,16 +154,19 @@ function CoinWidget({ market, name }: CoinWidgetProps) {
         activeCoinWebSocket.disconnect();
       }
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      activeCoinWebSocket = createStoreWebSocket(response.session_id, {
-        addReasoningEntry: addCoinReasoning,
-        setStatus: setCoinStatus,
-        setCurrentStage: setCoinStage,
-        setTradeProposal: setCoinProposal as any,
-        setAwaitingApproval: setCoinAwaitingApproval,
-        setActivePosition: setCoinPosition,
-        setError: setCoinError,
-      });
+      activeCoinWebSocket = createStoreWebSocket(
+        response.session_id,
+        {
+          addReasoningEntry: addCoinReasoning,
+          setStatus: setCoinStatus,
+          setCurrentStage: setCoinStage,
+          setTradeProposal: setCoinProposal,
+          setAwaitingApproval: setCoinAwaitingApproval,
+          setActivePosition: setCoinPosition,
+          setError: setCoinError,
+        },
+        'coin' // Market type for correct proposal format (₩ currency)
+      );
 
       activeCoinWebSocket.connect();
     } catch (err) {
@@ -201,10 +206,13 @@ function CoinWidget({ market, name }: CoinWidgetProps) {
         ? TrendingDown
         : Minus;
 
+  // Only show skeleton on initial load (when no data exists yet)
+  const showSkeleton = !data && (isLoading || error);
+
   return (
     <button
       onClick={handleClick}
-      disabled={isStarting || isLoading}
+      disabled={isStarting}
       className="bg-surface-light hover:bg-surface border border-border hover:border-blue-500/50 rounded-xl p-4 text-left transition-all group disabled:opacity-60"
     >
       <div className="flex items-center gap-2 mb-2">
@@ -215,12 +223,12 @@ function CoinWidget({ market, name }: CoinWidgetProps) {
         </div>
       </div>
 
-      {isLoading || error || !data ? (
+      {showSkeleton ? (
         <div className="animate-pulse">
           <div className="h-5 bg-surface rounded w-20 mb-1" />
           <div className="h-4 bg-surface rounded w-14" />
         </div>
-      ) : (
+      ) : data ? (
         <>
           <div className="text-lg font-semibold">
             ₩{formatPrice(data.tradePrice)}
@@ -230,6 +238,8 @@ function CoinWidget({ market, name }: CoinWidgetProps) {
             <span className="text-sm">{formatPercent(data.changeRate)}</span>
           </div>
         </>
+      ) : (
+        <div className="text-sm text-gray-500">데이터 로딩 중...</div>
       )}
 
       <div className="mt-2 text-xs text-blue-400 opacity-0 group-hover:opacity-100 transition-opacity">

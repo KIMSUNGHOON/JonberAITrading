@@ -22,16 +22,16 @@ import {
 import { useStore } from '@/store';
 import type { SessionStatus } from '@/types';
 
-// Workflow stages for Stock analysis (matching backend AnalysisStage enum)
+// Workflow stages for Stock analysis (matching backend KRStockAnalysisStage enum)
 const STOCK_WORKFLOW_STAGES = [
-  { id: 'decomposition', label: 'Task Decomposition', icon: GitBranch, description: 'Breaking down analysis tasks' },
-  { id: 'technical', label: 'Technical Analysis', icon: LineChart, description: 'Price patterns & indicators' },
-  { id: 'fundamental', label: 'Fundamental Analysis', icon: Building2, description: 'Company financials & metrics' },
-  { id: 'sentiment', label: 'Sentiment Analysis', icon: MessageSquare, description: 'Market sentiment & news' },
-  { id: 'risk', label: 'Risk Assessment', icon: Shield, description: 'Risk evaluation & position sizing' },
-  { id: 'synthesis', label: 'Synthesis', icon: Brain, description: 'Combining all analyses' },
-  { id: 'approval', label: 'Human Approval', icon: UserCheck, description: 'Awaiting your decision' },
-  { id: 'execution', label: 'Execution', icon: Rocket, description: 'Trade execution' },
+  { id: 'data_collection', label: '데이터 수집', icon: GitBranch, description: 'Collecting market data' },
+  { id: 'technical', label: '기술적 분석', icon: LineChart, description: 'Price patterns & indicators' },
+  { id: 'fundamental', label: '펀더멘털 분석', icon: Building2, description: 'Company financials & metrics' },
+  { id: 'sentiment', label: '감성 분석', icon: MessageSquare, description: 'Market sentiment & news' },
+  { id: 'risk', label: '리스크 평가', icon: Shield, description: 'Risk evaluation & position sizing' },
+  { id: 'synthesis', label: '종합 분석', icon: Brain, description: 'Combining all analyses' },
+  { id: 'approval', label: '승인 대기', icon: UserCheck, description: 'Awaiting your decision' },
+  { id: 'execution', label: '체결', icon: Rocket, description: 'Trade execution' },
 ] as const;
 
 // Workflow stages for Coin analysis (matching backend CoinAnalysisStage enum)
@@ -66,6 +66,7 @@ interface WorkflowProgressProps {
 
 export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgressProps) {
   const reset = useStore((state) => state.reset);
+  const setCurrentView = useStore((state) => state.setCurrentView);
 
   // Get appropriate stages based on ticker type
   const WORKFLOW_STAGES = useMemo(() => getWorkflowStages(ticker), [ticker]);
@@ -73,6 +74,7 @@ export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgr
   // Handle cancel/return to home
   const handleCancel = () => {
     reset();
+    setCurrentView('dashboard');
   };
 
   // Calculate stage statuses
