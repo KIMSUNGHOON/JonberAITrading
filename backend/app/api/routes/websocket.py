@@ -11,13 +11,15 @@ Provides real-time streaming of:
 
 import asyncio
 import json
-from typing import Optional
+from datetime import datetime
+from typing import Optional, Any
 
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.api.routes.analysis import get_active_sessions
 from app.api.routes.coin import get_coin_sessions
+from app.api.routes.kr_stocks import get_kr_stock_sessions
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -117,6 +119,296 @@ def safe_int(val, default=0):
 
 
 # -------------------------------------------
+# Analysis Results Extraction Helpers
+# -------------------------------------------
+
+
+def _extract_analysis_results(state: dict) -> dict | None:
+    """
+    Extract detailed analysis results from session state.
+
+    Returns structured analysis results matching DetailedAnalysisResults frontend type.
+    Handles both KR Stock (KRStockAnalysisResult) and other analysis formats.
+    """
+    results = {}
+
+    # Technical Analysis
+    tech = state.get("technical_analysis")
+    if tech:
+        # KR Stock stores indicators in 'signals' dict
+        tech_signals = tech.get("signals", {})
+
+        results["technical"] = {
+            "summary": tech.get("summary", ""),
+            "recommendation": _normalize_action(tech.get("signal", "HOLD")),
+            "confidence": safe_float(tech.get("confidence", 0.5)) * 100,  # Convert to 0-100
+            "indicators": {
+                "rsi": safe_float(tech_signals.get("rsi") or tech.get("rsi")),
+                "macd": _extract_macd_from_signals(tech_signals) or _extract_macd(tech),
+                "sma50": safe_float(tech_signals.get("sma_20") or tech.get("sma_50")),
+                "sma200": safe_float(tech_signals.get("sma_60") or tech.get("sma_200")),
+                "bollingerBands": _extract_bollinger_from_signals(tech_signals) or _extract_bollinger(tech),
+                "stochastic_k": safe_float(tech_signals.get("stochastic_k")),
+                "atr": safe_float(tech_signals.get("atr")),
+                "volume_ratio": safe_float(tech_signals.get("volume_ratio")),
+            },
+            "signals": tech.get("key_factors", [])[:5],
+            "trend": tech_signals.get("trend", "neutral"),
+            "cross": tech_signals.get("cross"),
+        }
+
+    # Fundamental Analysis
+    fund = state.get("fundamental_analysis")
+    if fund:
+        # KR Stock stores metrics in 'signals' dict
+        fund_signals = fund.get("signals", {})
+
+        results["fundamental"] = {
+            "summary": fund.get("summary", ""),
+            "recommendation": _normalize_action(fund.get("signal", "HOLD")),
+            "confidence": safe_float(fund.get("confidence", 0.5)) * 100,
+            "metrics": {
+                "per": safe_float(fund_signals.get("per") or fund.get("per")),
+                "pbr": safe_float(fund_signals.get("pbr") or fund.get("pbr")),
+                "roe": safe_float(fund_signals.get("roe") or fund.get("roe")),
+                "eps": safe_float(fund_signals.get("eps") or fund.get("eps")),
+                "debtRatio": safe_float(fund.get("debt_ratio")),
+                "revenueGrowth": safe_float(fund.get("revenue_growth")),
+                "operatingMargin": safe_float(fund.get("operating_margin")),
+            },
+            "highlights": fund.get("key_factors", [])[:5],
+            "financialHealth": _get_financial_health(fund_signals),
+        }
+
+    # Sentiment Analysis
+    sent = state.get("sentiment_analysis")
+    if sent:
+        # KR Stock stores sentiment data in 'signals' dict
+        sent_signals = sent.get("signals", {})
+
+        results["sentiment"] = {
+            "summary": sent.get("summary", ""),
+            "recommendation": _normalize_action(sent.get("signal", "HOLD")),
+            "confidence": safe_float(sent.get("confidence", 0.5)) * 100,
+            "sentiment": _normalize_sentiment(sent_signals.get("news_sentiment") or sent.get("sentiment", "neutral")),
+            "sentimentScore": safe_float(sent.get("sentiment_score", 0)),
+            "newsCount": safe_int(sent.get("news_count", 0)),
+            "recentNews": sent.get("recent_news", [])[:5],
+            "socialMentions": safe_int(sent.get("social_mentions")),
+            "analystRatings": sent.get("analyst_ratings"),
+        }
+
+    # Risk Assessment
+    risk = state.get("risk_assessment")
+    if risk:
+        # KR Stock stores risk data in 'signals' dict
+        risk_signals = risk.get("signals", {})
+        risk_score = safe_float(risk_signals.get("risk_score", risk.get("risk_score", 0.5)))
+
+        results["risk"] = {
+            "summary": risk.get("summary", ""),
+            "riskLevel": _get_risk_level(risk_score),
+            "confidence": safe_float(risk.get("confidence", 0.5)) * 100,
+            "riskScore": risk_score * 100,  # Convert to 0-100
+            "factors": _format_risk_factors(risk.get("key_factors", [])),
+            "volatility": None,  # Not available in KR Stock analysis
+            "suggestedStopLoss": safe_float(risk_signals.get("suggested_stop_loss") or risk.get("stop_loss")),
+            "suggestedTakeProfit": safe_float(risk_signals.get("suggested_take_profit") or risk.get("take_profit")),
+            "maxPositionSize": safe_float(risk_signals.get("max_position_pct")),
+        }
+
+    return results if results else None
+
+
+def _get_financial_health(fund_signals: dict) -> str:
+    """Determine financial health based on fundamental metrics."""
+    per = safe_float(fund_signals.get("per"))
+    pbr = safe_float(fund_signals.get("pbr"))
+
+    # Simple heuristic based on valuation metrics
+    if per is None and pbr is None:
+        return "unknown"
+
+    score = 0
+    if per is not None:
+        if 5 < per < 15:
+            score += 1
+        elif per > 30 or per < 0:
+            score -= 1
+    if pbr is not None:
+        if 0.5 < pbr < 2:
+            score += 1
+        elif pbr > 5 or pbr < 0:
+            score -= 1
+
+    if score >= 1:
+        return "strong"
+    elif score <= -1:
+        return "weak"
+    return "moderate"
+
+
+def _normalize_sentiment(sentiment: str | None) -> str:
+    """Normalize sentiment to positive/neutral/negative."""
+    if sentiment is None:
+        return "neutral"
+    s = str(sentiment).lower()
+    if s in ("positive", "bullish", "긍정"):
+        return "positive"
+    if s in ("negative", "bearish", "부정"):
+        return "negative"
+    return "neutral"
+
+
+def _format_risk_factors(factors: list) -> list[dict]:
+    """Convert simple string factors to structured format."""
+    result = []
+    for i, factor in enumerate(factors[:5]):
+        if isinstance(factor, dict):
+            result.append(factor)
+        else:
+            # Convert string to structured format
+            factor_str = str(factor)
+            impact = "neutral"
+            if any(kw in factor_str.lower() for kw in ["위험", "risk", "하락", "부정"]):
+                impact = "negative"
+            elif any(kw in factor_str.lower() for kw in ["기회", "opportunity", "상승", "긍정"]):
+                impact = "positive"
+
+            result.append({
+                "name": f"Factor {i+1}",
+                "impact": impact,
+                "weight": 0.5,
+                "description": factor_str,
+            })
+    return result
+
+
+def _get_risk_level(risk_score: float | None) -> str:
+    """Convert risk score to risk level string."""
+    if risk_score is None:
+        return "medium"
+    score = safe_float(risk_score, 0.5)
+    if score < 0.3:
+        return "low"
+    if score > 0.7:
+        return "high"
+    return "medium"
+
+
+def _extract_macd_from_signals(signals: dict) -> dict | None:
+    """Extract MACD data from KR Stock signals dict."""
+    histogram = signals.get("macd_histogram")
+    if histogram is None:
+        return None
+    return {
+        "value": None,  # KR Stock doesn't store MACD line separately
+        "signal": None,
+        "histogram": safe_float(histogram),
+    }
+
+
+def _extract_bollinger_from_signals(signals: dict) -> dict | None:
+    """Extract Bollinger Bands from KR Stock signals dict."""
+    upper = signals.get("bollinger_upper")
+    lower = signals.get("bollinger_lower")
+    if upper is None and lower is None:
+        return None
+    return {
+        "upper": safe_float(upper),
+        "middle": None,
+        "lower": safe_float(lower),
+    }
+
+
+def _normalize_action(signal: Any) -> str:
+    """Normalize signal/action to BUY/SELL/HOLD."""
+    if signal is None:
+        return "HOLD"
+    signal_str = str(signal).upper()
+    if signal_str in ("BUY", "STRONG_BUY", "BULLISH"):
+        return "BUY"
+    if signal_str in ("SELL", "STRONG_SELL", "BEARISH"):
+        return "SELL"
+    return "HOLD"
+
+
+def _extract_macd(tech: dict) -> dict | None:
+    """Extract MACD data from technical analysis."""
+    if not tech.get("macd"):
+        return None
+    macd = tech["macd"]
+    if isinstance(macd, dict):
+        return {
+            "value": safe_float(macd.get("value", macd.get("macd"))),
+            "signal": safe_float(macd.get("signal")),
+            "histogram": safe_float(macd.get("histogram")),
+        }
+    return None
+
+
+def _extract_bollinger(tech: dict) -> dict | None:
+    """Extract Bollinger Bands data from technical analysis."""
+    if not tech.get("bollinger_bands") and not tech.get("bb_upper"):
+        return None
+    bb = tech.get("bollinger_bands", {})
+    if isinstance(bb, dict):
+        return {
+            "upper": safe_float(bb.get("upper", tech.get("bb_upper"))),
+            "middle": safe_float(bb.get("middle", tech.get("bb_middle"))),
+            "lower": safe_float(bb.get("lower", tech.get("bb_lower"))),
+        }
+    return {
+        "upper": safe_float(tech.get("bb_upper")),
+        "middle": safe_float(tech.get("bb_middle")),
+        "lower": safe_float(tech.get("bb_lower")),
+    }
+
+
+def _serialize_proposal(proposal: dict) -> dict:
+    """Serialize trade proposal for WebSocket transmission."""
+    action = proposal.get("action", "HOLD")
+    if hasattr(action, "value"):
+        action = action.value
+
+    return {
+        "id": str(proposal.get("id", "")),
+        "ticker": proposal.get("ticker") or proposal.get("market") or proposal.get("stk_cd", ""),
+        "action": str(action),
+        "quantity": safe_int(proposal.get("quantity"), 0),
+        "entry_price": safe_float(proposal.get("entry_price")),
+        "stop_loss": safe_float(proposal.get("stop_loss")),
+        "take_profit": safe_float(proposal.get("take_profit")),
+        "risk_score": safe_float(proposal.get("risk_score"), 0.5),
+        "rationale": str(proposal.get("rationale", "") or "")[:1000],
+        "bull_case": str(proposal.get("bull_case", "") or "")[:500],
+        "bear_case": str(proposal.get("bear_case", "") or "")[:500],
+    }
+
+
+def _create_reasoning_summary(reasoning_log: list) -> str:
+    """Create a summary from reasoning log entries."""
+    if not reasoning_log:
+        return ""
+
+    # Filter for synthesis/final entries or take last few entries
+    summary_entries = []
+    for entry in reversed(reasoning_log):
+        entry_str = str(entry)
+        # Prioritize synthesis and final decision entries
+        if any(kw in entry_str.lower() for kw in ["synthesis", "결론", "종합", "final", "decision", "결정"]):
+            summary_entries.insert(0, entry_str)
+            if len(summary_entries) >= 3:
+                break
+
+    # If no synthesis entries found, take last 3 entries
+    if not summary_entries:
+        summary_entries = [str(e) for e in reasoning_log[-3:]]
+
+    return "\n".join(summary_entries)[:2000]
+
+
+# -------------------------------------------
 # WebSocket Endpoints
 # -------------------------------------------
 
@@ -138,10 +430,6 @@ async def websocket_session(websocket: WebSocket, session_id: str):
     """
     await manager.connect(session_id, websocket)
 
-    # Get both stock and coin sessions
-    stock_sessions = get_active_sessions()
-    coin_sessions = get_coin_sessions()
-
     # Track what we've sent to avoid duplicates
     last_log_index = 0
     last_status: Optional[str] = None
@@ -155,8 +443,16 @@ async def websocket_session(websocket: WebSocket, session_id: str):
         )
 
         while True:
-            # Check both stock and coin sessions
-            session = stock_sessions.get(session_id) or coin_sessions.get(session_id)
+            # Check all session types: US stocks, coins, and Korean stocks (Kiwoom)
+            stock_sessions = get_active_sessions()
+            coin_sessions = get_coin_sessions()
+            kr_stock_sessions = get_kr_stock_sessions()
+
+            session = (
+                stock_sessions.get(session_id) or
+                coin_sessions.get(session_id) or
+                kr_stock_sessions.get(session_id)
+            )
 
             if session:
                 state = session["state"]
@@ -170,6 +466,7 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                         await websocket.send_json({
                             "type": "reasoning",
                             "data": entry,
+                            "session_id": session_id,
                         })
                     logger.debug(
                         "websocket_reasoning_sent",
@@ -189,6 +486,7 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                 if current_status != last_status or stage != last_stage:
                     await websocket.send_json({
                         "type": "status",
+                        "session_id": session_id,
                         "data": {
                             "status": current_status,
                             "stage": stage,
@@ -218,6 +516,7 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     await websocket.send_json({
                         "type": "proposal",
                         "data": {
+                        "session_id": session_id,
                             "id": str(proposal.get("id", "")),
                             "ticker": str(ticker_or_market),
                             "action": str(action),
@@ -254,6 +553,7 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     await websocket.send_json({
                         "type": "position",
                         "data": {
+                        "session_id": session_id,
                             "ticker": str(position_ticker),
                             "quantity": quantity,
                             "entry_price": entry_price,
@@ -265,12 +565,35 @@ async def websocket_session(websocket: WebSocket, session_id: str):
 
                 # Check for completion
                 if current_status in ("completed", "cancelled", "error"):
+                    # Build complete message with detailed analysis results
+                    complete_data = {
+                        "status": current_status,
+                        "error": session.get("error"),
+                        "completed_at": datetime.utcnow().isoformat(),
+                    }
+
+                    # Include analysis results if completed successfully
+                    if current_status == "completed":
+                        # Extract analysis results from state
+                        analysis_results = _extract_analysis_results(state)
+                        if analysis_results:
+                            complete_data["analysis_results"] = analysis_results
+
+                        # Include trade proposal
+                        proposal = state.get("trade_proposal")
+                        if proposal:
+                            complete_data["trade_proposal"] = _serialize_proposal(proposal)
+
+                        # Include reasoning summary (last few entries)
+                        reasoning_log = state.get("reasoning_log", [])
+                        if reasoning_log:
+                            # Create a summary from the last synthesis/final entries
+                            complete_data["reasoning_summary"] = _create_reasoning_summary(reasoning_log)
+
                     await websocket.send_json({
                         "type": "complete",
-                        "data": {
-                            "status": current_status,
-                            "error": session.get("error"),
-                        },
+                        "session_id": session_id,
+                        "data": complete_data,
                     })
                     # Keep connection open for a bit, then close
                     await asyncio.sleep(2)
@@ -290,6 +613,7 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                         await websocket.send_json({
                             "type": "status",
                             "data": {
+                            "session_id": session_id,
                                 "status": session["status"],
                                 "stage": str(session["state"].get("current_stage", "")),
                                 "awaiting_approval": session["state"].get("awaiting_approval", False),
@@ -340,9 +664,10 @@ async def websocket_broadcast(websocket: WebSocket):
                 if data == "ping":
                     await websocket.send_text("pong")
                 elif data == "sessions":
-                    # Send current sessions summary (both stock and coin)
+                    # Send current sessions summary (stock, coin, and kr_stock)
                     stock_sessions = get_active_sessions()
                     coin_sessions_dict = get_coin_sessions()
+                    kr_stock_sessions_dict = get_kr_stock_sessions()
 
                     all_sessions = []
                     for sid, s in list(stock_sessions.items())[:5]:
@@ -359,12 +684,19 @@ async def websocket_broadcast(websocket: WebSocket):
                             "status": s["status"],
                             "type": "coin",
                         })
+                    for sid, s in list(kr_stock_sessions_dict.items())[:5]:
+                        all_sessions.append({
+                            "id": sid,
+                            "ticker": s.get("stk_cd", ""),
+                            "status": s["status"],
+                            "type": "kiwoom",
+                        })
 
                     await websocket.send_json({
                         "type": "sessions",
                         "data": {
-                            "total": len(stock_sessions) + len(coin_sessions_dict),
-                            "sessions": all_sessions[:10],
+                            "total": len(stock_sessions) + len(coin_sessions_dict) + len(kr_stock_sessions_dict),
+                            "sessions": all_sessions[:15],
                         },
                     })
 

@@ -19,6 +19,201 @@ export interface AnalysisSummary {
   key_factors: string[];
 }
 
+// -------------------------------------------
+// Detailed Analysis Result Types (Phase 9)
+// -------------------------------------------
+
+/**
+ * Technical Analysis Result with indicators
+ */
+export interface TechnicalAnalysisResult {
+  summary: string;
+  recommendation: TradeAction;
+  confidence: number;  // 0-100
+  indicators: {
+    rsi: number | null;
+    macd: {
+      value: number;
+      signal: number;
+      histogram: number;
+    } | null;
+    sma50: number | null;
+    sma200: number | null;
+    bollingerBands: {
+      upper: number;
+      middle: number;
+      lower: number;
+    } | null;
+  };
+  signals: string[];  // ["골든크로스", "RSI 과매수"]
+  priceAction: {
+    currentPrice: number;
+    change24h: number;
+    changePercent24h: number;
+    high52w: number | null;
+    low52w: number | null;
+  } | null;
+}
+
+/**
+ * Fundamental Analysis Result with financial metrics
+ */
+export interface FundamentalAnalysisResult {
+  summary: string;
+  recommendation: TradeAction;
+  confidence: number;
+  metrics: {
+    per: number | null;        // Price-to-Earnings Ratio
+    pbr: number | null;        // Price-to-Book Ratio
+    roe: number | null;        // Return on Equity
+    eps: number | null;        // Earnings Per Share
+    debtRatio: number | null;  // 부채비율
+    revenueGrowth: number | null;  // 매출 성장률
+    operatingMargin: number | null;  // 영업이익률
+  };
+  highlights: string[];  // 주요 포인트
+  financialHealth: 'strong' | 'moderate' | 'weak' | 'unknown';
+}
+
+/**
+ * Sentiment Analysis Result with news data
+ */
+export interface SentimentAnalysisResult {
+  summary: string;
+  recommendation: TradeAction;
+  confidence: number;
+  sentiment: 'positive' | 'neutral' | 'negative';
+  sentimentScore: number;  // -100 ~ 100
+  newsCount: number;
+  recentNews: {
+    title: string;
+    source: string;
+    sentiment: 'positive' | 'neutral' | 'negative';
+    publishedAt: string;
+  }[];
+  socialMentions: number | null;
+  analystRatings: {
+    buy: number;
+    hold: number;
+    sell: number;
+  } | null;
+}
+
+/**
+ * Risk Assessment Result
+ */
+export interface RiskAssessmentResult {
+  summary: string;
+  riskLevel: 'low' | 'medium' | 'high' | 'very_high';
+  confidence: number;
+  riskScore: number;  // 0-100 (higher = riskier)
+  factors: {
+    name: string;
+    impact: 'positive' | 'negative' | 'neutral';
+    weight: number;  // 0-1
+    description: string;
+  }[];
+  volatility: {
+    daily: number | null;
+    weekly: number | null;
+    monthly: number | null;
+  } | null;
+  suggestedStopLoss: number | null;
+  suggestedTakeProfit: number | null;
+  maxPositionSize: number | null;  // % of portfolio
+}
+
+/**
+ * Combined detailed analysis results
+ */
+export interface DetailedAnalysisResults {
+  technical: TechnicalAnalysisResult | null;
+  fundamental: FundamentalAnalysisResult | null;
+  sentiment: SentimentAnalysisResult | null;
+  risk: RiskAssessmentResult | null;
+}
+
+// -------------------------------------------
+// Phase 13: Trading Context Types
+// -------------------------------------------
+
+/**
+ * Active analysis context for chat
+ */
+export interface ActiveAnalysisContext {
+  ticker: string;
+  displayName: string;
+  marketType: MarketType;
+  status: SessionStatus;
+  recommendation?: TradeAction;
+  confidence?: number;
+  currentPrice?: number;
+  entryPrice?: number;
+  stopLoss?: number;
+  takeProfit?: number;
+  keySignals?: string[];
+}
+
+/**
+ * Trade decision record for chat context
+ */
+export interface TradeDecisionRecord {
+  ticker: string;
+  displayName: string;
+  action: 'approved' | 'rejected';
+  tradeAction: TradeAction;
+  timestamp: string;
+  quantity?: number;
+  price?: number;
+  rationale?: string;
+}
+
+/**
+ * Structured trading context for enhanced chat
+ */
+export interface TradingContext {
+  activeAnalysis?: ActiveAnalysisContext;
+  recentDecisions: TradeDecisionRecord[];
+  positions?: Array<{
+    ticker: string;
+    displayName?: string;
+    quantity: number;
+    entryPrice?: number;
+    currentPrice?: number;
+  }>;
+}
+
+// -------------------------------------------
+
+/**
+ * Extended history item with full analysis data
+ */
+export interface AnalysisHistoryItem {
+  sessionId: string;
+  ticker: string;
+  displayName: string;
+  marketType: MarketType;
+  timestamp: Date;
+  completedAt: Date | null;
+  status: SessionStatus;
+
+  // Detailed analysis results
+  analysisResults: DetailedAnalysisResults | null;
+
+  // Legacy analysis summaries (backward compatibility)
+  analyses: AnalysisSummary[];
+
+  // Trade proposal
+  tradeProposal: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+
+  // Reasoning summary (condensed from full log)
+  reasoningSummary: string | null;
+
+  // Metadata
+  duration: number | null;  // Analysis duration in ms
+  dataVersion: string;  // Schema version for migration
+}
+
 export interface TradeProposal {
   id: string;
   ticker: string;
@@ -108,7 +303,10 @@ export interface WSCompleteMessage {
 // Chat Types (for hybrid UI)
 // -------------------------------------------
 
-export type ChatMessageRole = 'user' | 'assistant' | 'system';
+export type ChatMessageRole = 'user' | 'assistant' | 'system' | 'proposal';
+
+// Union type for all proposal types
+export type AnyTradeProposal = TradeProposal | CoinTradeProposal | KRStockTradeProposal;
 
 export interface ChatMessage {
   id: string;
@@ -119,6 +317,7 @@ export interface ChatMessage {
     stage?: string;
     agent?: string;
     isThinking?: boolean;
+    proposal?: AnyTradeProposal;
   };
 }
 
@@ -393,4 +592,324 @@ export interface CoinTicker {
   trade_volume: number;
   acc_trade_price_24h: number;
   timestamp: string;
+}
+
+// -------------------------------------------
+// Korean Stock (Kiwoom) Types
+// -------------------------------------------
+
+export interface KRStockInfo {
+  stk_cd: string;           // Stock code (e.g., "005930")
+  stk_nm: string;           // Stock name (e.g., "삼성전자")
+  cur_prc: number;          // Current price (KRW)
+  prdy_ctrt: number;        // Previous day change rate (%)
+  prdy_vrss: number;        // Previous day price change
+  trde_qty: number;         // Trading volume
+  trde_prica: number;       // Trading value (KRW)
+}
+
+export interface KRStockListResponse {
+  stocks: KRStockInfo[];
+  total: number;
+}
+
+export interface KRStockTickerResponse {
+  stk_cd: string;
+  stk_nm: string;
+  cur_prc: number;
+  prdy_vrss: number;
+  prdy_ctrt: number;
+  opng_prc: number;
+  high_prc: number;
+  low_prc: number;
+  trde_qty: number;
+  trde_prica: number;
+  per: number | null;
+  pbr: number | null;
+  eps: number | null;
+  bps: number | null;
+  timestamp: string;
+}
+
+export interface KRStockAnalysisRequest {
+  stk_cd: string;
+  query?: string;
+}
+
+export interface KRStockAnalysisResponse {
+  session_id: string;
+  stk_cd: string;
+  stk_nm: string | null;
+  status: string;
+  message: string;
+}
+
+export interface KRStockTradeProposal {
+  id: string;
+  stk_cd: string;
+  stk_nm: string | null;
+  action: TradeAction;
+  quantity: number;
+  entry_price: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  risk_score: number;
+  position_size_pct: number;
+  rationale: string;
+  bull_case: string;
+  bear_case: string;
+  created_at: string;
+}
+
+export interface KRStockAnalysisStatus {
+  session_id: string;
+  stk_cd: string;
+  stk_nm: string | null;
+  status: SessionStatus;
+  current_stage: string | null;
+  awaiting_approval: boolean;
+  trade_proposal: KRStockTradeProposal | null;
+  analyses: AnalysisSummary[];
+  reasoning_log: string[];
+  error: string | null;
+}
+
+export interface KRStockPosition {
+  stk_cd: string;
+  stk_nm: string;
+  quantity: number;
+  avg_entry_price: number;
+  current_price: number;
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number;
+  stop_loss: number | null;
+  take_profit: number | null;
+  session_id: string | null;
+  created_at: string;
+}
+
+export interface KRStockPositionListResponse {
+  positions: KRStockPosition[];
+  total_value_krw: number;
+  total_pnl: number;
+  total_pnl_pct: number;
+}
+
+export type KRStockOrderSide = 'buy' | 'sell';
+export type KRStockOrderType = 'limit' | 'market';
+export type KRStockOrderStatus = 'pending' | 'partial' | 'completed' | 'cancelled';
+
+export interface KRStockOrder {
+  order_id: string;
+  stk_cd: string;
+  stk_nm: string | null;
+  side: KRStockOrderSide;
+  ord_type: KRStockOrderType;
+  price: number | null;
+  quantity: number;
+  executed_quantity: number;
+  remaining_quantity: number;
+  status: KRStockOrderStatus;
+  created_at: string;
+}
+
+export interface KRStockOrderListResponse {
+  orders: KRStockOrder[];
+  total: number;
+}
+
+export interface KRStockOrderRequest {
+  stk_cd: string;
+  side: KRStockOrderSide;
+  ord_type: KRStockOrderType;
+  price?: number;
+  quantity: number;
+}
+
+export interface KRStockTradeRecord {
+  id: string;
+  session_id: string | null;
+  stk_cd: string;
+  stk_nm: string | null;
+  side: KRStockOrderSide;
+  order_type: string;
+  price: number;
+  quantity: number;
+  executed_quantity: number;
+  fee: number;
+  total_krw: number;
+  status: string;
+  order_id: string | null;
+  created_at: string;
+}
+
+export interface KRStockTradeListResponse {
+  trades: KRStockTradeRecord[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+export interface KRStockAccountBalance {
+  deposit: number;
+  orderable_amount: number;
+  withdrawable_amount: number;
+}
+
+export interface KRStockHolding {
+  stk_cd: string;
+  stk_nm: string;
+  quantity: number;
+  avg_buy_price: number;
+  current_price: number;
+  eval_amount: number;
+  profit_loss: number;
+  profit_loss_rate: number;
+}
+
+export interface KRStockAccountResponse {
+  cash: KRStockAccountBalance;
+  holdings: KRStockHolding[];
+  total_eval_amount: number;
+  total_profit_loss: number;
+  total_profit_loss_rate: number;
+}
+
+// -------------------------------------------
+// Multi-Session Support Types
+// -------------------------------------------
+
+export type MarketType = 'stock' | 'coin' | 'kiwoom';
+
+/**
+ * Unified session data for multi-session support.
+ * Each session represents an independent analysis workflow.
+ */
+export interface SessionData {
+  sessionId: string;
+  ticker: string;           // stock: ticker, coin: market, kiwoom: stk_cd
+  displayName: string;      // Human-readable name (종목명)
+  marketType: MarketType;
+  status: SessionStatus;
+  currentStage: string | null;
+  reasoningLog: string[];
+  analyses: AnalysisSummary[];
+  tradeProposal: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+  awaitingApproval: boolean;
+  activePosition: Position | null;
+  error: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// Kiwoom Settings Types
+export interface KiwoomApiKeyStatus {
+  is_configured: boolean;
+  account_masked: string | null;
+  trading_mode: 'live' | 'paper';
+  is_valid: boolean | null;
+  last_validated: string | null;
+}
+
+export interface KiwoomApiKeyRequest {
+  app_key: string;
+  app_secret: string;
+  account_number: string;
+  is_mock: boolean;
+}
+
+export interface KiwoomApiKeyResponse {
+  success: boolean;
+  message: string;
+  status: KiwoomApiKeyStatus;
+}
+
+export interface KiwoomValidateResponse {
+  is_valid: boolean;
+  message: string;
+  account_info: Record<string, unknown> | null;
+}
+
+// -------------------------------------------
+// Technical Indicators API Types (Phase 10)
+// -------------------------------------------
+
+export interface MovingAveragesData {
+  sma_5: number | null;
+  sma_20: number | null;
+  sma_60: number | null;
+  sma_120: number | null;
+}
+
+export interface MomentumData {
+  rsi: number | null;
+  rsi_signal: 'overbought' | 'oversold' | 'neutral';
+  stochastic_k: number | null;
+  stochastic_d: number | null;
+}
+
+export interface MACDData {
+  line: number | null;
+  signal: number | null;
+  histogram: number | null;
+}
+
+export interface BollingerBandsData {
+  upper: number | null;
+  middle: number | null;
+  lower: number | null;
+  width_pct: number | null;
+}
+
+export interface VolatilityData {
+  atr: number | null;
+  daily_pct: number | null;
+}
+
+export interface VolumeData {
+  current: number | null;
+  avg_20: number | null;
+  ratio: number | null;
+}
+
+export interface LevelsData {
+  support_20d: number | null;
+  resistance_20d: number | null;
+}
+
+export interface TrendData {
+  direction: 'bullish' | 'bearish' | 'neutral';
+  price_vs_sma20_pct: number | null;
+}
+
+export type IndicatorSignalType = 'strong_buy' | 'buy' | 'neutral' | 'sell' | 'strong_sell';
+
+export interface IndicatorSignal {
+  type: 'opportunity' | 'warning' | 'info';
+  source: string;
+  signal: IndicatorSignalType;
+  value: number | null;
+  description: string;
+}
+
+export interface TechnicalIndicatorsResponse {
+  ticker: string;
+  current_price: number;
+  moving_averages: MovingAveragesData;
+  momentum: MomentumData;
+  macd: MACDData;
+  bollinger_bands: BollingerBandsData;
+  volatility: VolatilityData;
+  volume: VolumeData;
+  levels: LevelsData;
+  trend: TrendData;
+  signals: IndicatorSignal[];
+}
+
+export interface IndicatorsSummaryResponse {
+  ticker: string;
+  recommendation: TradeAction;
+  confidence: number;
+  key_signals: string[];
+  summary: string;
 }
