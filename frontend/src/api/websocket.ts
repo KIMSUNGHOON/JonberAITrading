@@ -24,6 +24,24 @@ export type WebSocketMessageType =
   | 'heartbeat'
   | 'sessions';
 
+/**
+ * Connection state for better tracking
+ */
+export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
+
+/**
+ * Event types for EventEmitter-like pattern
+ */
+export interface WebSocketEvents {
+  reasoning: string;
+  status: StatusMessage['data'];
+  proposal: ProposalMessage['data'];
+  position: PositionMessage['data'];
+  complete: CompleteMessage['data'];
+  connectionStateChange: ConnectionState;
+  error: Event | Error;
+}
+
 export interface WebSocketMessage {
   type: WebSocketMessageType;
   data: unknown;
@@ -107,6 +125,7 @@ export interface WebSocketHandlers {
   onConnect?: () => void;
   onDisconnect?: () => void;
   onError?: (error: Event) => void;
+  onConnectionStateChange?: (state: ConnectionState) => void;
 }
 
 // -------------------------------------------
@@ -122,10 +141,31 @@ export class TradingWebSocket {
   private reconnectDelay = 1000;
   private pingInterval: number | null = null;
   private isClosing = false;
+  private _connectionState: ConnectionState = 'disconnected';
+  private messageBuffer: WebSocketMessage[] = [];
+  private bufferEnabled = true;
+  private maxBufferSize = 100;
 
   constructor(sessionId: string, handlers: WebSocketHandlers = {}) {
     this.sessionId = sessionId;
     this.handlers = handlers;
+  }
+
+  /**
+   * Get current connection state.
+   */
+  get connectionState(): ConnectionState {
+    return this._connectionState;
+  }
+
+  /**
+   * Set connection state and notify handlers.
+   */
+  private setConnectionState(state: ConnectionState): void {
+    if (this._connectionState !== state) {
+      this._connectionState = state;
+      this.handlers.onConnectionStateChange?.(state);
+    }
   }
 
   /**
@@ -154,12 +194,14 @@ export class TradingWebSocket {
     this.isClosing = false;
     const url = this.getWebSocketUrl();
     console.log('Connecting to WebSocket:', url);
+    this.setConnectionState('connecting');
 
     try {
       this.ws = new WebSocket(url);
       this.setupEventListeners();
     } catch (error) {
       console.error('WebSocket connection error:', error);
+      this.setConnectionState('disconnected');
       this.handleReconnect();
     }
   }
@@ -173,13 +215,16 @@ export class TradingWebSocket {
     this.ws.onopen = () => {
       console.log('WebSocket connected');
       this.reconnectAttempts = 0;
+      this.setConnectionState('connected');
       this.startPingInterval();
+      this.flushMessageBuffer();
       this.handlers.onConnect?.();
     };
 
     this.ws.onclose = (event) => {
       console.log('WebSocket closed:', event.code, event.reason);
       this.stopPingInterval();
+      this.setConnectionState('disconnected');
       this.handlers.onDisconnect?.();
 
       if (!this.isClosing) {
@@ -198,6 +243,42 @@ export class TradingWebSocket {
   }
 
   /**
+   * Flush buffered messages (after reconnection).
+   */
+  private flushMessageBuffer(): void {
+    if (this.messageBuffer.length > 0) {
+      console.log(`[WebSocket] Flushing ${this.messageBuffer.length} buffered messages`);
+      for (const message of this.messageBuffer) {
+        this.dispatchMessage(message);
+      }
+      this.messageBuffer = [];
+    }
+  }
+
+  /**
+   * Dispatch a message to appropriate handlers.
+   */
+  private dispatchMessage(message: WebSocketMessage): void {
+    switch (message.type) {
+      case 'reasoning':
+        this.handlers.onReasoning?.(message.data as string);
+        break;
+      case 'status':
+        this.handlers.onStatus?.(message.data as StatusMessage['data']);
+        break;
+      case 'proposal':
+        this.handlers.onProposal?.(message.data as ProposalMessage['data']);
+        break;
+      case 'position':
+        this.handlers.onPosition?.(message.data as PositionMessage['data']);
+        break;
+      case 'complete':
+        this.handlers.onComplete?.(message.data as CompleteMessage['data']);
+        break;
+    }
+  }
+
+  /**
    * Handle incoming WebSocket messages.
    */
   private handleMessage(event: MessageEvent): void {
@@ -210,30 +291,17 @@ export class TradingWebSocket {
       const message: WebSocketMessage = JSON.parse(event.data);
       console.log('[WebSocket] Received message:', message.type, message.data);
 
-      switch (message.type) {
-        case 'reasoning':
-          this.handlers.onReasoning?.(message.data as string);
-          break;
+      if (message.type === 'status') {
+        console.log('[WebSocket] Status update - stage:', (message.data as StatusMessage['data']).stage);
+      }
 
-        case 'status':
-          console.log('[WebSocket] Status update - stage:', (message.data as StatusMessage['data']).stage);
-          this.handlers.onStatus?.(message.data as StatusMessage['data']);
-          break;
+      // Dispatch using the unified handler
+      this.dispatchMessage(message);
 
-        case 'proposal':
-          this.handlers.onProposal?.(message.data as ProposalMessage['data']);
-          break;
-
-        case 'position':
-          this.handlers.onPosition?.(message.data as PositionMessage['data']);
-          break;
-
-        case 'complete':
-          this.handlers.onComplete?.(message.data as CompleteMessage['data']);
-          break;
-
-        default:
-          console.log('Unknown message type:', message.type);
+      if (message.type !== 'reasoning' && message.type !== 'status' &&
+          message.type !== 'proposal' && message.type !== 'position' &&
+          message.type !== 'complete') {
+        console.log('Unknown message type:', message.type);
       }
     } catch (error) {
       console.error('Error parsing WebSocket message:', error);
@@ -267,9 +335,11 @@ export class TradingWebSocket {
   private handleReconnect(): void {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.error('Max reconnection attempts reached');
+      this.setConnectionState('disconnected');
       return;
     }
 
+    this.setConnectionState('reconnecting');
     const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts);
     console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts + 1})`);
 
@@ -294,11 +364,13 @@ export class TradingWebSocket {
   disconnect(): void {
     this.isClosing = true;
     this.stopPingInterval();
+    this.messageBuffer = []; // Clear any buffered messages
 
     if (this.ws) {
       this.ws.close(1000, 'Client disconnect');
       this.ws = null;
     }
+    this.setConnectionState('disconnected');
   }
 
   /**
