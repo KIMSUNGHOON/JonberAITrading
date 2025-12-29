@@ -13,6 +13,7 @@ from app.api.routes import (
     indicators,
     kr_stocks,
     news,
+    trading,
     websocket,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "indicators",
     "kr_stocks",
     "news",
+    "trading",
     "websocket",
 ]
