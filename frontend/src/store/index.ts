@@ -14,7 +14,7 @@
  */
 
 import { create } from 'zustand';
-import { devtools } from 'zustand/middleware';
+import { devtools, persist, createJSONStorage } from 'zustand/middleware';
 import type {
   AnalysisSummary,
   ChatMessage,
@@ -398,15 +398,8 @@ const initialChatState: ChatState = {
   isTyping: false,
 };
 
-// Helper to read hasVisited from localStorage
-const getHasVisitedFromStorage = (): boolean => {
-  if (typeof window === 'undefined') return false;
-  try {
-    return localStorage.getItem('agentic-trading-has-visited') === 'true';
-  } catch {
-    return false;
-  }
-};
+// Note: hasVisited is now persisted via zustand persist middleware
+// No need for manual localStorage reading
 
 const initialUIState: UIState = {
   activeMarket: 'stock',
@@ -428,7 +421,7 @@ const initialUIState: UIState = {
     showSMA200: true,
     showVolume: true,
   },
-  hasVisited: getHasVisitedFromStorage(),
+  hasVisited: false, // Will be restored from persist middleware
   // View/Page navigation
   currentView: 'dashboard',
   selectedSessionId: null,
@@ -438,9 +431,21 @@ const initialUIState: UIState = {
 // Store Implementation
 // -------------------------------------------
 
+// Type for persisted state (partial)
+interface PersistedState {
+  stock: { history: StockHistoryItem[] };
+  coin: { history: CoinHistoryItem[] };
+  kiwoom: { history: KiwoomHistoryItem[] };
+  basket: BasketState;
+  hasVisited: boolean;
+  chartConfig: ChartConfig;
+  sidebarCollapsed: boolean;
+}
+
 export const useStore = create<Store>()(
   devtools(
-    (set, get) => ({
+    persist(
+      (set, get) => ({
       // Initial states
       stock: initialStockState,
       coin: initialCoinState,
@@ -1337,15 +1342,7 @@ export const useStore = create<Store>()(
 
       setKiwoomApiConfigured: (configured) => set({ kiwoomApiConfigured: configured }),
 
-      setHasVisited: (visited) => {
-        // Persist to localStorage
-        try {
-          localStorage.setItem('agentic-trading-has-visited', visited ? 'true' : 'false');
-        } catch {
-          // Ignore localStorage errors
-        }
-        set({ hasVisited: visited });
-      },
+      setHasVisited: (visited) => set({ hasVisited: visited }),
 
       setCurrentView: (view) => set({ currentView: view }),
 
@@ -1584,7 +1581,62 @@ export const useStore = create<Store>()(
           get().resetKiwoom();
         }
       },
-    }),
+      }),
+      {
+        name: 'agentic-trading-storage',
+        version: 1,
+        storage: createJSONStorage(() => localStorage),
+        // Only persist history and settings, not active sessions
+        partialize: (state): PersistedState => ({
+          stock: { history: state.stock.history },
+          coin: { history: state.coin.history },
+          kiwoom: { history: state.kiwoom.history },
+          basket: state.basket,
+          hasVisited: state.hasVisited,
+          chartConfig: state.chartConfig,
+          sidebarCollapsed: state.sidebarCollapsed,
+        }),
+        // Merge persisted state with initial state
+        merge: (persistedState, currentState) => {
+          const persisted = persistedState as PersistedState | undefined;
+          if (!persisted) return currentState;
+
+          // Convert date strings back to Date objects in history
+          const parseHistoryDates = <T extends HistoryItem>(history: T[]): T[] =>
+            history.map((h) => ({
+              ...h,
+              timestamp: new Date(h.timestamp),
+              completedAt: h.completedAt ? new Date(h.completedAt) : null,
+            }));
+
+          return {
+            ...currentState,
+            stock: {
+              ...currentState.stock,
+              history: persisted.stock?.history
+                ? parseHistoryDates(persisted.stock.history as StockHistoryItem[])
+                : [],
+            },
+            coin: {
+              ...currentState.coin,
+              history: persisted.coin?.history
+                ? parseHistoryDates(persisted.coin.history as CoinHistoryItem[])
+                : [],
+            },
+            kiwoom: {
+              ...currentState.kiwoom,
+              history: persisted.kiwoom?.history
+                ? parseHistoryDates(persisted.kiwoom.history as KiwoomHistoryItem[])
+                : [],
+            },
+            basket: persisted.basket ?? currentState.basket,
+            hasVisited: persisted.hasVisited ?? currentState.hasVisited,
+            chartConfig: persisted.chartConfig ?? currentState.chartConfig,
+            sidebarCollapsed: persisted.sidebarCollapsed ?? currentState.sidebarCollapsed,
+          };
+        },
+      }
+    ),
     { name: 'agentic-trading-store' }
   )
 );
