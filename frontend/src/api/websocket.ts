@@ -8,7 +8,8 @@
  * - Position updates
  */
 
-import type { TradeProposal, CoinTradeProposal, Position, SessionStatus } from '@/types';
+import type { TradeProposal, CoinTradeProposal, KRStockTradeProposal, Position, SessionStatus, DetailedAnalysisResults } from '@/types';
+import type { MarketType } from '@/store';
 
 // -------------------------------------------
 // Types
@@ -74,6 +75,22 @@ export interface CompleteMessage {
   data: {
     status: string;
     error?: string;
+    completed_at?: string;
+    analysis_results?: DetailedAnalysisResults;
+    trade_proposal?: {
+      id: string;
+      ticker: string;
+      action: string;
+      quantity: number;
+      entry_price: number | null;
+      stop_loss: number | null;
+      take_profit: number | null;
+      risk_score: number;
+      rationale: string;
+      bull_case?: string;
+      bear_case?: string;
+    };
+    reasoning_summary?: string;
   };
 }
 
@@ -117,8 +134,12 @@ export class TradingWebSocket {
   private getWebSocketUrl(): string {
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     // Backend WebSocket is mounted at /ws, not /api/ws
+    // VITE_WS_URL should be the base URL without /ws (e.g., ws://localhost:8000)
+    // If not set, use the current host which will be proxied by Vite in dev
     const wsHost = import.meta.env.VITE_WS_URL || `${wsProtocol}//${window.location.host}`;
-    return `${wsHost}/ws/session/${this.sessionId}`;
+    const url = `${wsHost}/ws/session/${this.sessionId}`;
+    console.log('[WebSocket] Constructed URL:', url);
+    return url;
   }
 
   /**
@@ -187,6 +208,7 @@ export class TradingWebSocket {
       }
 
       const message: WebSocketMessage = JSON.parse(event.data);
+      console.log('[WebSocket] Received message:', message.type, message.data);
 
       switch (message.type) {
         case 'reasoning':
@@ -194,6 +216,7 @@ export class TradingWebSocket {
           break;
 
         case 'status':
+          console.log('[WebSocket] Status update - stage:', (message.data as StatusMessage['data']).stage);
           this.handlers.onStatus?.(message.data as StatusMessage['data']);
           break;
 
@@ -310,6 +333,9 @@ export function createWebSocket(
 
 /**
  * Creates a WebSocket connection integrated with Zustand store.
+ * @param sessionId - Session ID for the WebSocket connection
+ * @param store - Store actions for updating state
+ * @param marketType - Market type for creating correct proposal format (default: 'stock')
  */
 export function createStoreWebSocket(
   sessionId: string,
@@ -317,11 +343,13 @@ export function createStoreWebSocket(
     addReasoningEntry: (entry: string) => void;
     setStatus: (status: SessionStatus) => void;
     setCurrentStage: (stage: string) => void;
-    setTradeProposal: (proposal: TradeProposal | CoinTradeProposal | null) => void;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    setTradeProposal: (proposal: any) => void;
     setAwaitingApproval: (awaiting: boolean) => void;
     setActivePosition: (position: Position | null) => void;
     setError: (error: string | null) => void;
-  }
+  },
+  marketType: MarketType = 'stock'
 ): TradingWebSocket {
   return new TradingWebSocket(sessionId, {
     onReasoning: (entry) => {
@@ -333,21 +361,64 @@ export function createStoreWebSocket(
       store.setAwaitingApproval(data.awaiting_approval);
     },
     onProposal: (data) => {
-      store.setTradeProposal({
-        id: data.id,
-        ticker: data.ticker,
-        action: data.action.toUpperCase() as 'BUY' | 'SELL' | 'HOLD',
-        quantity: data.quantity,
-        entry_price: data.entry_price,
-        stop_loss: data.stop_loss,
-        take_profit: data.take_profit,
-        risk_score: data.risk_score,
-        position_size_pct: 0,
-        rationale: data.rationale,
-        bull_case: '',
-        bear_case: '',
-        created_at: new Date().toISOString(),
-      });
+      // Create proposal with correct format based on market type
+      if (marketType === 'kiwoom') {
+        // Korean stock proposal
+        const proposal: KRStockTradeProposal = {
+          id: data.id,
+          stk_cd: data.ticker,
+          stk_nm: null,
+          action: data.action.toUpperCase() as 'BUY' | 'SELL' | 'HOLD',
+          quantity: data.quantity,
+          entry_price: data.entry_price,
+          stop_loss: data.stop_loss,
+          take_profit: data.take_profit,
+          risk_score: data.risk_score,
+          position_size_pct: 0,
+          rationale: data.rationale,
+          bull_case: '',
+          bear_case: '',
+          created_at: new Date().toISOString(),
+        };
+        store.setTradeProposal(proposal);
+      } else if (marketType === 'coin') {
+        // Coin proposal
+        const proposal: CoinTradeProposal = {
+          id: data.id,
+          market: data.ticker,
+          korean_name: null,
+          action: data.action.toUpperCase() as 'BUY' | 'SELL' | 'HOLD',
+          quantity: data.quantity,
+          entry_price: data.entry_price,
+          stop_loss: data.stop_loss,
+          take_profit: data.take_profit,
+          risk_score: data.risk_score,
+          position_size_pct: 0,
+          rationale: data.rationale,
+          bull_case: '',
+          bear_case: '',
+          created_at: new Date().toISOString(),
+        };
+        store.setTradeProposal(proposal);
+      } else {
+        // US stock proposal (default)
+        const proposal: TradeProposal = {
+          id: data.id,
+          ticker: data.ticker,
+          action: data.action.toUpperCase() as 'BUY' | 'SELL' | 'HOLD',
+          quantity: data.quantity,
+          entry_price: data.entry_price,
+          stop_loss: data.stop_loss,
+          take_profit: data.take_profit,
+          risk_score: data.risk_score,
+          position_size_pct: 0,
+          rationale: data.rationale,
+          bull_case: '',
+          bear_case: '',
+          created_at: new Date().toISOString(),
+        };
+        store.setTradeProposal(proposal);
+      }
     },
     onPosition: (data) => {
       store.setActivePosition({
@@ -756,6 +827,154 @@ export class TickerWebSocket {
     this.handlers = { ...this.handlers, ...handlers };
   }
 }
+
+// -------------------------------------------
+// WebSocket Manager for Multi-Session Support
+// -------------------------------------------
+
+/**
+ * Manages multiple WebSocket connections for parallel analysis sessions.
+ * Each session gets its own WebSocket connection.
+ *
+ * Usage:
+ *   wsManager.connect(sessionId, handlers);
+ *   wsManager.disconnect(sessionId);
+ *   wsManager.disconnectAll();
+ */
+export class WebSocketManager {
+  private connections: Map<string, TradingWebSocket> = new Map();
+  private maxConnections: number = 5;
+
+  /**
+   * Connect to a session WebSocket.
+   * If a connection already exists for this session, it will be disconnected first.
+   */
+  connect(sessionId: string, handlers: WebSocketHandlers): TradingWebSocket {
+    // Disconnect existing connection if any
+    const existing = this.connections.get(sessionId);
+    if (existing) {
+      console.log(`[WebSocketManager] Replacing existing connection for session ${sessionId}`);
+      existing.disconnect();
+      this.connections.delete(sessionId);
+    }
+
+    // Check max connections
+    if (this.connections.size >= this.maxConnections) {
+      console.warn(`[WebSocketManager] Max connections (${this.maxConnections}) reached`);
+      // Disconnect oldest idle connection if possible
+      const oldestIdle = this.findOldestIdleConnection();
+      if (oldestIdle) {
+        console.log(`[WebSocketManager] Disconnecting idle session ${oldestIdle}`);
+        this.disconnect(oldestIdle);
+      }
+    }
+
+    const ws = new TradingWebSocket(sessionId, handlers);
+    this.connections.set(sessionId, ws);
+    ws.connect();
+    console.log(`[WebSocketManager] Connected session ${sessionId}, total: ${this.connections.size}`);
+    return ws;
+  }
+
+  /**
+   * Disconnect a specific session WebSocket.
+   */
+  disconnect(sessionId: string): void {
+    const ws = this.connections.get(sessionId);
+    if (ws) {
+      ws.disconnect();
+      this.connections.delete(sessionId);
+      console.log(`[WebSocketManager] Disconnected session ${sessionId}, remaining: ${this.connections.size}`);
+    }
+  }
+
+  /**
+   * Disconnect all WebSocket connections.
+   */
+  disconnectAll(): void {
+    console.log(`[WebSocketManager] Disconnecting all ${this.connections.size} connections`);
+    for (const [, ws] of this.connections) {
+      ws.disconnect();
+    }
+    this.connections.clear();
+  }
+
+  /**
+   * Get WebSocket connection for a session.
+   */
+  get(sessionId: string): TradingWebSocket | undefined {
+    return this.connections.get(sessionId);
+  }
+
+  /**
+   * Check if a session has an active connection.
+   */
+  has(sessionId: string): boolean {
+    return this.connections.has(sessionId);
+  }
+
+  /**
+   * Check if a session is connected.
+   */
+  isConnected(sessionId: string): boolean {
+    const ws = this.connections.get(sessionId);
+    return ws?.isConnected() ?? false;
+  }
+
+  /**
+   * Get the number of active connections.
+   */
+  getActiveCount(): number {
+    return this.connections.size;
+  }
+
+  /**
+   * Get all active session IDs.
+   */
+  getActiveSessionIds(): string[] {
+    return Array.from(this.connections.keys());
+  }
+
+  /**
+   * Get available connection slots.
+   */
+  getAvailableSlots(): number {
+    return Math.max(0, this.maxConnections - this.connections.size);
+  }
+
+  /**
+   * Set max concurrent connections.
+   */
+  setMaxConnections(max: number): void {
+    this.maxConnections = max;
+  }
+
+  /**
+   * Find the oldest idle connection (for cleanup when at max capacity).
+   * For now, just returns the first one. Could be improved with LRU tracking.
+   */
+  private findOldestIdleConnection(): string | null {
+    for (const [sessionId, ws] of this.connections) {
+      if (!ws.isConnected()) {
+        return sessionId;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Update handlers for a specific session.
+   */
+  updateHandlers(sessionId: string, handlers: Partial<WebSocketHandlers>): void {
+    const ws = this.connections.get(sessionId);
+    if (ws) {
+      ws.setHandlers(handlers);
+    }
+  }
+}
+
+// Singleton instance for global access
+export const wsManager = new WebSocketManager();
 
 // Singleton instance for shared ticker connection
 let tickerWebSocketInstance: TickerWebSocket | null = null;

@@ -9,6 +9,7 @@ Main application setup with:
 - Enhanced logging for development
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 import structlog
@@ -16,8 +17,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.llm_provider import get_llm_provider, reset_llm_provider
-from app.api.routes import analysis, approval, websocket, auth, coin, settings as settings_routes
+from app.api.routes import analysis, approval, websocket, auth, coin, kr_stocks, chat, indicators, settings as settings_routes
 from app.config import settings
+from app.core.analysis_limiter import cleanup_old_sessions
 from app.logging_config import configure_logging, RequestLoggingMiddleware
 from services.realtime_service import close_realtime_service, get_realtime_service
 from services.storage_service import close_storage_service, get_storage_service
@@ -96,6 +98,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("realtime_service_start_failed", error=str(e))
 
+    # Start session cleanup background task
+    asyncio.create_task(cleanup_old_sessions())
+    logger.info("session_cleanup_task_started")
+
     yield
 
     # Shutdown
@@ -154,6 +160,21 @@ app.include_router(
     coin.router,
     prefix="/api/coin",
     tags=["Coin"],
+)
+app.include_router(
+    kr_stocks.router,
+    prefix="/api/kr_stocks",
+    tags=["Korean Stocks (Kiwoom)"],
+)
+app.include_router(
+    chat.router,
+    prefix="/api/chat",
+    tags=["Chat"],
+)
+app.include_router(
+    indicators.router,
+    prefix="/api",
+    tags=["Technical Indicators"],
 )
 app.include_router(
     settings_routes.router,

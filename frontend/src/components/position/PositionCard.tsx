@@ -11,12 +11,22 @@ import {
   Activity,
 } from 'lucide-react';
 import type { Position } from '@/types';
+import type { MarketType } from '@/store';
+
+// Helper to format currency based on market type
+function formatCurrency(value: number, marketType: MarketType): string {
+  if (marketType === 'kiwoom' || marketType === 'coin') {
+    return `₩${value.toLocaleString('ko-KR')}`;
+  }
+  return `$${value.toFixed(2)}`;
+}
 
 interface PositionCardProps {
   position: Position;
+  marketType?: MarketType;
 }
 
-export function PositionCard({ position }: PositionCardProps) {
+export function PositionCard({ position, marketType = 'stock' }: PositionCardProps) {
   const {
     ticker,
     quantity,
@@ -74,18 +84,18 @@ export function PositionCard({ position }: PositionCardProps) {
         />
         <DetailBox
           label="Entry Price"
-          value={`$${entry_price.toFixed(2)}`}
+          value={formatCurrency(entry_price, marketType)}
           icon={<TrendingUp className="w-4 h-4" />}
         />
         <DetailBox
           label="Current Price"
-          value={`$${current_price.toFixed(2)}`}
+          value={formatCurrency(current_price, marketType)}
           icon={<Activity className="w-4 h-4" />}
           valueColor={current_price >= entry_price ? 'text-bull' : 'text-bear'}
         />
         <DetailBox
           label="P&L"
-          value={`${isProfit ? '+' : ''}$${pnl.toFixed(2)}`}
+          value={`${isProfit ? '+' : ''}${formatCurrency(Math.abs(pnl), marketType)}`}
           icon={isProfit ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />}
           valueColor={isProfit ? 'text-bull' : 'text-bear'}
         />

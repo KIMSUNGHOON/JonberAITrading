@@ -71,6 +71,7 @@ frontend/build/
 # Logs
 logs/
 *.log
+debug/log/
 
 # OS files
 .DS_Store
@@ -108,3 +109,37 @@ temp/
 *.key
 credentials.json
 secrets.json
+
+# Screenshots and images (development artifacts)
+*.png
+!docs/*.png
+!frontend/public/*.png
+
+# Claude Code artifacts
+.claude/
+
+# Development notes (not for repo)
+backend_log.md
+backend_log.txt
+FrontendUI.txt
+TempRequirement.md
+Feedback.md
+WORK_LOG_*.md
+
+# Test/temp files
+test.py
+nul
+list-candles-seconds
+websocket-ticker
+websocket-trade
+rate-limits
+upbit-api-overview.html
+
+# SQLite database
+*.db
+
+# Plans directory (personal planning)
+plans/
+
+# Old backend logs
+backend/2025-*

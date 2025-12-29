@@ -5,17 +5,28 @@ Provides:
 - Structured logging with log levels (DEBUG, INFO, WARNING, ERROR)
 - Request lifecycle logging
 - Agent workflow tracing
-- Color-coded console output
+- Color-coded console output (INFO+ only)
+- Debug logs saved to file (debug/log/YYYY-MM-DD-HH.log)
 - Request/Response body logging
 """
 
+import io
 import logging
+import os
 import sys
 import time
+from datetime import datetime
 from contextvars import ContextVar
 from functools import wraps
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
+
+# Fix Windows console encoding (cp949 -> utf-8)
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import structlog
 from fastapi import Request, Response
@@ -38,31 +49,85 @@ LOG_LEVELS = {
 }
 
 
+def _get_log_directory() -> Path:
+    """Get or create the log directory."""
+    # Use debug/log relative to the backend directory
+    log_dir = Path(__file__).parent.parent.parent / "debug" / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
+def _create_debug_file_handler() -> logging.FileHandler:
+    """Create a file handler for debug logs with date-time filename."""
+    log_dir = _get_log_directory()
+    now = datetime.now()
+    log_filename = now.strftime("%Y-%m-%d-%H") + ".log"
+    log_path = log_dir / log_filename
+
+    handler = logging.FileHandler(log_path, encoding='utf-8')
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    return handler
+
+
 def configure_logging(
     log_level: str = "DEBUG",
     json_logs: bool = False,
     log_file: Optional[str] = None,
+    debug_to_file: bool = True,
+    console_level: str = "INFO",
 ) -> None:
     """
     Configure structured logging for the application.
 
     Args:
-        log_level: Minimum log level (DEBUG, INFO, WARNING, ERROR)
+        log_level: Minimum log level for file output (DEBUG, INFO, WARNING, ERROR)
         json_logs: If True, output JSON logs (for production)
-        log_file: Optional file path for log output
+        log_file: Optional custom file path for log output
+        debug_to_file: If True, save debug logs to debug/log/YYYY-MM-DD-HH.log
+        console_level: Minimum log level for console output (default: INFO)
     """
-    # Set up stdlib logging
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
-        level=LOG_LEVELS.get(log_level.upper(), logging.DEBUG),
-    )
+    # Get root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)  # Capture all logs at root level
 
-    # Add file handler if specified
+    # Clear existing handlers
+    root_logger.handlers.clear()
+
+    # Console handler - only INFO and above for cleaner output
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(LOG_LEVELS.get(console_level.upper(), logging.INFO))
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+    root_logger.addHandler(console_handler)
+
+    # File handler for debug logs
+    if debug_to_file:
+        try:
+            file_handler = _create_debug_file_handler()
+            root_logger.addHandler(file_handler)
+        except Exception as e:
+            print(f"Warning: Could not create debug log file: {e}")
+
+    # Custom file handler if specified
     if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(LOG_LEVELS.get(log_level.upper(), logging.DEBUG))
-        logging.getLogger().addHandler(file_handler)
+        try:
+            custom_handler = logging.FileHandler(log_file, encoding='utf-8')
+            custom_handler.setLevel(LOG_LEVELS.get(log_level.upper(), logging.DEBUG))
+            custom_handler.setFormatter(logging.Formatter(
+                "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S"
+            ))
+            root_logger.addHandler(custom_handler)
+        except Exception as e:
+            print(f"Warning: Could not create log file {log_file}: {e}")
+
+    # Suppress noisy third-party loggers
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
+    logging.getLogger("websockets.client").setLevel(logging.WARNING)
 
     # Configure structlog processors
     shared_processors = [

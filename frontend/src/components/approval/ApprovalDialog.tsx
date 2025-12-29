@@ -20,14 +20,47 @@ import {
 import { useStore, selectTradeProposal, selectActiveSessionId } from '@/store';
 import { submitApproval } from '@/api/client';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
-import type { TradeProposal, CoinTradeProposal } from '@/types';
+import type { TradeProposal, CoinTradeProposal, KRStockTradeProposal } from '@/types';
 
-// Helper to get symbol from either stock or coin proposal
-function getProposalSymbol(proposal: TradeProposal | CoinTradeProposal): string {
+// Union type for all proposal types
+type AnyTradeProposal = TradeProposal | CoinTradeProposal | KRStockTradeProposal;
+
+// Helper to get symbol from stock, coin, or kiwoom proposal
+function getProposalSymbol(proposal: AnyTradeProposal): string {
   if ('ticker' in proposal) {
     return proposal.ticker;
   }
-  return proposal.market;
+  if ('market' in proposal) {
+    return proposal.market;
+  }
+  if ('stk_cd' in proposal) {
+    return proposal.stk_cd;
+  }
+  return 'UNKNOWN';
+}
+
+// Helper to detect market type from proposal
+function getProposalMarketType(proposal: AnyTradeProposal): 'stock' | 'coin' | 'kiwoom' {
+  if ('stk_cd' in proposal) {
+    return 'kiwoom';
+  }
+  if ('market' in proposal) {
+    return 'coin';
+  }
+  return 'stock';
+}
+
+// Helper to format currency based on market type
+function formatCurrency(value: number | null | undefined, marketType: 'stock' | 'coin' | 'kiwoom'): string {
+  if (value === null || value === undefined) return 'N/A';
+
+  if (marketType === 'kiwoom' || marketType === 'coin') {
+    // Korean Won formatting
+    return `₩${value.toLocaleString('ko-KR')}`;
+  }
+
+  // US Dollar formatting
+  return `$${value.toFixed(2)}`;
 }
 
 export function ApprovalDialog() {
@@ -48,6 +81,24 @@ export function ApprovalDialog() {
   const handleDecision = async (decision: 'approved' | 'rejected' | 'cancelled') => {
     setIsSubmitting(true);
 
+    // Optimistic update: immediately close dialog and update state
+    // This prevents WebSocket updates from reopening the dialog during the API call
+    setShowApprovalDialog(false);
+    setAwaitingApproval(false);
+
+    // Store proposal info for chat message before potentially clearing it
+    const symbol = getProposalSymbol(proposal);
+    const action = proposal.action.toUpperCase();
+    const quantity = proposal.quantity;
+
+    // Clear proposal immediately for cancelled
+    if (decision === 'cancelled') {
+      setTradeProposal(null);
+      setStatus('cancelled');
+    } else if (decision === 'rejected') {
+      setTradeProposal(null);
+    }
+
     try {
       await submitApproval({
         session_id: sessionId,
@@ -55,22 +106,10 @@ export function ApprovalDialog() {
         feedback: feedback.trim() || undefined,
       });
 
-      // Update state
-      setAwaitingApproval(false);
-      if (decision === 'rejected') {
-        // Re-analysis: clear proposal, analysis continues
-        setTradeProposal(null);
-      } else if (decision === 'cancelled') {
-        // Cancel: clear proposal and set status to cancelled
-        setTradeProposal(null);
-        setStatus('cancelled');
-      }
-
-      // Add chat message
-      const symbol = getProposalSymbol(proposal);
+      // Add chat message on success
       let chatContent = '';
       if (decision === 'approved') {
-        chatContent = `Trade approved: ${proposal.action.toUpperCase()} ${proposal.quantity} ${symbol}`;
+        chatContent = `Trade approved: ${action} ${quantity} ${symbol}`;
       } else if (decision === 'rejected') {
         chatContent = `Trade rejected - Re-analyzing with feedback${feedback ? `: "${feedback}"` : '...'}`;
       } else {
@@ -80,10 +119,10 @@ export function ApprovalDialog() {
         role: 'system',
         content: chatContent,
       });
-
-      setShowApprovalDialog(false);
     } catch (error) {
+      // On error, revert the optimistic update
       setError(error instanceof Error ? error.message : 'Failed to submit decision');
+      // Optionally restore proposal - but for simplicity, just show error
     } finally {
       setIsSubmitting(false);
     }
@@ -91,6 +130,7 @@ export function ApprovalDialog() {
 
   const isBuy = proposal.action === 'BUY';
   const riskLevel = getRiskLevel(proposal.risk_score);
+  const marketType = getProposalMarketType(proposal);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -154,18 +194,18 @@ export function ApprovalDialog() {
             <DetailRow
               icon={<Target className="w-4 h-4" />}
               label="Entry Price"
-              value={`$${proposal.entry_price?.toFixed(2) ?? 'N/A'}`}
+              value={formatCurrency(proposal.entry_price, marketType)}
             />
             <DetailRow
               icon={<AlertTriangle className="w-4 h-4" />}
               label="Stop Loss"
-              value={`$${proposal.stop_loss?.toFixed(2) ?? 'N/A'}`}
+              value={formatCurrency(proposal.stop_loss, marketType)}
               valueColor="text-bear"
             />
             <DetailRow
               icon={<CheckCircle2 className="w-4 h-4" />}
               label="Take Profit"
-              value={`$${proposal.take_profit?.toFixed(2) ?? 'N/A'}`}
+              value={formatCurrency(proposal.take_profit, marketType)}
               valueColor="text-bull"
             />
             <DetailRow

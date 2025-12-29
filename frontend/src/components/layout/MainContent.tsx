@@ -1,152 +1,221 @@
 /**
  * Main Content Component
  *
- * Dashboard area with chart and analysis panels.
+ * Handles routing between different views:
+ * - Dashboard: Comprehensive overview with all widgets
+ * - Analysis: Detailed workflow view for analyzing stocks
+ * - Basket, History, Positions, Charts pages
  */
 
-import { useShallow } from 'zustand/shallow';
-import {
-  useStore,
-  selectSession,
-  selectAnalysis,
-  selectProposal,
-  selectActivePosition,
-} from '@/store';
-import { ChartPanel } from '@/components/chart/ChartPanel';
-import { AnalysisPanel } from '@/components/analysis/AnalysisPanel';
-import { ReasoningLog } from '@/components/analysis/ReasoningLog';
-import { WorkflowProgress } from '@/components/analysis/WorkflowProgress';
-import { ProposalCard } from '@/components/approval/ProposalCard';
+import { useState, useEffect } from 'react';
+import { useStore, selectActivePosition } from '@/store';
+import { AnalysisQueueWidget } from '@/components/analysis/AnalysisQueueWidget';
+import { ReasoningSlidePanel } from '@/components/analysis/ReasoningSlidePanel';
 import { PositionCard } from '@/components/position/PositionCard';
 import { WelcomePanel } from '@/components/analysis/WelcomePanel';
-import { CoinInfo } from '@/components/coin/CoinInfo';
-import { CoinMarketDashboard } from '@/components/dashboard/CoinMarketDashboard';
+import { CoinMarketDashboard, DashboardSummary } from '@/components/dashboard';
 import { CoinAccountBalance } from '@/components/coin/CoinAccountBalance';
 import { CoinPositionPanel } from '@/components/coin/CoinPositionPanel';
 import { CoinOpenOrders } from '@/components/coin/CoinOpenOrders';
 import { CoinTradeHistory } from '@/components/coin/CoinTradeHistory';
+import {
+  KiwoomTickerInput,
+  KiwoomPositionPanel,
+  KiwoomAccountBalance,
+  KiwoomOpenOrders,
+} from '@/components/kiwoom';
+import { BasketWidget } from '@/components/basket';
+import { BasketPage } from '@/pages/BasketPage';
+import { PositionsPage } from '@/pages/PositionsPage';
+import { ChartsPage } from '@/pages/ChartsPage';
+import { TradesPage } from '@/pages/TradesPage';
+import { AnalysisPage } from '@/pages/AnalysisPage';
+import { WorkflowPage } from '@/pages/WorkflowPage';
+import { AnalysisDetailPage } from '@/pages/AnalysisDetailPage';
 
 export function MainContent() {
-  const { sessionId, ticker, status } = useStore(useShallow(selectSession));
-  const currentStage = useStore((state) =>
-    state.activeMarket === 'stock' ? state.stock.currentStage : state.coin.currentStage
-  );
-  const { analyses, reasoningLog } = useStore(useShallow(selectAnalysis));
-  const { proposal, awaitingApproval } = useStore(useShallow(selectProposal));
+  const [showReasoningPanel, setShowReasoningPanel] = useState(false);
+
   const activePosition = useStore(selectActivePosition);
-  const showChartPanel = useStore((state) => state.showChartPanel);
   const activeMarket = useStore((state) => state.activeMarket);
+  const kiwoomApiConfigured = useStore((state) => state.kiwoomApiConfigured);
+  const currentView = useStore((state) => state.currentView);
 
-  // Show welcome panel when idle
-  if (status === 'idle' && !sessionId) {
-    // For coin market, show market dashboard alongside welcome
-    if (activeMarket === 'coin') {
-      return (
-        <div className="p-3 md:p-4 space-y-4">
-          <WelcomePanel />
+  // First visit tracking - show WelcomePanel on first visit, DashboardSummary on subsequent visits
+  const hasVisited = useStore((state) => state.hasVisited);
+  const setHasVisited = useStore((state) => state.setHasVisited);
 
-          {/* Trading Dashboard - Two column layout */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {/* Left Column - Account & Positions */}
-            <div className="space-y-4">
+  // Set hasVisited to true after first render (immediate transition)
+  useEffect(() => {
+    if (!hasVisited) {
+      setHasVisited(true);
+    }
+  }, [hasVisited, setHasVisited]);
+
+  const handleViewReasoningDetails = () => {
+    setShowReasoningPanel(true);
+  };
+
+  // ============================================
+  // Page Views (basket, history, positions, charts)
+  // ============================================
+  if (currentView === 'basket') {
+    return <BasketPage />;
+  }
+
+  // History is now merged into Analysis page
+  if (currentView === 'history') {
+    return <AnalysisPage />;
+  }
+
+  if (currentView === 'positions') {
+    return <PositionsPage />;
+  }
+
+  if (currentView === 'charts') {
+    return <ChartsPage />;
+  }
+
+  if (currentView === 'trades') {
+    return <TradesPage />;
+  }
+
+  // ============================================
+  // Analysis Pages - New unified analysis views
+  // ============================================
+
+  // Analysis List Page - Shows running and completed analyses
+  if (currentView === 'analysis') {
+    return <AnalysisPage />;
+  }
+
+  // Workflow Page - Shows detailed progress for a running analysis
+  if (currentView === 'workflow') {
+    return <WorkflowPage />;
+  }
+
+  // Analysis Detail Page - Shows report for completed analysis
+  if (currentView === 'analysis-detail') {
+    return <AnalysisDetailPage />;
+  }
+
+  // ============================================
+  // Dashboard View - Comprehensive overview
+  // ============================================
+
+  // Coin market dashboard
+  if (activeMarket === 'coin') {
+    return (
+      <div className="p-3 md:p-4 space-y-4">
+        {/* Show WelcomePanel on first visit, DashboardSummary on subsequent visits */}
+        {hasVisited ? <DashboardSummary /> : <WelcomePanel />}
+
+        {/* Main Grid - Trading Dashboard + Basket/Queue */}
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+          {/* Left Column - Account & Positions (2/3 width on xl) */}
+          <div className="xl:col-span-2 space-y-4">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <CoinAccountBalance />
               <CoinPositionPanel />
             </div>
-
-            {/* Right Column - Orders & History */}
-            <div className="space-y-4">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <CoinOpenOrders />
               <CoinTradeHistory pageSize={5} />
             </div>
           </div>
 
-          <CoinMarketDashboard />
+          {/* Right Column - Basket & Queue (1/3 width on xl) */}
+          <div className="space-y-4">
+            <BasketWidget />
+            <AnalysisQueueWidget onViewDetails={handleViewReasoningDetails} />
+          </div>
         </div>
-      );
-    }
-    return <WelcomePanel />;
+
+        <CoinMarketDashboard />
+
+        {/* Reasoning Slide Panel */}
+        <ReasoningSlidePanel
+          isOpen={showReasoningPanel}
+          onClose={() => setShowReasoningPanel(false)}
+        />
+      </div>
+    );
   }
 
+  // Kiwoom market dashboard
+  if (activeMarket === 'kiwoom') {
+    return (
+      <div className="p-3 md:p-4 space-y-4">
+        {/* Show WelcomePanel on first visit, DashboardSummary on subsequent visits */}
+        {hasVisited ? <DashboardSummary /> : <WelcomePanel />}
+
+        {/* Main Grid - Trading Dashboard + Basket/Queue */}
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+          {/* Left Column - Account & Positions (2/3 width on xl) */}
+          <div className="xl:col-span-2 space-y-4">
+            {kiwoomApiConfigured && (
+              <>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <KiwoomAccountBalance />
+                  <KiwoomPositionPanel />
+                </div>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  <div className="bg-surface-light rounded-xl p-4 border border-border">
+                    <h3 className="text-sm font-medium text-gray-300 mb-3">종목 분석 시작</h3>
+                    <KiwoomTickerInput />
+                  </div>
+                  <KiwoomOpenOrders />
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Right Column - Basket & Queue (1/3 width on xl) */}
+          <div className="space-y-4">
+            <BasketWidget />
+            <AnalysisQueueWidget onViewDetails={handleViewReasoningDetails} />
+          </div>
+        </div>
+
+        {/* Reasoning Slide Panel */}
+        <ReasoningSlidePanel
+          isOpen={showReasoningPanel}
+          onClose={() => setShowReasoningPanel(false)}
+        />
+      </div>
+    );
+  }
+
+  // Default - stock market dashboard
   return (
-    <div className="p-3 md:p-4 space-y-3 h-full flex flex-col">
-      {/* Workflow Progress - Compact at top */}
-      {ticker && status !== 'idle' && (
-        <section className="flex-shrink-0">
-          <WorkflowProgress
-            currentStage={currentStage}
-            status={status}
-            ticker={ticker}
-          />
-        </section>
-      )}
+    <div className="p-3 md:p-4 space-y-4">
+      {/* Show WelcomePanel on first visit, DashboardSummary on subsequent visits */}
+      {hasVisited ? <DashboardSummary /> : <WelcomePanel />}
 
-      {/* Main Content Grid - Flexible height */}
-      <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-3 min-h-0">
-        {/* Left Column */}
-        <div className="flex flex-col gap-3 min-h-0 overflow-y-auto">
-          {/* Chart Section */}
-          {showChartPanel && ticker && (
-            <section className="flex-shrink-0">
-              <ChartPanel ticker={ticker} />
-            </section>
-          )}
-
-          {/* Coin Info - Show for coin markets */}
-          {ticker && ticker.includes('-') && (
-            <section className="flex-shrink-0">
-              <CoinInfo market={ticker} />
-            </section>
-          )}
-
+      {/* Main Grid - Trading Dashboard + Basket/Queue */}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
+        {/* Left Column - Main Content (2/3 width on xl) */}
+        <div className="xl:col-span-2 space-y-4">
           {/* Active Position */}
           {activePosition && (
-            <section className="flex-shrink-0">
+            <section>
               <PositionCard position={activePosition} />
             </section>
           )}
-
-          {/* Trade Proposal */}
-          {proposal && awaitingApproval && (
-            <section className="flex-shrink-0">
-              <ProposalCard proposal={proposal} />
-            </section>
-          )}
-
-          {/* Analysis Grid */}
-          {analyses.length > 0 && (
-            <section className="flex-shrink-0">
-              <h2 className="text-sm font-semibold mb-2">Analysis Results</h2>
-              <AnalysisPanel analyses={analyses} />
-            </section>
-          )}
-
-          {/* Coin Market Overview - Show during analysis for coin markets */}
-          {activeMarket === 'coin' && status === 'running' && (
-            <section className="flex-shrink-0">
-              <CoinMarketDashboard compact />
-            </section>
-          )}
-
-          {/* Coin Trading Panels - Show for coin markets */}
-          {activeMarket === 'coin' && (
-            <>
-              <section className="flex-shrink-0">
-                <CoinPositionPanel />
-              </section>
-              <section className="flex-shrink-0">
-                <CoinOpenOrders />
-              </section>
-            </>
-          )}
         </div>
 
-        {/* Right Column - Reasoning Log */}
-        {reasoningLog.length > 0 && (
-          <div className="min-h-0 overflow-hidden">
-            <ReasoningLog entries={reasoningLog} maxHeight={undefined} />
-          </div>
-        )}
+        {/* Right Column - Basket & Queue (1/3 width on xl) */}
+        <div className="space-y-4">
+          <BasketWidget />
+          <AnalysisQueueWidget onViewDetails={handleViewReasoningDetails} />
+        </div>
       </div>
+
+      {/* Reasoning Slide Panel */}
+      <ReasoningSlidePanel
+        isOpen={showReasoningPanel}
+        onClose={() => setShowReasoningPanel(false)}
+      />
     </div>
   );
 }

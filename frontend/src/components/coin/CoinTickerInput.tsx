@@ -121,16 +121,19 @@ export function CoinTickerInput() {
       }
 
       // Connect WebSocket for real-time updates (using coin-specific handlers)
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      activeCoinWebSocket = createStoreWebSocket(response.session_id, {
-        addReasoningEntry: addCoinReasoning,
-        setStatus: setCoinStatus,
-        setCurrentStage: setCoinStage,
-        setTradeProposal: setCoinProposal as any,
-        setAwaitingApproval: setCoinAwaitingApproval,
-        setActivePosition: setCoinPosition,
-        setError: setCoinError,
-      });
+      activeCoinWebSocket = createStoreWebSocket(
+        response.session_id,
+        {
+          addReasoningEntry: addCoinReasoning,
+          setStatus: setCoinStatus,
+          setCurrentStage: setCoinStage,
+          setTradeProposal: setCoinProposal,
+          setAwaitingApproval: setCoinAwaitingApproval,
+          setActivePosition: setCoinPosition,
+          setError: setCoinError,
+        },
+        'coin' // Market type for correct proposal format (₩ currency)
+      );
 
       activeCoinWebSocket.connect();
 

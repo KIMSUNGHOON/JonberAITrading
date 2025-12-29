@@ -15,6 +15,7 @@ import {
 import { useStore, selectChartConfig } from '@/store';
 import { TradingChart } from './TradingChart';
 import { CoinPriceTicker } from '@/components/coin/CoinPriceTicker';
+import { KRStockPriceTicker } from '@/components/kiwoom/KRStockPriceTicker';
 import type { TimeFrame } from '@/types';
 
 interface ChartPanelProps {
@@ -56,10 +57,15 @@ export function ChartPanel({ ticker }: ChartPanelProps) {
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-3">
-          {/* Show real-time price ticker for coin markets */}
+          {/* Show real-time price ticker based on market type */}
           {ticker.includes('-') ? (
+            // Coin market (e.g., KRW-BTC)
             <CoinPriceTicker market={ticker} showDetails />
+          ) : /^\d{6}$/.test(ticker) ? (
+            // Korean stock (6-digit code)
+            <KRStockPriceTicker stk_cd={ticker} showDetails />
           ) : (
+            // US stock (fallback)
             <>
               <h2 className="font-semibold text-lg">{ticker}</h2>
               <span className="live-indicator text-sm text-bull">Live</span>

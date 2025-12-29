@@ -22,6 +22,12 @@ from app.api.schemas.analysis import (
     SessionListResponse,
     TradeProposalResponse,
 )
+from app.core.analysis_limiter import (
+    acquire_analysis_slot,
+    release_analysis_slot,
+    register_session,
+    update_session_status,
+)
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -111,6 +117,7 @@ async def run_analysis_task(session_id: str, initial_state: dict):
     Background task to run the analysis graph.
 
     Runs until the approval interrupt point.
+    Uses semaphore to limit concurrent analyses.
     """
     graph = get_trading_graph()
     session = active_sessions.get(session_id)
@@ -119,7 +126,30 @@ async def run_analysis_task(session_id: str, initial_state: dict):
         logger.error("session_not_found_in_task", session_id=session_id)
         return
 
+    # Acquire analysis slot (with timeout)
+    slot_acquired = await acquire_analysis_slot(timeout=60.0)
+    if not slot_acquired:
+        session["status"] = "error"
+        session["error"] = "Analysis queue is full. Please try again later."
+        session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
+            "[Error] Concurrent analysis limit reached - please try again later."
+        ]
+        update_session_status(session_id, "error", session["error"])
+        logger.warning(
+            "analysis_slot_timeout",
+            session_id=session_id,
+        )
+        return
+
     try:
+        # Register with unified session tracker
+        register_session(
+            session_id=session_id,
+            market_type="stock",
+            ticker=session["ticker"],
+            display_name=session["ticker"],
+        )
+
         config = {"configurable": {"thread_id": session_id}}
 
         # Run until interrupt (approval node)
@@ -141,6 +171,7 @@ async def run_analysis_task(session_id: str, initial_state: dict):
         state = session["state"]
         if state.get("awaiting_approval"):
             session["status"] = "awaiting_approval"
+            update_session_status(session_id, "awaiting_approval")
             logger.info(
                 "analysis_awaiting_approval",
                 session_id=session_id,
@@ -148,6 +179,7 @@ async def run_analysis_task(session_id: str, initial_state: dict):
             )
         else:
             session["status"] = "completed"
+            update_session_status(session_id, "completed")
 
     except Exception as e:
         logger.error(
@@ -157,6 +189,15 @@ async def run_analysis_task(session_id: str, initial_state: dict):
         )
         session["status"] = "error"
         session["error"] = str(e)
+        update_session_status(session_id, "error", str(e))
+
+    finally:
+        # Always release the analysis slot
+        release_analysis_slot()
+        logger.debug(
+            "analysis_slot_released",
+            session_id=session_id,
+        )
 
 
 @router.get("/status/{session_id}", response_model=AnalysisStatusResponse)
@@ -307,3 +348,65 @@ async def delete_session(session_id: str):
 def get_active_sessions() -> dict:
     """Get reference to active sessions (for WebSocket, approval routes)."""
     return active_sessions
+
+
+# -------------------------------------------
+# Translation Endpoint
+# -------------------------------------------
+
+from pydantic import BaseModel
+from agents.llm_provider import get_llm_provider
+from langchain_core.messages import SystemMessage, HumanMessage
+
+
+class TranslationRequest(BaseModel):
+    """Translation request model."""
+    text: str
+    target_language: str = "en"  # "en" for English, "ko" for Korean
+
+
+class TranslationResponse(BaseModel):
+    """Translation response model."""
+    original: str
+    translated: str
+    target_language: str
+
+
+@router.post("/translate", response_model=TranslationResponse)
+async def translate_text(request: TranslationRequest):
+    """
+    Translate text between Korean and English using LLM.
+
+    Args:
+        request: Translation request with text and target language
+
+    Returns:
+        Original and translated text
+    """
+    try:
+        llm = get_llm_provider()
+
+        if request.target_language == "en":
+            prompt = "Translate the following Korean text to English. Only output the translation, nothing else."
+        else:
+            prompt = "Translate the following English text to Korean. Only output the translation, nothing else."
+
+        messages = [
+            SystemMessage(content=prompt),
+            HumanMessage(content=request.text),
+        ]
+
+        translated = await llm.generate(messages)
+
+        return TranslationResponse(
+            original=request.text,
+            translated=translated.strip(),
+            target_language=request.target_language,
+        )
+
+    except Exception as e:
+        logger.error("translation_failed", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Translation failed: {str(e)}",
+        )

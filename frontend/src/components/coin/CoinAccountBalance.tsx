@@ -56,7 +56,9 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
   const krwAccount = accounts.find((a) => a.currency === 'KRW');
   const coinAccounts = accounts.filter((a) => a.currency !== 'KRW' && (a.balance > 0 || a.locked > 0));
 
-  if (isLoading) {
+  // Only show loading skeleton on initial load (when no data exists)
+  // After data exists, just show refresh indicator without replacing content
+  if (isLoading && accounts.length === 0) {
     return (
       <div className="card animate-pulse">
         <div className="h-24 bg-surface rounded" />
@@ -94,7 +96,7 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
           className="p-1 hover:bg-surface rounded transition-colors"
           title="Refresh"
         >
-          <RefreshCw size={16} className="text-gray-400" />
+          <RefreshCw size={16} className={`text-gray-400 ${isLoading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 

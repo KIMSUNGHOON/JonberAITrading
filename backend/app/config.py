@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     UPBIT_TRADING_MODE: Literal["paper", "live"] = "paper"
 
     # -------------------------------------------
+    # Kiwoom REST API Configuration (Korean Stocks)
+    # -------------------------------------------
+    KIWOOM_APP_KEY: str | None = None
+    KIWOOM_SECRET_KEY: str | None = None
+    KIWOOM_ACCOUNT_NO: str | None = None
+    KIWOOM_IS_MOCK: bool = True  # True: 모의투자, False: 실거래
+
+    # -------------------------------------------
     # API Server Configuration
     # -------------------------------------------
     API_HOST: str = "0.0.0.0"
@@ -87,6 +95,21 @@ class Settings(BaseSettings):
         Local providers (vLLM, Ollama) don't require API keys.
         """
         return "not-needed-for-local"
+
+    @property
+    def kiwoom_base_url(self) -> str:
+        """
+        Kiwoom API Base URL.
+        Returns mock URL for paper trading, live URL for real trading.
+
+        Note: 모의투자(mockapi)는 KRX(한국거래소) 종목만 지원합니다.
+              NXT(대체거래소), SOR(스마트오더라우팅)는 실서버에서만 사용 가능합니다.
+        """
+        return (
+            "https://mockapi.kiwoom.com"  # KRX만 지원
+            if self.KIWOOM_IS_MOCK
+            else "https://api.kiwoom.com"  # KRX, NXT, SOR 모두 지원
+        )
 
 
 @lru_cache

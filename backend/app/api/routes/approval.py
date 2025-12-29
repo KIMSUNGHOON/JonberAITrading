@@ -10,9 +10,11 @@ import structlog
 from fastapi import APIRouter, HTTPException, status
 
 from agents.graph.coin_trading_graph import get_coin_trading_graph
+from agents.graph.kr_stock_graph import get_kr_stock_trading_graph
 from agents.graph.trading_graph import get_trading_graph
 from app.api.routes.analysis import get_active_sessions
 from app.api.routes.coin import get_coin_sessions
+from app.api.routes.kr_stocks import get_kr_stock_sessions
 from app.api.schemas.approval import (
     ApprovalRequest,
     ApprovalResponse,
@@ -43,10 +45,11 @@ async def submit_approval(request: ApprovalRequest):
     Returns:
         Updated status after decision is processed
     """
-    # Search both stock and coin sessions
+    # Search all session types: US stock, coin, and Korean stock
     stock_sessions = get_active_sessions()
     coin_sessions = get_coin_sessions()
-    session = stock_sessions.get(request.session_id) or coin_sessions.get(request.session_id)
+    kr_stock_sessions = get_kr_stock_sessions()
+    session = stock_sessions.get(request.session_id) or coin_sessions.get(request.session_id) or kr_stock_sessions.get(request.session_id)
 
     if not session:
         raise HTTPException(
@@ -89,8 +92,12 @@ async def submit_approval(request: ApprovalRequest):
                     )
 
     # Resume graph execution - select appropriate graph based on session type
-    is_coin_session = request.session_id in coin_sessions
-    graph = get_coin_trading_graph() if is_coin_session else get_trading_graph()
+    if request.session_id in kr_stock_sessions:
+        graph = get_kr_stock_trading_graph()
+    elif request.session_id in coin_sessions:
+        graph = get_coin_trading_graph()
+    else:
+        graph = get_trading_graph()
     config = {"configurable": {"thread_id": request.session_id}}
 
     execution_status = None
@@ -168,10 +175,11 @@ async def list_pending_approvals():
     Returns:
         List of pending approvals with trade proposal details
     """
-    # Combine stock and coin sessions
+    # Combine all session types: US stock, coin, and Korean stock
     stock_sessions = get_active_sessions()
     coin_sessions = get_coin_sessions()
-    all_sessions = {**stock_sessions, **coin_sessions}
+    kr_stock_sessions = get_kr_stock_sessions()
+    all_sessions = {**stock_sessions, **coin_sessions, **kr_stock_sessions}
     pending = []
 
     for session_id, session in all_sessions.items():
@@ -196,8 +204,8 @@ async def list_pending_approvals():
         action = proposal.get("action", "HOLD")
         rationale = proposal.get("rationale", "")
 
-        # Get ticker/market - stock sessions use "ticker", coin sessions use "market"
-        ticker = session.get("ticker") or session.get("market", "UNKNOWN")
+        # Get ticker/market/stk_cd - each session type uses different keys
+        ticker = session.get("ticker") or session.get("market") or session.get("stk_cd", "UNKNOWN")
 
         pending.append(
             PendingApprovalItem(
@@ -232,10 +240,11 @@ async def get_pending_approval(session_id: str):
     Returns:
         Detailed trade proposal and analyses
     """
-    # Search both stock and coin sessions
+    # Search all session types: US stock, coin, and Korean stock
     stock_sessions = get_active_sessions()
     coin_sessions = get_coin_sessions()
-    session = stock_sessions.get(session_id) or coin_sessions.get(session_id)
+    kr_stock_sessions = get_kr_stock_sessions()
+    session = stock_sessions.get(session_id) or coin_sessions.get(session_id) or kr_stock_sessions.get(session_id)
 
     if not session:
         raise HTTPException(
@@ -256,8 +265,8 @@ async def get_pending_approval(session_id: str):
     # Handle proposal as dict
     action = proposal.get("action", "HOLD") if proposal else "HOLD"
 
-    # Get ticker/market - stock sessions use "ticker", coin sessions use "market"
-    ticker = session.get("ticker") or session.get("market", "UNKNOWN")
+    # Get ticker/market/stk_cd - each session type uses different keys
+    ticker = session.get("ticker") or session.get("market") or session.get("stk_cd", "UNKNOWN")
 
     return {
         "session_id": session_id,

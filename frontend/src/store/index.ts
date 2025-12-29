@@ -24,6 +24,9 @@ import type {
   ChartConfig,
   TimeFrame,
   CoinTradeProposal,
+  KRStockTradeProposal,
+  SessionData,
+  DetailedAnalysisResults,
 } from '@/types';
 
 // UUID 생성 함수 (crypto.randomUUID 폴백)
@@ -48,6 +51,16 @@ interface HistoryItem {
   sessionId: string;
   timestamp: Date;
   status: SessionStatus | 'idle';
+
+  // Phase 9: Extended analysis data (optional for backward compatibility)
+  displayName?: string;
+  completedAt?: Date | null;
+  analysisResults?: DetailedAnalysisResults | null;
+  analyses?: AnalysisSummary[];
+  tradeProposal?: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+  reasoningSummary?: string | null;
+  duration?: number | null;  // Analysis duration in ms
+  dataVersion?: string;  // Schema version: '1.0' = legacy, '2.0' = with detailed results
 }
 
 // Stock-specific history
@@ -61,8 +74,15 @@ interface CoinHistoryItem extends HistoryItem {
   koreanName?: string;
 }
 
+// Kiwoom (Korean stock) specific history
+interface KiwoomHistoryItem extends HistoryItem {
+  type: 'kiwoom';
+  stk_cd: string;
+  stk_nm?: string;
+}
+
 // Combined ticker history (for backward compatibility)
-type TickerHistoryItem = StockHistoryItem | CoinHistoryItem;
+type TickerHistoryItem = StockHistoryItem | CoinHistoryItem | KiwoomHistoryItem;
 
 // Base analysis state (shared structure)
 interface BaseAnalysisState {
@@ -92,16 +112,41 @@ interface CoinState extends BaseAnalysisState {
   history: CoinHistoryItem[];
 }
 
+// Kiwoom (Korean stock) specific state - Multi-session support
+interface KiwoomState {
+  // Multi-session support
+  sessions: SessionData[];
+  activeSessionId: string | null;  // Currently displayed session
+  maxConcurrentSessions: number;   // Default: 3
+
+  // Legacy single-session fields (for backward compatibility)
+  stk_cd: string;           // e.g., "005930" (Samsung Electronics)
+  stk_nm: string | null;    // e.g., "삼성전자"
+  status: SessionStatus | 'idle';
+  currentStage: string | null;
+  reasoningLog: string[];
+  analyses: AnalysisSummary[];
+  tradeProposal: KRStockTradeProposal | null;
+  awaitingApproval: boolean;
+  activePosition: Position | null;
+  error: string | null;
+  history: KiwoomHistoryItem[];
+}
+
 interface ChatState {
   messages: ChatMessage[];
   isTyping: boolean;
 }
 
-type MarketType = 'stock' | 'coin';
+type MarketType = 'stock' | 'coin' | 'kiwoom';
+type StockRegion = 'us' | 'kr';
+
+type ChatPopupSize = 'small' | 'medium' | 'large';
 
 interface UIState {
   // Market selection
   activeMarket: MarketType;
+  stockRegion: StockRegion;  // US or Korea within stock market
 
   // Panels
   showApprovalDialog: boolean;
@@ -110,11 +155,63 @@ interface UIState {
   isMobileMenuOpen: boolean;
   sidebarCollapsed: boolean;
 
+  // Chat Popup (Desktop)
+  chatPopupOpen: boolean;
+  chatPopupSize: ChatPopupSize;
+  chatPopupPosition: { x: number; y: number };
+
   // Upbit API status
   upbitApiConfigured: boolean;
 
+  // Kiwoom API status
+  kiwoomApiConfigured: boolean;
+
   // Chart config
   chartConfig: ChartConfig;
+
+  // First visit tracking (persisted to localStorage)
+  hasVisited: boolean;
+
+  // Current view/page
+  currentView: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'workflow' | 'analysis-detail';
+
+  // Selected session for detail view
+  selectedSessionId: string | null;
+}
+
+// -------------------------------------------
+// Basket (Watchlist) Types
+// -------------------------------------------
+
+export interface BasketItem {
+  id: string;
+  marketType: MarketType;
+  ticker: string;           // 005930, KRW-BTC, AAPL
+  displayName: string;      // 삼성전자, 비트코인, Apple Inc.
+  price: number;
+  prevPrice: number;        // For calculating change
+  changeRate: number;       // Percentage change
+  change: 'RISE' | 'FALL' | 'EVEN';
+  addedAt: Date;
+  lastUpdated: Date | null;
+  isLoading: boolean;
+  error: string | null;     // API error message if any
+}
+
+interface BasketState {
+  items: BasketItem[];
+  maxItems: number;         // Default: 10
+  isUpdating: boolean;
+}
+
+interface BasketActions {
+  addToBasket: (item: Omit<BasketItem, 'id' | 'addedAt' | 'lastUpdated' | 'isLoading' | 'error'>) => boolean;
+  removeFromBasket: (id: string) => void;
+  clearBasket: () => void;
+  updateBasketItemPrice: (ticker: string, price: number, changeRate: number, change: 'RISE' | 'FALL' | 'EVEN') => void;
+  setBasketItemLoading: (ticker: string, loading: boolean) => void;
+  setBasketItemError: (ticker: string, error: string | null) => void;
+  setBasketUpdating: (updating: boolean) => void;
 }
 
 interface StockActions {
@@ -147,6 +244,44 @@ interface CoinActions {
   resetCoin: () => void;
 }
 
+interface KiwoomActions {
+  // Kiwoom (Korean stock) session actions - Legacy (operates on active session)
+  startKiwoomSession: (sessionId: string, stk_cd: string, stk_nm?: string) => void;
+  setKiwoomStatus: (status: SessionStatus) => void;
+  setKiwoomStage: (stage: string) => void;
+  addKiwoomReasoning: (entry: string) => void;
+  setKiwoomAnalyses: (analyses: AnalysisSummary[]) => void;
+  addKiwoomAnalysis: (analysis: AnalysisSummary) => void;
+  setKiwoomProposal: (proposal: KRStockTradeProposal | null) => void;
+  setKiwoomAwaitingApproval: (awaiting: boolean) => void;
+  setKiwoomPosition: (position: Position | null) => void;
+  setKiwoomError: (error: string | null) => void;
+  resetKiwoom: () => void;
+
+  // Multi-session management
+  addKiwoomSession: (session: SessionData) => boolean;
+  removeKiwoomSession: (sessionId: string) => void;
+  setActiveKiwoomSession: (sessionId: string | null) => void;
+
+  // Multi-session state updates (sessionId-specific)
+  updateKiwoomSessionStatus: (sessionId: string, status: SessionStatus) => void;
+  updateKiwoomSessionStage: (sessionId: string, stage: string) => void;
+  addKiwoomSessionReasoning: (sessionId: string, entry: string) => void;
+  setKiwoomSessionProposal: (sessionId: string, proposal: KRStockTradeProposal | null) => void;
+  setKiwoomSessionAwaitingApproval: (sessionId: string, awaiting: boolean) => void;
+  setKiwoomSessionError: (sessionId: string, error: string | null) => void;
+
+  // Phase 9: Complete session with detailed analysis results
+  completeKiwoomSession: (
+    sessionId: string,
+    data: {
+      analysisResults?: DetailedAnalysisResults | null;
+      tradeProposal?: KRStockTradeProposal | null;
+      reasoningSummary?: string;
+    }
+  ) => void;
+}
+
 interface ChatActions {
   addChatMessage: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => void;
   setIsTyping: (typing: boolean) => void;
@@ -155,15 +290,26 @@ interface ChatActions {
 
 interface UIActions {
   setActiveMarket: (market: MarketType) => void;
+  setStockRegion: (region: StockRegion) => void;
   setShowApprovalDialog: (show: boolean) => void;
   setShowChartPanel: (show: boolean) => void;
   setShowSettingsModal: (show: boolean) => void;
   setMobileMenuOpen: (open: boolean) => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
   toggleSidebar: () => void;
+  // Chat Popup actions
+  setChatPopupOpen: (open: boolean) => void;
+  toggleChatPopup: () => void;
+  setChatPopupSize: (size: ChatPopupSize) => void;
+  setChatPopupPosition: (position: { x: number; y: number }) => void;
   setUpbitApiConfigured: (configured: boolean) => void;
+  setKiwoomApiConfigured: (configured: boolean) => void;
   setChartTimeframe: (timeframe: TimeFrame) => void;
   toggleChartIndicator: (indicator: 'showSMA50' | 'showSMA200' | 'showVolume') => void;
+  setHasVisited: (visited: boolean) => void;
+  // View/Page navigation
+  setCurrentView: (view: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'workflow' | 'analysis-detail') => void;
+  setSelectedSessionId: (sessionId: string | null) => void;
 }
 
 // Legacy actions for backward compatibility
@@ -184,7 +330,9 @@ interface LegacyActions {
 type Store = {
   stock: StockState;
   coin: CoinState;
-} & ChatState & UIState & StockActions & CoinActions & ChatActions & UIActions & LegacyActions;
+  kiwoom: KiwoomState;
+  basket: BasketState;
+} & ChatState & UIState & StockActions & CoinActions & KiwoomActions & ChatActions & UIActions & BasketActions & LegacyActions;
 
 // -------------------------------------------
 // Initial States
@@ -219,25 +367,71 @@ const initialCoinState: CoinState = {
   history: [],
 };
 
+const initialKiwoomState: KiwoomState = {
+  // Multi-session support
+  sessions: [],
+  activeSessionId: null,
+  maxConcurrentSessions: 3,
+
+  // Legacy single-session fields (for backward compatibility)
+  stk_cd: '',
+  stk_nm: null,
+  status: 'idle',
+  currentStage: null,
+  reasoningLog: [],
+  analyses: [],
+  tradeProposal: null,
+  awaitingApproval: false,
+  activePosition: null,
+  error: null,
+  history: [],
+};
+
+const initialBasketState: BasketState = {
+  items: [],
+  maxItems: 10,
+  isUpdating: false,
+};
+
 const initialChatState: ChatState = {
   messages: [],
   isTyping: false,
 };
 
+// Helper to read hasVisited from localStorage
+const getHasVisitedFromStorage = (): boolean => {
+  if (typeof window === 'undefined') return false;
+  try {
+    return localStorage.getItem('agentic-trading-has-visited') === 'true';
+  } catch {
+    return false;
+  }
+};
+
 const initialUIState: UIState = {
   activeMarket: 'stock',
+  stockRegion: 'us',
   showApprovalDialog: false,
   showChartPanel: true,
   showSettingsModal: false,
   isMobileMenuOpen: false,
   sidebarCollapsed: false,
+  // Chat Popup (Desktop) - default values
+  chatPopupOpen: false,
+  chatPopupSize: 'medium',
+  chatPopupPosition: { x: -1, y: -1 }, // -1 = use default position (bottom-right)
   upbitApiConfigured: false,
+  kiwoomApiConfigured: false,
   chartConfig: {
     timeframe: '1d',
     showSMA50: true,
     showSMA200: true,
     showVolume: true,
   },
+  hasVisited: getHasVisitedFromStorage(),
+  // View/Page navigation
+  currentView: 'dashboard',
+  selectedSessionId: null,
 };
 
 // -------------------------------------------
@@ -250,6 +444,8 @@ export const useStore = create<Store>()(
       // Initial states
       stock: initialStockState,
       coin: initialCoinState,
+      kiwoom: initialKiwoomState,
+      basket: initialBasketState,
       ...initialChatState,
       ...initialUIState,
 
@@ -323,10 +519,27 @@ export const useStore = create<Store>()(
         })),
 
       setStockProposal: (proposal) =>
-        set((state) => ({
-          stock: { ...state.stock, tradeProposal: proposal },
-          showApprovalDialog: proposal !== null,
-        })),
+        set((state) => {
+          // Add proposal message to chat if proposal exists
+          const newMessages = proposal
+            ? [
+                ...state.messages,
+                {
+                  id: generateUUID(),
+                  role: 'proposal' as const,
+                  content: `Trade Proposal for ${proposal.ticker}`,
+                  timestamp: new Date(),
+                  metadata: { proposal },
+                },
+              ]
+            : state.messages;
+
+          return {
+            stock: { ...state.stock, tradeProposal: proposal },
+            messages: newMessages,
+            chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
+          };
+        }),
 
       setStockAwaitingApproval: (awaiting) =>
         set((state) => ({
@@ -428,10 +641,27 @@ export const useStore = create<Store>()(
         })),
 
       setCoinProposal: (proposal) =>
-        set((state) => ({
-          coin: { ...state.coin, tradeProposal: proposal },
-          showApprovalDialog: proposal !== null,
-        })),
+        set((state) => {
+          // Add proposal message to chat if proposal exists
+          const newMessages = proposal
+            ? [
+                ...state.messages,
+                {
+                  id: generateUUID(),
+                  role: 'proposal' as const,
+                  content: `Trade Proposal for ${proposal.korean_name || proposal.market}`,
+                  timestamp: new Date(),
+                  metadata: { proposal },
+                },
+              ]
+            : state.messages;
+
+          return {
+            coin: { ...state.coin, tradeProposal: proposal },
+            messages: newMessages,
+            chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
+          };
+        }),
 
       setCoinAwaitingApproval: (awaiting) =>
         set((state) => ({
@@ -462,6 +692,597 @@ export const useStore = create<Store>()(
         })),
 
       // -------------------------------------------
+      // Kiwoom (Korean Stock) Actions
+      // -------------------------------------------
+      startKiwoomSession: (sessionId, stk_cd, stk_nm) =>
+        set((state) => {
+          console.log('[Store] startKiwoomSession called', {
+            sessionId,
+            stk_cd,
+            stk_nm,
+            existingSessions: state.kiwoom.sessions.map(s => s.sessionId),
+          });
+
+          // Add to history if not exists
+          const existingIndex = state.kiwoom.history.findIndex(
+            (h) => h.sessionId === sessionId
+          );
+          let newHistory = [...state.kiwoom.history];
+          if (existingIndex === -1) {
+            newHistory = [
+              {
+                type: 'kiwoom' as const,
+                ticker: stk_cd,
+                stk_cd,
+                stk_nm,
+                sessionId,
+                timestamp: new Date(),
+                status: 'running' as const,
+              },
+              ...state.kiwoom.history,
+            ].slice(0, 20);
+          }
+
+          // Create new SessionData object and add to sessions[] array
+          const now = new Date();
+          const newSession: SessionData = {
+            sessionId,
+            ticker: stk_cd,
+            displayName: stk_nm || stk_cd,
+            marketType: 'kiwoom' as const,
+            status: 'running' as SessionStatus,
+            currentStage: null,
+            reasoningLog: [],
+            analyses: [],
+            tradeProposal: null,
+            awaitingApproval: false,
+            activePosition: null,
+            error: null,
+            createdAt: now,
+            updatedAt: now,
+          };
+
+          // Add to sessions array if not already exists
+          const existingSessionIndex = state.kiwoom.sessions.findIndex(
+            s => s.sessionId === sessionId
+          );
+          const newSessions = existingSessionIndex === -1
+            ? [...state.kiwoom.sessions, newSession]
+            : state.kiwoom.sessions;
+
+          console.log('[Store] startKiwoomSession - session added', {
+            sessionId,
+            totalSessions: newSessions.length,
+            allSessionIds: newSessions.map(s => s.sessionId),
+          });
+
+          return {
+            kiwoom: {
+              ...initialKiwoomState,
+              // Include the new session in the sessions array
+              sessions: newSessions,
+              activeSessionId: sessionId,
+              stk_cd,
+              stk_nm: stk_nm || null,
+              status: 'running',
+              history: newHistory,
+            },
+          };
+        }),
+
+      setKiwoomStatus: (status) =>
+        set((state) => {
+          // Update history
+          const newHistory = state.kiwoom.history.map((h) =>
+            h.sessionId === state.kiwoom.activeSessionId ? { ...h, status } : h
+          );
+          // Also update sessions[] array to keep in sync
+          const newSessions = state.kiwoom.sessions.map((s) =>
+            s.sessionId === state.kiwoom.activeSessionId
+              ? { ...s, status: status as SessionStatus, updatedAt: new Date() }
+              : s
+          );
+          return {
+            kiwoom: { ...state.kiwoom, status, history: newHistory, sessions: newSessions },
+          };
+        }),
+
+      setKiwoomStage: (stage) =>
+        set((state) => {
+          // Also update sessions[] array to keep in sync
+          const newSessions = state.kiwoom.sessions.map((s) =>
+            s.sessionId === state.kiwoom.activeSessionId
+              ? { ...s, currentStage: stage, updatedAt: new Date() }
+              : s
+          );
+          return {
+            kiwoom: { ...state.kiwoom, currentStage: stage, sessions: newSessions },
+          };
+        }),
+
+      addKiwoomReasoning: (entry) =>
+        set((state) => {
+          // Also update sessions[] array to keep in sync
+          const newSessions = state.kiwoom.sessions.map((s) =>
+            s.sessionId === state.kiwoom.activeSessionId
+              ? { ...s, reasoningLog: [...s.reasoningLog, entry], updatedAt: new Date() }
+              : s
+          );
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              reasoningLog: [...state.kiwoom.reasoningLog, entry],
+              sessions: newSessions,
+            },
+          };
+        }),
+
+      setKiwoomAnalyses: (analyses) =>
+        set((state) => {
+          // Also update sessions[] array to keep in sync
+          const newSessions = state.kiwoom.sessions.map((s) =>
+            s.sessionId === state.kiwoom.activeSessionId
+              ? { ...s, analyses, updatedAt: new Date() }
+              : s
+          );
+          return {
+            kiwoom: { ...state.kiwoom, analyses, sessions: newSessions },
+          };
+        }),
+
+      addKiwoomAnalysis: (analysis) =>
+        set((state) => {
+          const newAnalyses = [...state.kiwoom.analyses, analysis];
+          // Also update sessions[] array to keep in sync
+          const newSessions = state.kiwoom.sessions.map((s) =>
+            s.sessionId === state.kiwoom.activeSessionId
+              ? { ...s, analyses: [...s.analyses, analysis], updatedAt: new Date() }
+              : s
+          );
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              analyses: newAnalyses,
+              sessions: newSessions,
+            },
+          };
+        }),
+
+      setKiwoomProposal: (proposal) =>
+        set((state) => {
+          // Add proposal message to chat if proposal exists
+          const newMessages = proposal
+            ? [
+                ...state.messages,
+                {
+                  id: generateUUID(),
+                  role: 'proposal' as const,
+                  content: `Trade Proposal for ${proposal.stk_nm || proposal.stk_cd}`,
+                  timestamp: new Date(),
+                  metadata: { proposal },
+                },
+              ]
+            : state.messages;
+
+          // Also update sessions[] array to keep in sync
+          const newSessions = state.kiwoom.sessions.map((s) =>
+            s.sessionId === state.kiwoom.activeSessionId
+              ? { ...s, tradeProposal: proposal, updatedAt: new Date() }
+              : s
+          );
+
+          return {
+            kiwoom: { ...state.kiwoom, tradeProposal: proposal, sessions: newSessions },
+            messages: newMessages,
+            chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
+          };
+        }),
+
+      setKiwoomAwaitingApproval: (awaiting) =>
+        set((state) => {
+          // Also update sessions[] array to keep in sync
+          const newSessions = state.kiwoom.sessions.map((s) =>
+            s.sessionId === state.kiwoom.activeSessionId
+              ? { ...s, awaitingApproval: awaiting, updatedAt: new Date() }
+              : s
+          );
+          return {
+            kiwoom: { ...state.kiwoom, awaitingApproval: awaiting, sessions: newSessions },
+            showApprovalDialog: awaiting,
+          };
+        }),
+
+      setKiwoomPosition: (position) =>
+        set((state) => {
+          // Also update sessions[] array to keep in sync
+          const newSessions = state.kiwoom.sessions.map((s) =>
+            s.sessionId === state.kiwoom.activeSessionId
+              ? { ...s, activePosition: position, updatedAt: new Date() }
+              : s
+          );
+          return {
+            kiwoom: { ...state.kiwoom, activePosition: position, sessions: newSessions },
+          };
+        }),
+
+      setKiwoomError: (error) =>
+        set((state) => {
+          const newStatus = error ? 'error' : state.kiwoom.status;
+          // Also update sessions[] array to keep in sync
+          const newSessions = state.kiwoom.sessions.map((s) =>
+            s.sessionId === state.kiwoom.activeSessionId
+              ? { ...s, error, status: (error ? 'error' : s.status) as SessionStatus, updatedAt: new Date() }
+              : s
+          );
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              error,
+              status: newStatus,
+              sessions: newSessions,
+            },
+          };
+        }),
+
+      resetKiwoom: () =>
+        set((state) => ({
+          kiwoom: {
+            ...initialKiwoomState,
+            sessions: state.kiwoom.sessions,
+            history: state.kiwoom.history,
+          },
+        })),
+
+      // -------------------------------------------
+      // Kiwoom Multi-Session Actions
+      // -------------------------------------------
+      addKiwoomSession: (session) => {
+        const state = get();
+        console.log('[Store] addKiwoomSession called', {
+          newSessionId: session.sessionId,
+          ticker: session.ticker,
+          existingSessions: state.kiwoom.sessions.map(s => ({ id: s.sessionId, ticker: s.ticker })),
+          currentCount: state.kiwoom.sessions.length,
+        });
+
+        // Check if session already exists
+        if (state.kiwoom.sessions.some(s => s.sessionId === session.sessionId)) {
+          console.warn('[Store] Session already exists, skipping', session.sessionId);
+          return false;
+        }
+        // Check max concurrent limit
+        const runningSessions = state.kiwoom.sessions.filter(
+          s => s.status === 'running' || s.status === 'awaiting_approval'
+        );
+        if (runningSessions.length >= state.kiwoom.maxConcurrentSessions) {
+          console.warn('[Store] Max concurrent sessions reached', {
+            running: runningSessions.length,
+            max: state.kiwoom.maxConcurrentSessions,
+          });
+          return false;
+        }
+
+        const newSessions = [...state.kiwoom.sessions, session];
+        console.log('[Store] Session added successfully', {
+          newSessionId: session.sessionId,
+          totalSessions: newSessions.length,
+          allSessionIds: newSessions.map(s => s.sessionId),
+        });
+
+        // Also add to history if not already there
+        const existingHistoryIndex = state.kiwoom.history.findIndex(
+          h => h.sessionId === session.sessionId
+        );
+        let newHistory = [...state.kiwoom.history];
+        if (existingHistoryIndex === -1) {
+          newHistory = [
+            {
+              type: 'kiwoom' as const,
+              ticker: session.ticker,
+              stk_cd: session.ticker,
+              stk_nm: session.displayName,
+              sessionId: session.sessionId,
+              timestamp: new Date(),
+              status: session.status as 'running' | 'completed' | 'cancelled' | 'error',
+            },
+            ...state.kiwoom.history,
+          ].slice(0, 20);
+        }
+
+        set({
+          kiwoom: {
+            ...state.kiwoom,
+            sessions: newSessions,
+            history: newHistory,
+            activeSessionId: session.sessionId,
+            // Update legacy fields to match active session
+            stk_cd: session.ticker,
+            stk_nm: session.displayName,
+            status: session.status,
+            currentStage: session.currentStage,
+            reasoningLog: session.reasoningLog,
+            analyses: session.analyses,
+            tradeProposal: session.tradeProposal as KRStockTradeProposal | null,
+            awaitingApproval: session.awaitingApproval,
+            activePosition: session.activePosition,
+            error: session.error,
+          },
+        });
+        return true;
+      },
+
+      removeKiwoomSession: (sessionId) =>
+        set((state) => {
+          const newSessions = state.kiwoom.sessions.filter(s => s.sessionId !== sessionId);
+          const wasActive = state.kiwoom.activeSessionId === sessionId;
+          const newActiveId = wasActive
+            ? (newSessions.length > 0 ? newSessions[0].sessionId : null)
+            : state.kiwoom.activeSessionId;
+          const activeSession = newSessions.find(s => s.sessionId === newActiveId);
+
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              activeSessionId: newActiveId,
+              // Update legacy fields if active session changed
+              ...(wasActive && activeSession ? {
+                stk_cd: activeSession.ticker,
+                stk_nm: activeSession.displayName,
+                status: activeSession.status,
+                currentStage: activeSession.currentStage,
+                reasoningLog: activeSession.reasoningLog,
+                analyses: activeSession.analyses,
+                tradeProposal: activeSession.tradeProposal as KRStockTradeProposal | null,
+                awaitingApproval: activeSession.awaitingApproval,
+                activePosition: activeSession.activePosition,
+                error: activeSession.error,
+              } : {}),
+              ...(wasActive && !activeSession ? {
+                stk_cd: '',
+                stk_nm: null,
+                status: 'idle' as const,
+                currentStage: null,
+                reasoningLog: [],
+                analyses: [],
+                tradeProposal: null,
+                awaitingApproval: false,
+                activePosition: null,
+                error: null,
+              } : {}),
+            },
+          };
+        }),
+
+      setActiveKiwoomSession: (sessionId) =>
+        set((state) => {
+          const session = state.kiwoom.sessions.find(s => s.sessionId === sessionId);
+          if (!session && sessionId !== null) {
+            return state;
+          }
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              activeSessionId: sessionId,
+              // Sync legacy fields with active session
+              ...(session ? {
+                stk_cd: session.ticker,
+                stk_nm: session.displayName,
+                status: session.status,
+                currentStage: session.currentStage,
+                reasoningLog: session.reasoningLog,
+                analyses: session.analyses,
+                tradeProposal: session.tradeProposal as KRStockTradeProposal | null,
+                awaitingApproval: session.awaitingApproval,
+                activePosition: session.activePosition,
+                error: session.error,
+              } : {}),
+            },
+          };
+        }),
+
+      updateKiwoomSessionStatus: (sessionId, status) =>
+        set((state) => {
+          console.log('[Store] updateKiwoomSessionStatus called:', {
+            sessionId,
+            status,
+            existingSessions: state.kiwoom.sessions.map(s => ({ id: s.sessionId, status: s.status })),
+            activeSessionId: state.kiwoom.activeSessionId,
+          });
+          const newSessions = state.kiwoom.sessions.map(s =>
+            s.sessionId === sessionId
+              ? { ...s, status, updatedAt: new Date() }
+              : s
+          );
+          // Also update history to keep status in sync
+          const newHistory = state.kiwoom.history.map(h =>
+            h.sessionId === sessionId ? { ...h, status } : h
+          );
+          const isActive = state.kiwoom.activeSessionId === sessionId;
+          console.log('[Store] updateKiwoomSessionStatus result:', {
+            sessionFound: state.kiwoom.sessions.some(s => s.sessionId === sessionId),
+            newSessions: newSessions.map(s => ({ id: s.sessionId, status: s.status })),
+            isActive,
+          });
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              history: newHistory,
+              ...(isActive ? { status } : {}),
+            },
+          };
+        }),
+
+      updateKiwoomSessionStage: (sessionId, stage) =>
+        set((state) => {
+          const newSessions = state.kiwoom.sessions.map(s =>
+            s.sessionId === sessionId
+              ? { ...s, currentStage: stage, updatedAt: new Date() }
+              : s
+          );
+          const isActive = state.kiwoom.activeSessionId === sessionId;
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              ...(isActive ? { currentStage: stage } : {}),
+            },
+          };
+        }),
+
+      addKiwoomSessionReasoning: (sessionId, entry) =>
+        set((state) => {
+          const newSessions = state.kiwoom.sessions.map(s =>
+            s.sessionId === sessionId
+              ? { ...s, reasoningLog: [...s.reasoningLog, entry], updatedAt: new Date() }
+              : s
+          );
+          const isActive = state.kiwoom.activeSessionId === sessionId;
+          const session = newSessions.find(s => s.sessionId === sessionId);
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              ...(isActive && session ? { reasoningLog: session.reasoningLog } : {}),
+            },
+          };
+        }),
+
+      setKiwoomSessionProposal: (sessionId, proposal) =>
+        set((state) => {
+          const newSessions = state.kiwoom.sessions.map(s =>
+            s.sessionId === sessionId
+              ? { ...s, tradeProposal: proposal, updatedAt: new Date() }
+              : s
+          );
+          const isActive = state.kiwoom.activeSessionId === sessionId;
+
+          // Add proposal message to chat if proposal exists
+          const newMessages = proposal
+            ? [
+                ...state.messages,
+                {
+                  id: generateUUID(),
+                  role: 'proposal' as const,
+                  content: `Trade Proposal for ${(proposal as KRStockTradeProposal).stk_nm || (proposal as KRStockTradeProposal).stk_cd}`,
+                  timestamp: new Date(),
+                  metadata: { proposal },
+                },
+              ]
+            : state.messages;
+
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              ...(isActive ? { tradeProposal: proposal } : {}),
+            },
+            messages: newMessages,
+            chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
+          };
+        }),
+
+      setKiwoomSessionAwaitingApproval: (sessionId, awaiting) =>
+        set((state) => {
+          const newSessions = state.kiwoom.sessions.map(s =>
+            s.sessionId === sessionId
+              ? { ...s, awaitingApproval: awaiting, updatedAt: new Date() }
+              : s
+          );
+          const isActive = state.kiwoom.activeSessionId === sessionId;
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              ...(isActive ? { awaitingApproval: awaiting } : {}),
+            },
+            ...(isActive ? { showApprovalDialog: awaiting } : {}),
+          };
+        }),
+
+      setKiwoomSessionError: (sessionId, error) =>
+        set((state) => {
+          const newSessions = state.kiwoom.sessions.map(s =>
+            s.sessionId === sessionId
+              ? { ...s, error, status: error ? 'error' as const : s.status, updatedAt: new Date() }
+              : s
+          );
+          const isActive = state.kiwoom.activeSessionId === sessionId;
+          const session = newSessions.find(s => s.sessionId === sessionId);
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              ...(isActive && session ? { error, status: session.status } : {}),
+            },
+          };
+        }),
+
+      // Phase 9: Complete session with detailed analysis results
+      completeKiwoomSession: (sessionId, data) =>
+        set((state) => {
+          const session = state.kiwoom.sessions.find(s => s.sessionId === sessionId);
+          const startTime = session?.createdAt;
+          const now = new Date();
+          const duration = startTime ? now.getTime() - new Date(startTime).getTime() : null;
+
+          // Generate reasoning summary from log
+          const reasoningSummary = data.reasoningSummary ||
+            (session?.reasoningLog?.slice(-3).join('\n') || null);
+
+          // Update sessions array
+          const newSessions = state.kiwoom.sessions.map(s =>
+            s.sessionId === sessionId
+              ? {
+                  ...s,
+                  status: 'completed' as const,
+                  tradeProposal: data.tradeProposal ?? s.tradeProposal,
+                  updatedAt: now,
+                }
+              : s
+          );
+
+          // Update history with detailed analysis results
+          const newHistory = state.kiwoom.history.map(h =>
+            h.sessionId === sessionId
+              ? {
+                  ...h,
+                  status: 'completed' as const,
+                  completedAt: now,
+                  analysisResults: data.analysisResults || null,
+                  analyses: session?.analyses || [],
+                  tradeProposal: data.tradeProposal ?? session?.tradeProposal ?? null,
+                  reasoningSummary,
+                  duration,
+                  dataVersion: '2.0',
+                }
+              : h
+          );
+
+          const isActive = state.kiwoom.activeSessionId === sessionId;
+
+          console.log('[Store] completeKiwoomSession:', {
+            sessionId,
+            hasAnalysisResults: !!data.analysisResults,
+            hasProposal: !!data.tradeProposal,
+            duration,
+          });
+
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              history: newHistory,
+              ...(isActive ? {
+                status: 'completed' as const,
+                tradeProposal: data.tradeProposal ?? state.kiwoom.tradeProposal,
+              } : {}),
+            },
+          };
+        }),
+
+      // -------------------------------------------
       // Chat Actions
       // -------------------------------------------
       addChatMessage: (message) =>
@@ -483,7 +1304,13 @@ export const useStore = create<Store>()(
       // -------------------------------------------
       // UI Actions
       // -------------------------------------------
-      setActiveMarket: (market) => set({ activeMarket: market }),
+      setActiveMarket: (market) => set((state) => ({
+        activeMarket: market,
+        // Sync stockRegion when switching markets
+        stockRegion: market === 'kiwoom' ? 'kr' : market === 'stock' ? state.stockRegion : state.stockRegion,
+      })),
+
+      setStockRegion: (region) => set({ stockRegion: region }),
 
       setShowApprovalDialog: (show) => set({ showApprovalDialog: show }),
 
@@ -497,7 +1324,32 @@ export const useStore = create<Store>()(
 
       toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
 
+      // Chat Popup actions
+      setChatPopupOpen: (open) => set({ chatPopupOpen: open }),
+
+      toggleChatPopup: () => set((state) => ({ chatPopupOpen: !state.chatPopupOpen })),
+
+      setChatPopupSize: (size) => set({ chatPopupSize: size }),
+
+      setChatPopupPosition: (position) => set({ chatPopupPosition: position }),
+
       setUpbitApiConfigured: (configured) => set({ upbitApiConfigured: configured }),
+
+      setKiwoomApiConfigured: (configured) => set({ kiwoomApiConfigured: configured }),
+
+      setHasVisited: (visited) => {
+        // Persist to localStorage
+        try {
+          localStorage.setItem('agentic-trading-has-visited', visited ? 'true' : 'false');
+        } catch {
+          // Ignore localStorage errors
+        }
+        set({ hasVisited: visited });
+      },
+
+      setCurrentView: (view) => set({ currentView: view }),
+
+      setSelectedSessionId: (sessionId) => set({ selectedSessionId: sessionId }),
 
       setChartTimeframe: (timeframe) =>
         set((state) => ({
@@ -513,15 +1365,116 @@ export const useStore = create<Store>()(
         })),
 
       // -------------------------------------------
+      // Basket Actions
+      // -------------------------------------------
+      addToBasket: (item) => {
+        const state = get();
+        // Check if basket is full
+        if (state.basket.items.length >= state.basket.maxItems) {
+          return false;
+        }
+        // Check if item already exists
+        if (state.basket.items.some((i) => i.ticker === item.ticker && i.marketType === item.marketType)) {
+          return false;
+        }
+        const newItem: BasketItem = {
+          ...item,
+          id: generateUUID(),
+          addedAt: new Date(),
+          lastUpdated: null,
+          isLoading: false,
+          error: null,
+        };
+        set((state) => ({
+          basket: {
+            ...state.basket,
+            items: [...state.basket.items, newItem],
+          },
+        }));
+        return true;
+      },
+
+      removeFromBasket: (id) =>
+        set((state) => ({
+          basket: {
+            ...state.basket,
+            items: state.basket.items.filter((i) => i.id !== id),
+          },
+        })),
+
+      clearBasket: () =>
+        set((state) => ({
+          basket: {
+            ...state.basket,
+            items: [],
+          },
+        })),
+
+      updateBasketItemPrice: (ticker, price, changeRate, change) =>
+        set((state) => ({
+          basket: {
+            ...state.basket,
+            items: state.basket.items.map((item) =>
+              item.ticker === ticker
+                ? {
+                    ...item,
+                    prevPrice: item.price,
+                    price,
+                    changeRate,
+                    change,
+                    lastUpdated: new Date(),
+                    isLoading: false,
+                    error: null,
+                  }
+                : item
+            ),
+          },
+        })),
+
+      setBasketItemLoading: (ticker, loading) =>
+        set((state) => ({
+          basket: {
+            ...state.basket,
+            items: state.basket.items.map((item) =>
+              item.ticker === ticker
+                ? { ...item, isLoading: loading }
+                : item
+            ),
+          },
+        })),
+
+      setBasketItemError: (ticker, error) =>
+        set((state) => ({
+          basket: {
+            ...state.basket,
+            items: state.basket.items.map((item) =>
+              item.ticker === ticker
+                ? { ...item, error, isLoading: false }
+                : item
+            ),
+          },
+        })),
+
+      setBasketUpdating: (updating) =>
+        set((state) => ({
+          basket: {
+            ...state.basket,
+            isUpdating: updating,
+          },
+        })),
+
+      // -------------------------------------------
       // Legacy Actions (for backward compatibility)
-      // These delegate to stock or coin based on activeMarket
+      // These delegate to stock, coin, or kiwoom based on activeMarket
       // -------------------------------------------
       startSession: (sessionId, ticker) => {
         const market = get().activeMarket;
         if (market === 'stock') {
           get().startStockSession(sessionId, ticker);
-        } else {
+        } else if (market === 'coin') {
           get().startCoinSession(sessionId, ticker);
+        } else {
+          get().startKiwoomSession(sessionId, ticker);
         }
       },
 
@@ -529,8 +1482,10 @@ export const useStore = create<Store>()(
         const market = get().activeMarket;
         if (market === 'stock') {
           get().setStockStatus(status);
-        } else {
+        } else if (market === 'coin') {
           get().setCoinStatus(status);
+        } else {
+          get().setKiwoomStatus(status);
         }
       },
 
@@ -538,8 +1493,10 @@ export const useStore = create<Store>()(
         const market = get().activeMarket;
         if (market === 'stock') {
           get().setStockStage(stage);
-        } else {
+        } else if (market === 'coin') {
           get().setCoinStage(stage);
+        } else {
+          get().setKiwoomStage(stage);
         }
       },
 
@@ -547,8 +1504,10 @@ export const useStore = create<Store>()(
         const market = get().activeMarket;
         if (market === 'stock') {
           get().addStockReasoning(entry);
-        } else {
+        } else if (market === 'coin') {
           get().addCoinReasoning(entry);
+        } else {
+          get().addKiwoomReasoning(entry);
         }
       },
 
@@ -556,8 +1515,10 @@ export const useStore = create<Store>()(
         const market = get().activeMarket;
         if (market === 'stock') {
           get().setStockAnalyses(analyses);
-        } else {
+        } else if (market === 'coin') {
           get().setCoinAnalyses(analyses);
+        } else {
+          get().setKiwoomAnalyses(analyses);
         }
       },
 
@@ -565,8 +1526,10 @@ export const useStore = create<Store>()(
         const market = get().activeMarket;
         if (market === 'stock') {
           get().addStockAnalysis(analysis);
-        } else {
+        } else if (market === 'coin') {
           get().addCoinAnalysis(analysis);
+        } else {
+          get().addKiwoomAnalysis(analysis);
         }
       },
 
@@ -575,15 +1538,17 @@ export const useStore = create<Store>()(
         if (market === 'stock') {
           get().setStockProposal(proposal);
         }
-        // Coin proposals use different type, so skip
+        // Coin and Kiwoom proposals use different types, so skip
       },
 
       setAwaitingApproval: (awaiting) => {
         const market = get().activeMarket;
         if (market === 'stock') {
           get().setStockAwaitingApproval(awaiting);
-        } else {
+        } else if (market === 'coin') {
           get().setCoinAwaitingApproval(awaiting);
+        } else {
+          get().setKiwoomAwaitingApproval(awaiting);
         }
       },
 
@@ -591,8 +1556,10 @@ export const useStore = create<Store>()(
         const market = get().activeMarket;
         if (market === 'stock') {
           get().setStockPosition(position);
-        } else {
+        } else if (market === 'coin') {
           get().setCoinPosition(position);
+        } else {
+          get().setKiwoomPosition(position);
         }
       },
 
@@ -600,8 +1567,10 @@ export const useStore = create<Store>()(
         const market = get().activeMarket;
         if (market === 'stock') {
           get().setStockError(error);
-        } else {
+        } else if (market === 'coin') {
           get().setCoinError(error);
+        } else {
+          get().setKiwoomError(error);
         }
       },
 
@@ -609,8 +1578,10 @@ export const useStore = create<Store>()(
         const market = get().activeMarket;
         if (market === 'stock') {
           get().resetStock();
-        } else {
+        } else if (market === 'coin') {
           get().resetCoin();
+        } else {
+          get().resetKiwoom();
         }
       },
     }),
@@ -622,20 +1593,35 @@ export const useStore = create<Store>()(
 // Selectors
 // -------------------------------------------
 
+// Helper to get current market data
+const getMarketData = (state: Store) => {
+  if (state.activeMarket === 'stock') return state.stock;
+  if (state.activeMarket === 'coin') return state.coin;
+  return state.kiwoom;
+};
+
 // Get current market's session info
 export const selectSession = (state: Store) => {
-  const isStock = state.activeMarket === 'stock';
-  const data = isStock ? state.stock : state.coin;
+  const market = state.activeMarket;
+  const data = getMarketData(state);
+  let ticker: string;
+  if (market === 'stock') {
+    ticker = state.stock.ticker;
+  } else if (market === 'coin') {
+    ticker = state.coin.market;
+  } else {
+    ticker = state.kiwoom.stk_cd;
+  }
   return {
     sessionId: data.activeSessionId,
-    ticker: isStock ? state.stock.ticker : state.coin.market,
+    ticker,
     status: data.status,
   };
 };
 
 // Get current market's analysis state
 export const selectAnalysis = (state: Store) => {
-  const data = state.activeMarket === 'stock' ? state.stock : state.coin;
+  const data = getMarketData(state);
   return {
     analyses: data.analyses,
     currentStage: data.currentStage,
@@ -645,7 +1631,7 @@ export const selectAnalysis = (state: Store) => {
 
 // Get current market's proposal
 export const selectProposal = (state: Store) => {
-  const data = state.activeMarket === 'stock' ? state.stock : state.coin;
+  const data = getMarketData(state);
   return {
     proposal: data.tradeProposal,
     awaitingApproval: data.awaitingApproval,
@@ -661,8 +1647,9 @@ export const selectChartConfig = (state: Store) => state.chartConfig;
 
 // Get current market's history
 export const selectTickerHistory = (state: Store): TickerHistoryItem[] => {
-  const isStock = state.activeMarket === 'stock';
-  return isStock ? state.stock.history : state.coin.history;
+  if (state.activeMarket === 'stock') return state.stock.history;
+  if (state.activeMarket === 'coin') return state.coin.history;
+  return state.kiwoom.history;
 };
 
 // Select stock-specific state
@@ -671,60 +1658,247 @@ export const selectStock = (state: Store) => state.stock;
 // Select coin-specific state
 export const selectCoin = (state: Store) => state.coin;
 
+// Select kiwoom-specific state
+export const selectKiwoom = (state: Store) => state.kiwoom;
+
+// -------------------------------------------
+// Kiwoom Multi-Session Selectors
+// -------------------------------------------
+
+// Get all Kiwoom sessions
+export const selectKiwoomSessions = (state: Store) => state.kiwoom.sessions;
+
+// Get active Kiwoom session ID
+export const selectActiveKiwoomSessionId = (state: Store) => state.kiwoom.activeSessionId;
+
+// Get active Kiwoom session data
+export const selectActiveKiwoomSession = (state: Store): SessionData | null => {
+  const activeId = state.kiwoom.activeSessionId;
+  if (!activeId) return null;
+  return state.kiwoom.sessions.find(s => s.sessionId === activeId) || null;
+};
+
+// Get Kiwoom session by ID
+export const selectKiwoomSessionById = (state: Store, sessionId: string): SessionData | null => {
+  return state.kiwoom.sessions.find(s => s.sessionId === sessionId) || null;
+};
+
+// Phase 9: Get Kiwoom history item by session ID (with detailed analysis results)
+export const selectKiwoomHistoryById = (state: Store, sessionId: string): KiwoomHistoryItem | null => {
+  return state.kiwoom.history.find(h => h.sessionId === sessionId) || null;
+};
+
+// Get running Kiwoom sessions count
+export const selectKiwoomRunningSessionsCount = (state: Store): number => {
+  return state.kiwoom.sessions.filter(
+    s => s.status === 'running' || s.status === 'awaiting_approval'
+  ).length;
+};
+
+// Get available Kiwoom session slots
+export const selectKiwoomAvailableSlots = (state: Store): number => {
+  const running = selectKiwoomRunningSessionsCount(state);
+  return state.kiwoom.maxConcurrentSessions - running;
+};
+
+// Check if max Kiwoom sessions reached
+export const selectIsKiwoomMaxSessionsReached = (state: Store): boolean => {
+  return selectKiwoomAvailableSlots(state) <= 0;
+};
+
+// Get Kiwoom sessions as ActiveSession format (for UI compatibility)
+export const selectKiwoomActiveSessions = (state: Store): ActiveSession[] => {
+  return state.kiwoom.sessions
+    .filter(s => s.status !== 'completed' && s.status !== 'cancelled' && s.status !== 'error')
+    .map(s => ({
+      sessionId: s.sessionId,
+      ticker: s.ticker,
+      displayName: s.displayName,
+      marketType: 'kiwoom' as const,
+      status: s.status,
+      currentStage: s.currentStage,
+      reasoningLog: s.reasoningLog,
+    }));
+};
+
 // Legacy selectors for backward compatibility
 export const selectActiveSessionId = (state: Store) => {
-  return state.activeMarket === 'stock'
-    ? state.stock.activeSessionId
-    : state.coin.activeSessionId;
+  return getMarketData(state).activeSessionId;
 };
 
 export const selectTicker = (state: Store) => {
-  return state.activeMarket === 'stock'
-    ? state.stock.ticker
-    : state.coin.market;
+  if (state.activeMarket === 'stock') return state.stock.ticker;
+  if (state.activeMarket === 'coin') return state.coin.market;
+  return state.kiwoom.stk_cd;
 };
 
 export const selectStatus = (state: Store) => {
-  return state.activeMarket === 'stock'
-    ? state.stock.status
-    : state.coin.status;
+  return getMarketData(state).status;
 };
 
 export const selectAnalyses = (state: Store) => {
-  return state.activeMarket === 'stock'
-    ? state.stock.analyses
-    : state.coin.analyses;
+  return getMarketData(state).analyses;
 };
 
 export const selectReasoningLog = (state: Store) => {
-  return state.activeMarket === 'stock'
-    ? state.stock.reasoningLog
-    : state.coin.reasoningLog;
+  return getMarketData(state).reasoningLog;
 };
 
 export const selectTradeProposal = (state: Store) => {
-  return state.activeMarket === 'stock'
-    ? state.stock.tradeProposal
-    : state.coin.tradeProposal;
+  return getMarketData(state).tradeProposal;
 };
 
 export const selectAwaitingApproval = (state: Store) => {
-  return state.activeMarket === 'stock'
-    ? state.stock.awaitingApproval
-    : state.coin.awaitingApproval;
+  return getMarketData(state).awaitingApproval;
 };
 
 export const selectActivePosition = (state: Store) => {
-  return state.activeMarket === 'stock'
-    ? state.stock.activePosition
-    : state.coin.activePosition;
+  return getMarketData(state).activePosition;
 };
 
 export const selectError = (state: Store) => {
-  return state.activeMarket === 'stock'
-    ? state.stock.error
-    : state.coin.error;
+  return getMarketData(state).error;
+};
+
+// Active session type for cross-market tracking
+export interface ActiveSession {
+  sessionId: string;
+  ticker: string;
+  displayName: string;
+  marketType: MarketType;
+  status: SessionStatus | 'idle';
+  currentStage: string | null;
+  reasoningLog: string[];
+}
+
+// Get ALL active sessions from ALL markets (for main dashboard)
+export const selectAllActiveSessions = (state: Store): ActiveSession[] => {
+  const sessions: ActiveSession[] = [];
+
+  // Stock session
+  if (state.stock.activeSessionId && state.stock.status !== 'idle') {
+    sessions.push({
+      sessionId: state.stock.activeSessionId,
+      ticker: state.stock.ticker,
+      displayName: state.stock.ticker,
+      marketType: 'stock',
+      status: state.stock.status,
+      currentStage: state.stock.currentStage,
+      reasoningLog: state.stock.reasoningLog,
+    });
+  }
+
+  // Coin session
+  if (state.coin.activeSessionId && state.coin.status !== 'idle') {
+    sessions.push({
+      sessionId: state.coin.activeSessionId,
+      ticker: state.coin.market,
+      displayName: state.coin.koreanName || state.coin.market.replace('KRW-', ''),
+      marketType: 'coin',
+      status: state.coin.status,
+      currentStage: state.coin.currentStage,
+      reasoningLog: state.coin.reasoningLog,
+    });
+  }
+
+  // Kiwoom sessions (multi-session support)
+  // Include ALL running/active sessions, not just the active one
+  state.kiwoom.sessions.forEach((s) => {
+    if (s.status !== 'completed' && s.status !== 'cancelled' && s.status !== 'error') {
+      sessions.push({
+        sessionId: s.sessionId,
+        ticker: s.ticker,
+        displayName: s.displayName,
+        marketType: 'kiwoom',
+        status: s.status,
+        currentStage: s.currentStage,
+        reasoningLog: s.reasoningLog,
+      });
+    }
+  });
+
+  return sessions;
+};
+
+// Chat Popup selector
+export const selectChatPopup = (state: Store) => ({
+  isOpen: state.chatPopupOpen,
+  size: state.chatPopupSize,
+  position: state.chatPopupPosition,
+});
+
+// Basket selector
+export const selectBasket = (state: Store) => state.basket;
+export const selectBasketItems = (state: Store) => state.basket.items;
+export const selectBasketCount = (state: Store) => state.basket.items.length;
+export const selectBasketMaxItems = (state: Store) => state.basket.maxItems;
+export const selectIsBasketFull = (state: Store) => state.basket.items.length >= state.basket.maxItems;
+
+// Recent completed analyses selector
+export interface RecentAnalysisItem {
+  sessionId: string;
+  ticker: string;
+  displayName: string;
+  marketType: MarketType;
+  timestamp: Date;
+  status: SessionStatus | 'idle';
+  tradeProposal: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+}
+
+export const selectRecentCompletedAnalyses = (state: Store): RecentAnalysisItem[] => {
+  const allHistory: RecentAnalysisItem[] = [];
+
+  // Stock history - include completed, awaiting_approval, and cancelled
+  state.stock.history.forEach((h) => {
+    if (h.status === 'completed' || h.status === 'awaiting_approval' || h.status === 'cancelled') {
+      allHistory.push({
+        sessionId: h.sessionId,
+        ticker: h.ticker,
+        displayName: h.ticker,
+        marketType: 'stock',
+        timestamp: h.timestamp,
+        status: h.status,
+        tradeProposal: h.sessionId === state.stock.activeSessionId ? state.stock.tradeProposal : null,
+      });
+    }
+  });
+
+  // Coin history - include completed, awaiting_approval, and cancelled
+  state.coin.history.forEach((h) => {
+    if (h.status === 'completed' || h.status === 'awaiting_approval' || h.status === 'cancelled') {
+      allHistory.push({
+        sessionId: h.sessionId,
+        ticker: h.ticker,
+        displayName: h.koreanName || h.ticker.replace('KRW-', ''),
+        marketType: 'coin',
+        timestamp: h.timestamp,
+        status: h.status,
+        tradeProposal: h.sessionId === state.coin.activeSessionId ? state.coin.tradeProposal : null,
+      });
+    }
+  });
+
+  // Kiwoom history - include completed, awaiting_approval, and cancelled
+  state.kiwoom.history.forEach((h) => {
+    if (h.status === 'completed' || h.status === 'awaiting_approval' || h.status === 'cancelled') {
+      allHistory.push({
+        sessionId: h.sessionId,
+        ticker: h.stk_cd,
+        displayName: h.stk_nm || h.stk_cd,
+        marketType: 'kiwoom',
+        timestamp: h.timestamp,
+        status: h.status,
+        tradeProposal: h.sessionId === state.kiwoom.activeSessionId ? state.kiwoom.tradeProposal : null,
+      });
+    }
+  });
+
+  // Sort by timestamp (most recent first) and take top 5
+  return allHistory
+    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+    .slice(0, 5);
 };
 
 // Export types
-export type { TickerHistoryItem, StockHistoryItem, CoinHistoryItem, MarketType };
+export type { TickerHistoryItem, StockHistoryItem, CoinHistoryItem, KiwoomHistoryItem, MarketType, StockRegion, ChatPopupSize };
+export type { SessionData } from '@/types';

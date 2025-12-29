@@ -19,7 +19,7 @@ import {
 } from 'lightweight-charts';
 import { Loader2 } from 'lucide-react';
 import type { TimeFrame } from '@/types';
-import { getCoinCandles } from '@/api/client';
+import { getCoinCandles, getKRStockCandles } from '@/api/client';
 
 interface TradingChartProps {
   ticker: string;
@@ -140,6 +140,8 @@ export function TradingChart({
       try {
         // Check if ticker is a coin market (e.g., KRW-BTC)
         const isCoinMarket = ticker.includes('-');
+        // Check if ticker is a Korean stock (6-digit numeric code)
+        const isKRStock = /^\d{6}$/.test(ticker);
 
         let candles: CandlestickData[];
 
@@ -185,8 +187,40 @@ export function TradingChart({
           candleDataRef.current = transformedCandles;
 
           candles = transformedCandles.map(({ volume, ...rest }) => rest);
+        } else if (isKRStock) {
+          // Fetch real data from Kiwoom API for Korean stocks
+          // Currently only daily candles are supported by Kiwoom API
+          const response = await getKRStockCandles(ticker, 'D', 100);
+
+          // Check if we got valid data
+          if (!response.candles || response.candles.length === 0) {
+            throw new Error('No candle data available');
+          }
+
+          // Transform API response to lightweight-charts format
+          // Kiwoom returns newest first, so reverse for chronological order
+          const transformedCandles = response.candles
+            .filter((c) => c.datetime && c.open && c.high && c.low && c.close)
+            .map((c) => ({
+              time: Math.floor(new Date(c.datetime).getTime() / 1000) as any,
+              open: c.open,
+              high: c.high,
+              low: c.low,
+              close: c.close,
+              volume: c.volume,
+            }))
+            .reverse();
+
+          if (transformedCandles.length === 0) {
+            throw new Error('Invalid candle data received');
+          }
+
+          // Cache candle data for volume chart
+          candleDataRef.current = transformedCandles;
+
+          candles = transformedCandles.map(({ volume, ...rest }) => rest);
         } else {
-          // Fall back to mock data for stock tickers
+          // Fall back to mock data for US stock tickers (not yet supported)
           const data = generateMockData(ticker, timeframe);
           candles = data.candles;
         }
@@ -230,9 +264,11 @@ export function TradingChart({
         sma50SeriesRef.current = sma50Series;
       }
 
-      // Calculate and set SMA data
-      const smaData = calculateSMA(50);
-      sma50SeriesRef.current.setData(smaData);
+      // Calculate and set SMA data from cached candles
+      if (candleDataRef.current.length > 0) {
+        const smaData = calculateSMA(50, candleDataRef.current);
+        sma50SeriesRef.current.setData(smaData);
+      }
     } else {
       if (sma50SeriesRef.current) {
         chartRef.current.removeSeries(sma50SeriesRef.current);
@@ -255,9 +291,11 @@ export function TradingChart({
         sma200SeriesRef.current = sma200Series;
       }
 
-      // Calculate and set SMA data
-      const smaData = calculateSMA(200);
-      sma200SeriesRef.current.setData(smaData);
+      // Calculate and set SMA data from cached candles
+      if (candleDataRef.current.length > 0) {
+        const smaData = calculateSMA(200, candleDataRef.current);
+        sma200SeriesRef.current.setData(smaData);
+      }
     } else {
       if (sma200SeriesRef.current) {
         chartRef.current.removeSeries(sma200SeriesRef.current);
@@ -290,10 +328,11 @@ export function TradingChart({
         volumeSeriesRef.current = volumeSeries;
       }
 
-      // Check if coin market - use cached data (already fetched for candlestick)
+      // Check if coin market or Korean stock - use cached data (already fetched for candlestick)
       const isCoinMarket = ticker.includes('-');
+      const isKRStock = /^\d{6}$/.test(ticker);
 
-      if (isCoinMarket && candleDataRef.current.length > 0) {
+      if ((isCoinMarket || isKRStock) && candleDataRef.current.length > 0) {
         // Use cached candle data for volume (avoid duplicate API call)
         const volumeData = candleDataRef.current.map((c) => ({
           time: c.time,
@@ -304,8 +343,8 @@ export function TradingChart({
               : 'rgba(239, 68, 68, 0.5)',
         }));
         volumeSeriesRef.current?.setData(volumeData);
-      } else if (!isCoinMarket) {
-        // Fall back to mock volume data for stocks
+      } else if (!isCoinMarket && !isKRStock) {
+        // Fall back to mock volume data for US stocks
         const volumeData = generateVolumeData(ticker, timeframe);
         volumeSeriesRef.current.setData(volumeData);
       }
@@ -428,22 +467,27 @@ function generateVolumeData(
   return data;
 }
 
-function calculateSMA(_period: number): LineData[] {
-  // Mock SMA calculation
+function calculateSMA(
+  period: number,
+  candles: { time: any; close: number }[]
+): LineData[] {
+  // Calculate real SMA from candle data
+  if (!candles || candles.length < period) {
+    return [];
+  }
+
   const data: LineData[] = [];
-  const now = new Date();
-  const interval = 24 * 60 * 60 * 1000; // Daily for simplicity
-  const numPoints = 200;
 
-  let smaValue = 150;
-
-  for (let i = numPoints - 1; i >= 0; i--) {
-    const time = Math.floor((now.getTime() - i * interval) / 1000);
-    smaValue += (Math.random() - 0.48) * 2;
+  for (let i = period - 1; i < candles.length; i++) {
+    let sum = 0;
+    for (let j = 0; j < period; j++) {
+      sum += candles[i - j].close;
+    }
+    const sma = sum / period;
 
     data.push({
-      time: time as any,
-      value: Number(smaValue.toFixed(2)),
+      time: candles[i].time,
+      value: Number(sma.toFixed(2)),
     });
   }
 

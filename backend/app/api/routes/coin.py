@@ -38,6 +38,12 @@ from app.api.schemas.coin import (
     TickerResponse,
 )
 from app.config import settings
+from app.core.analysis_limiter import (
+    acquire_analysis_slot,
+    release_analysis_slot,
+    register_session,
+    update_session_status,
+)
 from services.upbit import UpbitClient
 
 logger = structlog.get_logger()
@@ -494,7 +500,7 @@ async def start_coin_analysis(
             "korean_name": korean_name,
             "query": request.query,
             "reasoning_log": [],
-            "current_stage": "initializing",
+            "current_stage": "data_collection",  # Match frontend WorkflowProgress stage IDs
         },
         "created_at": datetime.utcnow(),
         "error": None,
@@ -520,6 +526,8 @@ async def run_coin_analysis_task(session_id: str):
 
     Runs the coin trading graph through all analysis stages until
     it reaches the approval interrupt point.
+
+    Uses semaphore to limit concurrent analyses.
     """
     from agents.graph.coin_trading_graph import get_coin_trading_graph
     from agents.graph.coin_state import create_coin_initial_state
@@ -529,9 +537,32 @@ async def run_coin_analysis_task(session_id: str):
         logger.error("coin_session_not_found", session_id=session_id)
         return
 
+    # Acquire analysis slot (with timeout)
+    slot_acquired = await acquire_analysis_slot(timeout=60.0)
+    if not slot_acquired:
+        session["status"] = "error"
+        session["error"] = "분석 대기열이 가득 찼습니다. 잠시 후 다시 시도해주세요."
+        session["state"]["reasoning_log"].append(
+            "[Error] 동시 분석 한도 초과 - 잠시 후 다시 시도해주세요."
+        )
+        update_session_status(session_id, "error", session["error"])
+        logger.warning(
+            "coin_analysis_slot_timeout",
+            session_id=session_id,
+        )
+        return
+
     try:
         market = session["market"]
         korean_name = session.get("korean_name")
+
+        # Register with unified session tracker
+        register_session(
+            session_id=session_id,
+            market_type="coin",
+            ticker=market,
+            display_name=korean_name,
+        )
 
         # Get the coin trading graph
         graph = get_coin_trading_graph()
@@ -564,6 +595,7 @@ async def run_coin_analysis_task(session_id: str):
         state = session["state"]
         if state.get("awaiting_approval"):
             session["status"] = "awaiting_approval"
+            update_session_status(session_id, "awaiting_approval")
             logger.info(
                 "coin_analysis_awaiting_approval",
                 session_id=session_id,
@@ -572,8 +604,10 @@ async def run_coin_analysis_task(session_id: str):
         elif state.get("error"):
             session["status"] = "error"
             session["error"] = state.get("error")
+            update_session_status(session_id, "error", session["error"])
         else:
             session["status"] = "completed"
+            update_session_status(session_id, "completed")
 
     except Exception as e:
         logger.error(
@@ -586,6 +620,15 @@ async def run_coin_analysis_task(session_id: str):
         session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
             f"[Error] Analysis failed: {str(e)}"
         ]
+        update_session_status(session_id, "error", str(e))
+
+    finally:
+        # Always release the analysis slot
+        release_analysis_slot()
+        logger.debug(
+            "coin_analysis_slot_released",
+            session_id=session_id,
+        )
 
 
 @router.get("/analysis/status/{session_id}", response_model=CoinAnalysisStatusResponse)

@@ -126,7 +126,7 @@ async def coin_data_collection_node(state: dict) -> dict:
             "trades": trades_list,
             "reasoning_log": add_coin_reasoning_log(state, reasoning),
             "messages": [AIMessage(content=reasoning)],
-            "current_stage": CoinAnalysisStage.TECHNICAL,
+            "current_stage": CoinAnalysisStage.DATA_COLLECTION,
         }
 
     except Exception as e:
@@ -211,7 +211,7 @@ async def coin_technical_analysis_node(state: dict) -> dict:
         "technical_analysis": result.model_dump(),
         "reasoning_log": add_coin_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
-        "current_stage": CoinAnalysisStage.MARKET_ANALYSIS,
+        "current_stage": CoinAnalysisStage.TECHNICAL,
     }
 
 
@@ -282,7 +282,7 @@ Bid/Ask Ratio: {market_data.get('bid_ask_ratio', 1.0):.2f}
         "market_analysis": result.model_dump(),
         "reasoning_log": add_coin_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
-        "current_stage": CoinAnalysisStage.SENTIMENT,
+        "current_stage": CoinAnalysisStage.MARKET_ANALYSIS,
     }
 
 
@@ -344,7 +344,7 @@ async def coin_sentiment_analysis_node(state: dict) -> dict:
         "sentiment_analysis": result.model_dump(),
         "reasoning_log": add_coin_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
-        "current_stage": CoinAnalysisStage.RISK,
+        "current_stage": CoinAnalysisStage.SENTIMENT,
     }
 
 
@@ -413,7 +413,7 @@ async def coin_risk_assessment_node(state: dict) -> dict:
         "risk_assessment": result.model_dump(),
         "reasoning_log": add_coin_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
-        "current_stage": CoinAnalysisStage.SYNTHESIS,
+        "current_stage": CoinAnalysisStage.RISK,
     }
 
 
@@ -460,6 +460,49 @@ async def coin_strategic_decision_node(state: dict) -> dict:
 
     market_data = state.get("market_data", {})
     current_price = market_data.get("current_price", 0)
+    position_size_pct = float(risk_signals.get("max_position_pct", 3.0))
+
+    # Calculate quantity based on available KRW balance
+    quantity = 0.0
+    if action in (TradeAction.BUY, "BUY") and current_price > 0:
+        try:
+            # Get Upbit API credentials
+            access_key = getattr(settings, "UPBIT_ACCESS_KEY", None)
+            secret_key = getattr(settings, "UPBIT_SECRET_KEY", None)
+
+            if access_key and secret_key:
+                client = UpbitClient(access_key=access_key, secret_key=secret_key)
+                accounts = await client.get_accounts()
+
+                # Find KRW balance
+                krw_balance = 0.0
+                for account in accounts:
+                    if account.currency == "KRW":
+                        krw_balance = float(account.balance)
+                        break
+
+                # Calculate quantity: (KRW balance * position_size%) / price
+                investment_amount = krw_balance * position_size_pct / 100
+                quantity = investment_amount / current_price
+
+                logger.info(
+                    "coin_quantity_calculated",
+                    market=market,
+                    krw_balance=krw_balance,
+                    position_size_pct=position_size_pct,
+                    investment_amount=investment_amount,
+                    current_price=current_price,
+                    quantity=quantity,
+                )
+            else:
+                logger.warning("coin_api_keys_not_configured", market=market)
+        except Exception as e:
+            logger.warning(
+                "coin_quantity_calculation_failed",
+                market=market,
+                error=str(e),
+            )
+            # quantity remains 0, user can modify in approval dialog
 
     # Create trade proposal
     proposal = CoinTradeProposal(
@@ -467,19 +510,19 @@ async def coin_strategic_decision_node(state: dict) -> dict:
         market=market,
         korean_name=state.get("korean_name"),
         action=action,
-        quantity=0,  # Will be calculated based on portfolio size
+        quantity=quantity,
         entry_price=float(current_price),
         stop_loss=float(risk_signals.get("suggested_stop_loss", current_price * 0.92)),
         take_profit=float(risk_signals.get("suggested_take_profit", current_price * 1.15)),
         risk_score=float(risk_signals.get("risk_score", 0.5)),
-        position_size_pct=float(risk_signals.get("max_position_pct", 3.0)),
+        position_size_pct=position_size_pct,
         rationale=response,
         bull_case=_extract_bull_case(response),
         bear_case=_extract_bear_case(response),
         analyses=analyses,
     )
 
-    reasoning = f"[Strategic Decision] Proposal: {action.value} {market} @ {current_price:,.0f} KRW"
+    reasoning = f"[Strategic Decision] Proposal: {action.value} {market} {quantity:.4f} @ {current_price:,.0f} KRW"
 
     duration_ms = (time.perf_counter() - start_time) * 1000
     logger.info(
@@ -500,7 +543,7 @@ async def coin_strategic_decision_node(state: dict) -> dict:
         "awaiting_approval": True,
         "reasoning_log": add_coin_reasoning_log(state, reasoning),
         "messages": [AIMessage(content=reasoning)],
-        "current_stage": CoinAnalysisStage.APPROVAL,
+        "current_stage": CoinAnalysisStage.SYNTHESIS,
     }
 
 

@@ -1,28 +1,23 @@
 /**
  * Sidebar Component
  *
- * Navigation and quick actions with ticker history.
+ * Navigation for page views.
+ * - Dashboard, Analysis, Charts, Positions, My Basket, Trades
  */
 
-import { useState } from 'react';
+import { useMemo } from 'react';
 import {
   BarChart3,
-  History,
   Settings,
-  TrendingUp,
   Wallet,
   BookOpen,
   HelpCircle,
-  ChevronDown,
-  ChevronRight,
-  CheckCircle2,
-  XCircle,
-  Clock,
-  Loader2,
+  ShoppingBasket,
+  LayoutDashboard,
+  Activity,
+  Receipt,
 } from 'lucide-react';
-import { useStore, selectTickerHistory, type TickerHistoryItem } from '@/store';
-import { TickerInput } from '@/components/analysis/TickerInput';
-import { CoinTickerInput } from '@/components/coin/CoinTickerInput';
+import { useStore } from '@/store';
 import { MarketTabs } from '@/components/layout/MarketTabs';
 
 interface NavItemProps {
@@ -31,12 +26,10 @@ interface NavItemProps {
   active?: boolean;
   badge?: string;
   onClick?: () => void;
-  expandable?: boolean;
-  expanded?: boolean;
   collapsed?: boolean;
 }
 
-function NavItem({ icon, label, active, badge, onClick, expandable, expanded, collapsed }: NavItemProps) {
+function NavItem({ icon, label, active, badge, onClick, collapsed }: NavItemProps) {
   return (
     <button
       onClick={onClick}
@@ -56,13 +49,6 @@ function NavItem({ icon, label, active, badge, onClick, expandable, expanded, co
               {badge}
             </span>
           )}
-          {expandable && (
-            expanded ? (
-              <ChevronDown className="w-4 h-4" />
-            ) : (
-              <ChevronRight className="w-4 h-4" />
-            )
-          )}
         </>
       )}
       {collapsed && badge && (
@@ -74,167 +60,102 @@ function NavItem({ icon, label, active, badge, onClick, expandable, expanded, co
   );
 }
 
-function getStatusIcon(status: string) {
-  switch (status) {
-    case 'completed':
-      return <CheckCircle2 className="w-3.5 h-3.5 text-green-400" />;
-    case 'error':
-    case 'cancelled':
-      return <XCircle className="w-3.5 h-3.5 text-red-400" />;
-    case 'running':
-    case 'awaiting_approval':
-      return <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin" />;
-    default:
-      return <Clock className="w-3.5 h-3.5 text-gray-400" />;
-  }
-}
-
-function formatTime(date: Date): string {
-  const d = new Date(date);
-  const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
-  const diffMins = Math.floor(diffMs / 60000);
-
-  if (diffMins < 1) return 'Just now';
-  if (diffMins < 60) return `${diffMins}m ago`;
-  if (diffMins < 1440) return `${Math.floor(diffMins / 60)}h ago`;
-  return d.toLocaleDateString();
-}
-
-interface HistoryItemProps {
-  item: TickerHistoryItem;
-  isActive: boolean;
-  onClick?: () => void;
-}
-
-function HistoryItem({ item, isActive, collapsed, onClick }: HistoryItemProps & { collapsed?: boolean }) {
-  return (
-    <button
-      onClick={onClick}
-      title={collapsed ? `${item.ticker} - ${item.status}` : undefined}
-      className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer ${
-        isActive
-          ? 'bg-blue-600/20 text-blue-400'
-          : 'text-gray-400 hover:bg-surface hover:text-gray-300'
-      } ${collapsed ? 'justify-center' : ''}`}
-    >
-      {getStatusIcon(item.status)}
-      {!collapsed && (
-        <>
-          <span className="font-medium">{item.ticker}</span>
-          <span className="ml-auto text-xs opacity-60">
-            {formatTime(item.timestamp)}
-          </span>
-        </>
-      )}
-    </button>
-  );
-}
-
 interface SidebarProps {
   collapsed?: boolean;
 }
 
 export function Sidebar({ collapsed = false }: SidebarProps) {
-  const [showHistory, setShowHistory] = useState(true);
-  const activeMarket = useStore((state) => state.activeMarket);
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
-  const activePosition = useStore((state) =>
-    state.activeMarket === 'stock' ? state.stock.activePosition : state.coin.activePosition
-  );
-  const analyses = useStore((state) =>
-    state.activeMarket === 'stock' ? state.stock.analyses : state.coin.analyses
-  );
-  const tickerHistory = useStore(selectTickerHistory);
-  const activeSessionId = useStore((state) =>
-    state.activeMarket === 'stock' ? state.stock.activeSessionId : state.coin.activeSessionId
-  );
+  const currentView = useStore((state) => state.currentView);
+  const setCurrentView = useStore((state) => state.setCurrentView);
 
-  // Actions for restoring sessions from history
-  const startStockSession = useStore((state) => state.startStockSession);
-  const startCoinSession = useStore((state) => state.startCoinSession);
+  // Get counts for badges - use primitive selectors to avoid infinite loops
+  const basketItemsCount = useStore((state) => state.basket.items.length);
+  const activeMarket = useStore((state) => state.activeMarket);
+  const stockPosition = useStore((state) => state.stock.activePosition);
+  const coinPosition = useStore((state) => state.coin.activePosition);
+  const kiwoomPosition = useStore((state) => state.kiwoom.activePosition);
 
-  // Handle clicking on a history item to restore the session
-  const handleHistoryClick = (item: TickerHistoryItem) => {
-    // Don't do anything if already the active session
-    if (item.sessionId === activeSessionId) return;
+  // Get running session counts from each market
+  const stockStatus = useStore((state) => state.stock.status);
+  const coinStatus = useStore((state) => state.coin.status);
+  const kiwoomSessions = useStore((state) => state.kiwoom.sessions);
 
-    // Restore the session based on type
-    if ('type' in item && item.type === 'coin') {
-      startCoinSession(item.sessionId, item.ticker, (item as { koreanName?: string }).koreanName);
-    } else {
-      startStockSession(item.sessionId, item.ticker);
-    }
-  };
+  // Calculate active position based on current market
+  const activePosition = useMemo(() => {
+    if (activeMarket === 'stock') return stockPosition;
+    if (activeMarket === 'coin') return coinPosition;
+    return kiwoomPosition;
+  }, [activeMarket, stockPosition, coinPosition, kiwoomPosition]);
+
+  // Calculate running analyses count
+  const runningCount = useMemo(() => {
+    let count = 0;
+    if (stockStatus === 'running' || stockStatus === 'awaiting_approval') count++;
+    if (coinStatus === 'running' || coinStatus === 'awaiting_approval') count++;
+    count += kiwoomSessions.filter(
+      s => s.status === 'running' || s.status === 'awaiting_approval'
+    ).length;
+    return count;
+  }, [stockStatus, coinStatus, kiwoomSessions]);
 
   return (
-    <div className={`h-full flex flex-col ${collapsed ? 'p-2' : 'p-4'}`}>
+    <div className={`h-full flex flex-col overflow-hidden ${collapsed ? 'p-2' : 'p-3'}`}>
       {/* Market Tabs - Hidden when collapsed */}
       {!collapsed && (
-        <div className="mb-4">
+        <div className="mb-3 flex-shrink-0">
           <MarketTabs />
-        </div>
-      )}
-
-      {/* Ticker Input - Hidden when collapsed */}
-      {!collapsed && (
-        <div className="mb-4">
-          {activeMarket === 'stock' ? <TickerInput /> : <CoinTickerInput />}
         </div>
       )}
 
       {/* Navigation */}
       <nav className="space-y-1">
         <NavItem
-          icon={<TrendingUp className="w-5 h-5" />}
+          icon={<LayoutDashboard className="w-5 h-5" />}
+          label="Dashboard"
+          active={currentView === 'dashboard'}
+          onClick={() => setCurrentView('dashboard')}
+          collapsed={collapsed}
+        />
+        <NavItem
+          icon={<Activity className="w-5 h-5" />}
           label="Analysis"
-          active
-          badge={analyses.length > 0 ? String(analyses.length) : undefined}
+          active={currentView === 'analysis'}
+          badge={runningCount > 0 ? String(runningCount) : undefined}
+          onClick={() => setCurrentView('analysis')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<BarChart3 className="w-5 h-5" />}
           label="Charts"
+          active={currentView === 'charts'}
+          onClick={() => setCurrentView('charts')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<Wallet className="w-5 h-5" />}
           label="Positions"
+          active={currentView === 'positions'}
           badge={activePosition ? '1' : undefined}
+          onClick={() => setCurrentView('positions')}
           collapsed={collapsed}
         />
         <NavItem
-          icon={<History className="w-5 h-5" />}
-          label="History"
-          badge={tickerHistory.length > 0 ? String(tickerHistory.length) : undefined}
-          expandable={!collapsed}
-          expanded={showHistory}
-          onClick={() => !collapsed && setShowHistory(!showHistory)}
+          icon={<ShoppingBasket className="w-5 h-5" />}
+          label="My Basket"
+          active={currentView === 'basket'}
+          badge={basketItemsCount > 0 ? String(basketItemsCount) : undefined}
+          onClick={() => setCurrentView('basket')}
+          collapsed={collapsed}
+        />
+        <NavItem
+          icon={<Receipt className="w-5 h-5" />}
+          label="Trades"
+          active={currentView === 'trades'}
+          onClick={() => setCurrentView('trades')}
           collapsed={collapsed}
         />
       </nav>
-
-      {/* History Panel - Hidden when collapsed */}
-      {!collapsed && showHistory && tickerHistory.length > 0 && (
-        <div className="mt-2 ml-2 space-y-1 max-h-48 overflow-y-auto scrollbar-thin scrollbar-track-transparent scrollbar-thumb-gray-700">
-          {tickerHistory.map((item) => (
-            <HistoryItem
-              key={item.sessionId}
-              item={item}
-              isActive={item.sessionId === activeSessionId}
-              collapsed={collapsed}
-              onClick={() => handleHistoryClick(item)}
-            />
-          ))}
-        </div>
-      )}
-
-      {/* Empty History Message - Hidden when collapsed */}
-      {!collapsed && showHistory && tickerHistory.length === 0 && (
-        <div className="mt-2 ml-2 px-3 py-2 text-xs text-gray-500">
-          No analysis history yet
-        </div>
-      )}
 
       {/* Spacer to push secondary nav down */}
       <div className="flex-1" />

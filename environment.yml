@@ -58,6 +58,7 @@ dependencies:
       - python-dotenv>=1.0.0
       - structlog>=24.4.0
       - tenacity>=9.0.0
+      - watchfiles>=1.0.0  # For uvicorn hot-reload
 
       # LLM Providers (optional - install based on platform)
       # Windows/Linux with NVIDIA GPU:

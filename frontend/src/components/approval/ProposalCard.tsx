@@ -11,23 +11,37 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { useStore } from '@/store';
-import type { TradeProposal, CoinTradeProposal } from '@/types';
+import type { TradeProposal, CoinTradeProposal, KRStockTradeProposal } from '@/types';
+
+// Union type for all proposal types
+type AnyTradeProposal = TradeProposal | CoinTradeProposal | KRStockTradeProposal;
 
 interface ProposalCardProps {
-  proposal: TradeProposal | CoinTradeProposal;
+  proposal: AnyTradeProposal;
 }
 
-// Helper to get symbol from either stock or coin proposal
-function getProposalSymbol(proposal: TradeProposal | CoinTradeProposal): string {
+// Helper to get symbol from stock, coin, or kiwoom proposal
+function getProposalSymbol(proposal: AnyTradeProposal): string {
   if ('ticker' in proposal) {
     return proposal.ticker;
   }
-  return proposal.market;
+  if ('market' in proposal) {
+    return proposal.market;
+  }
+  if ('stk_cd' in proposal) {
+    return proposal.stk_cd;
+  }
+  return 'UNKNOWN';
 }
 
 // Helper to check if it's a coin proposal
-function isCoinProposal(proposal: TradeProposal | CoinTradeProposal): proposal is CoinTradeProposal {
+function isCoinProposal(proposal: AnyTradeProposal): proposal is CoinTradeProposal {
   return 'market' in proposal;
+}
+
+// Helper to check if it's a kiwoom proposal
+function isKiwoomProposal(proposal: AnyTradeProposal): proposal is KRStockTradeProposal {
+  return 'stk_cd' in proposal;
 }
 
 export function ProposalCard({ proposal }: ProposalCardProps) {
@@ -36,7 +50,11 @@ export function ProposalCard({ proposal }: ProposalCardProps) {
   const isBuy = proposal.action === 'BUY';
   const riskLevel = proposal.risk_score <= 3 ? 'Low' : proposal.risk_score <= 6 ? 'Medium' : 'High';
   const isCoin = isCoinProposal(proposal);
+  const isKiwoom = isKiwoomProposal(proposal);
   const symbol = getProposalSymbol(proposal);
+
+  // Determine proposal type label
+  const proposalTypeLabel = isCoin ? 'Coin' : isKiwoom ? 'Korean Stock' : 'Stock';
 
   return (
     <div
@@ -54,7 +72,7 @@ export function ProposalCard({ proposal }: ProposalCardProps) {
         {/* Content */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
-            <span className="font-semibold">{isCoin ? 'Coin' : 'Stock'} Trade Proposal</span>
+            <span className="font-semibold">{proposalTypeLabel} Trade Proposal</span>
             <span
               className={`px-2 py-0.5 rounded text-xs font-medium ${
                 isBuy ? 'signal-buy' : 'signal-sell'
@@ -73,8 +91,8 @@ export function ProposalCard({ proposal }: ProposalCardProps) {
               )}
               {symbol}
             </span>
-            <span>{proposal.quantity} {isCoin ? 'KRW' : 'shares'}</span>
-            <span>{isCoin ? '' : '$'}{proposal.entry_price?.toFixed(2) ?? 'N/A'}{isCoin ? ' KRW' : ''}</span>
+            <span>{proposal.quantity} {isCoin ? 'KRW' : isKiwoom ? '주' : 'shares'}</span>
+            <span>{(isCoin || isKiwoom) ? '' : '$'}{proposal.entry_price?.toFixed(2) ?? 'N/A'}{(isCoin || isKiwoom) ? ' KRW' : ''}</span>
             <span className={
               proposal.risk_score <= 3
                 ? 'text-bull'
