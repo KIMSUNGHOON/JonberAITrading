@@ -63,6 +63,18 @@ class Settings(BaseSettings):
     KIWOOM_IS_MOCK: bool = True  # True: 모의투자, False: 실거래
 
     # -------------------------------------------
+    # Naver API Configuration (News Search)
+    # https://developers.naver.com/apps
+    # -------------------------------------------
+    NAVER_CLIENT_ID: str | None = None
+    NAVER_CLIENT_SECRET: str | None = None
+
+    # -------------------------------------------
+    # Redis Configuration (Optional - for caching)
+    # -------------------------------------------
+    REDIS_URL: str | None = None
+
+    # -------------------------------------------
     # API Server Configuration
     # -------------------------------------------
     API_HOST: str = "0.0.0.0"

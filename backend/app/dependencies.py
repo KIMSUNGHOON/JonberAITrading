@@ -79,6 +79,64 @@ StorageDep = Annotated["StorageService", Depends(get_storage)]
 
 
 # -------------------------------------------
+# News Service Dependency
+# -------------------------------------------
+
+# Singleton instance for news service
+_news_service_instance = None
+
+
+async def get_news_service() -> "NewsService":
+    """
+    Dependency to get News service instance.
+
+    Usage:
+        @router.get("/news/search")
+        async def search(news: Annotated[NewsService, Depends(get_news_service)]):
+            result = await news.search("삼성전자 주식")
+            ...
+    """
+    global _news_service_instance
+
+    if _news_service_instance is None:
+        from services.news import NewsService, NaverNewsProvider
+        from services.news.cache import InMemoryCacheManager, NewsCacheManager
+
+        settings = get_settings()
+
+        # Create cache manager (Redis if available, else in-memory)
+        cache_manager = None
+        if settings.REDIS_URL:
+            try:
+                import redis.asyncio as redis
+                redis_client = redis.from_url(settings.REDIS_URL)
+                cache_manager = NewsCacheManager(redis_client)
+            except ImportError:
+                pass
+
+        if cache_manager is None:
+            cache_manager = InMemoryCacheManager()
+
+        # Create service
+        _news_service_instance = NewsService()
+
+        # Register Naver provider if credentials available
+        if settings.NAVER_CLIENT_ID and settings.NAVER_CLIENT_SECRET:
+            naver_provider = NaverNewsProvider(
+                client_id=settings.NAVER_CLIENT_ID,
+                client_secret=settings.NAVER_CLIENT_SECRET,
+                cache_manager=cache_manager,
+            )
+            _news_service_instance.register_provider(naver_provider, primary=True)
+
+    return _news_service_instance
+
+
+# Type alias for cleaner annotations
+NewsDep = Annotated["NewsService", Depends(get_news_service)]
+
+
+# -------------------------------------------
 # Future Dependencies (placeholders)
 # -------------------------------------------
 

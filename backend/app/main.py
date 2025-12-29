@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.llm_provider import get_llm_provider, reset_llm_provider
-from app.api.routes import analysis, approval, websocket, auth, coin, kr_stocks, chat, indicators, settings as settings_routes
+from app.api.routes import analysis, approval, websocket, auth, coin, kr_stocks, chat, indicators, settings as settings_routes, news
 from app.config import settings
 from app.core.analysis_limiter import cleanup_old_sessions
 from app.logging_config import configure_logging, RequestLoggingMiddleware
@@ -180,6 +180,11 @@ app.include_router(
     settings_routes.router,
     prefix="/api/settings",
     tags=["Settings"],
+)
+app.include_router(
+    news.router,
+    prefix="/api",
+    tags=["News"],
 )
 
 
