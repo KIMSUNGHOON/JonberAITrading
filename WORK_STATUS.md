@@ -1,11 +1,17 @@
 # Work Status - JonberAITrading
 
-> Last Updated: 2025-12-31
+> Last Updated: 2025-12-31 (Phase E 완료)
 > Branch: `claude/read-trading-prompt-dgm5U`
 
 ---
 
 ## 완료된 작업 ✅
+
+### Phase E: Frontend Watch List UI (2025-12-31)
+- WatchListWidget 컴포넌트 구현 완료
+- Watch → Trade Queue 변환 UI 구현
+- 재분석 버튼 기능 추가
+- Trading Dashboard에 Watch List 위젯 통합
 
 ### Phase D: Telegram Integration & Watch List (2025-12-31)
 
@@ -186,12 +192,29 @@ frontend/src/components/layout/MainContent.tsx        - Trading 컴포넌트 통
 
 ---
 
-## 남은 작업
+### Phase E: Frontend Watch List UI (2025-12-31) ✅
 
-### Phase E: Frontend Watch List UI [MEDIUM]
-- Watch List 페이지/위젯 구현
-- Watch → Trade Queue 변환 UI
-- 재분석 버튼 추가
+| # | Task | 상태 |
+|---|------|------|
+| 1 | Watch List 타입 정의 (`frontend/src/types/index.ts`) | ✅ 완료 |
+| 2 | Watch List API 클라이언트 (`frontend/src/api/client.ts`) | ✅ 완료 |
+| 3 | WatchListWidget 컴포넌트 | ✅ 완료 |
+| 4 | Watch → Trade Queue 변환 UI | ✅ 완료 |
+| 5 | 재분석 버튼 기능 | ✅ 완료 |
+| 6 | Trading Dashboard 통합 | ✅ 완료 |
+
+#### Phase E 수정된 파일 목록
+```
+frontend/src/types/index.ts                           - Watch List 타입 추가
+frontend/src/api/client.ts                            - Watch List API 메서드 추가
+frontend/src/components/trading/WatchListWidget.tsx   - 신규 (Watch List 위젯)
+frontend/src/components/trading/index.ts              - WatchListWidget export 추가
+frontend/src/components/trading/TradingDashboard.tsx  - WatchListWidget 통합
+```
+
+---
+
+## 남은 작업
 
 ### Phase F: 분석 데이터 저장 구조 개선 [MEDIUM]
 - 분석 결과 영구 저장

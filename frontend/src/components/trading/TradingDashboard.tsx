@@ -26,6 +26,7 @@ import {
 import AgentStatusWidget from './AgentStatusWidget';
 import TradeQueueWidget from './TradeQueueWidget';
 import StrategyConfigWidget from './StrategyConfigWidget';
+import WatchListWidget from './WatchListWidget';
 import {
   getTradingStatus,
   getTradingPortfolio,
@@ -411,6 +412,9 @@ export default function TradingDashboard() {
 
           {/* Trade Queue Widget */}
           <TradeQueueWidget />
+
+          {/* Watch List Widget */}
+          <WatchListWidget />
         </div>
 
         {/* Middle Column - Agent Status & Positions */}

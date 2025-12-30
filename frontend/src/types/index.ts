@@ -1119,3 +1119,71 @@ export interface StrategyPresetInfo {
   exit_conditions: ExitConditions;
   position_sizing: PositionSizingRules;
 }
+
+// -------------------------------------------
+// Watch List Types
+// -------------------------------------------
+
+export type WatchStatus = 'active' | 'triggered' | 'removed' | 'converted';
+
+export interface WatchedStock {
+  id: string;
+  session_id: string;
+  ticker: string;
+  stock_name: string | null;
+  action: string;
+  signal: string;
+  confidence: number;
+  current_price: number;
+  target_entry_price: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  analysis_summary: string;
+  key_factors: string[];
+  status: WatchStatus;
+  risk_score: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WatchListResponse {
+  watch_list: WatchedStock[];
+  count: number;
+}
+
+export interface AddToWatchListRequest {
+  ticker: string;
+  stock_name?: string;
+  signal?: string;
+  confidence?: number;
+  current_price: number;
+  target_entry_price?: number;
+  stop_loss?: number;
+  take_profit?: number;
+  analysis_summary?: string;
+  key_factors?: string[];
+  risk_score?: number;
+  session_id?: string;
+}
+
+export interface AddToWatchListResponse {
+  status: string;
+  watch_id: string;
+  ticker: string;
+  message: string;
+}
+
+export interface ConvertWatchToQueueRequest {
+  watch_id: string;
+  action?: string;
+  reason?: string;
+}
+
+export interface ConvertWatchToQueueResponse {
+  status: string;
+  watch_id: string;
+  queue_id: string;
+  ticker: string;
+  action: string;
+  message: string;
+}

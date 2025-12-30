@@ -48,6 +48,13 @@ import type {
   // Trading Strategy Types
   TradingStrategyRequest,
   TradingStrategyResponse,
+  // Watch List Types
+  WatchListResponse,
+  WatchedStock,
+  AddToWatchListRequest,
+  AddToWatchListResponse,
+  ConvertWatchToQueueRequest,
+  ConvertWatchToQueueResponse,
 } from '@/types';
 
 // -------------------------------------------
@@ -1364,6 +1371,56 @@ class ApiClient {
     const response = await this.client.get('/trading/agents');
     return response.data;
   }
+
+  // -------------------------------------------
+  // Watch List Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get all stocks in watch list.
+   */
+  async getWatchList(): Promise<WatchListResponse> {
+    const response = await this.client.get<WatchListResponse>('/trading/watch-list');
+    return response.data;
+  }
+
+  /**
+   * Get a watched stock by ticker.
+   */
+  async getWatchedStock(ticker: string): Promise<WatchedStock> {
+    const response = await this.client.get<WatchedStock>(`/trading/watch-list/${ticker}`);
+    return response.data;
+  }
+
+  /**
+   * Add a stock to watch list.
+   */
+  async addToWatchList(request: AddToWatchListRequest): Promise<AddToWatchListResponse> {
+    const response = await this.client.post<AddToWatchListResponse>(
+      '/trading/watch-list/add',
+      request
+    );
+    return response.data;
+  }
+
+  /**
+   * Remove a stock from watch list.
+   */
+  async removeFromWatchList(watchId: string): Promise<{ status: string; watch_id: string }> {
+    const response = await this.client.delete(`/trading/watch-list/${watchId}`);
+    return response.data;
+  }
+
+  /**
+   * Convert a watched stock to trade queue.
+   */
+  async convertWatchToQueue(request: ConvertWatchToQueueRequest): Promise<ConvertWatchToQueueResponse> {
+    const response = await this.client.post<ConvertWatchToQueueResponse>(
+      '/trading/watch-list/convert',
+      request
+    );
+    return response.data;
+  }
 }
 
 // -------------------------------------------
@@ -1611,3 +1668,17 @@ export const addToTradeQueue = (params: {
 
 // Agent Status API
 export const getAgentStates = () => apiClient.getAgentStates();
+
+// Watch List API
+export const getWatchList = () => apiClient.getWatchList();
+
+export const getWatchedStock = (ticker: string) => apiClient.getWatchedStock(ticker);
+
+export const addToWatchList = (request: AddToWatchListRequest) =>
+  apiClient.addToWatchList(request);
+
+export const removeFromWatchList = (watchId: string) =>
+  apiClient.removeFromWatchList(watchId);
+
+export const convertWatchToQueue = (request: ConvertWatchToQueueRequest) =>
+  apiClient.convertWatchToQueue(request);
