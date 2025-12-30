@@ -23,6 +23,7 @@ from app.api.schemas.approval import (
     PendingProposalSummary,
 )
 from app.dependencies import get_trading_coordinator
+from services.telegram import get_telegram_notifier
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -117,6 +118,9 @@ async def submit_approval(request: ApprovalRequest):
                         state.update(node_output)
                     session["last_node"] = node_name
 
+        # Track allocation result for response message
+        allocation_rationale = None
+
         # Update session status based on decision
         if request.decision == "approved":
             session["status"] = "completed"
@@ -149,6 +153,9 @@ async def submit_approval(request: ApprovalRequest):
                             risk_score=int(proposal.get("risk_score", 5) * 10),  # Convert 0-1 to 1-10
                             quantity_override=proposal.get("quantity"),
                         )
+
+                        # Store rationale for response message
+                        allocation_rationale = allocation.rationale
 
                         logger.info(
                             "auto_trading_connected",
@@ -198,6 +205,32 @@ async def submit_approval(request: ApprovalRequest):
             execution_status=execution_status,
         )
 
+        # Send Telegram notification
+        try:
+            telegram = await get_telegram_notifier()
+            if telegram.is_ready:
+                proposal = state.get("trade_proposal", {})
+                ticker = session.get("stk_cd") or session.get("ticker") or session.get("market", "")
+                stock_name = session.get("stk_nm") or session.get("stock_name", ticker)
+
+                if request.decision == "approved":
+                    await telegram.send_trade_executed(
+                        ticker=ticker,
+                        stock_name=stock_name,
+                        action=proposal.get("action", "BUY"),
+                        quantity=proposal.get("quantity", 0),
+                        price=proposal.get("entry_price", 0),
+                        total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
+                    )
+                elif request.decision == "rejected":
+                    await telegram.send_trade_rejected(
+                        ticker=ticker,
+                        stock_name=stock_name,
+                        reason=request.feedback or "User rejected the proposal",
+                    )
+        except Exception as te:
+            logger.warning("telegram_notification_failed", error=str(te))
+
     except Exception as e:
         logger.error(
             "approval_processing_failed",
@@ -213,7 +246,10 @@ async def submit_approval(request: ApprovalRequest):
 
     # Build response message
     if request.decision == "approved":
-        message = "Trade approved and executed successfully."
+        if allocation_rationale and "queued" in allocation_rationale.lower():
+            message = f"Trade approved. {allocation_rationale}"
+        else:
+            message = "Trade approved and executed successfully."
     elif request.decision == "rejected":
         message = "Trade rejected. Re-analyzing with your feedback..."
     elif request.decision == "cancelled":

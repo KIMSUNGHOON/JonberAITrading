@@ -228,7 +228,7 @@ export function useAnalysisWebSocket({
               bear_case: data.trade_proposal.bear_case || '',
               created_at: new Date().toISOString(),
             } : null,
-            reasoningSummary: data.reasoning_summary || null,
+            reasoningSummary: data.reasoning_summary ?? undefined,
             completedAt: data.completed_at ? new Date(data.completed_at) : new Date(),
           });
         }
@@ -359,7 +359,7 @@ export function useMultipleAnalysisWebSockets(
                   bear_case: data.trade_proposal.bear_case || '',
                   created_at: new Date().toISOString(),
                 } : null,
-                reasoningSummary: data.reasoning_summary || null,
+                reasoningSummary: data.reasoning_summary ?? undefined,
                 completedAt: data.completed_at ? new Date(data.completed_at) : new Date(),
               });
             }

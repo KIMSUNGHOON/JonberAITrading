@@ -23,6 +23,9 @@ import {
   Settings,
   Bell,
 } from 'lucide-react';
+import AgentStatusWidget from './AgentStatusWidget';
+import TradeQueueWidget from './TradeQueueWidget';
+import StrategyConfigWidget from './StrategyConfigWidget';
 import {
   getTradingStatus,
   getTradingPortfolio,
@@ -266,12 +269,12 @@ export default function TradingDashboard() {
   }
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="p-4 lg:p-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between mb-4">
         <div>
-          <h1 className="text-2xl font-bold text-white">Auto-Trading Dashboard</h1>
-          <p className="text-gray-400">Manage your automated trading system</p>
+          <h1 className="text-xl lg:text-2xl font-bold text-white">Auto-Trading</h1>
+          <p className="text-sm text-gray-400">Automated trading management</p>
         </div>
         <button
           onClick={fetchData}
@@ -283,204 +286,184 @@ export default function TradingDashboard() {
 
       {/* Error */}
       {error && (
-        <div className="p-4 bg-red-500/20 border border-red-500/30 rounded-lg text-red-400">
+        <div className="mb-4 p-3 bg-red-500/20 border border-red-500/30 rounded-lg text-red-400 text-sm">
           {error}
         </div>
       )}
 
-      {/* Status & Controls */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Status Card */}
-        <div className="bg-gray-900 rounded-xl p-6 border border-gray-800">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-              <Activity className="w-5 h-5 text-blue-400" />
-              Trading Status
-            </h2>
-            <StatusBadge mode={status?.mode || 'stopped'} />
-          </div>
+      {/* Main Grid Layout */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        {/* Left Column - Controls & Status */}
+        <div className="space-y-4">
+          {/* Status Card - Compact */}
+          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="font-semibold text-white flex items-center gap-2">
+                <Activity className="w-4 h-4 text-blue-400" />
+                Status
+              </h2>
+              <StatusBadge mode={status?.mode || 'stopped'} />
+            </div>
 
-          <div className="space-y-3 mb-6">
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">Started At</span>
-              <span className="text-white">
-                {status?.started_at
-                  ? new Date(status.started_at).toLocaleString()
-                  : '-'}
-              </span>
+            <div className="space-y-2 text-sm mb-4">
+              <div className="flex justify-between">
+                <span className="text-gray-400">Started</span>
+                <span className="text-white">
+                  {status?.started_at
+                    ? new Date(status.started_at).toLocaleTimeString()
+                    : '-'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-400">Trades</span>
+                <span className="text-white">
+                  {status?.daily_trades || 0}/{status?.max_daily_trades || 10}
+                </span>
+              </div>
             </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">Daily Trades</span>
-              <span className="text-white">
-                {status?.daily_trades || 0} / {status?.max_daily_trades || 10}
-              </span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">Pending Alerts</span>
-              <span className="text-white">{status?.pending_alerts_count || 0}</span>
-            </div>
-          </div>
 
-          {/* Control Buttons */}
-          <div className="flex gap-2">
-            {status?.mode === 'stopped' ? (
-              <button
-                onClick={handleStart}
-                disabled={actionLoading}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg disabled:opacity-50"
-              >
-                <Play className="w-4 h-4" />
-                Start
-              </button>
-            ) : status?.mode === 'paused' ? (
-              <>
+            {/* Control Buttons */}
+            <div className="flex gap-2">
+              {status?.mode === 'stopped' ? (
                 <button
-                  onClick={handleResume}
+                  onClick={handleStart}
                   disabled={actionLoading}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg disabled:opacity-50"
+                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg disabled:opacity-50"
                 >
                   <Play className="w-4 h-4" />
-                  Resume
+                  Start
                 </button>
-                <button
-                  onClick={handleStop}
-                  disabled={actionLoading}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg disabled:opacity-50"
-                >
-                  <Square className="w-4 h-4" />
-                  Stop
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  onClick={handlePause}
-                  disabled={actionLoading}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg disabled:opacity-50"
-                >
-                  <Pause className="w-4 h-4" />
-                  Pause
-                </button>
-                <button
-                  onClick={handleStop}
-                  disabled={actionLoading}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg disabled:opacity-50"
-                >
-                  <Square className="w-4 h-4" />
-                  Stop
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-
-        {/* Portfolio Summary */}
-        <div className="bg-gray-900 rounded-xl p-6 border border-gray-800">
-          <h2 className="text-lg font-semibold text-white flex items-center gap-2 mb-4">
-            <DollarSign className="w-5 h-5 text-green-400" />
-            Portfolio Summary
-          </h2>
-
-          {portfolio ? (
-            <div className="space-y-3">
-              <div className="flex justify-between">
-                <span className="text-gray-400">Total Equity</span>
-                <span className="text-white font-semibold">
-                  ₩{portfolio.total_equity.toLocaleString()}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-400">Cash</span>
-                <span className="text-white">
-                  ₩{portfolio.cash.toLocaleString()} ({(portfolio.cash_ratio * 100).toFixed(1)}%)
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-400">Stock Value</span>
-                <span className="text-white">
-                  ₩{portfolio.stock_value.toLocaleString()} ({(portfolio.stock_ratio * 100).toFixed(1)}%)
-                </span>
-              </div>
-              <div className="border-t border-gray-700 pt-3 mt-3">
-                <div className="flex justify-between">
-                  <span className="text-gray-400">Unrealized P&L</span>
-                  <span
-                    className={
-                      portfolio.total_unrealized_pnl >= 0
-                        ? 'text-green-400'
-                        : 'text-red-400'
-                    }
+              ) : status?.mode === 'paused' ? (
+                <>
+                  <button
+                    onClick={handleResume}
+                    disabled={actionLoading}
+                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg disabled:opacity-50"
                   >
-                    ₩{Math.abs(portfolio.total_unrealized_pnl).toLocaleString()} (
-                    {portfolio.total_unrealized_pnl_pct >= 0 ? '+' : ''}
-                    {portfolio.total_unrealized_pnl_pct.toFixed(2)}%)
+                    <Play className="w-4 h-4" />
+                    Resume
+                  </button>
+                  <button
+                    onClick={handleStop}
+                    disabled={actionLoading}
+                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg disabled:opacity-50"
+                  >
+                    <Square className="w-4 h-4" />
+                    Stop
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={handlePause}
+                    disabled={actionLoading}
+                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-yellow-600 hover:bg-yellow-700 text-white text-sm rounded-lg disabled:opacity-50"
+                  >
+                    <Pause className="w-4 h-4" />
+                    Pause
+                  </button>
+                  <button
+                    onClick={handleStop}
+                    disabled={actionLoading}
+                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg disabled:opacity-50"
+                  >
+                    <Square className="w-4 h-4" />
+                    Stop
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Portfolio Summary - Compact */}
+          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+            <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
+              <DollarSign className="w-4 h-4 text-green-400" />
+              Portfolio
+            </h2>
+
+            {portfolio ? (
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Equity</span>
+                  <span className="text-white font-medium">
+                    ₩{portfolio.total_equity.toLocaleString()}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Cash</span>
+                  <span className="text-white">
+                    {(portfolio.cash_ratio * 100).toFixed(0)}%
+                  </span>
+                </div>
+                <div className="flex justify-between pt-2 border-t border-gray-700">
+                  <span className="text-gray-400">P&L</span>
+                  <span className={portfolio.total_unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                    {portfolio.total_unrealized_pnl >= 0 ? '+' : ''}
+                    {portfolio.total_unrealized_pnl_pct.toFixed(2)}%
                   </span>
                 </div>
               </div>
-            </div>
-          ) : (
-            <div className="text-gray-400 text-center py-8">
-              No portfolio data available
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* Positions & Alerts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Positions */}
-        <div className="bg-gray-900 rounded-xl p-6 border border-gray-800">
-          <h2 className="text-lg font-semibold text-white flex items-center gap-2 mb-4">
-            <TrendingUp className="w-5 h-5 text-blue-400" />
-            Managed Positions
-            {portfolio?.positions && portfolio.positions.length > 0 && (
-              <span className="text-sm text-gray-400">
-                ({portfolio.positions.length})
-              </span>
+            ) : (
+              <div className="text-gray-400 text-center py-4 text-sm">No data</div>
             )}
-          </h2>
+          </div>
 
-          {portfolio?.positions && portfolio.positions.length > 0 ? (
-            <div className="space-y-3 max-h-96 overflow-y-auto">
-              {portfolio.positions.map((position, idx) => (
-                <PositionRow key={position.ticker || idx} position={position} />
-              ))}
-            </div>
-          ) : (
-            <div className="text-gray-400 text-center py-8">
-              No active positions
-            </div>
-          )}
+          {/* Trade Queue Widget */}
+          <TradeQueueWidget />
         </div>
 
-        {/* Alerts */}
-        <div className="bg-gray-900 rounded-xl p-6 border border-gray-800">
-          <h2 className="text-lg font-semibold text-white flex items-center gap-2 mb-4">
-            <Bell className="w-5 h-5 text-yellow-400" />
-            Pending Alerts
-            {alerts.length > 0 && (
-              <span className="text-sm text-gray-400">({alerts.length})</span>
+        {/* Middle Column - Agent Status & Positions */}
+        <div className="space-y-4">
+          {/* Agent Status Widget */}
+          <AgentStatusWidget />
+
+          {/* Positions */}
+          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+            <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
+              <TrendingUp className="w-4 h-4 text-blue-400" />
+              Positions
+              {portfolio?.positions && portfolio.positions.length > 0 && (
+                <span className="text-sm text-gray-400">
+                  ({portfolio.positions.length})
+                </span>
+              )}
+            </h2>
+
+            {portfolio?.positions && portfolio.positions.length > 0 ? (
+              <div className="space-y-2 max-h-64 overflow-y-auto">
+                {portfolio.positions.map((position, idx) => (
+                  <PositionRow key={position.ticker || idx} position={position} />
+                ))}
+              </div>
+            ) : (
+              <div className="text-gray-400 text-center py-6 text-sm">
+                No active positions
+              </div>
             )}
-          </h2>
+          </div>
 
-          {alerts.length > 0 ? (
-            <div className="space-y-3 max-h-96 overflow-y-auto">
-              {alerts.map((alert) => (
-                <AlertItem key={alert.id} alert={alert} />
-              ))}
+          {/* Alerts */}
+          {alerts.length > 0 && (
+            <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+              <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
+                <Bell className="w-4 h-4 text-yellow-400" />
+                Alerts
+                <span className="text-sm text-gray-400">({alerts.length})</span>
+              </h2>
+              <div className="space-y-2 max-h-48 overflow-y-auto">
+                {alerts.map((alert) => (
+                  <AlertItem key={alert.id} alert={alert} />
+                ))}
+              </div>
             </div>
-          ) : (
-            <div className="text-gray-400 text-center py-8">No pending alerts</div>
           )}
         </div>
-      </div>
 
-      {/* Settings Link */}
-      <div className="text-center">
-        <button className="inline-flex items-center gap-2 text-gray-400 hover:text-white">
-          <Settings className="w-4 h-4" />
-          Configure Risk Parameters
-        </button>
+        {/* Right Column - Strategy Configuration */}
+        <div>
+          <StrategyConfigWidget />
+        </div>
       </div>
     </div>
   );

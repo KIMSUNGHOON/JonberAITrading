@@ -57,9 +57,9 @@ export function ChatPanel() {
         marketType: 'kiwoom',
         status: kiwoomSession.status,
         recommendation: kiwoomSession.tradeProposal?.action,
-        entryPrice: kiwoomSession.tradeProposal?.entry_price,
-        stopLoss: kiwoomSession.tradeProposal?.stop_loss,
-        takeProfit: kiwoomSession.tradeProposal?.take_profit,
+        entryPrice: kiwoomSession.tradeProposal?.entry_price ?? undefined,
+        stopLoss: kiwoomSession.tradeProposal?.stop_loss ?? undefined,
+        takeProfit: kiwoomSession.tradeProposal?.take_profit ?? undefined,
         keySignals: kiwoomSession.reasoningLog?.slice(-3),
       };
     }
@@ -72,9 +72,9 @@ export function ChatPanel() {
         marketType: 'coin',
         status: state.coin.status,
         recommendation: state.coin.tradeProposal?.action,
-        entryPrice: state.coin.tradeProposal?.entry_price,
-        stopLoss: state.coin.tradeProposal?.stop_loss,
-        takeProfit: state.coin.tradeProposal?.take_profit,
+        entryPrice: state.coin.tradeProposal?.entry_price ?? undefined,
+        stopLoss: state.coin.tradeProposal?.stop_loss ?? undefined,
+        takeProfit: state.coin.tradeProposal?.take_profit ?? undefined,
       };
     }
 
@@ -86,9 +86,9 @@ export function ChatPanel() {
         marketType: 'stock',
         status: state.stock.status,
         recommendation: state.stock.tradeProposal?.action,
-        entryPrice: state.stock.tradeProposal?.entry_price,
-        stopLoss: state.stock.tradeProposal?.stop_loss,
-        takeProfit: state.stock.tradeProposal?.take_profit,
+        entryPrice: state.stock.tradeProposal?.entry_price ?? undefined,
+        stopLoss: state.stock.tradeProposal?.stop_loss ?? undefined,
+        takeProfit: state.stock.tradeProposal?.take_profit ?? undefined,
       };
     }
 
@@ -112,8 +112,8 @@ export function ChatPanel() {
           action: 'approved',  // If completed with proposal, it was approved
           tradeAction: h.tradeProposal.action || 'HOLD',
           timestamp: new Date(h.timestamp).toISOString(),
-          quantity: h.tradeProposal.quantity,
-          price: h.tradeProposal.entry_price,
+          quantity: h.tradeProposal.quantity ?? undefined,
+          price: h.tradeProposal.entry_price ?? undefined,
         });
       }
     });

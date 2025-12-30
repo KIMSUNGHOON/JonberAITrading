@@ -10,7 +10,7 @@
  * - Full reasoning log
  */
 
-import { useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import {
   ArrowLeft,
   FileText,
@@ -29,8 +29,12 @@ import {
   DollarSign,
   Newspaper,
   Languages,
+  Plus,
+  Loader2,
+  Eye,
 } from 'lucide-react';
 import { useStore, selectTickerHistory, type MarketType, type TickerHistoryItem } from '@/store';
+import { addToTradeQueue } from '@/api/client';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
 import { useTranslations } from '@/utils/translations';
 import type {
@@ -403,6 +407,10 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
   const setLanguage = useStore((state) => state.setLanguage);
   const t = useTranslations(language);
 
+  // State for Add to Queue
+  const [addingToQueue, setAddingToQueue] = useState(false);
+  const [queueMessage, setQueueMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
   // Use prop sessionId if provided, otherwise use store's selectedSessionId
   const sessionId = propSessionId || storeSessionId;
 
@@ -422,6 +430,60 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
       onBack();
     } else {
       setCurrentView('analysis');
+    }
+  };
+
+  // Handle adding trade to queue
+  const handleAddToQueue = async () => {
+    if (!analysis) return;
+
+    // Get required data
+    const ticker = 'stk_cd' in analysis ? (analysis as { stk_cd: string }).stk_cd : analysis.ticker;
+    const stockName = getDisplayName(analysis);
+    const action = getAction(analysis);
+
+    // Get trade proposal data if available
+    const proposal = 'tradeProposal' in analysis
+      ? (analysis as { tradeProposal?: { entry_price?: number; stop_loss?: number; take_profit?: number } }).tradeProposal
+      : null;
+
+    if (!action || action === 'HOLD' || action === 'WATCH' || action === 'AVOID') {
+      setQueueMessage({ type: 'error', text: `Cannot queue ${action || 'empty'} recommendations` });
+      setTimeout(() => setQueueMessage(null), 3000);
+      return;
+    }
+
+    if (!proposal?.entry_price) {
+      setQueueMessage({ type: 'error', text: 'No entry price available' });
+      setTimeout(() => setQueueMessage(null), 3000);
+      return;
+    }
+
+    try {
+      setAddingToQueue(true);
+      setQueueMessage(null);
+
+      const result = await addToTradeQueue({
+        ticker,
+        stock_name: stockName,
+        action,
+        entry_price: proposal.entry_price,
+        stop_loss: proposal.stop_loss,
+        take_profit: proposal.take_profit,
+        session_id: sessionId || undefined,
+        reason: `From completed analysis: ${stockName}`,
+      });
+
+      setQueueMessage({ type: 'success', text: result.message });
+      setTimeout(() => setQueueMessage(null), 5000);
+    } catch (err) {
+      setQueueMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to add to queue',
+      });
+      setTimeout(() => setQueueMessage(null), 5000);
+    } finally {
+      setAddingToQueue(false);
     }
   };
 
@@ -522,10 +584,15 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
               </button>
               {action && (
                 <span className={`px-2 py-1 text-xs font-medium rounded-lg flex items-center gap-1 ${
-                  action === 'BUY' ? 'bg-green-500/20 text-green-400' :
-                  action === 'SELL' ? 'bg-red-500/20 text-red-400' : 'bg-gray-500/20 text-gray-400'
+                  action === 'BUY' || action === 'ADD' ? 'bg-green-500/20 text-green-400' :
+                  action === 'SELL' || action === 'REDUCE' ? 'bg-red-500/20 text-red-400' :
+                  action === 'AVOID' ? 'bg-red-500/20 text-red-400' :
+                  action === 'WATCH' ? 'bg-yellow-500/20 text-yellow-400' :
+                  'bg-gray-500/20 text-gray-400'
                 }`}>
-                  {action === 'BUY' ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+                  {(action === 'BUY' || action === 'ADD') ? <TrendingUp className="w-3 h-3" /> :
+                   (action === 'SELL' || action === 'REDUCE' || action === 'AVOID') ? <TrendingDown className="w-3 h-3" /> :
+                   <Eye className="w-3 h-3" />}
                   {action}
                 </span>
               )}
@@ -575,10 +642,39 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
           {/* Trade Proposal Card (if available) */}
           {tradeProposal && (
             <div className="card bg-gradient-to-r from-green-600/10 to-blue-600/10 border-green-500/30">
-              <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                <Activity className="w-5 h-5 text-green-400" />
-                {t('trade_proposal')}
-              </h2>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-lg font-semibold flex items-center gap-2">
+                  <Activity className="w-5 h-5 text-green-400" />
+                  {t('trade_proposal')}
+                </h2>
+                {/* Add to Queue Button */}
+                {action && !['HOLD', 'WATCH', 'AVOID'].includes(action) && tradeProposal.entry_price && (
+                  <button
+                    onClick={handleAddToQueue}
+                    disabled={addingToQueue}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {addingToQueue ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Plus className="w-4 h-4" />
+                    )}
+                    Add to Queue
+                  </button>
+                )}
+              </div>
+
+              {/* Queue Message */}
+              {queueMessage && (
+                <div className={`mb-4 p-3 rounded-lg text-sm ${
+                  queueMessage.type === 'success'
+                    ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+                    : 'bg-red-500/20 text-red-400 border border-red-500/30'
+                }`}>
+                  {queueMessage.text}
+                </div>
+              )}
+
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
                 {tradeProposal.entry_price && (
                   <div className="text-center">

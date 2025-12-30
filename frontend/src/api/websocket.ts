@@ -144,8 +144,6 @@ export class TradingWebSocket {
   private isClosing = false;
   private _connectionState: ConnectionState = 'disconnected';
   private messageBuffer: WebSocketMessage[] = [];
-  private bufferEnabled = true;
-  private maxBufferSize = 100;
 
   constructor(sessionId: string, handlers: WebSocketHandlers = {}) {
     this.sessionId = sessionId;
@@ -427,7 +425,7 @@ export function createStoreWebSocket(
       data: {
         analysisResults?: DetailedAnalysisResults | null;
         tradeProposal?: KRStockTradeProposal | null;
-        reasoningSummary?: string | null;
+        reasoningSummary?: string;
         completedAt?: Date;
       }
     ) => void;
@@ -547,7 +545,7 @@ export function createStoreWebSocket(
             bear_case: data.trade_proposal.bear_case || '',
             created_at: new Date().toISOString(),
           } : null,
-          reasoningSummary: data.reasoning_summary || null,
+          reasoningSummary: data.reasoning_summary ?? undefined,
           completedAt: data.completed_at ? new Date(data.completed_at) : new Date(),
         });
       }

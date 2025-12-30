@@ -14,7 +14,6 @@ import { MobileNav } from '@/components/layout/MobileNav';
 import { SettingsModal } from '@/components/settings/SettingsModal';
 import { ChatToggleButton } from '@/components/chat/ChatToggleButton';
 import { ChatPopup } from '@/components/chat/ChatPopup';
-import { PopularTickerBar } from '@/components/ticker/PopularTickerBar';
 import { Toast } from '@/components/ui/Toast';
 import { getUpbitApiStatus, getKiwoomApiStatus } from '@/api/client';
 
@@ -74,9 +73,6 @@ function App() {
     <div className="h-screen bg-surface flex flex-col overflow-hidden">
       {/* Header - Fixed height */}
       <Header />
-
-      {/* Popular Ticker Bar - Real-time scrolling ticker */}
-      <PopularTickerBar />
 
       {/* Error Toast - Persistent with dismiss button */}
       {error && (

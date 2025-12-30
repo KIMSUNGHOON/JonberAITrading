@@ -70,8 +70,8 @@ def _get_stk_cd_safely(state: dict, node_name: str) -> str:
 
 async def kr_stock_data_collection_node(state: dict) -> dict:
     """
-    Fetch market data from Kiwoom API.
-    This is the first node that gathers all necessary data.
+    Fetch market data and portfolio context from Kiwoom API.
+    This is the first node that gathers all necessary data including existing positions.
     """
     start_time = time.perf_counter()
     stk_cd = _get_stk_cd_safely(state, "data_collection")
@@ -92,6 +92,53 @@ async def kr_stock_data_collection_node(state: dict) -> dict:
         # Fetch orderbook
         orderbook = await get_kr_orderbook(stk_cd)
 
+        # Fetch portfolio to check for existing position
+        existing_position = None
+        portfolio_summary = None
+        try:
+            client = await get_shared_kiwoom_client_async()
+            account_balance = await client.get_account_balance()
+
+            # Find existing position for this stock
+            for holding in account_balance.holdings:
+                if holding.stk_cd == stk_cd:
+                    existing_position = {
+                        "stk_cd": holding.stk_cd,
+                        "stk_nm": holding.stk_nm,
+                        "quantity": holding.hldg_qty,
+                        "avg_buy_price": holding.avg_buy_prc,
+                        "current_price": holding.cur_prc,
+                        "eval_amount": holding.evlu_amt,
+                        "profit_loss": holding.evlu_pfls_amt,
+                        "profit_loss_pct": holding.evlu_pfls_rt,
+                    }
+                    logger.info(
+                        "existing_position_found",
+                        stk_cd=stk_cd,
+                        quantity=holding.hldg_qty,
+                        avg_price=holding.avg_buy_prc,
+                        pnl_pct=holding.evlu_pfls_rt,
+                    )
+                    break
+
+            # Portfolio summary for context
+            portfolio_summary = {
+                "total_purchase": account_balance.pchs_amt,
+                "total_eval": account_balance.evlu_amt,
+                "total_pnl": account_balance.evlu_pfls_amt,
+                "total_pnl_pct": account_balance.evlu_pfls_rt,
+                "available_cash": account_balance.d2_ord_psbl_amt,
+                "holdings_count": len(account_balance.holdings),
+            }
+
+        except Exception as e:
+            logger.warning(
+                "portfolio_fetch_failed",
+                stk_cd=stk_cd,
+                error=str(e),
+            )
+            # Continue without portfolio data
+
         # Convert chart DataFrame to list of dicts for serialization
         chart_data = []
         if not chart_df.empty:
@@ -109,11 +156,21 @@ async def kr_stock_data_collection_node(state: dict) -> dict:
         cur_prc = stock_info.get("cur_prc", 0)
         prdy_ctrt = stock_info.get("prdy_ctrt", 0)
 
+        # Build reasoning with position context
+        position_info = ""
+        if existing_position:
+            position_info = (
+                f"\n[포지션] {existing_position['quantity']}주 보유 중, "
+                f"평균단가={existing_position['avg_buy_price']:,}원, "
+                f"수익률={existing_position['profit_loss_pct']:+.2f}%"
+            )
+
         reasoning = (
             f"[데이터 수집] {stk_nm} ({stk_cd}): "
             f"현재가={cur_prc:,}원, "
             f"전일대비={prdy_ctrt:+.2f}%, "
             f"차트 {len(chart_data)}일치"
+            f"{position_info}"
         )
 
         duration_ms = (time.perf_counter() - start_time) * 1000
@@ -122,6 +179,7 @@ async def kr_stock_data_collection_node(state: dict) -> dict:
             node="kr_stock_data_collection",
             stk_cd=stk_cd,
             stk_nm=stk_nm,
+            has_position=existing_position is not None,
             duration_ms=round(duration_ms, 2),
         )
 
@@ -130,6 +188,8 @@ async def kr_stock_data_collection_node(state: dict) -> dict:
             "market_data": stock_info,
             "chart_df": chart_data,
             "orderbook": orderbook,
+            "existing_position": existing_position,
+            "portfolio_summary": portfolio_summary,
             "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
             "messages": [AIMessage(content=reasoning)],
             "current_stage": KRStockAnalysisStage.DATA_COLLECTION,
@@ -263,6 +323,22 @@ async def kr_stock_technical_analysis_node(state: dict) -> dict:
         duration_ms=round(duration_ms, 2),
     )
 
+    # Send Telegram notification for sub-agent decision
+    try:
+        from services.telegram import get_telegram_notifier
+        telegram = await get_telegram_notifier()
+        if telegram.is_ready:
+            await telegram.send_subagent_decision(
+                ticker=stk_cd,
+                stock_name=stk_nm,
+                agent_type="technical",
+                signal=signal.value,
+                confidence=confidence,
+                key_factors=result.key_factors[:5],
+            )
+    except Exception as te:
+        logger.warning("telegram_subagent_notification_failed", agent="technical", error=str(te))
+
     return {
         "technical_analysis": result.model_dump(),
         "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
@@ -326,6 +402,22 @@ async def kr_stock_fundamental_analysis_node(state: dict) -> dict:
 
     duration_ms = (time.perf_counter() - start_time) * 1000
     logger.info("node_completed", node="kr_stock_fundamental_analysis", stk_cd=stk_cd, duration_ms=round(duration_ms, 2))
+
+    # Send Telegram notification for sub-agent decision
+    try:
+        from services.telegram import get_telegram_notifier
+        telegram = await get_telegram_notifier()
+        if telegram.is_ready:
+            await telegram.send_subagent_decision(
+                ticker=stk_cd,
+                stock_name=stk_nm,
+                agent_type="fundamental",
+                signal=signal.value,
+                confidence=result.confidence,
+                key_factors=result.key_factors[:5],
+            )
+    except Exception as te:
+        logger.warning("telegram_subagent_notification_failed", agent="fundamental", error=str(te))
 
     return {
         "fundamental_analysis": result.model_dump(),
@@ -488,6 +580,22 @@ async def kr_stock_sentiment_analysis_node(state: dict) -> dict:
     duration_ms = (time.perf_counter() - start_time) * 1000
     logger.info("node_completed", node="kr_stock_sentiment_analysis", stk_cd=stk_cd, duration_ms=round(duration_ms, 2))
 
+    # Send Telegram notification for sub-agent decision
+    try:
+        from services.telegram import get_telegram_notifier
+        telegram = await get_telegram_notifier()
+        if telegram.is_ready:
+            await telegram.send_subagent_decision(
+                ticker=stk_cd,
+                stock_name=stk_nm,
+                agent_type="sentiment",
+                signal=signal.value,
+                confidence=result.confidence,
+                key_factors=result.key_factors[:5],
+            )
+    except Exception as te:
+        logger.warning("telegram_subagent_notification_failed", agent="sentiment", error=str(te))
+
     return {
         "sentiment_analysis": result.model_dump(),
         "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
@@ -559,6 +667,30 @@ async def kr_stock_risk_assessment_node(state: dict) -> dict:
     duration_ms = (time.perf_counter() - start_time) * 1000
     logger.info("node_completed", node="kr_stock_risk_assessment", stk_cd=stk_cd, risk_score=risk_score, duration_ms=round(duration_ms, 2))
 
+    # Send Telegram notification for sub-agent decision
+    try:
+        from services.telegram import get_telegram_notifier
+        telegram = await get_telegram_notifier()
+        if telegram.is_ready:
+            # Map risk score to risk level signal
+            risk_level = "low" if risk_score < 0.4 else ("high" if risk_score > 0.7 else "medium")
+            risk_key_factors = [
+                f"리스크 점수: {risk_score:.0%}",
+                f"최대 포지션: {result.signals['max_position_pct']}%",
+                f"손절가: ₩{result.signals.get('suggested_stop_loss', 0):,}",
+                f"목표가: ₩{result.signals.get('suggested_take_profit', 0):,}",
+            ]
+            await telegram.send_subagent_decision(
+                ticker=stk_cd,
+                stock_name=stk_nm,
+                agent_type="risk",
+                signal=risk_level,
+                confidence=1 - risk_score,  # Higher confidence = lower risk
+                key_factors=risk_key_factors,
+            )
+    except Exception as te:
+        logger.warning("telegram_subagent_notification_failed", agent="risk", error=str(te))
+
     return {
         "risk_assessment": result.model_dump(),
         "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
@@ -575,6 +707,7 @@ async def kr_stock_risk_assessment_node(state: dict) -> dict:
 async def kr_stock_strategic_decision_node(state: dict) -> dict:
     """
     Synthesize all analyses into a Korean stock trade proposal.
+    Considers existing position context for appropriate action recommendations.
     """
     start_time = time.perf_counter()
     stk_cd = _get_stk_cd_safely(state, "strategic_decision")
@@ -583,6 +716,24 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
 
     logger.info("node_started", node="kr_stock_strategic_decision", stk_cd=stk_cd)
 
+    # Get existing position context
+    existing_position = state.get("existing_position")
+    has_position = existing_position is not None
+    position_pnl_pct = existing_position.get("profit_loss_pct", 0.0) if existing_position else 0.0
+
+    # Build position context string for LLM
+    position_context = ""
+    if existing_position:
+        position_context = (
+            f"\n## 현재 보유 포지션\n"
+            f"- 보유수량: {existing_position['quantity']}주\n"
+            f"- 평균매입가: {existing_position['avg_buy_price']:,}원\n"
+            f"- 현재가: {existing_position['current_price']:,}원\n"
+            f"- 평가손익: {existing_position['profit_loss']:,}원 ({position_pnl_pct:+.2f}%)\n"
+        )
+    else:
+        position_context = "\n## 현재 보유 포지션\n- 미보유 종목입니다.\n"
+
     # Collect all analyses
     analyses = get_all_kr_stock_analyses(state)
     analyses_context = "\n\n".join(kr_stock_analysis_dict_to_context_string(a) for a in analyses)
@@ -590,11 +741,13 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
     # Calculate consensus
     consensus_signal, avg_confidence = calculate_kr_stock_consensus_signal(analyses)
 
+    # Include position context in LLM prompt
     messages = [
         SystemMessage(content=KR_STOCK_STRATEGIC_DECISION_PROMPT),
         HumanMessage(
             content=f"{stk_nm} ({stk_cd}) 투자 결정:\n\n"
-            f"컨센서스 시그널: {consensus_signal.value} (평균 신뢰도: {avg_confidence:.0%})\n\n"
+            f"컨센서스 시그널: {consensus_signal.value} (평균 신뢰도: {avg_confidence:.0%})\n"
+            f"{position_context}\n"
             f"{analyses_context}"
         ),
     ]
@@ -602,8 +755,21 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
     logger.debug("llm_request", node="kr_stock_strategic_decision")
     response = await llm.generate(messages)
 
-    # Determine action from consensus
-    action = _signal_to_action(consensus_signal)
+    # Determine action considering existing position
+    action = _signal_to_action_with_position(
+        signal=consensus_signal,
+        has_position=has_position,
+        position_pnl_pct=position_pnl_pct,
+    )
+
+    logger.info(
+        "kr_stock_action_determined",
+        stk_cd=stk_cd,
+        consensus_signal=consensus_signal.value,
+        has_position=has_position,
+        position_pnl_pct=position_pnl_pct,
+        action=action.value,
+    )
 
     # Get risk parameters
     risk = state.get("risk_assessment", {})
@@ -613,9 +779,9 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
     current_price = market_data.get("cur_prc", 0)
     position_size_pct = float(risk_signals.get("max_position_pct", 5.0))
 
-    # Calculate quantity based on available balance
+    # Calculate quantity based on action type and available balance
     quantity = 0
-    if action in (TradeAction.BUY, "BUY") and current_price > 0:
+    if action in (TradeAction.BUY, TradeAction.ADD) and current_price > 0:
         try:
             client = await get_shared_kiwoom_client_async()
             cash_balance = await client.get_cash_balance()
@@ -642,6 +808,13 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
             )
             # quantity remains 0, user can modify in approval dialog
 
+    elif action in (TradeAction.SELL, TradeAction.REDUCE) and existing_position:
+        # For sell actions, use existing position quantity
+        if action == TradeAction.SELL:
+            quantity = existing_position["quantity"]  # Full sell
+        else:
+            quantity = max(1, existing_position["quantity"] // 2)  # Partial sell (50%)
+
     # Create trade proposal
     proposal = KRStockTradeProposal(
         id=str(uuid.uuid4()),
@@ -660,7 +833,12 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         analyses=analyses,
     )
 
-    reasoning = f"[투자 결정] 제안: {action.value} {stk_nm} {quantity}주 @ {current_price:,}원"
+    # Build reasoning with position context
+    position_note = ""
+    if has_position:
+        position_note = f" (기존 {existing_position['quantity']}주 보유 중)"
+
+    reasoning = f"[투자 결정] 제안: {action.value} {stk_nm} {quantity}주 @ {current_price:,}원{position_note}"
 
     duration_ms = (time.perf_counter() - start_time) * 1000
     logger.info(
@@ -670,6 +848,95 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         action=action.value,
         duration_ms=round(duration_ms, 2),
     )
+
+    # Handle WATCH action - add to watch list
+    if action == TradeAction.WATCH:
+        try:
+            from app.dependencies import get_trading_coordinator
+            coordinator = await get_trading_coordinator()
+
+            # Extract key factors from analyses
+            key_factors = []
+            for analysis in analyses:
+                if analysis.get("key_factors"):
+                    key_factors.extend(analysis["key_factors"][:2])
+            key_factors = key_factors[:5]  # Limit to 5 factors
+
+            # Build analysis summary
+            analysis_summary = f"컨센서스: {consensus_signal.value} (신뢰도: {avg_confidence:.0%})"
+
+            # Add to watch list
+            watched = coordinator.add_to_watch_list(
+                session_id=state.get("session_id", str(uuid.uuid4())),
+                ticker=stk_cd,
+                stock_name=stk_nm,
+                signal=consensus_signal.value,
+                confidence=avg_confidence,
+                current_price=current_price,
+                target_entry_price=int(current_price * 0.97),  # Suggest 3% below current
+                stop_loss=proposal.stop_loss,
+                take_profit=proposal.take_profit,
+                analysis_summary=analysis_summary,
+                key_factors=key_factors,
+                risk_score=int(proposal.risk_score * 10),
+            )
+
+            logger.info(
+                "kr_stock_added_to_watch_list",
+                stk_cd=stk_cd,
+                watch_id=watched.id,
+            )
+
+            # Send Telegram notification for watch list addition
+            from services.telegram import get_telegram_notifier
+            telegram = await get_telegram_notifier()
+            if telegram.is_ready:
+                await telegram.send_message(
+                    f"👁 *Watch List 추가*\n\n"
+                    f"*종목:* {stk_nm} ({stk_cd})\n"
+                    f"*현재가:* ₩{current_price:,}\n"
+                    f"*시그널:* {consensus_signal.value} (신뢰도: {avg_confidence:.0%})\n\n"
+                    f"*분석 요약:*\n{response[:200]}...\n\n"
+                    f"_매수 진입점 모니터링 중_"
+                )
+
+        except Exception as we:
+            logger.warning("watch_list_addition_failed", error=str(we))
+
+    # Send Telegram notification for trade proposal (BUY/SELL only)
+    elif action in (TradeAction.BUY, TradeAction.SELL, TradeAction.ADD, TradeAction.REDUCE):
+        try:
+            from services.telegram import get_telegram_notifier
+            telegram = await get_telegram_notifier()
+            if telegram.is_ready:
+                await telegram.send_trade_proposal(
+                    ticker=stk_cd,
+                    stock_name=stk_nm,
+                    action=action.value,
+                    entry_price=current_price,
+                    stop_loss=proposal.stop_loss,
+                    take_profit=proposal.take_profit,
+                    confidence=avg_confidence,
+                    rationale=response[:300],
+                )
+        except Exception as te:
+            logger.warning("telegram_proposal_notification_failed", error=str(te))
+
+    # Send Telegram notification for AVOID
+    elif action == TradeAction.AVOID:
+        try:
+            from services.telegram import get_telegram_notifier
+            telegram = await get_telegram_notifier()
+            if telegram.is_ready:
+                await telegram.send_message(
+                    f"⛔ *매수 회피*\n\n"
+                    f"*종목:* {stk_nm} ({stk_cd})\n"
+                    f"*현재가:* ₩{current_price:,}\n"
+                    f"*시그널:* {consensus_signal.value} (신뢰도: {avg_confidence:.0%})\n\n"
+                    f"*사유:*\n{response[:200]}..."
+                )
+        except Exception as te:
+            logger.warning("telegram_avoid_notification_failed", error=str(te))
 
     return {
         "trade_proposal": proposal.model_dump(),
@@ -1138,12 +1405,63 @@ def _format_kr_fundamental_data(market_data: dict) -> str:
 
 
 def _signal_to_action(signal: SignalType) -> TradeAction:
-    """Convert signal to trade action."""
+    """Convert signal to trade action (without position context)."""
     if signal in (SignalType.STRONG_BUY, SignalType.BUY):
         return TradeAction.BUY
     elif signal in (SignalType.STRONG_SELL, SignalType.SELL):
         return TradeAction.SELL
     return TradeAction.HOLD
+
+
+def _signal_to_action_with_position(
+    signal: SignalType,
+    has_position: bool,
+    position_pnl_pct: float = 0.0,
+) -> TradeAction:
+    """
+    Convert signal to trade action considering existing position.
+
+    Args:
+        signal: Analysis consensus signal
+        has_position: True if user already holds this stock
+        position_pnl_pct: Current position profit/loss percentage
+
+    Returns:
+        Appropriate TradeAction based on signal and position context
+    """
+    if has_position:
+        # User already holds this stock
+        if signal in (SignalType.STRONG_BUY, SignalType.BUY):
+            # Positive signal + holding -> ADD more or HOLD
+            if position_pnl_pct < 0:
+                # Currently at loss - good opportunity to average down
+                return TradeAction.ADD
+            elif position_pnl_pct > 20:
+                # Big profit - hold and watch
+                return TradeAction.HOLD
+            else:
+                # Small profit - can add more
+                return TradeAction.ADD
+        elif signal in (SignalType.STRONG_SELL, SignalType.SELL):
+            # Negative signal + holding -> SELL or REDUCE
+            if signal == SignalType.STRONG_SELL:
+                return TradeAction.SELL  # Full sell
+            else:
+                return TradeAction.REDUCE  # Partial sell
+        else:
+            # HOLD signal + holding -> maintain position
+            return TradeAction.HOLD
+    else:
+        # User doesn't hold this stock
+        if signal in (SignalType.STRONG_BUY, SignalType.BUY):
+            return TradeAction.BUY  # New buy
+        elif signal == SignalType.STRONG_SELL:
+            return TradeAction.AVOID  # Strong negative - avoid buying
+        elif signal == SignalType.SELL:
+            return TradeAction.WATCH  # Negative but not critical - watch
+        else:
+            # HOLD signal + no position -> watch (user can buy if interested)
+            return TradeAction.WATCH
 
 
 def _extract_key_factors(response: str) -> list[str]:

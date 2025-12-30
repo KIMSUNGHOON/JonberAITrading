@@ -5,3 +5,4 @@
  */
 
 export { default as TradingDashboard } from './TradingDashboard';
+export { TradingStatusWidget } from './TradingStatusWidget';

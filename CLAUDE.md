@@ -101,6 +101,9 @@ cd backend && pytest -v
 | `LLM_MODEL` | Model name | `deepseek-r1:14b` |
 | `MARKET_DATA_MODE` | Data source | `live` or `mock` |
 | `REDIS_URL` | Redis connection | `redis://localhost:6379` |
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | (required for notifications) |
+| `TELEGRAM_CHAT_ID` | Telegram Chat ID | (required for notifications) |
+| `TELEGRAM_ENABLED` | Enable Telegram | `false` |
 
 ## Project Structure
 
@@ -115,6 +118,10 @@ cd backend && pytest -v
 │   │   ├── subagents/       # Specialist agents
 │   │   └── tools/           # Agent tools
 │   ├── services/            # Business logic
+│   │   ├── trading/         # Auto-trading system
+│   │   ├── telegram/        # Telegram notifications
+│   │   ├── background_scanner/  # KOSPI/KOSDAQ scanner
+│   │   └── kiwoom/          # Kiwoom API client
 │   └── models/              # Data models
 ├── frontend/                # React application
 │   └── src/
@@ -147,3 +154,40 @@ cd backend && pytest -v
                                             ↓
                                    [Trade Execution]
 ```
+
+## New Features (2025-12-31)
+
+### Telegram Notifications
+- **Service**: `services/telegram/`
+- **Setup**: Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_ENABLED=true`
+- **Features**: Trade proposals, executions, sub-agent decisions, system status
+
+### Watch List
+- **Endpoints**: `/api/trading/watch-list/*`
+- **Features**: Monitor WATCH recommendations, convert to trade queue
+- **Actions**: GET list, POST add, DELETE remove, POST convert
+
+### Background Scanner
+- **Endpoints**: `/api/scanner/*`
+- **Features**: Scan all KOSPI/KOSDAQ stocks in background
+- **Actions**: POST start/pause/resume/stop, GET progress, GET results
+
+### TradeAction Types
+- `BUY`: New buy (no position)
+- `SELL`: Full sell (has position)
+- `HOLD`: Hold position
+- `ADD`: Add to position
+- `REDUCE`: Partial sell
+- `WATCH`: Monitor for entry (no position + HOLD signal)
+- `AVOID`: Avoid buying (no position + STRONG_SELL signal)
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| `CLAUDE.md` | Claude Code 개발 지침 (이 파일) |
+| `WORK_STATUS.md` | 작업 현황 및 완료된 태스크 |
+| `docs/PROJECT_ROADMAP.md` | 프로젝트 로드맵, 진행 상황 |
+| `docs/UI_ARCHITECTURE.md` | UI 구조 및 컴포넌트 |
+| `docs/OPENDART_API_GUIDE.md` | OpenDART API 가이드 (미구현) |
+| `docs/archive/` | 완료된 기능 문서 아카이브 |

@@ -1,11 +1,54 @@
 # Work Status - JonberAITrading
 
-> Last Updated: 2025-12-26
+> Last Updated: 2025-12-31
 > Branch: `claude/read-trading-prompt-dgm5U`
 
 ---
 
 ## 완료된 작업 ✅
+
+### Phase D: Telegram Integration & Watch List (2025-12-31)
+
+#### Telegram Notification System
+| # | Task | 상태 |
+|---|------|------|
+| 1 | Telegram 서비스 구현 (`services/telegram/`) | ✅ 완료 |
+| 2 | TelegramNotifier 클래스 (polling 모드) | ✅ 완료 |
+| 3 | 거래 제안 알림 | ✅ 완료 |
+| 4 | 거래 체결/거절 알림 | ✅ 완료 |
+| 5 | 포지션 업데이트 알림 | ✅ 완료 |
+| 6 | 손절/익절 도달 알림 | ✅ 완료 |
+| 7 | Sub-Agent 분석 완료 알림 (Technical, Fundamental, Sentiment, Risk) | ✅ 완료 |
+| 8 | 시스템 상태 알림 | ✅ 완료 |
+
+#### Watch List Feature
+| # | Task | 상태 |
+|---|------|------|
+| 9 | WatchedStock 모델 (`services/trading/models.py`) | ✅ 완료 |
+| 10 | WatchStatus Enum (ACTIVE, TRIGGERED, REMOVED, CONVERTED) | ✅ 완료 |
+| 11 | TradingState에 watch_list 추가 | ✅ 완료 |
+| 12 | ExecutionCoordinator Watch List 메서드 | ✅ 완료 |
+| 13 | Watch List API 엔드포인트 (`/api/trading/watch-list`) | ✅ 완료 |
+| 14 | WATCH 액션 시 자동 Watch List 추가 | ✅ 완료 |
+| 15 | Watch List → Trade Queue 변환 기능 | ✅ 완료 |
+
+#### KOSPI/KOSDAQ Background Scanner
+| # | Task | 상태 |
+|---|------|------|
+| 16 | BackgroundScanner 서비스 (`services/background_scanner/`) | ✅ 완료 |
+| 17 | Semaphore-controlled 병렬 분석 (3 슬롯) | ✅ 완료 |
+| 18 | 진행률 추적 및 ETA | ✅ 완료 |
+| 19 | 결과 필터링 (BUY, WATCH, AVOID 등) | ✅ 완료 |
+| 20 | Scanner API 엔드포인트 (`/api/scanner/`) | ✅ 완료 |
+| 21 | 월간 리마인더 시스템 | ✅ 완료 |
+
+#### TradeAction Enum 개선
+| # | Task | 상태 |
+|---|------|------|
+| 22 | WATCH 액션 추가 (미보유 + HOLD 시그널) | ✅ 완료 |
+| 23 | AVOID 액션 조정 (미보유 + STRONG_SELL만) | ✅ 완료 |
+
+---
 
 ### Phase 3: Trading Execution (2025-12-26)
 
@@ -75,6 +118,44 @@
 
 ---
 
+## Phase D 수정된 파일 목록 (2025-12-31)
+
+### Backend - Telegram
+```
+backend/services/telegram/__init__.py     - 패키지 exports
+backend/services/telegram/config.py       - TelegramConfig 설정
+backend/services/telegram/service.py      - TelegramNotifier 클래스
+```
+
+### Backend - Watch List
+```
+backend/services/trading/models.py        - WatchedStock, WatchStatus 추가
+backend/services/trading/coordinator.py   - Watch List 메서드 추가
+backend/app/api/routes/trading.py         - Watch List API 엔드포인트
+```
+
+### Backend - Background Scanner
+```
+backend/services/background_scanner/__init__.py  - 패키지 exports
+backend/services/background_scanner/scanner.py   - BackgroundScanner 서비스
+backend/app/api/routes/scanner.py                - Scanner API 엔드포인트
+```
+
+### Backend - Analysis Updates
+```
+backend/agents/graph/kr_stock_state.py    - TradeAction.WATCH 추가
+backend/agents/graph/kr_stock_nodes.py    - Sub-agent Telegram 알림 추가
+backend/app/api/routes/approval.py        - Telegram 알림 통합
+backend/app/main.py                       - Telegram 초기화, Scanner 라우터
+```
+
+### Config
+```
+.env.example                              - Telegram 환경 변수 추가
+```
+
+---
+
 ## Phase 3 수정된 파일 목록
 
 ### Backend
@@ -107,6 +188,16 @@ frontend/src/components/layout/MainContent.tsx        - Trading 컴포넌트 통
 
 ## 남은 작업
 
+### Phase E: Frontend Watch List UI [MEDIUM]
+- Watch List 페이지/위젯 구현
+- Watch → Trade Queue 변환 UI
+- 재분석 버튼 추가
+
+### Phase F: 분석 데이터 저장 구조 개선 [MEDIUM]
+- 분석 결과 영구 저장
+- AnalysisDetailPage 데이터 표시
+- 세션 복원 기능
+
 ### Phase 4: 다국어 지원 [LOW]
 - i18n 프레임워크 도입 (`react-i18next`)
 - 번역 파일 구조 생성
@@ -117,6 +208,8 @@ frontend/src/components/layout/MainContent.tsx        - Trading 컴포넌트 통
 - Live Trading 모드 활성화 (현재 Paper Trading만)
 - WebSocket을 통한 실시간 Position 업데이트
 - Stop-Loss/Take-Profit 자동 실행
+- OpenDART 전자공시 연동
+- 뉴스 API 실시간 연동
 
 ---
 

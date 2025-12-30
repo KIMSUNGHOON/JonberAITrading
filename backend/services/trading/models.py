@@ -5,7 +5,7 @@ Data models for the auto-trading system.
 """
 
 from enum import Enum
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -70,6 +70,8 @@ class ActivityType(str, Enum):
     SYSTEM_RESUME = "system_resume"
     TRADE_APPROVED = "trade_approved"
     TRADE_REJECTED = "trade_rejected"
+    TRADE_QUEUED = "trade_queued"
+    TRADE_DEQUEUED = "trade_dequeued"
     ALLOCATION_CALCULATED = "allocation_calculated"
     ORDER_PLACED = "order_placed"
     ORDER_EXECUTED = "order_executed"
@@ -79,6 +81,58 @@ class ActivityType(str, Enum):
     RISK_ALERT = "risk_alert"
     MARKET_CLOSED = "market_closed"
     ACCOUNT_REFRESHED = "account_refreshed"
+    STRATEGY_CHANGED = "strategy_changed"
+    STRATEGY_EVALUATED = "strategy_evaluated"
+    # Watch list activities
+    WATCH_ADDED = "watch_added"
+    WATCH_REMOVED = "watch_removed"
+    WATCH_CONVERTED = "watch_converted"
+
+
+class QueueStatus(str, Enum):
+    """Trade queue status"""
+    PENDING = "pending"        # Waiting for market open
+    PROCESSING = "processing"  # Being executed
+    COMPLETED = "completed"    # Successfully executed
+    FAILED = "failed"          # Execution failed
+    CANCELLED = "cancelled"    # Cancelled by user
+
+
+class WatchStatus(str, Enum):
+    """Watch list item status"""
+    ACTIVE = "active"          # Actively monitoring
+    TRIGGERED = "triggered"    # Conditions met, ready for action
+    REMOVED = "removed"        # Removed from watch list
+    CONVERTED = "converted"    # Converted to trade queue
+
+
+class AgentStatus(str, Enum):
+    """Individual agent status"""
+    IDLE = "idle"
+    WORKING = "working"
+    WAITING = "waiting"
+    ERROR = "error"
+
+
+# -------------------------------------------
+# Agent State Models
+# -------------------------------------------
+
+class AgentState(BaseModel):
+    """State of an individual agent"""
+    name: str
+    status: AgentStatus = AgentStatus.IDLE
+    current_task: Optional[str] = None
+    last_action: Optional[str] = None
+    last_action_time: Optional[datetime] = None
+    error_message: Optional[str] = None
+
+    # Statistics
+    tasks_completed: int = 0
+    tasks_failed: int = 0
+
+    class Config:
+        use_enum_values = True
 
 
 # -------------------------------------------
@@ -243,6 +297,82 @@ class AllocationPlan(BaseModel):
 
 
 # -------------------------------------------
+# Trade Queue Models
+# -------------------------------------------
+
+class QueuedTrade(BaseModel):
+    """Trade waiting in queue for market open"""
+    id: str = Field(default_factory=lambda: f"queue_{datetime.now().strftime('%Y%m%d%H%M%S%f')}")
+    session_id: str
+    ticker: str
+    stock_name: Optional[str] = None
+
+    # Trade details
+    action: str  # BUY or SELL
+    entry_price: float
+    quantity: Optional[int] = None  # If None, calculate at execution time
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    risk_score: int = 5
+
+    # Queue status
+    status: QueueStatus = QueueStatus.PENDING
+    reason: str = ""  # Why it was queued (e.g., "Market closed")
+
+    # Timestamps
+    queued_at: datetime = Field(default_factory=datetime.now)
+    executed_at: Optional[datetime] = None
+
+    # Execution result
+    allocation: Optional[AllocationPlan] = None
+    error_message: Optional[str] = None
+
+    class Config:
+        use_enum_values = True
+
+
+# -------------------------------------------
+# Watch List Models
+# -------------------------------------------
+
+class WatchedStock(BaseModel):
+    """Stock in watch list for monitoring"""
+    id: str = Field(default_factory=lambda: f"watch_{datetime.now().strftime('%Y%m%d%H%M%S%f')}")
+    session_id: str
+    ticker: str
+    stock_name: Optional[str] = None
+
+    # Analysis summary
+    action: str = "WATCH"  # Original recommendation (WATCH)
+    signal: str = "hold"  # Analysis signal (e.g., hold, sell)
+    confidence: float = 0.5  # Analysis confidence (0-1)
+
+    # Price information
+    current_price: float = 0
+    target_entry_price: Optional[float] = None  # Suggested entry price
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+
+    # Analysis summary
+    analysis_summary: str = ""  # Brief summary of why it's on watch list
+    key_factors: List[str] = Field(default_factory=list)
+
+    # Status
+    status: WatchStatus = WatchStatus.ACTIVE
+
+    # Timestamps
+    added_at: datetime = Field(default_factory=datetime.now)
+    last_checked: Optional[datetime] = None
+    triggered_at: Optional[datetime] = None
+
+    # Metadata
+    risk_score: int = 5  # 1-10
+
+    class Config:
+        use_enum_values = True
+
+
+# -------------------------------------------
 # Alert Models
 # -------------------------------------------
 
@@ -321,6 +451,12 @@ class TradingState(BaseModel):
     positions: List[ManagedPosition] = Field(default_factory=list)
     pending_orders: List[OrderRequest] = Field(default_factory=list)
 
+    # Trade Queue (for market-closed orders)
+    trade_queue: List["QueuedTrade"] = Field(default_factory=list)
+
+    # Watch List (for WATCH recommendations)
+    watch_list: List["WatchedStock"] = Field(default_factory=list)
+
     # Today's activity
     daily_trades_count: int = 0
     daily_pnl: float = 0
@@ -333,6 +469,14 @@ class TradingState(BaseModel):
 
     # Activity log (recent agent decisions)
     activity_log: List[ActivityLog] = Field(default_factory=list)
+
+    # Agent states (for status display)
+    agent_states: Dict[str, AgentState] = Field(default_factory=lambda: {
+        "portfolio": AgentState(name="Portfolio Agent"),
+        "order": AgentState(name="Order Agent"),
+        "risk": AgentState(name="Risk Monitor"),
+        "strategy": AgentState(name="Strategy Engine"),
+    })
 
     # Timestamps
     last_updated: datetime = Field(default_factory=datetime.now)

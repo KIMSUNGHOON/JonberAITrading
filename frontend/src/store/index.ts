@@ -286,6 +286,7 @@ interface KiwoomActions {
       analysisResults?: DetailedAnalysisResults | null;
       tradeProposal?: KRStockTradeProposal | null;
       reasoningSummary?: string;
+      completedAt?: Date;
     }
   ) => void;
 

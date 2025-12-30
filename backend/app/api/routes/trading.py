@@ -17,6 +17,16 @@ from services.trading import (
     RiskParameters,
     StopLossMode,
     AllocationPlan,
+    # Strategy
+    RiskTolerance,
+    TradingStyle,
+    StrategyPreset,
+    TradingStrategy,
+    EntryConditions,
+    ExitConditions,
+    PositionSizingRules,
+    get_strategy_preset,
+    get_all_presets,
 )
 from app.dependencies import get_trading_coordinator
 
@@ -418,4 +428,573 @@ async def get_market_hours():
             **market_hours.get_market_session(MarketType.CRYPTO)._asdict(),
             "current_time": market_hours.get_market_session(MarketType.CRYPTO).current_time.isoformat(),
         },
+    }
+
+
+# -------------------------------------------
+# Strategy Endpoints
+# -------------------------------------------
+
+class StrategyCreateRequest(BaseModel):
+    """Request to create a custom strategy"""
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field(default="")
+    preset: Optional[str] = Field(default=None)  # Base preset to copy from
+    risk_tolerance: str = Field(default="moderate")
+    trading_style: str = Field(default="position")
+    system_prompt: str = Field(default="")
+    entry_conditions: Optional[dict] = None
+    exit_conditions: Optional[dict] = None
+    position_sizing: Optional[dict] = None
+    custom_instructions: str = Field(default="")
+
+
+class StrategyUpdateRequest(BaseModel):
+    """Request to update a strategy"""
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = None
+    risk_tolerance: Optional[str] = None
+    trading_style: Optional[str] = None
+    system_prompt: Optional[str] = None
+    entry_conditions: Optional[dict] = None
+    exit_conditions: Optional[dict] = None
+    position_sizing: Optional[dict] = None
+    custom_instructions: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+@router.get("/strategies/presets")
+async def get_strategy_presets():
+    """
+    Get all available strategy presets.
+
+    Returns pre-defined trading strategies with their configurations.
+    """
+    return {
+        "presets": get_all_presets(),
+        "risk_tolerances": [r.value for r in RiskTolerance],
+        "trading_styles": [s.value for s in TradingStyle],
+    }
+
+
+@router.get("/strategies/presets/{preset_name}")
+async def get_preset_details(preset_name: str):
+    """
+    Get detailed configuration of a specific preset.
+    """
+    try:
+        preset_enum = StrategyPreset(preset_name)
+        strategy = get_strategy_preset(preset_enum)
+        return strategy.model_dump()
+    except ValueError:
+        raise HTTPException(404, f"Preset '{preset_name}' not found")
+
+
+@router.get("/strategy")
+async def get_current_strategy(
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Get the currently active trading strategy.
+    """
+    strategy = coordinator.get_strategy()
+    if strategy:
+        return strategy.model_dump()
+    return {"strategy": None, "message": "No strategy configured"}
+
+
+@router.post("/strategy")
+async def set_strategy(
+    request: StrategyCreateRequest,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Create and set a new trading strategy.
+
+    You can start from a preset or create a completely custom strategy.
+    """
+    try:
+        # If a preset is specified, start from it
+        if request.preset:
+            try:
+                preset_enum = StrategyPreset(request.preset)
+                base_strategy = get_strategy_preset(preset_enum)
+                # Copy preset values as base
+                strategy_data = base_strategy.model_dump()
+            except ValueError:
+                raise HTTPException(400, f"Invalid preset: {request.preset}")
+        else:
+            strategy_data = {}
+
+        # Override with request data
+        strategy_data["name"] = request.name
+        strategy_data["description"] = request.description
+        strategy_data["preset"] = StrategyPreset.CUSTOM  # Always mark as custom once edited
+
+        # Handle risk tolerance
+        if request.risk_tolerance:
+            try:
+                strategy_data["risk_tolerance"] = RiskTolerance(request.risk_tolerance)
+            except ValueError:
+                raise HTTPException(400, f"Invalid risk_tolerance: {request.risk_tolerance}")
+
+        # Handle trading style
+        if request.trading_style:
+            try:
+                strategy_data["trading_style"] = TradingStyle(request.trading_style)
+            except ValueError:
+                raise HTTPException(400, f"Invalid trading_style: {request.trading_style}")
+
+        # Handle system prompt
+        if request.system_prompt:
+            strategy_data["system_prompt"] = request.system_prompt
+
+        # Handle conditions
+        if request.entry_conditions:
+            strategy_data["entry_conditions"] = EntryConditions(**request.entry_conditions)
+
+        if request.exit_conditions:
+            strategy_data["exit_conditions"] = ExitConditions(**request.exit_conditions)
+
+        if request.position_sizing:
+            strategy_data["position_sizing"] = PositionSizingRules(**request.position_sizing)
+
+        if request.custom_instructions:
+            strategy_data["custom_instructions"] = request.custom_instructions
+
+        # Create strategy
+        strategy = TradingStrategy(**strategy_data)
+
+        # Set in coordinator
+        coordinator.set_strategy(strategy)
+
+        logger.info(f"[Strategy API] Set strategy: {strategy.name}")
+
+        return {
+            "status": "created",
+            "strategy": strategy.model_dump(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[Strategy API] Failed to create strategy")
+        raise HTTPException(500, f"Failed to create strategy: {e}")
+
+
+@router.put("/strategy")
+async def update_strategy(
+    request: StrategyUpdateRequest,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Update the current trading strategy.
+    """
+    try:
+        current = coordinator.get_strategy()
+        if not current:
+            raise HTTPException(404, "No strategy to update")
+
+        # Get current strategy data
+        strategy_data = current.model_dump()
+
+        # Update fields
+        if request.name is not None:
+            strategy_data["name"] = request.name
+
+        if request.description is not None:
+            strategy_data["description"] = request.description
+
+        if request.risk_tolerance is not None:
+            try:
+                strategy_data["risk_tolerance"] = RiskTolerance(request.risk_tolerance)
+            except ValueError:
+                raise HTTPException(400, f"Invalid risk_tolerance: {request.risk_tolerance}")
+
+        if request.trading_style is not None:
+            try:
+                strategy_data["trading_style"] = TradingStyle(request.trading_style)
+            except ValueError:
+                raise HTTPException(400, f"Invalid trading_style: {request.trading_style}")
+
+        if request.system_prompt is not None:
+            strategy_data["system_prompt"] = request.system_prompt
+
+        if request.entry_conditions is not None:
+            strategy_data["entry_conditions"] = EntryConditions(**request.entry_conditions)
+
+        if request.exit_conditions is not None:
+            strategy_data["exit_conditions"] = ExitConditions(**request.exit_conditions)
+
+        if request.position_sizing is not None:
+            strategy_data["position_sizing"] = PositionSizingRules(**request.position_sizing)
+
+        if request.custom_instructions is not None:
+            strategy_data["custom_instructions"] = request.custom_instructions
+
+        if request.is_active is not None:
+            strategy_data["is_active"] = request.is_active
+
+        # Mark as custom since it's been edited
+        strategy_data["preset"] = StrategyPreset.CUSTOM
+
+        # Update timestamp
+        from datetime import datetime
+        strategy_data["updated_at"] = datetime.now()
+
+        # Create updated strategy
+        strategy = TradingStrategy(**strategy_data)
+
+        # Set in coordinator
+        coordinator.set_strategy(strategy)
+
+        logger.info(f"[Strategy API] Updated strategy: {strategy.name}")
+
+        return {
+            "status": "updated",
+            "strategy": strategy.model_dump(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[Strategy API] Failed to update strategy")
+        raise HTTPException(500, f"Failed to update strategy: {e}")
+
+
+@router.delete("/strategy")
+async def clear_strategy(
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Clear the current trading strategy.
+    """
+    coordinator.set_strategy(None)
+    logger.info("[Strategy API] Strategy cleared")
+
+    return {
+        "status": "cleared",
+        "message": "Trading strategy has been cleared",
+    }
+
+
+@router.post("/strategy/apply-preset/{preset_name}")
+async def apply_preset(
+    preset_name: str,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Apply a preset strategy directly.
+    """
+    try:
+        preset_enum = StrategyPreset(preset_name)
+        strategy = get_strategy_preset(preset_enum)
+
+        coordinator.set_strategy(strategy)
+
+        logger.info(f"[Strategy API] Applied preset: {preset_name}")
+
+        return {
+            "status": "applied",
+            "preset": preset_name,
+            "strategy": strategy.model_dump(),
+        }
+
+    except ValueError:
+        raise HTTPException(404, f"Preset '{preset_name}' not found")
+
+
+# -------------------------------------------
+# Trade Queue Endpoints
+# -------------------------------------------
+
+class AddToQueueRequest(BaseModel):
+    """Request to add a trade directly to queue"""
+    ticker: str
+    stock_name: Optional[str] = None
+    action: str  # "BUY" or "SELL"
+    entry_price: float
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    risk_score: int = Field(default=5, ge=1, le=10)
+    session_id: Optional[str] = None
+    reason: str = "Manual queue addition"
+
+
+@router.post("/queue/add")
+async def add_to_trade_queue(
+    request: AddToQueueRequest,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Add a trade directly to the queue.
+
+    This bypasses the approval flow and adds the trade directly.
+    Useful for adding trades from completed analyses.
+    """
+    try:
+        import uuid
+
+        # Generate session ID if not provided
+        session_id = request.session_id or str(uuid.uuid4())
+
+        # Add to queue
+        queued_trade = coordinator.add_to_queue(
+            session_id=session_id,
+            ticker=request.ticker,
+            stock_name=request.stock_name,
+            action=request.action,
+            entry_price=request.entry_price,
+            stop_loss=request.stop_loss,
+            take_profit=request.take_profit,
+            risk_score=request.risk_score,
+            reason=request.reason,
+        )
+
+        logger.info(f"[Trading API] Added to queue: {request.ticker} - {request.action}")
+
+        return {
+            "status": "queued",
+            "queue_id": queued_trade.id,
+            "ticker": request.ticker,
+            "action": request.action,
+            "message": f"Trade queued: {request.action} {request.stock_name or request.ticker}",
+        }
+
+    except Exception as e:
+        logger.exception("[Trading API] Failed to add to queue")
+        raise HTTPException(500, f"Failed to add to queue: {e}")
+
+
+@router.get("/queue")
+async def get_trade_queue(
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Get pending trades in queue.
+
+    Returns trades that are waiting for market open.
+    """
+    queue = coordinator.get_trade_queue()
+    return {
+        "queue": [t.model_dump() for t in queue],
+        "count": len(queue),
+    }
+
+
+@router.delete("/queue/{queue_id}")
+async def cancel_queued_trade(
+    queue_id: str,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Cancel a queued trade.
+    """
+    success = coordinator.cancel_queued_trade(queue_id)
+    if not success:
+        raise HTTPException(404, f"Queued trade '{queue_id}' not found or already processed")
+
+    return {
+        "status": "cancelled",
+        "queue_id": queue_id,
+    }
+
+
+@router.post("/queue/process")
+async def process_trade_queue(
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Manually process the trade queue.
+
+    Normally this happens automatically when market opens.
+    """
+    await coordinator.process_trade_queue()
+
+    return {
+        "status": "processed",
+        "message": "Trade queue processing completed",
+    }
+
+
+# -------------------------------------------
+# Watch List Endpoints
+# -------------------------------------------
+
+class AddToWatchListRequest(BaseModel):
+    """Request to add a stock to watch list"""
+    ticker: str
+    stock_name: Optional[str] = None
+    signal: str = "hold"
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    current_price: float
+    target_entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    analysis_summary: str = ""
+    key_factors: Optional[List[str]] = None
+    risk_score: int = Field(default=5, ge=1, le=10)
+    session_id: Optional[str] = None
+
+
+class ConvertWatchToQueueRequest(BaseModel):
+    """Request to convert watch list item to trade queue"""
+    watch_id: str
+    action: str = "BUY"
+    reason: str = "User converted from watch list"
+
+
+@router.get("/watch-list")
+async def get_watch_list(
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Get all stocks in watch list.
+
+    Returns stocks that have WATCH recommendation for monitoring.
+    """
+    watch_list = coordinator.get_watch_list()
+    return {
+        "watch_list": [w.model_dump() for w in watch_list],
+        "count": len(watch_list),
+    }
+
+
+@router.post("/watch-list/add")
+async def add_to_watch_list(
+    request: AddToWatchListRequest,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Add a stock to the watch list.
+
+    Use this to track stocks that are not yet ready for immediate buying
+    but should be monitored for potential entry.
+    """
+    try:
+        import uuid
+
+        # Generate session ID if not provided
+        session_id = request.session_id or str(uuid.uuid4())
+
+        # Add to watch list
+        watched = coordinator.add_to_watch_list(
+            session_id=session_id,
+            ticker=request.ticker,
+            stock_name=request.stock_name,
+            signal=request.signal,
+            confidence=request.confidence,
+            current_price=request.current_price,
+            target_entry_price=request.target_entry_price,
+            stop_loss=request.stop_loss,
+            take_profit=request.take_profit,
+            analysis_summary=request.analysis_summary,
+            key_factors=request.key_factors,
+            risk_score=request.risk_score,
+        )
+
+        logger.info(f"[Trading API] Added to watch list: {request.ticker}")
+
+        return {
+            "status": "added",
+            "watch_id": watched.id,
+            "ticker": request.ticker,
+            "message": f"Added to watch list: {request.stock_name or request.ticker}",
+        }
+
+    except Exception as e:
+        logger.exception("[Trading API] Failed to add to watch list")
+        raise HTTPException(500, f"Failed to add to watch list: {e}")
+
+
+@router.delete("/watch-list/{watch_id}")
+async def remove_from_watch_list(
+    watch_id: str,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Remove a stock from the watch list.
+    """
+    success = coordinator.remove_from_watch_list(watch_id)
+    if not success:
+        raise HTTPException(404, f"Watch list item '{watch_id}' not found or already removed")
+
+    return {
+        "status": "removed",
+        "watch_id": watch_id,
+    }
+
+
+@router.post("/watch-list/convert")
+async def convert_watch_to_queue(
+    request: ConvertWatchToQueueRequest,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Convert a watched stock to the trade queue.
+
+    Use this when you decide to buy a stock that was on the watch list.
+    """
+    try:
+        queued = coordinator.convert_watch_to_queue(
+            watch_id=request.watch_id,
+            action=request.action,
+            reason=request.reason,
+        )
+
+        if not queued:
+            raise HTTPException(404, f"Watch list item '{request.watch_id}' not found or already converted")
+
+        logger.info(f"[Trading API] Converted watch to queue: {request.watch_id} -> {queued.id}")
+
+        return {
+            "status": "converted",
+            "watch_id": request.watch_id,
+            "queue_id": queued.id,
+            "ticker": queued.ticker,
+            "action": request.action,
+            "message": f"Converted to trade queue: {queued.stock_name or queued.ticker}",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[Trading API] Failed to convert watch to queue")
+        raise HTTPException(500, f"Failed to convert: {e}")
+
+
+@router.get("/watch-list/{ticker}")
+async def get_watched_stock(
+    ticker: str,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Get watch list item by ticker.
+    """
+    watched = coordinator.get_watched_stock(ticker)
+    if not watched:
+        raise HTTPException(404, f"Stock '{ticker}' not found in watch list")
+
+    return watched.model_dump()
+
+
+# -------------------------------------------
+# Agent Status Endpoints
+# -------------------------------------------
+
+@router.get("/agents")
+async def get_agent_states(
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Get status of all trading agents.
+
+    Returns current task and status for each agent:
+    - Portfolio Agent: Position sizing and allocation
+    - Order Agent: Order execution
+    - Risk Monitor: Stop-loss/take-profit monitoring
+    - Strategy Engine: Strategy evaluation
+    """
+    return {
+        "agents": coordinator.get_agent_states(),
     }

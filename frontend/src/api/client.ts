@@ -45,6 +45,9 @@ import type {
   KiwoomApiKeyRequest,
   KiwoomApiKeyResponse,
   KiwoomValidateResponse,
+  // Trading Strategy Types
+  TradingStrategyRequest,
+  TradingStrategyResponse,
 } from '@/types';
 
 // -------------------------------------------
@@ -1129,6 +1132,238 @@ class ApiClient {
     );
     return response.data;
   }
+
+  /**
+   * Get trading activity log.
+   */
+  async getTradingActivity(limit = 50): Promise<{
+    activities: Array<{
+      id: string;
+      activity_type: string;
+      agent: string;
+      ticker: string | null;
+      message: string;
+      details: Record<string, unknown> | null;
+      timestamp: string;
+    }>;
+    count: number;
+  }> {
+    const response = await this.client.get('/trading/activity', {
+      params: { limit },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get market hours status.
+   */
+  async getMarketHours(): Promise<{
+    krx: {
+      market: string;
+      name: string;
+      is_open: boolean;
+      current_time: string;
+      next_open: string | null;
+      next_close: string | null;
+      message: string;
+    };
+    crypto: {
+      market: string;
+      name: string;
+      is_open: boolean;
+      current_time: string;
+      message: string;
+    };
+  }> {
+    const response = await this.client.get('/trading/market-hours');
+    return response.data;
+  }
+
+  // -------------------------------------------
+  // Trading Strategy Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get all available strategy presets.
+   */
+  async getStrategyPresets(): Promise<{
+    presets: Record<string, {
+      name: string;
+      description: string;
+      risk_tolerance: string;
+      trading_style: string;
+      entry_conditions: Record<string, unknown>;
+      exit_conditions: Record<string, unknown>;
+      position_sizing: Record<string, unknown>;
+    }>;
+    risk_tolerances: string[];
+    trading_styles: string[];
+  }> {
+    const response = await this.client.get('/trading/strategies/presets');
+    return response.data;
+  }
+
+  /**
+   * Get a specific preset details.
+   */
+  async getPresetDetails(presetName: string): Promise<TradingStrategyResponse> {
+    const response = await this.client.get(`/trading/strategies/presets/${presetName}`);
+    return response.data;
+  }
+
+  /**
+   * Get the current trading strategy.
+   */
+  async getCurrentStrategy(): Promise<TradingStrategyResponse | { strategy: null; message: string }> {
+    const response = await this.client.get('/trading/strategy');
+    return response.data;
+  }
+
+  /**
+   * Create and set a new trading strategy.
+   */
+  async setStrategy(request: TradingStrategyRequest): Promise<{
+    status: string;
+    strategy: TradingStrategyResponse;
+  }> {
+    const response = await this.client.post('/trading/strategy', request);
+    return response.data;
+  }
+
+  /**
+   * Update the current trading strategy.
+   */
+  async updateStrategy(request: Partial<TradingStrategyRequest>): Promise<{
+    status: string;
+    strategy: TradingStrategyResponse;
+  }> {
+    const response = await this.client.put('/trading/strategy', request);
+    return response.data;
+  }
+
+  /**
+   * Clear the current trading strategy.
+   */
+  async clearStrategy(): Promise<{
+    status: string;
+    message: string;
+  }> {
+    const response = await this.client.delete('/trading/strategy');
+    return response.data;
+  }
+
+  /**
+   * Apply a preset strategy directly.
+   */
+  async applyStrategyPreset(presetName: string): Promise<{
+    status: string;
+    preset: string;
+    strategy: TradingStrategyResponse;
+  }> {
+    const response = await this.client.post(`/trading/strategy/apply-preset/${presetName}`);
+    return response.data;
+  }
+
+  // -------------------------------------------
+  // Trade Queue Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get pending trades in queue.
+   */
+  async getTradeQueue(): Promise<{
+    queue: Array<{
+      id: string;
+      session_id: string;
+      ticker: string;
+      stock_name: string | null;
+      action: string;
+      entry_price: number;
+      quantity: number | null;
+      stop_loss: number | null;
+      take_profit: number | null;
+      risk_score: number;
+      status: string;
+      reason: string;
+      queued_at: string;
+      executed_at: string | null;
+      error_message: string | null;
+    }>;
+    count: number;
+  }> {
+    const response = await this.client.get('/trading/queue');
+    return response.data;
+  }
+
+  /**
+   * Cancel a queued trade.
+   */
+  async cancelQueuedTrade(queueId: string): Promise<{
+    status: string;
+    queue_id: string;
+  }> {
+    const response = await this.client.delete(`/trading/queue/${queueId}`);
+    return response.data;
+  }
+
+  /**
+   * Manually process the trade queue.
+   */
+  async processTradeQueue(): Promise<{
+    status: string;
+    message: string;
+  }> {
+    const response = await this.client.post('/trading/queue/process');
+    return response.data;
+  }
+
+  /**
+   * Add a trade directly to the queue.
+   * Bypasses the approval flow - useful for completed analyses.
+   */
+  async addToTradeQueue(params: {
+    ticker: string;
+    stock_name?: string;
+    action: string;
+    entry_price: number;
+    stop_loss?: number;
+    take_profit?: number;
+    risk_score?: number;
+    session_id?: string;
+    reason?: string;
+  }): Promise<{
+    status: string;
+    queue_id: string;
+    ticker: string;
+    action: string;
+    message: string;
+  }> {
+    const response = await this.client.post('/trading/queue/add', params);
+    return response.data;
+  }
+
+  // -------------------------------------------
+  // Agent Status Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get status of all trading agents.
+   */
+  async getAgentStates(): Promise<{
+    agents: Record<string, {
+      name: string;
+      status: 'idle' | 'working' | 'waiting' | 'error';
+      current_task: string | null;
+      last_action: string | null;
+      last_action_time: string | null;
+      error_message: string | null;
+      tasks_completed: number;
+      tasks_failed: number;
+    }>;
+  }> {
+    const response = await this.client.get('/trading/agents');
+    return response.data;
+  }
 }
 
 // -------------------------------------------
@@ -1329,3 +1564,50 @@ export const updatePositionStopLoss = (ticker: string, stopLoss: number) =>
 
 export const updatePositionTakeProfit = (ticker: string, takeProfit: number) =>
   apiClient.updatePositionTakeProfit(ticker, takeProfit);
+
+export const getTradingActivity = (limit = 50) =>
+  apiClient.getTradingActivity(limit);
+
+export const getMarketHours = () => apiClient.getMarketHours();
+
+// Strategy API
+export const getStrategyPresets = () => apiClient.getStrategyPresets();
+
+export const getPresetDetails = (presetName: string) =>
+  apiClient.getPresetDetails(presetName);
+
+export const getCurrentStrategy = () => apiClient.getCurrentStrategy();
+
+export const setStrategy = (request: TradingStrategyRequest) =>
+  apiClient.setStrategy(request);
+
+export const updateStrategy = (request: Partial<TradingStrategyRequest>) =>
+  apiClient.updateStrategy(request);
+
+export const clearStrategy = () => apiClient.clearStrategy();
+
+export const applyStrategyPreset = (presetName: string) =>
+  apiClient.applyStrategyPreset(presetName);
+
+// Trade Queue API
+export const getTradeQueue = () => apiClient.getTradeQueue();
+
+export const cancelQueuedTrade = (queueId: string) =>
+  apiClient.cancelQueuedTrade(queueId);
+
+export const processTradeQueue = () => apiClient.processTradeQueue();
+
+export const addToTradeQueue = (params: {
+  ticker: string;
+  stock_name?: string;
+  action: string;
+  entry_price: number;
+  stop_loss?: number;
+  take_profit?: number;
+  risk_score?: number;
+  session_id?: string;
+  reason?: string;
+}) => apiClient.addToTradeQueue(params);
+
+// Agent Status API
+export const getAgentStates = () => apiClient.getAgentStates();

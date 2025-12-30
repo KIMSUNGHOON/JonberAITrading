@@ -7,7 +7,7 @@
 // -------------------------------------------
 
 export type SignalType = 'strong_buy' | 'buy' | 'hold' | 'sell' | 'strong_sell';
-export type TradeAction = 'BUY' | 'SELL' | 'HOLD';
+export type TradeAction = 'BUY' | 'SELL' | 'HOLD' | 'ADD' | 'REDUCE' | 'AVOID' | 'WATCH';
 export type SessionStatus = 'running' | 'awaiting_approval' | 'completed' | 'cancelled' | 'error';
 export type TimeFrame = '1m' | '5m' | '15m' | '1h' | '1d' | '1w' | '1M';
 
@@ -1036,4 +1036,86 @@ export interface TradingRiskParamsUpdateRequest {
   max_daily_trades?: number;
   stop_loss_mode?: string;
   take_profit_mode?: string;
+}
+
+// -------------------------------------------
+// Trading Strategy Types
+// -------------------------------------------
+
+export type RiskTolerance = 'conservative' | 'moderate' | 'aggressive';
+export type TradingStyle = 'value' | 'growth' | 'momentum' | 'swing' | 'position' | 'dividend';
+export type StrategyPreset = 'conservative_income' | 'growth_momentum' | 'technical_breakout' | 'value_investing' | 'custom';
+
+export interface EntryConditions {
+  min_technical_score: number;
+  min_fundamental_score: number;
+  min_sentiment_score: number;
+  max_risk_score: number;
+  rsi_oversold: number;
+  rsi_overbought: number;
+  require_uptrend: boolean;
+  require_volume_increase: boolean;
+  avoid_high_volatility: boolean;
+  prefer_dividend: boolean;
+}
+
+export interface ExitConditions {
+  stop_loss_pct: number;
+  take_profit_pct: number;
+  trailing_stop_enabled: boolean;
+  trailing_stop_pct: number;
+  max_holding_days: number | null;
+  exit_on_negative_news: boolean;
+  news_sentiment_threshold: number;
+}
+
+export interface PositionSizingRules {
+  max_position_pct: number;
+  min_position_pct: number;
+  min_cash_ratio: number;
+  max_total_stock_pct: number;
+  adjust_by_risk_score: boolean;
+  risk_adjustment_factor: number;
+  max_sector_concentration: number;
+  max_positions: number;
+}
+
+export interface TradingStrategyRequest {
+  name: string;
+  description?: string;
+  preset?: string;
+  risk_tolerance?: string;
+  trading_style?: string;
+  system_prompt?: string;
+  entry_conditions?: Partial<EntryConditions>;
+  exit_conditions?: Partial<ExitConditions>;
+  position_sizing?: Partial<PositionSizingRules>;
+  custom_instructions?: string;
+}
+
+export interface TradingStrategyResponse {
+  id: string;
+  name: string;
+  description: string;
+  preset: StrategyPreset;
+  risk_tolerance: RiskTolerance;
+  trading_style: TradingStyle;
+  system_prompt: string;
+  entry_conditions: EntryConditions;
+  exit_conditions: ExitConditions;
+  position_sizing: PositionSizingRules;
+  custom_instructions: string;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
+}
+
+export interface StrategyPresetInfo {
+  name: string;
+  description: string;
+  risk_tolerance: RiskTolerance;
+  trading_style: TradingStyle;
+  entry_conditions: EntryConditions;
+  exit_conditions: ExitConditions;
+  position_sizing: PositionSizingRules;
 }

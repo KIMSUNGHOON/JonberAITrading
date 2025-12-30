@@ -31,9 +31,13 @@ class SignalType(str, Enum):
 class TradeAction(str, Enum):
     """Trade action types."""
 
-    BUY = "BUY"
-    SELL = "SELL"
-    HOLD = "HOLD"
+    BUY = "BUY"        # 신규 매수 (미보유 시)
+    SELL = "SELL"      # 전량 매도 (보유 시)
+    HOLD = "HOLD"      # 유지 (보유 시)
+    ADD = "ADD"        # 추가 매수 (보유 시)
+    REDUCE = "REDUCE"  # 부분 매도 (보유 시)
+    AVOID = "AVOID"    # 매수 금지 (미보유 + SELL 시그널)
+    WATCH = "WATCH"    # 관망 (미보유 + HOLD 시그널) - 매수 고려 가능
 
 
 class KRStockAnalysisStage(str, Enum):
@@ -270,6 +274,10 @@ class KRStockTradingState(TypedDict, total=False):
     chart_df: Optional[list[dict]]  # Daily chart data as list of dicts
     orderbook: Optional[dict]  # Orderbook data
 
+    # Portfolio context (NEW - fetched during data collection)
+    existing_position: Optional[dict]  # User's current position in this stock
+    portfolio_summary: Optional[dict]  # Overall portfolio summary
+
     # Analysis results (stored as dicts for serialization)
     technical_analysis: Optional[dict]
     fundamental_analysis: Optional[dict]
@@ -340,6 +348,10 @@ def create_kr_stock_initial_state(
         "market_data": None,
         "chart_df": None,
         "orderbook": None,
+
+        # Portfolio context
+        "existing_position": None,
+        "portfolio_summary": None,
 
         # Analysis results
         "technical_analysis": None,

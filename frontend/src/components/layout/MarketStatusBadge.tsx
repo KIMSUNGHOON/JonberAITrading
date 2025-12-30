@@ -6,7 +6,6 @@
  */
 
 import { useState, useEffect } from 'react';
-import { Clock, TrendingUp, Building2, Bitcoin } from 'lucide-react';
 import {
   getAllMarketsStatus,
   type AllMarketsStatus,

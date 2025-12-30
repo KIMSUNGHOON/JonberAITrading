@@ -17,12 +17,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.llm_provider import get_llm_provider, reset_llm_provider
-from app.api.routes import analysis, approval, websocket, auth, coin, kr_stocks, chat, indicators, settings as settings_routes, news, trading
+from app.api.routes import analysis, approval, websocket, auth, coin, kr_stocks, chat, indicators, settings as settings_routes, news, trading, scanner
 from app.config import settings
 from app.core.analysis_limiter import cleanup_old_sessions
 from app.logging_config import configure_logging, RequestLoggingMiddleware
 from services.realtime_service import close_realtime_service, get_realtime_service
 from services.storage_service import close_storage_service, get_storage_service
+from services.telegram import get_telegram_notifier
 
 # Configure enhanced logging
 configure_logging(
@@ -101,6 +102,17 @@ async def lifespan(app: FastAPI):
     # Start session cleanup background task
     asyncio.create_task(cleanup_old_sessions())
     logger.info("session_cleanup_task_started")
+
+    # Initialize Telegram notifications (if configured)
+    try:
+        telegram_notifier = await get_telegram_notifier()
+        if telegram_notifier.is_ready:
+            await telegram_notifier.send_system_status("started", "Trading system started successfully")
+            logger.info("telegram_notifier_ready")
+        else:
+            logger.info("telegram_notifier_disabled", message="Telegram not configured")
+    except Exception as e:
+        logger.warning("telegram_init_failed", error=str(e))
 
     yield
 
@@ -190,6 +202,11 @@ app.include_router(
     trading.router,
     prefix="/api",
     tags=["Trading"],
+)
+app.include_router(
+    scanner.router,
+    prefix="/api",
+    tags=["Background Scanner"],
 )
 
 
