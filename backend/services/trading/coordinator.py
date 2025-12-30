@@ -331,12 +331,25 @@ class ExecutionCoordinator:
         if self._kiwoom:
             try:
                 # Fetch balance from Kiwoom
+                # AccountBalance is a Pydantic model with:
+                # - evlu_amt: 평가금액 (may include cash, so don't use directly)
+                # - d2_ord_psbl_amt: D+2 주문가능금액 (available cash)
+                # - holdings: list of Holding with individual evlu_amt
+                # - total_value: property (evlu_amt + d2_ord_psbl_amt)
                 balance = await self._kiwoom.get_account_balance()
+
+                # Calculate stock value from holdings (not evlu_amt which may include cash)
+                # See kr_stocks.py line 968-970 for reference
+                stock_value = sum(h.evlu_amt for h in balance.holdings)
+                available_cash = balance.d2_ord_psbl_amt
+                total_equity = available_cash + stock_value
+
                 self._state.account = AccountInfo(
-                    total_equity=balance.get("total_equity", 0),
-                    available_cash=balance.get("available_cash", 0),
-                    total_stock_value=balance.get("stock_value", 0),
+                    total_equity=total_equity,
+                    available_cash=available_cash,
+                    total_stock_value=stock_value,
                 )
+                logger.info(f"[Coordinator] Account refreshed: equity={total_equity:,}, cash={available_cash:,}, stocks={stock_value:,}")
             except Exception as e:
                 logger.error(f"[Coordinator] Failed to refresh account: {e}")
         else:

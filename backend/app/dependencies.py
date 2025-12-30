@@ -158,23 +158,19 @@ async def get_trading_coordinator() -> "ExecutionCoordinator":
 
     if _trading_coordinator_instance is None:
         from services.trading import ExecutionCoordinator, RiskParameters
-        from services.kiwoom import KiwoomClient
+        from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 
         settings = get_settings()
 
-        # Initialize Kiwoom client if credentials available
+        # Use shared Kiwoom client singleton (same as kr_stocks routes)
         kiwoom_client = None
-        if settings.KIWOOM_APP_KEY and settings.KIWOOM_SECRET_KEY:
-            try:
-                kiwoom_client = KiwoomClient(
-                    app_key=settings.KIWOOM_APP_KEY,
-                    secret_key=settings.KIWOOM_SECRET_KEY,
-                    account_no=settings.KIWOOM_ACCOUNT_NO,
-                    is_mock=settings.KIWOOM_IS_MOCK,
-                )
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"Failed to init Kiwoom client: {e}")
+        try:
+            kiwoom_client = await get_shared_kiwoom_client_async()
+            import logging
+            logging.getLogger(__name__).info("Trading coordinator using shared Kiwoom client")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to get shared Kiwoom client: {e}")
 
         # Initialize Redis client if available
         redis_client = None
