@@ -14,6 +14,8 @@ from .models import (
     PositionStatus,
     OrderType,
     OrderSide,
+    ActivityType,
+    ActivityLog,
     ManagedPosition,
     OrderRequest,
     OrderResult,
@@ -22,6 +24,7 @@ from .models import (
     TradingAlert,
     RiskParameters,
 )
+from .market_hours import MarketType, MarketSession, MarketHoursService, get_market_hours_service
 from .portfolio_agent import PortfolioAgent
 from .order_agent import OrderAgent
 from .risk_monitor import RiskMonitor
@@ -34,6 +37,8 @@ __all__ = [
     "PositionStatus",
     "OrderType",
     "OrderSide",
+    "ActivityType",
+    "ActivityLog",
     "ManagedPosition",
     "OrderRequest",
     "OrderResult",
@@ -41,6 +46,11 @@ __all__ = [
     "TradingState",
     "TradingAlert",
     "RiskParameters",
+    # Market Hours
+    "MarketType",
+    "MarketSession",
+    "MarketHoursService",
+    "get_market_hours_service",
     # Agents
     "PortfolioAgent",
     "OrderAgent",

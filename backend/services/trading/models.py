@@ -62,6 +62,25 @@ class AlertType(str, Enum):
     NEWS_ALERT = "news_alert"
 
 
+class ActivityType(str, Enum):
+    """Activity log types for tracking agent decisions"""
+    SYSTEM_START = "system_start"
+    SYSTEM_STOP = "system_stop"
+    SYSTEM_PAUSE = "system_pause"
+    SYSTEM_RESUME = "system_resume"
+    TRADE_APPROVED = "trade_approved"
+    TRADE_REJECTED = "trade_rejected"
+    ALLOCATION_CALCULATED = "allocation_calculated"
+    ORDER_PLACED = "order_placed"
+    ORDER_EXECUTED = "order_executed"
+    ORDER_FAILED = "order_failed"
+    POSITION_OPENED = "position_opened"
+    POSITION_CLOSED = "position_closed"
+    RISK_ALERT = "risk_alert"
+    MARKET_CLOSED = "market_closed"
+    ACCOUNT_REFRESHED = "account_refreshed"
+
+
 # -------------------------------------------
 # Risk Parameters
 # -------------------------------------------
@@ -254,6 +273,20 @@ class TradingAlert(BaseModel):
         use_enum_values = True
 
 
+class ActivityLog(BaseModel):
+    """Activity log entry for tracking agent decisions and actions"""
+    id: str = Field(default_factory=lambda: datetime.now().strftime("%Y%m%d%H%M%S%f"))
+    activity_type: ActivityType
+    agent: str = "system"  # Which agent: system, portfolio, order, risk
+    ticker: Optional[str] = None
+    message: str
+    details: Optional[dict] = None
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+    class Config:
+        use_enum_values = True
+
+
 # -------------------------------------------
 # Trading State
 # -------------------------------------------
@@ -297,6 +330,9 @@ class TradingState(BaseModel):
 
     # Alerts
     pending_alerts: List[TradingAlert] = Field(default_factory=list)
+
+    # Activity log (recent agent decisions)
+    activity_log: List[ActivityLog] = Field(default_factory=list)
 
     # Timestamps
     last_updated: datetime = Field(default_factory=datetime.now)

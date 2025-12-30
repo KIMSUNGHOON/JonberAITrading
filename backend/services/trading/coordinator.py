@@ -23,10 +23,13 @@ from .models import (
     PositionStatus,
     OrderSide,
     StopLossMode,
+    ActivityType,
+    ActivityLog,
 )
 from .portfolio_agent import PortfolioAgent
 from .order_agent import OrderAgent, KiwoomRateLimiter
 from .risk_monitor import RiskMonitor
+from .market_hours import MarketType, get_market_hours_service
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +82,43 @@ class ExecutionCoordinator:
         self._state = TradingState(risk_params=self.risk_params)
         self._kiwoom = kiwoom_client
 
+        # Market hours service
+        self._market_hours = get_market_hours_service()
+
         # Callbacks
         self._alert_callback: Optional[Callable[[TradingAlert], Awaitable[None]]] = None
         self._state_callback: Optional[Callable[[TradingState], Awaitable[None]]] = None
+
+    # -------------------------------------------
+    # Activity Logging
+    # -------------------------------------------
+
+    def _log_activity(
+        self,
+        activity_type: ActivityType,
+        message: str,
+        agent: str = "system",
+        ticker: Optional[str] = None,
+        details: Optional[dict] = None,
+    ):
+        """Log an activity to the state's activity log."""
+        activity = ActivityLog(
+            activity_type=activity_type,
+            agent=agent,
+            ticker=ticker,
+            message=message,
+            details=details,
+        )
+        # Keep only last 100 activities
+        self._state.activity_log.append(activity)
+        if len(self._state.activity_log) > 100:
+            self._state.activity_log = self._state.activity_log[-100:]
+
+        logger.info(f"[{agent.upper()}] {message}")
+
+    def get_activity_log(self, limit: int = 50) -> List[ActivityLog]:
+        """Get recent activity log entries."""
+        return self._state.activity_log[-limit:]
 
     # -------------------------------------------
     # Lifecycle
@@ -101,6 +138,12 @@ class ExecutionCoordinator:
         self._state.mode = TradingMode.ACTIVE
         self._state.started_at = datetime.now()
 
+        self._log_activity(
+            ActivityType.SYSTEM_START,
+            f"Auto-trading system started. Account: ₩{self._state.account.total_equity:,.0f}",
+            details={"account": self._state.account.model_dump()},
+        )
+
         await self._notify_state_change()
 
     async def stop(self):
@@ -110,18 +153,36 @@ class ExecutionCoordinator:
         await self.risk_monitor.stop()
         self._state.mode = TradingMode.STOPPED
 
+        self._log_activity(
+            ActivityType.SYSTEM_STOP,
+            "Auto-trading system stopped",
+        )
+
         await self._notify_state_change()
 
     async def pause(self, reason: str = "Manual pause"):
         """Pause auto-trading."""
         await self.risk_monitor.pause(reason)
         self._state.mode = TradingMode.PAUSED
+
+        self._log_activity(
+            ActivityType.SYSTEM_PAUSE,
+            f"Trading paused: {reason}",
+            details={"reason": reason},
+        )
+
         await self._notify_state_change()
 
     async def resume(self):
         """Resume auto-trading."""
         await self.risk_monitor.resume()
         self._state.mode = TradingMode.ACTIVE
+
+        self._log_activity(
+            ActivityType.SYSTEM_RESUME,
+            "Trading resumed",
+        )
+
         await self._notify_state_change()
 
     # -------------------------------------------
@@ -157,14 +218,30 @@ class ExecutionCoordinator:
         Returns:
             AllocationPlan with execution details
         """
-        logger.info(
-            f"[Coordinator] Trade approved: {action} {ticker} "
-            f"@ {entry_price} (risk: {risk_score})"
+        self._log_activity(
+            ActivityType.TRADE_APPROVED,
+            f"Trade approved: {action} {stock_name or ticker} @ ₩{entry_price:,.0f} (risk: {risk_score})",
+            agent="system",
+            ticker=ticker,
+            details={
+                "session_id": session_id,
+                "action": action,
+                "entry_price": entry_price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "risk_score": risk_score,
+            },
         )
 
         # Check if trading is active
         if self._state.mode != TradingMode.ACTIVE:
-            logger.warning("[Coordinator] Trading not active, skipping execution")
+            rationale = f"Trading is {self._state.mode.value}"
+            self._log_activity(
+                ActivityType.TRADE_REJECTED,
+                f"Trade skipped: {rationale}",
+                agent="system",
+                ticker=ticker,
+            )
             return AllocationPlan(
                 ticker=ticker,
                 stock_name=stock_name,
@@ -173,12 +250,38 @@ class ExecutionCoordinator:
                 entry_price=entry_price,
                 estimated_amount=0,
                 position_pct=0,
-                rationale=f"Trading is {self._state.mode.value}",
+                rationale=rationale,
+            )
+
+        # Check market hours (KRX for Korean stocks)
+        market_session = self._market_hours.get_market_session(MarketType.KRX)
+        if not market_session.is_open:
+            self._log_activity(
+                ActivityType.MARKET_CLOSED,
+                f"Market closed: {market_session.message}",
+                agent="system",
+                ticker=ticker,
+            )
+            return AllocationPlan(
+                ticker=ticker,
+                stock_name=stock_name,
+                side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
+                quantity=0,
+                entry_price=entry_price,
+                estimated_amount=0,
+                position_pct=0,
+                rationale=f"Market closed: {market_session.message}",
             )
 
         # Check daily trade limit
         if self._state.daily_trades_count >= self.risk_params.max_daily_trades:
-            logger.warning("[Coordinator] Daily trade limit reached")
+            rationale = f"Daily trade limit reached ({self._state.daily_trades_count}/{self.risk_params.max_daily_trades})"
+            self._log_activity(
+                ActivityType.TRADE_REJECTED,
+                rationale,
+                agent="system",
+                ticker=ticker,
+            )
             return AllocationPlan(
                 ticker=ticker,
                 stock_name=stock_name,
@@ -187,7 +290,7 @@ class ExecutionCoordinator:
                 entry_price=entry_price,
                 estimated_amount=0,
                 position_pct=0,
-                rationale="Daily trade limit reached",
+                rationale=rationale,
             )
 
         # Refresh account info
@@ -213,13 +316,38 @@ class ExecutionCoordinator:
             allocation.estimated_amount = quantity_override * entry_price
             allocation.rationale += f" (quantity override: {quantity_override})"
 
+        # Log allocation decision
+        self._log_activity(
+            ActivityType.ALLOCATION_CALCULATED,
+            f"Allocation: {allocation.quantity} shares @ ₩{entry_price:,.0f} = ₩{allocation.estimated_amount:,.0f} ({allocation.position_pct:.1f}%)",
+            agent="portfolio",
+            ticker=ticker,
+            details={
+                "quantity": allocation.quantity,
+                "entry_price": entry_price,
+                "estimated_amount": allocation.estimated_amount,
+                "position_pct": allocation.position_pct,
+                "rationale": allocation.rationale,
+            },
+        )
+
         if allocation.quantity <= 0:
-            logger.warning(f"[Coordinator] Allocation returned 0 quantity: {allocation.rationale}")
+            self._log_activity(
+                ActivityType.TRADE_REJECTED,
+                f"Allocation rejected: {allocation.rationale}",
+                agent="portfolio",
+                ticker=ticker,
+            )
             return allocation
 
         # Execute rebalancing orders first
         for rebalance_order in allocation.rebalance_orders:
-            logger.info(f"[Coordinator] Executing rebalance: {rebalance_order}")
+            self._log_activity(
+                ActivityType.ORDER_PLACED,
+                f"Rebalance order: {rebalance_order.side.value} {rebalance_order.quantity} shares",
+                agent="order",
+                ticker=rebalance_order.ticker,
+            )
             await self._execute_order(rebalance_order)
 
         # Execute main order
@@ -233,7 +361,40 @@ class ExecutionCoordinator:
             reason=f"Trade approval (risk: {risk_score})",
         )
 
+        self._log_activity(
+            ActivityType.ORDER_PLACED,
+            f"Order placed: {action} {allocation.quantity} {stock_name or ticker} @ ₩{entry_price:,.0f}",
+            agent="order",
+            ticker=ticker,
+            details={
+                "side": action,
+                "quantity": allocation.quantity,
+                "price": entry_price,
+            },
+        )
+
         result = await self._execute_order(order)
+
+        # Log execution result
+        if result.filled_quantity > 0:
+            self._log_activity(
+                ActivityType.ORDER_EXECUTED,
+                f"Order filled: {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
+                agent="order",
+                ticker=ticker,
+                details={
+                    "filled_quantity": result.filled_quantity,
+                    "avg_price": result.avg_price,
+                    "order_id": result.order_id,
+                },
+            )
+        else:
+            self._log_activity(
+                ActivityType.ORDER_FAILED,
+                f"Order failed: {result.error or 'Unknown error'}",
+                agent="order",
+                ticker=ticker,
+            )
 
         # If successful, add to monitoring
         if result.filled_quantity > 0 and side == OrderSide.BUY:
@@ -251,6 +412,19 @@ class ExecutionCoordinator:
                 risk_score=risk_score,
             )
             self._add_position(position)
+
+            self._log_activity(
+                ActivityType.POSITION_OPENED,
+                f"Position opened: {result.filled_quantity} {stock_name or ticker} @ ₩{result.avg_price:,.0f}",
+                agent="portfolio",
+                ticker=ticker,
+                details={
+                    "quantity": result.filled_quantity,
+                    "avg_price": result.avg_price,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                },
+            )
 
         return allocation
 

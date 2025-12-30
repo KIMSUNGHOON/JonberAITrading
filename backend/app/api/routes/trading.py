@@ -365,3 +365,57 @@ async def update_position_take_profit(
         "ticker": ticker,
         "take_profit": take_profit,
     }
+
+
+# -------------------------------------------
+# Activity Log Endpoints
+# -------------------------------------------
+
+@router.get("/activity")
+async def get_activity_log(
+    limit: int = 50,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Get recent activity log entries.
+
+    Shows agent decisions, orders, and system events.
+    """
+    activities = coordinator.get_activity_log(limit)
+    return {
+        "activities": [a.model_dump() for a in activities],
+        "count": len(activities),
+    }
+
+
+# -------------------------------------------
+# Market Hours Endpoints
+# -------------------------------------------
+
+@router.get("/market-hours")
+async def get_market_hours():
+    """
+    Get current market session status.
+
+    Returns trading hours information for supported markets.
+    """
+    from services.trading import get_market_hours_service, MarketType
+
+    market_hours = get_market_hours_service()
+
+    return {
+        "krx": {
+            "market": "KRX",
+            "name": "Korea Exchange",
+            **market_hours.get_market_session(MarketType.KRX)._asdict(),
+            "current_time": market_hours.get_market_session(MarketType.KRX).current_time.isoformat(),
+            "next_open": market_hours.get_market_session(MarketType.KRX).next_open.isoformat() if market_hours.get_market_session(MarketType.KRX).next_open else None,
+            "next_close": market_hours.get_market_session(MarketType.KRX).next_close.isoformat() if market_hours.get_market_session(MarketType.KRX).next_close else None,
+        },
+        "crypto": {
+            "market": "CRYPTO",
+            "name": "Cryptocurrency",
+            **market_hours.get_market_session(MarketType.CRYPTO)._asdict(),
+            "current_time": market_hours.get_market_session(MarketType.CRYPTO).current_time.isoformat(),
+        },
+    }
