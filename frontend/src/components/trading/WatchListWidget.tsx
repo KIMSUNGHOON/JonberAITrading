@@ -9,12 +9,10 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
 import {
   Eye,
   X,
   RefreshCw,
-  TrendingUp,
   ShoppingCart,
   AlertCircle,
   Search,
@@ -22,6 +20,7 @@ import {
   ArrowRight,
   Tag,
 } from 'lucide-react';
+import { useStore } from '@/store';
 import {
   getWatchList,
   removeFromWatchList,
@@ -237,7 +236,8 @@ function WatchItem({
 // -------------------------------------------
 
 export default function WatchListWidget() {
-  const navigate = useNavigate();
+  const setCurrentView = useStore((state) => state.setCurrentView);
+  const startKiwoomSession = useStore((state) => state.startKiwoomSession);
   const [loading, setLoading] = useState(true);
   const [removing, setRemoving] = useState<string | null>(null);
   const [converting, setConverting] = useState<string | null>(null);
@@ -298,8 +298,9 @@ export default function WatchListWidget() {
     try {
       setReanalyzing(ticker);
       const response = await startKRStockAnalysis({ stk_cd: ticker });
-      // Navigate to analysis page
-      navigate(`/analysis/${response.session_id}`);
+      // Start session and navigate to workflow page
+      startKiwoomSession(response.session_id, ticker, name);
+      setCurrentView('workflow');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start re-analysis');
     } finally {
@@ -391,7 +392,7 @@ export default function WatchListWidget() {
               </span>
             </div>
             <button
-              onClick={() => navigate('/trading')}
+              onClick={() => setCurrentView('trading')}
               className="flex items-center gap-1 text-blue-400 hover:text-blue-300"
             >
               Trading Dashboard
