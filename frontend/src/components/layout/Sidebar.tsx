@@ -16,6 +16,7 @@ import {
   LayoutDashboard,
   Activity,
   Receipt,
+  Bot,
 } from 'lucide-react';
 import { useStore } from '@/store';
 import { MarketTabs } from '@/components/layout/MarketTabs';
@@ -153,6 +154,13 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
           label="Trades"
           active={currentView === 'trades'}
           onClick={() => setCurrentView('trades')}
+          collapsed={collapsed}
+        />
+        <NavItem
+          icon={<Bot className="w-5 h-5" />}
+          label="Auto-Trading"
+          active={currentView === 'trading'}
+          onClick={() => setCurrentView('trading')}
           collapsed={collapsed}
         />
       </nav>

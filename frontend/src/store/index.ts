@@ -174,7 +174,7 @@ interface UIState {
   hasVisited: boolean;
 
   // Current view/page
-  currentView: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'workflow' | 'analysis-detail';
+  currentView: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'trading' | 'workflow' | 'analysis-detail';
 
   // Selected session for detail view
   selectedSessionId: string | null;
@@ -319,7 +319,7 @@ interface UIActions {
   toggleChartIndicator: (indicator: 'showSMA50' | 'showSMA200' | 'showVolume') => void;
   setHasVisited: (visited: boolean) => void;
   // View/Page navigation
-  setCurrentView: (view: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'workflow' | 'analysis-detail') => void;
+  setCurrentView: (view: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'trading' | 'workflow' | 'analysis-detail') => void;
   setSelectedSessionId: (sessionId: string | null) => void;
   // Language preference
   setLanguage: (language: Language) => void;

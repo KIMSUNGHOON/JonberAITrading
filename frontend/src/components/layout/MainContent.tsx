@@ -32,6 +32,7 @@ import { TradesPage } from '@/pages/TradesPage';
 import { AnalysisPage } from '@/pages/AnalysisPage';
 import { WorkflowPage } from '@/pages/WorkflowPage';
 import { AnalysisDetailPage } from '@/pages/AnalysisDetailPage';
+import { TradingDashboard } from '@/components/trading';
 
 export function MainContent() {
   const [showReasoningPanel, setShowReasoningPanel] = useState(false);
@@ -78,6 +79,10 @@ export function MainContent() {
 
   if (currentView === 'trades') {
     return <TradesPage />;
+  }
+
+  if (currentView === 'trading') {
+    return <TradingDashboard />;
   }
 
   // ============================================

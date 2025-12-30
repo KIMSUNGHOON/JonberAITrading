@@ -185,7 +185,14 @@ export default function TradingDashboard() {
       ]);
 
       setStatus(statusData);
-      setPortfolio(portfolioData);
+      if (portfolioData) {
+        setPortfolio({
+          ...portfolioData,
+          positions: portfolioData.positions as ManagedPosition[],
+        });
+      } else {
+        setPortfolio(null);
+      }
       setAlerts((alertsData.alerts as TradingAlert[]) || []);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch trading data');
