@@ -1,11 +1,21 @@
 # Work Status - JonberAITrading
 
-> Last Updated: 2025-12-31 (Phase E 완료)
+> Last Updated: 2025-12-31 (Phase 4 완료)
 > Branch: `claude/read-trading-prompt-dgm5U`
 
 ---
 
 ## 완료된 작업 ✅
+
+### Phase 4: 다국어 지원 (i18n) (2025-12-31)
+- 번역 키 100+ 확장 (translations.ts)
+- LanguageSelector 컴포넌트 구현
+- Header에 글로벌 언어 토글 추가
+- Sidebar, WatchListWidget, TradingDashboard 번역 적용
+
+### Phase F: 분석 데이터 저장 구조 개선 (2025-12-31)
+- KiwoomHistoryItem에 action 필드 추가
+- completeKiwoomSession에 action 저장 로직 추가
 
 ### Phase E: Frontend Watch List UI (2025-12-31)
 - WatchListWidget 컴포넌트 구현 완료
@@ -214,20 +224,50 @@ frontend/src/components/trading/TradingDashboard.tsx  - WatchListWidget 통합
 
 ---
 
+### Phase F: 분석 데이터 저장 구조 개선 (2025-12-31) ✅
+
+| # | Task | 상태 |
+|---|------|------|
+| 1 | Backend WebSocket에서 analysis_results 전송 | ✅ 기존 구현 확인 |
+| 2 | Store에서 completeKiwoomSession 저장 | ✅ 기존 구현 확인 |
+| 3 | localStorage 영구 저장 | ✅ 기존 구현 확인 |
+| 4 | KiwoomHistoryItem에 action 필드 추가 | ✅ 완료 |
+
+#### Phase F 수정된 파일 목록
+```
+frontend/src/types/index.ts    - KiwoomHistoryItem.action 필드 추가
+frontend/src/store/index.ts    - completeKiwoomSession에 action 저장 로직
+```
+
+---
+
+### Phase 4: 다국어 지원 (i18n) (2025-12-31) ✅
+
+| # | Task | 상태 |
+|---|------|------|
+| 1 | 번역 키 확장 (100+ 키) | ✅ 완료 |
+| 2 | LanguageSelector 컴포넌트 | ✅ 완료 |
+| 3 | Header에 글로벌 언어 토글 추가 | ✅ 완료 |
+| 4 | Sidebar 네비게이션 번역 | ✅ 완료 |
+| 5 | WatchListWidget 번역 | ✅ 완료 |
+| 6 | TradingDashboard 번역 | ✅ 완료 |
+
+#### Phase 4 수정된 파일 목록
+```
+frontend/src/utils/translations.ts                    - 번역 키 100+ 확장
+frontend/src/components/layout/LanguageSelector.tsx   - 신규 (언어 선택기)
+frontend/src/components/layout/index.ts               - LanguageSelector export
+frontend/src/components/layout/Header.tsx             - 언어 토글 추가
+frontend/src/components/layout/Sidebar.tsx            - 번역 적용
+frontend/src/components/trading/WatchListWidget.tsx   - 번역 적용
+frontend/src/components/trading/TradingDashboard.tsx  - 번역 적용
+```
+
+---
+
 ## 남은 작업
 
-### Phase F: 분석 데이터 저장 구조 개선 [MEDIUM]
-- 분석 결과 영구 저장
-- AnalysisDetailPage 데이터 표시
-- 세션 복원 기능
-
-### Phase 4: 다국어 지원 [LOW]
-- i18n 프레임워크 도입 (`react-i18next`)
-- 번역 파일 구조 생성
-- 언어 선택 UI 추가
-- 모든 하드코딩 문자열 번역 키로 변경
-
-### 향후 개선사항
+### 향후 개선사항 [LOW]
 - Live Trading 모드 활성화 (현재 Paper Trading만)
 - WebSocket을 통한 실시간 Position 업데이트
 - Stop-Loss/Take-Profit 자동 실행
