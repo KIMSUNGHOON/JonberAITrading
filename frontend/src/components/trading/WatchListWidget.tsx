@@ -27,7 +27,7 @@ import {
   convertWatchToQueue,
   startKRStockAnalysis,
 } from '@/api/client';
-import { useTranslations } from '@/utils/translations';
+import { useTranslations, type TranslationKey } from '@/utils/translations';
 import type { WatchedStock } from '@/types';
 
 // -------------------------------------------
@@ -84,7 +84,7 @@ interface WatchItemProps {
   removing: string | null;
   converting: string | null;
   reanalyzing: string | null;
-  t: (key: string) => string;
+  t: (key: TranslationKey) => string;
 }
 
 function WatchItem({

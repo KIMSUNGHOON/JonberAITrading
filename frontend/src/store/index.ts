@@ -1324,7 +1324,7 @@ export const useStore = create<Store>()(
                   analyses: session?.analyses || [],
                   tradeProposal: proposal,
                   // Phase F: Extract action from trade proposal for display
-                  action: proposal?.action || null,
+                  action: proposal?.action,
                   reasoningSummary,
                   duration,
                   dataVersion: '2.0',

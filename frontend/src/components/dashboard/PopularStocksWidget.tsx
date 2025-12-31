@@ -18,7 +18,7 @@ import {
   Clock,
 } from 'lucide-react';
 import { useStore } from '@/store';
-import { getKRStocks } from '@/api/client';
+import { getKRStocks, startKRStockAnalysis } from '@/api/client';
 
 interface StockItem {
   stk_cd: string;
@@ -38,8 +38,8 @@ export function PopularStocksWidget() {
   const [error, setError] = useState<string | null>(null);
 
   const setActiveMarket = useStore((state) => state.setActiveMarket);
-  const setSearchTerm = useStore((state) => state.setSearchTerm);
   const setCurrentView = useStore((state) => state.setCurrentView);
+  const startKiwoomSession = useStore((state) => state.startKiwoomSession);
 
   const fetchStocks = useCallback(async (isManual = false) => {
     try {
@@ -72,11 +72,16 @@ export function PopularStocksWidget() {
     fetchStocks(true);
   };
 
-  const handleStockClick = (stock: StockItem) => {
-    // Set market to kiwoom and navigate to analysis
-    setActiveMarket('kiwoom');
-    setSearchTerm(stock.stk_nm);
-    setCurrentView('analysis');
+  const handleStockClick = async (stock: StockItem) => {
+    try {
+      // Set market to kiwoom and start analysis
+      setActiveMarket('kiwoom');
+      const response = await startKRStockAnalysis({ stk_cd: stock.stk_cd });
+      startKiwoomSession(response.session_id, stock.stk_cd, stock.stk_nm);
+      setCurrentView('workflow');
+    } catch (err) {
+      console.error('Failed to start analysis:', err);
+    }
   };
 
   const formatPrice = (price: number) => {

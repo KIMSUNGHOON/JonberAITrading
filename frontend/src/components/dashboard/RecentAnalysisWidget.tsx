@@ -66,12 +66,20 @@ function ActionBadge({ action, status }: { action: TradeAction | undefined; stat
       BUY: 'bg-green-500/20 text-green-400 border-green-500/30',
       SELL: 'bg-red-500/20 text-red-400 border-red-500/30',
       HOLD: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+      ADD: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+      REDUCE: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
+      AVOID: 'bg-red-500/20 text-red-400 border-red-500/30',
+      WATCH: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
     };
 
     const labels: Record<TradeAction, string> = {
       BUY: '매수',
       SELL: '매도',
       HOLD: '관망',
+      ADD: '추가매수',
+      REDUCE: '비중축소',
+      AVOID: '매수금지',
+      WATCH: '관심종목',
     };
 
     return (

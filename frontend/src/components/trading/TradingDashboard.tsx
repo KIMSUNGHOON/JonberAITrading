@@ -20,7 +20,6 @@ import {
   TrendingDown,
   DollarSign,
   Activity,
-  Settings,
   Bell,
 } from 'lucide-react';
 import { useStore } from '@/store';
