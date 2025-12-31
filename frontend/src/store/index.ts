@@ -79,6 +79,8 @@ interface KiwoomHistoryItem extends HistoryItem {
   type: 'kiwoom';
   stk_cd: string;
   stk_nm?: string;
+  // Phase F: Trade action for display in AnalysisDetailPage
+  action?: string;  // 'BUY' | 'SELL' | 'HOLD' | 'ADD' | 'REDUCE' | 'WATCH' | 'AVOID'
 }
 
 // Combined ticker history (for backward compatibility)
@@ -1311,6 +1313,7 @@ export const useStore = create<Store>()(
           );
 
           // Update history with detailed analysis results
+          const proposal = data.tradeProposal ?? session?.tradeProposal ?? null;
           const newHistory = state.kiwoom.history.map(h =>
             h.sessionId === sessionId
               ? {
@@ -1319,7 +1322,9 @@ export const useStore = create<Store>()(
                   completedAt: now,
                   analysisResults: data.analysisResults || null,
                   analyses: session?.analyses || [],
-                  tradeProposal: data.tradeProposal ?? session?.tradeProposal ?? null,
+                  tradeProposal: proposal,
+                  // Phase F: Extract action from trade proposal for display
+                  action: proposal?.action || null,
                   reasoningSummary,
                   duration,
                   dataVersion: '2.0',
