@@ -27,6 +27,7 @@ import {
   convertWatchToQueue,
   startKRStockAnalysis,
 } from '@/api/client';
+import { useTranslations } from '@/utils/translations';
 import type { WatchedStock } from '@/types';
 
 // -------------------------------------------
@@ -83,6 +84,7 @@ interface WatchItemProps {
   removing: string | null;
   converting: string | null;
   reanalyzing: string | null;
+  t: (key: string) => string;
 }
 
 function WatchItem({
@@ -93,6 +95,7 @@ function WatchItem({
   removing,
   converting,
   reanalyzing,
+  t,
 }: WatchItemProps) {
   const confidenceLevel = getConfidenceLevel(stock.confidence);
 
@@ -116,7 +119,7 @@ function WatchItem({
                 {stock.signal.toUpperCase()}
               </span>
               <span className={`text-xs ${CONFIDENCE_COLORS[confidenceLevel]}`}>
-                {Math.round(stock.confidence * 100)}% 신뢰도
+                {Math.round(stock.confidence * 100)}% {t('watch_list_confidence')}
               </span>
             </div>
           </div>
@@ -127,7 +130,7 @@ function WatchItem({
           onClick={() => onRemove(stock.id)}
           disabled={removing === stock.id}
           className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded disabled:opacity-50"
-          title="Watch List에서 제거"
+          title={t('watch_list_remove')}
         >
           {removing === stock.id ? (
             <Loader2 className="w-4 h-4 animate-spin" />
@@ -140,15 +143,15 @@ function WatchItem({
       {/* Price Info */}
       <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
         <div className="text-gray-400">
-          현재가: <span className="text-white">{formatPrice(stock.current_price)}원</span>
+          {t('watch_list_current_price')}: <span className="text-white">{formatPrice(stock.current_price)}</span>
         </div>
         {stock.target_entry_price && (
           <div className="text-gray-400">
-            목표가: <span className="text-green-400">{formatPrice(stock.target_entry_price)}원</span>
+            {t('watch_list_target_price')}: <span className="text-green-400">{formatPrice(stock.target_entry_price)}</span>
           </div>
         )}
         <div className="text-gray-400">
-          리스크: <span className="text-white">{stock.risk_score}/10</span>
+          {t('watch_list_risk')}: <span className="text-white">{stock.risk_score}/10</span>
         </div>
       </div>
 
@@ -157,12 +160,12 @@ function WatchItem({
         <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
           {stock.stop_loss && (
             <div className="text-gray-400">
-              손절: <span className="text-red-400">{formatPrice(stock.stop_loss)}원</span>
+              {t('watch_list_stop_loss')}: <span className="text-red-400">{formatPrice(stock.stop_loss)}</span>
             </div>
           )}
           {stock.take_profit && (
             <div className="text-gray-400">
-              익절: <span className="text-green-400">{formatPrice(stock.take_profit)}원</span>
+              {t('watch_list_take_profit')}: <span className="text-green-400">{formatPrice(stock.take_profit)}</span>
             </div>
           )}
         </div>
@@ -195,7 +198,7 @@ function WatchItem({
 
       {/* Timestamp */}
       <div className="mt-2 text-xs text-gray-500">
-        추가일: {formatDate(stock.created_at)}
+        {t('watch_list_added_date')}: {formatDate(stock.created_at)}
       </div>
 
       {/* Action Buttons */}
@@ -210,7 +213,7 @@ function WatchItem({
           ) : (
             <>
               <ShoppingCart className="w-4 h-4" />
-              매수 대기열 추가
+              {t('watch_list_add_to_queue')}
             </>
           )}
         </button>
@@ -218,7 +221,7 @@ function WatchItem({
           onClick={() => onReanalyze(stock.ticker, stock.stock_name || stock.ticker)}
           disabled={reanalyzing === stock.ticker}
           className="flex items-center justify-center gap-1 px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg disabled:opacity-50 transition-colors"
-          title="재분석"
+          title={t('watch_list_reanalyze')}
         >
           {reanalyzing === stock.ticker ? (
             <Loader2 className="w-4 h-4 animate-spin" />
@@ -238,6 +241,8 @@ function WatchItem({
 export default function WatchListWidget() {
   const setCurrentView = useStore((state) => state.setCurrentView);
   const startKiwoomSession = useStore((state) => state.startKiwoomSession);
+  const language = useStore((state) => state.language);
+  const t = useTranslations(language);
   const [loading, setLoading] = useState(true);
   const [removing, setRemoving] = useState<string | null>(null);
   const [converting, setConverting] = useState<string | null>(null);
@@ -315,10 +320,10 @@ export default function WatchListWidget() {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Eye className={`w-5 h-5 ${watchList.length > 0 ? 'text-blue-400' : 'text-gray-400'}`} />
-            <h2 className="text-lg font-semibold text-white">Watch List</h2>
+            <h2 className="text-lg font-semibold text-white">{t('watch_list_title')}</h2>
             {watchList.length > 0 && (
               <span className="px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded-full">
-                {watchList.length} 종목
+                {watchList.length} {t('stocks')}
               </span>
             )}
           </div>
@@ -331,7 +336,7 @@ export default function WatchListWidget() {
           </button>
         </div>
         <p className="text-xs text-gray-500 mt-1">
-          매수 대기 중인 관심 종목 목록
+          {t('watch_list_subtitle')}
         </p>
       </div>
 
@@ -353,13 +358,13 @@ export default function WatchListWidget() {
         {loading && watchList.length === 0 ? (
           <div className="text-center text-gray-400 py-8">
             <RefreshCw className="w-6 h-6 mx-auto mb-2 animate-spin" />
-            <p className="text-sm">Loading...</p>
+            <p className="text-sm">{t('loading')}</p>
           </div>
         ) : watchList.length === 0 ? (
           <div className="text-center text-gray-500 py-8">
             <Eye className="w-8 h-8 mx-auto mb-2 text-gray-600" />
-            <p className="text-sm">Watch List가 비어있습니다</p>
-            <p className="text-xs mt-1">WATCH 추천을 받은 종목이 여기에 표시됩니다</p>
+            <p className="text-sm">{t('watch_list_empty')}</p>
+            <p className="text-xs mt-1">{t('watch_list_empty_desc')}</p>
           </div>
         ) : (
           <div className="space-y-3 max-h-[500px] overflow-y-auto">
@@ -373,6 +378,7 @@ export default function WatchListWidget() {
                 removing={removing}
                 converting={converting}
                 reanalyzing={reanalyzing}
+                t={t}
               />
             ))}
           </div>
@@ -385,17 +391,17 @@ export default function WatchListWidget() {
           <div className="flex items-center justify-between text-xs text-gray-400">
             <div className="flex items-center gap-4">
               <span>
-                평균 신뢰도: {Math.round(watchList.reduce((acc, s) => acc + s.confidence, 0) / watchList.length * 100)}%
+                {t('watch_list_avg_confidence')}: {Math.round(watchList.reduce((acc, s) => acc + s.confidence, 0) / watchList.length * 100)}%
               </span>
               <span>
-                평균 리스크: {(watchList.reduce((acc, s) => acc + s.risk_score, 0) / watchList.length).toFixed(1)}/10
+                {t('watch_list_avg_risk')}: {(watchList.reduce((acc, s) => acc + s.risk_score, 0) / watchList.length).toFixed(1)}/10
               </span>
             </div>
             <button
               onClick={() => setCurrentView('trading')}
               className="flex items-center gap-1 text-blue-400 hover:text-blue-300"
             >
-              Trading Dashboard
+              {t('nav_auto_trading')}
               <ArrowRight className="w-3 h-3" />
             </button>
           </div>

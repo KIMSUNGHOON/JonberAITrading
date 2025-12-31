@@ -23,6 +23,7 @@ import {
   Settings,
   Bell,
 } from 'lucide-react';
+import { useStore } from '@/store';
 import AgentStatusWidget from './AgentStatusWidget';
 import TradeQueueWidget from './TradeQueueWidget';
 import StrategyConfigWidget from './StrategyConfigWidget';
@@ -36,6 +37,7 @@ import {
   pauseTrading,
   resumeTrading,
 } from '@/api/client';
+import { useTranslations } from '@/utils/translations';
 import type {
   TradingMode,
   ManagedPosition,
@@ -149,6 +151,8 @@ function AlertItem({ alert }: AlertItemProps) {
 // -------------------------------------------
 
 export default function TradingDashboard() {
+  const language = useStore((state) => state.language);
+  const t = useTranslations(language);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -274,8 +278,8 @@ export default function TradingDashboard() {
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h1 className="text-xl lg:text-2xl font-bold text-white">Auto-Trading</h1>
-          <p className="text-sm text-gray-400">Automated trading management</p>
+          <h1 className="text-xl lg:text-2xl font-bold text-white">{t('trading_title')}</h1>
+          <p className="text-sm text-gray-400">{t('trading_subtitle')}</p>
         </div>
         <button
           onClick={fetchData}
@@ -301,14 +305,14 @@ export default function TradingDashboard() {
             <div className="flex items-center justify-between mb-3">
               <h2 className="font-semibold text-white flex items-center gap-2">
                 <Activity className="w-4 h-4 text-blue-400" />
-                Status
+                {t('trading_status')}
               </h2>
               <StatusBadge mode={status?.mode || 'stopped'} />
             </div>
 
             <div className="space-y-2 text-sm mb-4">
               <div className="flex justify-between">
-                <span className="text-gray-400">Started</span>
+                <span className="text-gray-400">{t('trading_started')}</span>
                 <span className="text-white">
                   {status?.started_at
                     ? new Date(status.started_at).toLocaleTimeString()
@@ -316,7 +320,7 @@ export default function TradingDashboard() {
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-gray-400">Trades</span>
+                <span className="text-gray-400">{t('trading_trades')}</span>
                 <span className="text-white">
                   {status?.daily_trades || 0}/{status?.max_daily_trades || 10}
                 </span>
@@ -332,7 +336,7 @@ export default function TradingDashboard() {
                   className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg disabled:opacity-50"
                 >
                   <Play className="w-4 h-4" />
-                  Start
+                  {t('trading_start_btn')}
                 </button>
               ) : status?.mode === 'paused' ? (
                 <>
@@ -342,7 +346,7 @@ export default function TradingDashboard() {
                     className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg disabled:opacity-50"
                   >
                     <Play className="w-4 h-4" />
-                    Resume
+                    {t('trading_resume_btn')}
                   </button>
                   <button
                     onClick={handleStop}
@@ -350,7 +354,7 @@ export default function TradingDashboard() {
                     className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg disabled:opacity-50"
                   >
                     <Square className="w-4 h-4" />
-                    Stop
+                    {t('trading_stop_btn')}
                   </button>
                 </>
               ) : (
@@ -361,7 +365,7 @@ export default function TradingDashboard() {
                     className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-yellow-600 hover:bg-yellow-700 text-white text-sm rounded-lg disabled:opacity-50"
                   >
                     <Pause className="w-4 h-4" />
-                    Pause
+                    {t('trading_pause_btn')}
                   </button>
                   <button
                     onClick={handleStop}
@@ -369,7 +373,7 @@ export default function TradingDashboard() {
                     className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg disabled:opacity-50"
                   >
                     <Square className="w-4 h-4" />
-                    Stop
+                    {t('trading_stop_btn')}
                   </button>
                 </>
               )}
@@ -380,25 +384,25 @@ export default function TradingDashboard() {
           <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
             <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
               <DollarSign className="w-4 h-4 text-green-400" />
-              Portfolio
+              {t('trading_portfolio')}
             </h2>
 
             {portfolio ? (
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
-                  <span className="text-gray-400">Equity</span>
+                  <span className="text-gray-400">{t('trading_equity')}</span>
                   <span className="text-white font-medium">
                     ₩{portfolio.total_equity.toLocaleString()}
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-400">Cash</span>
+                  <span className="text-gray-400">{t('trading_cash')}</span>
                   <span className="text-white">
                     {(portfolio.cash_ratio * 100).toFixed(0)}%
                   </span>
                 </div>
                 <div className="flex justify-between pt-2 border-t border-gray-700">
-                  <span className="text-gray-400">P&L</span>
+                  <span className="text-gray-400">{t('trading_pnl')}</span>
                   <span className={portfolio.total_unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
                     {portfolio.total_unrealized_pnl >= 0 ? '+' : ''}
                     {portfolio.total_unrealized_pnl_pct.toFixed(2)}%
@@ -406,7 +410,7 @@ export default function TradingDashboard() {
                 </div>
               </div>
             ) : (
-              <div className="text-gray-400 text-center py-4 text-sm">No data</div>
+              <div className="text-gray-400 text-center py-4 text-sm">{t('no_data')}</div>
             )}
           </div>
 
@@ -426,7 +430,7 @@ export default function TradingDashboard() {
           <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
             <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
               <TrendingUp className="w-4 h-4 text-blue-400" />
-              Positions
+              {t('trading_positions')}
               {portfolio?.positions && portfolio.positions.length > 0 && (
                 <span className="text-sm text-gray-400">
                   ({portfolio.positions.length})
@@ -442,7 +446,7 @@ export default function TradingDashboard() {
               </div>
             ) : (
               <div className="text-gray-400 text-center py-6 text-sm">
-                No active positions
+                {t('trading_no_positions')}
               </div>
             )}
           </div>
@@ -452,7 +456,7 @@ export default function TradingDashboard() {
             <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
               <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
                 <Bell className="w-4 h-4 text-yellow-400" />
-                Alerts
+                {t('trading_alerts')}
                 <span className="text-sm text-gray-400">({alerts.length})</span>
               </h2>
               <div className="space-y-2 max-h-48 overflow-y-auto">

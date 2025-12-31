@@ -7,6 +7,7 @@
 import { Menu, Settings, Bell, Activity, PanelLeftClose, PanelLeft } from 'lucide-react';
 import { useStore, selectStatus, selectTicker } from '@/store';
 import { MarketStatusBadge, MarketStatusCompact } from './MarketStatusBadge';
+import { LanguageToggleButton } from './LanguageSelector';
 
 export function Header() {
   const status = useStore(selectStatus);
@@ -88,6 +89,9 @@ export function Header() {
             {status === 'idle' ? 'Ready' : status.replace('_', ' ')}
           </span>
         </div>
+
+        {/* Language Toggle */}
+        <LanguageToggleButton />
 
         {/* Notifications */}
         <button className="p-2 hover:bg-surface rounded-lg relative">

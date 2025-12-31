@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { useStore } from '@/store';
 import { MarketTabs } from '@/components/layout/MarketTabs';
+import { useTranslations } from '@/utils/translations';
 
 interface NavItemProps {
   icon: React.ReactNode;
@@ -69,6 +70,8 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
   const currentView = useStore((state) => state.currentView);
   const setCurrentView = useStore((state) => state.setCurrentView);
+  const language = useStore((state) => state.language);
+  const t = useTranslations(language);
 
   // Get counts for badges - use primitive selectors to avoid infinite loops
   const basketItemsCount = useStore((state) => state.basket.items.length);
@@ -113,14 +116,14 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
       <nav className="space-y-1">
         <NavItem
           icon={<LayoutDashboard className="w-5 h-5" />}
-          label="Dashboard"
+          label={t('nav_dashboard')}
           active={currentView === 'dashboard'}
           onClick={() => setCurrentView('dashboard')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<Activity className="w-5 h-5" />}
-          label="Analysis"
+          label={t('nav_analysis')}
           active={currentView === 'analysis'}
           badge={runningCount > 0 ? String(runningCount) : undefined}
           onClick={() => setCurrentView('analysis')}
@@ -128,14 +131,14 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
         />
         <NavItem
           icon={<BarChart3 className="w-5 h-5" />}
-          label="Charts"
+          label={t('nav_charts')}
           active={currentView === 'charts'}
           onClick={() => setCurrentView('charts')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<Wallet className="w-5 h-5" />}
-          label="Positions"
+          label={t('nav_positions')}
           active={currentView === 'positions'}
           badge={activePosition ? '1' : undefined}
           onClick={() => setCurrentView('positions')}
@@ -143,7 +146,7 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
         />
         <NavItem
           icon={<ShoppingBasket className="w-5 h-5" />}
-          label="My Basket"
+          label={t('nav_basket')}
           active={currentView === 'basket'}
           badge={basketItemsCount > 0 ? String(basketItemsCount) : undefined}
           onClick={() => setCurrentView('basket')}
@@ -151,14 +154,14 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
         />
         <NavItem
           icon={<Receipt className="w-5 h-5" />}
-          label="Trades"
+          label={t('nav_trades')}
           active={currentView === 'trades'}
           onClick={() => setCurrentView('trades')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<Bot className="w-5 h-5" />}
-          label="Auto-Trading"
+          label={t('nav_auto_trading')}
           active={currentView === 'trading'}
           onClick={() => setCurrentView('trading')}
           collapsed={collapsed}
@@ -175,17 +178,17 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
       <nav className="space-y-1 flex-shrink-0">
         <NavItem
           icon={<BookOpen className="w-5 h-5" />}
-          label="Documentation"
+          label={t('nav_documentation')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<HelpCircle className="w-5 h-5" />}
-          label="Help"
+          label={t('nav_help')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<Settings className="w-5 h-5" />}
-          label="Settings"
+          label={t('nav_settings')}
           onClick={() => setShowSettingsModal(true)}
           collapsed={collapsed}
         />
