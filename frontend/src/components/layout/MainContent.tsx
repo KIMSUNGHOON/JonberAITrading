@@ -32,6 +32,7 @@ import { TradesPage } from '@/pages/TradesPage';
 import { AnalysisPage } from '@/pages/AnalysisPage';
 import { WorkflowPage } from '@/pages/WorkflowPage';
 import { AnalysisDetailPage } from '@/pages/AnalysisDetailPage';
+import { ScannerResultsPage } from '@/pages/ScannerResultsPage';
 import { TradingDashboard } from '@/components/trading';
 
 export function MainContent() {
@@ -83,6 +84,10 @@ export function MainContent() {
 
   if (currentView === 'trading') {
     return <TradingDashboard />;
+  }
+
+  if (currentView === 'scanner') {
+    return <ScannerResultsPage />;
   }
 
   // ============================================

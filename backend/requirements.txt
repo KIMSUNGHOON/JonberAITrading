@@ -35,10 +35,11 @@ aiohttp>=3.11.0
 httpx>=0.28.0
 
 # -------------------------------------------
-# State & Caching (SQLite-based, no server required)
+# State & Caching
 # -------------------------------------------
 aiosqlite>=0.20.0
 diskcache>=5.6.0
+redis[hiredis]>=5.0.0
 
 # -------------------------------------------
 # Utilities

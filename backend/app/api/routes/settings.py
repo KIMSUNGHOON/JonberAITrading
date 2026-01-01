@@ -5,7 +5,7 @@ Endpoints for managing application settings including API keys.
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
@@ -169,7 +169,7 @@ async def validate_upbit_api_keys():
 
             # Update validation status
             _runtime_upbit_keys["is_valid"] = True
-            _runtime_upbit_keys["last_validated"] = datetime.utcnow()
+            _runtime_upbit_keys["last_validated"] = datetime.now(timezone.utc)
 
             logger.info("upbit_api_keys_validated", account_count=len(accounts))
 
@@ -181,7 +181,7 @@ async def validate_upbit_api_keys():
 
     except Exception as e:
         _runtime_upbit_keys["is_valid"] = False
-        _runtime_upbit_keys["last_validated"] = datetime.utcnow()
+        _runtime_upbit_keys["last_validated"] = datetime.now(timezone.utc)
 
         logger.error("upbit_api_keys_invalid", error=str(e))
 
@@ -326,7 +326,7 @@ async def validate_kiwoom_api_keys():
 
             # Update validation status
             _runtime_kiwoom_keys["is_valid"] = True
-            _runtime_kiwoom_keys["last_validated"] = datetime.utcnow()
+            _runtime_kiwoom_keys["last_validated"] = datetime.now(timezone.utc)
 
             logger.info("kiwoom_api_keys_validated")
 
@@ -338,7 +338,7 @@ async def validate_kiwoom_api_keys():
 
     except Exception as e:
         _runtime_kiwoom_keys["is_valid"] = False
-        _runtime_kiwoom_keys["last_validated"] = datetime.utcnow()
+        _runtime_kiwoom_keys["last_validated"] = datetime.now(timezone.utc)
 
         logger.error("kiwoom_api_keys_invalid", error=str(e))
 
@@ -369,3 +369,84 @@ async def clear_kiwoom_api_keys():
     logger.info("kiwoom_api_keys_cleared")
 
     return {"message": "Kiwoom API keys cleared from runtime storage."}
+
+
+# -------------------------------------------
+# Cache Statistics Endpoints
+# -------------------------------------------
+
+
+@router.get("/cache/stats")
+async def get_cache_stats():
+    """
+    Get cache statistics for all cache layers.
+
+    Returns:
+        Cache statistics including L1 (memory) and L2 (Redis) stats
+    """
+    from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+
+    stats = {
+        "kiwoom": None,
+        "multi_tier": None,
+        "redis_url_configured": bool(settings.REDIS_URL),
+    }
+
+    # Kiwoom cache stats
+    try:
+        client = await get_shared_kiwoom_client_async()
+        if client and hasattr(client, '_cache'):
+            stats["kiwoom"] = client._cache.stats
+    except Exception as e:
+        logger.warning("Failed to get Kiwoom cache stats", error=str(e))
+
+    # Multi-tier cache stats
+    try:
+        from services.cache import get_cache_service
+        cache = await get_cache_service()
+        stats["multi_tier"] = cache.get_stats().to_dict()
+    except Exception as e:
+        logger.warning("Failed to get multi-tier cache stats", error=str(e))
+
+    return stats
+
+
+@router.post("/cache/clear")
+async def clear_cache(pattern: str = "*"):
+    """
+    Clear cache entries matching pattern.
+
+    Args:
+        pattern: Key pattern to match (default: "*" clears all)
+
+    Returns:
+        Number of entries cleared
+    """
+    cleared = 0
+
+    # Clear Kiwoom cache
+    try:
+        from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+        client = await get_shared_kiwoom_client_async()
+        if client and hasattr(client, '_cache'):
+            if pattern == "*":
+                cleared += await client._cache.clear_async()
+            else:
+                # Clear matching keys
+                for key in list(client._cache._cache.keys()):
+                    if pattern in key:
+                        await client._cache.delete_async(key)
+                        cleared += 1
+    except Exception as e:
+        logger.warning("Failed to clear Kiwoom cache", error=str(e))
+
+    # Clear multi-tier cache
+    try:
+        from services.cache import get_cache_service
+        cache = await get_cache_service()
+        cleared += await cache.clear(pattern)
+    except Exception as e:
+        logger.warning("Failed to clear multi-tier cache", error=str(e))
+
+    logger.info("cache_cleared", pattern=pattern, cleared=cleared)
+    return {"pattern": pattern, "cleared": cleared}

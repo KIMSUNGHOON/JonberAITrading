@@ -5,7 +5,7 @@ Defines all state objects, data models, and type definitions
 for the Korean stock multi-agent trading workflow using Kiwoom Securities API.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, Optional, TypedDict
 
@@ -398,7 +398,7 @@ def create_kr_stock_initial_state(
 def add_kr_stock_reasoning_log(state: dict, message: str) -> list[str]:
     """Add a message to the reasoning log."""
     current_log = state.get("reasoning_log", [])
-    return current_log + [f"[{datetime.utcnow().strftime('%H:%M:%S')}] {message}"]
+    return current_log + [f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {message}"]
 
 
 def get_all_kr_stock_analyses(state: dict) -> list[dict]:
@@ -459,11 +459,19 @@ def calculate_kr_stock_consensus_signal(analyses: list[dict]) -> tuple[SignalTyp
     Calculate consensus signal from multiple Korean stock analyses.
 
     Uses confidence-weighted voting.
+    NOTE: Risk assessment is EXCLUDED from voting as it provides risk parameters,
+    not directional signals. Including it would bias consensus toward HOLD.
 
     Returns:
         Tuple of (consensus_signal, average_confidence)
     """
     if not analyses:
+        return SignalType.HOLD, 0.0
+
+    # Filter out risk assessment - it should not vote on direction
+    voting_analyses = [a for a in analyses if a.get("agent_type") != "risk"]
+
+    if not voting_analyses:
         return SignalType.HOLD, 0.0
 
     signal_values = {
@@ -474,24 +482,26 @@ def calculate_kr_stock_consensus_signal(analyses: list[dict]) -> tuple[SignalTyp
         SignalType.STRONG_SELL: -2,
     }
 
-    total_weight = sum(a.get("confidence", 0.5) for a in analyses)
+    total_weight = sum(a.get("confidence", 0.5) for a in voting_analyses)
     if total_weight == 0:
         return SignalType.HOLD, 0.0
 
     weighted_sum = sum(
         signal_values[_parse_kr_stock_signal(a.get("signal", "hold"))] * a.get("confidence", 0.5)
-        for a in analyses
+        for a in voting_analyses
     )
     avg_signal = weighted_sum / total_weight
-    avg_confidence = total_weight / len(analyses)
+    avg_confidence = total_weight / len(voting_analyses)
 
-    if avg_signal >= 1.5:
+    # Adjusted thresholds for better signal distribution
+    # With 3 agents (tech, fund, sentiment), need clearer thresholds
+    if avg_signal >= 1.3:
         consensus = SignalType.STRONG_BUY
-    elif avg_signal >= 0.5:
+    elif avg_signal >= 0.4:
         consensus = SignalType.BUY
-    elif avg_signal >= -0.5:
+    elif avg_signal >= -0.4:
         consensus = SignalType.HOLD
-    elif avg_signal >= -1.5:
+    elif avg_signal >= -1.3:
         consensus = SignalType.SELL
     else:
         consensus = SignalType.STRONG_SELL

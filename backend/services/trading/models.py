@@ -7,7 +7,7 @@ Data models for the auto-trading system.
 from enum import Enum
 from typing import Optional, List, Any, Dict
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # -------------------------------------------
@@ -131,8 +131,42 @@ class AgentState(BaseModel):
     tasks_completed: int = 0
     tasks_failed: int = 0
 
-    class Config:
-        use_enum_values = True
+    # 세부 정보 (Sub Agent Status 개선)
+    processing_stock: Optional[str] = None  # 현재 처리 중인 종목 (ticker)
+    processing_stock_name: Optional[str] = None  # 종목명
+
+    # 거래 세부 정보
+    trade_details: Optional[Dict[str, Any]] = None
+    # 예: {
+    #   "action": "BUY",
+    #   "quantity": 100,
+    #   "entry_price": 55000,
+    #   "stop_loss": 52000,
+    #   "take_profit": 60000,
+    #   "risk_score": 7,
+    #   "position_pct": 10.5
+    # }
+
+    # 분석 결과 요약
+    analysis_summary: Optional[Dict[str, Any]] = None
+    # 예: {
+    #   "technical": {"signal": "buy", "confidence": 0.75, "key_factors": ["RSI oversold", "MACD crossover"]},
+    #   "fundamental": {"signal": "hold", "confidence": 0.6, "key_factors": ["P/E ratio high"]},
+    #   "sentiment": {"signal": "buy", "confidence": 0.8, "key_factors": ["Positive news"]},
+    #   "risk": {"level": "medium", "score": 6, "factors": ["High volatility"]}
+    # }
+
+    # 마지막 처리 결과
+    last_result: Optional[Dict[str, Any]] = None
+    # 예: {
+    #   "success": True,
+    #   "message": "Order placed successfully",
+    #   "order_id": "ORD123",
+    #   "filled_quantity": 100,
+    #   "avg_price": 55100
+    # }
+
+    model_config = ConfigDict(use_enum_values=True)
 
 
 # -------------------------------------------
@@ -195,8 +229,7 @@ class OrderRequest(BaseModel):
     session_id: Optional[str] = None
     reason: Optional[str] = None
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 class OrderResult(BaseModel):
@@ -261,8 +294,7 @@ class ManagedPosition(BaseModel):
     analysis_session_id: Optional[str] = None
     risk_score: Optional[int] = None
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 # -------------------------------------------
@@ -292,8 +324,7 @@ class AllocationPlan(BaseModel):
     # Reason/rationale
     rationale: Optional[str] = None
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 # -------------------------------------------
@@ -327,8 +358,7 @@ class QueuedTrade(BaseModel):
     allocation: Optional[AllocationPlan] = None
     error_message: Optional[str] = None
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 # -------------------------------------------
@@ -368,8 +398,7 @@ class WatchedStock(BaseModel):
     # Metadata
     risk_score: int = 5  # 1-10
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 # -------------------------------------------
@@ -399,8 +428,7 @@ class TradingAlert(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     acknowledged_at: Optional[datetime] = None
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 class ActivityLog(BaseModel):
@@ -413,8 +441,7 @@ class ActivityLog(BaseModel):
     details: Optional[dict] = None
     timestamp: datetime = Field(default_factory=datetime.now)
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 # -------------------------------------------
@@ -506,5 +533,4 @@ class TradingState(BaseModel):
             self.daily_trades_count < self.risk_params.max_daily_trades
         )
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)

@@ -2,6 +2,8 @@
 Order Agent
 
 Handles order execution via Kiwoom API with rate limiting and split orders.
+
+Uses KRX tick size (호가 단위) for proper price rounding.
 """
 
 import asyncio
@@ -15,6 +17,11 @@ from .models import (
     OrderResult,
     OrderType,
     OrderSide,
+)
+from .market_hours import (
+    round_to_tick_size,
+    is_valid_tick_price,
+    get_krx_tick_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -335,12 +342,26 @@ class OrderAgent:
         order_type_code = "00" if order.order_type == OrderType.LIMIT else "03"
         side_code = "01" if order.side == OrderSide.BUY else "02"
 
+        # Apply tick size rounding for limit orders
+        price_to_use = 0
+        if order.price and order.order_type == OrderType.LIMIT:
+            # Round price to valid tick size
+            direction = "up" if order.side == OrderSide.BUY else "down"
+            price_to_use = round_to_tick_size(order.price, direction)
+
+            if price_to_use != int(order.price):
+                logger.info(
+                    f"[OrderAgent] Price adjusted to tick size: "
+                    f"{order.price:,.0f} → {price_to_use:,.0f} "
+                    f"(tick size: {get_krx_tick_size(order.price)})"
+                )
+
         try:
             response = await self.kiwoom.place_order(
                 order_type=side_code,
                 stock_code=order.ticker,
                 quantity=order.quantity,
-                price=int(order.price) if order.price else 0,
+                price=price_to_use,
                 price_type=order_type_code,
             )
 

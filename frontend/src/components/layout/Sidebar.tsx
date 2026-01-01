@@ -17,6 +17,7 @@ import {
   Activity,
   Receipt,
   Bot,
+  Scan,
 } from 'lucide-react';
 import { useStore } from '@/store';
 import { MarketTabs } from '@/components/layout/MarketTabs';
@@ -164,6 +165,13 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
           label={t('nav_auto_trading')}
           active={currentView === 'trading'}
           onClick={() => setCurrentView('trading')}
+          collapsed={collapsed}
+        />
+        <NavItem
+          icon={<Scan className="w-5 h-5" />}
+          label={t('nav_scanner')}
+          active={currentView === 'scanner'}
+          onClick={() => setCurrentView('scanner')}
           collapsed={collapsed}
         />
       </nav>

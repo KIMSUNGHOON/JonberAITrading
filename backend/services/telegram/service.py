@@ -59,17 +59,71 @@ class TelegramNotifier:
             logger.error("telegram_init_failed", error=str(e))
             return False
 
+    def _split_message(self, text: str, max_length: int = 4000) -> list[str]:
+        """
+        Split a long message into chunks that fit within Telegram's limit.
+
+        Telegram limit is 4096 chars, we use 4000 to be safe.
+        Tries to split at newlines or spaces when possible.
+        """
+        if len(text) <= max_length:
+            return [text]
+
+        chunks = []
+        remaining = text
+
+        while remaining:
+            if len(remaining) <= max_length:
+                chunks.append(remaining)
+                break
+
+            # Find best split point (prefer newlines, then spaces)
+            split_pos = max_length
+
+            # Try to find newline near the end of allowed length
+            newline_pos = remaining.rfind("\n", 0, max_length)
+            if newline_pos > max_length * 0.6:  # Only if not too far back
+                split_pos = newline_pos + 1
+            else:
+                # Try to find space
+                space_pos = remaining.rfind(" ", 0, max_length)
+                if space_pos > max_length * 0.6:
+                    split_pos = space_pos + 1
+
+            chunks.append(remaining[:split_pos].rstrip())
+            remaining = remaining[split_pos:].lstrip()
+
+        return chunks
+
     async def _send_message(self, text: str, parse_mode: str = "Markdown") -> bool:
-        """Send a message to the configured chat."""
+        """Send a message to the configured chat. Handles long messages by splitting."""
         if not self._initialized or not self._bot:
             return False
 
         try:
-            await self._bot.send_message(
-                chat_id=self._config.TELEGRAM_CHAT_ID,
-                text=text,
-                parse_mode=parse_mode,
-            )
+            # Split long messages
+            chunks = self._split_message(text)
+
+            for i, chunk in enumerate(chunks):
+                # Add continuation indicator for multi-part messages
+                if len(chunks) > 1:
+                    if i == 0:
+                        chunk = chunk + "\n\n_(계속...)_"
+                    elif i < len(chunks) - 1:
+                        chunk = f"_(...계속)_\n\n{chunk}\n\n_(계속...)_"
+                    else:
+                        chunk = f"_(...계속)_\n\n{chunk}"
+
+                await self._bot.send_message(
+                    chat_id=self._config.TELEGRAM_CHAT_ID,
+                    text=chunk,
+                    parse_mode=parse_mode,
+                )
+
+                # Small delay between chunks to maintain order
+                if i < len(chunks) - 1:
+                    await asyncio.sleep(0.3)
+
             return True
         except TelegramError as e:
             logger.error("telegram_send_failed", error=str(e))
@@ -165,6 +219,44 @@ _승인 대기 중..._
 
 *종목:* {stock_name} ({ticker})
 *사유:* {reason or "사용자 거절"}
+
+⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+"""
+        return await self._send_message(message.strip())
+
+    async def send_watch_list_added(
+        self,
+        ticker: str,
+        stock_name: str,
+        signal: str = "hold",
+        confidence: float = 0.0,
+        current_price: int = 0,
+        target_price: Optional[int] = None,
+        risk_score: int = 5,
+    ) -> bool:
+        """Send watch list addition notification."""
+        if not self._config.TELEGRAM_NOTIFY_TRADE_ALERTS:
+            return False
+
+        signal_emoji = {
+            "strong_buy": "🟢",
+            "buy": "🔵",
+            "hold": "🟡",
+            "sell": "🟠",
+            "strong_sell": "🔴",
+        }.get(signal.lower(), "🟡")
+
+        message = f"""
+👁️ *Watch List 등록*
+
+*종목:* {stock_name} ({ticker})
+*신호:* {signal_emoji} {signal.upper()}
+*신뢰도:* {confidence:.0%}
+*현재가:* ₩{current_price:,}
+*목표가:* {"₩" + f"{target_price:,}" if target_price else "미설정"}
+*위험도:* {risk_score}/10
+
+_모니터링 중..._
 
 ⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 """

@@ -29,6 +29,8 @@ class StartScanRequest(BaseModel):
     """Request to start background scan"""
     notify_progress: bool = True
     custom_stocks: Optional[List[tuple]] = None  # [(stk_cd, stk_nm), ...]
+    use_llm: bool = False  # Use LLM for analysis (slower but more accurate)
+    auto_gpu_scaling: bool = True  # Automatically adjust concurrency based on GPU memory
 
 
 class ScanProgressResponse(BaseModel):
@@ -62,6 +64,7 @@ class ScanResultItem(BaseModel):
     summary: str
     key_factors: List[str]
     current_price: int
+    market_type: str = ""
     scanned_at: str
 
 
@@ -69,7 +72,31 @@ class ScanResultsResponse(BaseModel):
     """Scan results response"""
     results: List[ScanResultItem]
     count: int
+    total: int = 0
     filter: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class ScanSessionItem(BaseModel):
+    """Scan session information"""
+    id: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    total_stocks: int = 0
+    completed: int = 0
+    failed: int = 0
+    buy_count: int = 0
+    sell_count: int = 0
+    hold_count: int = 0
+    watch_count: int = 0
+    avoid_count: int = 0
+    status: str = ""
+
+
+class ScanSessionsResponse(BaseModel):
+    """Scan sessions list response"""
+    sessions: List[ScanSessionItem]
+    count: int
 
 
 # -------------------------------------------
@@ -81,7 +108,11 @@ async def start_scan(request: Optional[StartScanRequest] = None):
     """
     Start background stock scan.
 
-    Scans all KOSPI/KOSDAQ stocks with 3 concurrent analysis slots.
+    Scans all KOSPI/KOSDAQ stocks with controlled concurrency.
+    Supports two modes:
+    - Quick mode (default): Technical indicators only, fast parallel analysis
+    - LLM mode: Deep analysis with GPU-based batch processing
+
     Sends Telegram notifications for progress and completion.
     """
     try:
@@ -95,16 +126,25 @@ async def start_scan(request: Optional[StartScanRequest] = None):
                 detail="Scanner is already running"
             )
 
+        # Extract parameters with defaults
+        use_llm = request.use_llm if request else False
+        auto_gpu_scaling = request.auto_gpu_scaling if request else True
+
         # Start scan
         await scanner.start_scan(
             stock_list=request.custom_stocks if request else None,
             notify_progress=request.notify_progress if request else True,
+            use_llm=use_llm,
+            auto_gpu_scaling=auto_gpu_scaling,
         )
 
+        mode = "LLM 배치 분석" if use_llm else "기술적 지표 분석"
         return {
             "status": "started",
-            "message": "Background scan started",
+            "message": f"Background scan started ({mode})",
             "total_stocks": scanner.get_progress().total_stocks,
+            "mode": "llm" if use_llm else "quick",
+            "auto_gpu_scaling": auto_gpu_scaling,
         }
 
     except HTTPException:
@@ -282,3 +322,117 @@ async def check_reminder():
         "last_scan_date": scanner.get_progress().last_scan_date.isoformat()
             if scanner.get_progress().last_scan_date else None,
     }
+
+
+# -------------------------------------------
+# Database Query Endpoints
+# -------------------------------------------
+
+@router.get("/db/results")
+async def get_db_results(
+    action: Optional[str] = None,
+    session_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    """
+    Get scan results from database.
+
+    Args:
+        action: Filter by action (BUY, SELL, HOLD, WATCH, AVOID)
+        session_id: Filter by scan session (None = latest session)
+        limit: Maximum results to return
+        offset: Offset for pagination
+    """
+    try:
+        scanner = await get_background_scanner()
+        results = await scanner.get_results_from_db(
+            action_filter=action,
+            session_id=session_id,
+            limit=limit,
+            offset=offset,
+        )
+        counts = await scanner.get_result_counts_from_db(session_id=session_id)
+
+        return ScanResultsResponse(
+            results=[
+                ScanResultItem(
+                    stk_cd=r.stk_cd,
+                    stk_nm=r.stk_nm,
+                    action=r.action,
+                    signal=r.signal,
+                    confidence=r.confidence,
+                    summary=r.summary,
+                    key_factors=r.key_factors,
+                    current_price=r.current_price,
+                    market_type=r.market_type,
+                    scanned_at=r.scanned_at.isoformat(),
+                )
+                for r in results
+            ],
+            count=len(results),
+            total=counts.get("total", 0),
+            filter=action,
+            session_id=session_id,
+        )
+
+    except Exception as e:
+        logger.exception("[Scanner API] DB results query failed")
+        raise HTTPException(500, f"Failed to query results: {e}")
+
+
+@router.get("/db/counts")
+async def get_db_counts(session_id: Optional[str] = None):
+    """
+    Get action counts from database.
+
+    Args:
+        session_id: Filter by scan session (None = latest session)
+    """
+    try:
+        scanner = await get_background_scanner()
+        counts = await scanner.get_result_counts_from_db(session_id=session_id)
+
+        return counts
+
+    except Exception as e:
+        logger.exception("[Scanner API] DB counts query failed")
+        raise HTTPException(500, f"Failed to query counts: {e}")
+
+
+@router.get("/db/sessions", response_model=ScanSessionsResponse)
+async def get_sessions(limit: int = 10):
+    """
+    Get recent scan sessions.
+
+    Args:
+        limit: Maximum sessions to return
+    """
+    try:
+        scanner = await get_background_scanner()
+        sessions = await scanner.get_scan_sessions(limit=limit)
+
+        return ScanSessionsResponse(
+            sessions=[
+                ScanSessionItem(
+                    id=s.get("id", ""),
+                    started_at=str(s.get("started_at")) if s.get("started_at") else None,
+                    completed_at=str(s.get("completed_at")) if s.get("completed_at") else None,
+                    total_stocks=s.get("total_stocks") or 0,
+                    completed=s.get("completed") or 0,
+                    failed=s.get("failed") or 0,
+                    buy_count=s.get("buy_count") or 0,
+                    sell_count=s.get("sell_count") or 0,
+                    hold_count=s.get("hold_count") or 0,
+                    watch_count=s.get("watch_count") or 0,
+                    avoid_count=s.get("avoid_count") or 0,
+                    status=s.get("status") or "",
+                )
+                for s in sessions
+            ],
+            count=len(sessions),
+        )
+
+    except Exception as e:
+        logger.exception("[Scanner API] Sessions query failed")
+        raise HTTPException(500, f"Failed to query sessions: {e}")

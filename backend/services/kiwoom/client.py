@@ -29,6 +29,7 @@ from .models import (
     Exchange,
     FilledOrder,
     Holding,
+    MarketType,
     Orderbook,
     OrderbookUnit,
     OrderRequest,
@@ -36,6 +37,7 @@ from .models import (
     OrderType,
     PendingOrder,
     StockBasicInfo,
+    StockListItem,
 )
 
 logger = structlog.get_logger()
@@ -1069,3 +1071,149 @@ class KiwoomClient:
         if self._cache:
             return self._cache.clear()
         return 0
+
+    # ===========================================
+    # 종목 목록 조회 API (ka10099)
+    # ===========================================
+
+    async def get_stock_list(
+        self,
+        market_type: MarketType = MarketType.KOSPI,
+    ) -> list[StockListItem]:
+        """
+        종목 정보 리스트 조회 (ka10099)
+
+        전체 KOSPI/KOSDAQ 종목 목록을 조회합니다.
+        연속 조회를 자동으로 처리하여 전체 목록을 반환합니다.
+
+        Args:
+            market_type: 시장 구분 (KOSPI, KOSDAQ, ETF 등)
+
+        Returns:
+            StockListItem 리스트
+        """
+        cache_key = make_cache_key("stock_list", market_type.value)
+
+        # 캐시 확인 (1시간 유효)
+        if self._cache:
+            cached = self._cache.get(cache_key)
+            if cached:
+                return cached
+
+        all_items: list[StockListItem] = []
+        cont_yn = "N"
+        next_key = ""
+
+        while True:
+            # 연속 조회 헤더 설정
+            extra_headers = {}
+            if cont_yn == "Y":
+                extra_headers["cont-yn"] = cont_yn
+                extra_headers["next-key"] = next_key
+
+            response = await self._request(
+                api_id="ka10099",
+                endpoint="/api/dostk/stkinfo",
+                data={"mrkt_tp": market_type.value},
+                extra_headers=extra_headers if extra_headers else None,
+            )
+
+            # 응답 파싱
+            output = response.get("output", response)
+            items = output.get("list", [])
+
+            for item in items:
+                try:
+                    # 상장주식수 파싱 (문자열 -> 정수)
+                    list_count_str = item.get("listCount", "0")
+                    list_count = int(list_count_str) if list_count_str else None
+
+                    stock_item = StockListItem(
+                        code=item.get("code", ""),
+                        name=item.get("name", ""),
+                        market_code=item.get("marketCode", ""),
+                        market_name=item.get("marketName", ""),
+                        list_count=list_count,
+                        state=item.get("state", ""),
+                        order_warning=item.get("orderWarning", "0"),
+                    )
+
+                    # 유효한 종목만 추가 (코드가 있고 6자리인 경우)
+                    if stock_item.code and len(stock_item.code) == 6:
+                        all_items.append(stock_item)
+
+                except Exception as e:
+                    logger.warning(
+                        "stock_list_item_parse_error",
+                        item=item,
+                        error=str(e),
+                    )
+
+            # 연속 조회 확인
+            cont_yn = response.get("cont-yn", "N")
+            next_key = response.get("next-key", "")
+
+            if cont_yn != "Y":
+                break
+
+            # Rate limit 대기
+            await asyncio.sleep(0.3)
+
+        logger.info(
+            "stock_list_fetched",
+            market_type=market_type.value,
+            count=len(all_items),
+        )
+
+        # 캐시 저장 (1시간)
+        if self._cache and all_items:
+            self._cache.set(cache_key, all_items, ttl=3600)
+
+        return all_items
+
+    async def get_all_stocks(
+        self,
+        include_kospi: bool = True,
+        include_kosdaq: bool = True,
+        exclude_warnings: bool = True,
+    ) -> list[StockListItem]:
+        """
+        KOSPI/KOSDAQ 전체 종목 조회
+
+        Args:
+            include_kospi: 코스피 포함 여부
+            include_kosdaq: 코스닥 포함 여부
+            exclude_warnings: 투자주의/경고 종목 제외 여부
+
+        Returns:
+            StockListItem 리스트
+        """
+        all_stocks: list[StockListItem] = []
+
+        if include_kospi:
+            kospi_stocks = await self.get_stock_list(MarketType.KOSPI)
+            all_stocks.extend(kospi_stocks)
+
+        if include_kosdaq:
+            kosdaq_stocks = await self.get_stock_list(MarketType.KOSDAQ)
+            all_stocks.extend(kosdaq_stocks)
+
+        if exclude_warnings:
+            all_stocks = [s for s in all_stocks if s.is_normal]
+
+        # 중복 제거 (코드 기준)
+        seen = set()
+        unique_stocks = []
+        for stock in all_stocks:
+            if stock.code not in seen:
+                seen.add(stock.code)
+                unique_stocks.append(stock)
+
+        logger.info(
+            "all_stocks_fetched",
+            total=len(unique_stocks),
+            kospi=include_kospi,
+            kosdaq=include_kosdaq,
+        )
+
+        return unique_stocks

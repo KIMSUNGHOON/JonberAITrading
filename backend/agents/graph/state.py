@@ -6,7 +6,7 @@ for the multi-agent trading workflow.
 """
 
 import operator
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, Optional, TypedDict
 
@@ -360,7 +360,7 @@ def create_initial_state(ticker: str, user_query: Optional[str] = None) -> dict:
 def add_reasoning_log(state: dict, message: str) -> list[str]:
     """Add a message to the reasoning log."""
     current_log = state.get("reasoning_log", [])
-    return current_log + [f"[{datetime.utcnow().strftime('%H:%M:%S')}] {message}"]
+    return current_log + [f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {message}"]
 
 
 def get_all_analyses(state: dict) -> list[dict]:

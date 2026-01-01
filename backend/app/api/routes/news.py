@@ -57,7 +57,7 @@ class NewsErrorResponse(BaseModel):
 async def search_news(
     query: str = Query(..., min_length=1, description="Search query"),
     count: int = Query(10, ge=1, le=100, description="Number of results"),
-    sort: str = Query("date", regex="^(date|sim)$", description="Sort: date or sim"),
+    sort: str = Query("date", pattern="^(date|sim)$", description="Sort: date or sim"),
     provider: Optional[str] = Query(None, description="Specific provider to use"),
     news_service: NewsService = Depends(get_news_service),
 ):

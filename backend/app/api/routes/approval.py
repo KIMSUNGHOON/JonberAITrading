@@ -138,10 +138,39 @@ async def submit_approval(request: ApprovalRequest):
 
                     # Extract proposal data
                     action = proposal.get("action", "HOLD")
-                    if action not in ("BUY", "SELL"):
-                        action = None  # Skip HOLD actions
 
-                    if ticker and action:
+                    # Handle WATCH action - add to watch list
+                    if action == "WATCH" and ticker:
+                        # Get analysis data for watch list
+                        technical = state.get("technical_analysis", {})
+                        risk = state.get("risk_assessment", {})
+                        synthesis = state.get("synthesis", {})
+
+                        coordinator.add_to_watch_list(
+                            session_id=request.session_id,
+                            ticker=ticker,
+                            stock_name=stock_name,
+                            signal=technical.get("signal", "hold"),
+                            confidence=technical.get("confidence", 0.5),
+                            current_price=proposal.get("entry_price", 0),
+                            target_entry_price=proposal.get("entry_price"),
+                            stop_loss=proposal.get("stop_loss"),
+                            take_profit=proposal.get("take_profit"),
+                            analysis_summary=synthesis.get("summary", proposal.get("rationale", ""))[:500],
+                            key_factors=technical.get("key_factors", [])[:5],
+                            risk_score=int(risk.get("risk_score", 5)),
+                        )
+
+                        logger.info(
+                            "watch_list_added",
+                            session_id=request.session_id,
+                            ticker=ticker,
+                            stock_name=stock_name,
+                        )
+                        allocation_rationale = f"Added {stock_name or ticker} to Watch List"
+
+                    # Handle BUY/SELL actions - send to trade queue
+                    elif action in ("BUY", "SELL") and ticker:
                         allocation = await coordinator.on_trade_approved(
                             session_id=request.session_id,
                             ticker=ticker,
@@ -212,16 +241,32 @@ async def submit_approval(request: ApprovalRequest):
                 proposal = state.get("trade_proposal", {})
                 ticker = session.get("stk_cd") or session.get("ticker") or session.get("market", "")
                 stock_name = session.get("stk_nm") or session.get("stock_name", ticker)
+                action = proposal.get("action", "BUY")
 
                 if request.decision == "approved":
-                    await telegram.send_trade_executed(
-                        ticker=ticker,
-                        stock_name=stock_name,
-                        action=proposal.get("action", "BUY"),
-                        quantity=proposal.get("quantity", 0),
-                        price=proposal.get("entry_price", 0),
-                        total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
-                    )
+                    # WATCH action sends watch list notification
+                    if action == "WATCH":
+                        technical = state.get("technical_analysis", {})
+                        risk = state.get("risk_assessment", {})
+                        await telegram.send_watch_list_added(
+                            ticker=ticker,
+                            stock_name=stock_name,
+                            signal=technical.get("signal", "hold"),
+                            confidence=technical.get("confidence", 0.5),
+                            current_price=int(proposal.get("entry_price", 0)),
+                            target_price=int(proposal.get("entry_price", 0)) if proposal.get("entry_price") else None,
+                            risk_score=int(risk.get("risk_score", 5)),
+                        )
+                    # BUY/SELL actions send trade executed notification
+                    elif action in ("BUY", "SELL"):
+                        await telegram.send_trade_executed(
+                            ticker=ticker,
+                            stock_name=stock_name,
+                            action=action,
+                            quantity=proposal.get("quantity", 0),
+                            price=proposal.get("entry_price", 0),
+                            total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
+                        )
                 elif request.decision == "rejected":
                     await telegram.send_trade_rejected(
                         ticker=ticker,
@@ -246,7 +291,9 @@ async def submit_approval(request: ApprovalRequest):
 
     # Build response message
     if request.decision == "approved":
-        if allocation_rationale and "queued" in allocation_rationale.lower():
+        if allocation_rationale and "watch list" in allocation_rationale.lower():
+            message = f"{allocation_rationale}"
+        elif allocation_rationale and "queued" in allocation_rationale.lower():
             message = f"Trade approved. {allocation_rationale}"
         else:
             message = "Trade approved and executed successfully."

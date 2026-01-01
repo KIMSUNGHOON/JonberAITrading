@@ -155,6 +155,20 @@ cd backend && pytest -v
                                    [Trade Execution]
 ```
 
+## Planned Features (2026-01-01)
+
+### Agent Group Chat (계획됨)
+- **목적**: 사용자 관심 종목 기반 자율 자동매매
+- **계획 문서**: `docs/AGENT_GROUP_CHAT_PLAN.md`
+- **주요 컴포넌트**:
+  - Agent Group Chat: Sub-Agent 간 토론/협의/투표
+  - Watch Monitor: 관심 종목 5분 주기 모니터링
+  - Position Manager: 실시간 손절/익절 관리
+  - Decision Engine: 합의 기반 매매 결정
+- **핵심 원칙**:
+  - 사용자 통제: 관심 종목, 리스크 설정, 자동매매 ON/OFF
+  - 시스템 자율: 매수/매도 타이밍, Agent 토론, 포지션 관리
+
 ## New Features (2025-12-31)
 
 ### Telegram Notifications
@@ -187,6 +201,7 @@ cd backend && pytest -v
 |----------|-------------|
 | `CLAUDE.md` | Claude Code 개발 지침 (이 파일) |
 | `WORK_STATUS.md` | 작업 현황 및 완료된 태스크 |
+| `docs/AGENT_GROUP_CHAT_PLAN.md` | Agent Group Chat 구현 계획 |
 | `docs/PROJECT_ROADMAP.md` | 프로젝트 로드맵, 진행 상황 |
 | `docs/UI_ARCHITECTURE.md` | UI 구조 및 컴포넌트 |
 | `docs/OPENDART_API_GUIDE.md` | OpenDART API 가이드 (미구현) |

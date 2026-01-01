@@ -17,13 +17,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.llm_provider import get_llm_provider, reset_llm_provider
-from app.api.routes import analysis, approval, websocket, auth, coin, kr_stocks, chat, indicators, settings as settings_routes, news, trading, scanner
+from app.api.routes import analysis, analysis_unified, approval, websocket, auth, coin, kr_stocks, chat, indicators, settings as settings_routes, news, trading, scanner, holidays, agent_chat
 from app.config import settings
 from app.core.analysis_limiter import cleanup_old_sessions
 from app.logging_config import configure_logging, RequestLoggingMiddleware
 from services.realtime_service import close_realtime_service, get_realtime_service
 from services.storage_service import close_storage_service, get_storage_service
 from services.telegram import get_telegram_notifier
+from services.krx_holiday import get_holiday_service
+from services.session_manager import get_session_manager
 
 # Configure enhanced logging
 configure_logging(
@@ -99,6 +101,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("realtime_service_start_failed", error=str(e))
 
+    # Initialize unified SessionManager
+    try:
+        session_manager = await get_session_manager()
+        stats = await session_manager.get_stats()
+        logger.info(
+            "session_manager_initialized",
+            loaded_sessions=stats.get("total_sessions", 0),
+        )
+    except Exception as e:
+        logger.error("session_manager_init_failed", error=str(e))
+
     # Start session cleanup background task
     asyncio.create_task(cleanup_old_sessions())
     logger.info("session_cleanup_task_started")
@@ -114,6 +127,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("telegram_init_failed", error=str(e))
 
+    # Initialize KRX Holiday Service
+    try:
+        holiday_service = await get_holiday_service()
+        status = holiday_service.get_status()
+        logger.info(
+            "holiday_service_initialized",
+            total_holidays=status.get("total_holidays", 0),
+            years=list(status.get("year_stats", {}).keys()),
+        )
+
+        # Start automatic update scheduler (monthly on 1st at 6:00 AM)
+        holiday_service.start_scheduler(update_day=1, update_hour=6)
+        logger.info("holiday_update_scheduler_started")
+    except Exception as e:
+        logger.warning("holiday_service_init_failed", error=str(e))
+
     yield
 
     # Shutdown
@@ -122,6 +151,13 @@ async def lifespan(app: FastAPI):
     await llm.close()
     reset_llm_provider()
     await close_storage_service()
+
+    # Close holiday service
+    try:
+        holiday_svc = await get_holiday_service()
+        await holiday_svc.close()
+    except Exception:
+        pass
 
 
 # Create FastAPI application
@@ -147,66 +183,177 @@ app.add_middleware(
 if settings.DEBUG:
     app.add_middleware(RequestLoggingMiddleware, log_request_body=True)
 
-# Include API routers
-app.include_router(
-    analysis.router,
-    prefix="/api/analysis",
-    tags=["Analysis"],
-)
-app.include_router(
-    approval.router,
-    prefix="/api/approval",
-    tags=["Approval"],
-)
+# =============================================================================
+# API Version 1 Routes (/api/v1/*)
+# =============================================================================
+
+
+def register_v1_routes(app: FastAPI) -> None:
+    """Register API v1 routes with /api/v1 prefix."""
+    # Unified Analysis (recommended for new integrations)
+    app.include_router(
+        analysis_unified.router,
+        prefix="/api/v1/unified-analysis",
+        tags=["v1 - Unified Analysis"],
+    )
+    app.include_router(
+        analysis.router,
+        prefix="/api/v1/analysis",
+        tags=["v1 - Analysis"],
+    )
+    app.include_router(
+        approval.router,
+        prefix="/api/v1/approval",
+        tags=["v1 - Approval"],
+    )
+    app.include_router(
+        auth.router,
+        prefix="/api/v1/auth",
+        tags=["v1 - Authentication"],
+    )
+    app.include_router(
+        coin.router,
+        prefix="/api/v1/coin",
+        tags=["v1 - Coin"],
+    )
+    app.include_router(
+        kr_stocks.router,
+        prefix="/api/v1/kr_stocks",
+        tags=["v1 - Korean Stocks"],
+    )
+    app.include_router(
+        chat.router,
+        prefix="/api/v1/chat",
+        tags=["v1 - Chat"],
+    )
+    app.include_router(
+        indicators.router,
+        prefix="/api/v1",
+        tags=["v1 - Indicators"],
+    )
+    app.include_router(
+        settings_routes.router,
+        prefix="/api/v1/settings",
+        tags=["v1 - Settings"],
+    )
+    app.include_router(
+        news.router,
+        prefix="/api/v1",
+        tags=["v1 - News"],
+    )
+    app.include_router(
+        trading.router,
+        prefix="/api/v1",
+        tags=["v1 - Trading"],
+    )
+    app.include_router(
+        scanner.router,
+        prefix="/api/v1",
+        tags=["v1 - Scanner"],
+    )
+    app.include_router(
+        holidays.router,
+        prefix="/api/v1",
+        tags=["v1 - Holidays"],
+    )
+    app.include_router(
+        agent_chat.router,
+        prefix="/api/v1",
+        tags=["v1 - Agent Chat"],
+    )
+
+
+def register_legacy_routes(app: FastAPI) -> None:
+    """
+    Register legacy API routes (/api/*) for backward compatibility.
+
+    These routes will be deprecated in a future version.
+    New clients should use /api/v1/* endpoints.
+    """
+    # Unified Analysis (also available on legacy path)
+    app.include_router(
+        analysis_unified.router,
+        prefix="/api/unified-analysis",
+        tags=["Legacy - Unified Analysis"],
+    )
+    app.include_router(
+        analysis.router,
+        prefix="/api/analysis",
+        tags=["Legacy - Analysis"],
+    )
+    app.include_router(
+        approval.router,
+        prefix="/api/approval",
+        tags=["Legacy - Approval"],
+    )
+    app.include_router(
+        auth.router,
+        prefix="/api/auth",
+        tags=["Legacy - Authentication"],
+    )
+    app.include_router(
+        coin.router,
+        prefix="/api/coin",
+        tags=["Legacy - Coin"],
+    )
+    app.include_router(
+        kr_stocks.router,
+        prefix="/api/kr_stocks",
+        tags=["Legacy - Korean Stocks"],
+    )
+    app.include_router(
+        chat.router,
+        prefix="/api/chat",
+        tags=["Legacy - Chat"],
+    )
+    app.include_router(
+        indicators.router,
+        prefix="/api",
+        tags=["Legacy - Indicators"],
+    )
+    app.include_router(
+        settings_routes.router,
+        prefix="/api/settings",
+        tags=["Legacy - Settings"],
+    )
+    app.include_router(
+        news.router,
+        prefix="/api",
+        tags=["Legacy - News"],
+    )
+    app.include_router(
+        trading.router,
+        prefix="/api",
+        tags=["Legacy - Trading"],
+    )
+    app.include_router(
+        scanner.router,
+        prefix="/api",
+        tags=["Legacy - Scanner"],
+    )
+    app.include_router(
+        holidays.router,
+        prefix="/api",
+        tags=["Legacy - Holidays"],
+    )
+    app.include_router(
+        agent_chat.router,
+        prefix="/api",
+        tags=["Legacy - Agent Chat"],
+    )
+
+
+# Register API v1 routes (new standard)
+register_v1_routes(app)
+
+# Register legacy routes for backward compatibility
+register_legacy_routes(app)
+
+# WebSocket (version-independent)
 app.include_router(
     websocket.router,
     prefix="/ws",
     tags=["WebSocket"],
-)
-app.include_router(
-    auth.router,
-    prefix="/api/auth",
-    tags=["Authentication"],
-)
-app.include_router(
-    coin.router,
-    prefix="/api/coin",
-    tags=["Coin"],
-)
-app.include_router(
-    kr_stocks.router,
-    prefix="/api/kr_stocks",
-    tags=["Korean Stocks (Kiwoom)"],
-)
-app.include_router(
-    chat.router,
-    prefix="/api/chat",
-    tags=["Chat"],
-)
-app.include_router(
-    indicators.router,
-    prefix="/api",
-    tags=["Technical Indicators"],
-)
-app.include_router(
-    settings_routes.router,
-    prefix="/api/settings",
-    tags=["Settings"],
-)
-app.include_router(
-    news.router,
-    prefix="/api",
-    tags=["News"],
-)
-app.include_router(
-    trading.router,
-    prefix="/api",
-    tags=["Trading"],
-)
-app.include_router(
-    scanner.router,
-    prefix="/api",
-    tags=["Background Scanner"],
 )
 
 
@@ -221,8 +368,17 @@ async def root():
     return {
         "name": "Agentic Trading API",
         "version": "1.0.0",
-        "docs": "/docs" if settings.DEBUG else "disabled",
-        "health": "/health",
+        "api_versions": {
+            "current": "v1",
+            "supported": ["v1"],
+            "deprecated": ["legacy (no version prefix)"],
+        },
+        "endpoints": {
+            "v1": "/api/v1",
+            "legacy": "/api (deprecated)",
+            "docs": "/docs" if settings.DEBUG else "disabled",
+            "health": "/health",
+        },
     }
 
 

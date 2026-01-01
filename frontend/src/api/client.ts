@@ -55,6 +55,10 @@ import type {
   AddToWatchListResponse,
   ConvertWatchToQueueRequest,
   ConvertWatchToQueueResponse,
+  // Scanner Types
+  ScanProgressResponse,
+  ScanResultsResponse,
+  StartScanRequest,
 } from '@/types';
 
 // -------------------------------------------
@@ -1366,6 +1370,35 @@ class ApiClient {
       error_message: string | null;
       tasks_completed: number;
       tasks_failed: number;
+      // 세부 정보 (Sub Agent Status 개선)
+      processing_stock?: string | null;
+      processing_stock_name?: string | null;
+      trade_details?: {
+        action?: string;
+        quantity?: number;
+        entry_price?: number;
+        stop_loss?: number;
+        take_profit?: number;
+        risk_score?: number;
+        estimated_amount?: number;
+        total_amount?: number;
+        position_pct?: number;
+      } | null;
+      analysis_summary?: {
+        technical?: { signal: string; confidence: number; key_factors?: string[] };
+        fundamental?: { signal: string; confidence: number; key_factors?: string[] };
+        sentiment?: { signal: string; confidence: number; key_factors?: string[] };
+        risk?: { level: string; score: number; factors?: string[] };
+      } | null;
+      last_result?: {
+        success: boolean;
+        message: string;
+        order_id?: string;
+        filled_quantity?: number;
+        avg_price?: number;
+        quantity?: number;
+        estimated_amount?: number;
+      } | null;
     }>;
   }> {
     const response = await this.client.get('/trading/agents');
@@ -1419,6 +1452,97 @@ class ApiClient {
       '/trading/watch-list/convert',
       request
     );
+    return response.data;
+  }
+
+  // -------------------------------------------
+  // Background Scanner API
+  // -------------------------------------------
+
+  async startScan(request?: StartScanRequest): Promise<{ status: string; message: string; total_stocks: number }> {
+    const response = await this.client.post<{ status: string; message: string; total_stocks: number }>(
+      '/scanner/start',
+      request || {}
+    );
+    return response.data;
+  }
+
+  async pauseScan(): Promise<{ status: string; message: string }> {
+    const response = await this.client.post<{ status: string; message: string }>('/scanner/pause');
+    return response.data;
+  }
+
+  async resumeScan(): Promise<{ status: string; message: string }> {
+    const response = await this.client.post<{ status: string; message: string }>('/scanner/resume');
+    return response.data;
+  }
+
+  async stopScan(): Promise<{ status: string; message: string }> {
+    const response = await this.client.post<{ status: string; message: string }>('/scanner/stop');
+    return response.data;
+  }
+
+  async getScanProgress(): Promise<ScanProgressResponse> {
+    const response = await this.client.get<ScanProgressResponse>('/scanner/progress');
+    return response.data;
+  }
+
+  async getScanResults(action?: string): Promise<ScanResultsResponse> {
+    const params = action ? { action } : {};
+    const response = await this.client.get<ScanResultsResponse>('/scanner/results', { params });
+    return response.data;
+  }
+
+  /**
+   * Get scan results from database with pagination
+   */
+  async getScanResultsFromDb(params: {
+    action?: string;
+    session_id?: string;
+    limit?: number;
+    offset?: number;
+  } = {}): Promise<ScanResultsResponse> {
+    const response = await this.client.get<ScanResultsResponse>('/scanner/db/results', { params });
+    return response.data;
+  }
+
+  /**
+   * Get action counts from database
+   */
+  async getScanCounts(session_id?: string): Promise<{
+    buy_count: number;
+    sell_count: number;
+    hold_count: number;
+    watch_count: number;
+    avoid_count: number;
+    total: number;
+  }> {
+    const params = session_id ? { session_id } : {};
+    const response = await this.client.get('/scanner/db/counts', { params });
+    return response.data;
+  }
+
+  /**
+   * Get recent scan sessions
+   */
+  async getScanSessions(limit: number = 10): Promise<{
+    sessions: Array<{
+      id: string;
+      started_at: string | null;
+      completed_at: string | null;
+      total_stocks: number;
+      completed: number;
+      failed: number;
+      buy_count: number;
+      sell_count: number;
+      hold_count: number;
+      watch_count: number;
+      avoid_count: number;
+      status: string;
+    }>;
+    count: number;
+  }> {
+    const response = await this.client.get('/scanner/db/sessions', { params: { limit } });
     return response.data;
   }
 }
@@ -1682,3 +1806,18 @@ export const removeFromWatchList = (watchId: string) =>
 
 export const convertWatchToQueue = (request: ConvertWatchToQueueRequest) =>
   apiClient.convertWatchToQueue(request);
+
+// Background Scanner API
+export const startScan = (request?: StartScanRequest) =>
+  apiClient.startScan(request);
+
+export const pauseScan = () => apiClient.pauseScan();
+
+export const resumeScan = () => apiClient.resumeScan();
+
+export const stopScan = () => apiClient.stopScan();
+
+export const getScanProgress = () => apiClient.getScanProgress();
+
+export const getScanResults = (action?: string) =>
+  apiClient.getScanResults(action);

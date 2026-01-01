@@ -28,7 +28,19 @@ from .models import (
     AgentStatus,
     AgentState,
 )
-from .market_hours import MarketType, MarketSession, MarketHoursService, get_market_hours_service
+from .market_hours import (
+    MarketType,
+    MarketSession,
+    MarketHoursService,
+    get_market_hours_service,
+    # Tick size functions
+    KRX_TICK_SIZE_TABLE,
+    get_krx_tick_size,
+    round_to_tick_size,
+    is_valid_tick_price,
+    get_price_with_slippage,
+    get_tick_info,
+)
 from .portfolio_agent import PortfolioAgent
 from .order_agent import OrderAgent
 from .risk_monitor import RiskMonitor
@@ -74,6 +86,13 @@ __all__ = [
     "MarketSession",
     "MarketHoursService",
     "get_market_hours_service",
+    # Tick Size (호가 단위)
+    "KRX_TICK_SIZE_TABLE",
+    "get_krx_tick_size",
+    "round_to_tick_size",
+    "is_valid_tick_price",
+    "get_price_with_slippage",
+    "get_tick_info",
     # Agents
     "PortfolioAgent",
     "OrderAgent",

@@ -89,8 +89,10 @@ export function MarketSummaryWidget() {
 
     try {
       const response: KRStockAccountResponse = await getKRStockAccount();
+      // Total assets = cash deposit + stock evaluation (consistent with KiwoomAccountBalance)
+      const totalAssets = (response.cash?.deposit || 0) + response.total_eval_amount;
       return {
-        totalAssets: response.total_eval_amount,
+        totalAssets,
         profitLoss: response.total_profit_loss,
         profitLossRate: response.total_profit_loss_rate,
         holdingsCount: response.holdings?.length || 0,

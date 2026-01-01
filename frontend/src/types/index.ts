@@ -1187,3 +1187,55 @@ export interface ConvertWatchToQueueResponse {
   action: string;
   message: string;
 }
+
+// -------------------------------------------
+// Background Scanner Types
+// -------------------------------------------
+
+export type ScanStatus = 'idle' | 'running' | 'paused' | 'completed' | 'error';
+
+export interface ScanProgressResponse {
+  status: ScanStatus;
+  total_stocks: number;
+  completed: number;
+  in_progress: number;
+  failed: number;
+  progress_pct: number;
+  current_stocks: string[];
+  buy_count: number;
+  sell_count: number;
+  hold_count: number;
+  watch_count: number;
+  avoid_count: number;
+  started_at: string | null;
+  estimated_completion: string | null;
+  completed_at: string | null;
+  last_scan_date: string | null;
+  last_error: string | null;
+}
+
+export interface ScanResultItem {
+  stk_cd: string;
+  stk_nm: string;
+  action: string;
+  signal: string;
+  confidence: number;
+  summary: string;
+  key_factors: string[];
+  current_price: number;
+  market_type: string;
+  scanned_at: string;
+}
+
+export interface ScanResultsResponse {
+  results: ScanResultItem[];
+  count: number;
+  total: number;
+  filter: string | null;
+  session_id?: string | null;
+}
+
+export interface StartScanRequest {
+  notify_progress?: boolean;
+  custom_stocks?: [string, string][];
+}

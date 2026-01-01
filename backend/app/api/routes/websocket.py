@@ -11,7 +11,7 @@ Provides real-time streaming of:
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Any
 
 import structlog
@@ -595,7 +595,7 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     complete_data = {
                         "status": current_status,
                         "error": session.get("error"),
-                        "completed_at": datetime.utcnow().isoformat(),
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
                     }
 
                     # Include analysis results if completed successfully

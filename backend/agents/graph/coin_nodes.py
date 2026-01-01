@@ -7,7 +7,7 @@ Nodes are executed in sequence as defined in the coin trading graph.
 
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 import structlog
@@ -96,7 +96,7 @@ async def coin_data_collection_node(state: dict) -> dict:
             "high_24h": analysis_data.high_24h,
             "low_24h": analysis_data.low_24h,
             "bid_ask_ratio": analysis_data.bid_ask_ratio,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         # analysis_data.candles is already a list of dicts from get_analysis_data()

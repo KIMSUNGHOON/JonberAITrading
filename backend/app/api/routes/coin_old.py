@@ -5,7 +5,7 @@ Endpoints for Upbit cryptocurrency market data and analysis.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
@@ -113,7 +113,7 @@ async def get_markets(
     global _cached_markets, _markets_cache_time
 
     # Check cache
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if _cached_markets and _markets_cache_time:
         cache_age = (now - _markets_cache_time).total_seconds()
         if cache_age < CACHE_TTL_SECONDS:
@@ -225,7 +225,7 @@ async def get_ticker(market: str):
                 low_price=t.low_price,
                 trade_volume=t.acc_trade_volume_24h,
                 acc_trade_price_24h=t.acc_trade_price_24h,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
             )
 
         except HTTPException:
@@ -286,7 +286,7 @@ async def get_tickers(
                     low_price=t.low_price,
                     trade_volume=t.acc_trade_volume_24h,
                     acc_trade_price_24h=t.acc_trade_price_24h,
-                    timestamp=datetime.utcnow(),
+                    timestamp=datetime.now(timezone.utc),
                 )
                 for t in tickers
             ]
@@ -439,7 +439,7 @@ async def get_orderbook(market: str):
                     OrderbookUnit(price=u.bid_price, size=u.bid_size)
                     for u in ob.orderbook_units
                 ],
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
             )
 
         except HTTPException:
@@ -503,7 +503,7 @@ async def start_coin_analysis(
             "reasoning_log": [],
             "current_stage": "data_collection",  # Match frontend WorkflowProgress stage IDs
         },
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
         "error": None,
     }
 
@@ -666,7 +666,7 @@ async def get_coin_analysis_status(session_id: str):
             bear_case=proposal.get("bear_case", ""),
             created_at=datetime.fromisoformat(proposal["created_at"])
             if isinstance(proposal.get("created_at"), str)
-            else proposal.get("created_at", datetime.utcnow()),
+            else proposal.get("created_at", datetime.now(timezone.utc)),
         )
 
     # Build analyses (placeholder for now)
@@ -998,7 +998,7 @@ async def create_order(request: OrderRequest):
             price=request.price,
             state="done" if request.ord_type in ["price", "market"] else "wait",
             market=request.market.upper(),
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             volume=request.volume,
             remaining_volume=0 if request.ord_type in ["price", "market"] else request.volume,
             executed_volume=request.volume if request.ord_type in ["price", "market"] else 0,
@@ -1337,7 +1337,7 @@ async def close_position(market: str):
             price=current_price,
             state="done",
             market=market,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
             volume=quantity,
             remaining_volume=0,
             executed_volume=quantity,

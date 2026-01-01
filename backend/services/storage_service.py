@@ -118,6 +118,12 @@ class StorageService:
                     "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
                 )
                 await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_checkpoints_thread ON checkpoints(thread_id)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_checkpoints_created ON checkpoints(created_at DESC)"
+                )
+                await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at)"
                 )
                 await conn.execute(
@@ -129,6 +135,18 @@ class StorageService:
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_coin_trades_created ON coin_trades(created_at DESC)"
                 )
+                # Composite index for market + time sorting (frequently used together)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_market_created ON coin_trades(market, created_at DESC)"
+                )
+                # Index for state filtering
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_state ON coin_trades(state)"
+                )
+                # Index for side filtering (buy/sell statistics)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_side ON coin_trades(side)"
+                )
 
                 # Additional indexes for common query patterns
                 await conn.execute(
@@ -139,6 +157,9 @@ class StorageService:
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_coin_positions_updated ON coin_positions(updated_at DESC)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_positions_session ON coin_positions(session_id)"
                 )
 
                 await conn.commit()

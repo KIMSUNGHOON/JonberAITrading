@@ -262,6 +262,48 @@ class FilledOrder(BaseModel):
     buy_sell_tp: str = Field(..., description="매수매도구분")
 
 
+class MarketType(str, Enum):
+    """시장 구분 (ka10099 mrkt_tp)"""
+
+    KOSPI = "0"       # 코스피
+    KOSDAQ = "10"     # 코스닥
+    ELW = "3"         # ELW
+    ETF = "8"         # ETF
+    KOTC = "30"       # K-OTC
+    KONEX = "50"      # 코넥스
+    WARRANT = "5"     # 신주인수권
+    FUND = "4"        # 투자펀드
+    REITS = "6"       # 리츠
+    HIFUND = "9"      # 하이펀드
+
+
+class StockListItem(BaseModel):
+    """종목 정보 리스트 아이템 (ka10099 응답)"""
+
+    code: str = Field(..., description="종목코드")
+    name: str = Field(..., description="종목명")
+    market_code: str = Field(default="", description="시장구분코드")
+    market_name: str = Field(default="", description="시장명")
+    list_count: Optional[int] = Field(default=None, description="상장주식수")
+    state: str = Field(default="", description="종목상태")
+    order_warning: str = Field(default="0", description="투자주의여부")
+
+    @property
+    def is_kospi(self) -> bool:
+        """코스피 종목 여부"""
+        return self.market_code in ("10", "0") or "코스피" in self.market_name
+
+    @property
+    def is_kosdaq(self) -> bool:
+        """코스닥 종목 여부"""
+        return self.market_code == "20" or "코스닥" in self.market_name
+
+    @property
+    def is_normal(self) -> bool:
+        """정상 거래 종목 여부 (투자주의/경고 제외)"""
+        return self.order_warning == "0"
+
+
 # 인기 종목 상수
 POPULAR_KR_TICKERS: dict[str, str] = {
     # KOSPI 대형주

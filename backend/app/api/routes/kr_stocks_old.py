@@ -6,7 +6,7 @@ Follows the same patterns as coin.py for consistency.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
@@ -232,7 +232,7 @@ async def get_stocks():
     global _cached_popular_stocks, _stocks_cache_time
 
     # Check cache
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if _cached_popular_stocks and _stocks_cache_time:
         cache_age = (now - _stocks_cache_time).total_seconds()
         if cache_age < CACHE_TTL_SECONDS:
@@ -418,7 +418,7 @@ async def get_ticker(stk_cd: str):
             pbr=info.pbr,
             eps=info.eps,
             bps=info.bps,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
         )
 
     except HTTPException:
@@ -642,7 +642,7 @@ async def get_orderbook(stk_cd: str):
             total_ask_volume=orderbook.total_ask_volume,
             total_bid_volume=orderbook.total_bid_volume,
             bid_ask_ratio=orderbook.bid_ask_ratio,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
         )
 
     except HTTPException:
@@ -709,7 +709,7 @@ async def start_kr_stock_analysis(
             "reasoning_log": [],
             "current_stage": "data_collection",  # Match frontend WorkflowProgress stage IDs
         },
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
         "error": None,
     }
 
@@ -853,7 +853,7 @@ async def get_kr_stock_analysis_status(session_id: str):
             bear_case=proposal.get("bear_case", ""),
             created_at=datetime.fromisoformat(proposal["created_at"])
             if isinstance(proposal.get("created_at"), str)
-            else proposal.get("created_at", datetime.utcnow()),
+            else proposal.get("created_at", datetime.now(timezone.utc)),
         )
 
     # Build analyses
@@ -1053,7 +1053,7 @@ async def get_orders(
                     "%Y%m%d%H%M%S"
                 )
             except (ValueError, TypeError):
-                created_at = datetime.utcnow()
+                created_at = datetime.now(timezone.utc)
 
             orders.append(
                 KRStockOrderResponse(
@@ -1133,7 +1133,7 @@ async def create_order(request: KRStockOrderRequest):
             executed_quantity=request.quantity if request.ord_type == "market" else 0,
             remaining_quantity=0 if request.ord_type == "market" else request.quantity,
             status="completed" if request.ord_type == "market" else "pending",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
 
     # Live trading
@@ -1177,7 +1177,7 @@ async def create_order(request: KRStockOrderRequest):
             executed_quantity=0,
             remaining_quantity=request.quantity,
             status="pending",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
 
     except HTTPException:
@@ -1474,7 +1474,7 @@ async def close_position(stk_cd: str):
             executed_quantity=quantity,
             remaining_quantity=0,
             status="completed",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
 
     # Live trading
@@ -1511,7 +1511,7 @@ async def close_position(stk_cd: str):
             executed_quantity=0,
             remaining_quantity=quantity,
             status="pending",
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
 
     except HTTPException:

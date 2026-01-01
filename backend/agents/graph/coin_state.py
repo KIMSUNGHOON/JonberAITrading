@@ -6,7 +6,7 @@ for the cryptocurrency multi-agent trading workflow using Upbit API.
 """
 
 import operator
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Literal, Optional, TypedDict
 
@@ -365,7 +365,7 @@ def create_coin_initial_state(
 def add_coin_reasoning_log(state: dict, message: str) -> list[str]:
     """Add a message to the reasoning log."""
     current_log = state.get("reasoning_log", [])
-    return current_log + [f"[{datetime.utcnow().strftime('%H:%M:%S')}] {message}"]
+    return current_log + [f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {message}"]
 
 
 def get_all_coin_analyses(state: dict) -> list[dict]:

@@ -13,7 +13,7 @@ from typing import Any, Callable, Optional
 
 import structlog
 import websockets
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 logger = structlog.get_logger()
@@ -85,8 +85,7 @@ class WebSocketTicker(BaseModel):
     timestamp: int = Field(..., description="타임스탬프 (ms)")
     stream_type: StreamType = Field(..., description="스트림 타입")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class WebSocketTrade(BaseModel):
@@ -111,8 +110,7 @@ class WebSocketTrade(BaseModel):
     best_bid_size: Optional[float] = Field(None, description="최우선 매수잔량")
     stream_type: StreamType = Field(..., description="스트림 타입")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class WebSocketOrderbook(BaseModel):

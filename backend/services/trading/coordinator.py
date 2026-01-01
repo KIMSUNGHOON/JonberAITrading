@@ -256,6 +256,22 @@ class ExecutionCoordinator:
             },
         )
 
+        # Update portfolio agent status with trade details
+        self._update_agent_status(
+            "portfolio",
+            AgentStatus.WORKING,
+            task=f"Calculating allocation for {action} {stock_name or ticker}",
+            processing_stock=ticker,
+            processing_stock_name=stock_name,
+            trade_details={
+                "action": action,
+                "entry_price": entry_price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "risk_score": risk_score,
+            },
+        )
+
         # Check market hours (KRX for Korean stocks)
         market_session = self._market_hours.get_market_session(MarketType.KRX)
 
@@ -356,6 +372,32 @@ class ExecutionCoordinator:
             },
         )
 
+        # Update portfolio agent with allocation result
+        self._update_agent_status(
+            "portfolio",
+            AgentStatus.IDLE,
+            action=f"Allocated {allocation.quantity} shares",
+            processing_stock=ticker,
+            processing_stock_name=stock_name,
+            trade_details={
+                "action": action,
+                "quantity": allocation.quantity,
+                "entry_price": entry_price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "risk_score": risk_score,
+                "estimated_amount": allocation.estimated_amount,
+                "position_pct": allocation.position_pct,
+            },
+            last_result={
+                "success": allocation.quantity > 0,
+                "message": allocation.rationale,
+                "quantity": allocation.quantity,
+                "estimated_amount": allocation.estimated_amount,
+            },
+        )
+        self._complete_agent_task("portfolio", success=allocation.quantity > 0)
+
         if allocation.quantity <= 0:
             self._log_activity(
                 ActivityType.TRADE_REJECTED,
@@ -398,6 +440,23 @@ class ExecutionCoordinator:
             },
         )
 
+        # Update order agent status
+        self._update_agent_status(
+            "order",
+            AgentStatus.WORKING,
+            task=f"Executing {action} {allocation.quantity} {stock_name or ticker}",
+            processing_stock=ticker,
+            processing_stock_name=stock_name,
+            trade_details={
+                "action": action,
+                "quantity": allocation.quantity,
+                "entry_price": entry_price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "estimated_amount": allocation.estimated_amount,
+            },
+        )
+
         result = await self._execute_order(order)
 
         # Log execution result
@@ -413,13 +472,51 @@ class ExecutionCoordinator:
                     "order_id": result.order_id,
                 },
             )
+            # Update order agent with success result
+            self._update_agent_status(
+                "order",
+                AgentStatus.IDLE,
+                action=f"Filled {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
+                processing_stock=ticker,
+                processing_stock_name=stock_name,
+                trade_details={
+                    "action": action,
+                    "quantity": result.filled_quantity,
+                    "entry_price": result.avg_price,
+                    "total_amount": result.filled_quantity * result.avg_price,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
+                },
+                last_result={
+                    "success": True,
+                    "message": f"Order filled: {result.filled_quantity} shares",
+                    "order_id": result.order_id,
+                    "filled_quantity": result.filled_quantity,
+                    "avg_price": result.avg_price,
+                },
+            )
+            self._complete_agent_task("order", success=True)
         else:
             self._log_activity(
                 ActivityType.ORDER_FAILED,
-                f"Order failed: {result.error or 'Unknown error'}",
+                f"Order failed: {result.message or 'Unknown error'}",
                 agent="order",
                 ticker=ticker,
             )
+            # Update order agent with failure result
+            self._update_agent_status(
+                "order",
+                AgentStatus.IDLE,
+                action=f"Order failed: {result.message or 'Unknown error'}",
+                error=result.message,
+                processing_stock=ticker,
+                processing_stock_name=stock_name,
+                last_result={
+                    "success": False,
+                    "message": result.message or "Unknown error",
+                },
+            )
+            self._complete_agent_task("order", success=False)
 
         # If successful, add to monitoring
         if result.filled_quantity > 0 and side == OrderSide.BUY:
@@ -731,8 +828,14 @@ class ExecutionCoordinator:
         task: Optional[str] = None,
         action: Optional[str] = None,
         error: Optional[str] = None,
+        # 세부 정보 (Sub Agent Status 개선)
+        processing_stock: Optional[str] = None,
+        processing_stock_name: Optional[str] = None,
+        trade_details: Optional[dict] = None,
+        analysis_summary: Optional[dict] = None,
+        last_result: Optional[dict] = None,
     ):
-        """Update status of a specific agent."""
+        """Update status of a specific agent with detailed information."""
         if agent in self._state.agent_states:
             agent_state = self._state.agent_states[agent]
             agent_state.status = status
@@ -744,6 +847,18 @@ class ExecutionCoordinator:
                 agent_state.error_message = error
             else:
                 agent_state.error_message = None
+
+            # 세부 정보 업데이트
+            if processing_stock is not None:
+                agent_state.processing_stock = processing_stock
+            if processing_stock_name is not None:
+                agent_state.processing_stock_name = processing_stock_name
+            if trade_details is not None:
+                agent_state.trade_details = trade_details
+            if analysis_summary is not None:
+                agent_state.analysis_summary = analysis_summary
+            if last_result is not None:
+                agent_state.last_result = last_result
 
     def _complete_agent_task(self, agent: str, success: bool = True):
         """Mark agent task as completed."""
