@@ -8,10 +8,11 @@
 - (Done) Trade Queue에서 이미 보유 중인 종목 처리 시 에러 메시지가 불명확함 → `d9be1ef` P0.1.1 한국어 에러 메시지 및 FAILED 상태 UI 개선
 
 # Improvement lists
-- (Improve) Agent Group Chat Frontend 기본 UI 완료 → P0 진행 중 (WebSocket, PositionMonitor 추가 필요)
+- (Improve) Agent Group Chat Frontend 기본 UI 완료 → P0 진행 중 (PositionMonitor 추가 필요)
+- (Done) WebSocket 실시간 업데이트 → useAgentChatWebSocket hook 구현
 
 # Instruction
-- P0 추가 작업 (WebSocket, PositionMonitor) 계속 진행
+- P0 추가 작업 (PositionMonitor) 계속 진행
 
 # 중요 지시 사항
 - 모든 테스트 케이스를 통과해야 합니다.

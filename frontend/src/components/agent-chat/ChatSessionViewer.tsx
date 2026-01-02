@@ -3,6 +3,7 @@
  *
  * Displays the full discussion of a chat session.
  * Shows messages from all agents and the final decision.
+ * Uses WebSocket for real-time updates.
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
@@ -20,14 +21,18 @@ import {
   TrendingDown,
   Minus,
   AlertCircle,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
 import { getAgentChatSessionDetail } from '@/api/client';
+import { useAgentChatWebSocket } from '@/hooks/useAgentChatWebSocket';
 import type {
   AgentChatSessionDetail,
   AgentChatMessage,
   AgentChatDecision,
   AgentChatVote,
   AgentChatAgentType,
+  AgentChatSessionStatus,
 } from '@/types';
 
 interface ChatSessionViewerProps {
@@ -247,6 +252,57 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
   const [error, setError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  // Determine if session is active (needs real-time updates)
+  const isActiveSession = session && ['initializing', 'analyzing', 'discussing', 'voting'].includes(session.status);
+
+  // WebSocket for real-time updates
+  const { isConnected, connectionState } = useAgentChatWebSocket({
+    sessionId: isActiveSession ? sessionId : null, // Only connect for active sessions
+    autoConnect: true,
+    onMessage: useCallback((message: AgentChatMessage) => {
+      setSession((prev) => {
+        if (!prev) return prev;
+        // Check if message already exists
+        if (prev.messages.some((m) => m.id === message.id)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          messages: [...prev.messages, message],
+        };
+      });
+    }, []),
+    onStatusChange: useCallback((_status: AgentChatSessionStatus, updatedSession: AgentChatSessionDetail) => {
+      setSession(updatedSession);
+    }, []),
+    onVote: useCallback((vote: AgentChatVote) => {
+      setSession((prev) => {
+        if (!prev) return prev;
+        // Check if vote from this agent already exists
+        if (prev.votes.some((v) => v.agent_type === vote.agent_type)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          votes: [...prev.votes, vote],
+        };
+      });
+    }, []),
+    onDecision: useCallback((decision: AgentChatDecision) => {
+      setSession((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          decision,
+          status: 'decided' as AgentChatSessionStatus,
+        };
+      });
+    }, []),
+    onError: useCallback((wsError: string) => {
+      console.error('[ChatSessionViewer] WebSocket error:', wsError);
+    }, []),
+  });
+
   const fetchSession = useCallback(async () => {
     try {
       setError(null);
@@ -259,19 +315,21 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
     }
   }, [sessionId]);
 
+  // Initial fetch
   useEffect(() => {
     fetchSession();
-    // Poll for updates if session is still active
+  }, [fetchSession]);
+
+  // Fallback polling when WebSocket is not connected and session is active
+  useEffect(() => {
+    if (!isActiveSession || isConnected) return;
+
+    // Poll as fallback when WebSocket is not connected
     const interval = setInterval(() => {
-      if (
-        session &&
-        ['initializing', 'analyzing', 'discussing', 'voting'].includes(session.status)
-      ) {
-        fetchSession();
-      }
+      fetchSession();
     }, 5000);
     return () => clearInterval(interval);
-  }, [fetchSession, session?.status]);
+  }, [isActiveSession, isConnected, fetchSession]);
 
   useEffect(() => {
     // Auto-scroll to bottom when new messages arrive
@@ -317,12 +375,35 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
           <ArrowLeft className="w-5 h-5" />
           Back to Dashboard
         </button>
-        <button
-          onClick={fetchSession}
-          className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
-        >
-          <RefreshCw className="w-5 h-5" />
-        </button>
+        <div className="flex items-center gap-3">
+          {/* WebSocket Connection Status */}
+          {isActiveSession && (
+            <div className="flex items-center gap-2">
+              {isConnected ? (
+                <div className="flex items-center gap-1.5 px-2 py-1 bg-green-500/10 rounded-lg">
+                  <Wifi className="w-4 h-4 text-green-400" />
+                  <span className="text-xs text-green-400">Live</span>
+                </div>
+              ) : connectionState === 'connecting' || connectionState === 'reconnecting' ? (
+                <div className="flex items-center gap-1.5 px-2 py-1 bg-yellow-500/10 rounded-lg">
+                  <RefreshCw className="w-4 h-4 text-yellow-400 animate-spin" />
+                  <span className="text-xs text-yellow-400">Connecting...</span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-500/10 rounded-lg">
+                  <WifiOff className="w-4 h-4 text-gray-400" />
+                  <span className="text-xs text-gray-400">Polling</span>
+                </div>
+              )}
+            </div>
+          )}
+          <button
+            onClick={fetchSession}
+            className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
+          >
+            <RefreshCw className="w-5 h-5" />
+          </button>
+        </div>
       </div>
 
       {/* Session Info */}

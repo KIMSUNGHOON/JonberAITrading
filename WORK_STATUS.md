@@ -25,11 +25,11 @@
 - [x] API 클라이언트 함수 (agent-chat 엔드포인트)
 - [x] AgentChatDashboard - Coordinator 상태, 시작/중지
 - [x] ChatSessionList - 진행 중/완료된 토론 목록
-- [x] ChatSessionViewer - Agent 간 대화 표시 (Polling)
+- [x] ChatSessionViewer - Agent 간 대화 표시 (WebSocket 실시간 + Polling 폴백)
 - [x] Sidebar/Navigation에 Agent Chat 메뉴 추가
+- [x] useAgentChatWebSocket hook - 실시간 업데이트
 
 #### 추가 필요 작업
-- [ ] WebSocket 실시간 업데이트 (현재 Polling)
 - [ ] PositionMonitor - 포지션 이벤트 알림
 - [ ] AgentChatSettings - 상세 설정 UI
 
@@ -39,7 +39,10 @@ frontend/src/components/agent-chat/
 ├── index.ts                   # 컴포넌트 export
 ├── AgentChatDashboard.tsx     # 메인 대시보드, 시작/중지
 ├── ChatSessionList.tsx        # 세션 목록
-└── ChatSessionViewer.tsx      # 토론 내용 뷰어 (메시지, 투표, 결정)
+└── ChatSessionViewer.tsx      # 토론 내용 뷰어 (WebSocket 실시간)
+
+frontend/src/hooks/
+└── useAgentChatWebSocket.ts   # WebSocket 연결 관리 hook
 ```
 
 ---
