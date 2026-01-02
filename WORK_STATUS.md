@@ -14,6 +14,7 @@
 | **P2** | WebSocket 체결 알림 | ✅ 완료 | 실시간 체결 알림 구현 |
 | P3 | Live Trading 전환 | ⏳ 대기 | 모의투자 검증 후 |
 | P4 | 코드 품질 개선 | 🟢 낮음 | Pydantic deprecated 수정 |
+| **Docs** | ReadTheDocs 문서화 | ✅ 완료 | MkDocs + Material 테마 |
 
 ---
 
@@ -51,6 +52,39 @@ frontend/src/hooks/
 ## ✅ 완료된 작업 (Git History 기준)
 
 ### 2026-01-03
+
+#### ReadTheDocs 문서화
+
+**구현 내역:**
+- MkDocs + Material 테마 설정
+- ReadTheDocs 배포 설정 (.readthedocs.yaml)
+- 전체 문서 구조화 및 23개 문서 작성
+
+| 카테고리 | 문서 |
+|----------|------|
+| Getting Started | installation, quick-start, configuration |
+| Architecture | overview, agents, trading-system |
+| User Guide | analysis, trading, agent-chat, notifications |
+| API Reference | overview, analysis, trading, websocket, kiwoom |
+| Development | contributing, testing, roadmap |
+| 기타 | changelog |
+
+**파일 구조:**
+```
+mkdocs.yml                    # MkDocs 설정
+.readthedocs.yaml             # ReadTheDocs 설정
+docs/
+├── index.md                  # 홈페이지
+├── requirements.txt          # 문서 빌드 의존성
+├── getting-started/          # 시작 가이드
+├── architecture/             # 아키텍처
+├── user-guide/               # 사용자 가이드
+├── api/                      # API 레퍼런스
+├── development/              # 개발자 가이드
+└── changelog.md              # 변경 이력
+```
+
+---
 
 #### P2 WebSocket 체결 알림
 
@@ -239,9 +273,13 @@ backend/tests/test_services/test_agent_chat/  # 142개 테스트
 | 문서 | 설명 |
 |------|------|
 | `CLAUDE.md` | Claude Code 개발 지침 |
-| `docs/PROJECT_ROADMAP.md` | 프로젝트 로드맵 |
-| `docs/AGENT_GROUP_CHAT_PLAN.md` | Agent Group Chat 설계 |
-| `docs/UI_ARCHITECTURE.md` | UI 구조 |
+| `mkdocs.yml` | ReadTheDocs 문서 설정 |
+| `docs/index.md` | 문서 홈페이지 |
+| `docs/getting-started/` | 설치 및 시작 가이드 |
+| `docs/architecture/` | 시스템 아키텍처 |
+| `docs/user-guide/` | 사용자 가이드 |
+| `docs/api/` | API 레퍼런스 |
+| `docs/development/` | 개발자 가이드 |
 
 ---
 

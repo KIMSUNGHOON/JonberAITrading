@@ -20,8 +20,11 @@
 - (Done) Issue 개선 방안 제안 완료 → 위 Proposal 참조
 - (Done) P0.2 장 마감 시 매매 과정 UI/UX 개선 → `9a94516` 커밋 완료
 - P1, P3는 현재 테스트가 불가능하기 때문에, 이부분은 저의 요청이 있을때 까지는 작업을 진행하지 않습니다.
-- github readthedoc을 이용해서 현재까지 작업 된 프로젝트를 문서화 하고 싶습니다. 먼저 초안을 너가 만들어 줬으면 좋겠습니다. 물론 제안은 너가 하고, 너가 만들어주는겁니다.
-- 그리고 지금 까지 markdown 문서들, *.md 파일들을 모두 정리 하고, 개발 관련 문서, 프로젝트 README 등 카테고리를 나눠서 현재 버전으로 통합시키는 노력을 하십시오.
+- (Done) ReadTheDocs 문서화 → `4b17f00` 커밋 완료
+  - MkDocs + Material 테마 설정
+  - .readthedocs.yaml 설정
+  - docs/ 구조: Getting Started, Architecture, User Guide, API Reference, Development
+  - 23개 문서 파일 생성
 
 ## 다음 작업 우선순위
 | 우선순위 | 작업 | 상태 | 설명 |
