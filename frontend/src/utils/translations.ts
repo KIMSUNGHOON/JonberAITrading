@@ -21,6 +21,7 @@ type NavKeys =
   | 'nav_trades'
   | 'nav_auto_trading'
   | 'nav_scanner'
+  | 'nav_agent_chat'
   | 'nav_documentation'
   | 'nav_help'
   | 'nav_settings';
@@ -245,6 +246,7 @@ const translations: Record<Language, Record<TranslationKey, string>> = {
     nav_trades: '거래내역',
     nav_auto_trading: '자동매매',
     nav_scanner: '스캐너 결과',
+    nav_agent_chat: 'Agent Chat',
     nav_documentation: '문서',
     nav_help: '도움말',
     nav_settings: '설정',
@@ -438,6 +440,7 @@ const translations: Record<Language, Record<TranslationKey, string>> = {
     nav_trades: 'Trades',
     nav_auto_trading: 'Auto-Trading',
     nav_scanner: 'Scanner Results',
+    nav_agent_chat: 'Agent Chat',
     nav_documentation: 'Documentation',
     nav_help: 'Help',
     nav_settings: 'Settings',

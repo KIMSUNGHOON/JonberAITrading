@@ -1239,3 +1239,207 @@ export interface StartScanRequest {
   notify_progress?: boolean;
   custom_stocks?: [string, string][];
 }
+
+// -------------------------------------------
+// Agent Group Chat Types
+// -------------------------------------------
+
+export type AgentChatAgentType = 'technical' | 'fundamental' | 'sentiment' | 'risk' | 'moderator';
+export type AgentChatMessageType = 'analysis' | 'opinion' | 'question' | 'answer' | 'vote' | 'summary' | 'decision' | 'system';
+export type AgentChatVoteType = 'STRONG_BUY' | 'BUY' | 'HOLD' | 'SELL' | 'STRONG_SELL' | 'ABSTAIN';
+export type AgentChatSessionStatus = 'initializing' | 'analyzing' | 'discussing' | 'voting' | 'decided' | 'cancelled' | 'error';
+export type AgentChatDecisionAction = 'BUY' | 'SELL' | 'HOLD' | 'ADD' | 'REDUCE' | 'WATCH' | 'NO_ACTION';
+export type AgentChatPositionEventType =
+  | 'stop_loss_near'
+  | 'stop_loss_hit'
+  | 'take_profit_near'
+  | 'take_profit_hit'
+  | 'significant_gain'
+  | 'significant_loss'
+  | 'trailing_stop_update'
+  | 'holding_period_long'
+  | 'volatility_spike';
+
+export interface AgentChatCoordinatorStatus {
+  is_running: boolean;
+  active_discussions: number;
+  total_sessions: number;
+  check_interval_minutes: number;
+  max_concurrent_discussions: number;
+}
+
+export interface AgentChatStartCoordinatorRequest {
+  check_interval_minutes?: number;
+  max_concurrent_discussions?: number;
+}
+
+export interface AgentChatStartDiscussionRequest {
+  ticker: string;
+  stock_name: string;
+}
+
+export interface AgentChatStartDiscussionResponse {
+  session_id: string;
+  ticker: string;
+  stock_name: string;
+  status: string;
+  started_at: string;
+  message: string;
+}
+
+export interface AgentChatSessionSummary {
+  id: string;
+  ticker: string;
+  stock_name: string;
+  status: AgentChatSessionStatus;
+  started_at: string | null;
+  ended_at: string | null;
+  total_messages: number;
+  total_rounds: number;
+  consensus_level: number | null;
+  decision_action: AgentChatDecisionAction | null;
+  decision_confidence: number | null;
+}
+
+export interface AgentChatMessage {
+  id: string;
+  timestamp: string;
+  agent_type: AgentChatAgentType;
+  agent_name: string;
+  message_type: AgentChatMessageType;
+  content: string;
+  confidence: number | null;
+  data: Record<string, unknown> | null;
+}
+
+export interface AgentChatVote {
+  agent_type: AgentChatAgentType;
+  vote: AgentChatVoteType;
+  confidence: number;
+  weight: number;
+  weighted_score: number;
+  reasoning: string;
+}
+
+export interface AgentChatRound {
+  round_number: number;
+  round_type: string;
+  started_at: string | null;
+  ended_at: string | null;
+  message_count: number;
+}
+
+export interface AgentChatDecision {
+  action: AgentChatDecisionAction;
+  confidence: number;
+  consensus_level: number;
+  entry_price: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  quantity: number | null;
+  key_factors: string[];
+  dissenting_opinions: string[];
+  rationale: string;
+}
+
+export interface AgentChatSessionDetail {
+  id: string;
+  ticker: string;
+  stock_name: string;
+  status: AgentChatSessionStatus;
+  started_at: string | null;
+  ended_at: string | null;
+  rounds: AgentChatRound[];
+  messages: AgentChatMessage[];
+  votes: AgentChatVote[];
+  consensus_level: number;
+  decision: AgentChatDecision | null;
+}
+
+export interface AgentChatActiveDiscussion {
+  ticker: string;
+  stock_name: string;
+  session_id: string;
+  status: string;
+  started_at: string | null;
+}
+
+export interface AgentChatAgentInfo {
+  type: AgentChatAgentType;
+  name: string;
+  description: string;
+  weight: number;
+}
+
+export interface AgentChatDecisionActionInfo {
+  action: AgentChatDecisionAction;
+  description: string;
+  emoji: string;
+}
+
+// Position Management Types
+export interface AgentChatMonitoredPosition {
+  ticker: string;
+  stock_name: string;
+  quantity: number;
+  avg_price: number;
+  current_price: number | null;
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number;
+  position_value: number;
+  stop_loss: number | null;
+  take_profit: number | null;
+  trailing_stop_pct: number | null;
+  trailing_stop_price: number | null;
+  highest_price: number | null;
+  holding_days: number;
+  discussion_count: number;
+  last_discussion: string | null;
+}
+
+export interface AgentChatPositionEvent {
+  id: string;
+  ticker: string;
+  event_type: AgentChatPositionEventType;
+  timestamp: string;
+  current_price: number;
+  trigger_value: number | null;
+  message: string;
+  requires_discussion: boolean;
+  auto_execute: boolean;
+  data: Record<string, unknown> | null;
+}
+
+export interface AgentChatPositionEventTypeInfo {
+  type: AgentChatPositionEventType;
+  description: string;
+  emoji: string;
+}
+
+export interface AgentChatAddPositionRequest {
+  ticker: string;
+  stock_name: string;
+  quantity: number;
+  avg_price: number;
+  current_price?: number;
+  stop_loss?: number;
+  take_profit?: number;
+  trailing_stop_pct?: number;
+}
+
+export interface AgentChatUpdatePositionRequest {
+  quantity?: number;
+  stop_loss?: number;
+  take_profit?: number;
+  trailing_stop_pct?: number;
+}
+
+export interface AgentChatPositionSummary {
+  is_running: boolean;
+  position_count: number;
+  total_value: number;
+  total_unrealized_pnl: number;
+  total_unrealized_pnl_pct: number;
+  event_count: number;
+  positions: AgentChatMonitoredPosition[];
+}

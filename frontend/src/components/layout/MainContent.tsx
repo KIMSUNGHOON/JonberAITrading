@@ -34,6 +34,7 @@ import { WorkflowPage } from '@/pages/WorkflowPage';
 import { AnalysisDetailPage } from '@/pages/AnalysisDetailPage';
 import { ScannerResultsPage } from '@/pages/ScannerResultsPage';
 import { TradingDashboard } from '@/components/trading';
+import { AgentChatDashboard } from '@/components/agent-chat';
 
 export function MainContent() {
   const [showReasoningPanel, setShowReasoningPanel] = useState(false);
@@ -88,6 +89,14 @@ export function MainContent() {
 
   if (currentView === 'scanner') {
     return <ScannerResultsPage />;
+  }
+
+  if (currentView === 'agent-chat') {
+    return (
+      <div className="p-3 md:p-4">
+        <AgentChatDashboard />
+      </div>
+    );
   }
 
   // ============================================

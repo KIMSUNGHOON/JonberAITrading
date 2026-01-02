@@ -18,6 +18,7 @@ import {
   Receipt,
   Bot,
   Scan,
+  MessageSquare,
 } from 'lucide-react';
 import { useStore } from '@/store';
 import { MarketTabs } from '@/components/layout/MarketTabs';
@@ -172,6 +173,13 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
           label={t('nav_scanner')}
           active={currentView === 'scanner'}
           onClick={() => setCurrentView('scanner')}
+          collapsed={collapsed}
+        />
+        <NavItem
+          icon={<MessageSquare className="w-5 h-5" />}
+          label={t('nav_agent_chat')}
+          active={currentView === 'agent-chat'}
+          onClick={() => setCurrentView('agent-chat')}
           collapsed={collapsed}
         />
       </nav>

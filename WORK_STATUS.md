@@ -9,7 +9,7 @@
 
 | Priority | 작업 | 상태 | 설명 |
 |----------|------|------|------|
-| **P0** | Agent Group Chat Frontend | ❌ 미구현 | Backend 완료, Frontend 0% |
+| **P0** | Agent Group Chat Frontend | 🟡 진행중 | 기본 UI 완료, 추가 기능 필요 |
 | P1 | 장중 테스트 | ⏳ 대기 | 호가/체결/손절익절 검증 |
 | P2 | WebSocket 체결 알림 | ❌ 미구현 | Telegram만 완료 |
 | P3 | Live Trading 전환 | ⏳ 대기 | 모의투자 검증 후 |
@@ -17,43 +17,54 @@
 
 ---
 
-## 📋 진행 예정 작업
+## 📋 P0: Agent Group Chat Frontend
 
-### P0: Agent Group Chat Frontend
+**현재 상태:** 기본 UI 구현 완료 (진행중)
 
-**현재 상태:** Backend API 100% 완료, Frontend 0% 미구현
+#### 완료된 컴포넌트
+- [x] API 클라이언트 함수 (agent-chat 엔드포인트)
+- [x] AgentChatDashboard - Coordinator 상태, 시작/중지
+- [x] ChatSessionList - 진행 중/완료된 토론 목록
+- [x] ChatSessionViewer - Agent 간 대화 표시 (Polling)
+- [x] Sidebar/Navigation에 Agent Chat 메뉴 추가
 
-Backend에서 142개 테스트가 통과하고 API가 완벽히 동작하지만,
-Frontend UI가 없어 Agent Group Chat 기능을 사용할 수 없음.
+#### 추가 필요 작업
+- [ ] WebSocket 실시간 업데이트 (현재 Polling)
+- [ ] PositionMonitor - 포지션 이벤트 알림
+- [ ] AgentChatSettings - 상세 설정 UI
 
-#### 필요 컴포넌트
+#### 파일 구조
 ```
 frontend/src/components/agent-chat/
+├── index.ts                   # 컴포넌트 export
 ├── AgentChatDashboard.tsx     # 메인 대시보드, 시작/중지
 ├── ChatSessionList.tsx        # 세션 목록
-├── ChatSessionViewer.tsx      # 토론 내용 뷰어 (WebSocket)
-├── AgentMessageBubble.tsx     # 메시지 버블
-├── VotingResult.tsx           # 투표 결과
-├── PositionMonitor.tsx        # 포지션 모니터링
-└── AgentChatSettings.tsx      # 설정
+└── ChatSessionViewer.tsx      # 토론 내용 뷰어 (메시지, 투표, 결정)
 ```
-
-#### 작업 목록
-- [ ] API 클라이언트 함수 (agent-chat 엔드포인트)
-- [ ] AgentChatDashboard - Coordinator 상태, 시작/중지
-- [ ] ChatSessionList - 진행 중/완료된 토론 목록
-- [ ] ChatSessionViewer - Agent 간 대화 표시
-- [ ] PositionMonitor - 포지션 이벤트 알림
-- [ ] Sidebar/Navigation에 Agent Chat 메뉴 추가
-
-#### 참고 문서
-- `docs/AGENT_GROUP_CHAT_PLAN.md` - 상세 설계
 
 ---
 
 ## ✅ 완료된 작업 (Git History 기준)
 
 ### 2026-01-02
+
+#### P0 Agent Group Chat Frontend (구현중)
+
+**Frontend UI 구현:**
+- AgentChatDashboard - Coordinator 제어 (시작/중지), 설정, 활성 토론 표시
+- ChatSessionList - 세션 목록 (상태, 결정, 합의도 표시)
+- ChatSessionViewer - 세션 상세 (메시지, 투표, 결정)
+- API 클라이언트 함수 22개 추가 (agent-chat 엔드포인트)
+- Sidebar 네비게이션 추가
+
+```
+frontend/src/api/client.ts  # API 클라이언트 함수 추가
+frontend/src/types/index.ts  # Agent Chat 타입 정의
+frontend/src/store/index.ts  # currentView에 'agent-chat' 추가
+frontend/src/utils/translations.ts  # 번역 키 추가
+```
+
+---
 
 #### `d9be1ef` P0.1 AgentWorkflowGraph + P0.1.1 Trade Queue 중복 종목 처리 개선
 

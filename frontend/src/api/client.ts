@@ -59,6 +59,25 @@ import type {
   ScanProgressResponse,
   ScanResultsResponse,
   StartScanRequest,
+  // Agent Chat Types
+  AgentChatCoordinatorStatus,
+  AgentChatStartCoordinatorRequest,
+  AgentChatStartDiscussionRequest,
+  AgentChatStartDiscussionResponse,
+  AgentChatSessionSummary,
+  AgentChatSessionDetail,
+  AgentChatMessage,
+  AgentChatDecision,
+  AgentChatActiveDiscussion,
+  AgentChatAgentInfo,
+  AgentChatDecisionActionInfo,
+  AgentChatMonitoredPosition,
+  AgentChatPositionEvent,
+  AgentChatPositionEventType,
+  AgentChatPositionEventTypeInfo,
+  AgentChatAddPositionRequest,
+  AgentChatUpdatePositionRequest,
+  AgentChatPositionSummary,
 } from '@/types';
 
 // -------------------------------------------
@@ -1562,6 +1581,237 @@ class ApiClient {
     const response = await this.client.get('/scanner/db/sessions', { params: { limit } });
     return response.data;
   }
+
+  // -------------------------------------------
+  // Agent Group Chat Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get agent chat coordinator status.
+   */
+  async getAgentChatStatus(): Promise<AgentChatCoordinatorStatus> {
+    const response = await this.client.get<AgentChatCoordinatorStatus>('/agent-chat/status');
+    return response.data;
+  }
+
+  /**
+   * Start the agent chat coordinator.
+   */
+  async startAgentChat(request?: AgentChatStartCoordinatorRequest): Promise<{
+    status: string;
+    message: string;
+    check_interval: number;
+  }> {
+    const response = await this.client.post('/agent-chat/start', request || {});
+    return response.data;
+  }
+
+  /**
+   * Stop the agent chat coordinator.
+   */
+  async stopAgentChat(): Promise<{
+    status: string;
+    message: string;
+  }> {
+    const response = await this.client.post('/agent-chat/stop');
+    return response.data;
+  }
+
+  /**
+   * Start a manual discussion for a stock.
+   */
+  async startAgentChatDiscussion(request: AgentChatStartDiscussionRequest): Promise<AgentChatStartDiscussionResponse> {
+    const response = await this.client.post<AgentChatStartDiscussionResponse>('/agent-chat/discuss', request);
+    return response.data;
+  }
+
+  /**
+   * Get active discussions.
+   */
+  async getAgentChatActiveDiscussions(): Promise<{
+    discussions: AgentChatActiveDiscussion[];
+    count: number;
+  }> {
+    const response = await this.client.get('/agent-chat/active');
+    return response.data;
+  }
+
+  /**
+   * Get chat session history.
+   */
+  async getAgentChatSessions(params?: {
+    limit?: number;
+    ticker?: string;
+  }): Promise<{
+    sessions: AgentChatSessionSummary[];
+    count: number;
+  }> {
+    const response = await this.client.get('/agent-chat/sessions', { params });
+    return response.data;
+  }
+
+  /**
+   * Get detailed session information.
+   */
+  async getAgentChatSessionDetail(sessionId: string): Promise<AgentChatSessionDetail> {
+    const response = await this.client.get<AgentChatSessionDetail>(`/agent-chat/sessions/${sessionId}`);
+    return response.data;
+  }
+
+  /**
+   * Get session messages.
+   */
+  async getAgentChatSessionMessages(sessionId: string): Promise<{
+    messages: AgentChatMessage[];
+    count: number;
+  }> {
+    const response = await this.client.get(`/agent-chat/sessions/${sessionId}/messages`);
+    return response.data;
+  }
+
+  /**
+   * Get session decision.
+   */
+  async getAgentChatSessionDecision(sessionId: string): Promise<{
+    session_id: string;
+    ticker: string;
+    stock_name: string;
+  } & AgentChatDecision> {
+    const response = await this.client.get(`/agent-chat/sessions/${sessionId}/decision`);
+    return response.data;
+  }
+
+  /**
+   * Get agent information.
+   */
+  async getAgentChatAgents(): Promise<{
+    agents: AgentChatAgentInfo[];
+    total_weight: number;
+    consensus_threshold: number;
+  }> {
+    const response = await this.client.get('/agent-chat/agents');
+    return response.data;
+  }
+
+  /**
+   * Get decision action types.
+   */
+  async getAgentChatDecisionActions(): Promise<{
+    actions: AgentChatDecisionActionInfo[];
+  }> {
+    const response = await this.client.get('/agent-chat/decision-actions');
+    return response.data;
+  }
+
+  // -------------------------------------------
+  // Agent Chat Position Management Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get monitored positions.
+   */
+  async getAgentChatPositions(): Promise<{
+    positions: AgentChatMonitoredPosition[];
+    count: number;
+    is_running: boolean;
+  }> {
+    const response = await this.client.get('/agent-chat/positions');
+    return response.data;
+  }
+
+  /**
+   * Get position summary.
+   */
+  async getAgentChatPositionSummary(): Promise<AgentChatPositionSummary> {
+    const response = await this.client.get<AgentChatPositionSummary>('/agent-chat/positions/summary');
+    return response.data;
+  }
+
+  /**
+   * Get position events.
+   */
+  async getAgentChatPositionEvents(params?: {
+    ticker?: string;
+    event_type?: AgentChatPositionEventType;
+    limit?: number;
+  }): Promise<{
+    events: AgentChatPositionEvent[];
+    count: number;
+  }> {
+    const response = await this.client.get('/agent-chat/positions/events', { params });
+    return response.data;
+  }
+
+  /**
+   * Get position event types.
+   */
+  async getAgentChatPositionEventTypes(): Promise<{
+    event_types: AgentChatPositionEventTypeInfo[];
+  }> {
+    const response = await this.client.get('/agent-chat/positions/event-types');
+    return response.data;
+  }
+
+  /**
+   * Get a specific position.
+   */
+  async getAgentChatPosition(ticker: string): Promise<AgentChatMonitoredPosition & {
+    lowest_price: number | null;
+    entry_time: string;
+    events_triggered: number;
+  }> {
+    const response = await this.client.get(`/agent-chat/positions/${ticker}`);
+    return response.data;
+  }
+
+  /**
+   * Add a position to monitor.
+   */
+  async addAgentChatPosition(request: AgentChatAddPositionRequest): Promise<{
+    status: string;
+    ticker: string;
+    message: string;
+  }> {
+    const response = await this.client.post('/agent-chat/positions', request);
+    return response.data;
+  }
+
+  /**
+   * Update a monitored position.
+   */
+  async updateAgentChatPosition(ticker: string, request: AgentChatUpdatePositionRequest): Promise<{
+    status: string;
+    ticker: string;
+    stop_loss: number | null;
+    take_profit: number | null;
+    trailing_stop_pct: number | null;
+  }> {
+    const response = await this.client.put(`/agent-chat/positions/${ticker}`, request);
+    return response.data;
+  }
+
+  /**
+   * Remove a position from monitoring.
+   */
+  async removeAgentChatPosition(ticker: string): Promise<{
+    status: string;
+    ticker: string;
+  }> {
+    const response = await this.client.delete(`/agent-chat/positions/${ticker}`);
+    return response.data;
+  }
+
+  /**
+   * Sync positions from account holdings.
+   */
+  async syncAgentChatPositions(): Promise<{
+    status: string;
+    position_count: number;
+    tickers: string[];
+  }> {
+    const response = await this.client.post('/agent-chat/positions/sync');
+    return response.data;
+  }
 }
 
 // -------------------------------------------
@@ -1842,3 +2092,63 @@ export const getScanProgress = () => apiClient.getScanProgress();
 
 export const getScanResults = (action?: string) =>
   apiClient.getScanResults(action);
+
+// Agent Group Chat API
+export const getAgentChatStatus = () => apiClient.getAgentChatStatus();
+
+export const startAgentChat = (request?: AgentChatStartCoordinatorRequest) =>
+  apiClient.startAgentChat(request);
+
+export const stopAgentChat = () => apiClient.stopAgentChat();
+
+export const startAgentChatDiscussion = (request: AgentChatStartDiscussionRequest) =>
+  apiClient.startAgentChatDiscussion(request);
+
+export const getAgentChatActiveDiscussions = () =>
+  apiClient.getAgentChatActiveDiscussions();
+
+export const getAgentChatSessions = (params?: { limit?: number; ticker?: string }) =>
+  apiClient.getAgentChatSessions(params);
+
+export const getAgentChatSessionDetail = (sessionId: string) =>
+  apiClient.getAgentChatSessionDetail(sessionId);
+
+export const getAgentChatSessionMessages = (sessionId: string) =>
+  apiClient.getAgentChatSessionMessages(sessionId);
+
+export const getAgentChatSessionDecision = (sessionId: string) =>
+  apiClient.getAgentChatSessionDecision(sessionId);
+
+export const getAgentChatAgents = () => apiClient.getAgentChatAgents();
+
+export const getAgentChatDecisionActions = () =>
+  apiClient.getAgentChatDecisionActions();
+
+// Agent Chat Position Management API
+export const getAgentChatPositions = () => apiClient.getAgentChatPositions();
+
+export const getAgentChatPositionSummary = () =>
+  apiClient.getAgentChatPositionSummary();
+
+export const getAgentChatPositionEvents = (params?: {
+  ticker?: string;
+  event_type?: AgentChatPositionEventType;
+  limit?: number;
+}) => apiClient.getAgentChatPositionEvents(params);
+
+export const getAgentChatPositionEventTypes = () =>
+  apiClient.getAgentChatPositionEventTypes();
+
+export const getAgentChatPosition = (ticker: string) =>
+  apiClient.getAgentChatPosition(ticker);
+
+export const addAgentChatPosition = (request: AgentChatAddPositionRequest) =>
+  apiClient.addAgentChatPosition(request);
+
+export const updateAgentChatPosition = (ticker: string, request: AgentChatUpdatePositionRequest) =>
+  apiClient.updateAgentChatPosition(ticker, request);
+
+export const removeAgentChatPosition = (ticker: string) =>
+  apiClient.removeAgentChatPosition(ticker);
+
+export const syncAgentChatPositions = () => apiClient.syncAgentChatPositions();
