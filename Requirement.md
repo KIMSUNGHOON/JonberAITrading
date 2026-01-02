@@ -4,7 +4,11 @@
 - (Done) @screenshot/autotrading.png 를 살펴 보면 각 sub agent의 UI/UX가 애매모호합니다. 몇개 수량을 매매 하는지, 어떤 decision을 하는지 사용자가 알기 어렵습니다. → `d9be1ef` AgentDetailModal에서 거래상세(수량, 가격, 손절/익절) 표시
 
 # Issue lists
-- (Issue) 실제 장이 마감 되었는데 자동매매시에 TradeQueue 또는 Approval시에 매매하는 과정이 사용자가 알기에는 어려운 UI/UX입니다. 너의 개선 방법 또는 제안이 궁금합니다.
+- (Done) 실제 장이 마감 되었는데 자동매매시에 TradeQueue 또는 Approval시에 매매하는 과정이 사용자가 알기에는 어려운 UI/UX입니다. → P0.2 장 마감 시 매매 과정 UI/UX 개선
+  - ✅ MarketStatusBanner 컴포넌트 추가 (장 상태 + 카운트다운)
+  - ✅ ApprovalDialog에 예상 실행 시간 표시 + 장 마감 경고
+  - ✅ TradeQueueWidget에 실행 예정 시간 + 순서 표시
+  - ✅ useMarketHours hook + GET /api/trading/market-status API
 - (Done) Trade Queue에서 이미 보유 중인 종목 처리 시 에러 메시지가 불명확함 → `d9be1ef` P0.1.1 한국어 에러 메시지 및 FAILED 상태 UI 개선
 
 # Improvement lists
@@ -13,7 +17,9 @@
 - (Done) PositionMonitor → 포지션 모니터링 및 이벤트 표시 구현
 
 # Instruction
-- P0 완료. 다음 작업 지시 대기
+- (Done) Issue 개선 방안 제안 완료 → 위 Proposal 참조
+- 다음 Phase: **P1 장중 테스트 (운영 검증)** - 실제 장 시간에 모의투자 매매 테스트 필요
+- 사용자 결정 대기: Issue 개선안 구현 여부 또는 다음 작업 지시
 
 # 중요 지시 사항
 - 모든 테스트 케이스를 통과해야 합니다.
@@ -23,3 +29,7 @@
 - 기능 개발이 완료된 경우 반드시 git commit 을 하기 바랍니다.
 - git commit msg는 반드시 영어로 작성합니다.
 - 해당 파일로 작업을 지시 합니다. 따라서 작업이 끝나면 해당 파일을 업데이트 하세요.
+
+# 참고 문서
+- docs/*.md
+- WORK_STATUS.md

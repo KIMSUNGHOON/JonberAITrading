@@ -1443,3 +1443,18 @@ export interface AgentChatPositionSummary {
   event_count: number;
   positions: AgentChatMonitoredPosition[];
 }
+
+// -------------------------------------------
+// Market Status Types
+// -------------------------------------------
+
+export interface MarketStatus {
+  market: string;
+  name: string;
+  is_open: boolean;
+  message: string;
+  current_time: string;
+  next_open: string | null;
+  next_close: string | null;
+  countdown_seconds: number;
+}

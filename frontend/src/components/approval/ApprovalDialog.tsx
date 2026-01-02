@@ -16,10 +16,12 @@ import {
   DollarSign,
   Target,
   Loader2,
+  Clock,
 } from 'lucide-react';
 import { useStore, selectTradeProposal, selectActiveSessionId } from '@/store';
 import { submitApproval } from '@/api/client';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
+import { useMarketHours } from '@/hooks/useMarketHours';
 import type { TradeProposal, CoinTradeProposal, KRStockTradeProposal } from '@/types';
 
 // Union type for all proposal types
@@ -145,6 +147,15 @@ export function ApprovalDialog() {
   const riskLevel = getRiskLevel(proposal.risk_score);
   const marketType = getProposalMarketType(proposal);
 
+  // Get market status for Korean stocks (kiwoom)
+  const { status: marketStatus, countdownFormatted, nextEventFormatted } = useMarketHours({
+    market: marketType === 'kiwoom' ? 'krx' : 'crypto',
+    enableCountdown: true,
+  });
+
+  // Check if this is a market-hours dependent trade
+  const isMarketClosed = marketType === 'kiwoom' && marketStatus && !marketStatus.is_open;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       {/* Backdrop */}
@@ -172,6 +183,31 @@ export function ApprovalDialog() {
 
         {/* Content */}
         <div className="p-6">
+          {/* Market Closed Warning */}
+          {isMarketClosed && (
+            <div className="mb-4 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+              <div className="flex items-start gap-3">
+                <Clock className="w-5 h-5 text-yellow-400 mt-0.5 flex-shrink-0" />
+                <div>
+                  <div className="text-sm font-medium text-yellow-400">
+                    현재 장이 마감되어 있습니다
+                  </div>
+                  <div className="text-xs text-yellow-300/80 mt-1">
+                    이 주문은 다음 장 오픈 시 실행됩니다
+                  </div>
+                  <div className="flex items-center gap-2 mt-2 text-xs">
+                    <span className="text-gray-400">예상 실행 시간:</span>
+                    <span className="text-white font-medium">{nextEventFormatted}</span>
+                  </div>
+                  <div className="flex items-center gap-2 mt-1 text-xs">
+                    <span className="text-gray-400">대기 시간:</span>
+                    <span className="text-yellow-400 font-medium">{countdownFormatted}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Action Badge */}
           <div className="flex items-center justify-center mb-6">
             <div

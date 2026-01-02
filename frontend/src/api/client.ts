@@ -78,6 +78,8 @@ import type {
   AgentChatAddPositionRequest,
   AgentChatUpdatePositionRequest,
   AgentChatPositionSummary,
+  // Market Status Types
+  MarketStatus,
 } from '@/types';
 
 // -------------------------------------------
@@ -1295,6 +1297,20 @@ class ApiClient {
   }
 
   // -------------------------------------------
+  // Market Status Endpoints
+  // -------------------------------------------
+
+  /**
+   * Get current market status with countdown.
+   */
+  async getMarketStatus(market: string = 'krx'): Promise<MarketStatus> {
+    const response = await this.client.get('/trading/market-status', {
+      params: { market },
+    });
+    return response.data;
+  }
+
+  // -------------------------------------------
   // Trade Queue Endpoints
   // -------------------------------------------
 
@@ -2063,6 +2079,10 @@ export const addToTradeQueue = (params: {
 
 // Agent Status API
 export const getAgentStates = () => apiClient.getAgentStates();
+
+// Market Status API
+export const getMarketStatus = (market: string = 'krx') =>
+  apiClient.getMarketStatus(market);
 
 // Watch List API
 export const getWatchList = () => apiClient.getWatchList();

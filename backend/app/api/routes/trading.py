@@ -402,6 +402,68 @@ async def get_activity_log(
 # Market Hours Endpoints
 # -------------------------------------------
 
+class MarketStatusResponse(BaseModel):
+    """Market status response for frontend"""
+    market: str
+    name: str
+    is_open: bool
+    message: str
+    current_time: str
+    next_open: Optional[str] = None
+    next_close: Optional[str] = None
+    countdown_seconds: int = 0  # Seconds until next_open or next_close
+
+
+def _calculate_countdown(target_time, current_time) -> int:
+    """Calculate seconds until target time."""
+    if target_time is None:
+        return 0
+    delta = target_time - current_time
+    return max(0, int(delta.total_seconds()))
+
+
+@router.get("/market-status")
+async def get_market_status(market: str = "krx"):
+    """
+    Get current market status with countdown.
+
+    This endpoint is optimized for frontend use with countdown_seconds.
+
+    Args:
+        market: Market type (krx, crypto). Default: krx
+
+    Returns:
+        Market status with countdown in seconds.
+    """
+    from services.trading import get_market_hours_service, MarketType
+
+    market_hours = get_market_hours_service()
+
+    try:
+        market_type = MarketType(market.lower())
+    except ValueError:
+        market_type = MarketType.KRX
+
+    session = market_hours.get_market_session(market_type)
+
+    # Calculate countdown
+    if session.is_open:
+        countdown = _calculate_countdown(session.next_close, session.current_time)
+    else:
+        countdown = _calculate_countdown(session.next_open, session.current_time)
+
+    return MarketStatusResponse(
+        market=market_type.value.upper(),
+        name="Korea Exchange" if market_type == MarketType.KRX else "Cryptocurrency",
+        is_open=session.is_open,
+        message=session.message,
+        current_time=session.current_time.isoformat(),
+        next_open=session.next_open.isoformat() if session.next_open else None,
+        next_close=session.next_close.isoformat() if session.next_close else None,
+        countdown_seconds=countdown,
+    )
+
+
 @router.get("/market-hours")
 async def get_market_hours():
     """
@@ -413,20 +475,29 @@ async def get_market_hours():
 
     market_hours = get_market_hours_service()
 
+    krx_session = market_hours.get_market_session(MarketType.KRX)
+    crypto_session = market_hours.get_market_session(MarketType.CRYPTO)
+
     return {
         "krx": {
             "market": "KRX",
             "name": "Korea Exchange",
-            **market_hours.get_market_session(MarketType.KRX)._asdict(),
-            "current_time": market_hours.get_market_session(MarketType.KRX).current_time.isoformat(),
-            "next_open": market_hours.get_market_session(MarketType.KRX).next_open.isoformat() if market_hours.get_market_session(MarketType.KRX).next_open else None,
-            "next_close": market_hours.get_market_session(MarketType.KRX).next_close.isoformat() if market_hours.get_market_session(MarketType.KRX).next_close else None,
+            "is_open": krx_session.is_open,
+            "message": krx_session.message,
+            "current_time": krx_session.current_time.isoformat(),
+            "next_open": krx_session.next_open.isoformat() if krx_session.next_open else None,
+            "next_close": krx_session.next_close.isoformat() if krx_session.next_close else None,
+            "countdown_seconds": _calculate_countdown(
+                krx_session.next_close if krx_session.is_open else krx_session.next_open,
+                krx_session.current_time
+            ),
         },
         "crypto": {
             "market": "CRYPTO",
             "name": "Cryptocurrency",
-            **market_hours.get_market_session(MarketType.CRYPTO)._asdict(),
-            "current_time": market_hours.get_market_session(MarketType.CRYPTO).current_time.isoformat(),
+            "is_open": crypto_session.is_open,
+            "message": crypto_session.message,
+            "current_time": crypto_session.current_time.isoformat(),
         },
     }
 

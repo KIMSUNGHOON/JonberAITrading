@@ -20,8 +20,10 @@ import {
   Loader2,
   Trash2,
   XCircle,
+  Timer,
 } from 'lucide-react';
 import { getTradeQueue, cancelQueuedTrade, processTradeQueue, dismissTrade } from '@/api/client';
+import { useMarketHours } from '@/hooks/useMarketHours';
 
 // -------------------------------------------
 // Types
@@ -67,9 +69,13 @@ interface QueueItemProps {
   onDismiss: (id: string) => void;
   cancelling: string | null;
   dismissing: string | null;
+  /** Expected execution time (next market open) */
+  nextExecutionTime?: string;
+  /** Position in queue (1-based) */
+  queuePosition?: number;
 }
 
-function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing }: QueueItemProps) {
+function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExecutionTime, queuePosition }: QueueItemProps) {
   const formatTime = (timeStr: string) => {
     const date = new Date(timeStr);
     return date.toLocaleString('ko-KR', {
@@ -195,11 +201,27 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing }: Queue
         </div>
       )}
 
-      {/* Reason - only show for pending */}
+      {/* Execution info - only show for pending */}
       {isPending && (
-        <div className="mt-2 text-xs text-gray-500">
-          <Clock className="w-3 h-3 inline mr-1" />
-          {formatTime(trade.queued_at)} - {trade.reason}
+        <div className="mt-2 space-y-1">
+          {/* Queue position and expected execution */}
+          {nextExecutionTime && (
+            <div className="flex items-center gap-2 text-xs">
+              <Timer className="w-3 h-3 text-blue-400" />
+              <span className="text-gray-400">예상 실행:</span>
+              <span className="text-blue-400 font-medium">{nextExecutionTime}</span>
+              {queuePosition && (
+                <span className="px-1.5 py-0.5 bg-blue-500/20 text-blue-400 rounded text-xs">
+                  #{queuePosition}
+                </span>
+              )}
+            </div>
+          )}
+          {/* Queued time and reason */}
+          <div className="text-xs text-gray-500">
+            <Clock className="w-3 h-3 inline mr-1" />
+            {formatTime(trade.queued_at)} - {trade.reason}
+          </div>
         </div>
       )}
 
@@ -240,6 +262,29 @@ export default function TradeQueueWidget() {
   const [dismissing, setDismissing] = useState<string | null>(null);
   const [queue, setQueue] = useState<QueuedTrade[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  // Get market status for showing expected execution time
+  const { status: marketStatus, countdownFormatted, nextEventFormatted } = useMarketHours({
+    market: 'krx',
+    enableCountdown: true,
+  });
+
+  const isMarketOpen = marketStatus?.is_open ?? false;
+
+  // Format next open time for display
+  const formatNextOpenTime = () => {
+    if (!marketStatus?.next_open) return '';
+    try {
+      const date = new Date(marketStatus.next_open);
+      return date.toLocaleTimeString('ko-KR', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
+    } catch {
+      return '';
+    }
+  };
 
   const fetchQueue = useCallback(async () => {
     try {
@@ -308,6 +353,21 @@ export default function TradeQueueWidget() {
           <div className="flex items-center gap-2">
             <Clock className={`w-5 h-5 ${pendingCount > 0 ? 'text-yellow-400' : failedCount > 0 ? 'text-red-400' : 'text-gray-400'}`} />
             <h2 className="text-lg font-semibold text-white">Trade Queue</h2>
+            {/* Market status indicator */}
+            <div
+              className={`flex items-center gap-1.5 px-2 py-0.5 rounded text-xs ${
+                isMarketOpen
+                  ? 'bg-green-500/20 text-green-400'
+                  : 'bg-red-500/20 text-red-400'
+              }`}
+            >
+              <div
+                className={`w-1.5 h-1.5 rounded-full ${
+                  isMarketOpen ? 'bg-green-500' : 'bg-red-500'
+                }`}
+              />
+              {isMarketOpen ? '장중' : '장마감'}
+            </div>
             {pendingCount > 0 && (
               <span className="px-2 py-0.5 text-xs bg-yellow-500/20 text-yellow-400 rounded-full">
                 {pendingCount} 대기
@@ -320,7 +380,7 @@ export default function TradeQueueWidget() {
             )}
           </div>
           <div className="flex items-center gap-2">
-            {pendingCount > 0 && (
+            {pendingCount > 0 && isMarketOpen && (
               <button
                 onClick={handleProcess}
                 disabled={processing}
@@ -343,6 +403,19 @@ export default function TradeQueueWidget() {
             </button>
           </div>
         </div>
+
+        {/* Market closed banner with countdown */}
+        {!isMarketOpen && pendingCount > 0 && (
+          <div className="mt-3 p-2.5 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
+            <div className="flex items-center justify-between text-sm">
+              <div className="flex items-center gap-2">
+                <Timer className="w-4 h-4 text-yellow-400" />
+                <span className="text-yellow-300">다음 실행 예정: {nextEventFormatted}</span>
+              </div>
+              <span className="text-yellow-400 font-medium">{countdownFormatted}</span>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Content */}
@@ -367,16 +440,25 @@ export default function TradeQueueWidget() {
           </div>
         ) : (
           <div className="space-y-3 max-h-80 overflow-y-auto">
-            {queue.map((trade) => (
-              <QueueItem
-                key={trade.id}
-                trade={trade}
-                onCancel={handleCancel}
-                onDismiss={handleDismiss}
-                cancelling={cancelling}
-                dismissing={dismissing}
-              />
-            ))}
+            {queue.map((trade) => {
+              // Calculate queue position for pending trades
+              const pendingTrades = queue.filter(t => t.status === 'pending');
+              const pendingIndex = pendingTrades.findIndex(t => t.id === trade.id);
+              const queuePosition = trade.status === 'pending' && pendingIndex >= 0 ? pendingIndex + 1 : undefined;
+
+              return (
+                <QueueItem
+                  key={trade.id}
+                  trade={trade}
+                  onCancel={handleCancel}
+                  onDismiss={handleDismiss}
+                  cancelling={cancelling}
+                  dismissing={dismissing}
+                  nextExecutionTime={!isMarketOpen ? formatNextOpenTime() : undefined}
+                  queuePosition={queuePosition}
+                />
+              );
+            })}
           </div>
         )}
       </div>

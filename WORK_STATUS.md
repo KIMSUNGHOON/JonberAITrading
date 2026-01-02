@@ -1,6 +1,6 @@
 # Work Status - JonberAITrading
 
-> Last Updated: 2026-01-02
+> Last Updated: 2026-01-03
 > Branch: `claude/read-trading-prompt-dgm5U`
 
 ---
@@ -9,7 +9,7 @@
 
 | Priority | 작업 | 상태 | 설명 |
 |----------|------|------|------|
-| **P0** | Agent Group Chat Frontend | 🟡 진행중 | 기본 UI 완료, 추가 기능 필요 |
+| **P0** | Agent Group Chat Frontend | ✅ 완료 | 기본 UI + 시장 상태 UI 개선 |
 | P1 | 장중 테스트 | ⏳ 대기 | 호가/체결/손절익절 검증 |
 | P2 | WebSocket 체결 알림 | ❌ 미구현 | Telegram만 완료 |
 | P3 | Live Trading 전환 | ⏳ 대기 | 모의투자 검증 후 |
@@ -49,6 +49,37 @@ frontend/src/hooks/
 ---
 
 ## ✅ 완료된 작업 (Git History 기준)
+
+### 2026-01-03
+
+#### P0.2 장 마감 시 매매 과정 UI/UX 개선
+
+**문제점:**
+- 장 마감 시 TradeQueue/Approval에서 매매 실행 시점이 불명확
+- 사용자가 현재 장 상태를 알기 어려움
+
+**구현 내역:**
+
+| 컴포넌트 | 설명 |
+|----------|------|
+| `GET /api/trading/market-status` | 시장 상태 API + countdown_seconds |
+| `useMarketHours` hook | 실시간 카운트다운 관리 |
+| `MarketStatusBanner` | 장 상태 + 카운트다운 배너 |
+| `ApprovalDialog` 개선 | 장 마감 시 경고 + 예상 실행 시간 |
+| `TradeQueueWidget` 개선 | 장 상태 표시 + 실행 순서/시간 |
+
+**파일 구조:**
+```
+backend/app/api/routes/trading.py      # GET /market-status 추가
+frontend/src/hooks/useMarketHours.ts   # 시장 상태 hook (신규)
+frontend/src/components/trading/MarketStatusBanner.tsx  # 시장 상태 배너 (신규)
+frontend/src/components/approval/ApprovalDialog.tsx    # 장 마감 경고 추가
+frontend/src/components/trading/TradeQueueWidget.tsx   # 실행 시간 표시
+frontend/src/types/index.ts            # MarketStatus 타입 추가
+frontend/src/api/client.ts             # getMarketStatus() 추가
+```
+
+---
 
 ### 2026-01-02
 
