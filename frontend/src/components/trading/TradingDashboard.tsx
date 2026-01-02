@@ -21,9 +21,12 @@ import {
   DollarSign,
   Activity,
   Bell,
+  LayoutGrid,
+  GitBranch,
 } from 'lucide-react';
 import { useStore } from '@/store';
 import AgentStatusWidget from './AgentStatusWidget';
+import { AgentWorkflowGraph } from './AgentWorkflowGraph';
 import TradeQueueWidget from './TradeQueueWidget';
 import StrategyConfigWidget from './StrategyConfigWidget';
 import WatchListWidget from './WatchListWidget';
@@ -154,6 +157,7 @@ export default function TradingDashboard() {
   const t = useTranslations(language);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [agentViewMode, setAgentViewMode] = useState<'workflow' | 'grid'>('workflow');
 
   // Trading state
   const [status, setStatus] = useState<{
@@ -422,8 +426,41 @@ export default function TradingDashboard() {
 
         {/* Middle Column - Agent Status & Positions */}
         <div className="space-y-4">
-          {/* Agent Status Widget */}
-          <AgentStatusWidget />
+          {/* Agent Status Section with View Toggle */}
+          <div className="relative">
+            {/* View Toggle Buttons */}
+            <div className="absolute -top-1 right-0 flex bg-gray-800 rounded-lg p-0.5 z-10">
+              <button
+                onClick={() => setAgentViewMode('workflow')}
+                className={`p-1.5 rounded-md transition-colors ${
+                  agentViewMode === 'workflow'
+                    ? 'bg-blue-600 text-white'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+                title="워크플로우 뷰"
+              >
+                <GitBranch className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setAgentViewMode('grid')}
+                className={`p-1.5 rounded-md transition-colors ${
+                  agentViewMode === 'grid'
+                    ? 'bg-blue-600 text-white'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+                title="그리드 뷰"
+              >
+                <LayoutGrid className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Agent View */}
+            {agentViewMode === 'workflow' ? (
+              <AgentWorkflowGraph />
+            ) : (
+              <AgentStatusWidget />
+            )}
+          </div>
 
           {/* Positions */}
           <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">

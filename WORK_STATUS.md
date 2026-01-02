@@ -1,6 +1,6 @@
 # Work Status - JonberAITrading
 
-> Last Updated: 2026-01-02 (Phase 7 & 8 완료 - 분석 라우트 통합 + API 버전 관리)
+> Last Updated: 2026-01-02 (P0.1.1 완료 - Trade Queue 중복 종목 처리 개선)
 > Branch: `claude/read-trading-prompt-dgm5U`
 
 ---
@@ -897,6 +897,107 @@ backend/tests/test_services/test_trading/test_tick_size.py  - 호가 단위 테�
 ---
 
 ## 완료된 작업 ✅
+
+### P0.1 자동매매 Sub Agent UI/UX 개선 (2026-01-02)
+
+#### 개요
+Sub Agent들을 Graph Node 형태로 시각화하여 사용자가 각 Agent의 상태와 세부 정보를 쉽게 파악할 수 있도록 개선
+
+#### 구현된 기능
+| # | Task | 상태 |
+|---|------|------|
+| 1 | AgentWorkflowGraph 컴포넌트 - 수직 흐름 그래프 레이아웃 | ✅ 완료 |
+| 2 | AgentNode - 클릭 가능한 개별 Agent 노드 | ✅ 완료 |
+| 3 | AgentDetailModal - 세부 정보 모달 (거래상세, 분석요약, 결과) | ✅ 완료 |
+| 4 | CSS 기반 커넥터 - Agent 간 연결선 및 애니메이션 | ✅ 완료 |
+| 5 | TradingDashboard 통합 - 뷰 토글 기능 (Workflow/Grid) | ✅ 완료 |
+| 6 | 타입 정의 - AgentState, TradeDetails, AnalysisSummary | ✅ 완료 |
+
+#### 주요 기능
+- **Vertical Flow 레이아웃**: Strategy → Portfolio → Order → Risk 순서로 워크플로우 표시
+- **상태별 색상 표시**: idle(회색), working(파랑), waiting(노랑), error(빨강)
+- **실시간 업데이트**: 3초 주기 Agent 상태 폴링
+- **클릭 상세 모달**: 거래 상세(수량, 가격, 손절/익절), 분석 요약, 최근 결과 표시
+- **애니메이션 커넥터**: working 상태 시 파랑 펄스 애니메이션
+- **뷰 토글**: 새 Workflow 뷰와 기존 Grid 뷰 간 전환 가능
+
+#### 관련 파일
+```
+frontend/src/components/trading/AgentWorkflowGraph/
+├── index.tsx              # 메인 컨테이너 (폴링, 레이아웃)
+├── AgentNode.tsx          # 개별 Agent 노드 (클릭 가능)
+├── AgentDetailModal.tsx   # 상세 정보 모달
+├── AgentEdge.tsx          # SVG 연결선 (참조용)
+└── types.ts               # 타입 정의
+
+frontend/src/components/trading/
+├── TradingDashboard.tsx   # 뷰 토글 통합
+└── index.ts               # export 추가
+```
+
+---
+
+### P0.1.1 Trade Queue 중복 종목 처리 개선 (2026-01-02)
+
+#### 개요
+포트폴리오에 이미 보유 중인 종목을 Trade Queue에서 처리할 때 발생하는 문제 해결 및 UI/UX 개선
+
+#### 문제점
+1. 기존 포지션 보유 시 포트폴리오 Agent에서 quantity=0 반환 시 명확한 사유 미제공
+2. FAILED 상태의 거래가 Queue UI에 표시되지 않음 (PENDING만 표시)
+3. FAILED/COMPLETED/CANCELLED 상태 거래를 Queue에서 제거할 방법 없음
+
+#### 구현된 기능
+| # | Task | 상태 |
+|---|------|------|
+| 1 | portfolio_agent.py - 기존 포지션 명확한 예외 처리 및 한국어 메시지 | ✅ 완료 |
+| 2 | coordinator.py - get_trade_queue() include_all 파라미터 추가 | ✅ 완료 |
+| 3 | coordinator.py - dismiss_trade() 함수 추가 | ✅ 완료 |
+| 4 | trading.py API - /queue 엔드포인트 include_all 지원 | ✅ 완료 |
+| 5 | trading.py API - /queue/{id}/dismiss 엔드포인트 추가 | ✅ 완료 |
+| 6 | client.ts - getTradeQueue(includeAll) 및 dismissTrade() 추가 | ✅ 완료 |
+| 7 | TradeQueueWidget.tsx - FAILED 상태 UI 개선 | ✅ 완료 |
+
+#### 주요 변경사항
+
+**Backend - portfolio_agent.py:**
+- 기존 포지션 보유 시 명확한 한국어 에러 메시지 반환
+- "이미 보유 중: 100주 (15.5%) - 추가 매수 불가 (최대 포지션 도달)"
+- 최대 포지션 초과 체크 시 더 상세한 rationale 제공
+
+**Backend - coordinator.py:**
+- `get_trade_queue(include_all=False)`: 기본값 PENDING/PROCESSING만 반환
+- `include_all=True` 시 FAILED/COMPLETED/CANCELLED 포함한 전체 반환
+- `dismiss_trade(queue_id)`: PENDING/PROCESSING 아닌 거래 제거 기능
+
+**Backend - trading.py API:**
+- `GET /queue?include_all=true`: 전체 거래 조회
+- `DELETE /queue/{id}/dismiss`: 완료/실패 거래 제거
+
+**Frontend - TradeQueueWidget.tsx:**
+- 한국어 상태 라벨: 대기, 처리중, 완료, 실패, 취소됨
+- FAILED 상태 강조 표시 (빨간 테두리, XCircle 아이콘)
+- 실패 사유 명확한 UI 표시 (AlertCircle + "실패 사유" 박스)
+- Dismiss 버튼 (휴지통 아이콘) - FAILED/COMPLETED/CANCELLED 항목에 표시
+- 헤더에 실패 카운트 배지 표시
+
+#### 관련 파일
+```
+backend/services/trading/
+├── portfolio_agent.py     # 기존 포지션 예외 처리 개선
+└── coordinator.py         # get_trade_queue, dismiss_trade 함수
+
+backend/app/api/routes/
+└── trading.py             # /queue, /queue/{id}/dismiss API
+
+frontend/src/api/
+└── client.ts              # getTradeQueue, dismissTrade 함수
+
+frontend/src/components/trading/
+└── TradeQueueWidget.tsx   # FAILED 상태 UI 개선
+```
+
+---
 
 ### KRX 휴장일 데이터 연동 (2026-01-01)
 

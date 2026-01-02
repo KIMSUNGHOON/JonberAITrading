@@ -53,12 +53,20 @@ dependencies:
       # Storage & State
       - aiosqlite>=0.20.0
       - diskcache>=5.6.0
+      - redis[hiredis]>=5.0.0
+
+      # Authentication
+      - PyJWT>=2.8.0
+
+      # Notifications
+      - python-telegram-bot>=20.0
 
       # Utilities
       - python-dotenv>=1.0.0
       - structlog>=24.4.0
       - tenacity>=9.0.0
       - watchfiles>=1.0.0  # For uvicorn hot-reload
+      - apscheduler>=3.10.0  # For scheduled tasks (Agent Chat Coordinator)
 
       # LLM Providers (optional - install based on platform)
       # Windows/Linux with NVIDIA GPU:

@@ -269,22 +269,33 @@ export function useAnalysisWebSocket({
     ws?.requestStatus();
   }, [sessionId]);
 
+  // Track if we've connected for this sessionId
+  const connectedSessionRef = useRef<string | null>(null);
+
   // Auto-connect/disconnect effect
+  // Only depend on sessionId and autoConnect to prevent reconnection loops
   useEffect(() => {
     if (!sessionId || !autoConnect) return;
 
+    // Only connect if sessionId changed (not on every render)
+    if (connectedSessionRef.current === sessionId) {
+      return; // Already connected to this session
+    }
+
     // Connect when sessionId changes
-    connect();
+    const handlers = createHandlers();
+    wsManager.connect(sessionId, handlers);
+    connectedSessionRef.current = sessionId;
 
     // Cleanup on unmount or sessionId change
     return () => {
-      // Only disconnect if we're the ones who connected
-      // This prevents disconnecting during re-renders
-      if (wsManager.has(sessionId)) {
-        disconnect();
+      if (connectedSessionRef.current && wsManager.has(connectedSessionRef.current)) {
+        wsManager.disconnect(connectedSessionRef.current);
+        connectedSessionRef.current = null;
       }
     };
-  }, [sessionId, autoConnect, connect, disconnect]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, autoConnect]); // Intentionally exclude createHandlers to prevent reconnection loops
 
   return {
     isConnected: sessionId ? wsManager.isConnected(sessionId) : false,

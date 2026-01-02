@@ -768,14 +768,17 @@ async def add_to_trade_queue(
 
 @router.get("/queue")
 async def get_trade_queue(
+    include_all: bool = False,
     coordinator=Depends(get_trading_coordinator),
 ):
     """
-    Get pending trades in queue.
+    Get trades in queue.
 
-    Returns trades that are waiting for market open.
+    Args:
+        include_all: If True, returns all trades including FAILED/COMPLETED/CANCELLED.
+                    If False (default), returns only PENDING and PROCESSING trades.
     """
-    queue = coordinator.get_trade_queue()
+    queue = coordinator.get_trade_queue(include_all=include_all)
     return {
         "queue": [t.model_dump() for t in queue],
         "count": len(queue),
@@ -796,6 +799,30 @@ async def cancel_queued_trade(
 
     return {
         "status": "cancelled",
+        "queue_id": queue_id,
+    }
+
+
+@router.delete("/queue/{queue_id}/dismiss")
+async def dismiss_trade(
+    queue_id: str,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """
+    Dismiss a completed/failed/cancelled trade from the queue.
+
+    This removes the trade from the queue entirely.
+    Only works for trades that are not PENDING or PROCESSING.
+    """
+    success = coordinator.dismiss_trade(queue_id)
+    if not success:
+        raise HTTPException(
+            400,
+            f"Cannot dismiss trade '{queue_id}': not found or still active"
+        )
+
+    return {
+        "status": "dismissed",
         "queue_id": queue_id,
     }
 

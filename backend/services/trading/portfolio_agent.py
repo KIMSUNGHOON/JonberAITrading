@@ -144,7 +144,27 @@ class PortfolioAgent:
         # 3. Consider existing position
         if existing_position:
             current_value = existing_position.quantity * existing_position.current_price
-            max_position_value = max(0, max_position_value - current_value)
+            current_position_pct = (current_value / account.total_equity) * 100 if account.total_equity > 0 else 0
+
+            # Check if already at or above max position
+            if current_value >= max_position_value:
+                logger.warning(
+                    f"[PortfolioAgent] {ticker} already at max position: "
+                    f"{existing_position.quantity}주 ({current_position_pct:.1f}%)"
+                )
+                return AllocationPlan(
+                    ticker=ticker,
+                    stock_name=stock_name,
+                    side=OrderSide.BUY,
+                    quantity=0,
+                    entry_price=entry_price,
+                    estimated_amount=0,
+                    position_pct=0,
+                    rationale=f"이미 보유 중: {existing_position.quantity}주 ({current_position_pct:.1f}%) - 추가 매수 불가 (최대 포지션 도달)",
+                )
+
+            # Calculate remaining allowed position
+            max_position_value = max_position_value - current_value
 
         # 4. Apply constraints
         position_value = min(available_for_trade, max_position_value)
@@ -153,6 +173,10 @@ class PortfolioAgent:
         quantity = int(position_value / entry_price)
 
         if quantity <= 0:
+            rationale = "Position size too small after risk adjustment"
+            if existing_position:
+                existing_pct = (existing_position.quantity * existing_position.current_price / account.total_equity) * 100 if account.total_equity > 0 else 0
+                rationale = f"추가 매수 불가: 이미 {existing_position.quantity}주 보유 ({existing_pct:.1f}%)"
             return AllocationPlan(
                 ticker=ticker,
                 stock_name=stock_name,
@@ -161,7 +185,7 @@ class PortfolioAgent:
                 entry_price=entry_price,
                 estimated_amount=0,
                 position_pct=0,
-                rationale="Position size too small after risk adjustment",
+                rationale=rationale,
             )
 
         # 6. Final calculations

@@ -607,14 +607,56 @@ class ExecutionCoordinator:
         # Add to risk monitor
         self.risk_monitor.add_position(position)
 
+        # Update risk agent status
+        self._update_agent_status(
+            "risk",
+            AgentStatus.WORKING,
+            task=f"Monitoring {position.stock_name or position.ticker}",
+            processing_stock=position.ticker,
+            processing_stock_name=position.stock_name,
+            trade_details={
+                "action": "MONITOR",
+                "quantity": position.quantity,
+                "entry_price": position.avg_price,
+                "stop_loss": position.stop_loss,
+                "take_profit": position.take_profit,
+            },
+        )
+
         logger.info(f"[Coordinator] Position added/updated: {position.ticker}")
 
     def _remove_position(self, ticker: str):
         """Remove a position from tracking."""
+        # Find position before removing for status update
+        position = next((p for p in self._state.positions if p.ticker == ticker), None)
+
         self._state.positions = [
             p for p in self._state.positions if p.ticker != ticker
         ]
         self.risk_monitor.remove_position(ticker)
+
+        # Update risk agent status
+        remaining_count = len(self._state.positions)
+        if remaining_count > 0:
+            self._update_agent_status(
+                "risk",
+                AgentStatus.WORKING,
+                task=f"Monitoring {remaining_count} positions",
+                last_result={
+                    "success": True,
+                    "message": f"Position closed: {position.stock_name if position else ticker}",
+                },
+            )
+        else:
+            self._update_agent_status(
+                "risk",
+                AgentStatus.IDLE,
+                action="No positions to monitor",
+                last_result={
+                    "success": True,
+                    "message": f"Position closed: {position.stock_name if position else ticker}",
+                },
+            )
 
         logger.info(f"[Coordinator] Position removed: {ticker}")
 
@@ -735,6 +777,22 @@ class ExecutionCoordinator:
         elif action == "EXECUTE_STOP_LOSS" and alert.ticker:
             config = self.risk_monitor._watching.get(alert.ticker)
             if config:
+                # Update risk agent status - executing stop-loss
+                self._update_agent_status(
+                    "risk",
+                    AgentStatus.WORKING,
+                    task=f"Executing stop-loss for {config.stock_name or alert.ticker}",
+                    processing_stock=alert.ticker,
+                    processing_stock_name=config.stock_name,
+                    trade_details={
+                        "action": "STOP_LOSS",
+                        "quantity": config.quantity,
+                        "entry_price": config.entry_price,
+                        "stop_loss": config.stop_loss,
+                        "current_price": config.last_price,
+                    },
+                )
+
                 price = config.last_price or config.entry_price
                 order = OrderRequest(
                     ticker=alert.ticker,
@@ -750,6 +808,22 @@ class ExecutionCoordinator:
         elif action == "EXECUTE_TAKE_PROFIT" and alert.ticker:
             config = self.risk_monitor._watching.get(alert.ticker)
             if config:
+                # Update risk agent status - executing take-profit
+                self._update_agent_status(
+                    "risk",
+                    AgentStatus.WORKING,
+                    task=f"Executing take-profit for {config.stock_name or alert.ticker}",
+                    processing_stock=alert.ticker,
+                    processing_stock_name=config.stock_name,
+                    trade_details={
+                        "action": "TAKE_PROFIT",
+                        "quantity": config.quantity,
+                        "entry_price": config.entry_price,
+                        "take_profit": config.take_profit,
+                        "current_price": config.last_price,
+                    },
+                )
+
                 price = config.last_price or config.take_profit
                 order = OrderRequest(
                     ticker=alert.ticker,
@@ -925,9 +999,41 @@ class ExecutionCoordinator:
         logger.info(f"[Coordinator] Trade queued: {queued_trade.id}")
         return queued_trade
 
-    def get_trade_queue(self) -> List[QueuedTrade]:
-        """Get all pending trades in queue."""
-        return [t for t in self._state.trade_queue if t.status == QueueStatus.PENDING]
+    def get_trade_queue(self, include_all: bool = False) -> List[QueuedTrade]:
+        """
+        Get trades in queue.
+
+        Args:
+            include_all: If True, return all trades including FAILED/COMPLETED.
+                        If False, return only PENDING and PROCESSING trades.
+        """
+        if include_all:
+            return list(self._state.trade_queue)
+
+        # Default: return active trades (PENDING or PROCESSING)
+        return [
+            t for t in self._state.trade_queue
+            if t.status in (QueueStatus.PENDING, QueueStatus.PROCESSING)
+        ]
+
+    def dismiss_trade(self, queue_id: str) -> bool:
+        """
+        Dismiss a completed/failed/cancelled trade from the queue.
+
+        Only removes trades that are not PENDING or PROCESSING.
+        """
+        for i, trade in enumerate(self._state.trade_queue):
+            if trade.id == queue_id:
+                if trade.status in (QueueStatus.PENDING, QueueStatus.PROCESSING):
+                    logger.warning(
+                        f"[Coordinator] Cannot dismiss active trade: {queue_id} (status={trade.status})"
+                    )
+                    return False
+
+                self._state.trade_queue.pop(i)
+                logger.info(f"[Coordinator] Trade dismissed from queue: {queue_id}")
+                return True
+        return False
 
     def cancel_queued_trade(self, queue_id: str) -> bool:
         """Cancel a queued trade."""
@@ -1267,6 +1373,21 @@ class ExecutionCoordinator:
             "positions": [p.model_dump() for p in self._state.positions],
         }
 
+        # Update strategy agent status - working
+        self._update_agent_status(
+            "strategy",
+            AgentStatus.WORKING,
+            task=f"Evaluating entry for {stock_name or ticker}",
+            processing_stock=ticker,
+            processing_stock_name=stock_name,
+            analysis_summary={
+                "technical": analysis_results.get("technical", {}).get("signal", "N/A"),
+                "fundamental": analysis_results.get("fundamental", {}).get("signal", "N/A"),
+                "sentiment": analysis_results.get("sentiment", {}).get("signal", "N/A"),
+                "risk": analysis_results.get("risk", {}).get("level", "N/A"),
+            } if analysis_results else None,
+        )
+
         try:
             decision = await self._strategy_engine.evaluate_entry(
                 ticker=ticker,
@@ -1289,10 +1410,44 @@ class ExecutionCoordinator:
                 },
             )
 
+            # Update strategy agent status - completed
+            self._update_agent_status(
+                "strategy",
+                AgentStatus.IDLE,
+                action=f"Decided: {decision.action} ({decision.confidence}%)",
+                processing_stock=ticker,
+                processing_stock_name=stock_name,
+                trade_details={
+                    "action": decision.action,
+                    "confidence": decision.confidence,
+                    "entry_price": decision.entry_price,
+                    "stop_loss": decision.stop_loss,
+                    "take_profit": decision.take_profit,
+                },
+                last_result={
+                    "success": True,
+                    "message": decision.rationale,
+                },
+            )
+            self._complete_agent_task("strategy", success=True)
+
             return decision.model_dump()
 
         except Exception as e:
             logger.error(f"[Coordinator] Strategy evaluation failed: {e}")
+            # Update strategy agent status - error
+            self._update_agent_status(
+                "strategy",
+                AgentStatus.ERROR,
+                error=str(e),
+                processing_stock=ticker,
+                processing_stock_name=stock_name,
+                last_result={
+                    "success": False,
+                    "message": f"Strategy evaluation error: {e}",
+                },
+            )
+            self._complete_agent_task("strategy", success=False)
             return {
                 "action": "SKIP",
                 "confidence": 0,

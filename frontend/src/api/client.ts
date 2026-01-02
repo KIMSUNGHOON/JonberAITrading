@@ -1280,9 +1280,12 @@ class ApiClient {
   // -------------------------------------------
 
   /**
-   * Get pending trades in queue.
+   * Get trades in queue.
+   *
+   * @param includeAll - If true, returns all trades including FAILED/COMPLETED/CANCELLED.
+   *                    If false (default), returns only PENDING and PROCESSING trades.
    */
-  async getTradeQueue(): Promise<{
+  async getTradeQueue(includeAll: boolean = false): Promise<{
     queue: Array<{
       id: string;
       session_id: string;
@@ -1302,7 +1305,9 @@ class ApiClient {
     }>;
     count: number;
   }> {
-    const response = await this.client.get('/trading/queue');
+    const response = await this.client.get('/trading/queue', {
+      params: { include_all: includeAll },
+    });
     return response.data;
   }
 
@@ -1314,6 +1319,18 @@ class ApiClient {
     queue_id: string;
   }> {
     const response = await this.client.delete(`/trading/queue/${queueId}`);
+    return response.data;
+  }
+
+  /**
+   * Dismiss a completed/failed/cancelled trade from the queue.
+   * Removes the trade entirely from the queue.
+   */
+  async dismissTrade(queueId: string): Promise<{
+    status: string;
+    queue_id: string;
+  }> {
+    const response = await this.client.delete(`/trading/queue/${queueId}/dismiss`);
     return response.data;
   }
 
@@ -1771,10 +1788,14 @@ export const applyStrategyPreset = (presetName: string) =>
   apiClient.applyStrategyPreset(presetName);
 
 // Trade Queue API
-export const getTradeQueue = () => apiClient.getTradeQueue();
+export const getTradeQueue = (includeAll: boolean = false) =>
+  apiClient.getTradeQueue(includeAll);
 
 export const cancelQueuedTrade = (queueId: string) =>
   apiClient.cancelQueuedTrade(queueId);
+
+export const dismissTrade = (queueId: string) =>
+  apiClient.dismissTrade(queueId);
 
 export const processTradeQueue = () => apiClient.processTradeQueue();
 

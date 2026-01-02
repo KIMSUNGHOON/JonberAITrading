@@ -18,8 +18,10 @@ import {
   AlertCircle,
   CheckCircle,
   Loader2,
+  Trash2,
+  XCircle,
 } from 'lucide-react';
-import { getTradeQueue, cancelQueuedTrade, processTradeQueue } from '@/api/client';
+import { getTradeQueue, cancelQueuedTrade, processTradeQueue, dismissTrade } from '@/api/client';
 
 // -------------------------------------------
 // Types
@@ -62,10 +64,12 @@ const STATUS_COLORS: Record<string, string> = {
 interface QueueItemProps {
   trade: QueuedTrade;
   onCancel: (id: string) => void;
+  onDismiss: (id: string) => void;
   cancelling: string | null;
+  dismissing: string | null;
 }
 
-function QueueItem({ trade, onCancel, cancelling }: QueueItemProps) {
+function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing }: QueueItemProps) {
   const formatTime = (timeStr: string) => {
     const date = new Date(timeStr);
     return date.toLocaleString('ko-KR', {
@@ -82,15 +86,44 @@ function QueueItem({ trade, onCancel, cancelling }: QueueItemProps) {
 
   const isBuy = trade.action === 'BUY';
   const isPending = trade.status === 'pending';
+  const isProcessing = trade.status === 'processing';
+  const isFailed = trade.status === 'failed';
+  const isCompleted = trade.status === 'completed';
+  const isCancelled = trade.status === 'cancelled';
+  const canDismiss = isFailed || isCompleted || isCancelled;
+
+  // Status-specific border colors
+  const getBorderClass = () => {
+    if (isFailed) return 'border-red-500/40 bg-red-500/5';
+    if (isCompleted) return 'border-green-500/30 bg-green-500/5';
+    if (isProcessing) return 'border-blue-500/30 bg-blue-500/5';
+    if (isPending) return 'border-yellow-500/30 bg-yellow-500/5';
+    return 'border-gray-700 bg-gray-800/50';
+  };
+
+  // Status label in Korean
+  const getStatusLabel = () => {
+    switch (trade.status) {
+      case 'pending': return '대기';
+      case 'processing': return '처리중';
+      case 'completed': return '완료';
+      case 'failed': return '실패';
+      case 'cancelled': return '취소됨';
+      default: return trade.status;
+    }
+  };
 
   return (
-    <div className={`p-3 rounded-lg border ${
-      isPending ? 'border-yellow-500/30 bg-yellow-500/5' : 'border-gray-700 bg-gray-800/50'
-    }`}>
+    <div className={`p-3 rounded-lg border ${getBorderClass()}`}>
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-2">
-          <div className={`p-1.5 rounded ${isBuy ? 'bg-green-500/20' : 'bg-red-500/20'}`}>
-            {isBuy ? (
+          <div className={`p-1.5 rounded ${
+            isFailed ? 'bg-red-500/20' :
+            isBuy ? 'bg-green-500/20' : 'bg-red-500/20'
+          }`}>
+            {isFailed ? (
+              <XCircle className="w-4 h-4 text-red-400" />
+            ) : isBuy ? (
               <TrendingUp className="w-4 h-4 text-green-400" />
             ) : (
               <TrendingDown className="w-4 h-4 text-red-400" />
@@ -102,7 +135,7 @@ function QueueItem({ trade, onCancel, cancelling }: QueueItemProps) {
                 {trade.stock_name || trade.ticker}
               </span>
               <span className={`px-1.5 py-0.5 text-xs rounded ${STATUS_COLORS[trade.status] || STATUS_COLORS.pending}`}>
-                {trade.status}
+                {getStatusLabel()}
               </span>
             </div>
             <div className="text-xs text-gray-400">
@@ -111,48 +144,85 @@ function QueueItem({ trade, onCancel, cancelling }: QueueItemProps) {
           </div>
         </div>
 
-        {isPending && (
-          <button
-            onClick={() => onCancel(trade.id)}
-            disabled={cancelling === trade.id}
-            className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded disabled:opacity-50"
-          >
-            {cancelling === trade.id ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <X className="w-4 h-4" />
-            )}
-          </button>
-        )}
-      </div>
-
-      {/* Details */}
-      <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
-        {trade.stop_loss && (
-          <div className="text-gray-400">
-            손절: <span className="text-red-400">{formatPrice(trade.stop_loss)}</span>
-          </div>
-        )}
-        {trade.take_profit && (
-          <div className="text-gray-400">
-            익절: <span className="text-green-400">{formatPrice(trade.take_profit)}</span>
-          </div>
-        )}
-        <div className="text-gray-400">
-          리스크: <span className="text-white">{trade.risk_score}/10</span>
+        <div className="flex items-center gap-1">
+          {isPending && (
+            <button
+              onClick={() => onCancel(trade.id)}
+              disabled={cancelling === trade.id}
+              className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded disabled:opacity-50"
+              title="취소"
+            >
+              {cancelling === trade.id ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <X className="w-4 h-4" />
+              )}
+            </button>
+          )}
+          {canDismiss && (
+            <button
+              onClick={() => onDismiss(trade.id)}
+              disabled={dismissing === trade.id}
+              className="p-1.5 text-gray-400 hover:text-gray-300 hover:bg-gray-700 rounded disabled:opacity-50"
+              title="목록에서 제거"
+            >
+              {dismissing === trade.id ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Trash2 className="w-4 h-4" />
+              )}
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Reason */}
-      <div className="mt-2 text-xs text-gray-500">
-        <Clock className="w-3 h-3 inline mr-1" />
-        {formatTime(trade.queued_at)} - {trade.reason}
-      </div>
+      {/* Details - hide for failed/cancelled */}
+      {!isFailed && !isCancelled && (
+        <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
+          {trade.stop_loss && (
+            <div className="text-gray-400">
+              손절: <span className="text-red-400">{formatPrice(trade.stop_loss)}</span>
+            </div>
+          )}
+          {trade.take_profit && (
+            <div className="text-gray-400">
+              익절: <span className="text-green-400">{formatPrice(trade.take_profit)}</span>
+            </div>
+          )}
+          <div className="text-gray-400">
+            리스크: <span className="text-white">{trade.risk_score}/10</span>
+          </div>
+        </div>
+      )}
 
-      {/* Error */}
-      {trade.error_message && (
-        <div className="mt-2 p-2 bg-red-500/10 border border-red-500/20 rounded text-xs text-red-400">
-          {trade.error_message}
+      {/* Reason - only show for pending */}
+      {isPending && (
+        <div className="mt-2 text-xs text-gray-500">
+          <Clock className="w-3 h-3 inline mr-1" />
+          {formatTime(trade.queued_at)} - {trade.reason}
+        </div>
+      )}
+
+      {/* Error message for failed trades - prominent display */}
+      {isFailed && trade.error_message && (
+        <div className="mt-2 p-2.5 bg-red-500/10 border border-red-500/30 rounded">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 text-red-400 mt-0.5 flex-shrink-0" />
+            <div>
+              <div className="text-sm text-red-400 font-medium">실패 사유</div>
+              <div className="text-xs text-red-300 mt-1">
+                {trade.error_message}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Completed message */}
+      {isCompleted && (
+        <div className="mt-2 p-2 bg-green-500/10 border border-green-500/30 rounded text-xs text-green-400 flex items-center gap-2">
+          <CheckCircle className="w-4 h-4" />
+          <span>주문 완료 - {trade.executed_at ? formatTime(trade.executed_at) : ''}</span>
         </div>
       )}
     </div>
@@ -167,13 +237,15 @@ export default function TradeQueueWidget() {
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
   const [cancelling, setCancelling] = useState<string | null>(null);
+  const [dismissing, setDismissing] = useState<string | null>(null);
   const [queue, setQueue] = useState<QueuedTrade[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const fetchQueue = useCallback(async () => {
     try {
       setError(null);
-      const data = await getTradeQueue();
+      // Fetch all trades including FAILED/COMPLETED/CANCELLED
+      const data = await getTradeQueue(true);
       setQueue(data.queue);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch queue');
@@ -201,6 +273,18 @@ export default function TradeQueueWidget() {
     }
   };
 
+  const handleDismiss = async (id: string) => {
+    try {
+      setDismissing(id);
+      await dismissTrade(id);
+      await fetchQueue();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to dismiss trade');
+    } finally {
+      setDismissing(null);
+    }
+  };
+
   const handleProcess = async () => {
     try {
       setProcessing(true);
@@ -214,6 +298,7 @@ export default function TradeQueueWidget() {
   };
 
   const pendingCount = queue.filter(t => t.status === 'pending').length;
+  const failedCount = queue.filter(t => t.status === 'failed').length;
 
   return (
     <div className="bg-gray-900 rounded-xl border border-gray-800">
@@ -221,11 +306,16 @@ export default function TradeQueueWidget() {
       <div className="p-4 border-b border-gray-800">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Clock className={`w-5 h-5 ${pendingCount > 0 ? 'text-yellow-400' : 'text-gray-400'}`} />
+            <Clock className={`w-5 h-5 ${pendingCount > 0 ? 'text-yellow-400' : failedCount > 0 ? 'text-red-400' : 'text-gray-400'}`} />
             <h2 className="text-lg font-semibold text-white">Trade Queue</h2>
             {pendingCount > 0 && (
               <span className="px-2 py-0.5 text-xs bg-yellow-500/20 text-yellow-400 rounded-full">
-                {pendingCount} pending
+                {pendingCount} 대기
+              </span>
+            )}
+            {failedCount > 0 && (
+              <span className="px-2 py-0.5 text-xs bg-red-500/20 text-red-400 rounded-full">
+                {failedCount} 실패
               </span>
             )}
           </div>
@@ -282,7 +372,9 @@ export default function TradeQueueWidget() {
                 key={trade.id}
                 trade={trade}
                 onCancel={handleCancel}
+                onDismiss={handleDismiss}
                 cancelling={cancelling}
+                dismissing={dismissing}
               />
             ))}
           </div>

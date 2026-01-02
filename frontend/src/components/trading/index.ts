@@ -10,3 +10,4 @@ export { default as WatchListWidget } from './WatchListWidget';
 export { default as TradeQueueWidget } from './TradeQueueWidget';
 export { default as AgentStatusWidget } from './AgentStatusWidget';
 export { default as StrategyConfigWidget } from './StrategyConfigWidget';
+export { AgentWorkflowGraph } from './AgentWorkflowGraph';
