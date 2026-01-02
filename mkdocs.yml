@@ -1,0 +1,109 @@
+# MkDocs Configuration for JonberAITrading Documentation
+# https://www.mkdocs.org/
+
+site_name: JonberAI Trading
+site_description: AI-powered autonomous trading system with multi-agent analysis
+site_author: KIMSUNGHOON
+site_url: https://kimsunghoon.github.io/JonberAITrading/
+
+repo_name: KIMSUNGHOON/JonberAITrading
+repo_url: https://github.com/KIMSUNGHOON/JonberAITrading
+
+# Theme configuration
+theme:
+  name: material
+  language: ko
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+  palette:
+    - scheme: slate
+      primary: indigo
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: indigo
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  icon:
+    repo: fontawesome/brands/github
+
+# Extensions
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+
+# Plugins
+plugins:
+  - search:
+      lang:
+        - en
+        - ko
+  - minify:
+      minify_html: true
+
+# Navigation structure
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quick Start: getting-started/quick-start.md
+    - Configuration: getting-started/configuration.md
+  - Architecture:
+    - System Overview: architecture/overview.md
+    - Agent System: architecture/agents.md
+    - Trading System: architecture/trading-system.md
+  - User Guide:
+    - Analysis: user-guide/analysis.md
+    - Auto Trading: user-guide/trading.md
+    - Agent Group Chat: user-guide/agent-chat.md
+    - Notifications: user-guide/notifications.md
+  - API Reference:
+    - Overview: api/overview.md
+    - Analysis API: api/analysis.md
+    - Trading API: api/trading.md
+    - WebSocket API: api/websocket.md
+    - Kiwoom API: api/kiwoom.md
+  - Development:
+    - Contributing: development/contributing.md
+    - Testing: development/testing.md
+    - Roadmap: development/roadmap.md
+  - Changelog: changelog.md
+
+# Extra configuration
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/KIMSUNGHOON/JonberAITrading
+  generator: false
+
+# Copyright
+copyright: Copyright &copy; 2025-2026 KIMSUNGHOON
