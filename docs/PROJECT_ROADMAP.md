@@ -1,7 +1,7 @@
 # Agentic AI Trading - Project Roadmap
 
-> Last Updated: 2025-12-31
-> Status: Production Ready (모의투자 검증 완료)
+> Last Updated: 2026-01-02
+> Status: Backend Complete, Frontend In Progress
 
 ---
 
@@ -96,6 +96,36 @@ AI 기반 주식/코인 자동매매 시스템
 
 ## 남은 작업 우선순위
 
+### Priority 0: Agent Group Chat Frontend 🔴 (Critical)
+
+**현재 상태:** Backend API 100% 완료, Frontend 0% (미구현)
+
+Agent Group Chat은 핵심 기능이지만 Frontend UI가 없어 사용 불가:
+- Backend: 142개 테스트 통과, API 완벽 동작
+- Frontend: Agent Chat 관련 컴포넌트 0개
+
+**필요 컴포넌트:**
+```
+frontend/src/components/agent-chat/
+├── AgentChatDashboard.tsx     # 메인 대시보드
+├── ChatSessionList.tsx        # 세션 목록
+├── ChatSessionViewer.tsx      # 토론 내용 뷰어
+├── AgentMessageBubble.tsx     # 메시지 버블
+├── VotingResult.tsx           # 투표 결과 표시
+├── PositionMonitor.tsx        # 포지션 모니터링
+└── AgentChatSettings.tsx      # 설정 (ON/OFF, 파라미터)
+```
+
+**작업 목록:**
+- [ ] AgentChatDashboard - Coordinator 상태, 시작/중지
+- [ ] ChatSessionList - 진행 중/완료된 토론 목록
+- [ ] ChatSessionViewer - Agent 간 대화 표시, 실시간 WebSocket
+- [ ] PositionMonitor - 모니터링 중인 포지션, 이벤트 알림
+- [ ] API 클라이언트 함수 (agent-chat 엔드포인트)
+- [ ] Sidebar/Navigation 추가
+
+---
+
 ### Priority 1: 장중 테스트 (운영 검증) 🔴
 
 **목표:** 실제 장 시간에 모의투자 매매 테스트
@@ -123,8 +153,6 @@ AI 기반 주식/코인 자동매매 시스템
 - [ ] `broadcast_to_session()`으로 체결 정보 전송
 - [ ] 프론트엔드에서 `execution` 메시지 타입 처리
 - [ ] 체결 알림 Toast/Notification UI
-
-**예상 소요:** 2-4시간
 
 ---
 
@@ -154,8 +182,6 @@ KIWOOM_IS_MOCK=false      # 실거래 활성화
 - [ ] Pydantic V2 `ConfigDict` 마이그레이션
 - [ ] `datetime.utcnow()` → `datetime.now(UTC)` 변경
 - [ ] `regex` → `pattern` 변경
-
-**예상 소요:** 1-2시간
 
 ---
 

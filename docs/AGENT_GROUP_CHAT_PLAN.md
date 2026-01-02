@@ -392,13 +392,68 @@ class PositionManagerConfig:
 | `/api/agent-chat/positions/events` | GET | 포지션 이벤트 조회 |
 | `/api/agent-chat/positions/event-types` | GET | 이벤트 타입 목록 |
 
-### Phase 5: API & Frontend 연동 ✅ 완료 (API 구현)
+### Phase 5: API & Frontend 연동 ⏳ 진행 중
 
-API 구현 완료 (`backend/app/api/routes/agent_chat.py`):
+**API 구현 완료 ✅** (`backend/app/api/routes/agent_chat.py`):
 - Coordinator 제어 (start/stop/status)
 - 세션 관리 (list/detail/messages/decision)
 - WebSocket 실시간 업데이트
 - Position 관리 API
+
+**Frontend 구현 필요 ❌**:
+```
+frontend/src/components/agent-chat/
+├── AgentChatDashboard.tsx     # 메인 대시보드
+│   - Coordinator 상태 표시 (running/stopped)
+│   - 시작/중지 버튼
+│   - 통계 요약 (총 세션, 성공률)
+│
+├── ChatSessionList.tsx        # 세션 목록
+│   - 활성 세션 표시 (discussing/voting)
+│   - 완료된 세션 히스토리
+│   - 필터링 (ticker, status, date)
+│
+├── ChatSessionViewer.tsx      # 토론 내용 뷰어
+│   - Agent 메시지 버블 (분석/의견/질문/답변)
+│   - 실시간 WebSocket 스트리밍
+│   - 투표 결과 차트
+│   - 최종 결정 요약
+│
+├── AgentMessageBubble.tsx     # 메시지 버블 컴포넌트
+│   - Agent 아이콘/색상 구분
+│   - 신뢰도 표시
+│   - 시간 표시
+│
+├── VotingResult.tsx           # 투표 결과 표시
+│   - Agent별 투표 내역
+│   - 가중치 적용 결과
+│   - 합의 수준 게이지
+│
+├── PositionMonitor.tsx        # 포지션 모니터링
+│   - 모니터링 중인 포지션 목록
+│   - 이벤트 알림 (손절/익절 근접)
+│   - 동기화 버튼
+│
+└── AgentChatSettings.tsx      # 설정 패널
+    - 자동매매 ON/OFF
+    - 최소 합의 수준 설정
+    - 모니터링 주기 설정
+```
+
+**API 클라이언트 필요:**
+```typescript
+// frontend/src/api/client.ts에 추가 필요
+getAgentChatStatus(): Promise<AgentChatStatus>
+startAgentChat(): Promise<void>
+stopAgentChat(): Promise<void>
+getActiveSessions(): Promise<ChatSession[]>
+getSessionHistory(): Promise<ChatSession[]>
+getSessionDetail(id: string): Promise<ChatSession>
+getSessionMessages(id: string): Promise<AgentMessage[]>
+startDiscussion(ticker: string): Promise<ChatSession>
+getPositions(): Promise<MonitoredPosition[]>
+syncPositions(): Promise<void>
+```
 
 ---
 
