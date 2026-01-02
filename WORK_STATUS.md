@@ -11,7 +11,7 @@
 |----------|------|------|------|
 | **P0** | Agent Group Chat Frontend | ✅ 완료 | 기본 UI + 시장 상태 UI 개선 |
 | P1 | 장중 테스트 | ⏳ 대기 | 호가/체결/손절익절 검증 |
-| P2 | WebSocket 체결 알림 | ❌ 미구현 | Telegram만 완료 |
+| **P2** | WebSocket 체결 알림 | ✅ 완료 | 실시간 체결 알림 구현 |
 | P3 | Live Trading 전환 | ⏳ 대기 | 모의투자 검증 후 |
 | P4 | 코드 품질 개선 | 🟢 낮음 | Pydantic deprecated 수정 |
 
@@ -51,6 +51,34 @@ frontend/src/hooks/
 ## ✅ 완료된 작업 (Git History 기준)
 
 ### 2026-01-03
+
+#### P2 WebSocket 체결 알림
+
+**구현 내역:**
+- 실시간 체결 알림 WebSocket 시스템 구현
+- Telegram 알림과 병행 동작
+
+| 컴포넌트 | 설명 |
+|----------|------|
+| `/ws/trade-notifications` | WebSocket 엔드포인트 |
+| `TradeNotificationManager` | 알림 구독자 관리 |
+| `broadcast_trade_executed()` | 체결 알림 브로드캐스트 |
+| `broadcast_trade_queued()` | 대기열 추가 알림 |
+| `broadcast_trade_rejected()` | 거부 알림 |
+| `broadcast_watch_added()` | 관심종목 추가 알림 |
+| `useTradeNotifications` hook | 프론트엔드 WebSocket 연결 |
+| `TradeNotificationToast` | 실시간 알림 UI 컴포넌트 |
+
+**파일 구조:**
+```
+backend/app/api/routes/websocket.py     # TradeNotificationManager + 엔드포인트
+backend/app/api/routes/approval.py      # WebSocket 브로드캐스트 호출
+frontend/src/hooks/useTradeNotifications.ts  # WebSocket hook (신규)
+frontend/src/components/ui/TradeNotificationToast.tsx  # Toast UI (신규)
+frontend/src/App.tsx                    # 전역 알림 통합
+```
+
+---
 
 #### P0.2 장 마감 시 매매 과정 UI/UX 개선
 

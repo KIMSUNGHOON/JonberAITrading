@@ -14,22 +14,24 @@
 # Improvement lists
 - (Done) Agent Group Chat Frontend 기본 UI 완료 → P0 완료
 - (Done) WebSocket 실시간 업데이트 → useAgentChatWebSocket hook 구현
-- (Done) PositionMonitor → 포지션 모니터링 및 이벤트 표시 구현
+- (Done) PositionMonitor → 포지션 모니터링 및 이벤트 표시 구현ㅖ
 
 # Instruction
 - (Done) Issue 개선 방안 제안 완료 → 위 Proposal 참조
 - (Done) P0.2 장 마감 시 매매 과정 UI/UX 개선 → `9a94516` 커밋 완료
+- P1, P3는 현재 테스트가 불가능하기 때문에, 이부분은 저의 요청이 있을때 까지는 작업을 진행하지 않습니다.
+- github readthedoc을 이용해서 현재까지 작업 된 프로젝트를 문서화 하고 싶습니다. 먼저 초안을 너가 만들어 줬으면 좋겠습니다. 물론 제안은 너가 하고, 너가 만들어주는겁니다.
+- 그리고 지금 까지 markdown 문서들, *.md 파일들을 모두 정리 하고, 개발 관련 문서, 프로젝트 README 등 카테고리를 나눠서 현재 버전으로 통합시키는 노력을 하십시오.
 
 ## 다음 작업 우선순위
 | 우선순위 | 작업 | 상태 | 설명 |
 |----------|------|------|------|
 | **P1** | 장중 테스트 | ⏳ 대기 | 실제 장 시간에 모의투자 매매 테스트 필요 |
-| **P2** | WebSocket 체결 알림 | ❌ 미구현 | 실시간 체결 알림 (현재 Telegram만 지원) |
+| ~~P2~~ | WebSocket 체결 알림 | ✅ 완료 | 실시간 체결 알림 구현 완료 |
 | P3 | Live Trading 전환 | ⏳ 대기 | 모의투자 검증 완료 후 진행 |
 
 ## 사용자 결정 필요
 - P1 장중 테스트: 장 시간(09:00-15:30)에 진행 필요
-- P2 WebSocket 체결 알림: 지금 구현 가능
 
 # 중요 지시 사항
 - 모든 테스트 케이스를 통과해야 합니다.

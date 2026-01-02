@@ -24,6 +24,12 @@ from app.api.schemas.approval import (
 )
 from app.dependencies import get_trading_coordinator
 from services.telegram import get_telegram_notifier
+from app.api.routes.websocket import (
+    broadcast_trade_executed,
+    broadcast_trade_queued,
+    broadcast_trade_rejected,
+    broadcast_watch_added,
+)
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -234,15 +240,60 @@ async def submit_approval(request: ApprovalRequest):
             execution_status=execution_status,
         )
 
-        # Send Telegram notification
+        # Send notifications (Telegram + WebSocket)
+        proposal = state.get("trade_proposal", {})
+        ticker = session.get("stk_cd") or session.get("ticker") or session.get("market", "")
+        stock_name = session.get("stk_nm") or session.get("stock_name", ticker)
+        action = proposal.get("action", "BUY")
+
+        # WebSocket broadcast for real-time UI updates
+        try:
+            if request.decision == "approved":
+                if action == "WATCH":
+                    technical = state.get("technical_analysis", {})
+                    await broadcast_watch_added(
+                        ticker=ticker,
+                        stock_name=stock_name,
+                        signal=technical.get("signal", "hold"),
+                        confidence=technical.get("confidence", 0.5),
+                        current_price=proposal.get("entry_price", 0),
+                        session_id=request.session_id,
+                    )
+                elif action in ("BUY", "SELL"):
+                    # Check if trade was queued or executed immediately
+                    if allocation_rationale and "queued" in allocation_rationale.lower():
+                        await broadcast_trade_queued(
+                            ticker=ticker,
+                            stock_name=stock_name,
+                            action=action,
+                            quantity=proposal.get("quantity", 0),
+                            price=proposal.get("entry_price", 0),
+                            session_id=request.session_id,
+                        )
+                    else:
+                        await broadcast_trade_executed(
+                            ticker=ticker,
+                            stock_name=stock_name,
+                            action=action,
+                            quantity=proposal.get("quantity", 0),
+                            price=proposal.get("entry_price", 0),
+                            total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
+                            session_id=request.session_id,
+                        )
+            elif request.decision == "rejected":
+                await broadcast_trade_rejected(
+                    ticker=ticker,
+                    stock_name=stock_name,
+                    reason=request.feedback,
+                    session_id=request.session_id,
+                )
+        except Exception as we:
+            logger.warning("websocket_broadcast_failed", error=str(we))
+
+        # Telegram notification
         try:
             telegram = await get_telegram_notifier()
             if telegram.is_ready:
-                proposal = state.get("trade_proposal", {})
-                ticker = session.get("stk_cd") or session.get("ticker") or session.get("market", "")
-                stock_name = session.get("stk_nm") or session.get("stock_name", ticker)
-                action = proposal.get("action", "BUY")
-
                 if request.decision == "approved":
                     # WATCH action sends watch list notification
                     if action == "WATCH":

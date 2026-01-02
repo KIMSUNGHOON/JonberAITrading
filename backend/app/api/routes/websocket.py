@@ -94,6 +94,60 @@ manager = ConnectionManager()
 
 
 # -------------------------------------------
+# Trade Notification Manager
+# -------------------------------------------
+
+
+class TradeNotificationManager:
+    """Manages WebSocket connections for trade execution notifications."""
+
+    def __init__(self):
+        self.subscribers: set[WebSocket] = set()
+
+    async def subscribe(self, websocket: WebSocket):
+        """Accept and register a WebSocket for trade notifications."""
+        await websocket.accept()
+        self.subscribers.add(websocket)
+        logger.info(
+            "trade_notification_subscribed",
+            total_subscribers=len(self.subscribers),
+        )
+
+    def unsubscribe(self, websocket: WebSocket):
+        """Remove a WebSocket from trade notifications."""
+        self.subscribers.discard(websocket)
+        logger.info(
+            "trade_notification_unsubscribed",
+            total_subscribers=len(self.subscribers),
+        )
+
+    async def broadcast(self, notification: dict):
+        """Broadcast trade notification to all subscribers."""
+        if not self.subscribers:
+            return
+
+        dead_connections = set()
+
+        for ws in self.subscribers:
+            try:
+                await ws.send_json(notification)
+            except Exception as e:
+                logger.warning(
+                    "trade_notification_send_failed",
+                    error=str(e),
+                )
+                dead_connections.add(ws)
+
+        # Clean up dead connections
+        for conn in dead_connections:
+            self.subscribers.discard(conn)
+
+
+# Global trade notification manager
+trade_notification_manager = TradeNotificationManager()
+
+
+# -------------------------------------------
 # Safe Type Conversion Helpers
 # -------------------------------------------
 
@@ -923,3 +977,214 @@ async def websocket_ticker(websocket: WebSocket):
                 await service.unsubscribe_all(ticker_callback)
             except Exception as e:
                 logger.warning("ticker_cleanup_error", error=str(e))
+
+
+# -------------------------------------------
+# Trade Notification WebSocket
+# -------------------------------------------
+
+
+@router.websocket("/trade-notifications")
+async def websocket_trade_notifications(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time trade execution notifications.
+
+    Broadcasts:
+    - trade_executed: Trade was executed (BUY/SELL)
+    - trade_queued: Trade was queued for later execution
+    - trade_rejected: Trade was rejected by user
+    - watch_added: Stock was added to watch list
+    - position_update: Position P&L update
+    - stop_loss_triggered: Stop loss was hit
+    - take_profit_triggered: Take profit was hit
+
+    Client can send:
+    - "ping": Heartbeat (server responds with "pong")
+    """
+    await trade_notification_manager.subscribe(websocket)
+
+    try:
+        # Send initial connection confirmation
+        await websocket.send_json({
+            "type": "connected",
+            "message": "Trade notification subscription active",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        while True:
+            try:
+                # Wait for client message with timeout
+                data = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=30.0,
+                )
+
+                if data == "ping":
+                    await websocket.send_text("pong")
+
+            except asyncio.TimeoutError:
+                # Send heartbeat
+                try:
+                    await websocket.send_json({
+                        "type": "heartbeat",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                except Exception:
+                    break
+
+    except WebSocketDisconnect:
+        logger.info("trade_notification_websocket_disconnected")
+    except Exception as e:
+        logger.error("trade_notification_websocket_error", error=str(e))
+    finally:
+        trade_notification_manager.unsubscribe(websocket)
+
+
+# -------------------------------------------
+# Trade Notification Broadcast Helpers
+# -------------------------------------------
+
+
+async def broadcast_trade_executed(
+    ticker: str,
+    stock_name: str,
+    action: str,
+    quantity: int,
+    price: float,
+    total_amount: float,
+    session_id: str | None = None,
+):
+    """Broadcast trade execution notification to all subscribers."""
+    await trade_notification_manager.broadcast({
+        "type": "trade_executed",
+        "data": {
+            "ticker": ticker,
+            "stock_name": stock_name,
+            "action": action,
+            "quantity": quantity,
+            "price": price,
+            "total_amount": total_amount,
+            "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+    logger.info(
+        "trade_executed_broadcast",
+        ticker=ticker,
+        action=action,
+        quantity=quantity,
+    )
+
+
+async def broadcast_trade_queued(
+    ticker: str,
+    stock_name: str,
+    action: str,
+    quantity: int,
+    price: float,
+    queue_position: int | None = None,
+    expected_execution: str | None = None,
+    session_id: str | None = None,
+):
+    """Broadcast trade queued notification to all subscribers."""
+    await trade_notification_manager.broadcast({
+        "type": "trade_queued",
+        "data": {
+            "ticker": ticker,
+            "stock_name": stock_name,
+            "action": action,
+            "quantity": quantity,
+            "price": price,
+            "queue_position": queue_position,
+            "expected_execution": expected_execution,
+            "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+    logger.info(
+        "trade_queued_broadcast",
+        ticker=ticker,
+        action=action,
+        queue_position=queue_position,
+    )
+
+
+async def broadcast_trade_rejected(
+    ticker: str,
+    stock_name: str,
+    reason: str | None = None,
+    session_id: str | None = None,
+):
+    """Broadcast trade rejection notification to all subscribers."""
+    await trade_notification_manager.broadcast({
+        "type": "trade_rejected",
+        "data": {
+            "ticker": ticker,
+            "stock_name": stock_name,
+            "reason": reason or "User rejected the proposal",
+            "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+    logger.info(
+        "trade_rejected_broadcast",
+        ticker=ticker,
+        reason=reason,
+    )
+
+
+async def broadcast_watch_added(
+    ticker: str,
+    stock_name: str,
+    signal: str,
+    confidence: float,
+    current_price: float,
+    session_id: str | None = None,
+):
+    """Broadcast watch list addition notification to all subscribers."""
+    await trade_notification_manager.broadcast({
+        "type": "watch_added",
+        "data": {
+            "ticker": ticker,
+            "stock_name": stock_name,
+            "signal": signal,
+            "confidence": confidence,
+            "current_price": current_price,
+            "session_id": session_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+    logger.info(
+        "watch_added_broadcast",
+        ticker=ticker,
+        signal=signal,
+    )
+
+
+async def broadcast_position_event(
+    event_type: str,  # "stop_loss_triggered" or "take_profit_triggered"
+    ticker: str,
+    stock_name: str,
+    trigger_price: float,
+    target_price: float,
+    pnl: float | None = None,
+    pnl_percent: float | None = None,
+):
+    """Broadcast position event (stop loss or take profit) to all subscribers."""
+    await trade_notification_manager.broadcast({
+        "type": event_type,
+        "data": {
+            "ticker": ticker,
+            "stock_name": stock_name,
+            "trigger_price": trigger_price,
+            "target_price": target_price,
+            "pnl": pnl,
+            "pnl_percent": pnl_percent,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+    logger.info(
+        f"{event_type}_broadcast",
+        ticker=ticker,
+        trigger_price=trigger_price,
+    )

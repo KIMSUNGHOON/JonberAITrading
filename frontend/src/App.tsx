@@ -15,6 +15,7 @@ import { SettingsModal } from '@/components/settings/SettingsModal';
 import { ChatToggleButton } from '@/components/chat/ChatToggleButton';
 import { ChatPopup } from '@/components/chat/ChatPopup';
 import { Toast } from '@/components/ui/Toast';
+import { TradeNotificationToast } from '@/components/ui/TradeNotificationToast';
 import { getUpbitApiStatus, getKiwoomApiStatus } from '@/api/client';
 
 function App() {
@@ -83,6 +84,13 @@ function App() {
           onClose={() => setError(null)}
         />
       )}
+
+      {/* Trade Notification Toast - Real-time WebSocket notifications */}
+      <TradeNotificationToast
+        maxToasts={5}
+        duration={5000}
+        position="top-right"
+      />
 
       {/* Main Layout - Takes remaining height */}
       <div className="flex-1 flex min-h-0">
