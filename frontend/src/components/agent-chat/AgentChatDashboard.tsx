@@ -31,6 +31,7 @@ import type {
 } from '@/types';
 import { ChatSessionList } from './ChatSessionList';
 import { ChatSessionViewer } from './ChatSessionViewer';
+import { PositionMonitor } from './PositionMonitor';
 
 interface CoordinatorConfig {
   check_interval_minutes: number;
@@ -297,11 +298,21 @@ export function AgentChatDashboard() {
         </div>
       )}
 
-      {/* Recent Sessions */}
-      <ChatSessionList
-        sessions={recentSessions}
-        onSelectSession={setSelectedSessionId}
-      />
+      {/* Main Grid - Sessions and Position Monitor */}
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+        {/* Recent Sessions (2/3 width) */}
+        <div className="xl:col-span-2">
+          <ChatSessionList
+            sessions={recentSessions}
+            onSelectSession={setSelectedSessionId}
+          />
+        </div>
+
+        {/* Position Monitor (1/3 width) */}
+        <div>
+          <PositionMonitor />
+        </div>
+      </div>
     </div>
   );
 }

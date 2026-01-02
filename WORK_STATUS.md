@@ -28,9 +28,9 @@
 - [x] ChatSessionViewer - Agent 간 대화 표시 (WebSocket 실시간 + Polling 폴백)
 - [x] Sidebar/Navigation에 Agent Chat 메뉴 추가
 - [x] useAgentChatWebSocket hook - 실시간 업데이트
+- [x] PositionMonitor - 포지션 모니터링 및 이벤트 표시
 
 #### 추가 필요 작업
-- [ ] PositionMonitor - 포지션 이벤트 알림
 - [ ] AgentChatSettings - 상세 설정 UI
 
 #### 파일 구조
@@ -39,7 +39,8 @@ frontend/src/components/agent-chat/
 ├── index.ts                   # 컴포넌트 export
 ├── AgentChatDashboard.tsx     # 메인 대시보드, 시작/중지
 ├── ChatSessionList.tsx        # 세션 목록
-└── ChatSessionViewer.tsx      # 토론 내용 뷰어 (WebSocket 실시간)
+├── ChatSessionViewer.tsx      # 토론 내용 뷰어 (WebSocket 실시간)
+└── PositionMonitor.tsx        # 포지션 모니터링 및 이벤트
 
 frontend/src/hooks/
 └── useAgentChatWebSocket.ts   # WebSocket 연결 관리 hook
