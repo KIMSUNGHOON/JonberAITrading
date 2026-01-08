@@ -1,0 +1,41 @@
+/**
+ * DashboardSummary Component
+ *
+ * Combines MarketSummaryWidget, TradingStatusCard, PopularStocksWidget,
+ * BackgroundScannerWidget, and RecentAnalysisWidget for a comprehensive dashboard overview.
+ *
+ * Replaces WelcomePanel after first visit.
+ */
+
+import { MarketSummaryWidget } from './MarketSummaryWidget';
+import { TradingStatusCard } from './TradingStatusCard';
+import { PopularStocksWidget } from './PopularStocksWidget';
+import { BackgroundScannerWidget } from './BackgroundScannerWidget';
+import { RecentAnalysisWidget } from './RecentAnalysisWidget';
+
+export function DashboardSummary() {
+  return (
+    <div className="space-y-4">
+      {/* Top Row - Market Summary + Trading Status */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Market Summary - Account overview */}
+        <MarketSummaryWidget />
+
+        {/* Auto Trading Status */}
+        <TradingStatusCard />
+      </div>
+
+      {/* Second Row - Popular Stocks + Background Scanner */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Popular Stocks - Compact List Style */}
+        <PopularStocksWidget />
+
+        {/* Background Scanner - Scan all stocks */}
+        <BackgroundScannerWidget />
+      </div>
+
+      {/* Recent Analysis Results */}
+      <RecentAnalysisWidget />
+    </div>
+  );
+}

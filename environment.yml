@@ -1,0 +1,75 @@
+# Anaconda Environment Configuration
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate agentic-trading
+#
+# Update existing environment:
+#   conda env update -f environment.yml --prune
+
+name: agentic-trading
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python version
+  - python=3.12
+
+  # Core dependencies (conda)
+  - pip
+  - numpy>=1.26.0
+  - pandas>=2.2.0
+
+  # Development tools
+  - pytest>=8.0.0
+  - pytest-asyncio>=0.24.0
+  - pytest-cov>=5.0.0
+  - black>=24.0.0
+  - isort>=5.13.0
+  - mypy>=1.8.0
+
+  # Pip dependencies (latest stable versions)
+  - pip:
+      # Web Framework
+      - fastapi>=0.115.0
+      - uvicorn[standard]>=0.32.0
+      - pydantic[email]>=2.10.0
+      - pydantic-settings>=2.6.0
+
+      # LangChain & LangGraph
+      - langchain>=0.3.0
+      - langchain-community>=0.3.0
+      - langchain-openai>=0.2.0
+      - langgraph>=0.2.0
+
+      # Async & HTTP
+      - websockets>=13.0
+      - aiohttp>=3.11.0
+      - httpx>=0.28.0
+
+      # Market Data
+      - yfinance>=0.2.50
+
+      # Storage & State
+      - aiosqlite>=0.20.0
+      - diskcache>=5.6.0
+      - redis[hiredis]>=5.0.0
+
+      # Authentication
+      - PyJWT>=2.8.0
+
+      # Notifications
+      - python-telegram-bot>=20.0
+
+      # Utilities
+      - python-dotenv>=1.0.0
+      - structlog>=24.4.0
+      - tenacity>=9.0.0
+      - watchfiles>=1.0.0  # For uvicorn hot-reload
+      - apscheduler>=3.10.0  # For scheduled tasks (Agent Chat Coordinator)
+
+      # LLM Providers (optional - install based on platform)
+      # Windows/Linux with NVIDIA GPU:
+      #   pip install vllm
+      # All platforms:
+      #   ollama is installed separately (brew install ollama / download from ollama.ai)

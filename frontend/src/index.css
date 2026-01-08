@@ -1,0 +1,125 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Base styles */
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-surface text-gray-100;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    @apply w-2 h-2;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-surface-dark;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-border-light;
+  }
+}
+
+/* Component styles */
+@layer components {
+  /* Card component */
+  .card {
+    @apply bg-surface-light rounded-xl border border-border p-4;
+  }
+
+  /* Button variants */
+  .btn {
+    @apply px-4 py-2 rounded-lg font-medium transition-all duration-200
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-primary {
+    @apply btn bg-blue-600 hover:bg-blue-700 text-white;
+  }
+
+  .btn-success {
+    @apply btn bg-bull hover:bg-bull-dark text-white;
+  }
+
+  .btn-danger {
+    @apply btn bg-bear hover:bg-bear-dark text-white;
+  }
+
+  .btn-warning {
+    @apply btn bg-amber-600 hover:bg-amber-700 text-white;
+  }
+
+  .btn-ghost {
+    @apply btn bg-transparent hover:bg-surface-light text-gray-300;
+  }
+
+  /* Input styling */
+  .input {
+    @apply w-full bg-surface border border-border rounded-lg px-4 py-3
+           text-white placeholder-gray-500
+           focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent
+           transition-all duration-200;
+  }
+
+  /* Signal badges */
+  .signal-buy {
+    @apply bg-bull/20 text-bull border border-bull/30;
+  }
+
+  .signal-sell {
+    @apply bg-bear/20 text-bear border border-bear/30;
+  }
+
+  .signal-hold {
+    @apply bg-yellow-500/20 text-yellow-500 border border-yellow-500/30;
+  }
+
+  /* Live indicator */
+  .live-indicator {
+    @apply flex items-center gap-1.5;
+  }
+
+  .live-indicator::before {
+    content: '';
+    @apply w-2 h-2 bg-bull rounded-full animate-pulse;
+  }
+}
+
+/* Utility styles */
+@layer utilities {
+  /* Text gradient */
+  .text-gradient {
+    @apply bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent;
+  }
+
+  /* Glass effect */
+  .glass {
+    @apply bg-surface-light/80 backdrop-blur-lg;
+  }
+
+  /* Hide scrollbar but keep functionality */
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Mobile safe area */
+  .safe-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
