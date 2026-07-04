@@ -13,7 +13,7 @@ import asyncio
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.llm_provider import get_llm_provider, reset_llm_provider
@@ -188,166 +188,39 @@ if settings.DEBUG:
 # =============================================================================
 
 
-def register_v1_routes(app: FastAPI) -> None:
-    """Register API v1 routes with /api/v1 prefix."""
-    # Unified Analysis (recommended for new integrations)
-    app.include_router(
-        analysis_unified.router,
-        prefix="/api/v1/unified-analysis",
-        tags=["v1 - Unified Analysis"],
-    )
-    app.include_router(
-        analysis.router,
-        prefix="/api/v1/analysis",
-        tags=["v1 - Analysis"],
-    )
-    app.include_router(
-        approval.router,
-        prefix="/api/v1/approval",
-        tags=["v1 - Approval"],
-    )
-    app.include_router(
-        auth.router,
-        prefix="/api/v1/auth",
-        tags=["v1 - Authentication"],
-    )
-    app.include_router(
-        coin.router,
-        prefix="/api/v1/coin",
-        tags=["v1 - Coin"],
-    )
-    app.include_router(
-        kr_stocks.router,
-        prefix="/api/v1/kr_stocks",
-        tags=["v1 - Korean Stocks"],
-    )
-    app.include_router(
-        chat.router,
-        prefix="/api/v1/chat",
-        tags=["v1 - Chat"],
-    )
-    app.include_router(
-        indicators.router,
-        prefix="/api/v1",
-        tags=["v1 - Indicators"],
-    )
-    app.include_router(
-        settings_routes.router,
-        prefix="/api/v1/settings",
-        tags=["v1 - Settings"],
-    )
-    app.include_router(
-        news.router,
-        prefix="/api/v1",
-        tags=["v1 - News"],
-    )
-    app.include_router(
-        trading.router,
-        prefix="/api/v1",
-        tags=["v1 - Trading"],
-    )
-    app.include_router(
-        scanner.router,
-        prefix="/api/v1",
-        tags=["v1 - Scanner"],
-    )
-    app.include_router(
-        holidays.router,
-        prefix="/api/v1",
-        tags=["v1 - Holidays"],
-    )
-    app.include_router(
-        agent_chat.router,
-        prefix="/api/v1",
-        tags=["v1 - Agent Chat"],
-    )
+# (router, sub-path, tag-name). An empty sub-path means the router carries its
+# own internal prefix (e.g. indicators -> /indicators, agent_chat -> /agent-chat).
+_API_ROUTERS: list[tuple[APIRouter, str, str]] = [
+    (analysis_unified.router, "unified-analysis", "Unified Analysis"),
+    (analysis.router, "analysis", "Analysis"),
+    (approval.router, "approval", "Approval"),
+    (auth.router, "auth", "Authentication"),
+    (coin.router, "coin", "Coin"),
+    (kr_stocks.router, "kr_stocks", "Korean Stocks"),
+    (chat.router, "chat", "Chat"),
+    (indicators.router, "", "Indicators"),
+    (settings_routes.router, "settings", "Settings"),
+    (news.router, "", "News"),
+    (trading.router, "", "Trading"),
+    (scanner.router, "", "Scanner"),
+    (holidays.router, "", "Holidays"),
+    (agent_chat.router, "", "Agent Chat"),
+]
 
 
-def register_legacy_routes(app: FastAPI) -> None:
+def register_api_routes(app: FastAPI) -> None:
+    """Mount every router under both the /api/v1 and legacy /api prefixes.
+
+    The frontend depends on the legacy /api/* prefix (see frontend/src/api/client.ts);
+    keep both until the frontend migrates.
     """
-    Register legacy API routes (/api/*) for backward compatibility.
-
-    These routes will be deprecated in a future version.
-    New clients should use /api/v1/* endpoints.
-    """
-    # Unified Analysis (also available on legacy path)
-    app.include_router(
-        analysis_unified.router,
-        prefix="/api/unified-analysis",
-        tags=["Legacy - Unified Analysis"],
-    )
-    app.include_router(
-        analysis.router,
-        prefix="/api/analysis",
-        tags=["Legacy - Analysis"],
-    )
-    app.include_router(
-        approval.router,
-        prefix="/api/approval",
-        tags=["Legacy - Approval"],
-    )
-    app.include_router(
-        auth.router,
-        prefix="/api/auth",
-        tags=["Legacy - Authentication"],
-    )
-    app.include_router(
-        coin.router,
-        prefix="/api/coin",
-        tags=["Legacy - Coin"],
-    )
-    app.include_router(
-        kr_stocks.router,
-        prefix="/api/kr_stocks",
-        tags=["Legacy - Korean Stocks"],
-    )
-    app.include_router(
-        chat.router,
-        prefix="/api/chat",
-        tags=["Legacy - Chat"],
-    )
-    app.include_router(
-        indicators.router,
-        prefix="/api",
-        tags=["Legacy - Indicators"],
-    )
-    app.include_router(
-        settings_routes.router,
-        prefix="/api/settings",
-        tags=["Legacy - Settings"],
-    )
-    app.include_router(
-        news.router,
-        prefix="/api",
-        tags=["Legacy - News"],
-    )
-    app.include_router(
-        trading.router,
-        prefix="/api",
-        tags=["Legacy - Trading"],
-    )
-    app.include_router(
-        scanner.router,
-        prefix="/api",
-        tags=["Legacy - Scanner"],
-    )
-    app.include_router(
-        holidays.router,
-        prefix="/api",
-        tags=["Legacy - Holidays"],
-    )
-    app.include_router(
-        agent_chat.router,
-        prefix="/api",
-        tags=["Legacy - Agent Chat"],
-    )
+    for base, label in (("/api/v1", "v1"), ("/api", "Legacy")):
+        for router, subpath, name in _API_ROUTERS:
+            prefix = f"{base}/{subpath}" if subpath else base
+            app.include_router(router, prefix=prefix, tags=[f"{label} - {name}"])
 
 
-# Register API v1 routes (new standard)
-register_v1_routes(app)
-
-# Register legacy routes for backward compatibility
-register_legacy_routes(app)
+register_api_routes(app)
 
 # WebSocket (version-independent)
 app.include_router(
