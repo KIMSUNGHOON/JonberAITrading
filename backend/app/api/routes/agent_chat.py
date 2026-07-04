@@ -104,6 +104,16 @@ class StartCoordinatorRequest(BaseModel):
 # -------------------------------------------
 
 
+# Per-agent consensus weights (mirror of services.agent_chat.models.calculate_consensus)
+_AGENT_WEIGHTS = {
+    "technical": 0.25,
+    "fundamental": 0.25,
+    "sentiment": 0.20,
+    "risk": 0.30,
+    "moderator": 0.0,
+}
+
+
 def _session_to_summary(session: ChatSession) -> dict:
     """Convert session to summary dict."""
     return {
@@ -158,8 +168,10 @@ def _session_to_detail(session: ChatSession) -> dict:
                 "agent_type": v.agent_type.value,
                 "vote": v.vote.value,
                 "confidence": v.confidence,
-                "weight": v.weight,
-                "weighted_score": v.weighted_score,
+                "weight": _AGENT_WEIGHTS.get(v.agent_type.value, 0.25),
+                "weighted_score": round(
+                    _AGENT_WEIGHTS.get(v.agent_type.value, 0.25) * v.confidence, 4
+                ),
                 "reasoning": v.reasoning,
             }
             for v in session.votes
