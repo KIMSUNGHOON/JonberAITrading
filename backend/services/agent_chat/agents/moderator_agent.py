@@ -325,6 +325,11 @@ class ModeratorAgent(BaseDiscussionAgent):
         # Parse action
         action = self._parse_action(response, context.has_position)
 
+        # --- Consensus safety gate ---
+        # If agents did not reach the required agreement level, refuse to trade.
+        if session.consensus_level < session.consensus_threshold:
+            action = DecisionAction.HOLD if context.has_position else DecisionAction.NO_ACTION
+
         # Get weighted confidence
         confidence = calculate_weighted_confidence(session.votes)
 
