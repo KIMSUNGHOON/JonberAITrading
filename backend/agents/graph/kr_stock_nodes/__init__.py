@@ -19,7 +19,6 @@ from .analysis_nodes import (
     kr_stock_fundamental_analysis_node,
     kr_stock_sentiment_analysis_node,
 )
-from .parallel_analysis import kr_stock_parallel_analysis_node
 from .decision_nodes import (
     kr_stock_risk_assessment_node,
     kr_stock_strategic_decision_node,
@@ -65,7 +64,6 @@ __all__ = [
     "kr_stock_technical_analysis_node",
     "kr_stock_fundamental_analysis_node",
     "kr_stock_sentiment_analysis_node",
-    "kr_stock_parallel_analysis_node",
     "kr_stock_risk_assessment_node",
     "kr_stock_strategic_decision_node",
     "kr_stock_human_approval_node",
