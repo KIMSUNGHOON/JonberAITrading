@@ -10,6 +10,7 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
+import { pnlColor } from '../../utils/pnl';
 import {
   TrendingUp,
   TrendingDown,
@@ -263,7 +264,7 @@ export function MarketSummaryWidget() {
     );
   }
 
-  const profitColor = (summaryData?.profitLoss ?? 0) >= 0 ? 'text-red-400' : 'text-blue-400';
+  const profitColor = pnlColor(summaryData?.profitLoss ?? 0);
   const ProfitIcon = (summaryData?.profitLoss ?? 0) >= 0 ? TrendingUp : TrendingDown;
 
   return (

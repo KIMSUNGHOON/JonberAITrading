@@ -6,6 +6,7 @@
  */
 
 import { useState, useEffect } from 'react';
+import { pnlColor } from '../../utils/pnl';
 import { TrendingUp, TrendingDown, X, RefreshCw, AlertCircle, Target, Shield, Building2 } from 'lucide-react';
 import { getKRStockPositions, closeKRStockPosition } from '@/api/client';
 import type { KRStockPosition } from '@/types';
@@ -132,9 +133,7 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
           </div>
           <div className="flex items-center justify-between mt-1">
             <span className="text-gray-400">총 손익</span>
-            <div className={`flex items-center gap-1 font-semibold ${
-              totalPnl >= 0 ? 'text-red-400' : 'text-blue-400'
-            }`}>
+            <div className={`flex items-center gap-1 font-semibold ${pnlColor(totalPnl)}`}>
               {totalPnl >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
               <span>{totalPnl >= 0 ? '+' : ''}{formatKRW(totalPnl)}원</span>
               <span className="text-xs">({totalPnlPct >= 0 ? '+' : ''}{totalPnlPct.toFixed(2)}%)</span>
@@ -172,7 +171,7 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
               </div>
               <div className="flex items-center justify-between text-sm mt-1">
                 <span className="text-gray-400">평가손익</span>
-                <span className={position.unrealized_pnl >= 0 ? 'text-red-400' : 'text-blue-400'}>
+                <span className={pnlColor(position.unrealized_pnl)}>
                   {position.unrealized_pnl >= 0 ? '+' : ''}{formatKRW(position.unrealized_pnl)}원
                   ({position.unrealized_pnl_pct >= 0 ? '+' : ''}{position.unrealized_pnl_pct.toFixed(2)}%)
                 </span>

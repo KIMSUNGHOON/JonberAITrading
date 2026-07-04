@@ -6,6 +6,7 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
+import { pnlColor as pnlColorOf } from '../../utils/pnl';
 import {
   Activity,
   TrendingUp,
@@ -115,7 +116,7 @@ function formatTime(timestamp: string): string {
 
 function PositionCard({ position }: { position: AgentChatMonitoredPosition }) {
   const [expanded, setExpanded] = useState(false);
-  const pnlColor = position.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400';
+  const pnlColor = pnlColorOf(position.unrealized_pnl);
 
   return (
     <div className="bg-gray-800 rounded-lg p-4">
@@ -319,7 +320,7 @@ export function PositionMonitor({ compact = false }: PositionMonitorProps) {
     );
   }
 
-  const pnlColor = summary.total_unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400';
+  const pnlColor = pnlColorOf(summary.total_unrealized_pnl);
 
   return (
     <div className="bg-gray-900 rounded-xl border border-gray-800 p-6 space-y-6">

@@ -9,6 +9,7 @@
  */
 
 import { useState, useEffect, useMemo, useRef } from 'react';
+import { changeColor } from '../../utils/pnl';
 import { TrendingUp, TrendingDown, Minus, Loader2 } from 'lucide-react';
 import { useStore } from '@/store';
 import { getCoinTickers, getCoinMarkets, getKRStockTicker } from '@/api/client';
@@ -209,11 +210,7 @@ export function PopularTickerBar() {
     return <Minus className="w-3 h-3" />;
   };
 
-  const getChangeColor = (change: string) => {
-    if (change === 'RISE') return 'text-green-400';
-    if (change === 'FALL') return 'text-red-400';
-    return 'text-gray-400';
-  };
+  const getChangeColor = (change: string) => changeColor(change);
 
   // Don't show for US stocks (no data source yet)
   if (activeMarket === 'stock') {
