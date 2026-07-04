@@ -152,7 +152,7 @@ function getSignalConfig(signal: string) {
     hold: {
       icon: <Minus className="w-3 h-3" />,
       className: 'signal-hold',
-      barColor: 'bg-yellow-500',
+      barColor: 'bg-hairline',
     },
   };
 

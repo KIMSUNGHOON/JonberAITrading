@@ -2,6 +2,13 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Design tokens as CSS vars — for non-Tailwind consumers (lightweight-charts) */
+:root {
+  --canvas:#0b0e11; --card:#161a1f; --elevated:#1c222a; --hairline:#242c37;
+  --ink:#e8ecf1; --muted:#7b8794; --dim:#565e6b;
+  --accent:#f0b90b; --up:#0ecb81; --down:#f6465d; --warn:#f0a63a; --info:#4b9fff;
+}
+
 /* Base styles */
 @layer base {
   * {
@@ -9,7 +16,7 @@
   }
 
   body {
-    @apply bg-surface text-gray-100;
+    @apply bg-canvas text-ink;
     font-feature-settings: "rlig" 1, "calt" 1;
   }
 
@@ -35,7 +42,7 @@
 @layer components {
   /* Card component */
   .card {
-    @apply bg-surface-light rounded-xl border border-border p-4;
+    @apply bg-card rounded-md border border-hairline p-3;
   }
 
   /* Button variants */
@@ -82,7 +89,7 @@
   }
 
   .signal-hold {
-    @apply bg-yellow-500/20 text-yellow-500 border border-yellow-500/30;
+    @apply bg-elevated text-muted border border-hairline;
   }
 
   /* Live indicator */
@@ -98,14 +105,9 @@
 
 /* Utility styles */
 @layer utilities {
-  /* Text gradient */
-  .text-gradient {
-    @apply bg-gradient-to-r from-blue-400 to-purple-500 bg-clip-text text-transparent;
-  }
-
-  /* Glass effect */
-  .glass {
-    @apply bg-surface-light/80 backdrop-blur-lg;
+  /* Tabular figures — apply to every number surface (prices, %, P&L, qty) */
+  .num {
+    font-variant-numeric: tabular-nums;
   }
 
   /* Hide scrollbar but keep functionality */

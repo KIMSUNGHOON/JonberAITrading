@@ -40,7 +40,7 @@ export function WelcomePanel() {
         {/* Title */}
         <h1 className="text-3xl font-bold mb-4">
           Welcome to{' '}
-          <span className="text-gradient">Agentic Trading</span>
+          <span className="text-accent">Agentic Trading</span>
         </h1>
 
         {/* Description */}

@@ -55,8 +55,8 @@ export function TradingChart({
 
     const chart = createChart(containerRef.current, {
       layout: {
-        background: { type: ColorType.Solid, color: '#0f1419' },
-        textColor: '#9ca3af',
+        background: { type: ColorType.Solid, color: '#0b0e11' },
+        textColor: '#7b8794',
       },
       grid: {
         vertLines: { color: '#1f2937' },
