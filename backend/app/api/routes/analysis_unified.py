@@ -83,16 +83,15 @@ async def _run_analysis_task(
                 "reasoning_log": [],
             }
         elif market_type == "coin":
-            from agents.graph.coin_graph import get_coin_trading_graph
+            from agents.graph.coin_trading_graph import get_coin_trading_graph
+            from agents.graph.coin_state import create_coin_initial_state
 
             graph = get_coin_trading_graph()
-            initial_state = {
-                "market": ticker,
-                "korean_name": name,
-                "user_query": query or f"{ticker} 분석해주세요",
-                "messages": [],
-                "reasoning_log": [],
-            }
+            initial_state = create_coin_initial_state(
+                market=ticker,
+                korean_name=name,
+                user_query=query or f"{ticker} 분석해주세요",
+            )
         else:
             # Default stock graph
             from agents.graph.trading_graph import get_trading_graph
