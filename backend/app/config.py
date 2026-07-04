@@ -6,7 +6,7 @@ Loads settings from environment variables with sensible defaults.
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +36,33 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = Field(default=0.6, ge=0.0, le=2.0)
     LLM_MAX_TOKENS: int = Field(default=4096, ge=1, le=32768)
     LLM_TIMEOUT: int = Field(default=300, ge=10, le=600)  # Increased for complex LLM analysis
+
+    # -------------------------------------------
+    # OpenRouter (cloud LLM — the ONLY secret in the intelligence layer)
+    # CLIs (claude/codex) are keyless: they authenticate via local subscription OAuth.
+    # -------------------------------------------
+    OPENROUTER_API_KEY: SecretStr | None = None
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_MODEL: str = "deepseek-v4-flash"
+    OPENROUTER_DAILY_BUDGET_USD: float | None = 5.0
+
+    # Local backend (Ollama/vLLM) — retired from default chains; opt-in for Windows GPU.
+    LLM_LOCAL_ENABLED: bool = False
+
+    # CLI backends (keyless — auth via local OAuth subscription).
+    CLAUDE_CLI_PATH: str = "claude"
+    CODEX_CLI_PATH: str = "codex"
+    CLAUDE_STRATEGIC_MODEL: str = "opus"
+    CLAUDE_FALLBACK_MODEL: str = "sonnet"
+    CODEX_MODEL: str | None = None  # None -> codex account default
+
+    # Per-backend concurrency + timeouts (seconds).
+    LLM_OPENROUTER_CONCURRENCY: int = 8
+    LLM_CLI_CONCURRENCY: int = 2
+    LLM_LOCAL_CONCURRENCY: int = 3
+    LLM_CLI_TIMEOUT: int = 180
+    LLM_CIRCUIT_FAIL_THRESHOLD: int = 3
+    LLM_CIRCUIT_COOLDOWN: int = 60
 
     # -------------------------------------------
     # Market Data Configuration
