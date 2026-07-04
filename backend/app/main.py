@@ -143,6 +143,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("holiday_service_init_failed", error=str(e))
 
+    # Initialize the LLM router (best-effort CLI/HTTP health probes for /api/llm/stats)
+    try:
+        from agents.llm.router import get_router
+
+        await get_router().startup()
+        logger.info("llm_router_ready")
+    except Exception as e:
+        logger.warning("llm_router_startup_failed", error=str(e))
+
     yield
 
     # Shutdown
@@ -151,6 +160,14 @@ async def lifespan(app: FastAPI):
     await llm.close()
     reset_llm_provider()
     await close_storage_service()
+
+    # Close the LLM router
+    try:
+        from agents.llm.router import get_router
+
+        await get_router().aclose()
+    except Exception:
+        pass
 
     # Close holiday service
     try:
@@ -223,6 +240,15 @@ def register_api_routes(app: FastAPI) -> None:
 
 
 register_api_routes(app)
+
+
+@app.get("/api/llm/stats", tags=["LLM Router"])
+@app.get("/api/v1/llm/stats", tags=["LLM Router"])
+async def llm_router_stats() -> dict:
+    """Per-backend health, circuit state, and OpenRouter budget for the router."""
+    from agents.llm.router import get_router
+
+    return get_router().snapshot()
 
 # WebSocket (version-independent)
 app.include_router(
