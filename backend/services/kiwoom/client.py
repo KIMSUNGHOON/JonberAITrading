@@ -1105,17 +1105,12 @@ class KiwoomClient:
         next_key = ""
 
         while True:
-            # 연속 조회 헤더 설정
-            extra_headers = {}
-            if cont_yn == "Y":
-                extra_headers["cont-yn"] = cont_yn
-                extra_headers["next-key"] = next_key
-
             response = await self._request(
                 api_id="ka10099",
                 endpoint="/api/dostk/stkinfo",
                 data={"mrkt_tp": market_type.value},
-                extra_headers=extra_headers if extra_headers else None,
+                cont_yn=cont_yn if cont_yn == "Y" else "",
+                next_key=next_key if cont_yn == "Y" else "",
             )
 
             # 응답 파싱
