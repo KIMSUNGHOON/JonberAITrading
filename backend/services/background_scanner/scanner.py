@@ -928,7 +928,7 @@ KEY_FACTORS: [주요 판단 근거 3가지, 쉼표로 구분]
                 SystemMessage(content="당신은 한국 주식 시장 전문 분석가입니다."),
                 HumanMessage(content=prompt),
             ]
-            response = await llm.generate(messages)
+            response = await llm.generate(messages, task="scanner")
 
             # Parse LLM response
             action, confidence, summary, key_factors = self._parse_llm_response(
@@ -1006,7 +1006,7 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
                 SystemMessage(content="당신은 한국 주식 시장 전문 분석가입니다. 주어진 기술적 지표와 시장 데이터를 기반으로 종목을 분석합니다."),
                 HumanMessage(content=batch_prompt),
             ]
-            response = await llm.generate(messages)
+            response = await llm.generate(messages, task="scanner")
 
             # Parse batch response
             results = self._parse_batch_llm_response(response, stocks_data)
