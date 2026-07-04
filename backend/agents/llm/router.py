@@ -165,6 +165,8 @@ class Router:
                 continue
             if bn in self._unavailable:
                 continue
+            if self._health_cache.get(bn) is False:  # probed down at startup
+                continue
             if not self._breakers[bn].allow():
                 continue
             if streaming and not backend.supports_stream:

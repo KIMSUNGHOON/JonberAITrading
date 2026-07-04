@@ -86,3 +86,37 @@ async def test_codex_prompt_via_stdin_not_argv(monkeypatch):
     assert "danger $(whoami)" in captured["stdin"]
     assert all("danger" not in a for a in captured["argv"])
     assert "-s" in captured["argv"] and captured["argv"][captured["argv"].index("-s") + 1] == "read-only"
+
+
+# ---------- missing-binary -> BackendAuthError (so the router falls through) ----------
+
+@pytest.mark.asyncio
+async def test_claude_missing_binary_maps_to_auth_error(monkeypatch):
+    from agents.llm.backends.base import BackendAuthError
+
+    async def boom(*a, **k):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'claude'")
+
+    monkeypatch.setattr("agents.llm.backends.claude_cli.run_cli", boom)
+    with pytest.raises(BackendAuthError):
+        await ClaudeCLIBackend().generate([HumanMessage(content="hi")])
+
+
+@pytest.mark.asyncio
+async def test_codex_missing_binary_maps_to_auth_error(monkeypatch):
+    from agents.llm.backends.base import BackendAuthError
+
+    async def boom(*a, **k):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'codex'")
+
+    monkeypatch.setattr("agents.llm.backends.codex_cli.run_cli", boom)
+    with pytest.raises(BackendAuthError):
+        await CodexCLIBackend().generate([HumanMessage(content="hi")])
+
+
+@pytest.mark.asyncio
+async def test_claude_non_object_json_is_backend_error(monkeypatch):
+    b = ClaudeCLIBackend()
+    monkeypatch.setattr("agents.llm.backends.claude_cli.run_cli", AsyncMock(return_value=(0, '"just a string"', "")))
+    with pytest.raises(BackendError):
+        await b.generate([HumanMessage(content="hi")])

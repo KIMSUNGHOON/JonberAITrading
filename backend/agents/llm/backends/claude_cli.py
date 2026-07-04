@@ -68,6 +68,9 @@ class ClaudeCLIBackend(LLMBackend):
         cwd = tempfile.mkdtemp(prefix="claudecli-")
         try:
             rc, out, err = await run_cli(argv, stdin=None, timeout=self.timeout, cwd=cwd)
+        except (FileNotFoundError, PermissionError) as e:
+            # missing/unrunnable binary -> permanent; router marks unavailable + falls through
+            raise BackendAuthError(f"claude CLI unavailable at '{self.cli_path}': {e}")
         finally:
             shutil.rmtree(cwd, ignore_errors=True)
 
@@ -77,6 +80,8 @@ class ClaudeCLIBackend(LLMBackend):
             obj = json.loads(out)
         except json.JSONDecodeError:
             raise BackendError(f"claude output not JSON: {out[:200]}")
+        if not isinstance(obj, dict):
+            raise BackendError(f"claude output not a JSON object: {out[:200]}")
         if obj.get("subtype") != "success" or obj.get("is_error"):
             raise self._classify(
                 f"claude failure subtype={obj.get('subtype')}: {str(obj.get('result'))[:200]}",

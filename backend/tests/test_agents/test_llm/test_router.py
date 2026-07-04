@@ -127,3 +127,27 @@ def test_snapshot_shape():
     r = _router({BackendName.OPENROUTER: FakeBackend(BackendName.OPENROUTER)})
     snap = r.snapshot()
     assert "backends" in snap
+
+
+# ---------- health cache gating + missing-CLI fall-through ----------
+
+def test_unhealthy_backend_dropped_from_resolve():
+    r = _router({BackendName.OPENROUTER: FakeBackend(BackendName.OPENROUTER)})
+    r._health_cache[BackendName.OPENROUTER] = False  # probed down at startup
+    assert r.resolve(TaskType.SCANNER, streaming=False) == []
+
+
+@pytest.mark.asyncio
+async def test_auth_error_falls_through_and_marks_unavailable():
+    from agents.llm.backends.base import BackendAuthError
+
+    bad = FakeBackend(BackendName.CLAUDE_CLI, error=BackendAuthError("cli not found"))
+    good = FakeBackend(BackendName.OPENROUTER, result="ok")
+    r = _router({BackendName.OPENROUTER: good, BackendName.CLAUDE_CLI: bad})
+    out = await r.generate([HumanMessage(content="x")], task=TaskType.STRATEGIC_DECISION)
+    assert out == "ok"
+    assert BackendName.CLAUDE_CLI in r._unavailable  # won't be retried next call
+    # next call skips claude entirely
+    bad_calls = bad.calls
+    await r.generate([HumanMessage(content="x")], task=TaskType.STRATEGIC_DECISION)
+    assert bad.calls == bad_calls

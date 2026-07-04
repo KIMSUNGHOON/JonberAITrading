@@ -74,7 +74,11 @@ class CodexCLIBackend(LLMBackend):
         preamble = f"{system_str}\n\n---\n{_PREAMBLE}" if system_str else _PREAMBLE
         stdin = f"{preamble}\n\n{user_str}"
         try:
-            rc, out, err = await run_cli(argv, stdin=stdin, timeout=self.timeout, cwd=tmpdir)
+            try:
+                rc, out, err = await run_cli(argv, stdin=stdin, timeout=self.timeout, cwd=tmpdir)
+            except (FileNotFoundError, PermissionError) as e:
+                # missing/unrunnable binary -> permanent; router marks unavailable + falls through
+                raise BackendAuthError(f"codex CLI unavailable at '{self.cli_path}': {e}")
             if rc != 0:
                 raise self._classify(f"codex exited {rc}: {err[:200]}", err)
             try:

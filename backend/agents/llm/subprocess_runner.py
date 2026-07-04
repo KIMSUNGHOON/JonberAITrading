@@ -34,6 +34,10 @@ async def run_cli(
         proc.kill()
         await proc.wait()
         raise TimeoutError(f"CLI timed out after {timeout}s: {argv[0]}")
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
     return (
         proc.returncode if proc.returncode is not None else -1,
         stdout.decode("utf-8", errors="replace"),
