@@ -184,7 +184,9 @@ if settings.DEBUG:
     app.add_middleware(RequestLoggingMiddleware, log_request_body=True)
 
 # =============================================================================
-# API Version 1 Routes (/api/v1/*)
+# API Routes — every router mounts under both the versioned (/api/v1/*) and
+# legacy (/api/*) prefixes. The frontend depends on the legacy /api/* prefix
+# (see frontend/src/api/client.ts); keep both until the frontend migrates.
 # =============================================================================
 
 
