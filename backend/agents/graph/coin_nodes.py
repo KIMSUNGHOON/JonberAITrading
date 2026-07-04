@@ -26,6 +26,11 @@ from agents.graph.coin_state import (
     get_all_coin_analyses,
 )
 from agents.llm_provider import get_llm_provider
+from agents.graph.shared_extractors import (
+    extract_key_factors as _extract_key_factors,
+    extract_bull_case as _extract_bull_case,
+    extract_bear_case as _extract_bear_case,
+)
 from agents.prompts import (
     COIN_MARKET_ANALYST_PROMPT,
     COIN_RISK_ASSESSOR_PROMPT,
@@ -1077,36 +1082,3 @@ def _signal_to_action(signal: SignalType) -> TradeAction:
     elif signal in (SignalType.STRONG_SELL, SignalType.SELL):
         return TradeAction.SELL
     return TradeAction.HOLD
-
-
-def _extract_key_factors(response: str) -> list[str]:
-    """Extract key factors from LLM response."""
-    factors = []
-    lines = response.split("\n")
-
-    for line in lines:
-        line = line.strip()
-        if line.startswith(("-", "•", "*")) or (line and line[0].isdigit() and "." in line[:3]):
-            clean = line.lstrip("-•*0123456789. ").strip()
-            if clean and len(clean) > 10:
-                factors.append(clean[:200])
-
-    return factors[:5]
-
-
-def _extract_bull_case(response: str) -> str:
-    """Extract bull case from response."""
-    lower = response.lower()
-    if "bull" in lower:
-        start = lower.find("bull")
-        return response[start : start + 500]
-    return ""
-
-
-def _extract_bear_case(response: str) -> str:
-    """Extract bear case from response."""
-    lower = response.lower()
-    if "bear" in lower:
-        start = lower.find("bear")
-        return response[start : start + 500]
-    return ""
