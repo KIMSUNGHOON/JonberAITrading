@@ -8,13 +8,14 @@
  * activeMarket so switching the market tab re-fetches (the tile never remounts).
  */
 import { useEffect, useState } from 'react';
-import { useStore } from '@/store';
+import { useStore, selectChartSymbol } from '@/store';
 import { getKRStockPositions, getCoinPositions } from '@/api/client';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting, TH, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
 
 interface Row {
   sym: string;
+  code: string; // chartable symbol: KR 6-digit code or coin KRW-XXX market
   qty: number;
   entry: number;
   cur: number;
@@ -50,6 +51,7 @@ function usePositions() {
           setRows(
             res.positions.map((p) => ({
               sym: p.stk_nm || p.stk_cd,
+              code: p.stk_cd,
               qty: p.quantity,
               entry: p.avg_entry_price,
               cur: p.current_price,
@@ -65,6 +67,7 @@ function usePositions() {
           setRows(
             res.positions.map((p) => ({
               sym: p.currency || p.market,
+              code: p.market,
               qty: p.quantity,
               entry: p.avg_entry_price,
               cur: p.current_price,
@@ -96,6 +99,8 @@ function usePositions() {
 
 export function PositionsPanel() {
   const { activeMarket, rows, state, err } = usePositions();
+  const setChartSymbol = useStore((s) => s.setChartSymbol);
+  const chartSymbol = useStore(selectChartSymbol);
 
   if (state === 'unsupported') return <Awaiting label="US 포지션 미연동 (SIM)" />;
   if (state === 'loading') return <Awaiting label="포지션 로드 중…" />;
@@ -118,7 +123,14 @@ export function PositionsPanel() {
       </thead>
       <tbody>
         {rows.map((r, i) => (
-          <tr key={`${r.sym}-${i}`} className="border-b border-hairline/60 hover:bg-elevated/40">
+          <tr
+            key={`${r.code}-${i}`}
+            onClick={() => setChartSymbol(r.code)}
+            title="차트에 표시"
+            className={`border-b border-hairline/60 cursor-pointer hover:bg-elevated/40 ${
+              chartSymbol === r.code ? 'bg-elevated/60' : ''
+            }`}
+          >
             <td className="text-left px-2.5 py-1 font-semibold truncate max-w-[120px]">{r.sym}</td>
             <td className="text-right px-2.5 py-1">{fmtInt(r.qty)}</td>
             <td className="text-right px-2.5 py-1 text-muted">{fmtPrice(r.entry, activeMarket)}</td>

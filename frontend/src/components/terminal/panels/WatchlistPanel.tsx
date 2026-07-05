@@ -10,7 +10,7 @@
  */
 import { useEffect } from 'react';
 import { useShallow } from 'zustand/shallow';
-import { useStore, selectBasketItems } from '@/store';
+import { useStore, selectBasketItems, selectChartSymbol } from '@/store';
 import { getCoinTickers } from '@/api/client';
 import { changeColor } from '@/utils/pnl';
 import { Awaiting, TH, DASH, fmtPct, fmtPrice, marketLabelOf } from './shared';
@@ -20,6 +20,8 @@ export function WatchlistPanel() {
   const allItems = useStore(useShallow(selectBasketItems));
   const upbitApiConfigured = useStore((s) => s.upbitApiConfigured);
   const updateBasketItemPrice = useStore((s) => s.updateBasketItemPrice);
+  const setChartSymbol = useStore((s) => s.setChartSymbol);
+  const chartSymbol = useStore(selectChartSymbol);
 
   const items = allItems.filter((i) => i.marketType === activeMarket);
 
@@ -74,7 +76,14 @@ export function WatchlistPanel() {
       </thead>
       <tbody>
         {items.map((it) => (
-          <tr key={it.id} className="border-b border-hairline/60 hover:bg-elevated/40">
+          <tr
+            key={it.id}
+            onClick={() => setChartSymbol(it.ticker)}
+            title="차트에 표시"
+            className={`border-b border-hairline/60 cursor-pointer hover:bg-elevated/40 ${
+              chartSymbol === it.ticker ? 'bg-elevated/60' : ''
+            }`}
+          >
             <td className="text-left px-2.5 py-1">
               <span className="font-semibold">{it.displayName || it.ticker}</span>
               {it.displayName && it.displayName !== it.ticker && (

@@ -172,6 +172,11 @@ interface UIState {
   // Chart config
   chartConfig: ChartConfig;
 
+  // Explicitly-picked chart symbol (e.g. a watchlist row click), independent of
+  // any running analysis session. null = fall back to the active session ticker.
+  // Cleared on market switch. Ephemeral (not persisted).
+  chartSymbol: string | null;
+
   // First visit tracking (persisted to localStorage)
   hasVisited: boolean;
 
@@ -320,6 +325,7 @@ interface UIActions {
   setKiwoomApiConfigured: (configured: boolean) => void;
   setChartTimeframe: (timeframe: TimeFrame) => void;
   toggleChartIndicator: (indicator: 'showSMA50' | 'showSMA200' | 'showVolume') => void;
+  setChartSymbol: (symbol: string | null) => void;
   setHasVisited: (visited: boolean) => void;
   // View/Page navigation
   setCurrentView: (view: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'trading' | 'workflow' | 'analysis-detail' | 'scanner' | 'agent-chat') => void;
@@ -437,6 +443,7 @@ const initialUIState: UIState = {
     showSMA200: true,
     showVolume: true,
   },
+  chartSymbol: null,
   hasVisited: false, // Will be restored from persist middleware
   // View/Page navigation
   currentView: 'dashboard',
@@ -1388,6 +1395,9 @@ export const useStore = create<Store>()(
         activeMarket: market,
         // Sync stockRegion when switching markets
         stockRegion: market === 'kiwoom' ? 'kr' : market === 'stock' ? state.stockRegion : state.stockRegion,
+        // Clear any explicitly-picked chart symbol so the chart falls back to
+        // the newly-active market's session ticker instead of a stale symbol.
+        chartSymbol: null,
       })),
 
       setStockRegion: (region) => set({ stockRegion: region }),
@@ -1437,6 +1447,8 @@ export const useStore = create<Store>()(
             [indicator]: !state.chartConfig[indicator],
           },
         })),
+
+      setChartSymbol: (symbol) => set({ chartSymbol: symbol }),
 
       // -------------------------------------------
       // Basket Actions
@@ -1775,6 +1787,7 @@ export const selectChat = (state: Store) => ({
 });
 
 export const selectChartConfig = (state: Store) => state.chartConfig;
+export const selectChartSymbol = (state: Store) => state.chartSymbol;
 
 // Get current market's history
 export const selectTickerHistory = (state: Store): TickerHistoryItem[] => {
