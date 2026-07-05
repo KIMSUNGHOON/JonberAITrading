@@ -24,4 +24,11 @@ describe('commands', () => {
     command.run(ctx as any, arg);
     expect(ctx.setChartSymbol).toHaveBeenCalledWith('KRW-BTC');
   });
+  it('progressively surfaces :analyze for a partial colon query', () => {
+    const cmds = buildCommands(ctx as any);
+    const hits = filterCommands(cmds, ':anal');
+    const hit = hits.find((h) => h.command.id === 'analyze');
+    expect(hit).toBeDefined();
+    expect(hit?.arg).toBeUndefined();
+  });
 });

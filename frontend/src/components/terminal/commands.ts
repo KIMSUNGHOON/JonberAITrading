@@ -95,7 +95,11 @@ export function filterCommands(
     if (match) {
       return [{ command: match, arg: rest || undefined }];
     }
-    return [];
+    // No exact `:id` match (e.g. still typing `:anal`) — fall through to the
+    // substring branch below so incremental typing progressively surfaces
+    // `:analyze`/`:chart`/`:debate`/`:scan` instead of showing nothing until
+    // the id is fully typed. The substring match runs over title+keywords,
+    // which includes the leading `:`, so `:anal` still matches `:analyze`.
   }
 
   const needle = trimmed.toLowerCase();

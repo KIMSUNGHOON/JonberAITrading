@@ -11,7 +11,9 @@ import {
 } from 'lucide-react';
 import { useStore } from '@/store';
 import { useGoTo, useActiveView } from '@/hooks/useNav';
+import { useCommandPalette } from '@/hooks/useCommandPalette';
 import { NAV_ITEMS, type ViewKey } from '@/nav';
+import { CommandPalette } from './CommandPalette';
 
 // Icon lookup for the nav rail — preserves the exact icon choices from the
 // pre-router NAV array. Keyed by ViewKey; only the views present in
@@ -52,20 +54,26 @@ export function TerminalShell() {
   const setActiveMarket = useStore((s) => s.setActiveMarket);
   const setShowSettingsModal = useStore((s) => s.setShowSettingsModal);
   const clock = useClock();
+  const { open, setOpen } = useCommandPalette();
 
   return (
     <div className="h-screen flex flex-col bg-canvas text-ink font-mono text-[13px] overflow-hidden">
+      <CommandPalette open={open} onClose={() => setOpen(false)} />
       {/* ── command bar ── */}
       <div className="flex items-center gap-3 h-9 px-3 bg-card border-b border-hairline flex-none">
         <div className="flex items-center gap-2 font-bold tracking-[0.14em] text-accent">
           JONBER
           <span className="text-[11px] font-normal tracking-normal text-muted">// agentic terminal</span>
         </div>
-        <div className="flex items-center gap-2 flex-1 max-w-[520px] bg-canvas border border-hairline rounded px-2.5 py-1">
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="flex items-center gap-2 flex-1 max-w-[520px] bg-canvas border border-hairline rounded px-2.5 py-1 text-left"
+        >
           <span className="text-accent font-bold">❯</span>
           <span className="text-dim">:analyze 005930 · :go positions · /filter</span>
           <span className="ml-auto text-[10px] text-dim border border-hairline rounded px-1.5">⌘K</span>
-        </div>
+        </button>
         <div className="flex gap-0.5 ml-auto">
           {MARKETS.map((m) => (
             <button
