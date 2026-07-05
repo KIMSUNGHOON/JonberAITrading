@@ -10,22 +10,23 @@ import {
   Bot, Scan, MessageSquare, Settings, Bell,
 } from 'lucide-react';
 import { useStore } from '@/store';
+import { useGoTo, useActiveView } from '@/hooks/useNav';
+import { NAV_ITEMS, type ViewKey } from '@/nav';
 
-type View =
-  | 'dashboard' | 'analysis' | 'charts' | 'positions' | 'basket'
-  | 'trades' | 'trading' | 'scanner' | 'agent-chat';
-
-const NAV: { view: View; icon: React.ReactNode; label: string }[] = [
-  { view: 'dashboard', icon: <LayoutDashboard size={17} />, label: 'Dashboard' },
-  { view: 'analysis', icon: <Activity size={17} />, label: 'Analysis' },
-  { view: 'charts', icon: <BarChart3 size={17} />, label: 'Chart' },
-  { view: 'positions', icon: <Wallet size={17} />, label: 'Positions' },
-  { view: 'basket', icon: <ShoppingBasket size={17} />, label: 'Watchlist' },
-  { view: 'agent-chat', icon: <MessageSquare size={17} />, label: 'Agent Chat' },
-  { view: 'scanner', icon: <Scan size={17} />, label: 'Scanner' },
-  { view: 'trading', icon: <Bot size={17} />, label: 'Auto-trade' },
-  { view: 'trades', icon: <Receipt size={17} />, label: 'Trades' },
-];
+// Icon lookup for the nav rail — preserves the exact icon choices from the
+// pre-router NAV array. Keyed by ViewKey; only the views present in
+// NAV_ITEMS need an entry here.
+const NAV_ICONS: Partial<Record<ViewKey, React.ReactNode>> = {
+  dashboard: <LayoutDashboard size={17} />,
+  analysis: <Activity size={17} />,
+  charts: <BarChart3 size={17} />,
+  positions: <Wallet size={17} />,
+  basket: <ShoppingBasket size={17} />,
+  'agent-chat': <MessageSquare size={17} />,
+  scanner: <Scan size={17} />,
+  trading: <Bot size={17} />,
+  trades: <Receipt size={17} />,
+};
 
 const MARKETS: { id: 'kiwoom' | 'stock' | 'coin'; label: string; sim?: boolean }[] = [
   { id: 'kiwoom', label: 'KR · KRX' },
@@ -45,8 +46,8 @@ function useClock() {
 }
 
 export function TerminalShell() {
-  const currentView = useStore((s) => s.currentView);
-  const setCurrentView = useStore((s) => s.setCurrentView);
+  const goTo = useGoTo();
+  const activeView = useActiveView();
   const activeMarket = useStore((s) => s.activeMarket);
   const setActiveMarket = useStore((s) => s.setActiveMarket);
   const setShowSettingsModal = useStore((s) => s.setShowSettingsModal);
@@ -88,12 +89,12 @@ export function TerminalShell() {
       {/* ── body: nav rail + main ── */}
       <div className="flex-1 flex min-h-0">
         <nav className="w-12 flex flex-col items-center gap-1 py-2 bg-card border-r border-hairline flex-none">
-          {NAV.map((n) => {
-            const active = currentView === n.view;
+          {NAV_ITEMS.map((n) => {
+            const active = activeView === n.view;
             return (
               <button
                 key={n.view}
-                onClick={() => setCurrentView(n.view)}
+                onClick={() => goTo(n.view)}
                 title={n.label}
                 aria-current={active ? 'page' : undefined}
                 className={`relative w-9 h-9 flex items-center justify-center rounded ${
@@ -101,7 +102,7 @@ export function TerminalShell() {
                 }`}
               >
                 {active && <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-accent rounded" />}
-                {n.icon}
+                {NAV_ICONS[n.view]}
               </button>
             );
           })}
