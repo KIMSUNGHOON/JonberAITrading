@@ -180,9 +180,6 @@ interface UIState {
   // First visit tracking (persisted to localStorage)
   hasVisited: boolean;
 
-  // Current view/page
-  currentView: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'trading' | 'workflow' | 'analysis-detail' | 'scanner' | 'agent-chat';
-
   // Selected session for detail view
   selectedSessionId: string | null;
 
@@ -327,8 +324,6 @@ interface UIActions {
   toggleChartIndicator: (indicator: 'showSMA50' | 'showSMA200' | 'showVolume') => void;
   setChartSymbol: (symbol: string | null) => void;
   setHasVisited: (visited: boolean) => void;
-  // View/Page navigation
-  setCurrentView: (view: 'dashboard' | 'analysis' | 'basket' | 'history' | 'positions' | 'charts' | 'trades' | 'trading' | 'workflow' | 'analysis-detail' | 'scanner' | 'agent-chat') => void;
   setSelectedSessionId: (sessionId: string | null) => void;
   // Language preference
   setLanguage: (language: Language) => void;
@@ -445,8 +440,6 @@ const initialUIState: UIState = {
   },
   chartSymbol: null,
   hasVisited: false, // Will be restored from persist middleware
-  // View/Page navigation
-  currentView: 'dashboard',
   selectedSessionId: null,
   // Language preference (default: Korean)
   language: 'ko',
@@ -1428,8 +1421,6 @@ export const useStore = create<Store>()(
       setKiwoomApiConfigured: (configured) => set({ kiwoomApiConfigured: configured }),
 
       setHasVisited: (visited) => set({ hasVisited: visited }),
-
-      setCurrentView: (view) => set({ currentView: view }),
 
       setSelectedSessionId: (sessionId) => set({ selectedSessionId: sessionId }),
 

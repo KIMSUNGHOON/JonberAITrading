@@ -1,5 +1,5 @@
 // frontend/src/nav.ts
-// Single source of truth mapping app views <-> URL paths. Retires store.currentView.
+// Single source of truth mapping app views <-> URL paths. The store no longer tracks the active view.
 export type ViewKey =
   | 'dashboard' | 'analysis' | 'analysis-detail' | 'workflow'
   | 'positions' | 'charts' | 'basket' | 'scanner' | 'agent-chat'
