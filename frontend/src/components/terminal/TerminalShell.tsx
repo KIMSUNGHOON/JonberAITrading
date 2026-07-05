@@ -4,6 +4,7 @@
  * children (main) + status line (bottom). Wired to the existing store.
  */
 import { useEffect, useState } from 'react';
+import { Outlet } from 'react-router-dom';
 import {
   LayoutDashboard, Activity, BarChart3, Wallet, ShoppingBasket, Receipt,
   Bot, Scan, MessageSquare, Settings, Bell,
@@ -43,7 +44,7 @@ function useClock() {
   return t;
 }
 
-export function TerminalShell({ children }: { children: React.ReactNode }) {
+export function TerminalShell() {
   const currentView = useStore((s) => s.currentView);
   const setCurrentView = useStore((s) => s.setCurrentView);
   const activeMarket = useStore((s) => s.activeMarket);
@@ -113,7 +114,7 @@ export function TerminalShell({ children }: { children: React.ReactNode }) {
           </button>
         </nav>
 
-        <div className="flex-1 min-w-0 overflow-auto bg-canvas">{children}</div>
+        <div className="flex-1 min-w-0 overflow-auto bg-canvas"><Outlet /></div>
       </div>
 
       {/* ── status line ── */}

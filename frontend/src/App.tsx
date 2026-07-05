@@ -5,8 +5,8 @@
  */
 
 import { useEffect } from 'react';
+import { Routes, Route, Navigate } from 'react-router-dom';
 import { useStore, selectError } from '@/store';
-import { MainContent } from '@/components/layout/MainContent';
 import { TerminalShell } from '@/components/terminal/TerminalShell';
 import { TerminalDashboard } from '@/components/terminal/TerminalDashboard';
 import { ApprovalDialog } from '@/components/approval/ApprovalDialog';
@@ -17,6 +17,17 @@ import { ChatPopup } from '@/components/chat/ChatPopup';
 import { Toast } from '@/components/ui/Toast';
 import { TradeNotificationToast } from '@/components/ui/TradeNotificationToast';
 import { getUpbitApiStatus, getKiwoomApiStatus } from '@/api/client';
+import { SessionBridge } from '@/routes/SessionBridge';
+import { BasketPage } from '@/pages/BasketPage';
+import { PositionsPage } from '@/pages/PositionsPage';
+import { ChartsPage } from '@/pages/ChartsPage';
+import { TradesPage } from '@/pages/TradesPage';
+import { AnalysisPage } from '@/pages/AnalysisPage';
+import { WorkflowPage } from '@/pages/WorkflowPage';
+import { AnalysisDetailPage } from '@/pages/AnalysisDetailPage';
+import { ScannerResultsPage } from '@/pages/ScannerResultsPage';
+import { TradingDashboard } from '@/components/trading';
+import { AgentChatDashboard } from '@/components/agent-chat';
 
 function App() {
   const showApprovalDialog = useStore((state) => state.showApprovalDialog);
@@ -24,7 +35,6 @@ function App() {
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
   const setUpbitApiConfigured = useStore((state) => state.setUpbitApiConfigured);
   const setKiwoomApiConfigured = useStore((state) => state.setKiwoomApiConfigured);
-  const currentView = useStore((state) => state.currentView);
   const error = useStore(selectError);
   const setError = useStore((state) => state.setError);
 
@@ -73,9 +83,22 @@ function App() {
   return (
     <div className="h-screen overflow-hidden">
       {/* Dense Terminal Shell: command bar + nav rail + status line wrap all views */}
-      <TerminalShell>
-        {currentView === 'dashboard' ? <TerminalDashboard /> : <MainContent />}
-      </TerminalShell>
+      <Routes>
+        <Route element={<TerminalShell />}>
+          <Route index element={<TerminalDashboard />} />
+          <Route path="analysis" element={<AnalysisPage />} />
+          <Route path="analysis/:sessionId" element={<SessionBridge><AnalysisDetailPage /></SessionBridge>} />
+          <Route path="workflow/:sessionId" element={<SessionBridge><WorkflowPage /></SessionBridge>} />
+          <Route path="positions" element={<PositionsPage />} />
+          <Route path="charts" element={<ChartsPage />} />
+          <Route path="watchlist" element={<BasketPage />} />
+          <Route path="scanner" element={<ScannerResultsPage />} />
+          <Route path="agent-chat" element={<div className="p-3 md:p-4"><AgentChatDashboard /></div>} />
+          <Route path="trading" element={<TradingDashboard />} />
+          <Route path="trades" element={<TradesPage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
 
       {/* Error Toast - Persistent with dismiss button (overlay) */}
       {error && (
