@@ -69,28 +69,28 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
   // If no active session, show empty state
   if (!ticker || status === 'idle') {
     return (
-      <div className="h-full flex flex-col bg-surface">
+      <div className="h-full flex flex-col bg-canvas">
         {/* Header */}
-        <div className="flex items-center gap-3 px-6 py-4 border-b border-border bg-surface-dark">
+        <div className="flex-none flex items-center gap-3 px-4 py-2.5 border-b border-hairline bg-card">
           <button
             onClick={handleBack}
-            className="p-2 rounded-lg hover:bg-surface transition-colors"
+            className="p-1.5 rounded hover:bg-elevated transition-colors"
             title="Back to Analysis"
           >
-            <ArrowLeft className="w-5 h-5 text-gray-400" />
+            <ArrowLeft className="w-4 h-4 text-muted" />
           </button>
           <div>
-            <h1 className="text-xl font-semibold flex items-center gap-2">
-              <Activity className="w-6 h-6 text-blue-400" />
+            <h1 className="text-sm font-semibold flex items-center gap-2 text-ink">
+              <Activity className="w-4 h-4 text-accent" />
               Workflow
             </h1>
-            <p className="text-sm text-gray-500">Analysis workflow progress</p>
+            <p className="text-[11px] text-dim">Analysis workflow progress</p>
           </div>
         </div>
 
         {/* Empty State */}
         <div className="flex-1 flex items-center justify-center">
-          <div className="text-center text-gray-500">
+          <div className="text-center text-dim">
             <Activity className="w-12 h-12 mx-auto mb-4 opacity-50" />
             <p className="text-lg">No active analysis</p>
             <p className="text-sm mt-2">
@@ -98,7 +98,7 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
             </p>
             <button
               onClick={handleBack}
-              className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white text-sm transition-colors"
+              className="mt-4 px-4 py-2 bg-accent hover:bg-accent/90 rounded-lg text-canvas text-sm transition-colors"
             >
               Back to Analysis
             </button>
@@ -109,22 +109,22 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
   }
 
   return (
-    <div className="h-full flex flex-col bg-surface">
+    <div className="h-full flex flex-col bg-canvas">
       {/* Header */}
-      <div className="flex items-center gap-3 px-6 py-4 border-b border-border bg-surface-dark">
+      <div className="flex-none flex items-center gap-3 px-4 py-2.5 border-b border-hairline bg-card">
         <button
           onClick={handleBack}
-          className="p-2 rounded-lg hover:bg-surface transition-colors"
+          className="p-1.5 rounded hover:bg-elevated transition-colors"
           title="Back to Analysis"
         >
-          <ArrowLeft className="w-5 h-5 text-gray-400" />
+          <ArrowLeft className="w-4 h-4 text-muted" />
         </button>
         <div className="flex-1">
-          <h1 className="text-xl font-semibold flex items-center gap-2">
-            <Activity className="w-6 h-6 text-blue-400" />
+          <h1 className="text-sm font-semibold flex items-center gap-2 text-ink">
+            <Activity className="w-4 h-4 text-accent" />
             {ticker}
           </h1>
-          <p className="text-sm text-gray-500">
+          <p className="text-[11px] text-dim">
             {status === 'running' && (currentStage || 'Analyzing...')}
             {status === 'awaiting_approval' && 'Awaiting Approval'}
             {status === 'completed' && 'Analysis Complete'}

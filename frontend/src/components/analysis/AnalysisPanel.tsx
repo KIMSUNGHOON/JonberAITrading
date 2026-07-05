@@ -14,6 +14,7 @@ import {
   Shield,
 } from 'lucide-react';
 import type { AnalysisSummary } from '@/types';
+import { pnlColor } from '@/utils/pnl';
 
 interface AnalysisPanelProps {
   analyses: AnalysisSummary[];
@@ -51,13 +52,13 @@ function AnalysisCard({ analysis }: AnalysisCardProps) {
           </div>
           <div>
             <h3 className="font-medium">{agentConfig.label}</h3>
-            <p className="text-xs text-gray-400">{agentConfig.description}</p>
+            <p className="text-xs text-muted">{agentConfig.description}</p>
           </div>
         </div>
 
-        {/* Signal Badge */}
+        {/* Signal Badge — text-only chip on a neutral bg (trading colors are text-only, never a fill) */}
         <div
-          className={`px-2 py-1 rounded text-xs font-medium flex items-center gap-1 ${signalConfig.className}`}
+          className={`px-2 py-1 rounded border border-hairline bg-elevated text-xs font-medium flex items-center gap-1 ${signalConfig.textColor}`}
         >
           {signalConfig.icon}
           {signal.toUpperCase()}
@@ -67,10 +68,10 @@ function AnalysisCard({ analysis }: AnalysisCardProps) {
       {/* Confidence Bar */}
       <div className="mb-3">
         <div className="flex items-center justify-between text-xs mb-1">
-          <span className="text-gray-400">Confidence</span>
-          <span className="font-medium">{Math.round(confidence * 100)}%</span>
+          <span className="text-muted">Confidence</span>
+          <span className="font-medium tabular-nums">{Math.round(confidence * 100)}%</span>
         </div>
-        <div className="h-2 bg-surface rounded-full overflow-hidden">
+        <div className="h-2 bg-elevated rounded-full overflow-hidden">
           <div
             className={`h-full rounded-full transition-all duration-500 ${signalConfig.barColor}`}
             style={{ width: `${confidence * 100}%` }}
@@ -79,7 +80,7 @@ function AnalysisCard({ analysis }: AnalysisCardProps) {
       </div>
 
       {/* Summary */}
-      <p className="text-sm text-gray-300 line-clamp-3">{summary}</p>
+      <p className="text-sm text-ink line-clamp-3">{summary}</p>
     </div>
   );
 }
@@ -124,43 +125,45 @@ function getAgentConfig(agent: string) {
     configs[agent] || {
       label: agent,
       description: 'Analysis',
-      icon: <BarChart3 className="w-5 h-5 text-gray-400" />,
+      icon: <BarChart3 className="w-5 h-5 text-muted" />,
       bgColor: 'bg-gray-500/20',
     }
   );
 }
 
+// Signal color routes through the shared P&L helper: buy is bullish (up),
+// sell is bearish (down), hold is neutral (muted) — never a raw green/red.
 function getSignalConfig(signal: string) {
   const configs: Record<
     string,
     {
       icon: React.ReactNode;
-      className: string;
+      textColor: string;
       barColor: string;
     }
   > = {
     buy: {
       icon: <TrendingUp className="w-3 h-3" />,
-      className: 'signal-buy',
-      barColor: 'bg-bull',
+      textColor: pnlColor(1),
+      barColor: 'bg-up',
     },
     sell: {
       icon: <TrendingDown className="w-3 h-3" />,
-      className: 'signal-sell',
-      barColor: 'bg-bear',
+      textColor: pnlColor(-1),
+      barColor: 'bg-down',
     },
     hold: {
       icon: <Minus className="w-3 h-3" />,
-      className: 'signal-hold',
-      barColor: 'bg-hairline',
+      textColor: 'text-muted',
+      barColor: 'bg-dim',
     },
   };
 
   return (
     configs[signal.toLowerCase()] || {
       icon: <Minus className="w-3 h-3" />,
-      className: 'signal-hold',
-      barColor: 'bg-gray-500',
+      textColor: 'text-muted',
+      barColor: 'bg-dim',
     }
   );
 }
