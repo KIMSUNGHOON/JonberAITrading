@@ -24,26 +24,36 @@ export function CommandPalette({ open, onClose }: Props) {
   const setActiveMarket = useStore((s) => s.setActiveMarket);
   const setChartSymbol = useStore((s) => s.setChartSymbol);
   const setShowSettingsModal = useStore((s) => s.setShowSettingsModal);
+  const setError = useStore((s) => s.setError);
   const start = useStartAnalysis();
 
   const ctx = useMemo<CommandCtx>(
-    () => ({
-      goTo,
-      setActiveMarket,
-      setChartSymbol,
-      setShowSettingsModal,
-      startAnalysis: (t) => {
-        const m = useStore.getState().activeMarket;
-        void start(m, t);
-      },
-      startScan: () => {
-        void startScan();
-      },
-      startDebate: (t) => {
-        void startAgentChatDiscussion({ ticker: t, stock_name: t });
-      },
-    }),
-    [goTo, setActiveMarket, setChartSymbol, setShowSettingsModal, start]
+    () => {
+      // These three actions fire async work (start-analysis throws on failure;
+      // startScan/startAgentChatDiscussion reject on API error). Surface any
+      // failure through the app's error Toast instead of a silent unhandled
+      // rejection. (start() switches the active market first, so setError lands
+      // on the market being analyzed.)
+      const fail = (msg: string) => (e: unknown) =>
+        setError(`${msg}: ${e instanceof Error ? e.message : '요청 실패'}`);
+      return {
+        goTo,
+        setActiveMarket,
+        setChartSymbol,
+        setShowSettingsModal,
+        startAnalysis: (t) => {
+          const m = useStore.getState().activeMarket;
+          start(m, t).catch(fail(`분석 시작 실패 (${t})`));
+        },
+        startScan: () => {
+          startScan().catch(fail('스캔 시작 실패'));
+        },
+        startDebate: (t) => {
+          startAgentChatDiscussion({ ticker: t, stock_name: t }).catch(fail(`토론 시작 실패 (${t})`));
+        },
+      };
+    },
+    [goTo, setActiveMarket, setChartSymbol, setShowSettingsModal, setError, start]
   );
 
   const commands = useMemo(() => buildCommands(ctx), [ctx]);
