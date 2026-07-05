@@ -125,3 +125,28 @@
     padding-bottom: env(safe-area-inset-bottom);
   }
 }
+
+/* ── react-mosaic → dense terminal theme (raw classes, not Tailwind) ── */
+.jonber-mosaic.mosaic,
+.jonber-mosaic .mosaic-root { background: var(--canvas); inset: 0; }
+.jonber-mosaic .mosaic-tile { margin: 0; }
+.jonber-mosaic .mosaic-window { border: 1px solid var(--hairline); border-radius: 0; box-shadow: none; }
+.jonber-mosaic .mosaic-window-toolbar {
+  height: 24px; min-height: 24px; background: var(--card);
+  border-bottom: 1px solid var(--hairline); box-shadow: none; padding: 0 8px; cursor: grab;
+}
+.jonber-mosaic .mosaic-window-toolbar:active { cursor: grabbing; }
+.jonber-mosaic .mosaic-window-title {
+  color: var(--muted); font-size: 10px; letter-spacing: .11em; text-transform: uppercase;
+  font-family: ui-monospace, "JetBrains Mono", Menlo, monospace; font-weight: 600; padding: 0;
+}
+.jonber-mosaic .mosaic-window-body { background: var(--card); border: none; }
+.jonber-mosaic .mosaic-window-controls,
+.jonber-mosaic .mosaic-window-additional-actions-bar { display: none; }
+.jonber-mosaic .mosaic-split { background: transparent; }
+.jonber-mosaic .mosaic-split .mosaic-split-line { box-shadow: 0 0 0 1px var(--hairline); }
+.jonber-mosaic .mosaic-split:hover .mosaic-split-line { box-shadow: 0 0 0 1px var(--accent); }
+.jonber-mosaic .mosaic-preview { background: var(--card); border: 1px dashed var(--accent); box-shadow: none; }
+.jonber-mosaic .mosaic-preview .mosaic-window-toolbar { background: var(--elevated); }
+.jonber-mosaic .drop-target-hint { background: rgba(240,185,11,.12); outline: 1px solid var(--accent); }
+.jonber-mosaic .mosaic-zero-state { background: var(--canvas); color: var(--muted); border: 1px dashed var(--hairline); }
