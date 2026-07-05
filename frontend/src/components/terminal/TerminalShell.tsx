@@ -49,7 +49,6 @@ export function TerminalShell({ children }: { children: React.ReactNode }) {
   const activeMarket = useStore((s) => s.activeMarket);
   const setActiveMarket = useStore((s) => s.setActiveMarket);
   const setShowSettingsModal = useStore((s) => s.setShowSettingsModal);
-  const kiwoomIsMock = useStore((s) => s.kiwoomApiConfigured);
   const clock = useClock();
 
   return (
@@ -122,7 +121,12 @@ export function TerminalShell({ children }: { children: React.ReactNode }) {
         <span className="uppercase">{activeMarket === 'kiwoom' ? 'KRX' : activeMarket === 'coin' ? 'UPBIT' : 'US'}</span>
         <span className="text-up">● live</span>
         <span className="text-ink">{clock} KST</span>
-        <span className="text-warn">{kiwoomIsMock ? 'MOCK' : 'LIVE'}</span>
+        {/* Trading mode indicator. The app is PAPER/mock-only (live trading is
+            frozen). Do NOT derive this from kiwoomApiConfigured — that flag is
+            whether API keys exist, not the trade mode, and reading it here would
+            mis-label real vs paper trading. Wire to the backend's real trading
+            mode (KIWOOM_IS_MOCK / UPBIT_TRADING_MODE) before ever showing LIVE. */}
+        <span className="text-warn">PAPER</span>
         <span className="text-accent">P&amp;L GRN-UP</span>
         <span>WS 1/1</span>
         <span className="ml-auto text-dim">⌘K command · j/k rows · :help</span>
