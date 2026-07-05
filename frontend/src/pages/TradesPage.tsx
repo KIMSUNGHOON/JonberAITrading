@@ -9,6 +9,7 @@
 
 import { ArrowLeft } from 'lucide-react';
 import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import { CoinTradeHistory } from '@/components/coin/CoinTradeHistory';
 import { KRStockTradeHistory } from '@/components/kiwoom';
 
@@ -17,7 +18,7 @@ interface TradesPageProps {
 }
 
 export function TradesPage({ onBack }: TradesPageProps) {
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const activeMarket = useStore((state) => state.activeMarket);
   const kiwoomApiConfigured = useStore((state) => state.kiwoomApiConfigured);
   const upbitApiConfigured = useStore((state) => state.upbitApiConfigured);
@@ -26,7 +27,7 @@ export function TradesPage({ onBack }: TradesPageProps) {
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('dashboard');
+      goTo('dashboard');
     }
   };
 

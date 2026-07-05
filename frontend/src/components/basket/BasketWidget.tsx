@@ -46,6 +46,7 @@ import {
   searchKRStocks,
 } from '@/api/client';
 import { wsManager, type WebSocketHandlers } from '@/api/websocket';
+import { useGoTo } from '@/hooks/useNav';
 import type { KRStockTradeProposal, SessionStatus, KRStockInfo } from '@/types';
 
 // Market type icon component
@@ -231,7 +232,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
   const availableSlots = useStore(selectKiwoomAvailableSlots);
 
   // Navigation actions
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
 
   // Basket actions
   const addToBasket = useStore((state) => state.addToBasket);
@@ -813,7 +814,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
           </button>
           {!expanded && (
             <button
-              onClick={() => setCurrentView('basket')}
+              onClick={() => goTo('basket')}
               className="flex items-center gap-0.5 ml-1 text-xs text-gray-400 hover:text-blue-400 transition-colors"
               title="전체 화면으로 보기"
             >

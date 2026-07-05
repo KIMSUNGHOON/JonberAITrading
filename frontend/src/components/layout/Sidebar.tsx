@@ -21,6 +21,7 @@ import {
   MessageSquare,
 } from 'lucide-react';
 import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import { MarketTabs } from '@/components/layout/MarketTabs';
 import { useTranslations } from '@/utils/translations';
 
@@ -69,9 +70,9 @@ interface SidebarProps {
 }
 
 export function Sidebar({ collapsed = false }: SidebarProps) {
+  const goTo = useGoTo();
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
   const currentView = useStore((state) => state.currentView);
-  const setCurrentView = useStore((state) => state.setCurrentView);
   const language = useStore((state) => state.language);
   const t = useTranslations(language);
 
@@ -120,7 +121,7 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
           icon={<LayoutDashboard className="w-5 h-5" />}
           label={t('nav_dashboard')}
           active={currentView === 'dashboard'}
-          onClick={() => setCurrentView('dashboard')}
+          onClick={() => goTo('dashboard')}
           collapsed={collapsed}
         />
         <NavItem
@@ -128,14 +129,14 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
           label={t('nav_analysis')}
           active={currentView === 'analysis'}
           badge={runningCount > 0 ? String(runningCount) : undefined}
-          onClick={() => setCurrentView('analysis')}
+          onClick={() => goTo('analysis')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<BarChart3 className="w-5 h-5" />}
           label={t('nav_charts')}
           active={currentView === 'charts'}
-          onClick={() => setCurrentView('charts')}
+          onClick={() => goTo('charts')}
           collapsed={collapsed}
         />
         <NavItem
@@ -143,7 +144,7 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
           label={t('nav_positions')}
           active={currentView === 'positions'}
           badge={activePosition ? '1' : undefined}
-          onClick={() => setCurrentView('positions')}
+          onClick={() => goTo('positions')}
           collapsed={collapsed}
         />
         <NavItem
@@ -151,35 +152,35 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
           label={t('nav_basket')}
           active={currentView === 'basket'}
           badge={basketItemsCount > 0 ? String(basketItemsCount) : undefined}
-          onClick={() => setCurrentView('basket')}
+          onClick={() => goTo('basket')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<Receipt className="w-5 h-5" />}
           label={t('nav_trades')}
           active={currentView === 'trades'}
-          onClick={() => setCurrentView('trades')}
+          onClick={() => goTo('trades')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<Bot className="w-5 h-5" />}
           label={t('nav_auto_trading')}
           active={currentView === 'trading'}
-          onClick={() => setCurrentView('trading')}
+          onClick={() => goTo('trading')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<Scan className="w-5 h-5" />}
           label={t('nav_scanner')}
           active={currentView === 'scanner'}
-          onClick={() => setCurrentView('scanner')}
+          onClick={() => goTo('scanner')}
           collapsed={collapsed}
         />
         <NavItem
           icon={<MessageSquare className="w-5 h-5" />}
           label={t('nav_agent_chat')}
           active={currentView === 'agent-chat'}
-          onClick={() => setCurrentView('agent-chat')}
+          onClick={() => goTo('agent-chat')}
           collapsed={collapsed}
         />
       </nav>

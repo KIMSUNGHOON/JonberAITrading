@@ -9,7 +9,7 @@
  */
 
 import { ArrowLeft } from 'lucide-react';
-import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import { BasketWidget } from '@/components/basket/BasketWidget';
 
 interface BasketPageProps {
@@ -17,13 +17,13 @@ interface BasketPageProps {
 }
 
 export function BasketPage({ onBack }: BasketPageProps) {
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
 
   const handleBack = () => {
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('dashboard');
+      goTo('dashboard');
     }
   };
 

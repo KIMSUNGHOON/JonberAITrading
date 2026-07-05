@@ -18,7 +18,7 @@ import {
   RefreshCw,
   AlertCircle,
 } from 'lucide-react';
-import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import { getTradingStatus, getTradeQueue } from '@/api/client';
 
 interface TradingStatus {
@@ -44,7 +44,7 @@ export function TradingStatusCard() {
   const [queueCount, setQueueCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -103,7 +103,7 @@ export function TradingStatusCard() {
   };
 
   const goToTrading = () => {
-    setCurrentView('trading');
+    goTo('trading');
   };
 
   if (loading) {

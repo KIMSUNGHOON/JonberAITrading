@@ -21,6 +21,7 @@ import {
   Tag,
 } from 'lucide-react';
 import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import {
   getWatchList,
   removeFromWatchList,
@@ -239,7 +240,7 @@ function WatchItem({
 // -------------------------------------------
 
 export default function WatchListWidget() {
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const startKiwoomSession = useStore((state) => state.startKiwoomSession);
   const language = useStore((state) => state.language);
   const t = useTranslations(language);
@@ -305,7 +306,7 @@ export default function WatchListWidget() {
       const response = await startKRStockAnalysis({ stk_cd: ticker });
       // Start session and navigate to workflow page
       startKiwoomSession(response.session_id, ticker, name);
-      setCurrentView('workflow');
+      goTo('workflow', response.session_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start re-analysis');
     } finally {
@@ -398,7 +399,7 @@ export default function WatchListWidget() {
               </span>
             </div>
             <button
-              onClick={() => setCurrentView('trading')}
+              onClick={() => goTo('trading')}
               className="flex items-center gap-1 text-blue-400 hover:text-blue-300"
             >
               {t('nav_auto_trading')}

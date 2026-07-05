@@ -20,6 +20,7 @@ import {
   Home,
 } from 'lucide-react';
 import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import type { SessionStatus } from '@/types';
 
 // Workflow stages for Stock analysis (matching backend KRStockAnalysisStage enum)
@@ -66,7 +67,7 @@ interface WorkflowProgressProps {
 
 export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgressProps) {
   const reset = useStore((state) => state.reset);
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
 
   // Get appropriate stages based on ticker type
   const WORKFLOW_STAGES = useMemo(() => getWorkflowStages(ticker), [ticker]);
@@ -74,7 +75,7 @@ export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgr
   // Handle cancel/return to home
   const handleCancel = () => {
     reset();
-    setCurrentView('dashboard');
+    goTo('dashboard');
   };
 
   // Calculate stage statuses

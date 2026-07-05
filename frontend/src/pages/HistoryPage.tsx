@@ -11,6 +11,7 @@
 import { useState, useMemo } from 'react';
 import { ArrowLeft, Search, Filter, CheckCircle2, XCircle, AlertCircle } from 'lucide-react';
 import { useStore, selectTickerHistory, type MarketType } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 
 interface HistoryPageProps {
   onBack?: () => void;
@@ -77,7 +78,7 @@ function getAction(item: unknown): string | null {
 }
 
 export function HistoryPage({ onBack }: HistoryPageProps) {
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const history = useStore(selectTickerHistory);
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -88,7 +89,7 @@ export function HistoryPage({ onBack }: HistoryPageProps) {
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('dashboard');
+      goTo('dashboard');
     }
   };
 

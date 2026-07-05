@@ -24,6 +24,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useStore, selectTickerHistory, type MarketType, type ActiveSession, type TickerHistoryItem } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import type { SessionStatus } from '@/types';
 
 interface AnalysisPageProps {
@@ -124,7 +125,7 @@ export function AnalysisPage(_props: AnalysisPageProps) {
   // Store state - use global selectedSessionId for navigation between pages
   const selectedSessionId = useStore((state) => state.selectedSessionId);
   const setSelectedSessionId = useStore((state) => state.setSelectedSessionId);
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const setActiveMarket = useStore((state) => state.setActiveMarket);
   const setActiveKiwoomSession = useStore((state) => state.setActiveKiwoomSession);
   const setShowApprovalDialog = useStore((state) => state.setShowApprovalDialog);
@@ -247,13 +248,13 @@ export function AnalysisPage(_props: AnalysisPageProps) {
     }
 
     // Navigate to workflow view
-    setCurrentView('workflow');
+    goTo('workflow', session.sessionId);
   };
 
   // Handle clicking on a completed analysis - navigate to detail view
   const handleSelectCompleted = (item: TickerHistoryItem) => {
     // Navigate to analysis detail page
-    setCurrentView('analysis-detail');
+    goTo('analysis-detail', item.sessionId);
     // Store the selected session ID for the detail page
     setSelectedSessionId(item.sessionId);
   };
@@ -496,7 +497,7 @@ export function AnalysisPage(_props: AnalysisPageProps) {
                 Dashboard에서 종목을 검색하여 분석을 시작하세요
               </p>
               <button
-                onClick={() => setCurrentView('dashboard')}
+                onClick={() => goTo('dashboard')}
                 className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white text-sm transition-colors"
               >
                 Dashboard로 이동

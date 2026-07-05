@@ -19,6 +19,7 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { useStore, type MarketType, type RecentAnalysisItem } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import type { TradeAction } from '@/types';
 
 // Format relative time
@@ -209,7 +210,7 @@ function RecentAnalysisItemRow({
 
 export function RecentAnalysisWidget() {
   // Navigation action
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
 
   // Get recent analyses from store - use useMemo to stabilize the reference
   const stockHistory = useStore((state) => state.stock.history);
@@ -310,7 +311,7 @@ export function RecentAnalysisWidget() {
           </span>
         </div>
         <button
-          onClick={() => setCurrentView('history')}
+          onClick={() => goTo('history')}
           className="flex items-center gap-1 text-xs text-gray-400 hover:text-blue-400 transition-colors"
         >
           더보기

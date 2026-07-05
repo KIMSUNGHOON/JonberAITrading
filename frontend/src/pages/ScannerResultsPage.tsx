@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import { apiClient, startKRStockAnalysis } from '@/api/client';
 import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 
 interface ScannerResultsPageProps {
   onBack?: () => void;
@@ -95,7 +96,7 @@ function formatPrice(price: number): string {
 export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
   // const language = useStore((state) => state.language);
   // const t = useTranslations(language);  // TODO: Add translations for scanner page
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const setActiveMarket = useStore((state) => state.setActiveMarket);
   const startKiwoomSession = useStore((state) => state.startKiwoomSession);
 
@@ -164,7 +165,7 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('dashboard');
+      goTo('dashboard');
     }
   };
 
@@ -174,13 +175,13 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
       setActiveMarket('kiwoom');
       const response = await startKRStockAnalysis({ stk_cd });
       startKiwoomSession(response.session_id, stk_cd, stk_nm);
-      setCurrentView('workflow');
+      goTo('workflow', response.session_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start analysis');
     } finally {
       setAnalyzing(null);
     }
-  }, [setActiveMarket, startKiwoomSession, setCurrentView]);
+  }, [setActiveMarket, startKiwoomSession, goTo]);
 
   const filteredResults = results.filter((item) => {
     if (!searchQuery) return true;

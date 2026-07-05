@@ -23,6 +23,7 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import {
   startScan,
   pauseScan,
@@ -167,7 +168,7 @@ function ResultItem({ item, onAnalyze, analyzing }: ResultItemProps) {
 
 export function BackgroundScannerWidget() {
   const setActiveMarket = useStore((state) => state.setActiveMarket);
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const startKiwoomSession = useStore((state) => state.startKiwoomSession);
 
   const [progress, setProgress] = useState<ScanProgressResponse | null>(null);
@@ -259,7 +260,7 @@ export function BackgroundScannerWidget() {
       setActiveMarket('kiwoom');
       const response = await startKRStockAnalysis({ stk_cd });
       startKiwoomSession(response.session_id, stk_cd, stk_nm);
-      setCurrentView('workflow');
+      goTo('workflow', response.session_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start analysis');
     } finally {

@@ -8,20 +8,20 @@
  */
 
 import { ArrowLeft, LineChart } from 'lucide-react';
-import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 
 interface ChartsPageProps {
   onBack?: () => void;
 }
 
 export function ChartsPage({ onBack }: ChartsPageProps) {
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
 
   const handleBack = () => {
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('dashboard');
+      goTo('dashboard');
     }
   };
 

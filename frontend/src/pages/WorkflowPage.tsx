@@ -17,6 +17,7 @@ import {
   selectAnalysis,
   selectActivePosition,
 } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import { ChartPanel } from '@/components/chart/ChartPanel';
 import { AnalysisPanel } from '@/components/analysis/AnalysisPanel';
 import { AnalysisQueueWidget } from '@/components/analysis/AnalysisQueueWidget';
@@ -51,13 +52,13 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
   const activePosition = useStore(selectActivePosition);
   const showChartPanel = useStore((state) => state.showChartPanel);
   const activeMarket = useStore((state) => state.activeMarket);
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
 
   const handleBack = () => {
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('dashboard');
+      goTo('dashboard');
     }
   };
 

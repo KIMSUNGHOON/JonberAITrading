@@ -9,6 +9,7 @@
 
 import { ArrowLeft } from 'lucide-react';
 import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import { CoinPositionPanel } from '@/components/coin/CoinPositionPanel';
 import { CoinAccountBalance } from '@/components/coin/CoinAccountBalance';
 import { CoinOpenOrders } from '@/components/coin/CoinOpenOrders';
@@ -19,7 +20,7 @@ interface PositionsPageProps {
 }
 
 export function PositionsPage({ onBack }: PositionsPageProps) {
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const activeMarket = useStore((state) => state.activeMarket);
   const kiwoomApiConfigured = useStore((state) => state.kiwoomApiConfigured);
   const upbitApiConfigured = useStore((state) => state.upbitApiConfigured);
@@ -28,7 +29,7 @@ export function PositionsPage({ onBack }: PositionsPageProps) {
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('dashboard');
+      goTo('dashboard');
     }
   };
 

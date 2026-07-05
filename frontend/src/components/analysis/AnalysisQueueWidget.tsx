@@ -25,6 +25,7 @@ import {
   Building2,
 } from 'lucide-react';
 import { useStore, type ActiveSession } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import type { SessionStatus } from '@/types';
 import type { MarketType } from '@/store';
 import { cancelKRStockSession, cancelCoinSession, cancelSession } from '@/api/client';
@@ -244,7 +245,7 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
   const kiwoomState = useStore((state) => state.kiwoom);
 
   // Navigation and market actions
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const setActiveMarket = useStore((state) => state.setActiveMarket);
   const setActiveKiwoomSession = useStore((state) => state.setActiveKiwoomSession);
 
@@ -419,7 +420,7 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
     }
 
     // Navigate to Analysis page
-    setCurrentView('analysis');
+    goTo('analysis');
     // Track selected session
     setSelectedSessionId(session.sessionId);
   };

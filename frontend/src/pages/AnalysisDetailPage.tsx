@@ -34,6 +34,7 @@ import {
   Eye,
 } from 'lucide-react';
 import { useStore, selectTickerHistory, type MarketType, type TickerHistoryItem } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import { addToTradeQueue } from '@/api/client';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
 import { useTranslations } from '@/utils/translations';
@@ -400,7 +401,7 @@ function RiskFactors({ data }: { data: RiskAssessmentResult }) {
 }
 
 export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: AnalysisDetailPageProps) {
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const storeSessionId = useStore((state) => state.selectedSessionId);
   const history = useStore(selectTickerHistory);
   const language = useStore((state) => state.language);
@@ -429,7 +430,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('analysis');
+      goTo('analysis');
     }
   };
 
