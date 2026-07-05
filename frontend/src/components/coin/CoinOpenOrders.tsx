@@ -86,7 +86,7 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
   if (isLoading && orders.length === 0) {
     return (
       <div className="card animate-pulse">
-        <div className="h-24 bg-surface rounded" />
+        <div className="h-24 bg-elevated rounded" />
       </div>
     );
   }
@@ -106,10 +106,10 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
         </div>
         <button
           onClick={fetchOrders}
-          className="p-1 hover:bg-surface rounded transition-colors"
+          className="p-1 hover:bg-elevated rounded transition-colors"
           title="Refresh"
         >
-          <RefreshCw size={16} className={`text-gray-400 ${isLoading ? 'animate-spin' : ''}`} />
+          <RefreshCw size={16} className={`text-muted ${isLoading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
@@ -127,7 +127,7 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
           {orders.map((order) => (
             <div
               key={order.uuid}
-              className="p-3 bg-surface rounded-lg"
+              className="p-3 bg-elevated rounded-lg"
             >
               {/* Order Header */}
               <div className="flex items-center justify-between mb-2">
@@ -143,7 +143,7 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
                 </div>
                 <button
                   onClick={() => handleCancelOrder(order.uuid)}
-                  className="p-1 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+                  className="p-1 text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
                   disabled={cancellingId === order.uuid}
                   title="Cancel order"
                 >
@@ -156,13 +156,13 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
               </div>
 
               {/* Order Details */}
-              <div className="grid grid-cols-2 gap-2 text-sm">
+              <div className="grid grid-cols-2 gap-2 text-sm tabular-nums">
                 <div>
-                  <span className="text-gray-400">Price</span>
+                  <span className="text-muted">Price</span>
                   <div className="font-mono">{formatKRW(order.price)} KRW</div>
                 </div>
                 <div>
-                  <span className="text-gray-400">Volume</span>
+                  <span className="text-muted">Volume</span>
                   <div className="font-mono">{formatVolume(order.volume)}</div>
                 </div>
               </div>
@@ -171,10 +171,10 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
               {order.executed_volume && order.executed_volume > 0 && (
                 <div className="mt-2">
                   <div className="flex items-center justify-between text-xs mb-1">
-                    <span className="text-gray-400">Filled</span>
-                    <span>{getProgress(order).toFixed(1)}%</span>
+                    <span className="text-muted">Filled</span>
+                    <span className="tabular-nums">{getProgress(order).toFixed(1)}%</span>
                   </div>
-                  <div className="h-1 bg-border rounded overflow-hidden">
+                  <div className="h-1 bg-hairline rounded overflow-hidden">
                     <div
                       className="h-full bg-primary transition-all"
                       style={{ width: `${getProgress(order)}%` }}
@@ -184,14 +184,14 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
               )}
 
               {/* Time */}
-              <div className="mt-2 text-xs text-gray-500">
+              <div className="mt-2 text-xs text-dim">
                 {formatDate(order.created_at)}
               </div>
             </div>
           ))}
         </div>
       ) : (
-        <div className="text-center py-6 text-gray-500">
+        <div className="text-center py-6 text-dim">
           <Clock size={24} className="mx-auto mb-2 opacity-50" />
           <p className="text-sm">No open orders</p>
         </div>

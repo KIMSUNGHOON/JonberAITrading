@@ -130,7 +130,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
   if (isLoading && orders.length === 0) {
     return (
       <div className="card animate-pulse">
-        <div className="h-24 bg-surface rounded" />
+        <div className="h-24 bg-elevated rounded" />
       </div>
     );
   }
@@ -150,11 +150,11 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
         </div>
         <button
           onClick={() => fetchOrders(0, true)}
-          className="p-1 hover:bg-surface rounded transition-colors"
+          className="p-1 hover:bg-elevated rounded transition-colors"
           title="새로고침"
           aria-label="Refresh orders"
         >
-          <RefreshCw size={16} className={`text-gray-400 ${isLoading ? 'animate-spin' : ''}`} />
+          <RefreshCw size={16} className={`text-muted ${isLoading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
@@ -186,7 +186,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
             return (
               <div
                 key={order.order_id}
-                className="p-3 bg-surface rounded-lg"
+                className="p-3 bg-elevated rounded-lg"
               >
                 {/* Order Info */}
                 <div className="flex items-center justify-between mb-2">
@@ -196,7 +196,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
                     </div>
                     <div>
                       <div className="font-medium text-sm">{order.stk_nm || order.stk_cd}</div>
-                      <div className="text-xs text-gray-500">{order.stk_cd}</div>
+                      <div className="text-xs text-dim">{order.stk_cd}</div>
                     </div>
                   </div>
                   <div className={`text-xs px-2 py-0.5 rounded ${sideBg} ${sideColor}`}>
@@ -205,27 +205,27 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
                 </div>
 
                 {/* Order Details */}
-                <div className="grid grid-cols-2 gap-2 text-xs mb-2">
+                <div className="grid grid-cols-2 gap-2 text-xs mb-2 tabular-nums">
                   <div>
-                    <span className="text-gray-500">주문가: </span>
+                    <span className="text-dim">주문가: </span>
                     <span>{order.price ? `${formatKRW(order.price)}원` : '시장가'}</span>
                   </div>
                   <div>
-                    <span className="text-gray-500">수량: </span>
+                    <span className="text-dim">수량: </span>
                     <span>{formatKRW(order.quantity)}주</span>
                   </div>
                   <div>
-                    <span className="text-gray-500">체결: </span>
+                    <span className="text-dim">체결: </span>
                     <span>{formatKRW(order.executed_quantity)}주</span>
                   </div>
                   <div>
-                    <span className="text-gray-500">미체결: </span>
+                    <span className="text-dim">미체결: </span>
                     <span>{formatKRW(order.remaining_quantity)}주</span>
                   </div>
                 </div>
 
                 {/* Time & Status */}
-                <div className="flex items-center justify-between text-xs text-gray-500 mb-2">
+                <div className="flex items-center justify-between text-xs text-dim mb-2">
                   <span>{formatTime(order.created_at)}</span>
                   <span className="capitalize">
                     {order.status === 'pending' ? '대기중' :
@@ -234,14 +234,14 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
                 </div>
 
                 {/* Cancel Button */}
-                <div className="pt-2 border-t border-border">
+                <div className="pt-2 border-t border-hairline">
                   {confirmCancel === order.order_id ? (
                     <div className="flex items-center justify-between">
                       <span className="text-xs text-yellow-400">취소하시겠습니까?</span>
                       <div className="flex gap-2">
                         <button
                           onClick={() => setConfirmCancel(null)}
-                          className="px-2 py-1 text-xs bg-surface-light hover:bg-border rounded"
+                          className="px-2 py-1 text-xs bg-elevated hover:bg-hairline rounded"
                         >
                           아니오
                         </button>
@@ -257,7 +257,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
                   ) : (
                     <button
                       onClick={() => handleCancelOrder(order.order_id)}
-                      className="w-full flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+                      className="w-full flex items-center justify-center gap-1 py-1 text-xs text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
                       disabled={cancellingOrder === order.order_id}
                     >
                       <X size={12} />
@@ -270,7 +270,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
           })}
         </div>
       ) : (
-        <div className="text-center py-6 text-gray-500">
+        <div className="text-center py-6 text-dim">
           <Clock size={28} className="mx-auto mb-2 opacity-50" />
           <p className="text-sm">미체결 주문 없음</p>
         </div>

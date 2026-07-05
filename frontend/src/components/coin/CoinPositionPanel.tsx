@@ -8,6 +8,7 @@
 import { useState, useEffect } from 'react';
 import { TrendingUp, TrendingDown, X, RefreshCw, AlertCircle, Target, Shield } from 'lucide-react';
 import { getCoinPositions, closeCoinPosition } from '@/api/client';
+import { pnlColor } from '@/utils/pnl';
 import type { CoinPosition } from '@/types';
 
 interface CoinPositionPanelProps {
@@ -82,7 +83,7 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
   if (isLoading && positions.length === 0) {
     return (
       <div className="card animate-pulse">
-        <div className="h-32 bg-surface rounded" />
+        <div className="h-32 bg-elevated rounded" />
       </div>
     );
   }
@@ -102,10 +103,10 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
         </div>
         <button
           onClick={fetchPositions}
-          className="p-1 hover:bg-surface rounded transition-colors"
+          className="p-1 hover:bg-elevated rounded transition-colors"
           title="Refresh"
         >
-          <RefreshCw size={16} className={`text-gray-400 ${isLoading ? 'animate-spin' : ''}`} />
+          <RefreshCw size={16} className={`text-muted ${isLoading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
@@ -119,16 +120,14 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
 
       {/* Portfolio Summary */}
       {positions.length > 0 && (
-        <div className="p-3 bg-surface rounded-lg">
+        <div className="p-3 bg-elevated rounded-lg">
           <div className="flex items-center justify-between">
-            <span className="text-gray-400">Total Value</span>
-            <span className="font-semibold">{formatKRW(totalValue)} KRW</span>
+            <span className="text-muted">Total Value</span>
+            <span className="font-semibold tabular-nums">{formatKRW(totalValue)} KRW</span>
           </div>
           <div className="flex items-center justify-between mt-1">
-            <span className="text-gray-400">Total P&L</span>
-            <div className={`flex items-center gap-1 font-semibold ${
-              totalPnl >= 0 ? 'text-green-400' : 'text-red-400'
-            }`}>
+            <span className="text-muted">Total P&L</span>
+            <div className={`flex items-center gap-1 font-semibold tabular-nums ${pnlColor(totalPnl)}`}>
               {totalPnl >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
               <span>{totalPnl >= 0 ? '+' : ''}{formatKRW(totalPnl)} KRW</span>
               <span className="text-xs">({totalPnlPct >= 0 ? '+' : ''}{totalPnlPct.toFixed(2)}%)</span>
@@ -143,17 +142,17 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
           {positions.map((position) => (
             <div
               key={position.market}
-              className="p-3 bg-surface rounded-lg"
+              className="p-3 bg-elevated rounded-lg"
             >
               {/* Market Info */}
               <div className="flex items-center justify-between mb-2">
                 <div>
                   <div className="font-medium">{position.currency}</div>
-                  <div className="text-xs text-gray-500">{position.market}</div>
+                  <div className="text-xs text-dim">{position.market}</div>
                 </div>
                 <div className="text-right">
-                  <div className="font-mono text-sm">{formatCrypto(position.quantity)}</div>
-                  <div className="text-xs text-gray-500">
+                  <div className="font-mono text-sm tabular-nums">{formatCrypto(position.quantity)}</div>
+                  <div className="text-xs text-dim tabular-nums">
                     @ {position.avg_entry_price.toLocaleString('ko-KR')} KRW
                   </div>
                 </div>
@@ -161,12 +160,12 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
 
               {/* Price & P&L */}
               <div className="flex items-center justify-between text-sm">
-                <span className="text-gray-400">Current</span>
-                <span>{position.current_price.toLocaleString('ko-KR')} KRW</span>
+                <span className="text-muted">Current</span>
+                <span className="tabular-nums">{position.current_price.toLocaleString('ko-KR')} KRW</span>
               </div>
               <div className="flex items-center justify-between text-sm mt-1">
-                <span className="text-gray-400">P&L</span>
-                <span className={position.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                <span className="text-muted">P&L</span>
+                <span className={`tabular-nums ${pnlColor(position.unrealized_pnl)}`}>
                   {position.unrealized_pnl >= 0 ? '+' : ''}{formatKRW(position.unrealized_pnl)} KRW
                   ({position.unrealized_pnl_pct >= 0 ? '+' : ''}{position.unrealized_pnl_pct.toFixed(2)}%)
                 </span>
@@ -178,27 +177,27 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
                   {position.stop_loss && (
                     <div className="flex items-center gap-1 text-red-400">
                       <Shield size={12} />
-                      <span>SL: {position.stop_loss.toLocaleString('ko-KR')}</span>
+                      <span className="tabular-nums">SL: {position.stop_loss.toLocaleString('ko-KR')}</span>
                     </div>
                   )}
                   {position.take_profit && (
                     <div className="flex items-center gap-1 text-green-400">
                       <Target size={12} />
-                      <span>TP: {position.take_profit.toLocaleString('ko-KR')}</span>
+                      <span className="tabular-nums">TP: {position.take_profit.toLocaleString('ko-KR')}</span>
                     </div>
                   )}
                 </div>
               )}
 
               {/* Close Button */}
-              <div className="mt-3 pt-2 border-t border-border">
+              <div className="mt-3 pt-2 border-t border-hairline">
                 {confirmClose === position.market ? (
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-yellow-400">Confirm close?</span>
                     <div className="flex gap-2">
                       <button
                         onClick={() => setConfirmClose(null)}
-                        className="px-2 py-1 text-xs bg-surface hover:bg-border rounded"
+                        className="px-2 py-1 text-xs bg-elevated hover:bg-hairline rounded"
                       >
                         Cancel
                       </button>
@@ -214,7 +213,7 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
                 ) : (
                   <button
                     onClick={() => handleClosePosition(position.market)}
-                    className="w-full flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+                    className="w-full flex items-center justify-center gap-1 py-1 text-xs text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
                     disabled={closingMarket === position.market}
                   >
                     <X size={12} />
@@ -226,7 +225,7 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
           ))}
         </div>
       ) : (
-        <div className="text-center py-8 text-gray-500">
+        <div className="text-center py-8 text-dim">
           <TrendingUp size={32} className="mx-auto mb-2 opacity-50" />
           <p className="text-sm">No open positions</p>
           <p className="text-xs mt-1">Start an analysis to create a trade</p>

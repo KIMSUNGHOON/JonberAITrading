@@ -88,7 +88,7 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
   if (isLoading && positions.length === 0) {
     return (
       <div className="card animate-pulse">
-        <div className="h-32 bg-surface rounded" />
+        <div className="h-32 bg-elevated rounded" />
       </div>
     );
   }
@@ -108,11 +108,11 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
         </div>
         <button
           onClick={() => fetchPositions(true)}
-          className="p-1 hover:bg-surface rounded transition-colors"
+          className="p-1 hover:bg-elevated rounded transition-colors"
           title="새로고침"
           aria-label="Refresh positions"
         >
-          <RefreshCw size={16} className={`text-gray-400 ${isLoading ? 'animate-spin' : ''}`} />
+          <RefreshCw size={16} className={`text-muted ${isLoading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
@@ -126,14 +126,14 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
 
       {/* Portfolio Summary */}
       {positions.length > 0 && (
-        <div className="p-3 bg-surface rounded-lg">
+        <div className="p-3 bg-elevated rounded-lg">
           <div className="flex items-center justify-between">
-            <span className="text-gray-400">총 평가금액</span>
-            <span className="font-semibold">{formatKRW(totalValue)}원</span>
+            <span className="text-muted">총 평가금액</span>
+            <span className="font-semibold tabular-nums">{formatKRW(totalValue)}원</span>
           </div>
           <div className="flex items-center justify-between mt-1">
-            <span className="text-gray-400">총 손익</span>
-            <div className={`flex items-center gap-1 font-semibold ${pnlColor(totalPnl)}`}>
+            <span className="text-muted">총 손익</span>
+            <div className={`flex items-center gap-1 font-semibold tabular-nums ${pnlColor(totalPnl)}`}>
               {totalPnl >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
               <span>{totalPnl >= 0 ? '+' : ''}{formatKRW(totalPnl)}원</span>
               <span className="text-xs">({totalPnlPct >= 0 ? '+' : ''}{totalPnlPct.toFixed(2)}%)</span>
@@ -148,17 +148,17 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
           {positions.map((position) => (
             <div
               key={position.stk_cd}
-              className="p-3 bg-surface rounded-lg"
+              className="p-3 bg-elevated rounded-lg"
             >
               {/* Stock Info */}
               <div className="flex items-center justify-between mb-2">
                 <div>
                   <div className="font-medium">{position.stk_nm}</div>
-                  <div className="text-xs text-gray-500">{position.stk_cd}</div>
+                  <div className="text-xs text-dim">{position.stk_cd}</div>
                 </div>
                 <div className="text-right">
-                  <div className="font-mono text-sm">{formatQuantity(position.quantity)}주</div>
-                  <div className="text-xs text-gray-500">
+                  <div className="font-mono text-sm tabular-nums">{formatQuantity(position.quantity)}주</div>
+                  <div className="text-xs text-dim tabular-nums">
                     @ {position.avg_entry_price.toLocaleString('ko-KR')}원
                   </div>
                 </div>
@@ -166,12 +166,12 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
 
               {/* Price & P&L */}
               <div className="flex items-center justify-between text-sm">
-                <span className="text-gray-400">현재가</span>
-                <span>{position.current_price.toLocaleString('ko-KR')}원</span>
+                <span className="text-muted">현재가</span>
+                <span className="tabular-nums">{position.current_price.toLocaleString('ko-KR')}원</span>
               </div>
               <div className="flex items-center justify-between text-sm mt-1">
-                <span className="text-gray-400">평가손익</span>
-                <span className={pnlColor(position.unrealized_pnl)}>
+                <span className="text-muted">평가손익</span>
+                <span className={`tabular-nums ${pnlColor(position.unrealized_pnl)}`}>
                   {position.unrealized_pnl >= 0 ? '+' : ''}{formatKRW(position.unrealized_pnl)}원
                   ({position.unrealized_pnl_pct >= 0 ? '+' : ''}{position.unrealized_pnl_pct.toFixed(2)}%)
                 </span>
@@ -183,27 +183,27 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
                   {position.stop_loss && (
                     <div className="flex items-center gap-1 text-blue-400">
                       <Shield size={12} />
-                      <span>손절: {position.stop_loss.toLocaleString('ko-KR')}원</span>
+                      <span className="tabular-nums">손절: {position.stop_loss.toLocaleString('ko-KR')}원</span>
                     </div>
                   )}
                   {position.take_profit && (
                     <div className="flex items-center gap-1 text-red-400">
                       <Target size={12} />
-                      <span>익절: {position.take_profit.toLocaleString('ko-KR')}원</span>
+                      <span className="tabular-nums">익절: {position.take_profit.toLocaleString('ko-KR')}원</span>
                     </div>
                   )}
                 </div>
               )}
 
               {/* Close Button */}
-              <div className="mt-3 pt-2 border-t border-border">
+              <div className="mt-3 pt-2 border-t border-hairline">
                 {confirmClose === position.stk_cd ? (
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-yellow-400">청산하시겠습니까?</span>
                     <div className="flex gap-2">
                       <button
                         onClick={() => setConfirmClose(null)}
-                        className="px-2 py-1 text-xs bg-surface hover:bg-border rounded"
+                        className="px-2 py-1 text-xs bg-elevated hover:bg-hairline rounded"
                       >
                         취소
                       </button>
@@ -219,7 +219,7 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
                 ) : (
                   <button
                     onClick={() => handleClosePosition(position.stk_cd)}
-                    className="w-full flex items-center justify-center gap-1 py-1 text-xs text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+                    className="w-full flex items-center justify-center gap-1 py-1 text-xs text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
                     disabled={closingStock === position.stk_cd}
                   >
                     <X size={12} />
@@ -231,7 +231,7 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
           ))}
         </div>
       ) : (
-        <div className="text-center py-8 text-gray-500">
+        <div className="text-center py-8 text-dim">
           <Building2 size={32} className="mx-auto mb-2 opacity-50" />
           <p className="text-sm">보유 종목 없음</p>
           <p className="text-xs mt-1">분석을 시작하여 거래를 생성하세요</p>

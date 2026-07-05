@@ -61,7 +61,7 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
   if (isLoading && accounts.length === 0) {
     return (
       <div className="card animate-pulse">
-        <div className="h-24 bg-surface rounded" />
+        <div className="h-24 bg-elevated rounded" />
       </div>
     );
   }
@@ -93,24 +93,24 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
         </div>
         <button
           onClick={handleRefresh}
-          className="p-1 hover:bg-surface rounded transition-colors"
+          className="p-1 hover:bg-elevated rounded transition-colors"
           title="Refresh"
         >
-          <RefreshCw size={16} className={`text-gray-400 ${isLoading ? 'animate-spin' : ''}`} />
+          <RefreshCw size={16} className={`text-muted ${isLoading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
       {/* KRW Balance */}
       {krwAccount && (
-        <div className="p-3 bg-surface rounded-lg">
+        <div className="p-3 bg-elevated rounded-lg">
           <div className="flex items-center justify-between">
-            <span className="text-gray-400">KRW</span>
+            <span className="text-muted">KRW</span>
             <div className="text-right">
-              <div className="font-semibold">
-                {formatKRW(krwAccount.balance)} <span className="text-xs text-gray-500">KRW</span>
+              <div className="font-semibold tabular-nums">
+                {formatKRW(krwAccount.balance)} <span className="text-xs text-dim">KRW</span>
               </div>
               {krwAccount.locked > 0 && (
-                <div className="text-xs text-gray-500">
+                <div className="text-xs text-dim tabular-nums">
                   Locked: {formatKRW(krwAccount.locked)} KRW
                 </div>
               )}
@@ -122,27 +122,27 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
       {/* Coin Holdings */}
       {coinAccounts.length > 0 && (
         <div className="space-y-2">
-          <div className="text-xs text-gray-500 uppercase tracking-wide">Holdings</div>
+          <div className="text-xs text-dim uppercase tracking-wide">Holdings</div>
           <div className="space-y-2 max-h-40 overflow-y-auto">
             {coinAccounts.map((account) => (
               <div
                 key={account.currency}
-                className="flex items-center justify-between py-2 px-3 bg-surface rounded-lg"
+                className="flex items-center justify-between py-2 px-3 bg-elevated rounded-lg"
               >
                 <div>
                   <div className="font-medium">{account.currency}</div>
                   {account.avg_buy_price > 0 && (
-                    <div className="text-xs text-gray-500">
+                    <div className="text-xs text-dim tabular-nums">
                       Avg: {formatKRW(account.avg_buy_price)} KRW
                     </div>
                   )}
                 </div>
                 <div className="text-right">
-                  <div className="font-mono text-sm">
+                  <div className="font-mono text-sm tabular-nums">
                     {formatCrypto(account.balance)}
                   </div>
                   {account.locked > 0 && (
-                    <div className="text-xs text-gray-500">
+                    <div className="text-xs text-dim tabular-nums">
                       +{formatCrypto(account.locked)} locked
                     </div>
                   )}
@@ -155,17 +155,17 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
 
       {/* Total Value */}
       {totalKrw !== null && totalKrw > 0 && (
-        <div className="pt-2 border-t border-border">
+        <div className="pt-2 border-t border-hairline">
           <div className="flex items-center justify-between text-sm">
-            <span className="text-gray-400">Available KRW</span>
-            <span className="font-semibold">{formatKRW(totalKrw)} KRW</span>
+            <span className="text-muted">Available KRW</span>
+            <span className="font-semibold tabular-nums">{formatKRW(totalKrw)} KRW</span>
           </div>
         </div>
       )}
 
       {/* Empty State */}
       {accounts.length === 0 && (
-        <div className="text-center py-4 text-gray-500 text-sm">
+        <div className="text-center py-4 text-dim text-sm">
           No account data available
         </div>
       )}
