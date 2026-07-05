@@ -36,18 +36,11 @@ import {
   selectKiwoomAvailableSlots,
   type BasketItem,
   type MarketType,
-  type SessionData,
 } from '@/store';
-import {
-  getCoinTickers,
-  startKRStockAnalysis,
-  startCoinAnalysis,
-  startAnalysis,
-  searchKRStocks,
-} from '@/api/client';
-import { wsManager, type WebSocketHandlers } from '@/api/websocket';
+import { getCoinTickers, searchKRStocks } from '@/api/client';
 import { useGoTo } from '@/hooks/useNav';
-import type { KRStockTradeProposal, SessionStatus, KRStockInfo } from '@/types';
+import { useStartAnalysis } from '@/hooks/useStartAnalysis';
+import type { KRStockInfo } from '@/types';
 
 // Market type icon component
 function MarketIcon({ marketType }: { marketType: MarketType }) {
@@ -228,7 +221,6 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
   const upbitApiConfigured = useStore((state) => state.upbitApiConfigured);
   const kiwoomApiConfigured = useStore((state) => state.kiwoomApiConfigured);
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
-  const setActiveMarket = useStore((state) => state.setActiveMarket);
   const availableSlots = useStore(selectKiwoomAvailableSlots);
 
   // Navigation actions
@@ -242,19 +234,9 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
   const setBasketItemError = useStore((state) => state.setBasketItemError);
   const setBasketItemLoading = useStore((state) => state.setBasketItemLoading);
 
-  // Legacy session actions (for stock/coin single-session mode)
-  const startCoinSession = useStore((state) => state.startCoinSession);
-  const startStockSession = useStore((state) => state.startStockSession);
-
-  // Multi-session actions for Kiwoom
-  const addKiwoomSession = useStore((state) => state.addKiwoomSession);
-  const updateKiwoomSessionStatus = useStore((state) => state.updateKiwoomSessionStatus);
-  const updateKiwoomSessionStage = useStore((state) => state.updateKiwoomSessionStage);
-  const addKiwoomSessionReasoning = useStore((state) => state.addKiwoomSessionReasoning);
-  const setKiwoomSessionProposal = useStore((state) => state.setKiwoomSessionProposal);
-  const setKiwoomSessionAwaitingApproval = useStore((state) => state.setKiwoomSessionAwaitingApproval);
-  const setKiwoomSessionError = useStore((state) => state.setKiwoomSessionError);
-  const setActiveKiwoomSession = useStore((state) => state.setActiveKiwoomSession);
+  // Shared "start analysis" flow (API call + session + Kiwoom WS wiring),
+  // also used by the ⌘K command palette.
+  const start = useStartAnalysis();
 
   // Check which APIs need configuration based on basket items
   const hasCoinItems = basketItems.some((item) => item.marketType === 'coin');
@@ -525,57 +507,6 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
     }
   };
 
-  // Create WebSocket handlers for a Kiwoom session
-  const createKiwoomWebSocketHandlers = (sessionId: string): WebSocketHandlers => ({
-    onReasoning: (entry) => {
-      addKiwoomSessionReasoning(sessionId, entry);
-    },
-    onStatus: (data) => {
-      updateKiwoomSessionStatus(sessionId, data.status as SessionStatus);
-      updateKiwoomSessionStage(sessionId, data.stage);
-      setKiwoomSessionAwaitingApproval(sessionId, data.awaiting_approval);
-    },
-    onProposal: (data) => {
-      const proposal: KRStockTradeProposal = {
-        id: data.id,
-        stk_cd: data.ticker,
-        stk_nm: null,
-        action: data.action.toUpperCase() as 'BUY' | 'SELL' | 'HOLD',
-        quantity: data.quantity,
-        entry_price: data.entry_price,
-        stop_loss: data.stop_loss,
-        take_profit: data.take_profit,
-        risk_score: data.risk_score,
-        position_size_pct: 0,
-        rationale: data.rationale,
-        bull_case: '',
-        bear_case: '',
-        created_at: new Date().toISOString(),
-      };
-      setKiwoomSessionProposal(sessionId, proposal);
-    },
-    onComplete: (data) => {
-      if (data.error) {
-        setKiwoomSessionError(sessionId, data.error);
-      }
-      updateKiwoomSessionStatus(sessionId, data.status as SessionStatus);
-      // Remove from analyzing items
-      setAnalyzingItems((prev) => {
-        const next = new Set(prev);
-        next.delete(sessionId);
-        return next;
-      });
-    },
-    onError: () => {
-      setKiwoomSessionError(sessionId, 'WebSocket connection error');
-      setAnalyzingItems((prev) => {
-        const next = new Set(prev);
-        next.delete(sessionId);
-        return next;
-      });
-    },
-  });
-
   // Handle bulk analyze - start analysis for all items
   const handleBulkAnalyze = async () => {
     if (basketItems.length === 0) return;
@@ -656,69 +587,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
     setAnalyzingItems((prev) => new Set(prev).add(item.id));
 
     try {
-      let sessionId: string;
-
-      // Switch to the correct market
-      console.log(`[BasketWidget] Setting active market: ${item.marketType}`);
-      setActiveMarket(item.marketType);
-
-      if (item.marketType === 'kiwoom') {
-        // Call API to start analysis
-        console.log(`[BasketWidget] Calling startKRStockAnalysis for ${item.ticker}`);
-        const response = await startKRStockAnalysis({ stk_cd: item.ticker });
-        sessionId = response.session_id;
-        console.log(`[BasketWidget] API response received`, { sessionId, stk_nm: response.stk_nm });
-
-        // Create session data for multi-session store
-        const sessionData: SessionData = {
-          sessionId,
-          ticker: item.ticker,
-          displayName: item.displayName || response.stk_nm || item.ticker,
-          marketType: 'kiwoom',
-          status: 'running',
-          currentStage: null,
-          reasoningLog: [],
-          analyses: [],
-          tradeProposal: null,
-          awaitingApproval: false,
-          activePosition: null,
-          error: null,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-
-        // Add to multi-session store - check if it was successful
-        console.log(`[BasketWidget] Adding session to store`, { sessionId, ticker: item.ticker });
-        const sessionAdded = addKiwoomSession(sessionData);
-
-        if (!sessionAdded) {
-          console.error(`[BasketWidget] Failed to add session to store for ${item.ticker}`);
-          throw new Error('세션 추가 실패: 동시 분석 한도에 도달했습니다.');
-        }
-
-        // Connect WebSocket with handlers
-        console.log(`[BasketWidget] Connecting WebSocket for ${sessionId}`);
-        const handlers = createKiwoomWebSocketHandlers(sessionId);
-        wsManager.connect(sessionId, handlers);
-
-        // Set as active session
-        console.log(`[BasketWidget] Setting active session: ${sessionId}`);
-        setActiveKiwoomSession(sessionId);
-
-        console.log(`[BasketWidget] Kiwoom analysis complete: ${item.ticker} -> ${sessionId}`);
-
-      } else if (item.marketType === 'coin') {
-        // For coin, use legacy single-session mode for now
-        const response = await startCoinAnalysis({ market: item.ticker });
-        sessionId = response.session_id;
-        startCoinSession(sessionId, item.ticker, item.displayName);
-
-      } else {
-        // For US stock, use legacy single-session mode
-        const response = await startAnalysis({ ticker: item.ticker });
-        sessionId = response.session_id;
-        startStockSession(sessionId, item.ticker);
-      }
+      const sessionId = await start(item.marketType, item.ticker, item.displayName);
 
       // Remove from analyzing state but keep in basket until bulk clear
       setAnalyzingItems((prev) => {
