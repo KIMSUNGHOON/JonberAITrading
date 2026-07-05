@@ -27,6 +27,8 @@ import {
 import { apiClient, startKRStockAnalysis } from '@/api/client';
 import { useStore } from '@/store';
 import { useGoTo } from '@/hooks/useNav';
+import { pnlColor } from '@/utils/pnl';
+import { Awaiting, TH } from '@/components/terminal/panels/shared';
 
 interface ScannerResultsPageProps {
   onBack?: () => void;
@@ -62,12 +64,27 @@ interface ScanSession {
 
 type ActionFilter = 'all' | 'BUY' | 'SELL' | 'HOLD' | 'WATCH' | 'AVOID';
 
-const ACTION_COLORS: Record<string, string> = {
-  BUY: 'bg-green-500/20 text-green-400 border-green-500/30',
-  SELL: 'bg-red-500/20 text-red-400 border-red-500/30',
-  HOLD: 'bg-blue-500/20 text-blue-400 border-blue-500/30',
-  WATCH: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
-  AVOID: 'bg-gray-500/20 text-gray-400 border-gray-500/30',
+// Action -> text color. BUY/SELL genuinely express bullish/bearish direction,
+// so they route through the shared P&L helper (single source of truth for
+// up/down semantics); HOLD/WATCH/AVOID are non-directional and use the
+// dedicated semantic tokens. Trading colors are TEXT ONLY (never a fill), so
+// badges below sit on a neutral bg-elevated/border-hairline chip.
+const ACTION_TEXT_COLOR: Record<string, string> = {
+  BUY: pnlColor(1), // bullish -> text-up (western convention)
+  SELL: pnlColor(-1), // bearish -> text-down
+  HOLD: 'text-muted',
+  WATCH: 'text-warn',
+  AVOID: 'text-accent',
+};
+
+// Border accent for the selected stat-tile (borders aren't a "fill", so the
+// text-only trading-color rule doesn't restrict them here).
+const ACTION_BORDER_COLOR: Record<string, string> = {
+  BUY: 'border-up',
+  SELL: 'border-down',
+  HOLD: 'border-dim',
+  WATCH: 'border-warn',
+  AVOID: 'border-accent',
 };
 
 const ACTION_ICONS: Record<string, React.ReactNode> = {
@@ -195,54 +212,55 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
   const totalPages = Math.ceil(total / pageSize);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 text-white">
+    <div className="h-full flex flex-col bg-canvas">
       {/* Header */}
-      <div className="border-b border-gray-700 bg-gray-900/50 backdrop-blur-sm sticky top-0 z-10">
-        <div className="max-w-7xl mx-auto px-4 py-4">
+      <div className="flex-none border-b border-hairline bg-card sticky top-0 z-10">
+        <div className="max-w-7xl mx-auto px-4 py-2.5">
           <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-3">
               <button
                 onClick={handleBack}
-                className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
+                className="p-1.5 hover:bg-elevated rounded transition-colors"
               >
-                <ArrowLeft className="w-5 h-5" />
+                <ArrowLeft className="w-4 h-4 text-muted" />
               </button>
               <div>
-                <h1 className="text-xl font-bold">Scanner Results</h1>
-                <p className="text-sm text-gray-400">
+                <h1 className="text-sm font-semibold text-ink">Scanner Results</h1>
+                <p className="text-[11px] text-dim">
                   {total > 0 ? `${total}개 종목 분석 완료` : '분석 결과 없음'}
                 </p>
               </div>
             </div>
             <button
               onClick={loadResults}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors"
+              className="flex items-center gap-2 px-3 py-1.5 bg-accent hover:bg-accent/90 text-canvas text-xs font-medium rounded transition-colors"
             >
-              <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
               새로고침
             </button>
           </div>
         </div>
       </div>
 
-      <div className="max-w-7xl mx-auto px-4 py-6">
+      <div className="flex-1 overflow-y-auto px-4 py-4">
+      <div className="max-w-7xl mx-auto">
         {/* Counts Summary */}
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-4">
           {(['BUY', 'SELL', 'HOLD', 'WATCH', 'AVOID'] as const).map((action) => (
             <button
               key={action}
               onClick={() => setActionFilter(actionFilter === action ? 'all' : action)}
-              className={`p-4 rounded-lg border transition-all ${
+              className={`p-3 rounded-lg border transition-all ${
                 actionFilter === action
-                  ? ACTION_COLORS[action] + ' border-2'
-                  : 'bg-gray-800/50 border-gray-700 hover:border-gray-600'
+                  ? `bg-elevated border-2 ${ACTION_BORDER_COLOR[action]} ${ACTION_TEXT_COLOR[action]}`
+                  : 'bg-card border-hairline hover:border-dim text-ink'
               }`}
             >
               <div className="flex items-center justify-between mb-2">
-                <span className="text-xs uppercase font-medium">{action}</span>
+                <span className="text-[10px] uppercase tracking-wide font-medium">{action}</span>
                 {ACTION_ICONS[action]}
               </div>
-              <div className="text-2xl font-bold">
+              <div className="text-lg font-bold tabular-nums">
                 {counts[`${action.toLowerCase()}_count`] || 0}
               </div>
             </button>
@@ -250,29 +268,29 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
         </div>
 
         {/* Filters */}
-        <div className="flex flex-wrap gap-4 mb-6">
+        <div className="flex flex-wrap gap-3 mb-4">
           {/* Search */}
           <div className="relative flex-1 min-w-[200px]">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted" />
             <input
               type="text"
               placeholder="종목코드 또는 종목명 검색..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-10 pr-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:border-blue-500"
+              className="w-full pl-10 pr-4 py-2 bg-card border border-hairline rounded-lg text-ink placeholder:text-dim focus:outline-none focus:border-accent"
             />
           </div>
 
           {/* Session Select */}
           <div className="flex items-center gap-2">
-            <Filter className="w-4 h-4 text-gray-400" />
+            <Filter className="w-4 h-4 text-muted" />
             <select
               value={selectedSession || ''}
               onChange={(e) => {
                 setSelectedSession(e.target.value || undefined);
                 setPage(0);
               }}
-              className="px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:border-blue-500"
+              className="px-4 py-2 bg-card border border-hairline rounded-lg text-ink focus:outline-none focus:border-accent"
             >
               <option value="">최근 세션</option>
               {sessions.map((session) => (
@@ -292,8 +310,8 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
               }}
               className={`px-3 py-1 rounded-full text-sm transition-colors ${
                 actionFilter === 'all'
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                  ? 'bg-accent text-canvas'
+                  : 'bg-elevated text-ink hover:bg-hairline'
               }`}
             >
               전체
@@ -309,70 +327,72 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
         )}
 
         {/* Results Table */}
-        <div className="bg-gray-800/50 rounded-lg border border-gray-700 overflow-hidden">
+        <div className="bg-card rounded-lg border border-hairline overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full">
-              <thead className="bg-gray-900/50">
+              <thead>
                 <tr>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">종목</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">시장</th>
-                  <th className="px-4 py-3 text-center text-xs font-medium text-gray-400 uppercase">액션</th>
-                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-400 uppercase">현재가</th>
-                  <th className="px-4 py-3 text-center text-xs font-medium text-gray-400 uppercase">신뢰도</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-400 uppercase">요약</th>
-                  <th className="px-4 py-3 text-center text-xs font-medium text-gray-400 uppercase">분석일시</th>
-                  <th className="px-4 py-3 text-center text-xs font-medium text-gray-400 uppercase">액션</th>
+                  <th className={`${TH} text-left`}>종목</th>
+                  <th className={`${TH} text-left`}>시장</th>
+                  <th className={`${TH} text-center`}>액션</th>
+                  <th className={TH}>현재가</th>
+                  <th className={`${TH} text-center`}>신뢰도</th>
+                  <th className={`${TH} text-left`}>요약</th>
+                  <th className={`${TH} text-center`}>분석일시</th>
+                  <th className={`${TH} text-center`}>액션</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-700">
+              <tbody className="divide-y divide-hairline">
                 {loading ? (
                   <tr>
-                    <td colSpan={8} className="px-4 py-8 text-center text-gray-400">
+                    <td colSpan={8} className="px-4 py-8 text-center text-dim">
                       <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2" />
                       로딩 중...
                     </td>
                   </tr>
                 ) : filteredResults.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="px-4 py-8 text-center text-gray-400">
-                      {searchQuery ? '검색 결과가 없습니다.' : '분석 결과가 없습니다.'}
+                    <td colSpan={8} className="p-0">
+                      <Awaiting
+                        label={searchQuery ? '검색 결과가 없습니다.' : '분석 결과가 없습니다.'}
+                      />
                     </td>
                   </tr>
                 ) : (
                   filteredResults.map((result) => (
                     <tr
                       key={`${result.stk_cd}-${result.scanned_at}`}
-                      className="hover:bg-gray-700/30 transition-colors"
+                      className="hover:bg-elevated/40 transition-colors"
                     >
                       <td className="px-4 py-3">
                         <div>
-                          <div className="font-medium">{result.stk_nm}</div>
-                          <div className="text-xs text-gray-400">{result.stk_cd}</div>
+                          <div className="font-medium text-ink">{result.stk_nm}</div>
+                          <div className="text-xs text-muted">{result.stk_cd}</div>
                         </div>
                       </td>
                       <td className="px-4 py-3">
-                        <span className="text-xs px-2 py-1 bg-gray-700 rounded">
+                        <span className="text-xs px-2 py-1 bg-elevated rounded text-muted">
                           {result.market_type || '-'}
                         </span>
                       </td>
                       <td className="px-4 py-3 text-center">
                         <span
-                          className={`inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-medium ${
-                            ACTION_COLORS[result.action] || 'bg-gray-700'
+                          className={`inline-flex items-center gap-1 px-2 py-1 rounded border border-hairline bg-elevated text-xs font-medium ${
+                            ACTION_TEXT_COLOR[result.action] ?? 'text-muted'
                           }`}
                         >
                           {ACTION_ICONS[result.action]}
                           {result.action}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-right font-mono">
+                      <td className="px-4 py-3 text-right font-mono tabular-nums text-ink">
                         {result.current_price > 0
                           ? `₩${formatPrice(result.current_price)}`
                           : '-'}
                       </td>
                       <td className="px-4 py-3 text-center">
                         <div className="flex items-center justify-center">
-                          <div className="w-16 h-2 bg-gray-700 rounded-full overflow-hidden">
+                          <div className="w-16 h-2 bg-elevated rounded-full overflow-hidden">
                             <div
                               className={`h-full ${
                                 result.confidence >= 0.7
@@ -384,24 +404,24 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
                               style={{ width: `${result.confidence * 100}%` }}
                             />
                           </div>
-                          <span className="ml-2 text-xs text-gray-400">
+                          <span className="ml-2 text-xs text-muted tabular-nums">
                             {(result.confidence * 100).toFixed(0)}%
                           </span>
                         </div>
                       </td>
                       <td className="px-4 py-3">
-                        <div className="max-w-xs truncate text-sm text-gray-300" title={result.summary}>
+                        <div className="max-w-xs truncate text-sm text-ink" title={result.summary}>
                           {result.summary || '-'}
                         </div>
                       </td>
-                      <td className="px-4 py-3 text-center text-xs text-gray-400">
+                      <td className="px-4 py-3 text-center text-xs text-muted">
                         {formatDate(result.scanned_at)}
                       </td>
                       <td className="px-4 py-3 text-center">
                         <button
                           onClick={() => handleAnalyze(result.stk_cd, result.stk_nm)}
                           disabled={analyzing === result.stk_cd}
-                          className="px-3 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs transition-colors disabled:opacity-50"
+                          className="px-3 py-1 bg-accent hover:bg-accent/90 text-canvas rounded text-xs font-medium transition-colors disabled:opacity-50"
                         >
                           {analyzing === result.stk_cd ? '분석중...' : '상세분석'}
                         </button>
@@ -415,25 +435,25 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
 
           {/* Pagination */}
           {totalPages > 1 && (
-            <div className="px-4 py-3 border-t border-gray-700 flex items-center justify-between">
-              <div className="text-sm text-gray-400">
+            <div className="px-4 py-3 border-t border-hairline flex items-center justify-between">
+              <div className="text-sm text-muted tabular-nums">
                 {page * pageSize + 1} - {Math.min((page + 1) * pageSize, total)} / {total}개
               </div>
               <div className="flex gap-2">
                 <button
                   onClick={() => setPage(Math.max(0, page - 1))}
                   disabled={page === 0}
-                  className="p-2 hover:bg-gray-700 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="p-2 hover:bg-elevated rounded disabled:opacity-50 disabled:cursor-not-allowed text-muted"
                 >
                   <ChevronLeft className="w-4 h-4" />
                 </button>
-                <span className="px-4 py-2 text-sm">
+                <span className="px-4 py-2 text-sm tabular-nums text-ink">
                   {page + 1} / {totalPages}
                 </span>
                 <button
                   onClick={() => setPage(Math.min(totalPages - 1, page + 1))}
                   disabled={page >= totalPages - 1}
-                  className="p-2 hover:bg-gray-700 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="p-2 hover:bg-elevated rounded disabled:opacity-50 disabled:cursor-not-allowed text-muted"
                 >
                   <ChevronRight className="w-4 h-4" />
                 </button>
@@ -441,6 +461,7 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
             </div>
           )}
         </div>
+      </div>
       </div>
     </div>
   );
