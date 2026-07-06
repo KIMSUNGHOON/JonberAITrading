@@ -98,6 +98,9 @@ const CLEAN_SET = [
   // d2 t8: Chat session viewer (agentConfig IDENTITY kept raw+color-ok;
   // voteColor/actionColor DIRECTIONAL -> pnlColor).
   'src/components/agent-chat/ChatSessionViewer.tsx',
+  // d2 t9: Position monitor (eventTypeConfig STATUS/DIRECTIONAL -> tokens;
+  // volatility_spike kept raw+color-ok as event-category identity).
+  'src/components/agent-chat/PositionMonitor.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 
