@@ -129,7 +129,7 @@ export function KiwoomAccountBalance() {
   if (error) {
     return (
       <div className="card">
-        <div className="flex items-center gap-2 text-red-400">
+        <div className="flex items-center gap-2 text-down">
           <AlertCircle size={18} />
           <span className="text-sm">{error}</span>
         </div>
@@ -190,7 +190,7 @@ export function KiwoomAccountBalance() {
         {/* Cash Balance */}
         <div className="p-3 bg-elevated rounded-lg">
           <div className="flex items-center gap-2 mb-2">
-            <Banknote size={16} className="text-green-400" />
+            <Banknote size={16} className="text-green-400" /> {/* color-ok: cash category icon, not directional */}
             <span className="text-xs text-muted">예수금</span>
           </div>
           <div className="font-semibold tabular-nums">{formatKRW(account.cash.deposit)}원</div>

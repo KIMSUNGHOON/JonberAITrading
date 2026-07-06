@@ -169,7 +169,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
 
       {/* Error */}
       {error && (
-        <div className="flex items-center gap-2 p-2 bg-red-500/10 rounded text-red-400 text-sm">
+        <div className="flex items-center gap-2 p-2 bg-down/10 rounded text-down text-sm">
           <AlertCircle size={14} />
           <span>{error}</span>
         </div>
@@ -247,7 +247,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
                         </button>
                         <button
                           onClick={() => handleCancelOrder(order.order_id)}
-                          className="px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded"
+                          className="px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded" // color-ok: destructive action (confirm cancel)
                           disabled={cancellingOrder === order.order_id}
                         >
                           {cancellingOrder === order.order_id ? '취소 중...' : '예'}
@@ -257,7 +257,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
                   ) : (
                     <button
                       onClick={() => handleCancelOrder(order.order_id)}
-                      className="w-full flex items-center justify-center gap-1 py-1 text-xs text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+                      className="w-full flex items-center justify-center gap-1 py-1 text-xs text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors" // color-ok: destructive action hover
                       disabled={cancellingOrder === order.order_id}
                     >
                       <X size={12} />

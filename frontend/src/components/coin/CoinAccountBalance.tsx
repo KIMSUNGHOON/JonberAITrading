@@ -69,7 +69,7 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
   if (error) {
     return (
       <div className="card">
-        <div className="flex items-center gap-2 text-red-400">
+        <div className="flex items-center gap-2 text-down">
           <AlertCircle size={16} />
           <span className="text-sm">{error}</span>
         </div>

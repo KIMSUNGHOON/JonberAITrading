@@ -321,7 +321,7 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
 
         {/* Error */}
         {error && (
-          <div className="mb-4 p-4 bg-red-500/20 border border-red-500/30 rounded-lg text-red-400">
+          <div className="mb-4 p-4 bg-down/20 border border-down/30 rounded-lg text-down">
             {error}
           </div>
         )}

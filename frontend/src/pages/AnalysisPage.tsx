@@ -50,7 +50,7 @@ function MarketIcon({ marketType, size = 16 }: { marketType: MarketType; size?: 
 // their distinct hues rather than routing through pnlColor.
 function getMarketColor(marketType: MarketType): string {
   switch (marketType) {
-    case 'stock': return 'text-green-400';
+    case 'stock': return 'text-green-400'; // color-ok: market identity, not directional
     case 'coin': return 'text-yellow-400';
     case 'kiwoom': return 'text-blue-400';
   }
@@ -493,7 +493,7 @@ export function AnalysisPage(_props: AnalysisPageProps) {
                       {/* Delete Button */}
                       <button
                         onClick={(e) => handleDeleteItem(e, item)}
-                        className="p-1.5 rounded-md text-dim hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                        className="p-1.5 rounded-md text-dim hover:text-red-400 hover:bg-red-500/10 transition-colors" // color-ok: destructive action (delete) hover
                         title="삭제"
                       >
                         <Trash2 className="w-4 h-4" />

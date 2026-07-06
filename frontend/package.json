@@ -10,7 +10,8 @@
     "lint:fix": "eslint . --ext ts,tsx --fix",
     "format": "prettier --write \"src/**/*.{ts,tsx,css,json}\"",
     "test": "vitest",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "lint:colors": "node scripts/check-trading-colors.mjs"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",

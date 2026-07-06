@@ -116,7 +116,7 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
 
       {/* Error */}
       {error && (
-        <div className="flex items-center gap-2 p-2 bg-red-500/10 rounded text-red-400 text-sm">
+        <div className="flex items-center gap-2 p-2 bg-down/10 rounded text-down text-sm">
           <AlertCircle size={14} />
           <span>{error}</span>
         </div>
@@ -142,7 +142,7 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
                 </div>
                 <button
                   onClick={() => handleCancelOrder(order.uuid)}
-                  className="p-1 text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+                  className="p-1 text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors" // color-ok: destructive action hover
                   disabled={cancellingId === order.uuid}
                   title="Cancel order"
                 >

@@ -33,5 +33,7 @@ jobs:
           node-version: "20"
       - name: Install deps
         run: npm ci
+      - name: Trading-color guard
+        run: npm run lint:colors
       - name: Run unit tests
         run: npm run test:run

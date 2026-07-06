@@ -118,7 +118,7 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
 
       {/* Error */}
       {error && (
-        <div className="flex items-center gap-2 p-2 bg-red-500/10 rounded text-red-400 text-sm">
+        <div className="flex items-center gap-2 p-2 bg-down/10 rounded text-down text-sm">
           <AlertCircle size={14} />
           <span>{error}</span>
         </div>
@@ -209,7 +209,7 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
                       </button>
                       <button
                         onClick={() => handleClosePosition(position.stk_cd)}
-                        className="px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded"
+                        className="px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded" // color-ok: destructive action (confirm close)
                         disabled={closingStock === position.stk_cd}
                       >
                         {closingStock === position.stk_cd ? '청산 중...' : '확인'}
@@ -219,7 +219,7 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
                 ) : (
                   <button
                     onClick={() => handleClosePosition(position.stk_cd)}
-                    className="w-full flex items-center justify-center gap-1 py-1 text-xs text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+                    className="w-full flex items-center justify-center gap-1 py-1 text-xs text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors" // color-ok: destructive action hover
                     disabled={closingStock === position.stk_cd}
                   >
                     <X size={12} />

@@ -60,7 +60,7 @@ interface AnalysisDetailPageProps {
 function MarketIcon({ marketType, size = 16 }: { marketType: MarketType; size?: number }) {
   switch (marketType) {
     case 'stock':
-      return <TrendingUp size={size} className="text-green-400" />;
+      return <TrendingUp size={size} className="text-green-400" />; // color-ok: market identity, not directional
     case 'coin':
       return <Bitcoin size={size} className="text-yellow-400" />;
     case 'kiwoom':
@@ -751,7 +751,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
 
             {/* Fundamental Analysis */}
             <AnalysisCard
-              icon={<DollarSign className="w-5 h-5 text-green-400" />}
+              icon={<DollarSign className="w-5 h-5 text-green-400" />} // color-ok: analysis-category icon, not directional
               title={t('fundamental_analysis')}
               signal={fundamentalAnalysis?.recommendation}
               confidence={fundamentalAnalysis?.confidence}
