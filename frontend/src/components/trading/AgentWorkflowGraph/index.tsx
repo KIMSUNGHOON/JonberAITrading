@@ -80,8 +80,8 @@ export function AgentWorkflowGraph({ className = '' }: AgentWorkflowGraphProps) 
   // Render loading state
   if (isLoading && Object.keys(agents).length === 0) {
     return (
-      <div className={`bg-gray-900 rounded-lg p-6 ${className}`}>
-        <div className="flex items-center justify-center gap-2 text-gray-400">
+      <div className={`bg-card rounded-lg p-6 ${className}`}>
+        <div className="flex items-center justify-center gap-2 text-muted">
           <RefreshCw className="w-5 h-5 animate-spin" />
           <span>에이전트 상태 로딩중...</span>
         </div>
@@ -92,8 +92,8 @@ export function AgentWorkflowGraph({ className = '' }: AgentWorkflowGraphProps) 
   // Render error state
   if (error && Object.keys(agents).length === 0) {
     return (
-      <div className={`bg-gray-900 rounded-lg p-6 ${className}`}>
-        <div className="flex items-center justify-center gap-2 text-red-400">
+      <div className={`bg-card rounded-lg p-6 ${className}`}>
+        <div className="flex items-center justify-center gap-2 text-down">
           <AlertCircle className="w-5 h-5" />
           <span>{error}</span>
         </div>
@@ -102,19 +102,19 @@ export function AgentWorkflowGraph({ className = '' }: AgentWorkflowGraphProps) 
   }
 
   return (
-    <div className={`bg-gray-900 rounded-lg ${className}`}>
+    <div className={`bg-card rounded-lg ${className}`}>
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800">
-        <h3 className="text-lg font-semibold text-white">Agent Workflow</h3>
+      <div className="flex items-center justify-between px-4 py-3 border-b border-hairline">
+        <h3 className="text-lg font-semibold text-ink">Agent Workflow</h3>
         <div className="flex items-center gap-3">
           {lastUpdated && (
-            <span className="text-xs text-gray-500">
+            <span className="text-xs text-dim tabular-nums">
               {lastUpdated.toLocaleTimeString('ko-KR')}
             </span>
           )}
           <button
             onClick={fetchAgentStates}
-            className="p-1.5 rounded hover:bg-gray-800 text-gray-400 hover:text-white transition-colors"
+            className="p-1.5 rounded hover:bg-elevated text-muted hover:text-ink transition-colors"
             title="새로고침"
           >
             <RefreshCw className="w-4 h-4" />
@@ -149,8 +149,8 @@ export function AgentWorkflowGraph({ className = '' }: AgentWorkflowGraphProps) 
                     <div
                       className={`w-0.5 h-6 ${
                         isConnectorActive
-                          ? 'bg-gradient-to-b from-blue-500 to-blue-400 animate-pulse'
-                          : 'bg-gray-700'
+                          ? 'bg-accent animate-pulse'
+                          : 'bg-elevated'
                       }`}
                     />
                     {/* Arrow */}
@@ -160,8 +160,8 @@ export function AgentWorkflowGraph({ className = '' }: AgentWorkflowGraphProps) 
                         border-r-[6px] border-r-transparent
                         border-t-[8px] ${
                           isConnectorActive
-                            ? 'border-t-blue-400'
-                            : 'border-t-gray-700'
+                            ? 'border-t-accent'
+                            : 'border-t-hairline'
                         }`}
                     />
                   </div>

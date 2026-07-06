@@ -20,6 +20,7 @@ import {
   Shield,
 } from 'lucide-react';
 import { AGENT_CONFIG } from './AgentNode';
+import { pnlColor } from '@/utils/pnl';
 import type { AgentKey, AgentState, TradeDetails, AnalysisSummary, LastResult } from './types';
 
 // -------------------------------------------
@@ -50,10 +51,10 @@ function ModalHeader({
   const Icon = config.icon;
 
   const statusColors = {
-    idle: 'bg-gray-500',
-    working: 'bg-blue-500',
-    waiting: 'bg-yellow-500',
-    error: 'bg-red-500',
+    idle: 'bg-muted',
+    working: 'bg-accent',
+    waiting: 'bg-warn',
+    error: 'bg-down',
   };
 
   const statusLabels = {
@@ -64,26 +65,26 @@ function ModalHeader({
   };
 
   return (
-    <div className="flex items-center justify-between pb-4 border-b border-gray-700">
+    <div className="flex items-center justify-between pb-4 border-b border-hairline">
       <div className="flex items-center gap-3">
-        <div className="p-2 rounded-lg bg-gray-800">
-          <Icon className="w-6 h-6 text-white" />
+        <div className="p-2 rounded-lg bg-elevated">
+          <Icon className="w-6 h-6 text-ink" />
         </div>
         <div>
-          <h3 className="text-lg font-semibold text-white">{config.name}</h3>
-          <p className="text-sm text-gray-500">{config.description}</p>
+          <h3 className="text-lg font-semibold text-ink">{config.name}</h3>
+          <p className="text-sm text-dim">{config.description}</p>
         </div>
       </div>
       <div className="flex items-center gap-3">
         <span
-          className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium text-white ${statusColors[agent.status]}`}
+          className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium text-ink ${statusColors[agent.status]}`}
         >
-          <span className={`w-2 h-2 rounded-full bg-white ${agent.status === 'working' ? 'animate-pulse' : ''}`} />
+          <span className={`w-2 h-2 rounded-full bg-ink ${agent.status === 'working' ? 'animate-pulse' : ''}`} />
           {statusLabels[agent.status]}
         </span>
         <button
           onClick={onClose}
-          className="p-1.5 rounded hover:bg-gray-800 text-gray-400 hover:text-white transition-colors"
+          className="p-1.5 rounded hover:bg-elevated text-muted hover:text-ink transition-colors"
         >
           <X className="w-5 h-5" />
         </button>
@@ -95,16 +96,16 @@ function ModalHeader({
 /** Statistics row */
 function StatsRow({ agent }: { agent: AgentState }) {
   return (
-    <div className="grid grid-cols-2 gap-4 p-4 bg-gray-800/50 rounded-lg">
+    <div className="grid grid-cols-2 gap-4 p-4 bg-elevated/50 rounded-lg">
       <div className="flex items-center gap-2">
-        <CheckCircle2 className="w-4 h-4 text-green-400" />
-        <span className="text-sm text-gray-400">완료</span>
-        <span className="text-sm font-semibold text-green-400">{agent.tasks_completed}</span>
+        <CheckCircle2 className="w-4 h-4 text-up" />
+        <span className="text-sm text-muted">완료</span>
+        <span className="text-sm font-semibold text-up tabular-nums">{agent.tasks_completed}</span>
       </div>
       <div className="flex items-center gap-2">
-        <XCircle className="w-4 h-4 text-red-400" />
-        <span className="text-sm text-gray-400">실패</span>
-        <span className="text-sm font-semibold text-red-400">{agent.tasks_failed}</span>
+        <XCircle className="w-4 h-4 text-down" />
+        <span className="text-sm text-muted">실패</span>
+        <span className="text-sm font-semibold text-down tabular-nums">{agent.tasks_failed}</span>
       </div>
     </div>
   );
@@ -115,17 +116,17 @@ function ProcessingStock({ agent }: { agent: AgentState }) {
   if (!agent.processing_stock) return null;
 
   return (
-    <div className="p-4 bg-gray-800/50 rounded-lg">
+    <div className="p-4 bg-elevated/50 rounded-lg">
       <div className="flex items-center gap-2 mb-2">
-        <Activity className="w-4 h-4 text-blue-400" />
-        <span className="text-sm font-medium text-white">처리 중인 종목</span>
+        <Activity className="w-4 h-4 text-accent" />
+        <span className="text-sm font-medium text-ink">처리 중인 종목</span>
       </div>
       <div className="flex items-center gap-2">
-        <span className="text-lg font-semibold text-white">
+        <span className="text-lg font-semibold text-ink">
           {agent.processing_stock_name || agent.processing_stock}
         </span>
         {agent.processing_stock_name && (
-          <span className="text-sm text-gray-500">({agent.processing_stock})</span>
+          <span className="text-sm text-dim">({agent.processing_stock})</span>
         )}
       </div>
     </div>
@@ -140,17 +141,28 @@ function TradeDetailsGrid({ details }: { details: TradeDetails }) {
     return `₩${value.toLocaleString('ko-KR')}`;
   };
 
-  // Get action color and icon
+  // Get action color and icon. App-wide ACTION map (matches
+  // ScannerResultsPage/AnalysisDetailPage/AgentStatusWidget): BUY/ADD is
+  // bullish -> pnlColor(1) (up/green), SELL/REDUCE is bearish -> pnlColor(-1)
+  // (down/red), WATCH -> warn, AVOID -> accent, HOLD/default -> muted.
   const getActionStyle = (action: string | undefined) => {
     switch (action?.toUpperCase()) {
       case 'BUY':
-        return { color: 'text-green-400', Icon: TrendingUp, label: '매수' };
+        return { color: pnlColor(1), Icon: TrendingUp, label: '매수' };
+      case 'ADD':
+        return { color: pnlColor(1), Icon: TrendingUp, label: action };
       case 'SELL':
-        return { color: 'text-red-400', Icon: TrendingDown, label: '매도' };
+        return { color: pnlColor(-1), Icon: TrendingDown, label: '매도' };
+      case 'REDUCE':
+        return { color: pnlColor(-1), Icon: TrendingDown, label: action };
+      case 'WATCH':
+        return { color: 'text-warn', Icon: Minus, label: action };
+      case 'AVOID':
+        return { color: 'text-accent', Icon: Minus, label: action };
       case 'HOLD':
-        return { color: 'text-yellow-400', Icon: Minus, label: '홀드' };
+        return { color: 'text-muted', Icon: Minus, label: '홀드' };
       default:
-        return { color: 'text-gray-400', Icon: Minus, label: action || '-' };
+        return { color: 'text-muted', Icon: Minus, label: action || '-' };
     }
   };
 
@@ -158,16 +170,16 @@ function TradeDetailsGrid({ details }: { details: TradeDetails }) {
   const ActionIcon = actionStyle.Icon;
 
   return (
-    <div className="p-4 bg-gray-800/50 rounded-lg">
+    <div className="p-4 bg-elevated/50 rounded-lg">
       <div className="flex items-center gap-2 mb-3">
-        <FileText className="w-4 h-4 text-blue-400" />
-        <span className="text-sm font-medium text-white">거래 상세</span>
+        <FileText className="w-4 h-4 text-accent" />
+        <span className="text-sm font-medium text-ink">거래 상세</span>
       </div>
 
       <div className="grid grid-cols-2 gap-3 text-sm">
         {/* Action */}
         <div className="col-span-2">
-          <div className="text-gray-500 mb-1">액션</div>
+          <div className="text-dim mb-1">액션</div>
           <div className={`flex items-center gap-2 ${actionStyle.color}`}>
             <ActionIcon className="w-4 h-4" />
             <span className="font-semibold">{actionStyle.label}</span>
@@ -176,59 +188,59 @@ function TradeDetailsGrid({ details }: { details: TradeDetails }) {
 
         {/* Quantity */}
         <div>
-          <div className="text-gray-500">수량</div>
-          <div className="text-white font-medium">
+          <div className="text-dim">수량</div>
+          <div className="text-ink font-medium tabular-nums">
             {details.quantity !== undefined ? `${details.quantity.toLocaleString()}주` : '-'}
           </div>
         </div>
 
         {/* Position % */}
         <div>
-          <div className="text-gray-500">비중</div>
-          <div className="text-white font-medium">
+          <div className="text-dim">비중</div>
+          <div className="text-ink font-medium tabular-nums">
             {details.position_pct !== undefined ? `${details.position_pct.toFixed(1)}%` : '-'}
           </div>
         </div>
 
         {/* Entry Price */}
         <div>
-          <div className="text-gray-500">진입가</div>
-          <div className="text-white">{formatKRW(details.entry_price)}</div>
+          <div className="text-dim">진입가</div>
+          <div className="text-ink tabular-nums">{formatKRW(details.entry_price)}</div>
         </div>
 
         {/* Estimated Amount */}
         <div>
-          <div className="text-gray-500">예상 금액</div>
-          <div className="text-white">{formatKRW(details.estimated_amount || details.total_amount)}</div>
+          <div className="text-dim">예상 금액</div>
+          <div className="text-ink tabular-nums">{formatKRW(details.estimated_amount || details.total_amount)}</div>
         </div>
 
         {/* Stop Loss */}
         <div>
-          <div className="text-gray-500">손절가</div>
-          <div className="text-red-400">{formatKRW(details.stop_loss)}</div>
+          <div className="text-dim">손절가</div>
+          <div className="text-down tabular-nums">{formatKRW(details.stop_loss)}</div>
         </div>
 
         {/* Take Profit */}
         <div>
-          <div className="text-gray-500">익절가</div>
-          <div className="text-green-400">{formatKRW(details.take_profit)}</div>
+          <div className="text-dim">익절가</div>
+          <div className="text-up tabular-nums">{formatKRW(details.take_profit)}</div>
         </div>
 
         {/* Risk Score */}
         {details.risk_score !== undefined && (
           <div className="col-span-2">
-            <div className="text-gray-500 mb-1">위험도</div>
+            <div className="text-dim mb-1">위험도</div>
             <div className="flex items-center gap-2">
-              <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
+              <div className="flex-1 h-2 bg-elevated rounded-full overflow-hidden">
                 <div
                   className={`h-full rounded-full ${
-                    details.risk_score <= 3 ? 'bg-green-500' :
-                    details.risk_score <= 6 ? 'bg-yellow-500' : 'bg-red-500'
+                    details.risk_score <= 3 ? 'bg-up' :
+                    details.risk_score <= 6 ? 'bg-warn' : 'bg-down'
                   }`}
                   style={{ width: `${details.risk_score * 10}%` }}
                 />
               </div>
-              <span className="text-white font-medium">{details.risk_score}/10</span>
+              <span className="text-ink font-medium tabular-nums">{details.risk_score}/10</span>
             </div>
           </div>
         )}
@@ -242,12 +254,12 @@ function AnalysisSummaryView({ summary }: { summary: AnalysisSummary }) {
   const getSignalStyle = (signal: string) => {
     const upperSignal = signal.toUpperCase();
     if (upperSignal.includes('BUY') || upperSignal.includes('BULL')) {
-      return 'text-green-400 bg-green-500/10';
+      return `${pnlColor(1)} bg-up/10`;
     }
     if (upperSignal.includes('SELL') || upperSignal.includes('BEAR')) {
-      return 'text-red-400 bg-red-500/10';
+      return `${pnlColor(-1)} bg-down/10`;
     }
-    return 'text-yellow-400 bg-yellow-500/10';
+    return 'text-muted bg-elevated';
   };
 
   const analyses = [
@@ -257,10 +269,10 @@ function AnalysisSummaryView({ summary }: { summary: AnalysisSummary }) {
   ];
 
   return (
-    <div className="p-4 bg-gray-800/50 rounded-lg">
+    <div className="p-4 bg-elevated/50 rounded-lg">
       <div className="flex items-center gap-2 mb-3">
-        <BarChart3 className="w-4 h-4 text-blue-400" />
-        <span className="text-sm font-medium text-white">분석 요약</span>
+        <BarChart3 className="w-4 h-4 text-accent" />
+        <span className="text-sm font-medium text-ink">분석 요약</span>
       </div>
 
       <div className="space-y-3">
@@ -268,10 +280,10 @@ function AnalysisSummaryView({ summary }: { summary: AnalysisSummary }) {
           if (!data) return null;
           return (
             <div key={key} className="flex items-start gap-3">
-              <Icon className="w-4 h-4 text-gray-400 mt-0.5" />
+              <Icon className="w-4 h-4 text-muted mt-0.5" />
               <div className="flex-1">
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-sm text-gray-400">{label}</span>
+                  <span className="text-sm text-muted">{label}</span>
                   <span
                     className={`px-2 py-0.5 rounded text-xs font-medium ${getSignalStyle(data.signal)}`}
                   >
@@ -279,16 +291,16 @@ function AnalysisSummaryView({ summary }: { summary: AnalysisSummary }) {
                   </span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <div className="flex-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                  <div className="flex-1 h-1.5 bg-elevated rounded-full overflow-hidden">
                     <div
-                      className="h-full bg-blue-500 rounded-full"
+                      className="h-full bg-accent rounded-full"
                       style={{ width: `${data.confidence}%` }}
                     />
                   </div>
-                  <span className="text-xs text-gray-500">{data.confidence}%</span>
+                  <span className="text-xs text-dim tabular-nums">{data.confidence}%</span>
                 </div>
                 {data.key_factors && data.key_factors.length > 0 && (
-                  <div className="mt-1 text-xs text-gray-500">
+                  <div className="mt-1 text-xs text-dim">
                     {data.key_factors.slice(0, 2).join(', ')}
                   </div>
                 )}
@@ -299,32 +311,32 @@ function AnalysisSummaryView({ summary }: { summary: AnalysisSummary }) {
 
         {/* Risk Assessment */}
         {summary.risk && (
-          <div className="flex items-start gap-3 pt-2 border-t border-gray-700">
-            <Shield className="w-4 h-4 text-gray-400 mt-0.5" />
+          <div className="flex items-start gap-3 pt-2 border-t border-hairline">
+            <Shield className="w-4 h-4 text-muted mt-0.5" />
             <div className="flex-1">
               <div className="flex items-center justify-between mb-1">
-                <span className="text-sm text-gray-400">리스크</span>
+                <span className="text-sm text-muted">리스크</span>
                 <span
                   className={`px-2 py-0.5 rounded text-xs font-medium ${
-                    summary.risk.level === 'LOW' ? 'text-green-400 bg-green-500/10' :
-                    summary.risk.level === 'MEDIUM' ? 'text-yellow-400 bg-yellow-500/10' :
-                    'text-red-400 bg-red-500/10'
+                    summary.risk.level === 'LOW' ? 'text-up bg-up/10' :
+                    summary.risk.level === 'MEDIUM' ? 'text-warn bg-warn/10' :
+                    'text-down bg-down/10'
                   }`}
                 >
                   {summary.risk.level}
                 </span>
               </div>
               <div className="flex items-center gap-2">
-                <div className="flex-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                <div className="flex-1 h-1.5 bg-elevated rounded-full overflow-hidden">
                   <div
                     className={`h-full rounded-full ${
-                      summary.risk.score <= 3 ? 'bg-green-500' :
-                      summary.risk.score <= 6 ? 'bg-yellow-500' : 'bg-red-500'
+                      summary.risk.score <= 3 ? 'bg-up' :
+                      summary.risk.score <= 6 ? 'bg-warn' : 'bg-down'
                     }`}
                     style={{ width: `${summary.risk.score * 10}%` }}
                   />
                 </div>
-                <span className="text-xs text-gray-500">{summary.risk.score}/10</span>
+                <span className="text-xs text-dim tabular-nums">{summary.risk.score}/10</span>
               </div>
             </div>
           </div>
@@ -344,27 +356,27 @@ function LastResultView({ result }: { result: LastResult }) {
   return (
     <div
       className={`p-4 rounded-lg ${
-        result.success ? 'bg-green-500/10 border border-green-500/20' : 'bg-red-500/10 border border-red-500/20'
+        result.success ? 'bg-up/10 border border-up/20' : 'bg-down/10 border border-down/20'
       }`}
     >
       <div className="flex items-center gap-2 mb-2">
         {result.success ? (
-          <CheckCircle2 className="w-4 h-4 text-green-400" />
+          <CheckCircle2 className="w-4 h-4 text-up" />
         ) : (
-          <XCircle className="w-4 h-4 text-red-400" />
+          <XCircle className="w-4 h-4 text-down" />
         )}
-        <span className={`text-sm font-medium ${result.success ? 'text-green-400' : 'text-red-400'}`}>
+        <span className={`text-sm font-medium ${result.success ? 'text-up' : 'text-down'}`}>
           최근 결과: {result.success ? '성공' : '실패'}
         </span>
       </div>
-      <p className={`text-sm ${result.success ? 'text-green-300' : 'text-red-300'}`}>
+      <p className={`text-sm ${result.success ? 'text-up' : 'text-down'}`}>
         {result.message}
       </p>
       {result.success && result.filled_quantity && (
-        <div className="mt-2 text-sm text-gray-400">
+        <div className="mt-2 text-sm text-muted">
           {result.filled_quantity.toLocaleString()}주 @ {formatKRW(result.avg_price)} 체결
           {result.order_id && (
-            <span className="ml-2 text-xs text-gray-500">#{result.order_id}</span>
+            <span className="ml-2 text-xs text-dim">#{result.order_id}</span>
           )}
         </div>
       )}
@@ -375,12 +387,12 @@ function LastResultView({ result }: { result: LastResult }) {
 /** Current task display */
 function CurrentTask({ task }: { task: string }) {
   return (
-    <div className="p-4 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+    <div className="p-4 bg-accent/10 border border-accent/20 rounded-lg">
       <div className="flex items-center gap-2 mb-2">
-        <Clock className="w-4 h-4 text-blue-400 animate-pulse" />
-        <span className="text-sm font-medium text-blue-400">현재 작업</span>
+        <Clock className="w-4 h-4 text-accent animate-pulse" />
+        <span className="text-sm font-medium text-accent">현재 작업</span>
       </div>
-      <p className="text-sm text-blue-300">{task}</p>
+      <p className="text-sm text-accent">{task}</p>
     </div>
   );
 }
@@ -388,12 +400,12 @@ function CurrentTask({ task }: { task: string }) {
 /** Error message display */
 function ErrorMessage({ message }: { message: string }) {
   return (
-    <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-lg">
+    <div className="p-4 bg-down/10 border border-down/20 rounded-lg">
       <div className="flex items-center gap-2 mb-2">
-        <AlertTriangle className="w-4 h-4 text-red-400" />
-        <span className="text-sm font-medium text-red-400">오류</span>
+        <AlertTriangle className="w-4 h-4 text-down" />
+        <span className="text-sm font-medium text-down">오류</span>
       </div>
-      <p className="text-sm text-red-300">{message}</p>
+      <p className="text-sm text-down">{message}</p>
     </div>
   );
 }
@@ -409,7 +421,7 @@ export function AgentDetailModal({ agentKey, agent, onClose }: AgentDetailModalP
       onClick={onClose}
     >
       <div
-        className="bg-gray-900 border border-gray-700 rounded-lg max-w-lg w-full mx-4 max-h-[85vh] overflow-y-auto shadow-2xl"
+        className="bg-card border border-hairline rounded-lg max-w-lg w-full mx-4 max-h-[85vh] overflow-y-auto shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-6 space-y-4">
@@ -439,7 +451,7 @@ export function AgentDetailModal({ agentKey, agent, onClose }: AgentDetailModalP
 
           {/* Last Action Time */}
           {agent.last_action_time && (
-            <div className="text-xs text-gray-500 text-center pt-2 border-t border-gray-700">
+            <div className="text-xs text-dim text-center pt-2 border-t border-hairline">
               마지막 작업: {new Date(agent.last_action_time).toLocaleString('ko-KR')}
             </div>
           )}

@@ -87,6 +87,10 @@ const CLEAN_SET = [
   // d2 t5: Watchlist + strategy-config widgets (signal/confidence/risk spectrums -> LEVEL tokens).
   'src/components/trading/WatchListWidget.tsx',
   'src/components/trading/StrategyConfigWidget.tsx',
+  // d2 t6: Agent workflow graph + detail modal (BUY/SELL action map unification).
+  'src/components/trading/AgentWorkflowGraph/index.tsx',
+  'src/components/trading/AgentWorkflowGraph/AgentNode.tsx',
+  'src/components/trading/AgentWorkflowGraph/AgentDetailModal.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 

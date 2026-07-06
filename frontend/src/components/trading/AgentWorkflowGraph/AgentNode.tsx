@@ -58,25 +58,25 @@ function StatusBadge({ status }: StatusBadgeProps) {
   const config = {
     idle: {
       label: '대기',
-      color: 'bg-gray-500/20 text-gray-400',
+      color: 'bg-muted/20 text-muted',
       Icon: Circle,
       animate: false,
     },
     working: {
       label: '작업중',
-      color: 'bg-blue-500/20 text-blue-400',
+      color: 'bg-accent/20 text-accent',
       Icon: Loader2,
       animate: true,
     },
     waiting: {
       label: '대기중',
-      color: 'bg-yellow-500/20 text-yellow-400',
+      color: 'bg-warn/20 text-warn',
       Icon: Clock,
       animate: false,
     },
     error: {
       label: '오류',
-      color: 'bg-red-500/20 text-red-400',
+      color: 'bg-down/20 text-down',
       Icon: AlertCircle,
       animate: false,
     },
@@ -106,15 +106,15 @@ export const AgentNode = forwardRef<HTMLDivElement, AgentNodeProps>(
       return (
         <div
           ref={ref}
-          className="w-full p-4 rounded-lg border border-gray-700 bg-gray-800/30"
+          className="w-full p-4 rounded-lg border border-hairline bg-elevated/30"
         >
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-gray-700">
-              <Icon className="w-5 h-5 text-gray-400" />
+            <div className="p-2 rounded-lg bg-elevated">
+              <Icon className="w-5 h-5 text-muted" />
             </div>
             <div>
-              <div className="font-medium text-gray-400">{config.name}</div>
-              <div className="text-xs text-gray-500">Loading...</div>
+              <div className="font-medium text-muted">{config.name}</div>
+              <div className="text-xs text-dim">Loading...</div>
             </div>
           </div>
         </div>
@@ -133,29 +133,29 @@ export const AgentNode = forwardRef<HTMLDivElement, AgentNodeProps>(
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onClick(); }}
         className={`
           relative w-full p-4 rounded-lg border transition-all cursor-pointer text-left
-          hover:border-blue-500/50 hover:bg-gray-800/50
-          ${isWorking ? 'border-blue-500/50 bg-blue-500/5 ring-1 ring-blue-500/20' :
-            isError ? 'border-red-500/30 bg-red-500/5' :
-            'border-gray-700 bg-gray-800/30'}
+          hover:border-accent/50 hover:bg-elevated/50
+          ${isWorking ? 'border-accent/50 bg-accent/5 ring-1 ring-accent/20' :
+            isError ? 'border-down/30 bg-down/5' :
+            'border-hairline bg-elevated/30'}
         `}
       >
         {/* Header: Icon + Name + Status Badge */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className={`p-2 rounded-lg transition-colors ${
-              isWorking ? 'bg-blue-500/20' :
-              isError ? 'bg-red-500/20' :
-              'bg-gray-700'
+              isWorking ? 'bg-accent/20' :
+              isError ? 'bg-down/20' :
+              'bg-elevated'
             }`}>
               <Icon className={`w-5 h-5 ${
-                isWorking ? 'text-blue-400' :
-                isError ? 'text-red-400' :
-                'text-gray-400'
+                isWorking ? 'text-accent' :
+                isError ? 'text-down' :
+                'text-muted'
               }`} />
             </div>
             <div>
-              <div className="font-medium text-white">{config.name}</div>
-              <div className="text-xs text-gray-500">{config.description}</div>
+              <div className="font-medium text-ink">{config.name}</div>
+              <div className="text-xs text-dim">{config.description}</div>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -165,7 +165,7 @@ export const AgentNode = forwardRef<HTMLDivElement, AgentNodeProps>(
 
         {/* Current Task - Only when working */}
         {isWorking && agent.current_task && (
-          <div className="mt-3 p-2 bg-blue-500/10 border border-blue-500/20 rounded text-sm text-blue-300">
+          <div className="mt-3 p-2 bg-accent/10 border border-accent/20 rounded text-sm text-accent">
             {agent.current_task}
           </div>
         )}
@@ -173,35 +173,35 @@ export const AgentNode = forwardRef<HTMLDivElement, AgentNodeProps>(
         {/* Processing Stock */}
         {agent.processing_stock && (
           <div className="mt-2 flex items-center gap-2 text-xs">
-            <span className="text-gray-500">처리중:</span>
-            <span className="text-white font-medium">
+            <span className="text-dim">처리중:</span>
+            <span className="text-ink font-medium">
               {agent.processing_stock_name || agent.processing_stock}
             </span>
-            <span className="text-gray-500">({agent.processing_stock})</span>
+            <span className="text-dim">({agent.processing_stock})</span>
           </div>
         )}
 
         {/* Quick Stats */}
         <div className="mt-2 flex items-center gap-4 text-xs">
-          <span className="text-gray-500">
-            완료: <span className="text-green-400">{agent.tasks_completed}</span>
+          <span className="text-dim">
+            완료: <span className="text-up tabular-nums">{agent.tasks_completed}</span>
           </span>
           {agent.tasks_failed > 0 && (
-            <span className="text-gray-500">
-              실패: <span className="text-red-400">{agent.tasks_failed}</span>
+            <span className="text-dim">
+              실패: <span className="text-down tabular-nums">{agent.tasks_failed}</span>
             </span>
           )}
         </div>
 
         {/* Error Message Preview */}
         {agent.error_message && (
-          <div className="mt-2 p-2 bg-red-500/10 border border-red-500/20 rounded text-xs text-red-400 truncate">
+          <div className="mt-2 p-2 bg-down/10 border border-down/20 rounded text-xs text-down truncate">
             {agent.error_message}
           </div>
         )}
 
         {/* Expand Indicator */}
-        <ChevronRight className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+        <ChevronRight className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-dim" />
       </div>
     );
   }
