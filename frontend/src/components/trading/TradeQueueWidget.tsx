@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { getTradeQueue, cancelQueuedTrade, processTradeQueue, dismissTrade } from '@/api/client';
 import { useMarketHours } from '@/hooks/useMarketHours';
+import { pnlColor } from '@/utils/pnl';
 
 // -------------------------------------------
 // Types
@@ -52,11 +53,11 @@ interface QueuedTrade {
 // -------------------------------------------
 
 const STATUS_COLORS: Record<string, string> = {
-  pending: 'text-yellow-400 bg-yellow-500/10',
-  processing: 'text-blue-400 bg-blue-500/10',
-  completed: 'text-green-400 bg-green-500/10',
-  failed: 'text-red-400 bg-red-500/10',
-  cancelled: 'text-gray-400 bg-gray-500/10',
+  pending: 'text-warn bg-warn/10',
+  processing: 'text-accent bg-accent/10',
+  completed: 'text-up bg-up/10',
+  failed: 'text-down bg-down/10',
+  cancelled: 'text-muted bg-muted/10',
 };
 
 // -------------------------------------------
@@ -100,11 +101,11 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
 
   // Status-specific border colors
   const getBorderClass = () => {
-    if (isFailed) return 'border-red-500/40 bg-red-500/5';
-    if (isCompleted) return 'border-green-500/30 bg-green-500/5';
-    if (isProcessing) return 'border-blue-500/30 bg-blue-500/5';
-    if (isPending) return 'border-yellow-500/30 bg-yellow-500/5';
-    return 'border-gray-700 bg-gray-800/50';
+    if (isFailed) return 'border-down/40 bg-down/5';
+    if (isCompleted) return 'border-up/30 bg-up/5';
+    if (isProcessing) return 'border-accent/30 bg-accent/5';
+    if (isPending) return 'border-warn/30 bg-warn/5';
+    return 'border-hairline bg-elevated/50';
   };
 
   // Status label in Korean
@@ -123,29 +124,26 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
     <div className={`p-3 rounded-lg border ${getBorderClass()}`}>
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-2">
-          <div className={`p-1.5 rounded ${
-            isFailed ? 'bg-red-500/20' :
-            isBuy ? 'bg-green-500/20' : 'bg-red-500/20'
-          }`}>
+          <div className="p-1.5 rounded bg-elevated">
             {isFailed ? (
-              <XCircle className="w-4 h-4 text-red-400" />
+              <XCircle className="w-4 h-4 text-down" />
             ) : isBuy ? (
-              <TrendingUp className="w-4 h-4 text-green-400" />
+              <TrendingUp className={`w-4 h-4 ${pnlColor(1)}`} />
             ) : (
-              <TrendingDown className="w-4 h-4 text-red-400" />
+              <TrendingDown className={`w-4 h-4 ${pnlColor(-1)}`} />
             )}
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <span className="font-medium text-white">
+              <span className="font-medium text-ink">
                 {trade.stock_name || trade.ticker}
               </span>
               <span className={`px-1.5 py-0.5 text-xs rounded ${STATUS_COLORS[trade.status] || STATUS_COLORS.pending}`}>
                 {getStatusLabel()}
               </span>
             </div>
-            <div className="text-xs text-gray-400">
-              {trade.action} @ {formatPrice(trade.entry_price)}원
+            <div className="text-xs text-muted">
+              {trade.action} @ <span className="tabular-nums">{formatPrice(trade.entry_price)}</span>원
             </div>
           </div>
         </div>
@@ -155,7 +153,7 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
             <button
               onClick={() => onCancel(trade.id)}
               disabled={cancelling === trade.id}
-              className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded disabled:opacity-50"
+              className="p-1.5 text-muted hover:text-down hover:bg-down/10 rounded disabled:opacity-50"
               title="취소"
             >
               {cancelling === trade.id ? (
@@ -169,7 +167,7 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
             <button
               onClick={() => onDismiss(trade.id)}
               disabled={dismissing === trade.id}
-              className="p-1.5 text-gray-400 hover:text-gray-300 hover:bg-gray-700 rounded disabled:opacity-50"
+              className="p-1.5 text-muted hover:text-ink hover:bg-elevated rounded disabled:opacity-50"
               title="목록에서 제거"
             >
               {dismissing === trade.id ? (
@@ -186,17 +184,17 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
       {!isFailed && !isCancelled && (
         <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
           {trade.stop_loss && (
-            <div className="text-gray-400">
-              손절: <span className="text-red-400">{formatPrice(trade.stop_loss)}</span>
+            <div className="text-muted">
+              손절: <span className="text-down tabular-nums">{formatPrice(trade.stop_loss)}</span>
             </div>
           )}
           {trade.take_profit && (
-            <div className="text-gray-400">
-              익절: <span className="text-green-400">{formatPrice(trade.take_profit)}</span>
+            <div className="text-muted">
+              익절: <span className="text-up tabular-nums">{formatPrice(trade.take_profit)}</span>
             </div>
           )}
-          <div className="text-gray-400">
-            리스크: <span className="text-white">{trade.risk_score}/10</span>
+          <div className="text-muted">
+            리스크: <span className="text-ink tabular-nums">{trade.risk_score}/10</span>
           </div>
         </div>
       )}
@@ -207,18 +205,18 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
           {/* Queue position and expected execution */}
           {nextExecutionTime && (
             <div className="flex items-center gap-2 text-xs">
-              <Timer className="w-3 h-3 text-blue-400" />
-              <span className="text-gray-400">예상 실행:</span>
-              <span className="text-blue-400 font-medium">{nextExecutionTime}</span>
+              <Timer className="w-3 h-3 text-accent" />
+              <span className="text-muted">예상 실행:</span>
+              <span className="text-accent font-medium tabular-nums">{nextExecutionTime}</span>
               {queuePosition && (
-                <span className="px-1.5 py-0.5 bg-blue-500/20 text-blue-400 rounded text-xs">
+                <span className="px-1.5 py-0.5 bg-accent/20 text-accent rounded text-xs tabular-nums">
                   #{queuePosition}
                 </span>
               )}
             </div>
           )}
           {/* Queued time and reason */}
-          <div className="text-xs text-gray-500">
+          <div className="text-xs text-dim">
             <Clock className="w-3 h-3 inline mr-1" />
             {formatTime(trade.queued_at)} - {trade.reason}
           </div>
@@ -227,12 +225,12 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
 
       {/* Error message for failed trades - prominent display */}
       {isFailed && trade.error_message && (
-        <div className="mt-2 p-2.5 bg-red-500/10 border border-red-500/30 rounded">
+        <div className="mt-2 p-2.5 bg-down/10 border border-down/30 rounded">
           <div className="flex items-start gap-2">
-            <AlertCircle className="w-4 h-4 text-red-400 mt-0.5 flex-shrink-0" />
+            <AlertCircle className="w-4 h-4 text-down mt-0.5 flex-shrink-0" />
             <div>
-              <div className="text-sm text-red-400 font-medium">실패 사유</div>
-              <div className="text-xs text-red-300 mt-1">
+              <div className="text-sm text-down font-medium">실패 사유</div>
+              <div className="text-xs text-down mt-1">
                 {trade.error_message}
               </div>
             </div>
@@ -242,7 +240,7 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
 
       {/* Completed message */}
       {isCompleted && (
-        <div className="mt-2 p-2 bg-green-500/10 border border-green-500/30 rounded text-xs text-green-400 flex items-center gap-2">
+        <div className="mt-2 p-2 bg-up/10 border border-up/30 rounded text-xs text-up flex items-center gap-2">
           <CheckCircle className="w-4 h-4" />
           <span>주문 완료 - {trade.executed_at ? formatTime(trade.executed_at) : ''}</span>
         </div>
@@ -346,35 +344,35 @@ export default function TradeQueueWidget() {
   const failedCount = queue.filter(t => t.status === 'failed').length;
 
   return (
-    <div className="bg-gray-900 rounded-xl border border-gray-800">
+    <div className="bg-card rounded border border-hairline">
       {/* Header */}
-      <div className="p-4 border-b border-gray-800">
+      <div className="p-4 border-b border-hairline">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Clock className={`w-5 h-5 ${pendingCount > 0 ? 'text-yellow-400' : failedCount > 0 ? 'text-red-400' : 'text-gray-400'}`} />
-            <h2 className="text-lg font-semibold text-white">Trade Queue</h2>
-            {/* Market status indicator */}
+            <Clock className={`w-5 h-5 ${pendingCount > 0 ? 'text-warn' : failedCount > 0 ? 'text-down' : 'text-muted'}`} />
+            <h2 className="text-lg font-semibold text-ink">Trade Queue</h2>
+            {/* Market status indicator (market-state LEVEL, not P&L) */}
             <div
               className={`flex items-center gap-1.5 px-2 py-0.5 rounded text-xs ${
                 isMarketOpen
-                  ? 'bg-green-500/20 text-green-400'
-                  : 'bg-red-500/20 text-red-400'
+                  ? 'bg-up/20 text-up'
+                  : 'bg-down/20 text-down'
               }`}
             >
               <div
                 className={`w-1.5 h-1.5 rounded-full ${
-                  isMarketOpen ? 'bg-green-500' : 'bg-red-500'
+                  isMarketOpen ? 'bg-up' : 'bg-down'
                 }`}
               />
               {isMarketOpen ? '장중' : '장마감'}
             </div>
             {pendingCount > 0 && (
-              <span className="px-2 py-0.5 text-xs bg-yellow-500/20 text-yellow-400 rounded-full">
+              <span className="px-2 py-0.5 text-xs bg-warn/20 text-warn rounded-full tabular-nums">
                 {pendingCount} 대기
               </span>
             )}
             {failedCount > 0 && (
-              <span className="px-2 py-0.5 text-xs bg-red-500/20 text-red-400 rounded-full">
+              <span className="px-2 py-0.5 text-xs bg-down/20 text-down rounded-full tabular-nums">
                 {failedCount} 실패
               </span>
             )}
@@ -384,7 +382,7 @@ export default function TradeQueueWidget() {
               <button
                 onClick={handleProcess}
                 disabled={processing}
-                className="flex items-center gap-1 px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg disabled:opacity-50"
+                className="flex items-center gap-1 px-3 py-1.5 text-sm bg-accent hover:bg-accent/90 text-canvas rounded-lg disabled:opacity-50"
               >
                 {processing ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -397,7 +395,7 @@ export default function TradeQueueWidget() {
             <button
               onClick={fetchQueue}
               disabled={loading}
-              className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
+              className="p-2 text-muted hover:text-ink hover:bg-elevated rounded-lg"
             >
               <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
             </button>
@@ -406,13 +404,13 @@ export default function TradeQueueWidget() {
 
         {/* Market closed banner with countdown */}
         {!isMarketOpen && pendingCount > 0 && (
-          <div className="mt-3 p-2.5 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
+          <div className="mt-3 p-2.5 bg-warn/10 border border-warn/20 rounded-lg">
             <div className="flex items-center justify-between text-sm">
               <div className="flex items-center gap-2">
-                <Timer className="w-4 h-4 text-yellow-400" />
-                <span className="text-yellow-300">다음 실행 예정: {nextEventFormatted}</span>
+                <Timer className="w-4 h-4 text-warn" />
+                <span className="text-warn">다음 실행 예정: {nextEventFormatted}</span>
               </div>
-              <span className="text-yellow-400 font-medium">{countdownFormatted}</span>
+              <span className="text-warn font-medium tabular-nums">{countdownFormatted}</span>
             </div>
           </div>
         )}
@@ -421,20 +419,20 @@ export default function TradeQueueWidget() {
       {/* Content */}
       <div className="p-4">
         {error && (
-          <div className="mb-4 p-3 bg-red-500/20 border border-red-500/30 rounded-lg flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 text-red-400" />
-            <span className="text-sm text-red-400">{error}</span>
+          <div className="mb-4 p-3 bg-down/20 border border-down/30 rounded-lg flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-down" />
+            <span className="text-sm text-down">{error}</span>
           </div>
         )}
 
         {loading && queue.length === 0 ? (
-          <div className="text-center text-gray-400 py-8">
+          <div className="text-center text-muted py-8">
             <RefreshCw className="w-6 h-6 mx-auto mb-2 animate-spin" />
             <p className="text-sm">Loading...</p>
           </div>
         ) : queue.length === 0 ? (
-          <div className="text-center text-gray-500 py-8">
-            <CheckCircle className="w-8 h-8 mx-auto mb-2 text-gray-600" />
+          <div className="text-center text-dim py-8">
+            <CheckCircle className="w-8 h-8 mx-auto mb-2 text-dim" />
             <p className="text-sm">No trades in queue</p>
             <p className="text-xs mt-1">Trades will appear here when market is closed</p>
           </div>

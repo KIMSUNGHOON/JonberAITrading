@@ -81,6 +81,9 @@ const CLEAN_SET = [
   'src/components/basket/BasketWidget.tsx',
   // d2 t3: Trading dashboard shell.
   'src/components/trading/TradingDashboard.tsx',
+  // d2 t4: Trade queue + agent status widgets (BUY/SELL convention unification).
+  'src/components/trading/TradeQueueWidget.tsx',
+  'src/components/trading/AgentStatusWidget.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 
