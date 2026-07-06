@@ -35,3 +35,37 @@ describe('OrderTicketRail — idle', () => {
     expect(screen.getByText('NO PENDING ORDER')).toBeInTheDocument();
   });
 });
+
+describe('OrderTicketRail — active', () => {
+  it('renders the ticket: ACTION, symbol, SL/TP, risk, buttons', () => {
+    mockState = {
+      activeMarket: 'stock',
+      stock: {
+        tradeProposal: {
+          id: 'p1',
+          ticker: 'AAPL',
+          action: 'BUY',
+          quantity: 10,
+          entry_price: 100,
+          stop_loss: 90,
+          take_profit: 120,
+          risk_score: 5,
+          position_size_pct: 10,
+          rationale: 'Strong momentum with support at 95.',
+          bull_case: 'Upside case',
+          bear_case: 'Downside case',
+          created_at: new Date().toISOString(),
+        },
+        activeSessionId: 'session-1',
+        status: 'awaiting_approval',
+        currentStage: null,
+      },
+    };
+    render(<OrderTicketRail />);
+    expect(screen.getByText('BUY')).toBeInTheDocument();
+    expect(screen.getByText('AAPL')).toBeInTheDocument();
+    expect(screen.getByText('Medium Risk')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /approve/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /reject|re-analyze/i })).toBeInTheDocument();
+  });
+});
