@@ -1871,6 +1871,10 @@ export const selectStatus = (state: Store) => {
   return getMarketData(state).status;
 };
 
+export const selectCurrentStage = (state: Store) => {
+  return getMarketData(state).currentStage;
+};
+
 export const selectAnalyses = (state: Store) => {
   return getMarketData(state).analyses;
 };

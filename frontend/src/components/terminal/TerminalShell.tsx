@@ -14,6 +14,7 @@ import { useGoTo, useActiveView } from '@/hooks/useNav';
 import { useCommandPalette } from '@/hooks/useCommandPalette';
 import { NAV_ITEMS, type ViewKey } from '@/nav';
 import { CommandPalette } from './CommandPalette';
+import { OrderTicketRail } from './OrderTicketRail';
 
 // Icon lookup for the nav rail — preserves the exact icon choices from the
 // pre-router NAV array. Keyed by ViewKey; only the views present in
@@ -124,6 +125,7 @@ export function TerminalShell() {
         </nav>
 
         <div className="flex-1 min-w-0 overflow-auto bg-canvas"><Outlet /></div>
+        <OrderTicketRail />
       </div>
 
       {/* ── status line ── */}
