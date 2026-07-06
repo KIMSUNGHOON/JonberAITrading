@@ -35,18 +35,21 @@ import type { WatchedStock } from '@/types';
 // Constants
 // -------------------------------------------
 
+// Buy<->sell signal spectrum collapsed to the app-wide up/warn/down LEVEL
+// tokens (Western convention): strong_buy+buy=up, hold=warn, sell+strong_sell=down.
 const SIGNAL_COLORS: Record<string, string> = {
-  strong_buy: 'text-green-400 bg-green-500/10',
-  buy: 'text-emerald-400 bg-emerald-500/10',
-  hold: 'text-yellow-400 bg-yellow-500/10',
-  sell: 'text-orange-400 bg-orange-500/10',
-  strong_sell: 'text-red-400 bg-red-500/10',
+  strong_buy: 'text-up bg-up/10',
+  buy: 'text-up bg-up/10',
+  hold: 'text-warn bg-warn/10',
+  sell: 'text-down bg-down/10',
+  strong_sell: 'text-down bg-down/10',
 };
 
+// Confidence LEVEL (not P&L): high/medium/low -> up/warn/down.
 const CONFIDENCE_COLORS: Record<string, string> = {
-  high: 'text-green-400',
-  medium: 'text-yellow-400',
-  low: 'text-red-400',
+  high: 'text-up',
+  medium: 'text-warn',
+  low: 'text-down',
 };
 
 // -------------------------------------------
@@ -101,19 +104,19 @@ function WatchItem({
   const confidenceLevel = getConfidenceLevel(stock.confidence);
 
   return (
-    <div className="p-3 rounded-lg border border-gray-700 bg-gray-800/50 hover:border-gray-600 transition-colors">
+    <div className="p-3 rounded-lg border border-hairline bg-elevated/50 hover:border-dim transition-colors">
       {/* Header */}
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-2">
-          <div className="p-1.5 rounded bg-blue-500/20">
-            <Eye className="w-4 h-4 text-blue-400" />
+          <div className="p-1.5 rounded bg-accent/20">
+            <Eye className="w-4 h-4 text-accent" />
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <span className="font-medium text-white">
+              <span className="font-medium text-ink">
                 {stock.stock_name || stock.ticker}
               </span>
-              <span className="text-xs text-gray-500">{stock.ticker}</span>
+              <span className="text-xs text-dim">{stock.ticker}</span>
             </div>
             <div className="flex items-center gap-2 mt-0.5">
               <span className={`px-1.5 py-0.5 text-xs rounded ${SIGNAL_COLORS[stock.signal] || SIGNAL_COLORS.hold}`}>
@@ -130,7 +133,7 @@ function WatchItem({
         <button
           onClick={() => onRemove(stock.id)}
           disabled={removing === stock.id}
-          className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded disabled:opacity-50"
+          className="p-1.5 text-muted hover:text-red-400 hover:bg-red-500/10 rounded disabled:opacity-50" // color-ok: destructive action hover
           title={t('watch_list_remove')}
         >
           {removing === stock.id ? (
@@ -143,16 +146,16 @@ function WatchItem({
 
       {/* Price Info */}
       <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
-        <div className="text-gray-400">
-          {t('watch_list_current_price')}: <span className="text-white">{formatPrice(stock.current_price)}</span>
+        <div className="text-muted">
+          {t('watch_list_current_price')}: <span className="text-ink tabular-nums">{formatPrice(stock.current_price)}</span>
         </div>
         {stock.target_entry_price && (
-          <div className="text-gray-400">
-            {t('watch_list_target_price')}: <span className="text-green-400">{formatPrice(stock.target_entry_price)}</span>
+          <div className="text-muted">
+            {t('watch_list_target_price')}: <span className="text-accent tabular-nums">{formatPrice(stock.target_entry_price)}</span>
           </div>
         )}
-        <div className="text-gray-400">
-          {t('watch_list_risk')}: <span className="text-white">{stock.risk_score}/10</span>
+        <div className="text-muted">
+          {t('watch_list_risk')}: <span className="text-ink tabular-nums">{stock.risk_score}/10</span>
         </div>
       </div>
 
@@ -160,13 +163,13 @@ function WatchItem({
       {(stock.stop_loss || stock.take_profit) && (
         <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
           {stock.stop_loss && (
-            <div className="text-gray-400">
-              {t('watch_list_stop_loss')}: <span className="text-red-400">{formatPrice(stock.stop_loss)}</span>
+            <div className="text-muted">
+              {t('watch_list_stop_loss')}: <span className="text-down tabular-nums">{formatPrice(stock.stop_loss)}</span>
             </div>
           )}
           {stock.take_profit && (
-            <div className="text-gray-400">
-              {t('watch_list_take_profit')}: <span className="text-green-400">{formatPrice(stock.take_profit)}</span>
+            <div className="text-muted">
+              {t('watch_list_take_profit')}: <span className="text-up tabular-nums">{formatPrice(stock.take_profit)}</span>
             </div>
           )}
         </div>
@@ -174,7 +177,7 @@ function WatchItem({
 
       {/* Analysis Summary */}
       {stock.analysis_summary && (
-        <div className="mt-3 p-2 bg-gray-900/50 rounded text-xs text-gray-300 line-clamp-2">
+        <div className="mt-3 p-2 bg-card/50 rounded text-xs text-ink line-clamp-2">
           {stock.analysis_summary}
         </div>
       )}
@@ -185,20 +188,20 @@ function WatchItem({
           {stock.key_factors.slice(0, 3).map((factor, idx) => (
             <span
               key={idx}
-              className="inline-flex items-center gap-1 px-2 py-0.5 bg-gray-700/50 text-gray-300 text-xs rounded"
+              className="inline-flex items-center gap-1 px-2 py-0.5 bg-elevated text-ink text-xs rounded"
             >
               <Tag className="w-3 h-3" />
               {factor}
             </span>
           ))}
           {stock.key_factors.length > 3 && (
-            <span className="text-xs text-gray-500">+{stock.key_factors.length - 3}</span>
+            <span className="text-xs text-dim">+{stock.key_factors.length - 3}</span>
           )}
         </div>
       )}
 
       {/* Timestamp */}
-      <div className="mt-2 text-xs text-gray-500">
+      <div className="mt-2 text-xs text-dim">
         {t('watch_list_added_date')}: {formatDate(stock.created_at)}
       </div>
 
@@ -207,7 +210,7 @@ function WatchItem({
         <button
           onClick={() => onConvert(stock.id)}
           disabled={converting === stock.id}
-          className="flex-1 flex items-center justify-center gap-1 px-3 py-2 text-sm bg-green-600 hover:bg-green-700 text-white rounded-lg disabled:opacity-50 transition-colors"
+          className="flex-1 flex items-center justify-center gap-1 px-3 py-2 text-sm bg-accent hover:bg-accent/90 text-canvas rounded-lg disabled:opacity-50 transition-colors"
         >
           {converting === stock.id ? (
             <Loader2 className="w-4 h-4 animate-spin" />
@@ -221,7 +224,7 @@ function WatchItem({
         <button
           onClick={() => onReanalyze(stock.ticker, stock.stock_name || stock.ticker)}
           disabled={reanalyzing === stock.ticker}
-          className="flex items-center justify-center gap-1 px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg disabled:opacity-50 transition-colors"
+          className="flex items-center justify-center gap-1 px-3 py-2 text-sm bg-elevated hover:bg-hairline text-accent rounded-lg disabled:opacity-50 transition-colors"
           title={t('watch_list_reanalyze')}
         >
           {reanalyzing === stock.ticker ? (
@@ -315,15 +318,15 @@ export default function WatchListWidget() {
   };
 
   return (
-    <div className="bg-gray-900 rounded-xl border border-gray-800">
+    <div className="bg-card rounded border border-hairline">
       {/* Header */}
-      <div className="p-4 border-b border-gray-800">
+      <div className="p-4 border-b border-hairline">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Eye className={`w-5 h-5 ${watchList.length > 0 ? 'text-blue-400' : 'text-gray-400'}`} />
-            <h2 className="text-lg font-semibold text-white">{t('watch_list_title')}</h2>
+            <Eye className={`w-5 h-5 ${watchList.length > 0 ? 'text-accent' : 'text-muted'}`} />
+            <h2 className="text-lg font-semibold text-ink">{t('watch_list_title')}</h2>
             {watchList.length > 0 && (
-              <span className="px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded-full">
+              <span className="px-2 py-0.5 text-xs bg-accent/20 text-accent rounded-full tabular-nums">
                 {watchList.length} {t('stocks')}
               </span>
             )}
@@ -331,12 +334,12 @@ export default function WatchListWidget() {
           <button
             onClick={fetchWatchList}
             disabled={loading}
-            className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
+            className="p-2 text-muted hover:text-ink hover:bg-elevated rounded-lg"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
         </div>
-        <p className="text-xs text-gray-500 mt-1">
+        <p className="text-xs text-dim mt-1">
           {t('watch_list_subtitle')}
         </p>
       </div>
@@ -344,12 +347,12 @@ export default function WatchListWidget() {
       {/* Content */}
       <div className="p-4">
         {error && (
-          <div className="mb-4 p-3 bg-red-500/20 border border-red-500/30 rounded-lg flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 text-red-400" />
-            <span className="text-sm text-red-400">{error}</span>
+          <div className="mb-4 p-3 bg-down/20 border border-down/30 rounded-lg flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-down" />
+            <span className="text-sm text-down">{error}</span>
             <button
               onClick={() => setError(null)}
-              className="ml-auto text-red-400 hover:text-red-300"
+              className="ml-auto text-down hover:text-down/80"
             >
               <X className="w-4 h-4" />
             </button>
@@ -357,13 +360,13 @@ export default function WatchListWidget() {
         )}
 
         {loading && watchList.length === 0 ? (
-          <div className="text-center text-gray-400 py-8">
+          <div className="text-center text-muted py-8">
             <RefreshCw className="w-6 h-6 mx-auto mb-2 animate-spin" />
             <p className="text-sm">{t('loading')}</p>
           </div>
         ) : watchList.length === 0 ? (
-          <div className="text-center text-gray-500 py-8">
-            <Eye className="w-8 h-8 mx-auto mb-2 text-gray-600" />
+          <div className="text-center text-dim py-8">
+            <Eye className="w-8 h-8 mx-auto mb-2 text-dim" />
             <p className="text-sm">{t('watch_list_empty')}</p>
             <p className="text-xs mt-1">{t('watch_list_empty_desc')}</p>
           </div>
@@ -388,19 +391,19 @@ export default function WatchListWidget() {
 
       {/* Footer - Quick Stats */}
       {watchList.length > 0 && (
-        <div className="px-4 py-3 border-t border-gray-800 bg-gray-800/30">
-          <div className="flex items-center justify-between text-xs text-gray-400">
+        <div className="px-4 py-3 border-t border-hairline bg-elevated/30">
+          <div className="flex items-center justify-between text-xs text-muted">
             <div className="flex items-center gap-4">
-              <span>
+              <span className="tabular-nums">
                 {t('watch_list_avg_confidence')}: {Math.round(watchList.reduce((acc, s) => acc + s.confidence, 0) / watchList.length * 100)}%
               </span>
-              <span>
+              <span className="tabular-nums">
                 {t('watch_list_avg_risk')}: {(watchList.reduce((acc, s) => acc + s.risk_score, 0) / watchList.length).toFixed(1)}/10
               </span>
             </div>
             <button
               onClick={() => goTo('trading')}
-              className="flex items-center gap-1 text-blue-400 hover:text-blue-300"
+              className="flex items-center gap-1 text-accent hover:text-accent/80"
             >
               {t('nav_auto_trading')}
               <ArrowRight className="w-3 h-3" />

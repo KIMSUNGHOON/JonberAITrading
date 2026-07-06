@@ -84,6 +84,9 @@ const CLEAN_SET = [
   // d2 t4: Trade queue + agent status widgets (BUY/SELL convention unification).
   'src/components/trading/TradeQueueWidget.tsx',
   'src/components/trading/AgentStatusWidget.tsx',
+  // d2 t5: Watchlist + strategy-config widgets (signal/confidence/risk spectrums -> LEVEL tokens).
+  'src/components/trading/WatchListWidget.tsx',
+  'src/components/trading/StrategyConfigWidget.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 
