@@ -16,7 +16,9 @@ export default {
         muted: '#7b8794',    // secondary text / labels / axis
         dim: '#565e6b',      // tertiary / disabled / placeholder
         accent: '#f0b90b',   // the ONE accent — focus ring, active tab, primary CTA
-        // Trading — TEXT ONLY (never a fill/badge bg)
+        // Trading direction tokens — use for directional P&L TEXT (never a raw
+        // green/red badge fill that could misread). Status/level tints
+        // (bg-up/warn/down + /NN opacity) are OK.
         up: '#0ecb81',       // price up (Western green=up)
         down: '#f6465d',     // price down
         warn: '#f0a63a',     // genuine warnings only — NOT hold

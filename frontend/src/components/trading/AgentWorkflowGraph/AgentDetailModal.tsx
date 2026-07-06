@@ -51,10 +51,10 @@ function ModalHeader({
   const Icon = config.icon;
 
   const statusColors = {
-    idle: 'bg-muted',
-    working: 'bg-accent',
-    waiting: 'bg-warn',
-    error: 'bg-down',
+    idle: 'bg-muted text-ink',
+    working: 'bg-accent text-canvas',
+    waiting: 'bg-warn text-canvas',
+    error: 'bg-down text-ink',
   };
 
   const statusLabels = {
@@ -77,7 +77,7 @@ function ModalHeader({
       </div>
       <div className="flex items-center gap-3">
         <span
-          className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium text-ink ${statusColors[agent.status]}`}
+          className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium ${statusColors[agent.status]}`}
         >
           <span className={`w-2 h-2 rounded-full bg-ink ${agent.status === 'working' ? 'animate-pulse' : ''}`} />
           {statusLabels[agent.status]}
