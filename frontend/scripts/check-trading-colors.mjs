@@ -91,6 +91,10 @@ const CLEAN_SET = [
   'src/components/trading/AgentWorkflowGraph/index.tsx',
   'src/components/trading/AgentWorkflowGraph/AgentNode.tsx',
   'src/components/trading/AgentWorkflowGraph/AgentDetailModal.tsx',
+  // d2 t7: Agent-chat dashboard + session list (statusConfig STATUS map,
+  // decisionConfig DIRECTIONAL map -> pnlColor).
+  'src/components/agent-chat/AgentChatDashboard.tsx',
+  'src/components/agent-chat/ChatSessionList.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 

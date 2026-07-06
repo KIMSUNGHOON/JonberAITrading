@@ -112,7 +112,7 @@ export function AgentChatDashboard() {
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
-        <RefreshCw className="w-8 h-8 animate-spin text-blue-500" />
+        <RefreshCw className="w-8 h-8 animate-spin text-accent" />
       </div>
     );
   }
@@ -132,12 +132,12 @@ export function AgentChatDashboard() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <MessageSquare className="w-6 h-6 text-blue-400" />
-          <h2 className="text-xl font-semibold text-white">Agent Group Chat</h2>
+          <MessageSquare className="w-6 h-6 text-accent" />
+          <h2 className="text-xl font-semibold text-ink">Agent Group Chat</h2>
         </div>
         <button
           onClick={fetchData}
-          className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
+          className="p-2 text-muted hover:text-ink hover:bg-elevated rounded-lg"
         >
           <RefreshCw className="w-5 h-5" />
         </button>
@@ -145,29 +145,29 @@ export function AgentChatDashboard() {
 
       {/* Error Display */}
       {error && (
-        <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4 flex items-center gap-3">
-          <AlertCircle className="w-5 h-5 text-red-400" />
-          <span className="text-red-400">{error}</span>
+        <div className="bg-down/10 border border-down/30 rounded-lg p-4 flex items-center gap-3">
+          <AlertCircle className="w-5 h-5 text-down" />
+          <span className="text-down">{error}</span>
         </div>
       )}
 
       {/* Status Card */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
+      <div className="bg-card rounded border border-hairline p-6">
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-4">
             <div
               className={`w-3 h-3 rounded-full ${
-                status?.is_running ? 'bg-green-500 animate-pulse' : 'bg-gray-500'
+                status?.is_running ? 'bg-accent animate-pulse' : 'bg-muted'
               }`}
             />
-            <span className="text-lg font-medium text-white">
+            <span className="text-lg font-medium text-ink">
               Coordinator {status?.is_running ? 'Running' : 'Stopped'}
             </span>
           </div>
           <div className="flex items-center gap-2">
             <button
               onClick={() => setShowConfig(!showConfig)}
-              className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
+              className="p-2 text-muted hover:text-ink hover:bg-elevated rounded-lg"
             >
               <Settings className="w-5 h-5" />
             </button>
@@ -175,7 +175,7 @@ export function AgentChatDashboard() {
               <button
                 onClick={handleStop}
                 disabled={actionLoading}
-                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white rounded-lg"
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-ink rounded-lg" // color-ok: destructive action
               >
                 {actionLoading ? (
                   <RefreshCw className="w-4 h-4 animate-spin" />
@@ -188,7 +188,7 @@ export function AgentChatDashboard() {
               <button
                 onClick={handleStart}
                 disabled={actionLoading}
-                className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white rounded-lg"
+                className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent/90 disabled:opacity-50 text-canvas rounded-lg"
               >
                 {actionLoading ? (
                   <RefreshCw className="w-4 h-4 animate-spin" />
@@ -203,11 +203,11 @@ export function AgentChatDashboard() {
 
         {/* Config Panel */}
         {showConfig && (
-          <div className="mb-6 p-4 bg-gray-800 rounded-lg space-y-4">
-            <h4 className="text-sm font-medium text-gray-300">Configuration</h4>
+          <div className="mb-6 p-4 bg-elevated rounded-lg space-y-4">
+            <h4 className="text-sm font-medium text-ink">Configuration</h4>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-xs text-gray-400 mb-1">
+                <label className="block text-xs text-muted mb-1">
                   Check Interval (minutes)
                 </label>
                 <input
@@ -218,11 +218,11 @@ export function AgentChatDashboard() {
                   onChange={(e) =>
                     setConfig({ ...config, check_interval_minutes: parseInt(e.target.value) || 5 })
                   }
-                  className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm"
+                  className="w-full px-3 py-2 bg-card border border-hairline rounded-lg text-ink text-sm"
                 />
               </div>
               <div>
-                <label className="block text-xs text-gray-400 mb-1">
+                <label className="block text-xs text-muted mb-1">
                   Max Concurrent Discussions
                 </label>
                 <input
@@ -236,7 +236,7 @@ export function AgentChatDashboard() {
                       max_concurrent_discussions: parseInt(e.target.value) || 3,
                     })
                   }
-                  className="w-full px-3 py-2 bg-gray-900 border border-gray-700 rounded-lg text-white text-sm"
+                  className="w-full px-3 py-2 bg-card border border-hairline rounded-lg text-ink text-sm"
                 />
               </div>
             </div>
@@ -245,50 +245,50 @@ export function AgentChatDashboard() {
 
         {/* Stats Grid */}
         <div className="grid grid-cols-3 gap-4">
-          <div className="bg-gray-800 rounded-lg p-4 text-center">
-            <Users className="w-6 h-6 text-blue-400 mx-auto mb-2" />
-            <div className="text-2xl font-bold text-white">{status?.active_discussions || 0}</div>
-            <div className="text-xs text-gray-400">Active Discussions</div>
+          <div className="bg-elevated rounded-lg p-4 text-center">
+            <Users className="w-6 h-6 text-accent mx-auto mb-2" />
+            <div className="text-2xl font-bold text-ink tabular-nums">{status?.active_discussions || 0}</div>
+            <div className="text-xs text-muted">Active Discussions</div>
           </div>
-          <div className="bg-gray-800 rounded-lg p-4 text-center">
-            <TrendingUp className="w-6 h-6 text-green-400 mx-auto mb-2" />
-            <div className="text-2xl font-bold text-white">{status?.total_sessions || 0}</div>
-            <div className="text-xs text-gray-400">Total Sessions</div>
+          <div className="bg-elevated rounded-lg p-4 text-center">
+            <TrendingUp className="w-6 h-6 text-accent mx-auto mb-2" />
+            <div className="text-2xl font-bold text-ink tabular-nums">{status?.total_sessions || 0}</div>
+            <div className="text-xs text-muted">Total Sessions</div>
           </div>
-          <div className="bg-gray-800 rounded-lg p-4 text-center">
-            <Clock className="w-6 h-6 text-yellow-400 mx-auto mb-2" />
-            <div className="text-2xl font-bold text-white">
+          <div className="bg-elevated rounded-lg p-4 text-center">
+            <Clock className="w-6 h-6 text-accent mx-auto mb-2" />
+            <div className="text-2xl font-bold text-ink tabular-nums">
               {status?.check_interval_minutes || 5}m
             </div>
-            <div className="text-xs text-gray-400">Check Interval</div>
+            <div className="text-xs text-muted">Check Interval</div>
           </div>
         </div>
       </div>
 
       {/* Active Discussions */}
       {activeDiscussions.length > 0 && (
-        <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-          <h3 className="text-lg font-medium text-white mb-4 flex items-center gap-2">
-            <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+        <div className="bg-card rounded border border-hairline p-6">
+          <h3 className="text-lg font-medium text-ink mb-4 flex items-center gap-2">
+            <div className="w-2 h-2 bg-accent rounded-full animate-pulse" />
             Active Discussions
           </h3>
           <div className="space-y-3">
             {activeDiscussions.map((discussion) => (
               <div
                 key={discussion.session_id}
-                className="flex items-center justify-between p-4 bg-gray-800 rounded-lg cursor-pointer hover:bg-gray-700"
+                className="flex items-center justify-between p-4 bg-elevated rounded-lg cursor-pointer hover:bg-hairline"
                 onClick={() => setSelectedSessionId(discussion.session_id)}
               >
                 <div>
-                  <div className="text-white font-medium">
+                  <div className="text-ink font-medium">
                     {discussion.stock_name} ({discussion.ticker})
                   </div>
-                  <div className="text-sm text-gray-400">
+                  <div className="text-sm text-muted">
                     Status: {discussion.status}
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="px-2 py-1 text-xs bg-blue-500/20 text-blue-400 rounded">
+                  <span className="px-2 py-1 text-xs bg-accent/20 text-accent rounded">
                     In Progress
                   </span>
                 </div>
