@@ -95,6 +95,9 @@ const CLEAN_SET = [
   // decisionConfig DIRECTIONAL map -> pnlColor).
   'src/components/agent-chat/AgentChatDashboard.tsx',
   'src/components/agent-chat/ChatSessionList.tsx',
+  // d2 t8: Chat session viewer (agentConfig IDENTITY kept raw+color-ok;
+  // voteColor/actionColor DIRECTIONAL -> pnlColor).
+  'src/components/agent-chat/ChatSessionViewer.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 

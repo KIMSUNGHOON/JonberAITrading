@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import { getAgentChatSessionDetail } from '@/api/client';
 import { useAgentChatWebSocket } from '@/hooks/useAgentChatWebSocket';
+import { pnlColor } from '@/utils/pnl';
 import type {
   AgentChatSessionDetail,
   AgentChatMessage,
@@ -40,38 +41,42 @@ interface ChatSessionViewerProps {
   onClose: () => void;
 }
 
+// Agent-category IDENTITY map (not directional) -> which analyst produced
+// this message/vote. Colors stay raw hues per category; `fundamental`'s green
+// is agent-category identity, NOT a bullish vote (see voteColor/actionColor
+// below for the actual DIRECTIONAL BUY/SELL colors -> @/utils/pnl).
 const agentConfig: Record<
   AgentChatAgentType,
   { icon: React.ReactNode; color: string; bgColor: string; name: string }
 > = {
   technical: {
     icon: <BarChart2 className="w-4 h-4" />,
-    color: 'text-blue-400',
-    bgColor: 'bg-blue-500/20',
+    color: 'text-blue-400', // color-ok: agent-category identity, not directional
+    bgColor: 'bg-blue-500/20', // color-ok: agent-category identity, not directional
     name: 'Technical',
   },
   fundamental: {
     icon: <DollarSign className="w-4 h-4" />,
-    color: 'text-green-400',
-    bgColor: 'bg-green-500/20',
+    color: 'text-green-400', // color-ok: agent-category identity (fundamental analyst), not directional
+    bgColor: 'bg-green-500/20', // color-ok: agent-category identity (fundamental analyst), not directional
     name: 'Fundamental',
   },
   sentiment: {
     icon: <Newspaper className="w-4 h-4" />,
-    color: 'text-purple-400',
-    bgColor: 'bg-purple-500/20',
+    color: 'text-purple-400', // color-ok: agent-category identity, not directional
+    bgColor: 'bg-purple-500/20', // color-ok: agent-category identity, not directional
     name: 'Sentiment',
   },
   risk: {
     icon: <Shield className="w-4 h-4" />,
-    color: 'text-yellow-400',
-    bgColor: 'bg-yellow-500/20',
+    color: 'text-yellow-400', // color-ok: agent-category identity, not directional
+    bgColor: 'bg-yellow-500/20', // color-ok: agent-category identity, not directional
     name: 'Risk',
   },
   moderator: {
     icon: <User className="w-4 h-4" />,
-    color: 'text-gray-400',
-    bgColor: 'bg-gray-500/20',
+    color: 'text-muted',
+    bgColor: 'bg-muted/20',
     name: 'Moderator',
   },
 };
@@ -94,23 +99,23 @@ function MessageBubble({ message }: { message: AgentChatMessage }) {
   const config = agentConfig[message.agent_type] || agentConfig.moderator;
 
   return (
-    <div className="flex gap-3 p-3 hover:bg-gray-800/50 rounded-lg">
+    <div className="flex gap-3 p-3 hover:bg-elevated/50 rounded-lg">
       <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${config.bgColor}`}>
         {config.icon}
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
           <span className={`font-medium ${config.color}`}>{message.agent_name}</span>
-          <span className="text-xs text-gray-500">{formatTime(message.timestamp)}</span>
+          <span className="text-xs text-dim">{formatTime(message.timestamp)}</span>
           {message.confidence !== null && (
-            <span className="text-xs px-1.5 py-0.5 bg-gray-700 rounded text-gray-400">
+            <span className="text-xs px-1.5 py-0.5 bg-elevated rounded text-muted tabular-nums">
               {(message.confidence * 100).toFixed(0)}% confidence
             </span>
           )}
         </div>
-        <div className="text-sm text-gray-300 whitespace-pre-wrap">{message.content}</div>
+        <div className="text-sm text-ink whitespace-pre-wrap">{message.content}</div>
         {message.data && Object.keys(message.data).length > 0 && (
-          <div className="mt-2 p-2 bg-gray-800 rounded text-xs text-gray-400">
+          <div className="mt-2 p-2 bg-elevated rounded text-xs text-muted">
             <pre className="overflow-x-auto">{JSON.stringify(message.data, null, 2)}</pre>
           </div>
         )}
@@ -121,15 +126,18 @@ function MessageBubble({ message }: { message: AgentChatMessage }) {
 
 function VoteCard({ vote }: { vote: AgentChatVote }) {
   const config = agentConfig[vote.agent_type] || agentConfig.moderator;
+  // Vote DIRECTIONAL map -> @/utils/pnl. App-wide ACTION map: STRONG_BUY/BUY
+  // bullish -> pnlColor(1) (up/green), STRONG_SELL/SELL bearish -> pnlColor(-1)
+  // (down/red), HOLD -> muted (non-directional).
   const voteColor =
     vote.vote === 'STRONG_BUY' || vote.vote === 'BUY'
-      ? 'text-green-400'
+      ? pnlColor(1)
       : vote.vote === 'STRONG_SELL' || vote.vote === 'SELL'
-      ? 'text-red-400'
-      : 'text-gray-400';
+      ? pnlColor(-1)
+      : 'text-muted';
 
   return (
-    <div className="p-3 bg-gray-800 rounded-lg">
+    <div className="p-3 bg-elevated rounded-lg">
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
           <div className={`w-6 h-6 rounded-full flex items-center justify-center ${config.bgColor}`}>
@@ -139,22 +147,22 @@ function VoteCard({ vote }: { vote: AgentChatVote }) {
         </div>
         <span className={`font-bold ${voteColor}`}>{vote.vote}</span>
       </div>
-      <div className="text-xs text-gray-400 space-y-1">
+      <div className="text-xs text-muted space-y-1">
         <div className="flex justify-between">
           <span>Confidence:</span>
-          <span>{(vote.confidence * 100).toFixed(0)}%</span>
+          <span className="tabular-nums">{(vote.confidence * 100).toFixed(0)}%</span>
         </div>
         <div className="flex justify-between">
           <span>Weight:</span>
-          <span>{vote.weight}</span>
+          <span className="tabular-nums">{vote.weight}</span>
         </div>
         <div className="flex justify-between">
           <span>Score:</span>
-          <span>{vote.weighted_score.toFixed(2)}</span>
+          <span className="tabular-nums">{vote.weighted_score.toFixed(2)}</span>
         </div>
       </div>
       {vote.reasoning && (
-        <p className="mt-2 text-xs text-gray-500">{vote.reasoning}</p>
+        <p className="mt-2 text-xs text-dim">{vote.reasoning}</p>
       )}
     </div>
   );
@@ -170,15 +178,18 @@ function DecisionPanel({ decision, ticker, stockName }: { decision: AgentChatDec
       <Minus className="w-6 h-6" />
     );
 
+  // Decision-action DIRECTIONAL map -> @/utils/pnl semantics. App-wide ACTION
+  // map (ScannerResultsPage/AnalysisDetailPage): BUY/ADD bullish -> up/green,
+  // SELL/REDUCE bearish -> down/red, else neutral.
   const actionColor =
     decision.action === 'BUY' || decision.action === 'ADD'
-      ? 'text-green-400 bg-green-500/20 border-green-500/30'
+      ? `${pnlColor(1)} bg-up/20 border-up/30`
       : decision.action === 'SELL' || decision.action === 'REDUCE'
-      ? 'text-red-400 bg-red-500/20 border-red-500/30'
-      : 'text-gray-400 bg-gray-500/20 border-gray-500/30';
+      ? `${pnlColor(-1)} bg-down/20 border-down/30`
+      : 'text-muted bg-muted/20 border-hairline';
 
   return (
-    <div className={`p-6 rounded-xl border ${actionColor}`}>
+    <div className={`p-6 rounded border ${actionColor}`}>
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-3">
           {actionIcon}
@@ -194,37 +205,37 @@ function DecisionPanel({ decision, ticker, stockName }: { decision: AgentChatDec
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-        <div className="p-3 bg-gray-900/50 rounded-lg">
-          <div className="text-xs text-gray-400">Consensus</div>
-          <div className="text-lg font-medium text-white">
+        <div className="p-3 bg-elevated rounded-lg">
+          <div className="text-xs text-muted">Consensus</div>
+          <div className="text-lg font-medium text-ink tabular-nums">
             {(decision.consensus_level * 100).toFixed(0)}%
           </div>
         </div>
-        <div className="p-3 bg-gray-900/50 rounded-lg">
-          <div className="text-xs text-gray-400">Entry Price</div>
-          <div className="text-lg font-medium text-white">{formatPrice(decision.entry_price)}</div>
+        <div className="p-3 bg-elevated rounded-lg">
+          <div className="text-xs text-muted">Entry Price</div>
+          <div className="text-lg font-medium text-ink tabular-nums">{formatPrice(decision.entry_price)}</div>
         </div>
-        <div className="p-3 bg-gray-900/50 rounded-lg">
-          <div className="text-xs text-gray-400">Stop Loss</div>
-          <div className="text-lg font-medium text-red-400">{formatPrice(decision.stop_loss)}</div>
+        <div className="p-3 bg-elevated rounded-lg">
+          <div className="text-xs text-muted">Stop Loss</div>
+          <div className="text-lg font-medium text-down tabular-nums">{formatPrice(decision.stop_loss)}</div>
         </div>
-        <div className="p-3 bg-gray-900/50 rounded-lg">
-          <div className="text-xs text-gray-400">Take Profit</div>
-          <div className="text-lg font-medium text-green-400">{formatPrice(decision.take_profit)}</div>
+        <div className="p-3 bg-elevated rounded-lg">
+          <div className="text-xs text-muted">Take Profit</div>
+          <div className="text-lg font-medium text-up tabular-nums">{formatPrice(decision.take_profit)}</div>
         </div>
       </div>
 
       {decision.rationale && (
         <div className="mb-4">
-          <div className="text-sm font-medium text-gray-300 mb-2">Rationale</div>
-          <p className="text-sm text-gray-400">{decision.rationale}</p>
+          <div className="text-sm font-medium text-ink mb-2">Rationale</div>
+          <p className="text-sm text-muted">{decision.rationale}</p>
         </div>
       )}
 
       {decision.key_factors.length > 0 && (
         <div className="mb-4">
-          <div className="text-sm font-medium text-gray-300 mb-2">Key Factors</div>
-          <ul className="list-disc list-inside text-sm text-gray-400 space-y-1">
+          <div className="text-sm font-medium text-ink mb-2">Key Factors</div>
+          <ul className="list-disc list-inside text-sm text-muted space-y-1">
             {decision.key_factors.map((factor, i) => (
               <li key={i}>{factor}</li>
             ))}
@@ -234,8 +245,8 @@ function DecisionPanel({ decision, ticker, stockName }: { decision: AgentChatDec
 
       {decision.dissenting_opinions.length > 0 && (
         <div>
-          <div className="text-sm font-medium text-gray-300 mb-2">Dissenting Opinions</div>
-          <ul className="list-disc list-inside text-sm text-gray-400 space-y-1">
+          <div className="text-sm font-medium text-ink mb-2">Dissenting Opinions</div>
+          <ul className="list-disc list-inside text-sm text-muted space-y-1">
             {decision.dissenting_opinions.map((opinion, i) => (
               <li key={i}>{opinion}</li>
             ))}
@@ -339,22 +350,22 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
-        <RefreshCw className="w-8 h-8 animate-spin text-blue-500" />
+        <RefreshCw className="w-8 h-8 animate-spin text-accent" />
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
+      <div className="bg-card rounded border border-hairline p-6">
         <button
           onClick={onClose}
-          className="flex items-center gap-2 text-gray-400 hover:text-white mb-4"
+          className="flex items-center gap-2 text-muted hover:text-ink mb-4"
         >
           <ArrowLeft className="w-5 h-5" />
           Back
         </button>
-        <div className="flex items-center gap-3 text-red-400">
+        <div className="flex items-center gap-3 text-down">
           <AlertCircle className="w-5 h-5" />
           {error}
         </div>
@@ -370,7 +381,7 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
       <div className="flex items-center justify-between">
         <button
           onClick={onClose}
-          className="flex items-center gap-2 text-gray-400 hover:text-white"
+          className="flex items-center gap-2 text-muted hover:text-ink"
         >
           <ArrowLeft className="w-5 h-5" />
           Back to Dashboard
@@ -380,26 +391,26 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
           {isActiveSession && (
             <div className="flex items-center gap-2">
               {isConnected ? (
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-green-500/10 rounded-lg">
-                  <Wifi className="w-4 h-4 text-green-400" />
-                  <span className="text-xs text-green-400">Live</span>
+                <div className="flex items-center gap-1.5 px-2 py-1 bg-up/10 rounded-lg">
+                  <Wifi className="w-4 h-4 text-up" />
+                  <span className="text-xs text-up">Live</span>
                 </div>
               ) : connectionState === 'connecting' || connectionState === 'reconnecting' ? (
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-yellow-500/10 rounded-lg">
-                  <RefreshCw className="w-4 h-4 text-yellow-400 animate-spin" />
-                  <span className="text-xs text-yellow-400">Connecting...</span>
+                <div className="flex items-center gap-1.5 px-2 py-1 bg-warn/10 rounded-lg">
+                  <RefreshCw className="w-4 h-4 text-warn animate-spin" />
+                  <span className="text-xs text-warn">Connecting...</span>
                 </div>
               ) : (
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-500/10 rounded-lg">
-                  <WifiOff className="w-4 h-4 text-gray-400" />
-                  <span className="text-xs text-gray-400">Polling</span>
+                <div className="flex items-center gap-1.5 px-2 py-1 bg-muted/10 rounded-lg">
+                  <WifiOff className="w-4 h-4 text-muted" />
+                  <span className="text-xs text-muted">Polling</span>
                 </div>
               )}
             </div>
           )}
           <button
             onClick={fetchSession}
-            className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
+            className="p-2 text-muted hover:text-ink hover:bg-elevated rounded-lg"
           >
             <RefreshCw className="w-5 h-5" />
           </button>
@@ -407,13 +418,13 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
       </div>
 
       {/* Session Info */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
+      <div className="bg-card rounded border border-hairline p-6">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h2 className="text-xl font-semibold text-white">
+            <h2 className="text-xl font-semibold text-ink">
               {session.stock_name} ({session.ticker})
             </h2>
-            <p className="text-sm text-gray-400">
+            <p className="text-sm text-muted">
               Session: {session.id.slice(0, 8)}...
             </p>
           </div>
@@ -421,10 +432,10 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
             <span
               className={`px-3 py-1 rounded-full text-sm ${
                 session.status === 'decided'
-                  ? 'bg-green-500/20 text-green-400'
+                  ? 'bg-up/20 text-up'
                   : session.status === 'error'
-                  ? 'bg-red-500/20 text-red-400'
-                  : 'bg-blue-500/20 text-blue-400'
+                  ? 'bg-down/20 text-down'
+                  : 'bg-accent/20 text-accent'
               }`}
             >
               {session.status}
@@ -434,23 +445,23 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
 
         {/* Stats */}
         <div className="grid grid-cols-4 gap-4 text-center">
-          <div className="p-3 bg-gray-800 rounded-lg">
-            <div className="text-lg font-bold text-white">{session.rounds.length}</div>
-            <div className="text-xs text-gray-400">Rounds</div>
+          <div className="p-3 bg-elevated rounded-lg">
+            <div className="text-lg font-bold text-ink tabular-nums">{session.rounds.length}</div>
+            <div className="text-xs text-muted">Rounds</div>
           </div>
-          <div className="p-3 bg-gray-800 rounded-lg">
-            <div className="text-lg font-bold text-white">{session.messages.length}</div>
-            <div className="text-xs text-gray-400">Messages</div>
+          <div className="p-3 bg-elevated rounded-lg">
+            <div className="text-lg font-bold text-ink tabular-nums">{session.messages.length}</div>
+            <div className="text-xs text-muted">Messages</div>
           </div>
-          <div className="p-3 bg-gray-800 rounded-lg">
-            <div className="text-lg font-bold text-white">{session.votes.length}</div>
-            <div className="text-xs text-gray-400">Votes</div>
+          <div className="p-3 bg-elevated rounded-lg">
+            <div className="text-lg font-bold text-ink tabular-nums">{session.votes.length}</div>
+            <div className="text-xs text-muted">Votes</div>
           </div>
-          <div className="p-3 bg-gray-800 rounded-lg">
-            <div className="text-lg font-bold text-white">
+          <div className="p-3 bg-elevated rounded-lg">
+            <div className="text-lg font-bold text-ink tabular-nums">
               {(session.consensus_level * 100).toFixed(0)}%
             </div>
-            <div className="text-xs text-gray-400">Consensus</div>
+            <div className="text-xs text-muted">Consensus</div>
           </div>
         </div>
       </div>
@@ -466,9 +477,9 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
 
       {/* Votes */}
       {session.votes.length > 0 && (
-        <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-          <h3 className="text-lg font-medium text-white mb-4 flex items-center gap-2">
-            <CheckCircle className="w-5 h-5 text-green-400" />
+        <div className="bg-card rounded border border-hairline p-6">
+          <h3 className="text-lg font-medium text-ink mb-4 flex items-center gap-2">
+            <CheckCircle className="w-5 h-5 text-accent" />
             Agent Votes
           </h3>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -480,9 +491,9 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
       )}
 
       {/* Messages */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-        <h3 className="text-lg font-medium text-white mb-4 flex items-center gap-2">
-          <MessageSquare className="w-5 h-5 text-blue-400" />
+      <div className="bg-card rounded border border-hairline p-6">
+        <h3 className="text-lg font-medium text-ink mb-4 flex items-center gap-2">
+          <MessageSquare className="w-5 h-5 text-accent" />
           Discussion ({session.messages.length} messages)
         </h3>
         <div className="space-y-2 max-h-[600px] overflow-y-auto">
