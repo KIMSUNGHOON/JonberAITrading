@@ -26,19 +26,19 @@ export function ChartsPage({ onBack }: ChartsPageProps) {
   };
 
   return (
-    <div className="h-full flex flex-col bg-surface">
+    <div className="h-full flex flex-col bg-canvas">
       {/* Header */}
-      <div className="flex items-center gap-3 px-6 py-4 border-b border-border bg-surface-dark">
+      <div className="flex items-center gap-3 px-6 py-4 border-b border-hairline bg-card">
         <button
           onClick={handleBack}
-          className="p-2 rounded-lg hover:bg-surface transition-colors"
+          className="p-2 rounded hover:bg-elevated transition-colors"
           title="Back to Dashboard"
         >
-          <ArrowLeft className="w-5 h-5 text-gray-400" />
+          <ArrowLeft className="w-5 h-5 text-muted" />
         </button>
         <div>
           <h1 className="text-xl font-semibold">Charts</h1>
-          <p className="text-sm text-gray-500">Technical analysis and charting tools</p>
+          <p className="text-sm text-dim">Technical analysis and charting tools</p>
         </div>
       </div>
 
@@ -47,13 +47,13 @@ export function ChartsPage({ onBack }: ChartsPageProps) {
         <div className="max-w-6xl mx-auto">
           {/* Placeholder for chart tools */}
           <div className="card p-12 text-center">
-            <LineChart className="w-16 h-16 mx-auto mb-4 text-gray-600" />
+            <LineChart className="w-16 h-16 mx-auto mb-4 text-dim" />
             <h2 className="text-xl font-semibold mb-2">Advanced Charts</h2>
-            <p className="text-gray-500 max-w-md mx-auto">
+            <p className="text-dim max-w-md mx-auto">
               Full-featured charting with technical indicators, drawing tools, and
               multi-timeframe analysis coming soon.
             </p>
-            <p className="text-sm text-gray-600 mt-4">
+            <p className="text-sm text-dim mt-4">
               For now, charts are available within each analysis session.
             </p>
           </div>

@@ -71,7 +71,7 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
   if (isLoading && trades.length === 0) {
     return (
       <div className="card animate-pulse">
-        <div className="h-32 bg-surface rounded" />
+        <div className="h-32 bg-elevated rounded" />
       </div>
     );
   }
@@ -84,17 +84,17 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
           <History size={18} className="text-accent" />
           <h3 className="font-semibold">Trade History</h3>
           {total > 0 && (
-            <span className="text-xs text-gray-500">
+            <span className="text-xs text-dim">
               ({total} total)
             </span>
           )}
         </div>
         <button
           onClick={fetchTrades}
-          className="p-1 hover:bg-surface rounded transition-colors"
+          className="p-1 hover:bg-elevated rounded transition-colors"
           title="Refresh"
         >
-          <RefreshCw size={16} className={`text-gray-400 ${isLoading ? 'animate-spin' : ''}`} />
+          <RefreshCw size={16} className={`text-muted ${isLoading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
@@ -112,7 +112,7 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
           {trades.map((trade) => (
             <div
               key={trade.id}
-              className="p-3 bg-surface rounded-lg"
+              className="p-3 bg-elevated rounded-lg"
             >
               {/* Trade Header */}
               <div className="flex items-center justify-between mb-2">
@@ -127,7 +127,7 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
                 <span className={`px-2 py-0.5 rounded text-xs ${
                   trade.state === 'done'
                     ? 'bg-up/10 text-up'
-                    : 'bg-gray-500/10 text-gray-400'
+                    : 'bg-elevated text-muted'
                 }`}>
                   {trade.state}
                 </span>
@@ -136,21 +136,21 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
               {/* Trade Details */}
               <div className="grid grid-cols-3 gap-2 text-sm">
                 <div>
-                  <span className="text-gray-400 text-xs">Price</span>
+                  <span className="text-muted text-xs">Price</span>
                   <div className="font-mono">{formatKRW(trade.price)}</div>
                 </div>
                 <div>
-                  <span className="text-gray-400 text-xs">Volume</span>
+                  <span className="text-muted text-xs">Volume</span>
                   <div className="font-mono">{formatVolume(trade.executed_volume)}</div>
                 </div>
                 <div>
-                  <span className="text-gray-400 text-xs">Total</span>
+                  <span className="text-muted text-xs">Total</span>
                   <div className="font-mono">{formatKRW(trade.total_krw)}</div>
                 </div>
               </div>
 
               {/* Fee & Time */}
-              <div className="flex items-center justify-between mt-2 text-xs text-gray-500">
+              <div className="flex items-center justify-between mt-2 text-xs text-dim">
                 {trade.fee > 0 && (
                   <span>Fee: {trade.fee.toFixed(4)}</span>
                 )}
@@ -167,7 +167,7 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
           ))}
         </div>
       ) : (
-        <div className="text-center py-6 text-gray-500">
+        <div className="text-center py-6 text-dim">
           <History size={24} className="mx-auto mb-2 opacity-50" />
           <p className="text-sm">No trade history</p>
         </div>
@@ -175,21 +175,21 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
 
       {/* Pagination */}
       {totalPages > 1 && (
-        <div className="flex items-center justify-center gap-2 pt-2 border-t border-border">
+        <div className="flex items-center justify-center gap-2 pt-2 border-t border-hairline">
           <button
             onClick={() => setPage(Math.max(1, page - 1))}
             disabled={page === 1}
-            className="p-1 hover:bg-surface rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="p-1 hover:bg-elevated rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <ChevronLeft size={16} />
           </button>
-          <span className="text-sm text-gray-400">
+          <span className="text-sm text-muted">
             {page} / {totalPages}
           </span>
           <button
             onClick={() => setPage(Math.min(totalPages, page + 1))}
             disabled={page === totalPages}
-            className="p-1 hover:bg-surface rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="p-1 hover:bg-elevated rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <ChevronRight size={16} />
           </button>

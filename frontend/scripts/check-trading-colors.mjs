@@ -53,6 +53,8 @@ const CLEAN_SET = [
   'src/pages/WorkflowPage.tsx',
   'src/pages/AnalysisPage.tsx',
   'src/pages/AnalysisDetailPage.tsx',
+  'src/pages/ChartsPage.tsx',
+  'src/pages/TradesPage.tsx',
   'src/components/kiwoom/KiwoomPositionPanel.tsx',
   'src/components/kiwoom/KiwoomOpenOrders.tsx',
   'src/components/kiwoom/KiwoomAccountBalance.tsx',

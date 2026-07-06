@@ -32,19 +32,19 @@ export function TradesPage({ onBack }: TradesPageProps) {
   };
 
   return (
-    <div className="h-full flex flex-col bg-surface">
+    <div className="h-full flex flex-col bg-canvas">
       {/* Header */}
-      <div className="flex items-center gap-3 px-6 py-4 border-b border-border bg-surface-dark">
+      <div className="flex items-center gap-3 px-6 py-4 border-b border-hairline bg-card">
         <button
           onClick={handleBack}
-          className="p-2 rounded-lg hover:bg-surface transition-colors"
+          className="p-2 rounded hover:bg-elevated transition-colors"
           title="Back to Dashboard"
         >
-          <ArrowLeft className="w-5 h-5 text-gray-400" />
+          <ArrowLeft className="w-5 h-5 text-muted" />
         </button>
         <div>
           <h1 className="text-xl font-semibold">Trade History</h1>
-          <p className="text-sm text-gray-500">View your executed trades across all markets</p>
+          <p className="text-sm text-dim">View your executed trades across all markets</p>
         </div>
       </div>
 
@@ -72,7 +72,7 @@ export function TradesPage({ onBack }: TradesPageProps) {
             <section>
               <h2 className="text-lg font-semibold mb-3">US Stock Trades</h2>
               <div className="card p-8 text-center">
-                <p className="text-gray-500">US Stock trade history coming soon</p>
+                <p className="text-dim">US Stock trade history coming soon</p>
               </div>
             </section>
           )}
@@ -80,7 +80,7 @@ export function TradesPage({ onBack }: TradesPageProps) {
           {/* Empty state */}
           {!upbitApiConfigured && !kiwoomApiConfigured && activeMarket !== 'stock' && (
             <div className="card p-8 text-center">
-              <p className="text-gray-500">
+              <p className="text-dim">
                 Configure your API keys in Settings to view trade history
               </p>
             </div>
