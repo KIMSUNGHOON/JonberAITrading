@@ -76,6 +76,9 @@ const CLEAN_SET = [
   'src/components/terminal/panels/ScannerPanel.tsx',
   'src/components/terminal/panels/shared.tsx',
   'src/components/terminal/panels/WatchlistPanel.tsx',
+  // d2 t2: Basket page + widget.
+  'src/pages/BasketPage.tsx',
+  'src/components/basket/BasketWidget.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 

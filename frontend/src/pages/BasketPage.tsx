@@ -28,19 +28,19 @@ export function BasketPage({ onBack }: BasketPageProps) {
   };
 
   return (
-    <div className="h-full flex flex-col bg-surface">
+    <div className="h-full flex flex-col bg-canvas">
       {/* Header */}
-      <div className="flex items-center gap-3 px-6 py-4 border-b border-border bg-surface-dark">
+      <div className="flex items-center gap-3 px-6 py-4 border-b border-hairline bg-card">
         <button
           onClick={handleBack}
-          className="p-2 rounded-lg hover:bg-surface transition-colors"
+          className="p-2 rounded hover:bg-elevated transition-colors"
           title="Back to Dashboard"
         >
-          <ArrowLeft className="w-5 h-5 text-gray-400" />
+          <ArrowLeft className="w-5 h-5 text-muted" />
         </button>
         <div>
           <h1 className="text-xl font-semibold">My Basket</h1>
-          <p className="text-sm text-gray-500">Search and manage your watchlist</p>
+          <p className="text-sm text-dim">Search and manage your watchlist</p>
         </div>
       </div>
 

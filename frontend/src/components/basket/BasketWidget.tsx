@@ -40,17 +40,18 @@ import {
 import { getCoinTickers, searchKRStocks } from '@/api/client';
 import { useGoTo } from '@/hooks/useNav';
 import { useStartAnalysis } from '@/hooks/useStartAnalysis';
+import { pnlColor, changeColor } from '@/utils/pnl';
 import type { KRStockInfo } from '@/types';
 
 // Market type icon component
 function MarketIcon({ marketType }: { marketType: MarketType }) {
   switch (marketType) {
     case 'stock':
-      return <LineChart className="w-3.5 h-3.5 text-green-400" />;
+      return <LineChart className="w-3.5 h-3.5 text-green-400" />; // color-ok: market identity, not directional
     case 'coin':
-      return <Bitcoin className="w-3.5 h-3.5 text-yellow-400" />;
+      return <Bitcoin className="w-3.5 h-3.5 text-yellow-400" />; // color-ok: market identity, not directional
     case 'kiwoom':
-      return <Building2 className="w-3.5 h-3.5 text-blue-400" />;
+      return <Building2 className="w-3.5 h-3.5 text-blue-400" />; // color-ok: market identity, not directional
   }
 }
 
@@ -72,11 +73,9 @@ function formatChangeRate(rate: number): string {
   return `${sign}${rate.toFixed(2)}%`;
 }
 
-// Change color based on direction
+// Change color based on direction — delegates to the shared Western-default helper.
 function getChangeColor(change: 'RISE' | 'FALL' | 'EVEN'): string {
-  if (change === 'RISE') return 'text-green-400';
-  if (change === 'FALL') return 'text-red-400';
-  return 'text-gray-400';
+  return changeColor(change);
 }
 
 // Individual basket item component
@@ -98,25 +97,25 @@ function BasketItemRow({
   };
 
   return (
-    <div className="flex items-center gap-2 px-3 py-2 hover:bg-surface/50 rounded-lg transition-colors group">
+    <div className="flex items-center gap-2 px-3 py-2 hover:bg-elevated/50 rounded-lg transition-colors group">
       {/* Market Icon & Name */}
       <MarketIcon marketType={item.marketType} />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1">
           <span className="font-medium text-sm truncate">{item.displayName}</span>
           {item.displayName !== item.ticker && (
-            <span className="text-xs text-gray-500">({item.ticker})</span>
+            <span className="text-xs text-dim">({item.ticker})</span>
           )}
         </div>
 
         {/* Price & Change */}
         {item.isLoading ? (
-          <div className="flex items-center gap-1 text-xs text-gray-500">
+          <div className="flex items-center gap-1 text-xs text-dim">
             <RefreshCw className="w-3 h-3 animate-spin" />
             <span>Loading...</span>
           </div>
         ) : item.error ? (
-          <div className="flex items-center gap-1 text-xs text-red-400">
+          <div className="flex items-center gap-1 text-xs text-down">
             <AlertCircle className="w-3 h-3" />
             <span className="truncate" title={item.error}>
               {item.error.includes('API') ? 'API 미등록' : 'Error'}
@@ -124,19 +123,19 @@ function BasketItemRow({
           </div>
         ) : item.price > 0 ? (
           <div className="flex items-center gap-2 text-xs">
-            <span className="text-gray-300">{formatCurrency(item.price, item.marketType)}</span>
-            <span className={`flex items-center gap-0.5 ${getChangeColor(item.change)}`}>
+            <span className="text-ink tabular-nums">{formatCurrency(item.price, item.marketType)}</span>
+            <span className={`flex items-center gap-0.5 tabular-nums ${getChangeColor(item.change)}`}>
               <ChangeIcon />
               {formatChangeRate(item.changeRate)}
             </span>
           </div>
         ) : !apiConfigured ? (
-          <div className="flex items-center gap-1 text-xs text-yellow-500">
+          <div className="flex items-center gap-1 text-xs text-warn">
             <AlertCircle className="w-3 h-3" />
             <span>API 설정 필요</span>
           </div>
         ) : (
-          <span className="text-xs text-gray-500">가격 정보 없음</span>
+          <span className="text-xs text-dim">가격 정보 없음</span>
         )}
       </div>
 
@@ -144,14 +143,14 @@ function BasketItemRow({
       <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
         <button
           onClick={onAnalyze}
-          className="p-1.5 text-blue-400 hover:bg-blue-500/20 rounded transition-colors"
+          className="p-1.5 text-accent hover:bg-accent/20 rounded transition-colors"
           title="분석 시작"
         >
           <Play className="w-3.5 h-3.5" />
         </button>
         <button
           onClick={onRemove}
-          className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-500/20 rounded transition-colors"
+          className="p-1.5 text-muted hover:text-red-400 hover:bg-red-500/20 rounded transition-colors" // color-ok: destructive action hover
           title="삭제"
         >
           <X className="w-3.5 h-3.5" />
@@ -172,19 +171,19 @@ function ApiNotConfiguredWarning({
   const marketName = marketType === 'coin' ? 'Upbit' : marketType === 'kiwoom' ? 'Kiwoom' : 'Stock';
 
   return (
-    <div className="px-3 py-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+    <div className="px-3 py-2 bg-warn/10 border border-warn/30 rounded-lg">
       <div className="flex items-start gap-2">
-        <AlertCircle className="w-4 h-4 text-yellow-500 flex-shrink-0 mt-0.5" />
+        <AlertCircle className="w-4 h-4 text-warn flex-shrink-0 mt-0.5" />
         <div className="flex-1">
-          <p className="text-xs text-yellow-500 font-medium">
+          <p className="text-xs text-warn font-medium">
             {marketName} API 미등록
           </p>
-          <p className="text-xs text-gray-400 mt-0.5">
+          <p className="text-xs text-muted mt-0.5">
             실시간 시세를 보려면 API를 등록하세요
           </p>
           <button
             onClick={onConfigure}
-            className="flex items-center gap-1 mt-2 text-xs text-yellow-400 hover:text-yellow-300"
+            className="flex items-center gap-1 mt-2 text-xs text-warn hover:text-warn/80"
           >
             <Settings className="w-3 h-3" />
             설정으로 이동
@@ -625,13 +624,13 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
       {/* Header */}
       <div className={`flex items-center justify-between ${expanded ? 'mb-4' : 'mb-3'}`}>
         <div className="flex items-center gap-2">
-          <ShoppingBasket className={`${expanded ? 'w-6 h-6' : 'w-5 h-5'} text-purple-400`} />
+          <ShoppingBasket className={`${expanded ? 'w-6 h-6' : 'w-5 h-5'} text-accent`} />
           <h3 className={`font-semibold ${expanded ? 'text-base' : 'text-sm'}`}>My Basket</h3>
-          <span className="px-1.5 py-0.5 text-xs bg-purple-600 text-white rounded-full">
+          <span className="px-1.5 py-0.5 text-xs bg-accent text-canvas rounded-full tabular-nums">
             {basketItems.length}/10
           </span>
           {availableSlots < 3 && (
-            <span className="px-1.5 py-0.5 text-xs bg-yellow-600/50 text-yellow-200 rounded-full" title="사용 가능한 분석 슬롯">
+            <span className="px-1.5 py-0.5 text-xs bg-warn/20 text-warn rounded-full tabular-nums" title="사용 가능한 분석 슬롯">
               슬롯: {availableSlots}/3
             </span>
           )}
@@ -644,8 +643,8 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
                 disabled={isAnalyzing || availableSlots === 0}
                 className={`p-1.5 rounded transition-colors ${
                   isAnalyzing || availableSlots === 0
-                    ? 'text-gray-600 cursor-not-allowed'
-                    : 'text-green-400 hover:bg-green-500/20'
+                    ? 'text-dim cursor-not-allowed'
+                    : 'text-accent hover:bg-accent/20'
                 }`}
                 title={
                   availableSlots === 0
@@ -662,7 +661,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
               <button
                 onClick={clearBasket}
                 disabled={isAnalyzing}
-                className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors disabled:opacity-50"
+                className="p-1.5 text-muted hover:text-red-400 hover:bg-red-500/10 rounded transition-colors disabled:opacity-50" // color-ok: destructive action hover
                 title="전체 삭제"
               >
                 <Trash2 className="w-4 h-4" />
@@ -674,8 +673,8 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
             disabled={isBasketFull}
             className={`p-1.5 rounded transition-colors ${
               isBasketFull
-                ? 'text-gray-600 cursor-not-allowed'
-                : 'text-purple-400 hover:bg-purple-500/20'
+                ? 'text-dim cursor-not-allowed'
+                : 'text-accent hover:bg-accent/20'
             }`}
             title={isBasketFull ? '바스켓이 가득 찼습니다' : '종목 추가'}
           >
@@ -684,7 +683,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
           {!expanded && (
             <button
               onClick={() => goTo('basket')}
-              className="flex items-center gap-0.5 ml-1 text-xs text-gray-400 hover:text-blue-400 transition-colors"
+              className="flex items-center gap-0.5 ml-1 text-xs text-muted hover:text-accent transition-colors"
               title="전체 화면으로 보기"
             >
               <ChevronRight className="w-3 h-3" />
@@ -695,7 +694,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
 
       {/* Add Item Form */}
       {isAddingItem && (
-        <div className="mb-3 p-3 bg-surface-dark rounded-lg border border-border">
+        <div className="mb-3 p-3 bg-elevated rounded-lg border border-hairline">
           <div className="flex items-center gap-2 mb-2">
             <select
               value={searchMarket}
@@ -705,7 +704,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
                 setSuggestions([]);
                 setShowDropdown(false);
               }}
-              className="px-2 py-1.5 bg-surface border border-border rounded text-xs focus:outline-none focus:border-purple-500"
+              className="px-2 py-1.5 bg-card border border-hairline rounded text-xs focus:outline-none focus:border-accent"
             >
               <option value="kiwoom">한국 주식</option>
               <option value="coin">코인</option>
@@ -743,46 +742,46 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
                     ? '코인 (예: BTC, ETH, XRP)'
                     : '티커 (예: AAPL, TSLA)'
                 }
-                className={`w-full px-2 py-1.5 bg-surface border rounded text-xs focus:outline-none ${
+                className={`w-full px-2 py-1.5 bg-card border rounded text-xs focus:outline-none ${
                   inputError
-                    ? 'border-red-500 focus:border-red-400'
-                    : 'border-border focus:border-purple-500'
+                    ? 'border-down focus:border-down'
+                    : 'border-hairline focus:border-accent'
                 }`}
                 autoFocus
               />
               {/* Loading indicator */}
               {isSearching && (
                 <div className="absolute right-2 top-1/2 -translate-y-1/2">
-                  <Loader2 className="w-3 h-3 animate-spin text-gray-400" />
+                  <Loader2 className="w-3 h-3 animate-spin text-muted" />
                 </div>
               )}
               {/* Autocomplete dropdown for Kiwoom stocks */}
               {showDropdown && searchMarket === 'kiwoom' && suggestions.length > 0 && (
                 <div
                   ref={dropdownRef}
-                  className="absolute z-50 w-full mt-1 bg-surface-light border border-border rounded-lg shadow-lg max-h-48 overflow-y-auto"
+                  className="absolute z-50 w-full mt-1 bg-elevated border border-hairline rounded-lg shadow-lg max-h-48 overflow-y-auto"
                 >
                   {suggestions.map((stock, index) => (
                     <button
                       key={stock.stk_cd}
                       type="button"
                       onClick={() => handleSelectSuggestion(stock)}
-                      className={`w-full px-3 py-2 text-left flex items-center gap-2 hover:bg-surface transition-colors ${
-                        index === selectedIndex ? 'bg-surface' : ''
+                      className={`w-full px-3 py-2 text-left flex items-center gap-2 hover:bg-canvas transition-colors ${
+                        index === selectedIndex ? 'bg-canvas' : ''
                       }`}
                     >
-                      <Building2 className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" />
+                      <Building2 className="w-3.5 h-3.5 text-blue-400 flex-shrink-0" /> {/* color-ok: kiwoom market identity, not directional */}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5">
                           <span className="font-medium text-xs truncate">{stock.stk_nm}</span>
-                          <span className="text-xs text-gray-500">{stock.stk_cd}</span>
+                          <span className="text-xs text-dim">{stock.stk_cd}</span>
                         </div>
                         {stock.cur_prc > 0 && (
                           <div className="flex items-center gap-1.5 text-xs">
-                            <span className="text-gray-400">
+                            <span className="text-muted tabular-nums">
                               {stock.cur_prc.toLocaleString()}원
                             </span>
-                            <span className={stock.prdy_ctrt > 0 ? 'text-red-400' : stock.prdy_ctrt < 0 ? 'text-blue-400' : 'text-gray-400'}>
+                            <span className={`${pnlColor(stock.prdy_ctrt)} tabular-nums`}>
                               {stock.prdy_ctrt > 0 ? '+' : ''}{stock.prdy_ctrt?.toFixed(2)}%
                             </span>
                           </div>
@@ -796,9 +795,9 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
               {showDropdown && searchMarket === 'kiwoom' && searchTicker.trim() && suggestions.length === 0 && !isSearching && (
                 <div
                   ref={dropdownRef}
-                  className="absolute z-50 w-full mt-1 bg-surface-light border border-border rounded-lg shadow-lg"
+                  className="absolute z-50 w-full mt-1 bg-elevated border border-hairline rounded-lg shadow-lg"
                 >
-                  <div className="px-3 py-3 text-center text-gray-500 text-xs">
+                  <div className="px-3 py-3 text-center text-dim text-xs">
                     "{searchTicker}" 검색 결과 없음
                   </div>
                 </div>
@@ -807,7 +806,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
           </div>
           {/* Error message */}
           {inputError && (
-            <div className="flex items-center gap-1 mb-2 text-xs text-red-400">
+            <div className="flex items-center gap-1 mb-2 text-xs text-down">
               <AlertCircle className="w-3 h-3 flex-shrink-0" />
               <span>{inputError}</span>
             </div>
@@ -821,14 +820,14 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
                 setSuggestions([]);
                 setShowDropdown(false);
               }}
-              className="px-3 py-1 text-xs text-gray-400 hover:text-gray-300"
+              className="px-3 py-1 text-xs text-muted hover:text-ink"
             >
               취소
             </button>
             <button
               onClick={handleAddItem}
               disabled={!searchTicker.trim() && suggestions.length === 0}
-              className="px-3 py-1 text-xs bg-purple-600 hover:bg-purple-500 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
+              className="px-3 py-1 text-xs bg-accent hover:bg-accent/90 text-canvas rounded disabled:opacity-50 disabled:cursor-not-allowed"
             >
               추가
             </button>
@@ -851,7 +850,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
       {/* Basket Items */}
       <div className="space-y-1">
         {basketItems.length === 0 ? (
-          <div className="text-center py-6 text-gray-500">
+          <div className="text-center py-6 text-dim">
             <ShoppingBasket className="w-8 h-8 mx-auto mb-2 opacity-30" />
             <p className="text-xs">바스켓이 비어있습니다</p>
             <p className="text-xs mt-1">종목을 추가해보세요</p>
@@ -879,7 +878,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
       </div>
 
       {/* Info text */}
-      <div className="mt-3 text-xs text-gray-500">
+      <div className="mt-3 text-xs text-dim">
         종목을 클릭하여 분석을 시작하세요
       </div>
     </div>
