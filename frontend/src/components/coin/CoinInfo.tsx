@@ -9,6 +9,7 @@ import { useState, useEffect } from 'react';
 import { TrendingUp, TrendingDown, BarChart3, ArrowUpDown } from 'lucide-react';
 import { getCoinOrderbook } from '@/api/client';
 import { useCoinTicker } from '@/hooks/useCoinTicker';
+import { pnlColor, changeColor } from '@/utils/pnl';
 
 interface CoinInfoProps {
   market: string;
@@ -77,13 +78,7 @@ export function CoinInfo({ market, koreanName }: CoinInfoProps) {
           <div className="text-xs text-gray-500">{market}</div>
         </div>
         <div
-          className={`px-2 py-1 rounded text-xs font-medium ${
-            ticker.change === 'RISE'
-              ? 'bg-green-500/20 text-green-400'
-              : ticker.change === 'FALL'
-                ? 'bg-red-500/20 text-red-400'
-                : 'bg-gray-500/20 text-gray-400'
-          }`}
+          className={`px-2 py-1 rounded text-xs font-medium bg-elevated border border-hairline ${changeColor(ticker.change)}`}
         >
           {ticker.change === 'RISE'
             ? 'Rising'
@@ -99,13 +94,7 @@ export function CoinInfo({ market, koreanName }: CoinInfoProps) {
           {ticker.tradePrice.toLocaleString('ko-KR')} KRW
         </div>
         <div
-          className={`flex items-center gap-2 mt-1 ${
-            ticker.change === 'RISE'
-              ? 'text-green-400'
-              : ticker.change === 'FALL'
-                ? 'text-red-400'
-                : 'text-gray-400'
-          }`}
+          className={`flex items-center gap-2 mt-1 ${changeColor(ticker.change)}`}
         >
           {ticker.change === 'RISE' ? (
             <TrendingUp className="w-4 h-4" />
@@ -125,13 +114,13 @@ export function CoinInfo({ market, koreanName }: CoinInfoProps) {
       <div className="grid grid-cols-2 gap-3">
         <div className="bg-surface p-3 rounded-lg">
           <div className="text-xs text-gray-500 mb-1">24h High</div>
-          <div className="font-medium text-green-400">
+          <div className={`font-medium ${pnlColor(1)}`}>
             {ticker.highPrice.toLocaleString('ko-KR')}
           </div>
         </div>
         <div className="bg-surface p-3 rounded-lg">
           <div className="text-xs text-gray-500 mb-1">24h Low</div>
-          <div className="font-medium text-red-400">
+          <div className={`font-medium ${pnlColor(-1)}`}>
             {ticker.lowPrice.toLocaleString('ko-KR')}
           </div>
         </div>
@@ -147,13 +136,7 @@ export function CoinInfo({ market, koreanName }: CoinInfoProps) {
               <ArrowUpDown className="w-3 h-3" /> Bid/Ask Ratio
             </div>
             <div
-              className={`font-medium ${
-                orderbook.bidAskRatio > 1
-                  ? 'text-green-400'
-                  : orderbook.bidAskRatio < 1
-                    ? 'text-red-400'
-                    : 'text-gray-400'
-              }`}
+              className={`font-medium ${pnlColor(orderbook.bidAskRatio - 1)}`}
             >
               {orderbook.bidAskRatio.toFixed(2)}
             </div>
@@ -167,7 +150,7 @@ export function CoinInfo({ market, koreanName }: CoinInfoProps) {
           <div>
             <div className="text-gray-500 mb-1">Top Bids (Buy)</div>
             {orderbook.topBids.slice(0, 3).map((bid, i) => (
-              <div key={i} className="flex justify-between text-green-400 opacity-80">
+              <div key={i} className={`flex justify-between opacity-80 ${pnlColor(1)}`}>
                 <span>{bid.price.toLocaleString('ko-KR')}</span>
                 <span>{bid.size.toFixed(4)}</span>
               </div>
@@ -176,7 +159,7 @@ export function CoinInfo({ market, koreanName }: CoinInfoProps) {
           <div>
             <div className="text-gray-500 mb-1">Top Asks (Sell)</div>
             {orderbook.topAsks.slice(0, 3).map((ask, i) => (
-              <div key={i} className="flex justify-between text-red-400 opacity-80">
+              <div key={i} className={`flex justify-between opacity-80 ${pnlColor(-1)}`}>
                 <span>{ask.price.toLocaleString('ko-KR')}</span>
                 <span>{ask.size.toFixed(4)}</span>
               </div>

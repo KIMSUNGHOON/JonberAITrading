@@ -7,6 +7,7 @@
 
 import { TrendingUp, TrendingDown, Minus } from 'lucide-react';
 import { useCoinTicker } from '@/hooks/useCoinTicker';
+import { changeColor } from '@/utils/pnl';
 
 interface CoinPriceTickerProps {
   market: string;
@@ -24,7 +25,7 @@ export function CoinPriceTicker({
   const { data, isLoading, error } = useCoinTicker(market);
 
   if (error) {
-    return <div className="text-sm text-red-400">Failed to load price</div>;
+    return <div className="text-sm text-down">Failed to load price</div>;
   }
 
   if (isLoading || !data) {
@@ -48,14 +49,7 @@ export function CoinPriceTicker({
   };
 
   const getChangeColor = (change: string) => {
-    switch (change) {
-      case 'RISE':
-        return 'text-green-400';
-      case 'FALL':
-        return 'text-red-400';
-      default:
-        return 'text-gray-400';
-    }
+    return changeColor(change);
   };
 
   const ChangeIcon =

@@ -7,6 +7,7 @@
 import { useState, useEffect } from 'react';
 import { History, RefreshCw, AlertCircle, ChevronLeft, ChevronRight } from 'lucide-react';
 import { getCoinTrades } from '@/api/client';
+import { pnlColor } from '@/utils/pnl';
 import type { CoinTradeRecord } from '@/types';
 
 interface CoinTradeHistoryProps {
@@ -99,7 +100,7 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
 
       {/* Error */}
       {error && (
-        <div className="flex items-center gap-2 p-2 bg-red-500/10 rounded text-red-400 text-sm">
+        <div className="flex items-center gap-2 p-2 bg-down/10 rounded text-down text-sm">
           <AlertCircle size={14} />
           <span>{error}</span>
         </div>
@@ -116,10 +117,8 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
               {/* Trade Header */}
               <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-2">
-                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-                    trade.side === 'bid'
-                      ? 'bg-green-500/20 text-green-400'
-                      : 'bg-red-500/20 text-red-400'
+                  <span className={`px-2 py-0.5 rounded text-xs font-medium bg-elevated border border-hairline ${
+                    trade.side === 'bid' ? pnlColor(1) : pnlColor(-1)
                   }`}>
                     {trade.side === 'bid' ? 'BUY' : 'SELL'}
                   </span>
@@ -127,7 +126,7 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
                 </div>
                 <span className={`px-2 py-0.5 rounded text-xs ${
                   trade.state === 'done'
-                    ? 'bg-green-500/10 text-green-400'
+                    ? 'bg-up/10 text-up'
                     : 'bg-gray-500/10 text-gray-400'
                 }`}>
                   {trade.state}
@@ -160,7 +159,7 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
 
               {/* Paper Trade Indicator */}
               {trade.id.startsWith('paper-') && (
-                <div className="mt-2 text-xs text-yellow-400">
+                <div className="mt-2 text-xs text-warn">
                   Paper Trade
                 </div>
               )}

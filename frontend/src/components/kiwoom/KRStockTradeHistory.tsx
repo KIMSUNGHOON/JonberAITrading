@@ -7,6 +7,7 @@
 import { useState, useEffect } from 'react';
 import { History, RefreshCw, AlertCircle, ChevronLeft, ChevronRight } from 'lucide-react';
 import { getKRStockTrades } from '@/api/client';
+import { pnlColor } from '@/utils/pnl';
 import type { KRStockTradeRecord } from '@/types';
 
 interface KRStockTradeHistoryProps {
@@ -79,7 +80,7 @@ export function KRStockTradeHistory({ stk_cd, pageSize = 10 }: KRStockTradeHisto
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <History size={18} className="text-blue-500" />
+          <History size={18} className="text-accent" />
           <h3 className="font-semibold">거래 내역</h3>
           {total > 0 && (
             <span className="text-xs text-gray-500">
@@ -98,7 +99,7 @@ export function KRStockTradeHistory({ stk_cd, pageSize = 10 }: KRStockTradeHisto
 
       {/* Error */}
       {error && (
-        <div className="flex items-center gap-2 p-2 bg-red-500/10 rounded text-red-400 text-sm">
+        <div className="flex items-center gap-2 p-2 bg-down/10 rounded text-down text-sm">
           <AlertCircle size={14} />
           <span>{error}</span>
         </div>
@@ -115,10 +116,8 @@ export function KRStockTradeHistory({ stk_cd, pageSize = 10 }: KRStockTradeHisto
               {/* Trade Header */}
               <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-2">
-                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-                    trade.side === 'buy'
-                      ? 'bg-red-500/20 text-red-400'
-                      : 'bg-blue-500/20 text-blue-400'
+                  <span className={`px-2 py-0.5 rounded text-xs font-medium bg-elevated border border-hairline ${
+                    trade.side === 'buy' ? pnlColor(1) : pnlColor(-1)
                   }`}>
                     {trade.side === 'buy' ? '매수' : '매도'}
                   </span>
@@ -129,9 +128,9 @@ export function KRStockTradeHistory({ stk_cd, pageSize = 10 }: KRStockTradeHisto
                 </div>
                 <span className={`px-2 py-0.5 rounded text-xs ${
                   trade.status === 'filled'
-                    ? 'bg-green-500/10 text-green-400'
+                    ? 'bg-up/10 text-up'
                     : trade.status === 'partial'
-                      ? 'bg-yellow-500/10 text-yellow-400'
+                      ? 'bg-warn/10 text-warn'
                       : 'bg-gray-500/10 text-gray-400'
                 }`}>
                   {trade.status === 'filled' ? '체결' : trade.status === 'partial' ? '부분체결' : trade.status}
@@ -164,7 +163,7 @@ export function KRStockTradeHistory({ stk_cd, pageSize = 10 }: KRStockTradeHisto
 
               {/* Paper Trade Indicator */}
               {trade.id.startsWith('paper-') && (
-                <div className="mt-2 text-xs text-yellow-400">
+                <div className="mt-2 text-xs text-warn">
                   모의거래
                 </div>
               )}

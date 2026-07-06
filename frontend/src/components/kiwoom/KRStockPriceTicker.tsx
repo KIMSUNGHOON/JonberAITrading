@@ -8,6 +8,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { TrendingUp, TrendingDown, Minus, Loader2 } from 'lucide-react';
 import { getKRStockTicker } from '@/api/client';
+import { pnlColor } from '@/utils/pnl';
 
 interface KRStockPriceTickerProps {
   stk_cd: string;
@@ -63,7 +64,7 @@ export function KRStockPriceTicker({
   }, [fetchTicker]);
 
   if (error) {
-    return <div className="text-sm text-red-400">{error}</div>;
+    return <div className="text-sm text-down">{error}</div>;
   }
 
   if (isLoading || !data) {
@@ -85,9 +86,7 @@ export function KRStockPriceTicker({
   };
 
   const getChangeColor = () => {
-    if (data.change > 0) return 'text-red-400'; // Korean market: red = up
-    if (data.change < 0) return 'text-blue-400'; // Korean market: blue = down
-    return 'text-gray-400';
+    return pnlColor(data.change);
   };
 
   const ChangeIcon =

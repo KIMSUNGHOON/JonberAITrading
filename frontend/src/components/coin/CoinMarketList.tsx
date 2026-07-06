@@ -8,6 +8,7 @@
 import { useState, useEffect } from 'react';
 import { Search, TrendingUp, TrendingDown, Bitcoin } from 'lucide-react';
 import { getCoinMarkets, getCoinTickers } from '@/api/client';
+import { changeColor } from '@/utils/pnl';
 import type { CoinMarketInfo } from '@/types';
 
 interface CoinMarketListProps {
@@ -35,6 +36,7 @@ function MarketRow({
       className="w-full flex items-center justify-between p-3 hover:bg-surface rounded-lg transition-colors"
     >
       <div className="flex items-center gap-3">
+        {/* color-ok: coin identity color, not directional */}
         <Bitcoin className="w-5 h-5 text-yellow-500" />
         <div className="text-left">
           <div className="font-medium">{market.korean_name}</div>
@@ -46,13 +48,7 @@ function MarketRow({
         <div className="text-right">
           <div className="font-medium">{market.price.toLocaleString('ko-KR')}</div>
           <div
-            className={`text-xs flex items-center gap-1 justify-end ${
-              market.change === 'RISE'
-                ? 'text-green-400'
-                : market.change === 'FALL'
-                  ? 'text-red-400'
-                  : 'text-gray-400'
-            }`}
+            className={`text-xs flex items-center gap-1 justify-end ${changeColor(market.change ?? '')}`}
           >
             {market.change === 'RISE' ? (
               <TrendingUp className="w-3 h-3" />
@@ -171,7 +167,7 @@ export function CoinMarketList({
   }
 
   if (error) {
-    return <div className="text-center text-red-400 py-8">{error}</div>;
+    return <div className="text-center text-down py-8">{error}</div>;
   }
 
   return (
