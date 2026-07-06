@@ -8,6 +8,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Clock, X, RefreshCw, AlertCircle, ArrowUpCircle, ArrowDownCircle } from 'lucide-react';
 import { getKRStockOrders, cancelKRStockOrder } from '@/api/client';
+import { pnlColor } from '@/utils/pnl';
 import type { KRStockOrder } from '@/types';
 
 // Rate limit retry configuration
@@ -143,7 +144,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
           <Clock size={18} className="text-amber-500" />
           <h3 className="font-semibold">미체결 주문</h3>
           {orders.length > 0 && (
-            <span className="px-2 py-0.5 bg-amber-500/20 text-amber-400 text-xs rounded-full">
+            <span className="px-2 py-0.5 bg-elevated text-muted text-xs rounded-full">
               {orders.length}
             </span>
           )}
@@ -180,8 +181,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
           {orders.map((order) => {
             const isBuy = order.side === 'buy';
             const SideIcon = isBuy ? ArrowUpCircle : ArrowDownCircle;
-            const sideColor = isBuy ? 'text-red-400' : 'text-blue-400';
-            const sideBg = isBuy ? 'bg-red-500/10' : 'bg-blue-500/10';
+            const sideColor = isBuy ? pnlColor(1) : pnlColor(-1);
 
             return (
               <div
@@ -191,7 +191,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
                 {/* Order Info */}
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
-                    <div className={`p-1 rounded ${sideBg}`}>
+                    <div className="p-1 rounded bg-elevated">
                       <SideIcon size={14} className={sideColor} />
                     </div>
                     <div>
@@ -199,7 +199,7 @@ export function KiwoomOpenOrders({ onOrderCancel }: KiwoomOpenOrdersProps) {
                       <div className="text-xs text-dim">{order.stk_cd}</div>
                     </div>
                   </div>
-                  <div className={`text-xs px-2 py-0.5 rounded ${sideBg} ${sideColor}`}>
+                  <div className={`text-xs px-2 py-0.5 rounded bg-elevated border border-hairline ${sideColor}`}>
                     {isBuy ? '매수' : '매도'}
                   </div>
                 </div>

@@ -101,7 +101,7 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
           <Building2 size={18} className="text-blue-500" />
           <h3 className="font-semibold">보유 종목</h3>
           {positions.length > 0 && (
-            <span className="px-2 py-0.5 bg-blue-500/20 text-blue-400 text-xs rounded-full">
+            <span className="px-2 py-0.5 bg-elevated text-muted text-xs rounded-full">
               {positions.length}
             </span>
           )}
@@ -181,13 +181,13 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
               {(position.stop_loss || position.take_profit) && (
                 <div className="flex items-center gap-4 mt-2 text-xs">
                   {position.stop_loss && (
-                    <div className="flex items-center gap-1 text-blue-400">
+                    <div className={`flex items-center gap-1 ${pnlColor(-1)}`}>
                       <Shield size={12} />
                       <span className="tabular-nums">손절: {position.stop_loss.toLocaleString('ko-KR')}원</span>
                     </div>
                   )}
                   {position.take_profit && (
-                    <div className="flex items-center gap-1 text-red-400">
+                    <div className={`flex items-center gap-1 ${pnlColor(1)}`}>
                       <Target size={12} />
                       <span className="tabular-nums">익절: {position.take_profit.toLocaleString('ko-KR')}원</span>
                     </div>

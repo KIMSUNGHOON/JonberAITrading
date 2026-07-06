@@ -80,7 +80,7 @@ export function CoinTradeHistory({ market, pageSize = 10 }: CoinTradeHistoryProp
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <History size={18} className="text-primary" />
+          <History size={18} className="text-accent" />
           <h3 className="font-semibold">Trade History</h3>
           {total > 0 && (
             <span className="text-xs text-gray-500">

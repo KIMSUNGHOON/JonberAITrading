@@ -7,6 +7,7 @@
 import { useState, useEffect } from 'react';
 import { Clock, X, RefreshCw, AlertCircle } from 'lucide-react';
 import { getCoinOrders, cancelCoinOrder } from '@/api/client';
+import { pnlColor } from '@/utils/pnl';
 import type { CoinOrder } from '@/types';
 
 interface CoinOpenOrdersProps {
@@ -96,10 +97,10 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Clock size={18} className="text-primary" />
+          <Clock size={18} className="text-accent" />
           <h3 className="font-semibold">Open Orders</h3>
           {orders.length > 0 && (
-            <span className="px-2 py-0.5 bg-yellow-500/20 text-yellow-400 text-xs rounded-full">
+            <span className="px-2 py-0.5 bg-elevated text-muted text-xs rounded-full">
               {orders.length}
             </span>
           )}
@@ -132,10 +133,8 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
               {/* Order Header */}
               <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-2">
-                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${
-                    order.side === 'bid'
-                      ? 'bg-green-500/20 text-green-400'
-                      : 'bg-red-500/20 text-red-400'
+                  <span className={`px-2 py-0.5 rounded text-xs font-medium bg-elevated border border-hairline ${
+                    order.side === 'bid' ? pnlColor(1) : pnlColor(-1)
                   }`}>
                     {order.side === 'bid' ? 'BUY' : 'SELL'}
                   </span>
@@ -176,7 +175,7 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
                   </div>
                   <div className="h-1 bg-hairline rounded overflow-hidden">
                     <div
-                      className="h-full bg-primary transition-all"
+                      className="h-full bg-accent transition-all"
                       style={{ width: `${getProgress(order)}%` }}
                     />
                   </div>

@@ -93,10 +93,10 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <TrendingUp size={18} className="text-primary" />
+          <TrendingUp size={18} className="text-accent" />
           <h3 className="font-semibold">Open Positions</h3>
           {positions.length > 0 && (
-            <span className="px-2 py-0.5 bg-primary/20 text-primary text-xs rounded-full">
+            <span className="px-2 py-0.5 bg-elevated text-muted text-xs rounded-full">
               {positions.length}
             </span>
           )}
@@ -175,13 +175,13 @@ export function CoinPositionPanel({ onPositionClose }: CoinPositionPanelProps) {
               {(position.stop_loss || position.take_profit) && (
                 <div className="flex items-center gap-4 mt-2 text-xs">
                   {position.stop_loss && (
-                    <div className="flex items-center gap-1 text-red-400">
+                    <div className={`flex items-center gap-1 ${pnlColor(-1)}`}>
                       <Shield size={12} />
                       <span className="tabular-nums">SL: {position.stop_loss.toLocaleString('ko-KR')}</span>
                     </div>
                   )}
                   {position.take_profit && (
-                    <div className="flex items-center gap-1 text-green-400">
+                    <div className={`flex items-center gap-1 ${pnlColor(1)}`}>
                       <Target size={12} />
                       <span className="tabular-nums">TP: {position.take_profit.toLocaleString('ko-KR')}</span>
                     </div>

@@ -396,10 +396,10 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
                             <div
                               className={`h-full ${
                                 result.confidence >= 0.7
-                                  ? 'bg-green-500'
+                                  ? 'bg-up'
                                   : result.confidence >= 0.5
-                                  ? 'bg-yellow-500'
-                                  : 'bg-red-500'
+                                  ? 'bg-warn'
+                                  : 'bg-down'
                               }`}
                               style={{ width: `${result.confidence * 100}%` }}
                             />

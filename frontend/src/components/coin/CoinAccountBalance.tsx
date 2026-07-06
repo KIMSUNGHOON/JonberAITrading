@@ -75,7 +75,7 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
         </div>
         <button
           onClick={handleRefresh}
-          className="mt-2 text-sm text-primary hover:underline"
+          className="mt-2 text-sm text-accent hover:underline"
         >
           Retry
         </button>
@@ -88,7 +88,7 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Wallet size={18} className="text-primary" />
+          <Wallet size={18} className="text-accent" />
           <h3 className="font-semibold">Account Balance</h3>
         </div>
         <button
