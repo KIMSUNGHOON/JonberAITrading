@@ -4,26 +4,34 @@
  * (Task 3+): a dense key-value approval ticket. Reuses the existing
  * submitApproval flow (Task 4) — presentation-only, no execution change.
  */
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   useStore, selectTradeProposal, selectActiveSessionId, selectStatus, selectCurrentStage,
 } from '@/store';
 import {
   isTicketActive, getProposalSymbol, getProposalMarketType, formatCurrency,
-  getRiskLevel, actionTextColor,
+  getRiskLevel, actionTextColor, buildApprovalRequest,
 } from './orderTicket';
 import { useMarketHours } from '@/hooks/useMarketHours';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
+import { submitApproval } from '@/api/client';
 
 export function OrderTicketRail() {
   const proposal = useStore(selectTradeProposal);
   const sessionId = useStore(selectActiveSessionId);
   const status = useStore(selectStatus);
   const currentStage = useStore(selectCurrentStage);
+  const setAwaitingApproval = useStore((s) => s.setAwaitingApproval);
+  const setTradeProposal = useStore((s) => s.setTradeProposal);
+  const setStatus = useStore((s) => s.setStatus);
+  const setError = useStore((s) => s.setError);
+  const addChatMessage = useStore((s) => s.addChatMessage);
 
   const active = isTicketActive(proposal, sessionId);
 
   const [feedback, setFeedback] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const approveRef = useRef<HTMLButtonElement>(null);
   const marketType = active ? getProposalMarketType(proposal!) : 'stock';
   const { status: marketStatus, countdownFormatted, nextEventFormatted } = useMarketHours({
     market: marketType === 'kiwoom' ? 'krx' : 'crypto',
@@ -31,6 +39,50 @@ export function OrderTicketRail() {
   });
   const isMarketClosed = marketType === 'kiwoom' && marketStatus && !marketStatus.is_open;
   const risk = active ? getRiskLevel(proposal!.risk_score) : null;
+
+  // Keyboard: ⌘⏎ focuses Approve (deliberate 2-step; does NOT activate).
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        approveRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [active]);
+
+  // Decision handler — reuses the EXISTING submitApproval endpoint only.
+  // Ported from ApprovalDialog.tsx:96-144 (decision submission, not execution).
+  async function handleDecision(decision: 'approved' | 'rejected' | 'cancelled') {
+    if (!sessionId) return;
+    setIsSubmitting(true);
+    setAwaitingApproval(false);
+    const symbol = getProposalSymbol(proposal!);
+    const label = `${proposal!.action.toUpperCase()} ${proposal!.quantity} ${symbol}`;
+    if (decision === 'cancelled') {
+      setTradeProposal(null);
+      setStatus('cancelled');
+    } else if (decision === 'rejected') {
+      setTradeProposal(null);
+    }
+    try {
+      await submitApproval(buildApprovalRequest(sessionId, decision, feedback));
+      addChatMessage({
+        role: 'system',
+        content: decision === 'approved'
+          ? `Trade approved: ${label}`
+          : decision === 'rejected'
+            ? `Trade rejected - Re-analyzing${feedback ? `: "${feedback}"` : '…'}`
+            : `Analysis cancelled for ${symbol}`,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to submit decision');
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
 
   return (
     <aside className="w-64 flex-none border-l border-hairline bg-card flex flex-col min-h-0 overflow-y-auto">
@@ -84,10 +136,32 @@ export function OrderTicketRail() {
             className="mt-1 w-full h-16 resize-none rounded border border-hairline bg-canvas px-2 py-1 text-[11px] text-ink placeholder:text-dim"
           />
           <div className="flex gap-2 mt-1">
-            <button type="button" className="flex-1 rounded border border-hairline bg-elevated py-1.5 text-warn font-medium">REJECT</button>
-            <button type="button" className="flex-1 rounded border border-hairline bg-elevated py-1.5 text-up font-medium">APPROVE</button>
+            <button
+              type="button"
+              onClick={() => handleDecision('rejected')}
+              disabled={isSubmitting}
+              className="flex-1 rounded border border-hairline bg-elevated py-1.5 text-warn font-medium"
+            >
+              REJECT
+            </button>
+            <button
+              ref={approveRef}
+              type="button"
+              onClick={() => handleDecision('approved')}
+              disabled={isSubmitting}
+              className="flex-1 rounded border border-hairline bg-elevated py-1.5 text-up font-medium"
+            >
+              APPROVE
+            </button>
           </div>
-          <button type="button" className="text-[11px] text-dim hover:text-ink py-1">Cancel Analysis</button>
+          <button
+            type="button"
+            onClick={() => handleDecision('cancelled')}
+            disabled={isSubmitting}
+            className="text-[11px] text-dim hover:text-ink py-1"
+          >
+            Cancel Analysis
+          </button>
         </div>
       )}
     </aside>

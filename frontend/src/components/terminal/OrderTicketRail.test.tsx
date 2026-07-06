@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { OrderTicketRail } from './OrderTicketRail';
 
 // Controlled store: `useStore` runs the real selector against `mockState`, so
@@ -16,6 +16,13 @@ vi.mock('@/store', async () => {
 vi.mock('@/hooks/useMarketHours', () => ({
   useMarketHours: () => ({ status: null, countdownFormatted: '', nextEventFormatted: '' }),
 }));
+
+// `submitApproval` is reused as-is (Task 4 wires the decision handler to the
+// EXISTING approval endpoint — no new/changed execution). The arrow-function
+// indirection defers the read of `submitApproval` until call time, so it's
+// safe regardless of vi.mock hoisting order.
+const submitApproval = vi.fn().mockResolvedValue({});
+vi.mock('@/api/client', () => ({ submitApproval: (...a: unknown[]) => submitApproval(...a) }));
 
 beforeEach(() => {
   mockState = {
@@ -67,5 +74,54 @@ describe('OrderTicketRail — active', () => {
     expect(screen.getByText('Medium Risk')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /approve/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /reject|re-analyze/i })).toBeInTheDocument();
+  });
+});
+
+describe('OrderTicketRail — decisions', () => {
+  beforeEach(() => {
+    submitApproval.mockClear();
+    mockState = {
+      activeMarket: 'stock',
+      stock: {
+        tradeProposal: {
+          id: 'p1',
+          ticker: 'AAPL',
+          action: 'BUY',
+          quantity: 10,
+          entry_price: 100,
+          stop_loss: 90,
+          take_profit: 120,
+          risk_score: 5,
+          position_size_pct: 10,
+          rationale: 'Strong momentum with support at 95.',
+          bull_case: 'Upside case',
+          bear_case: 'Downside case',
+          created_at: new Date().toISOString(),
+        },
+        activeSessionId: 'sess-1',
+        status: 'awaiting_approval',
+        currentStage: null,
+      },
+      setAwaitingApproval: vi.fn(),
+      setTradeProposal: vi.fn(),
+      setStatus: vi.fn(),
+      setError: vi.fn(),
+      addChatMessage: vi.fn(),
+    };
+  });
+
+  it('Approve calls submitApproval with {session_id, approved, feedback}', async () => {
+    render(<OrderTicketRail />);
+    fireEvent.click(screen.getByRole('button', { name: /approve/i }));
+    expect(submitApproval).toHaveBeenCalledWith(
+      expect.objectContaining({ session_id: 'sess-1', decision: 'approved' }),
+    );
+  });
+
+  it('the focus shortcut moves focus to Approve WITHOUT submitting', () => {
+    render(<OrderTicketRail />);
+    fireEvent.keyDown(window, { key: 'Enter', metaKey: true }); // ⌘⏎ focuses Approve
+    expect(submitApproval).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: /approve/i })).toHaveFocus();
   });
 });
