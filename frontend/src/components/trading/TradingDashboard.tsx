@@ -40,6 +40,7 @@ import {
   resumeTrading,
 } from '@/api/client';
 import { useTranslations } from '@/utils/translations';
+import { pnlColor } from '@/utils/pnl';
 import type {
   TradingMode,
   ManagedPosition,
@@ -56,9 +57,9 @@ interface StatusBadgeProps {
 
 function StatusBadge({ mode }: StatusBadgeProps) {
   const styles: Record<string, string> = {
-    active: 'bg-green-500/20 text-green-400 border-green-500/30',
-    paused: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
-    stopped: 'bg-gray-500/20 text-gray-400 border-gray-500/30',
+    active: 'bg-accent/20 text-accent border-accent/30',
+    paused: 'bg-warn/20 text-warn border-warn/30',
+    stopped: 'bg-muted/20 text-muted border-muted/30',
   };
 
   const labels: Record<string, string> = {
@@ -83,8 +84,7 @@ interface PositionRowProps {
 }
 
 function PositionRow({ position }: PositionRowProps) {
-  const pnlColor =
-    position.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400';
+  const pnlClass = pnlColor(position.unrealized_pnl);
   const pnlIcon =
     position.unrealized_pnl >= 0 ? (
       <TrendingUp className="w-4 h-4" />
@@ -93,16 +93,16 @@ function PositionRow({ position }: PositionRowProps) {
     );
 
   return (
-    <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
+    <div className="flex items-center justify-between p-3 bg-elevated rounded-lg">
       <div className="flex-1">
-        <div className="font-medium text-white">{position.stock_name}</div>
-        <div className="text-sm text-gray-400">{position.ticker}</div>
+        <div className="font-medium text-ink">{position.stock_name}</div>
+        <div className="text-sm text-muted">{position.ticker}</div>
       </div>
       <div className="text-right">
-        <div className="text-sm text-gray-300">
+        <div className="text-sm text-ink tabular-nums">
           {position.quantity}주 @ ₩{position.avg_price.toLocaleString()}
         </div>
-        <div className={`flex items-center justify-end gap-1 ${pnlColor}`}>
+        <div className={`flex items-center justify-end gap-1 tabular-nums ${pnlClass}`}>
           {pnlIcon}
           <span>
             ₩{Math.abs(position.unrealized_pnl).toLocaleString()} (
@@ -121,26 +121,26 @@ interface AlertItemProps {
 
 function AlertItem({ alert }: AlertItemProps) {
   const typeColors: Record<string, string> = {
-    stop_loss_triggered: 'border-red-500/50 bg-red-500/10',
-    take_profit_triggered: 'border-green-500/50 bg-green-500/10',
-    sudden_move_up: 'border-yellow-500/50 bg-yellow-500/10',
-    sudden_move_down: 'border-orange-500/50 bg-orange-500/10',
-    news_alert: 'border-blue-500/50 bg-blue-500/10',
+    stop_loss_triggered: 'border-down/50 bg-down/10',
+    take_profit_triggered: 'border-up/50 bg-up/10',
+    sudden_move_up: 'border-warn/50 bg-warn/10',
+    sudden_move_down: 'border-warn/50 bg-warn/10',
+    news_alert: 'border-accent/50 bg-accent/10',
   };
 
   return (
     <div
       className={`p-3 rounded-lg border ${
-        typeColors[alert.alert_type] || 'border-gray-700 bg-gray-800/50'
+        typeColors[alert.alert_type] || 'border-hairline bg-elevated'
       }`}
     >
       <div className="flex items-start gap-2">
-        <AlertTriangle className="w-4 h-4 mt-0.5 text-yellow-400" />
+        <AlertTriangle className="w-4 h-4 mt-0.5 text-warn" />
         <div className="flex-1">
-          <div className="font-medium text-white">{alert.title}</div>
-          <div className="text-sm text-gray-300">{alert.message}</div>
+          <div className="font-medium text-ink">{alert.title}</div>
+          <div className="text-sm text-ink">{alert.message}</div>
           {alert.ticker && (
-            <div className="text-xs text-gray-400 mt-1">{alert.ticker}</div>
+            <div className="text-xs text-muted mt-1">{alert.ticker}</div>
           )}
         </div>
       </div>
@@ -271,242 +271,245 @@ export default function TradingDashboard() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <RefreshCw className="w-8 h-8 animate-spin text-blue-500" />
+        <RefreshCw className="w-8 h-8 animate-spin text-accent" />
       </div>
     );
   }
 
   return (
-    <div className="p-4 lg:p-6">
+    <div className="h-full flex flex-col bg-canvas">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex-none flex items-center justify-between px-4 py-2.5 border-b border-hairline bg-card">
         <div>
-          <h1 className="text-xl lg:text-2xl font-bold text-white">{t('trading_title')}</h1>
-          <p className="text-sm text-gray-400">{t('trading_subtitle')}</p>
+          <h1 className="text-sm font-semibold text-ink">{t('trading_title')}</h1>
+          <p className="text-[11px] text-dim">{t('trading_subtitle')}</p>
         </div>
         <button
           onClick={fetchData}
-          className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
+          className="p-2 text-muted hover:text-ink hover:bg-elevated rounded-lg"
         >
           <RefreshCw className="w-5 h-5" />
         </button>
       </div>
 
-      {/* Error */}
-      {error && (
-        <div className="mb-4 p-3 bg-red-500/20 border border-red-500/30 rounded-lg text-red-400 text-sm">
-          {error}
-        </div>
-      )}
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto p-3">
+        {/* Error */}
+        {error && (
+          <div className="mb-3 p-3 bg-down/20 border border-down/30 rounded-lg text-down text-sm">
+            {error}
+          </div>
+        )}
 
-      {/* Main Grid Layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Left Column - Controls & Status */}
-        <div className="space-y-4">
-          {/* Status Card - Compact */}
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="font-semibold text-white flex items-center gap-2">
-                <Activity className="w-4 h-4 text-blue-400" />
-                {t('trading_status')}
-              </h2>
-              <StatusBadge mode={status?.mode || 'stopped'} />
-            </div>
-
-            <div className="space-y-2 text-sm mb-4">
-              <div className="flex justify-between">
-                <span className="text-gray-400">{t('trading_started')}</span>
-                <span className="text-white">
-                  {status?.started_at
-                    ? new Date(status.started_at).toLocaleTimeString()
-                    : '-'}
-                </span>
+        {/* Main Grid Layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Left Column - Controls & Status */}
+          <div className="space-y-4">
+            {/* Status Card - Compact */}
+            <div className="bg-card rounded p-4 border border-hairline">
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="font-semibold text-ink flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-accent" />
+                  {t('trading_status')}
+                </h2>
+                <StatusBadge mode={status?.mode || 'stopped'} />
               </div>
-              <div className="flex justify-between">
-                <span className="text-gray-400">{t('trading_trades')}</span>
-                <span className="text-white">
-                  {status?.daily_trades || 0}/{status?.max_daily_trades || 10}
-                </span>
-              </div>
-            </div>
 
-            {/* Control Buttons */}
-            <div className="flex gap-2">
-              {status?.mode === 'stopped' ? (
-                <button
-                  onClick={handleStart}
-                  disabled={actionLoading}
-                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg disabled:opacity-50"
-                >
-                  <Play className="w-4 h-4" />
-                  {t('trading_start_btn')}
-                </button>
-              ) : status?.mode === 'paused' ? (
-                <>
+              <div className="space-y-2 text-sm mb-4">
+                <div className="flex justify-between">
+                  <span className="text-muted">{t('trading_started')}</span>
+                  <span className="text-ink">
+                    {status?.started_at
+                      ? new Date(status.started_at).toLocaleTimeString()
+                      : '-'}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted">{t('trading_trades')}</span>
+                  <span className="text-ink tabular-nums">
+                    {status?.daily_trades || 0}/{status?.max_daily_trades || 10}
+                  </span>
+                </div>
+              </div>
+
+              {/* Control Buttons */}
+              <div className="flex gap-2">
+                {status?.mode === 'stopped' ? (
                   <button
-                    onClick={handleResume}
+                    onClick={handleStart}
                     disabled={actionLoading}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg disabled:opacity-50"
+                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent/90 text-canvas text-sm rounded-lg disabled:opacity-50"
                   >
                     <Play className="w-4 h-4" />
-                    {t('trading_resume_btn')}
+                    {t('trading_start_btn')}
                   </button>
-                  <button
-                    onClick={handleStop}
-                    disabled={actionLoading}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg disabled:opacity-50"
-                  >
-                    <Square className="w-4 h-4" />
-                    {t('trading_stop_btn')}
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    onClick={handlePause}
-                    disabled={actionLoading}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-yellow-600 hover:bg-yellow-700 text-white text-sm rounded-lg disabled:opacity-50"
-                  >
-                    <Pause className="w-4 h-4" />
-                    {t('trading_pause_btn')}
-                  </button>
-                  <button
-                    onClick={handleStop}
-                    disabled={actionLoading}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg disabled:opacity-50"
-                  >
-                    <Square className="w-4 h-4" />
-                    {t('trading_stop_btn')}
-                  </button>
-                </>
-              )}
-            </div>
-          </div>
-
-          {/* Portfolio Summary - Compact */}
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
-              <DollarSign className="w-4 h-4 text-green-400" />
-              {t('trading_portfolio')}
-            </h2>
-
-            {portfolio ? (
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-gray-400">{t('trading_equity')}</span>
-                  <span className="text-white font-medium">
-                    ₩{portfolio.total_equity.toLocaleString()}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-400">{t('trading_cash')}</span>
-                  <span className="text-white">
-                    {(portfolio.cash_ratio * 100).toFixed(0)}%
-                  </span>
-                </div>
-                <div className="flex justify-between pt-2 border-t border-gray-700">
-                  <span className="text-gray-400">{t('trading_pnl')}</span>
-                  <span className={portfolio.total_unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
-                    {portfolio.total_unrealized_pnl >= 0 ? '+' : ''}
-                    {portfolio.total_unrealized_pnl_pct.toFixed(2)}%
-                  </span>
-                </div>
+                ) : status?.mode === 'paused' ? (
+                  <>
+                    <button
+                      onClick={handleResume}
+                      disabled={actionLoading}
+                      className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-accent hover:bg-accent/90 text-canvas text-sm rounded-lg disabled:opacity-50"
+                    >
+                      <Play className="w-4 h-4" />
+                      {t('trading_resume_btn')}
+                    </button>
+                    <button
+                      onClick={handleStop}
+                      disabled={actionLoading}
+                      className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-ink text-sm rounded-lg disabled:opacity-50" // color-ok: destructive action
+                    >
+                      <Square className="w-4 h-4" />
+                      {t('trading_stop_btn')}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      onClick={handlePause}
+                      disabled={actionLoading}
+                      className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-warn hover:bg-warn/90 text-canvas text-sm rounded-lg disabled:opacity-50"
+                    >
+                      <Pause className="w-4 h-4" />
+                      {t('trading_pause_btn')}
+                    </button>
+                    <button
+                      onClick={handleStop}
+                      disabled={actionLoading}
+                      className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-ink text-sm rounded-lg disabled:opacity-50" // color-ok: destructive action
+                    >
+                      <Square className="w-4 h-4" />
+                      {t('trading_stop_btn')}
+                    </button>
+                  </>
+                )}
               </div>
-            ) : (
-              <div className="text-gray-400 text-center py-4 text-sm">{t('no_data')}</div>
-            )}
-          </div>
-
-          {/* Trade Queue Widget */}
-          <TradeQueueWidget />
-
-          {/* Watch List Widget */}
-          <WatchListWidget />
-        </div>
-
-        {/* Middle Column - Agent Status & Positions */}
-        <div className="space-y-4">
-          {/* Agent Status Section with View Toggle */}
-          <div className="relative">
-            {/* View Toggle Buttons */}
-            <div className="absolute -top-1 right-0 flex bg-gray-800 rounded-lg p-0.5 z-10">
-              <button
-                onClick={() => setAgentViewMode('workflow')}
-                className={`p-1.5 rounded-md transition-colors ${
-                  agentViewMode === 'workflow'
-                    ? 'bg-blue-600 text-white'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-                title="워크플로우 뷰"
-              >
-                <GitBranch className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => setAgentViewMode('grid')}
-                className={`p-1.5 rounded-md transition-colors ${
-                  agentViewMode === 'grid'
-                    ? 'bg-blue-600 text-white'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-                title="그리드 뷰"
-              >
-                <LayoutGrid className="w-4 h-4" />
-              </button>
             </div>
 
-            {/* Agent View */}
-            {agentViewMode === 'workflow' ? (
-              <AgentWorkflowGraph />
-            ) : (
-              <AgentStatusWidget />
-            )}
-          </div>
-
-          {/* Positions */}
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
-              <TrendingUp className="w-4 h-4 text-blue-400" />
-              {t('trading_positions')}
-              {portfolio?.positions && portfolio.positions.length > 0 && (
-                <span className="text-sm text-gray-400">
-                  ({portfolio.positions.length})
-                </span>
-              )}
-            </h2>
-
-            {portfolio?.positions && portfolio.positions.length > 0 ? (
-              <div className="space-y-2 max-h-64 overflow-y-auto">
-                {portfolio.positions.map((position, idx) => (
-                  <PositionRow key={position.ticker || idx} position={position} />
-                ))}
-              </div>
-            ) : (
-              <div className="text-gray-400 text-center py-6 text-sm">
-                {t('trading_no_positions')}
-              </div>
-            )}
-          </div>
-
-          {/* Alerts */}
-          {alerts.length > 0 && (
-            <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-              <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
-                <Bell className="w-4 h-4 text-yellow-400" />
-                {t('trading_alerts')}
-                <span className="text-sm text-gray-400">({alerts.length})</span>
+            {/* Portfolio Summary - Compact */}
+            <div className="bg-card rounded p-4 border border-hairline">
+              <h2 className="font-semibold text-ink flex items-center gap-2 mb-3">
+                <DollarSign className="w-4 h-4 text-accent" />
+                {t('trading_portfolio')}
               </h2>
-              <div className="space-y-2 max-h-48 overflow-y-auto">
-                {alerts.map((alert) => (
-                  <AlertItem key={alert.id} alert={alert} />
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
 
-        {/* Right Column - Strategy Configuration */}
-        <div>
-          <StrategyConfigWidget />
+              {portfolio ? (
+                <div className="space-y-2 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-muted">{t('trading_equity')}</span>
+                    <span className="text-ink font-medium tabular-nums">
+                      ₩{portfolio.total_equity.toLocaleString()}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-muted">{t('trading_cash')}</span>
+                    <span className="text-ink tabular-nums">
+                      {(portfolio.cash_ratio * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between pt-2 border-t border-hairline">
+                    <span className="text-muted">{t('trading_pnl')}</span>
+                    <span className={`tabular-nums ${pnlColor(portfolio.total_unrealized_pnl)}`}>
+                      {portfolio.total_unrealized_pnl >= 0 ? '+' : ''}
+                      {portfolio.total_unrealized_pnl_pct.toFixed(2)}%
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-muted text-center py-4 text-sm">{t('no_data')}</div>
+              )}
+            </div>
+
+            {/* Trade Queue Widget */}
+            <TradeQueueWidget />
+
+            {/* Watch List Widget */}
+            <WatchListWidget />
+          </div>
+
+          {/* Middle Column - Agent Status & Positions */}
+          <div className="space-y-4">
+            {/* Agent Status Section with View Toggle */}
+            <div className="relative">
+              {/* View Toggle Buttons */}
+              <div className="absolute -top-1 right-0 flex bg-elevated rounded-lg p-0.5 z-10">
+                <button
+                  onClick={() => setAgentViewMode('workflow')}
+                  className={`p-1.5 rounded-md transition-colors ${
+                    agentViewMode === 'workflow'
+                      ? 'bg-accent text-canvas'
+                      : 'text-muted hover:text-ink'
+                  }`}
+                  title="워크플로우 뷰"
+                >
+                  <GitBranch className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={() => setAgentViewMode('grid')}
+                  className={`p-1.5 rounded-md transition-colors ${
+                    agentViewMode === 'grid'
+                      ? 'bg-accent text-canvas'
+                      : 'text-muted hover:text-ink'
+                  }`}
+                  title="그리드 뷰"
+                >
+                  <LayoutGrid className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Agent View */}
+              {agentViewMode === 'workflow' ? (
+                <AgentWorkflowGraph />
+              ) : (
+                <AgentStatusWidget />
+              )}
+            </div>
+
+            {/* Positions */}
+            <div className="bg-card rounded p-4 border border-hairline">
+              <h2 className="font-semibold text-ink flex items-center gap-2 mb-3">
+                <TrendingUp className="w-4 h-4 text-accent" />
+                {t('trading_positions')}
+                {portfolio?.positions && portfolio.positions.length > 0 && (
+                  <span className="text-sm text-muted tabular-nums">
+                    ({portfolio.positions.length})
+                  </span>
+                )}
+              </h2>
+
+              {portfolio?.positions && portfolio.positions.length > 0 ? (
+                <div className="space-y-2 max-h-64 overflow-y-auto">
+                  {portfolio.positions.map((position, idx) => (
+                    <PositionRow key={position.ticker || idx} position={position} />
+                  ))}
+                </div>
+              ) : (
+                <div className="text-muted text-center py-6 text-sm">
+                  {t('trading_no_positions')}
+                </div>
+              )}
+            </div>
+
+            {/* Alerts */}
+            {alerts.length > 0 && (
+              <div className="bg-card rounded p-4 border border-hairline">
+                <h2 className="font-semibold text-ink flex items-center gap-2 mb-3">
+                  <Bell className="w-4 h-4 text-accent" />
+                  {t('trading_alerts')}
+                  <span className="text-sm text-muted tabular-nums">({alerts.length})</span>
+                </h2>
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {alerts.map((alert) => (
+                    <AlertItem key={alert.id} alert={alert} />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Right Column - Strategy Configuration */}
+          <div>
+            <StrategyConfigWidget />
+          </div>
         </div>
       </div>
     </div>

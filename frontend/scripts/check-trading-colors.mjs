@@ -79,6 +79,8 @@ const CLEAN_SET = [
   // d2 t2: Basket page + widget.
   'src/pages/BasketPage.tsx',
   'src/components/basket/BasketWidget.tsx',
+  // d2 t3: Trading dashboard shell.
+  'src/components/trading/TradingDashboard.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 
