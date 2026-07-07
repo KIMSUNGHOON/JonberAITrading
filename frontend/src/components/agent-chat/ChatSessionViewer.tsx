@@ -180,87 +180,115 @@ export function VoteBlotter({ votes }: { votes: AgentChatVote[] }) {
   );
 }
 
-function DecisionPanel({ decision, ticker, stockName }: { decision: AgentChatDecision; ticker: string; stockName: string }) {
+function TicketKV({ label, value, valueClass }: { label: string; value: string; valueClass?: string }) {
+  return (
+    <div className="bg-card px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wide text-dim">{label}</div>
+      <div className={`text-sm font-medium tabular-nums ${valueClass ?? 'text-ink'}`}>{value}</div>
+    </div>
+  );
+}
+
+function ConsensusTicket({
+  decision,
+  ticker,
+  stockName,
+}: {
+  decision: AgentChatDecision;
+  ticker: string;
+  stockName: string;
+}) {
   const actionIcon =
     decision.action === 'BUY' || decision.action === 'ADD' ? (
-      <TrendingUp className="w-6 h-6" />
+      <TrendingUp className="w-4 h-4" />
     ) : decision.action === 'SELL' || decision.action === 'REDUCE' ? (
-      <TrendingDown className="w-6 h-6" />
+      <TrendingDown className="w-4 h-4" />
     ) : (
-      <Minus className="w-6 h-6" />
+      <Minus className="w-4 h-4" />
     );
 
-  // Decision-action DIRECTIONAL map -> @/utils/pnl semantics. App-wide ACTION
-  // map (ScannerResultsPage/AnalysisDetailPage): BUY/ADD bullish -> up/green,
-  // SELL/REDUCE bearish -> down/red, else neutral.
+  // ACTION DIRECTIONAL -> @/utils/pnl (text-only badge; no card background).
   const actionColor =
     decision.action === 'BUY' || decision.action === 'ADD'
-      ? `${pnlColor(1)} bg-up/20 border-up/30`
+      ? pnlColor(1)
       : decision.action === 'SELL' || decision.action === 'REDUCE'
-      ? `${pnlColor(-1)} bg-down/20 border-down/30`
-      : 'text-muted bg-muted/20 border-hairline';
+      ? pnlColor(-1)
+      : 'text-muted';
+
+  const consensusPct = Math.round(decision.consensus_level * 100);
 
   return (
-    <div className={`p-6 rounded border ${actionColor}`}>
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-3">
+    <div className="bg-card border border-hairline rounded">
+      {/* Header: ACTION (text-only) + symbol + confidence */}
+      <div className="flex items-center gap-2.5 px-3 py-2 border-b border-hairline">
+        <span className={`inline-flex items-center gap-1.5 text-base font-bold ${actionColor}`}>
           {actionIcon}
-          <div>
-            <div className="text-2xl font-bold">{decision.action}</div>
-            <div className="text-sm opacity-75">{stockName} ({ticker})</div>
-          </div>
-        </div>
-        <div className="text-right">
-          <div className="text-xl font-bold">{(decision.confidence * 100).toFixed(0)}%</div>
-          <div className="text-sm opacity-75">Confidence</div>
-        </div>
+          {decision.action}
+        </span>
+        <span className="text-sm text-ink font-semibold">{stockName}</span>
+        <span className="text-xs text-dim">({ticker})</span>
+        <span className="ml-auto text-xs text-muted">
+          CONF <span className="text-ink font-bold tabular-nums">{(decision.confidence * 100).toFixed(0)}%</span>
+        </span>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-        <div className="p-3 bg-elevated rounded-lg">
-          <div className="text-xs text-muted">Consensus</div>
-          <div className="text-lg font-medium text-ink tabular-nums">
-            {(decision.consensus_level * 100).toFixed(0)}%
-          </div>
+      {/* Consensus bar + 75% display gate */}
+      <div className="flex items-center gap-2.5 px-3 py-2 border-b border-hairline">
+        <span className="text-[10px] text-muted">CONSENSUS</span>
+        <span className="text-sm font-bold tabular-nums text-ink">{consensusPct}%</span>
+        <div className="flex-1 h-1.5 rounded bg-elevated relative">
+          <span
+            className="absolute inset-y-0 left-0 rounded bg-accent transition-[width] duration-500"
+            style={{ width: `${Math.min(100, Math.max(0, consensusPct))}%` }}
+          />
+          {/* 75% gate is a display constant, not an enforced backend threshold. */}
+          <span className="absolute top-[-3px] bottom-[-3px] left-[75%] w-0.5 bg-warn" />
         </div>
-        <div className="p-3 bg-elevated rounded-lg">
-          <div className="text-xs text-muted">Entry Price</div>
-          <div className="text-lg font-medium text-ink tabular-nums">{formatPrice(decision.entry_price)}</div>
-        </div>
-        <div className="p-3 bg-elevated rounded-lg">
-          <div className="text-xs text-muted">Stop Loss</div>
-          <div className="text-lg font-medium text-down tabular-nums">{formatPrice(decision.stop_loss)}</div>
-        </div>
-        <div className="p-3 bg-elevated rounded-lg">
-          <div className="text-xs text-muted">Take Profit</div>
-          <div className="text-lg font-medium text-up tabular-nums">{formatPrice(decision.take_profit)}</div>
-        </div>
+        <span className="text-[11px] text-muted">gate 75%</span>
       </div>
 
+      {/* Entry / Stop / Take KV */}
+      <div className="grid grid-cols-3 gap-px bg-hairline border-b border-hairline">
+        <TicketKV label="ENTRY" value={formatPrice(decision.entry_price)} />
+        <TicketKV label="STOP" value={formatPrice(decision.stop_loss)} valueClass="text-down" />
+        <TicketKV label="TAKE" value={formatPrice(decision.take_profit)} valueClass="text-up" />
+      </div>
+
+      {/* Rationale — editorial reading pane (prose) */}
       {decision.rationale && (
-        <div className="mb-4">
-          <div className="text-sm font-medium text-ink mb-2">Rationale</div>
-          <p className="text-sm text-muted">{decision.rationale}</p>
+        <div className="px-3 py-2 border-b border-hairline">
+          <div className="text-[10px] uppercase tracking-wide text-dim mb-1">Rationale</div>
+          <ReadingPane>
+            <MarkdownRenderer content={decision.rationale} />
+          </ReadingPane>
         </div>
       )}
 
+      {/* Key factors — dense list */}
       {decision.key_factors.length > 0 && (
-        <div className="mb-4">
-          <div className="text-sm font-medium text-ink mb-2">Key Factors</div>
-          <ul className="list-disc list-inside text-sm text-muted space-y-1">
-            {decision.key_factors.map((factor, i) => (
-              <li key={i}>{factor}</li>
+        <div className="px-3 py-2 border-b border-hairline">
+          <div className="text-[10px] uppercase tracking-wide text-dim mb-1">Key Factors</div>
+          <ul className="text-xs text-muted space-y-0.5">
+            {decision.key_factors.map((f, i) => (
+              <li key={i} className="flex gap-1.5">
+                <span className="text-dim flex-none">·</span>
+                {f}
+              </li>
             ))}
           </ul>
         </div>
       )}
 
+      {/* Dissent — dense list */}
       {decision.dissenting_opinions.length > 0 && (
-        <div>
-          <div className="text-sm font-medium text-ink mb-2">Dissenting Opinions</div>
-          <ul className="list-disc list-inside text-sm text-muted space-y-1">
-            {decision.dissenting_opinions.map((opinion, i) => (
-              <li key={i}>{opinion}</li>
+        <div className="px-3 py-2">
+          <div className="text-[10px] uppercase tracking-wide text-dim mb-1">Dissent</div>
+          <ul className="text-xs text-muted space-y-0.5">
+            {decision.dissenting_opinions.map((o, i) => (
+              <li key={i} className="flex gap-1.5">
+                <span className="text-dim flex-none">·</span>
+                {o}
+              </li>
             ))}
           </ul>
         </div>
@@ -480,7 +508,7 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
 
       {/* Decision (if available) */}
       {session.decision && (
-        <DecisionPanel
+        <ConsensusTicket
           decision={session.decision}
           ticker={session.ticker}
           stockName={session.stock_name}
