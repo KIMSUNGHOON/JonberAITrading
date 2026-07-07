@@ -8,7 +8,6 @@
  * - Position panel
  */
 
-import { useState } from 'react';
 import { ArrowLeft, Activity } from 'lucide-react';
 import { useShallow } from 'zustand/shallow';
 import {
@@ -16,13 +15,15 @@ import {
   selectSession,
   selectAnalysis,
   selectActivePosition,
+  selectReasoningLog,
+  selectStatus,
 } from '@/store';
 import { useGoTo } from '@/hooks/useNav';
 import { ChartPanel } from '@/components/chart/ChartPanel';
 import { AnalysisPanel } from '@/components/analysis/AnalysisPanel';
 import { AnalysisQueueWidget } from '@/components/analysis/AnalysisQueueWidget';
-import { ReasoningSlidePanel } from '@/components/analysis/ReasoningSlidePanel';
 import { WorkflowProgress } from '@/components/analysis/WorkflowProgress';
+import { ReasoningWire } from '@/components/common/ReasoningWire';
 import { PositionCard } from '@/components/position/PositionCard';
 import { CoinInfo } from '@/components/coin/CoinInfo';
 import { CoinMarketDashboard } from '@/components/dashboard';
@@ -38,8 +39,6 @@ interface WorkflowPageProps {
 }
 
 export function WorkflowPage({ onBack }: WorkflowPageProps) {
-  const [showReasoningPanel, setShowReasoningPanel] = useState(false);
-
   const { ticker, status } = useStore(useShallow(selectSession));
   const currentStage = useStore((state) => {
     switch (state.activeMarket) {
@@ -48,6 +47,8 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
       case 'kiwoom': return state.kiwoom.currentStage;
     }
   });
+  const reasoningLog = useStore(selectReasoningLog);
+  const reasoningRunning = useStore(selectStatus) === 'running';
   const { analyses } = useStore(useShallow(selectAnalysis));
   const activePosition = useStore(selectActivePosition);
   const showChartPanel = useStore((state) => state.showChartPanel);
@@ -60,10 +61,6 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
     } else {
       goTo('dashboard');
     }
-  };
-
-  const handleViewReasoningDetails = () => {
-    setShowReasoningPanel(true);
   };
 
   // If no active session, show empty state
@@ -211,18 +208,23 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
             )}
           </div>
 
-          {/* Right Column - Queue (1/3 width on xl) */}
+          {/* Right Column - Queue + always-on reasoning tail */}
           <div className="space-y-4">
-            <AnalysisQueueWidget onViewDetails={handleViewReasoningDetails} />
+            <AnalysisQueueWidget />
+            <section className="border border-hairline rounded bg-card">
+              <div className="px-2.5 py-1.5 border-b border-hairline text-[10px] uppercase tracking-wide text-dim">
+                Reasoning{ticker ? ` · ${ticker}` : ''}
+              </div>
+              <ReasoningWire
+                entries={reasoningLog}
+                running={reasoningRunning}
+                currentStage={currentStage ?? undefined}
+                className="max-h-96"
+              />
+            </section>
           </div>
         </div>
       </div>
-
-      {/* Reasoning Slide Panel */}
-      <ReasoningSlidePanel
-        isOpen={showReasoningPanel}
-        onClose={() => setShowReasoningPanel(false)}
-      />
     </div>
   );
 }

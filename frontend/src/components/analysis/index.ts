@@ -7,4 +7,3 @@ export { AnalysisPanel } from './AnalysisPanel';
 export { ReasoningLog } from './ReasoningLog';
 export { WelcomePanel } from './WelcomePanel';
 export { AnalysisQueueWidget } from './AnalysisQueueWidget';
-export { ReasoningSlidePanel } from './ReasoningSlidePanel';
