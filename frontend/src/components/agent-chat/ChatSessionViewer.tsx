@@ -15,14 +15,10 @@ import {
   DollarSign,
   Newspaper,
   Shield,
-  MessageSquare,
-  CheckCircle,
   TrendingUp,
   TrendingDown,
   Minus,
   AlertCircle,
-  Wifi,
-  WifiOff,
 } from 'lucide-react';
 import { getAgentChatSessionDetail } from '@/api/client';
 import { useAgentChatWebSocket } from '@/hooks/useAgentChatWebSocket';
@@ -416,93 +412,54 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
   if (!session) return null;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-3">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <button
-          onClick={onClose}
-          className="flex items-center gap-2 text-muted hover:text-ink"
-        >
-          <ArrowLeft className="w-5 h-5" />
-          Back to Dashboard
+      <div className="flex items-center gap-3 border-b border-hairline pb-2">
+        <button onClick={onClose} className="flex items-center gap-1.5 text-xs text-muted hover:text-ink">
+          <ArrowLeft className="w-4 h-4" />
+          Back
         </button>
-        <div className="flex items-center gap-3">
-          {/* WebSocket Connection Status */}
+        <div className="ml-auto flex items-center gap-3">
           {isActiveSession && (
-            <div className="flex items-center gap-2">
+            <span className="text-[11px] font-mono">
               {isConnected ? (
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-up/10 rounded-lg">
-                  <Wifi className="w-4 h-4 text-up" />
-                  <span className="text-xs text-up">Live</span>
-                </div>
+                <span className="text-up">● live</span>
               ) : connectionState === 'connecting' || connectionState === 'reconnecting' ? (
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-warn/10 rounded-lg">
-                  <RefreshCw className="w-4 h-4 text-warn animate-spin" />
-                  <span className="text-xs text-warn">Connecting...</span>
-                </div>
+                <span className="text-warn">◌ connecting…</span>
               ) : (
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-muted/10 rounded-lg">
-                  <WifiOff className="w-4 h-4 text-muted" />
-                  <span className="text-xs text-muted">Polling</span>
-                </div>
+                <span className="text-muted">○ polling</span>
               )}
-            </div>
+            </span>
           )}
-          <button
-            onClick={fetchSession}
-            className="p-2 text-muted hover:text-ink hover:bg-elevated rounded-lg"
-          >
-            <RefreshCw className="w-5 h-5" />
+          <button onClick={fetchSession} className="p-1 text-muted hover:text-ink hover:bg-elevated rounded">
+            <RefreshCw className="w-4 h-4" />
           </button>
         </div>
       </div>
 
-      {/* Session Info */}
-      <div className="bg-card rounded border border-hairline p-6">
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <h2 className="text-xl font-semibold text-ink">
-              {session.stock_name} ({session.ticker})
-            </h2>
-            <p className="text-sm text-muted">
-              Session: {session.id.slice(0, 8)}...
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <span
-              className={`px-3 py-1 rounded-full text-sm ${
-                session.status === 'decided'
-                  ? 'bg-up/20 text-up'
-                  : session.status === 'error'
-                  ? 'bg-down/20 text-down'
-                  : 'bg-accent/20 text-accent'
-              }`}
-            >
-              {session.status}
-            </span>
-          </div>
+      {/* Session strip */}
+      <div className="border-b border-hairline pb-2">
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-sm font-semibold text-ink">{session.stock_name}</h2>
+          <span className="text-xs text-dim">({session.ticker})</span>
+          <span className="text-[10px] text-dim">· {session.id.slice(0, 8)}</span>
+          <span
+            className={`ml-auto text-[11px] font-mono uppercase ${
+              session.status === 'decided'
+                ? 'text-up'
+                : session.status === 'error'
+                ? 'text-down'
+                : 'text-accent'
+            }`}
+          >
+            {session.status}
+          </span>
         </div>
-
-        {/* Stats */}
-        <div className="grid grid-cols-4 gap-4 text-center">
-          <div className="p-3 bg-elevated rounded-lg">
-            <div className="text-lg font-bold text-ink tabular-nums">{session.rounds.length}</div>
-            <div className="text-xs text-muted">Rounds</div>
-          </div>
-          <div className="p-3 bg-elevated rounded-lg">
-            <div className="text-lg font-bold text-ink tabular-nums">{session.messages.length}</div>
-            <div className="text-xs text-muted">Messages</div>
-          </div>
-          <div className="p-3 bg-elevated rounded-lg">
-            <div className="text-lg font-bold text-ink tabular-nums">{session.votes.length}</div>
-            <div className="text-xs text-muted">Votes</div>
-          </div>
-          <div className="p-3 bg-elevated rounded-lg">
-            <div className="text-lg font-bold text-ink tabular-nums">
-              {(session.consensus_level * 100).toFixed(0)}%
-            </div>
-            <div className="text-xs text-muted">Consensus</div>
-          </div>
+        <div className="mt-1 flex gap-3 text-[11px] font-mono tabular-nums text-muted">
+          <span>ROUNDS <span className="text-ink">{session.rounds.length}</span></span>
+          <span>MSGS <span className="text-ink">{session.messages.length}</span></span>
+          <span>VOTES <span className="text-ink">{session.votes.length}</span></span>
+          <span>CONSENSUS <span className="text-ink">{(session.consensus_level * 100).toFixed(0)}%</span></span>
         </div>
       </div>
 
@@ -517,22 +474,20 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
 
       {/* Votes */}
       {session.votes.length > 0 && (
-        <div className="bg-card rounded border border-hairline p-6">
-          <h3 className="text-lg font-medium text-ink mb-4 flex items-center gap-2">
-            <CheckCircle className="w-5 h-5 text-accent" />
-            Agent Votes
-          </h3>
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-dim mb-1.5">
+            Agent Votes · {session.votes.length}
+          </div>
           <VoteBlotter votes={session.votes} />
         </div>
       )}
 
-      {/* Messages */}
-      <div className="bg-card rounded border border-hairline p-6">
-        <h3 className="text-lg font-medium text-ink mb-4 flex items-center gap-2">
-          <MessageSquare className="w-5 h-5 text-accent" />
-          Discussion ({session.messages.length} messages)
-        </h3>
-        <div className="space-y-2 max-h-[600px] overflow-y-auto">
+      {/* Discussion */}
+      <div>
+        <div className="text-[10px] uppercase tracking-wide text-dim mb-1.5">
+          Discussion · {session.messages.length}
+        </div>
+        <div className="space-y-1 max-h-[600px] overflow-y-auto">
           {session.messages.map((message) => (
             <MessageBubble key={message.id} message={message} />
           ))}
