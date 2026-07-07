@@ -7,6 +7,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   useStore, selectTradeProposal, selectActiveSessionId, selectStatus, selectCurrentStage,
+  selectAwaitingApproval,
 } from '@/store';
 import {
   isTicketActive, getProposalSymbol, getProposalMarketType, formatCurrency,
@@ -21,13 +22,14 @@ export function OrderTicketRail() {
   const sessionId = useStore(selectActiveSessionId);
   const status = useStore(selectStatus);
   const currentStage = useStore(selectCurrentStage);
+  const awaitingApproval = useStore(selectAwaitingApproval);
   const setAwaitingApproval = useStore((s) => s.setAwaitingApproval);
   const setTradeProposal = useStore((s) => s.setTradeProposal);
   const setStatus = useStore((s) => s.setStatus);
   const setError = useStore((s) => s.setError);
   const addChatMessage = useStore((s) => s.addChatMessage);
 
-  const active = isTicketActive(proposal, sessionId);
+  const active = awaitingApproval && isTicketActive(proposal, sessionId);
 
   const [feedback, setFeedback] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);

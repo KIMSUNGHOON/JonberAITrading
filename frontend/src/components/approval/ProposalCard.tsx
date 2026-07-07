@@ -45,7 +45,7 @@ function isKiwoomProposal(proposal: AnyTradeProposal): proposal is KRStockTradeP
 }
 
 export function ProposalCard({ proposal }: ProposalCardProps) {
-  const setShowApprovalDialog = useStore((state) => state.setShowApprovalDialog);
+  const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
 
   const isBuy = proposal.action === 'BUY';
   const riskLevel = proposal.risk_score <= 3 ? 'Low' : proposal.risk_score <= 6 ? 'Medium' : 'High';
@@ -61,7 +61,7 @@ export function ProposalCard({ proposal }: ProposalCardProps) {
       className={`card cursor-pointer hover:border-yellow-500/50 transition-colors ${
         'border-yellow-500/30'
       }`}
-      onClick={() => setShowApprovalDialog(true)}
+      onClick={() => setAwaitingApproval(true)}
     >
       <div className="flex items-center gap-4">
         {/* Alert Icon */}

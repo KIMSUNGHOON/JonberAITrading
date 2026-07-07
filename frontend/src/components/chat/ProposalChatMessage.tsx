@@ -87,7 +87,7 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
     en: {},
     ko: {},
   });
-  const setShowApprovalDialog = useStore((state) => state.setShowApprovalDialog);
+  const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
 
   // Detect original language (heuristic: check if rationale contains Korean characters)
   const hasKorean = /[\u3131-\u314e|\u314f-\u3163|\uac00-\ud7a3]/g.test(proposal.rationale || '');
@@ -351,7 +351,7 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
                   setActiveMarket('stock');
                   setStockProposal(proposal as TradeProposal);
                 }
-                setShowApprovalDialog(true);
+                setAwaitingApproval(true);
               }}
               className="flex items-center gap-1 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-300 hover:bg-surface rounded transition-colors"
             >
@@ -372,12 +372,12 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
                     setActiveMarket('stock');
                     setStockProposal(proposal as TradeProposal);
                   }
-                  setShowApprovalDialog(true);
+                  setAwaitingApproval(true);
                 }}
                 className="flex items-center gap-1 px-4 py-1.5 text-xs font-medium bg-green-600 hover:bg-green-500 text-white rounded transition-colors"
               >
                 <Check className="w-3 h-3" />
-                Approve
+                Review
               </button>
               <button
                 onClick={handleCancel}

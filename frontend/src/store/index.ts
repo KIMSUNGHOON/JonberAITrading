@@ -152,7 +152,6 @@ interface UIState {
   stockRegion: StockRegion;  // US or Korea within stock market
 
   // Panels
-  showApprovalDialog: boolean;
   showChartPanel: boolean;
   showSettingsModal: boolean;
   isMobileMenuOpen: boolean;
@@ -307,7 +306,6 @@ interface ChatActions {
 interface UIActions {
   setActiveMarket: (market: MarketType) => void;
   setStockRegion: (region: StockRegion) => void;
-  setShowApprovalDialog: (show: boolean) => void;
   setShowChartPanel: (show: boolean) => void;
   setShowSettingsModal: (show: boolean) => void;
   setMobileMenuOpen: (open: boolean) => void;
@@ -421,7 +419,6 @@ const initialChatState: ChatState = {
 const initialUIState: UIState = {
   activeMarket: 'stock',
   stockRegion: 'us',
-  showApprovalDialog: false,
   showChartPanel: true,
   showSettingsModal: false,
   isMobileMenuOpen: false,
@@ -558,14 +555,10 @@ export const useStore = create<Store>()(
               ]
             : state.messages;
 
-          // Open approval dialog when proposal is set AND already awaiting approval
-          const shouldOpenDialog = proposal !== null && state.stock.awaitingApproval && !state.showApprovalDialog;
-
           return {
             stock: { ...state.stock, tradeProposal: proposal },
             messages: newMessages,
             chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
-            ...(shouldOpenDialog ? { showApprovalDialog: true } : {}),
           };
         }),
 
@@ -695,14 +688,10 @@ export const useStore = create<Store>()(
               ]
             : state.messages;
 
-          // Open approval dialog when proposal is set AND already awaiting approval
-          const shouldOpenDialog = proposal !== null && state.coin.awaitingApproval && !state.showApprovalDialog;
-
           return {
             coin: { ...state.coin, tradeProposal: proposal },
             messages: newMessages,
             chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
-            ...(shouldOpenDialog ? { showApprovalDialog: true } : {}),
           };
         }),
 
@@ -925,15 +914,10 @@ export const useStore = create<Store>()(
               : s
           );
 
-          // Only open dialog if BOTH proposal is set AND already awaiting approval
-          // This prevents opening dialog before proposal data arrives
-          const shouldOpenDialog = proposal !== null && state.kiwoom.awaitingApproval && !state.showApprovalDialog;
-
           return {
             kiwoom: { ...state.kiwoom, tradeProposal: proposal, sessions: newSessions },
             messages: newMessages,
             chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
-            ...(shouldOpenDialog ? { showApprovalDialog: true } : {}),
           };
         }),
 
@@ -1218,7 +1202,6 @@ export const useStore = create<Store>()(
               : s
           );
           const isActive = state.kiwoom.activeSessionId === sessionId;
-          const session = newSessions.find(s => s.sessionId === sessionId);
 
           // Add proposal message to chat if proposal exists
           const newMessages = proposal
@@ -1234,10 +1217,6 @@ export const useStore = create<Store>()(
               ]
             : state.messages;
 
-          // Open approval dialog ONLY when proposal is set AND session is awaiting approval
-          // This ensures dialog opens with complete data, not when awaitingApproval status arrives first
-          const shouldOpenDialog = isActive && proposal !== null && session?.awaitingApproval && !state.showApprovalDialog;
-
           return {
             kiwoom: {
               ...state.kiwoom,
@@ -1246,7 +1225,6 @@ export const useStore = create<Store>()(
             },
             messages: newMessages,
             chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
-            ...(shouldOpenDialog ? { showApprovalDialog: true } : {}),
           };
         }),
 
@@ -1394,8 +1372,6 @@ export const useStore = create<Store>()(
       })),
 
       setStockRegion: (region) => set({ stockRegion: region }),
-
-      setShowApprovalDialog: (show) => set({ showApprovalDialog: show }),
 
       setShowChartPanel: (show) => set({ showChartPanel: show }),
 

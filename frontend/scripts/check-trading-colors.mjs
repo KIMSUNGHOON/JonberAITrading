@@ -101,6 +101,8 @@ const CLEAN_SET = [
   // d2 t9: Position monitor (eventTypeConfig STATUS/DIRECTIONAL -> tokens;
   // volatility_spike kept raw+color-ok as event-category identity).
   'src/components/agent-chat/PositionMonitor.tsx',
+  // e2 t5: Docked HITL order-ticket rail (dense tokens only, no raw colors).
+  'src/components/terminal/OrderTicketRail.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 

@@ -9,7 +9,6 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import { useStore, selectError } from '@/store';
 import { TerminalShell } from '@/components/terminal/TerminalShell';
 import { TerminalDashboard } from '@/components/terminal/TerminalDashboard';
-import { ApprovalDialog } from '@/components/approval/ApprovalDialog';
 import { MobileNav } from '@/components/layout/MobileNav';
 import { SettingsModal } from '@/components/settings/SettingsModal';
 import { ChatToggleButton } from '@/components/chat/ChatToggleButton';
@@ -30,7 +29,6 @@ import { TradingDashboard } from '@/components/trading';
 import { AgentChatDashboard } from '@/components/agent-chat';
 
 function App() {
-  const showApprovalDialog = useStore((state) => state.showApprovalDialog);
   const showSettingsModal = useStore((state) => state.showSettingsModal);
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
   const setUpbitApiConfigured = useStore((state) => state.setUpbitApiConfigured);
@@ -119,9 +117,6 @@ function App() {
 
       {/* Mobile Navigation */}
       <MobileNav />
-
-      {/* Approval Dialog */}
-      {showApprovalDialog && <ApprovalDialog />}
 
       {/* Settings Modal */}
       <SettingsModal

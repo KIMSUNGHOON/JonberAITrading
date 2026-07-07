@@ -148,7 +148,7 @@ export function AnalysisPage(_props: AnalysisPageProps) {
   const goTo = useGoTo();
   const setActiveMarket = useStore((state) => state.setActiveMarket);
   const setActiveKiwoomSession = useStore((state) => state.setActiveKiwoomSession);
-  const setShowApprovalDialog = useStore((state) => state.setShowApprovalDialog);
+  const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
 
   // Get individual market states
   const stockSession = useStore((state) => state.stock);
@@ -262,9 +262,9 @@ export function AnalysisPage(_props: AnalysisPageProps) {
     }
     setSelectedSessionId(session.sessionId);
 
-    // If awaiting approval, show the dialog
+    // If awaiting approval, surface the order-ticket rail
     if (session.status === 'awaiting_approval') {
-      setShowApprovalDialog(true);
+      setAwaitingApproval(true);
     }
 
     // Navigate to workflow view

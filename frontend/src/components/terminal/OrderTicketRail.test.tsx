@@ -66,6 +66,7 @@ describe('OrderTicketRail — active', () => {
         activeSessionId: 'session-1',
         status: 'awaiting_approval',
         currentStage: null,
+        awaitingApproval: true,
       },
     };
     render(<OrderTicketRail />);
@@ -101,6 +102,7 @@ describe('OrderTicketRail — decisions', () => {
         activeSessionId: 'sess-1',
         status: 'awaiting_approval',
         currentStage: null,
+        awaitingApproval: true,
       },
       setAwaitingApproval: vi.fn(),
       setTradeProposal: vi.fn(),
