@@ -34,6 +34,7 @@ import type {
   AgentChatMessage,
   AgentChatDecision,
   AgentChatVote,
+  AgentChatVoteType,
   AgentChatAgentType,
   AgentChatSessionStatus,
 } from '@/types';
@@ -126,47 +127,56 @@ function MessageBubble({ message }: { message: AgentChatMessage }) {
   );
 }
 
-function VoteCard({ vote }: { vote: AgentChatVote }) {
-  const config = agentConfig[vote.agent_type] || agentConfig.moderator;
-  // Vote DIRECTIONAL map -> @/utils/pnl. App-wide ACTION map: STRONG_BUY/BUY
-  // bullish -> pnlColor(1) (up/green), STRONG_SELL/SELL bearish -> pnlColor(-1)
-  // (down/red), HOLD -> muted (non-directional).
-  const voteColor =
-    vote.vote === 'STRONG_BUY' || vote.vote === 'BUY'
-      ? pnlColor(1)
-      : vote.vote === 'STRONG_SELL' || vote.vote === 'SELL'
-      ? pnlColor(-1)
-      : 'text-muted';
+const VOTE_LABEL: Record<AgentChatVoteType, string> = {
+  STRONG_BUY: 'S.BUY',
+  BUY: 'BUY',
+  HOLD: 'HOLD',
+  SELL: 'SELL',
+  STRONG_SELL: 'S.SELL',
+  ABSTAIN: 'ABS',
+};
 
+// Vote DIRECTIONAL color -> @/utils/pnl (app-wide ACTION map): STRONG_BUY/BUY
+// bullish -> up, STRONG_SELL/SELL bearish -> down, HOLD neutral, ABSTAIN dim.
+function voteColor(v: AgentChatVoteType): string {
+  if (v === 'STRONG_BUY' || v === 'BUY') return pnlColor(1);
+  if (v === 'SELL' || v === 'STRONG_SELL') return pnlColor(-1);
+  if (v === 'HOLD') return 'text-muted';
+  return 'text-dim';
+}
+
+export function VoteBlotter({ votes }: { votes: AgentChatVote[] }) {
   return (
-    <div className="p-3 bg-elevated rounded-lg">
-      <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-2">
-          <div className={`w-6 h-6 rounded-full flex items-center justify-center ${config.bgColor}`}>
-            {config.icon}
-          </div>
-          <span className={`text-sm font-medium ${config.color}`}>{config.name}</span>
-        </div>
-        <span className={`font-bold ${voteColor}`}>{vote.vote}</span>
-      </div>
-      <div className="text-xs text-muted space-y-1">
-        <div className="flex justify-between">
-          <span>Confidence:</span>
-          <span className="tabular-nums">{(vote.confidence * 100).toFixed(0)}%</span>
-        </div>
-        <div className="flex justify-between">
-          <span>Weight:</span>
-          <span className="tabular-nums">{vote.weight}</span>
-        </div>
-        <div className="flex justify-between">
-          <span>Score:</span>
-          <span className="tabular-nums">{vote.weighted_score.toFixed(2)}</span>
-        </div>
-      </div>
-      {vote.reasoning && (
-        <p className="mt-2 text-xs text-dim">{vote.reasoning}</p>
-      )}
-    </div>
+    <table className="w-full text-[12px] tabular-nums">
+      <thead>
+        <tr className="text-[10px] uppercase tracking-wide text-dim border-b border-hairline">
+          <th className="text-left font-semibold px-2.5 py-1.5">Agent</th>
+          <th className="text-right font-semibold px-2.5 py-1.5">Vote</th>
+          <th className="text-right font-semibold px-2.5 py-1.5">Conf</th>
+          <th className="text-right font-semibold px-2.5 py-1.5">Wgt</th>
+          <th className="text-right font-semibold px-2.5 py-1.5">Score</th>
+        </tr>
+      </thead>
+      <tbody className="text-muted">
+        {votes.map((v, i) => {
+          const config = agentConfig[v.agent_type] || agentConfig.moderator;
+          return (
+            <tr key={i} className="border-b border-hairline/60">
+              <td className="text-left px-2.5 h-6">
+                <span className="inline-flex items-center gap-1.5 font-semibold text-ink">
+                  <span className={`${config.color} text-[8px] leading-none`}>●</span>
+                  {config.name}
+                </span>
+              </td>
+              <td className={`text-right px-2.5 font-semibold ${voteColor(v.vote)}`}>{VOTE_LABEL[v.vote]}</td>
+              <td className="text-right px-2.5 text-dim">{(v.confidence * 100).toFixed(0)}%</td>
+              <td className="text-right px-2.5 text-muted">{v.weight.toFixed(2)}</td>
+              <td className="text-right px-2.5 text-muted">{v.weighted_score.toFixed(2)}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
   );
 }
 
@@ -484,11 +494,7 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
             <CheckCircle className="w-5 h-5 text-accent" />
             Agent Votes
           </h3>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {session.votes.map((vote, i) => (
-              <VoteCard key={i} vote={vote} />
-            ))}
-          </div>
+          <VoteBlotter votes={session.votes} />
         </div>
       )}
 
