@@ -103,6 +103,9 @@ const CLEAN_SET = [
   'src/components/agent-chat/PositionMonitor.tsx',
   // e2 t5: Docked HITL order-ticket rail (dense tokens only, no raw colors).
   'src/components/terminal/OrderTicketRail.tsx',
+  // e1 t2: MarkdownRenderer prose + trading-highlights re-skin; ReadingPane (e1 t1) added clean.
+  'src/components/common/MarkdownRenderer.tsx',
+  'src/components/common/ReadingPane.tsx',
 ];
 const CLEAN_SET_ABS = new Set(CLEAN_SET);
 
