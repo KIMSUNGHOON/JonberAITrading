@@ -27,6 +27,8 @@ import {
 import { getAgentChatSessionDetail } from '@/api/client';
 import { useAgentChatWebSocket } from '@/hooks/useAgentChatWebSocket';
 import { pnlColor } from '@/utils/pnl';
+import { ReadingPane } from '@/components/common/ReadingPane';
+import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
 import type {
   AgentChatSessionDetail,
   AgentChatMessage,
@@ -113,7 +115,7 @@ function MessageBubble({ message }: { message: AgentChatMessage }) {
             </span>
           )}
         </div>
-        <div className="text-sm text-ink whitespace-pre-wrap">{message.content}</div>
+        <ReadingPane><MarkdownRenderer content={message.content} /></ReadingPane>
         {message.data && Object.keys(message.data).length > 0 && (
           <div className="mt-2 p-2 bg-elevated rounded text-xs text-muted">
             <pre className="overflow-x-auto">{JSON.stringify(message.data, null, 2)}</pre>

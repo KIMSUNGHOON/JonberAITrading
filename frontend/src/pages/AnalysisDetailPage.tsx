@@ -37,6 +37,7 @@ import { useStore, selectTickerHistory, type MarketType, type TickerHistoryItem 
 import { useGoTo } from '@/hooks/useNav';
 import { addToTradeQueue } from '@/api/client';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
+import { ReadingPane } from '@/components/common/ReadingPane';
 import { useTranslations } from '@/utils/translations';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting } from '@/components/terminal/panels/shared';
@@ -192,7 +193,7 @@ function AnalysisCard({
 
           {summary && (
             <div className="text-sm text-ink mb-3 bg-elevated/50 rounded-lg p-3 max-h-64 overflow-y-auto">
-              <MarkdownRenderer content={summary} compact />
+              <ReadingPane><MarkdownRenderer content={summary} compact /></ReadingPane>
             </div>
           )}
 
@@ -729,7 +730,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
               {tradeProposal.rationale && (
                 <div className="text-sm text-ink bg-elevated rounded-lg p-3">
                   <p className="font-medium text-muted mb-2">{t('analysis_rationale')}:</p>
-                  <MarkdownRenderer content={tradeProposal.rationale} compact />
+                  <ReadingPane><MarkdownRenderer content={tradeProposal.rationale} compact /></ReadingPane>
                 </div>
               )}
             </div>
