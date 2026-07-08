@@ -249,43 +249,44 @@ async def create_order(request: KRStockOrderRequest):
     client = await get_shared_kiwoom_client_async()
 
     try:
-        from services.kiwoom import OrderRequest as KiwoomOrderRequest, OrderType
+        from services.kiwoom.models import OrderType as KiwoomOrderType
 
-        order_type = OrderType.BUY if request.side == "buy" else OrderType.SELL
-        if request.ord_type == "market":
-            order_type = (
-                OrderType.MARKET_BUY
-                if request.side == "buy"
-                else OrderType.MARKET_SELL
-            )
-
-        kiwoom_request = KiwoomOrderRequest(
-            stk_cd=request.stk_cd,
-            order_type=order_type,
-            quantity=request.quantity,
-            price=request.price or 0,
+        kiwoom_order_type = (
+            KiwoomOrderType.MARKET if request.ord_type == "market" else KiwoomOrderType.LIMIT
+        )
+        # Market orders send no price; limit orders send the requested price.
+        price_arg = (
+            int(request.price) if (request.ord_type == "limit" and request.price) else None
+        )
+        place = (
+            client.place_buy_order if request.side == "buy" else client.place_sell_order
         )
 
-        order = await client.place_order(kiwoom_request)
+        order = await place(
+            stk_cd=request.stk_cd,
+            qty=request.quantity,
+            price=price_arg,
+            order_type=kiwoom_order_type,
+        )
 
         logger.info(
             "order_created",
-            order_id=order.order_id,
+            order_id=order.ord_no,
             stk_cd=request.stk_cd,
             side=request.side,
         )
 
         return KRStockOrderResponse(
-            order_id=order.order_id,
+            order_id=order.ord_no,
             stk_cd=request.stk_cd,
-            stk_nm=order.stk_nm if hasattr(order, "stk_nm") else None,
+            stk_nm=None,
             side=request.side,
             ord_type=request.ord_type,
             price=request.price,
             quantity=request.quantity,
             executed_quantity=0,
             remaining_quantity=request.quantity,
-            status="pending",
+            status="pending" if order.is_success else "rejected",
             created_at=datetime.now(timezone.utc),
         )
 

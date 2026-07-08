@@ -256,16 +256,15 @@ async def close_position(stk_cd: str):
     client = await get_shared_kiwoom_client_async()
 
     try:
-        from services.kiwoom import OrderRequest as KiwoomOrderRequest, OrderType
+        from services.kiwoom.models import OrderType as KiwoomOrderType
 
-        kiwoom_request = KiwoomOrderRequest(
+        # Close = market sell of the full holding.
+        order = await client.place_sell_order(
             stk_cd=stk_cd,
-            order_type=OrderType.MARKET_SELL,
-            quantity=quantity,
-            price=0,
+            qty=quantity,
+            price=None,
+            order_type=KiwoomOrderType.MARKET,
         )
-
-        order = await client.place_order(kiwoom_request)
 
         # Delete position on success
         try:
@@ -273,10 +272,10 @@ async def close_position(stk_cd: str):
         except AttributeError:
             pass
 
-        logger.info("position_closed", stk_cd=stk_cd, order_id=order.order_id)
+        logger.info("position_closed", stk_cd=stk_cd, order_id=order.ord_no)
 
         return KRStockOrderResponse(
-            order_id=order.order_id,
+            order_id=order.ord_no,
             stk_cd=stk_cd,
             stk_nm=position["stk_nm"],
             side="sell",
