@@ -9,6 +9,7 @@ from typing import List, Optional
 
 import structlog
 
+from agents.llm.tasks import TaskType
 from agents.llm_provider import get_llm_provider
 from services.agent_chat.models import (
     AgentMessage,
@@ -103,6 +104,17 @@ class BaseDiscussionAgent(ABC):
                 error=str(e),
             )
             return f"분석 중 오류 발생: {str(e)}"
+
+    async def _structured_vote(self, messages, *, schema: dict, task=TaskType.GROUP_CHAT):
+        """Return the validated structured-vote dict, or None on any failure
+        (the caller then uses the regex fallback path). `self.llm` is the shared
+        provider facade; generate_structured raises ValueError on parse/missing keys.
+        """
+        try:
+            return await self.llm.generate_structured(messages, schema, task=task)
+        except (ValueError, KeyError) as e:
+            logger.warning("structured_vote_failed", agent=self.agent_type.value, error=str(e))
+            return None
 
     @abstractmethod
     async def analyze(self, context: MarketContext) -> AgentMessage:
