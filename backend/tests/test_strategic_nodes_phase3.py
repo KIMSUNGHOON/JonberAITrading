@@ -12,7 +12,7 @@ async def test_kr_node_passes_position_feasible_set_and_threads_result(monkeypat
 
     async def fake_decide_action(llm, messages, **kwargs):
         captured.update(kwargs)
-        return kr.TradeAction.HOLD, "LLM chose to hold", "llm"
+        return kr.TradeAction.HOLD, "LLM chose to hold", "llm", None, None
 
     monkeypatch.setattr(kr, "get_llm_provider", lambda: MagicMock())
     monkeypatch.setattr(kr, "decide_action", fake_decide_action)
@@ -22,6 +22,7 @@ async def test_kr_node_passes_position_feasible_set_and_threads_result(monkeypat
 
     # no existing_position -> has_position False
     assert captured["feasible"] == position_feasible_set(False)
+    assert captured["trade_action_cls"] is kr.TradeAction
     assert result["trade_proposal"]["action"] == "HOLD"
     assert result["synthesis"]["decision_rationale"] == "LLM chose to hold"
 
@@ -34,7 +35,7 @@ async def test_us_node_passes_agnostic_set_and_threads_result(monkeypatch):
 
     async def fake_decide_action(llm, messages, **kwargs):
         captured.update(kwargs)
-        return us.TradeAction.HOLD, "US hold rationale", "llm"
+        return us.TradeAction.HOLD, "US hold rationale", "llm", None, None
 
     monkeypatch.setattr(us, "get_llm_provider", lambda: MagicMock())
     monkeypatch.setattr(us, "decide_action", fake_decide_action)
@@ -48,6 +49,7 @@ async def test_us_node_passes_agnostic_set_and_threads_result(monkeypatch):
     result = await us.strategic_decision_node(state)
 
     assert captured["feasible"] == POSITION_AGNOSTIC_ACTIONS
+    assert captured["trade_action_cls"] is us.TradeAction
     assert result["trade_proposal"]["action"] == "HOLD"
     assert result["trade_proposal"]["rationale"] == "US hold rationale"
 
@@ -60,7 +62,7 @@ async def test_coin_node_passes_agnostic_set_and_threads_result(monkeypatch):
 
     async def fake_decide_action(llm, messages, **kwargs):
         captured.update(kwargs)
-        return coin.TradeAction.HOLD, "coin hold rationale", "llm"
+        return coin.TradeAction.HOLD, "coin hold rationale", "llm", None, None
 
     monkeypatch.setattr(coin, "get_llm_provider", lambda: MagicMock())
     monkeypatch.setattr(coin, "decide_action", fake_decide_action)
@@ -69,4 +71,5 @@ async def test_coin_node_passes_agnostic_set_and_threads_result(monkeypatch):
     result = await coin.coin_strategic_decision_node(state)
 
     assert captured["feasible"] == POSITION_AGNOSTIC_ACTIONS
+    assert captured["trade_action_cls"] is coin.TradeAction
     assert result["trade_proposal"]["action"] == "HOLD"

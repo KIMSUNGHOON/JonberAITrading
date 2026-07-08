@@ -188,7 +188,7 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         has_position=has_position,
         position_pnl_pct=position_pnl_pct,
     )
-    action, response, decision_source = await decide_action(
+    action, response, decision_source, bull_case, bear_case = await decide_action(
         llm,
         messages,
         trade_action_cls=TradeAction,
@@ -201,6 +201,10 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         response = (
             f"[룰 기반 결정] 컨센서스 {consensus_signal.value} → {action.value} (LLM 실패)"
         )
+    if bull_case is None:
+        bull_case = _extract_bull_case(response)
+    if bear_case is None:
+        bear_case = _extract_bear_case(response)
 
     logger.info(
         "kr_stock_action_determined",
@@ -269,8 +273,8 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         risk_score=float(risk_signals.get("risk_score", 0.5)),
         position_size_pct=position_size_pct,
         rationale=response,
-        bull_case=_extract_bull_case(response),
-        bear_case=_extract_bear_case(response),
+        bull_case=bull_case,
+        bear_case=bear_case,
         analyses=analyses,
     )
 

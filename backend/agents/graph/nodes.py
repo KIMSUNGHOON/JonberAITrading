@@ -445,7 +445,7 @@ async def strategic_decision_node(state: dict) -> dict:
     # Phase 3: the LLM decides among BUY/SELL/HOLD (structured); the rule signal
     # is the fallback (this node does not model position).
     rule_action = _signal_to_action(consensus_signal)
-    action, response, decision_source = await decide_action(
+    action, response, decision_source, bull_case, bear_case = await decide_action(
         llm,
         messages,
         trade_action_cls=TradeAction,
@@ -456,11 +456,17 @@ async def strategic_decision_node(state: dict) -> dict:
     )
     if not response:
         response = f"[rule] consensus {consensus_signal.value} -> {action.value} (LLM unavailable)"
+    if bull_case is None:
+        bull_case = _extract_bull_case(response)
+    if bear_case is None:
+        bear_case = _extract_bear_case(response)
     llm_duration = (time.perf_counter() - llm_start) * 1000
     logger.debug(
         "llm_response", node="strategic_decision", response_length=len(response),
         duration_ms=round(llm_duration, 2), decision_source=decision_source,
     )
+    logger.info("strategic_decision_source", ticker=ticker, action=action.value,
+                decision_source=decision_source)
 
     # Get risk parameters (risk is a dict from model_dump())
     risk = state.get("risk_assessment")
@@ -482,8 +488,8 @@ async def strategic_decision_node(state: dict) -> dict:
         risk_score=float(risk_signals.get("risk_score", 0.5)),
         position_size_pct=float(risk_signals.get("max_position_pct", 5.0)),
         rationale=response,
-        bull_case=_extract_bull_case(response),
-        bear_case=_extract_bear_case(response),
+        bull_case=bull_case,
+        bear_case=bear_case,
         analyses=analyses,  # Already dicts after serialization fix
     )
 

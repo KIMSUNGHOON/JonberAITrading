@@ -42,16 +42,21 @@ async def decide_action(llm, messages, *, trade_action_cls, rule_action, feasibl
                         decision_schema, task):
     """LLM structured decision, guarded by `feasible`, with the rule as fallback.
 
-    Returns (action, rationale, source); source in {'llm','rule_guardrail','rule_fallback'}.
-    On the fallback path `rationale` may be '' — the caller supplies a fallback string.
+    Returns (action, rationale, source, bull_case, bear_case);
+    source in {'llm','rule_guardrail','rule_fallback'}. On the fallback path
+    `rationale` may be '' and bull_case/bear_case are None (the caller extracts
+    them from the rationale text). On the llm/rule_guardrail path bull_case/
+    bear_case are the LLM's structured arrays (may be None if the model omitted
+    the optional fields).
     """
     try:
         decision = await llm.generate_structured(messages, decision_schema, task=task)
         llm_action = trade_action_cls(str(decision["action"]).upper())
         action, source = resolve_action(llm_action, rule_action, feasible)
-        return action, (decision.get("rationale") or ""), source
+        return (action, (decision.get("rationale") or ""), source,
+                decision.get("bull_case"), decision.get("bear_case"))
     except (ValueError, KeyError):
         try:
-            return rule_action, (await llm.generate(messages)), "rule_fallback"
+            return rule_action, (await llm.generate(messages)), "rule_fallback", None, None
         except Exception:
-            return rule_action, "", "rule_fallback"
+            return rule_action, "", "rule_fallback", None, None

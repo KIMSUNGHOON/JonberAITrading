@@ -49,46 +49,56 @@ class _StubLLM:
 
 async def test_decide_action_consumes_feasible_llm_action():
     llm = _StubLLM(structured={"action": "buy", "confidence": 0.8, "rationale": "r"})
-    action, rationale, source = await decide_action(
+    result = await decide_action(
         llm, [], trade_action_cls=TradeAction, rule_action=TradeAction.HOLD,
         feasible=FEASIBLE_WITHOUT_POSITION, decision_schema={"required": []}, task="t",
     )
-    assert (action, rationale, source) == (TradeAction.BUY, "r", "llm")
+    assert result == (TradeAction.BUY, "r", "llm", None, None)
 
 
 async def test_decide_action_guardrails_infeasible_to_rule():
     llm = _StubLLM(structured={"action": "SELL", "confidence": 0.9, "rationale": "r"})
-    action, rationale, source = await decide_action(
+    result = await decide_action(
         llm, [], trade_action_cls=TradeAction, rule_action=TradeAction.WATCH,
         feasible=FEASIBLE_WITHOUT_POSITION, decision_schema={"required": []}, task="t",
     )
-    assert (action, rationale, source) == (TradeAction.WATCH, "r", "rule_guardrail")
+    assert result == (TradeAction.WATCH, "r", "rule_guardrail", None, None)
 
 
 async def test_decide_action_falls_back_to_rule_on_structured_failure():
     llm = _StubLLM(structured_exc=ValueError("bad json"), text="fallback narrative")
-    action, rationale, source = await decide_action(
+    result = await decide_action(
         llm, [], trade_action_cls=TradeAction, rule_action=TradeAction.HOLD,
         feasible=FEASIBLE_WITHOUT_POSITION, decision_schema={"required": []}, task="t",
     )
-    assert (action, rationale, source) == (TradeAction.HOLD, "fallback narrative", "rule_fallback")
+    assert result == (TradeAction.HOLD, "fallback narrative", "rule_fallback", None, None)
 
 
 async def test_decide_action_empty_rationale_when_both_calls_fail():
     llm = _StubLLM(structured_exc=ValueError("x"), text_exc=RuntimeError("down"))
-    action, rationale, source = await decide_action(
+    result = await decide_action(
         llm, [], trade_action_cls=TradeAction, rule_action=TradeAction.HOLD,
         feasible=FEASIBLE_WITHOUT_POSITION, decision_schema={"required": []}, task="t",
     )
-    assert (action, rationale, source) == (TradeAction.HOLD, "", "rule_fallback")
+    assert result == (TradeAction.HOLD, "", "rule_fallback", None, None)
 
 
 async def test_decide_action_unknown_action_string_falls_back():
     # An action not in the enum (e.g. US/coin returning ADD) raises in the enum -> fallback.
     llm = _StubLLM(structured={"action": "NONSENSE", "confidence": 1.0, "rationale": "r"},
                    text="fb")
-    action, rationale, source = await decide_action(
+    result = await decide_action(
         llm, [], trade_action_cls=TradeAction, rule_action=TradeAction.HOLD,
         feasible=POSITION_AGNOSTIC_ACTIONS, decision_schema={"required": []}, task="t",
     )
-    assert (action, source) == (TradeAction.HOLD, "rule_fallback")
+    assert (result[0], result[2]) == (TradeAction.HOLD, "rule_fallback")
+
+
+async def test_decide_action_threads_structured_bull_bear():
+    llm = _StubLLM(structured={"action": "buy", "confidence": 0.8, "rationale": "r",
+                               "bull_case": ["up1"], "bear_case": ["down1"]})
+    result = await decide_action(
+        llm, [], trade_action_cls=TradeAction, rule_action=TradeAction.HOLD,
+        feasible=FEASIBLE_WITHOUT_POSITION, decision_schema={"required": []}, task="t",
+    )
+    assert result == (TradeAction.BUY, "r", "llm", ["up1"], ["down1"])
