@@ -24,3 +24,29 @@ async def test_kr_node_passes_position_feasible_set_and_threads_result(monkeypat
     assert captured["feasible"] == position_feasible_set(False)
     assert result["trade_proposal"]["action"] == "HOLD"
     assert result["synthesis"]["decision_rationale"] == "LLM chose to hold"
+
+
+async def test_us_node_passes_agnostic_set_and_threads_result(monkeypatch):
+    import agents.graph.nodes as us
+    from agents.graph.decision_policy import POSITION_AGNOSTIC_ACTIONS
+
+    captured = {}
+
+    async def fake_decide_action(llm, messages, **kwargs):
+        captured.update(kwargs)
+        return us.TradeAction.HOLD, "US hold rationale", "llm"
+
+    monkeypatch.setattr(us, "get_llm_provider", lambda: MagicMock())
+    monkeypatch.setattr(us, "decide_action", fake_decide_action)
+
+    async def fake_price(ticker):
+        return 100.0
+
+    monkeypatch.setattr(us, "get_current_price", fake_price)
+
+    state = {"ticker": "AAPL"}
+    result = await us.strategic_decision_node(state)
+
+    assert captured["feasible"] == POSITION_AGNOSTIC_ACTIONS
+    assert result["trade_proposal"]["action"] == "HOLD"
+    assert result["trade_proposal"]["rationale"] == "US hold rationale"

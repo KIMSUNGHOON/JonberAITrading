@@ -130,7 +130,9 @@ Your decision must include:
 - Rationale weighing all factors
 - Bull case and bear case
 
-Take your time and think carefully. Be decisive but prudent. If signals conflict significantly, HOLD may be appropriate."""
+Take your time and think carefully. Be decisive but prudent. If signals conflict significantly, HOLD may be appropriate.
+
+Return your decision as a JSON object with keys: "action" (exactly one of BUY, SELL, HOLD), "confidence" (a number 0.0-1.0), "rationale" (string), "bull_case" (array of strings), "bear_case" (array of strings)."""
 
 
 # -------------------------------------------

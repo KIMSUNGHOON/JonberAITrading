@@ -27,6 +27,8 @@ from agents.graph.state import (
     get_all_analyses,
 )
 from agents.llm_provider import get_llm_provider
+from agents.graph.decision_policy import decide_action, POSITION_AGNOSTIC_ACTIONS
+from agents.llm.tasks import DECISION_SCHEMA, TaskType
 from agents.graph.shared_extractors import (
     extract_key_factors as _extract_key_factors,
     extract_bull_case as _extract_bull_case,
@@ -439,12 +441,26 @@ async def strategic_decision_node(state: dict) -> dict:
 
     logger.debug("llm_request", node="strategic_decision", message_count=len(messages))
     llm_start = time.perf_counter()
-    response = await llm.generate(messages)
-    llm_duration = (time.perf_counter() - llm_start) * 1000
-    logger.debug("llm_response", node="strategic_decision", response_length=len(response), duration_ms=round(llm_duration, 2))
 
-    # Determine action from consensus
-    action = _signal_to_action(consensus_signal)
+    # Phase 3: the LLM decides among BUY/SELL/HOLD (structured); the rule signal
+    # is the fallback (this node does not model position).
+    rule_action = _signal_to_action(consensus_signal)
+    action, response, decision_source = await decide_action(
+        llm,
+        messages,
+        trade_action_cls=TradeAction,
+        rule_action=rule_action,
+        feasible=POSITION_AGNOSTIC_ACTIONS,
+        decision_schema=DECISION_SCHEMA,
+        task=TaskType.STRATEGIC_DECISION,
+    )
+    if not response:
+        response = f"[rule] consensus {consensus_signal.value} -> {action.value} (LLM unavailable)"
+    llm_duration = (time.perf_counter() - llm_start) * 1000
+    logger.debug(
+        "llm_response", node="strategic_decision", response_length=len(response),
+        duration_ms=round(llm_duration, 2), decision_source=decision_source,
+    )
 
     # Get risk parameters (risk is a dict from model_dump())
     risk = state.get("risk_assessment")
