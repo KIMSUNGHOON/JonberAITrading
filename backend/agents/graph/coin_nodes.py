@@ -26,6 +26,8 @@ from agents.graph.coin_state import (
     get_all_coin_analyses,
 )
 from agents.llm_provider import get_llm_provider
+from agents.graph.decision_policy import decide_action, POSITION_AGNOSTIC_ACTIONS
+from agents.llm.tasks import DECISION_SCHEMA, TaskType
 from agents.graph.shared_extractors import (
     extract_key_factors as _extract_key_factors,
     extract_bull_case as _extract_bull_case,
@@ -455,10 +457,24 @@ async def coin_strategic_decision_node(state: dict) -> dict:
     ]
 
     logger.debug("llm_request", node="coin_strategic_decision")
-    response = await llm.generate(messages)
 
-    # Determine action from consensus
-    action = _signal_to_action(consensus_signal)
+    # Phase 3: the LLM decides among BUY/SELL/HOLD (structured); the rule signal
+    # is the fallback (this node does not model position).
+    rule_action = _signal_to_action(consensus_signal)
+    action, response, decision_source = await decide_action(
+        llm,
+        messages,
+        trade_action_cls=TradeAction,
+        rule_action=rule_action,
+        feasible=POSITION_AGNOSTIC_ACTIONS,
+        decision_schema=DECISION_SCHEMA,
+        task=TaskType.STRATEGIC_DECISION,
+    )
+    if not response:
+        response = f"[rule] consensus {consensus_signal.value} -> {action.value} (LLM unavailable)"
+    logger.info(
+        "coin_decision_source", market=market, action=action.value, decision_source=decision_source,
+    )
 
     # Get risk parameters
     risk = state.get("risk_assessment", {})
