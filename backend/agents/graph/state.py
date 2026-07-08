@@ -19,14 +19,7 @@ from pydantic import BaseModel, Field
 # -------------------------------------------
 
 
-class SignalType(str, Enum):
-    """Trading signal types."""
-
-    STRONG_BUY = "strong_buy"
-    BUY = "buy"
-    HOLD = "hold"
-    SELL = "sell"
-    STRONG_SELL = "strong_sell"
+from agents.graph.state_base import SignalType  # shared (P4 consolidation)
 
 
 class TradeAction(str, Enum):
@@ -222,13 +215,7 @@ def replace_value(current: Any, new: Any) -> Any:
     return new if new is not None else current
 
 
-def append_list(current: list, new: list) -> list:
-    """Append new items to existing list."""
-    if current is None:
-        current = []
-    if new is None:
-        new = []
-    return current + new
+from agents.graph.state_base import append_list  # shared (P4 consolidation)
 
 
 # -------------------------------------------
