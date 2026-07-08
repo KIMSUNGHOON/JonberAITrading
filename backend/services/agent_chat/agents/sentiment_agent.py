@@ -8,6 +8,7 @@ Participates in group discussions with sentiment analysis perspective.
 from typing import List, Optional
 
 import structlog
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from services.agent_chat.agents.base_agent import BaseDiscussionAgent
 from services.agent_chat.models import (
@@ -18,6 +19,7 @@ from services.agent_chat.models import (
     MessageType,
     VoteType,
 )
+from services.agent_chat.vote_schema import VOTE_SCHEMA
 
 logger = structlog.get_logger()
 
@@ -139,7 +141,13 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
 형식:
 투표: [투표 옵션]
 신뢰도: [0-100]%
-근거: [핵심 심리 요인]"""
+근거: [핵심 심리 요인]
+
+응답은 다음 키를 가진 JSON 객체로도 반환하세요:
+- "vote": strong_buy / buy / hold / sell / strong_sell / abstain 중 하나
+- "confidence": 0.0~1.0 사이 숫자
+- "reasoning": 투표 근거 (한국어)
+- "key_factors": 핵심 근거 문자열 배열"""
 
     async def analyze(self, context: MarketContext) -> AgentMessage:
         """Present initial sentiment analysis."""
@@ -243,6 +251,26 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             news_count=context.news_count or 0,
             price_change_pct=context.price_change_pct,
         )
+
+        messages = [
+            SystemMessage(content=self.system_prompt),
+            HumanMessage(content=prompt),
+        ]
+        data = await self._structured_vote(messages, schema=VOTE_SCHEMA)
+        if data is not None:
+            try:
+                # Structured path: the LLM reasons about news-data availability
+                # itself (it's given news_sentiment/news_count in the prompt),
+                # so the legacy no-news confidence cap below is not reapplied here.
+                return AgentVote(
+                    agent_type=self.agent_type,
+                    vote=VoteType(str(data["vote"]).strip().lower()),
+                    confidence=float(data["confidence"]),
+                    reasoning=data.get("reasoning") or "",
+                    key_factors=data.get("key_factors") or [],
+                )
+            except (ValueError, KeyError):
+                pass  # malformed structured payload -> regex fallback
 
         response = await self._call_llm(self.system_prompt, prompt)
 
