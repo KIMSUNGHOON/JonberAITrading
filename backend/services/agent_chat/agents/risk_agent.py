@@ -8,7 +8,9 @@ Participates in group discussions with risk management perspective.
 from typing import List, Optional
 
 import structlog
+from langchain_core.messages import HumanMessage, SystemMessage
 
+from agents.llm.tasks import TaskType
 from services.agent_chat.agents.base_agent import BaseDiscussionAgent
 from services.agent_chat.models import (
     AgentMessage,
@@ -18,6 +20,7 @@ from services.agent_chat.models import (
     MessageType,
     VoteType,
 )
+from services.agent_chat.vote_schema import RISK_VOTE_SCHEMA
 
 logger = structlog.get_logger()
 
@@ -147,7 +150,16 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 권장 포지션: [포트폴리오 대비 %]
 손절가: [현재가 대비 -%]
 익절가: [현재가 대비 +%]
-근거: [핵심 리스크 요인]"""
+근거: [핵심 리스크 요인]
+
+응답은 다음 키를 가진 JSON 객체로도 반환하세요:
+- "vote": strong_buy / buy / hold / sell / strong_sell / abstain 중 하나
+- "confidence": 0.0~1.0 사이 숫자
+- "reasoning": 투표 근거 (한국어)
+- "key_factors": 핵심 근거 문자열 배열
+- "suggested_position_pct": 권장 포지션 비중(%) 숫자
+- "suggested_stop_loss_pct": 권장 손절 폭(%) 숫자
+- "suggested_take_profit_pct": 권장 익절 폭(%) 숫자"""
 
     async def analyze(self, context: MarketContext) -> AgentMessage:
         """Present initial risk assessment."""
@@ -269,6 +281,34 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             position_info=position_info,
         )
 
+        risk_level = self._calculate_risk_level(context)
+
+        messages = [
+            SystemMessage(content=self.system_prompt),
+            HumanMessage(content=prompt),
+        ]
+        data = await self._structured_vote(messages, schema=RISK_VOTE_SCHEMA, task=TaskType.RISK)
+        if data is not None:
+            try:
+                return AgentVote(
+                    agent_type=self.agent_type,
+                    vote=VoteType(str(data["vote"]).strip().lower()),
+                    confidence=float(data["confidence"]),
+                    reasoning=data.get("reasoning") or "",
+                    key_factors=data.get("key_factors") or [],
+                    suggested_position_pct=data.get("suggested_position_pct")
+                        if data.get("suggested_position_pct") is not None
+                        else self._calculate_position_size(risk_level),
+                    suggested_stop_loss_pct=data.get("suggested_stop_loss_pct")
+                        if data.get("suggested_stop_loss_pct") is not None
+                        else self._calculate_stop_loss(risk_level),
+                    suggested_take_profit_pct=data.get("suggested_take_profit_pct")
+                        if data.get("suggested_take_profit_pct") is not None
+                        else self._calculate_take_profit(risk_level),
+                )
+            except (ValueError, KeyError):
+                pass  # malformed structured payload -> regex fallback
+
         response = await self._call_llm(self.system_prompt, prompt)
 
         vote_type = self._parse_vote(response)
@@ -276,7 +316,6 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
         key_factors = self._extract_key_factors(response)
 
         # Extract risk parameters from response
-        risk_level = self._calculate_risk_level(context)
         position_pct = self._parse_position_pct(response) or self._calculate_position_size(risk_level)
         stop_loss_pct = self._parse_stop_loss_pct(response) or self._calculate_stop_loss(risk_level)
         take_profit_pct = self._parse_take_profit_pct(response) or self._calculate_take_profit(risk_level)

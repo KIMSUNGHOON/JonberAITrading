@@ -90,3 +90,33 @@ async def test_sentiment_structured_caps_confidence_without_news(mock_get):
                                 current_price=72500.0, price_change_pct=0.5)  # no news
     vote = await SentimentDiscussionAgent().vote(ctx_no_news, [])
     assert vote.confidence == 0.5  # structured confidence 0.9 capped to 0.5 (no news)
+
+
+@patch("services.agent_chat.agents.base_agent.get_llm_provider")
+async def test_risk_vote_uses_structured_with_risk_fields(mock_get):
+    provider = MagicMock()
+    provider.generate_structured = AsyncMock(return_value={
+        "vote": "hold", "confidence": 0.6, "reasoning": "R", "key_factors": ["k"],
+        "suggested_position_pct": 4.0, "suggested_stop_loss_pct": 5.0,
+        "suggested_take_profit_pct": 9.0,
+    })
+    provider.generate = AsyncMock(return_value="unused")
+    mock_get.return_value = provider
+    from services.agent_chat.agents.risk_agent import RiskDiscussionAgent
+    vote = await RiskDiscussionAgent().vote(_ctx(), [])
+    assert vote.vote == VoteType.HOLD
+    assert vote.suggested_position_pct == 4.0
+    assert vote.suggested_stop_loss_pct == 5.0
+    assert vote.suggested_take_profit_pct == 9.0
+
+
+@patch("services.agent_chat.agents.base_agent.get_llm_provider")
+async def test_risk_vote_falls_back_to_regex(mock_get):
+    provider = MagicMock()
+    provider.generate_structured = AsyncMock(side_effect=ValueError("bad"))
+    provider.generate = AsyncMock(return_value="위험도 판단: 보유 (HOLD), 신뢰도: 60%")
+    mock_get.return_value = provider
+    from services.agent_chat.agents.risk_agent import RiskDiscussionAgent
+    vote = await RiskDiscussionAgent().vote(_ctx(), [])
+    assert vote.vote == VoteType.HOLD
+    assert vote.suggested_position_pct is not None  # _calculate_* fallback populated it
