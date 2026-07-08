@@ -81,6 +81,65 @@ async def test_aget_tuple_none_when_missing():
     assert tup is None
 
 
+async def test_real_graph_interrupt_survives_restart_and_resumes():
+    """End-to-end durable HITL: a graph interrupts, a BRAND-NEW checkpointer instance
+    (simulated restart) resumes from the SQLite-persisted state and completes — the
+    pre-interrupt work must survive (MemorySaver would lose it)."""
+    from typing import Annotated, TypedDict
+
+    from langgraph.graph import END, StateGraph
+
+    from agents.graph.state_base import append_list
+
+    class S(TypedDict, total=False):
+        steps: Annotated[list, append_list]
+        approved: bool
+
+    def node_a(state):
+        return {"steps": ["a"]}
+
+    def gate(state):
+        return {}
+
+    def node_b(state):
+        return {"steps": ["b"]}
+
+    def build():
+        g = StateGraph(S)
+        g.add_node("a", node_a)
+        g.add_node("gate", gate)
+        g.add_node("b", node_b)
+        g.set_entry_point("a")
+        g.add_edge("a", "gate")
+        g.add_edge("gate", "b")
+        g.add_edge("b", END)
+        return g
+
+    storage = _FakeStorage()
+    config = {"configurable": {"thread_id": "run-1"}}
+
+    cp1 = SqliteCheckpointer()
+    cp1._storage_service = storage
+    graph1 = build().compile(checkpointer=cp1, interrupt_before=["gate"])
+    async for _ in graph1.astream({"steps": []}, config):
+        pass  # runs "a", then pauses before "gate"
+
+    # Simulated restart: fresh checkpointer + freshly-compiled graph, SAME storage.
+    cp2 = SqliteCheckpointer()
+    cp2._storage_service = storage
+    graph2 = build().compile(checkpointer=cp2, interrupt_before=["gate"])
+    # Correct resume: inject the decision into the (persisted) checkpoint, then
+    # continue with astream(None). Passing a dict to astream would RESTART the graph.
+    await graph2.aupdate_state(config, {"approved": True})
+    async for _ in graph2.astream(None, config):
+        pass  # resumes from the interrupt, runs "gate" then "b"
+
+    snap = await graph2.aget_state(config)
+    # "a" (pre-interrupt, durably persisted) + "b" (post-resume) both present.
+    assert snap.values.get("steps") == ["a", "b"]
+    assert snap.values.get("approved") is True
+
+
 async def test_session_agnostic_keys_by_thread_id():
     # No session_id (the singleton-graph mode): partition by thread_id so one compiled
     # graph durably checkpoints every session.

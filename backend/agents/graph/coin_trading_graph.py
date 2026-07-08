@@ -130,7 +130,10 @@ def get_coin_trading_graph() -> StateGraph:
     """
     global _coin_trading_graph
     if _coin_trading_graph is None:
-        _coin_trading_graph = compile_coin_trading_graph()
+        # Durable persistence (P6): SqliteCheckpointer partitions by thread_id so
+        # HITL interrupt/resume survives a restart. Local import avoids a cycle.
+        from agents.graph.sqlite_checkpointer import SqliteCheckpointer
+        _coin_trading_graph = compile_coin_trading_graph(checkpointer=SqliteCheckpointer())
     return _coin_trading_graph
 
 
@@ -232,9 +235,11 @@ async def resume_coin_after_approval(
         status=approval_status,
     )
 
-    # Resume from interrupt with updated state
+    # Inject the decision into the checkpoint, then resume with astream(None).
+    # (astream(update) would RESTART the graph from its entry, not resume.)
+    await graph.aupdate_state(config, update)
     final_state = None
-    async for event in graph.astream(update, config):
+    async for event in graph.astream(None, config):
         for node_name, node_output in event.items():
             if node_name != "__end__":
                 final_state = node_output

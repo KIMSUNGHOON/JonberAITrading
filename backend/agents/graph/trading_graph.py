@@ -131,7 +131,11 @@ def get_trading_graph() -> StateGraph:
     """
     global _trading_graph
     if _trading_graph is None:
-        _trading_graph = compile_trading_graph()
+        # Durable persistence (P6): SqliteCheckpointer (session_id=None → partitions
+        # by thread_id) so HITL interrupt/resume survives a restart. Local import
+        # avoids an import cycle.
+        from agents.graph.sqlite_checkpointer import SqliteCheckpointer
+        _trading_graph = compile_trading_graph(checkpointer=SqliteCheckpointer())
     return _trading_graph
 
 
@@ -232,9 +236,11 @@ async def resume_after_approval(
         status=approval_status,
     )
 
-    # Resume from interrupt with updated state
+    # Inject the decision into the checkpoint, then resume with astream(None).
+    # (astream(update) would RESTART the graph from its entry, not resume.)
+    await graph.aupdate_state(config, update)
     final_state = None
-    async for event in graph.astream(update, config):
+    async for event in graph.astream(None, config):
         for node_name, node_output in event.items():
             if node_name != "__end__":
                 final_state = node_output

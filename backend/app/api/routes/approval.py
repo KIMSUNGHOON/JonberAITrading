@@ -115,11 +115,12 @@ async def submit_approval(request: ApprovalRequest):
 
     execution_status = None
 
-    # Inject the human decision INTO the graph checkpoint so the conditional edge
-    # (should_continue_*_execution) sees approval_status on resume. The old code
-    # passed None here, so the graph resumed WITHOUT the decision and always routed
-    # to 'end' — the execute node never fired and rejects never re-analyzed. This
-    # mirrors the resume_*_after_approval helpers' astream(update) pattern.
+    # Inject the human decision INTO the persisted graph checkpoint, THEN resume
+    # with astream(None). Passing the dict to astream() instead RESTARTS the graph
+    # from its entry node (re-running the whole analysis) rather than resuming from
+    # the approval interrupt — so aupdate_state + astream(None) is the correct
+    # LangGraph resume, and it also lets should_continue_*_execution see
+    # approval_status (the old astream(None)-without-update routed to 'end').
     resume_update = {
         "approval_status": request.decision,
         "user_feedback": request.feedback,
@@ -127,8 +128,9 @@ async def submit_approval(request: ApprovalRequest):
     }
 
     try:
-        # Continue from interrupt with the decision applied to graph state
-        async for event in graph.astream(resume_update, config):
+        await graph.aupdate_state(config, resume_update)
+        # Continue from the interrupt (decision already applied to graph state)
+        async for event in graph.astream(None, config):
             for node_name, node_output in event.items():
                 if node_name != "__end__":
                     if isinstance(node_output, dict):
