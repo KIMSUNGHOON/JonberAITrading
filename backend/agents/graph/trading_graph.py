@@ -12,7 +12,7 @@ from typing import Optional
 
 import structlog
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, StateGraph
+from langgraph.graph import StateGraph
 
 from agents.graph.nodes import (
     execution_node,
@@ -27,6 +27,7 @@ from agents.graph.nodes import (
     technical_analysis_node,
 )
 from agents.graph.state import TradingState, create_initial_state
+from agents.graph.graph_factory import build_analysis_graph, compile_analysis_graph
 
 logger = structlog.get_logger()
 
@@ -63,68 +64,22 @@ def create_trading_graph() -> StateGraph:
                                                  [End]
     ```
     """
-    # Initialize graph with TradingState TypedDict for proper state accumulation
-    workflow = StateGraph(TradingState)
-
-    # -------------------------------------------
-    # Add Nodes
-    # -------------------------------------------
-
-    # Stage 1: Task Decomposition
-    workflow.add_node("decompose", task_decomposition_node)
-
-    # Stage 2: Analysis (Sequential)
-    # Note: For true parallel execution, use branching or subgraphs
-    workflow.add_node("technical", technical_analysis_node)
-    workflow.add_node("fundamental", fundamental_analysis_node)
-    workflow.add_node("sentiment", sentiment_analysis_node)
-    workflow.add_node("risk", risk_assessment_node)
-
-    # Stage 3: Strategic Decision
-    workflow.add_node("decision", strategic_decision_node)
-
-    # Stage 4: Human Approval
-    workflow.add_node("approval", human_approval_node)
-
-    # Stage 4.5: Re-analysis (when user rejects)
-    workflow.add_node("re_analyze", re_analyze_node)
-
-    # Stage 5: Execution
-    workflow.add_node("execute", execution_node)
-
-    # -------------------------------------------
-    # Define Edges
-    # -------------------------------------------
-
-    # Set entry point
-    workflow.set_entry_point("decompose")
-
-    # Sequential analysis flow
-    workflow.add_edge("decompose", "technical")
-    workflow.add_edge("technical", "fundamental")
-    workflow.add_edge("fundamental", "sentiment")
-    workflow.add_edge("sentiment", "risk")
-    workflow.add_edge("risk", "decision")
-    workflow.add_edge("decision", "approval")
-
-    # Conditional edge after approval
-    workflow.add_conditional_edges(
-        "approval",
-        should_continue_to_execution,
-        {
-            "execute": "execute",
-            "re_analyze": "re_analyze",
-            "end": END,
-        },
+    # Topology is shared across all 3 market stacks; see graph_factory.
+    return build_analysis_graph(
+        TradingState,
+        entry_node=("decompose", task_decomposition_node),
+        analysis_nodes=[
+            ("technical", technical_analysis_node),
+            ("fundamental", fundamental_analysis_node),
+            ("sentiment", sentiment_analysis_node),
+            ("risk", risk_assessment_node),
+        ],
+        decision_node=strategic_decision_node,
+        approval_node=human_approval_node,
+        re_analyze_node=re_analyze_node,
+        execute_node=execution_node,
+        cond_fn=should_continue_to_execution,
     )
-
-    # Re-analysis loops back to decompose for fresh analysis
-    workflow.add_edge("re_analyze", "decompose")
-
-    # Execution leads to end
-    workflow.add_edge("execute", END)
-
-    return workflow
 
 
 def compile_trading_graph(
@@ -142,22 +97,18 @@ def compile_trading_graph(
     Returns:
         Compiled StateGraph ready for execution.
     """
-    workflow = create_trading_graph()
-
     if checkpointer is None:
         checkpointer = MemorySaver()
 
-    # Configure interrupts for HITL
-    interrupt_before = ["approval"] if interrupt_before_approval else []
-
-    compiled = workflow.compile(
-        checkpointer=checkpointer,
-        interrupt_before=interrupt_before,
+    compiled = compile_analysis_graph(
+        create_trading_graph(),
+        checkpointer,
+        interrupt_before_approval=interrupt_before_approval,
     )
 
     logger.info(
         "trading_graph_compiled",
-        interrupt_before=interrupt_before,
+        interrupt_before=["approval"] if interrupt_before_approval else [],
         checkpointer_type=type(checkpointer).__name__,
     )
 

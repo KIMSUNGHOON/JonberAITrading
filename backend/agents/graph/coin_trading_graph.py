@@ -12,7 +12,7 @@ from typing import Optional
 
 import structlog
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, StateGraph
+from langgraph.graph import StateGraph
 
 from agents.graph.coin_nodes import (
     coin_data_collection_node,
@@ -27,6 +27,7 @@ from agents.graph.coin_nodes import (
     should_continue_coin_execution,
 )
 from agents.graph.coin_state import CoinTradingState, create_coin_initial_state
+from agents.graph.graph_factory import build_analysis_graph, compile_analysis_graph
 
 logger = structlog.get_logger()
 
@@ -63,67 +64,22 @@ def create_coin_trading_graph() -> StateGraph:
                                                       [End]    [Data Collection]
     ```
     """
-    # Initialize graph with CoinTradingState TypedDict
-    workflow = StateGraph(CoinTradingState)
-
-    # -------------------------------------------
-    # Add Nodes
-    # -------------------------------------------
-
-    # Stage 1: Data Collection from Upbit
-    workflow.add_node("data_collection", coin_data_collection_node)
-
-    # Stage 2: Analysis (Sequential)
-    workflow.add_node("technical", coin_technical_analysis_node)
-    workflow.add_node("market", coin_market_analysis_node)
-    workflow.add_node("sentiment", coin_sentiment_analysis_node)
-    workflow.add_node("risk", coin_risk_assessment_node)
-
-    # Stage 3: Strategic Decision
-    workflow.add_node("decision", coin_strategic_decision_node)
-
-    # Stage 4: Human Approval
-    workflow.add_node("approval", coin_human_approval_node)
-
-    # Stage 4.5: Re-analysis (when user rejects)
-    workflow.add_node("re_analyze", coin_re_analyze_node)
-
-    # Stage 5: Execution
-    workflow.add_node("execute", coin_execution_node)
-
-    # -------------------------------------------
-    # Define Edges
-    # -------------------------------------------
-
-    # Set entry point
-    workflow.set_entry_point("data_collection")
-
-    # Sequential analysis flow
-    workflow.add_edge("data_collection", "technical")
-    workflow.add_edge("technical", "market")
-    workflow.add_edge("market", "sentiment")
-    workflow.add_edge("sentiment", "risk")
-    workflow.add_edge("risk", "decision")
-    workflow.add_edge("decision", "approval")
-
-    # Conditional edge after approval
-    workflow.add_conditional_edges(
-        "approval",
-        should_continue_coin_execution,
-        {
-            "execute": "execute",
-            "re_analyze": "re_analyze",
-            "end": END,
-        },
+    # Topology is shared across all 3 market stacks; see graph_factory.
+    return build_analysis_graph(
+        CoinTradingState,
+        entry_node=("data_collection", coin_data_collection_node),
+        analysis_nodes=[
+            ("technical", coin_technical_analysis_node),
+            ("market", coin_market_analysis_node),
+            ("sentiment", coin_sentiment_analysis_node),
+            ("risk", coin_risk_assessment_node),
+        ],
+        decision_node=coin_strategic_decision_node,
+        approval_node=coin_human_approval_node,
+        re_analyze_node=coin_re_analyze_node,
+        execute_node=coin_execution_node,
+        cond_fn=should_continue_coin_execution,
     )
-
-    # Re-analysis loops back to data collection
-    workflow.add_edge("re_analyze", "data_collection")
-
-    # Execution leads to end
-    workflow.add_edge("execute", END)
-
-    return workflow
 
 
 def compile_coin_trading_graph(
@@ -140,22 +96,18 @@ def compile_coin_trading_graph(
     Returns:
         Compiled StateGraph ready for execution.
     """
-    workflow = create_coin_trading_graph()
-
     if checkpointer is None:
         checkpointer = MemorySaver()
 
-    # Configure interrupts for HITL
-    interrupt_before = ["approval"] if interrupt_before_approval else []
-
-    compiled = workflow.compile(
-        checkpointer=checkpointer,
-        interrupt_before=interrupt_before,
+    compiled = compile_analysis_graph(
+        create_coin_trading_graph(),
+        checkpointer,
+        interrupt_before_approval=interrupt_before_approval,
     )
 
     logger.info(
         "coin_trading_graph_compiled",
-        interrupt_before=interrupt_before,
+        interrupt_before=["approval"] if interrupt_before_approval else [],
         checkpointer_type=type(checkpointer).__name__,
     )
 
