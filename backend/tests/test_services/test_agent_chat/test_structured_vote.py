@@ -40,7 +40,8 @@ from services.agent_chat.models import MarketContext, VoteType
 
 def _ctx():
     return MarketContext(ticker="005930", stock_name="삼성전자",
-                         current_price=72500.0, price_change_pct=0.5)
+                         current_price=72500.0, price_change_pct=0.5,
+                         news_sentiment="긍정", news_count=5)
 
 
 ANALYSTS = [
@@ -77,3 +78,15 @@ async def test_analyst_vote_falls_back_to_regex(mock_get, module, cls):
     agent = getattr(importlib.import_module(module), cls)()
     vote = await agent.vote(_ctx(), [])
     assert vote.vote == VoteType.BUY          # regex fallback still works
+
+
+@patch("services.agent_chat.agents.base_agent.get_llm_provider")
+async def test_sentiment_structured_caps_confidence_without_news(mock_get):
+    provider = MagicMock()
+    provider.generate_structured = AsyncMock(return_value={"vote": "buy", "confidence": 0.9})
+    mock_get.return_value = provider
+    from services.agent_chat.agents.sentiment_agent import SentimentDiscussionAgent
+    ctx_no_news = MarketContext(ticker="005930", stock_name="삼성전자",
+                                current_price=72500.0, price_change_pct=0.5)  # no news
+    vote = await SentimentDiscussionAgent().vote(ctx_no_news, [])
+    assert vote.confidence == 0.5  # structured confidence 0.9 capped to 0.5 (no news)

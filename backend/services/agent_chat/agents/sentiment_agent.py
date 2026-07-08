@@ -259,13 +259,15 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
         data = await self._structured_vote(messages, schema=VOTE_SCHEMA)
         if data is not None:
             try:
-                # Structured path: the LLM reasons about news-data availability
-                # itself (it's given news_sentiment/news_count in the prompt),
-                # so the legacy no-news confidence cap below is not reapplied here.
+                confidence = float(data["confidence"])
+                # Preserve the no-news confidence cap (same rule as the regex
+                # fallback below): sentiment is unreliable without news data.
+                if not context.news_sentiment or context.news_count == 0:
+                    confidence = min(confidence, 0.5)
                 return AgentVote(
                     agent_type=self.agent_type,
                     vote=VoteType(str(data["vote"]).strip().lower()),
-                    confidence=float(data["confidence"]),
+                    confidence=confidence,
                     reasoning=data.get("reasoning") or "",
                     key_factors=data.get("key_factors") or [],
                 )
