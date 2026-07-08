@@ -26,7 +26,11 @@ from agents.graph.kr_stock_state import (
 )
 from app.config import settings
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
-from services.kiwoom import OrderType
+from services.execution import (
+    KiwoomExecutionAdapter,
+    ExecutionSide,
+    ExecutionOrderType,
+)
 
 logger = structlog.get_logger()
 
@@ -222,28 +226,16 @@ async def kr_stock_execution_node(state: dict) -> dict:
             "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
         }
 
-    # Execute order via Kiwoom API (using shared singleton)
+    # Execute via the broker-agnostic execution path. KiwoomExecutionAdapter wraps
+    # the shared client (mock/live gated inside it by KIWOOM_IS_MOCK).
     try:
         client = await get_shared_kiwoom_client_async()
+        adapter = KiwoomExecutionAdapter(client)
 
-        # BUY or ADD → Execute buy order
         if _is_buy_action(action):
-            order_response = await client.place_buy_order(
-                stk_cd=stk_cd,
-                qty=quantity,
-                price=entry_price,
-                order_type=OrderType.LIMIT,
-            )
-
-        # SELL or REDUCE → Execute sell order
+            exec_side = ExecutionSide.BUY
         elif _is_sell_action(action):
-            order_response = await client.place_sell_order(
-                stk_cd=stk_cd,
-                qty=quantity,
-                price=entry_price,
-                order_type=OrderType.LIMIT,
-            )
-
+            exec_side = ExecutionSide.SELL
         else:
             # Should not reach here due to no-trade check above
             reasoning = f"[실행] 알 수 없는 액션: {action.value}"
@@ -253,6 +245,15 @@ async def kr_stock_execution_node(state: dict) -> dict:
                 "current_stage": KRStockAnalysisStage.COMPLETE,
                 "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
             }
+
+        result = await adapter.place(
+            ticker=stk_cd,
+            side=exec_side,
+            qty=quantity,
+            price=entry_price,
+            order_type=ExecutionOrderType.LIMIT,
+        )
+        order_response = result.raw  # native OrderResponse — ord_no/return_code used below
 
         logger.info(
             "kr_stock_order_placed",

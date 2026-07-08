@@ -43,6 +43,11 @@ from agents.prompts import (
 from app.config import settings
 from app.api.routes.settings import get_upbit_access_key, get_upbit_secret_key
 from services.upbit import UpbitClient
+from services.execution import (
+    UpbitExecutionAdapter,
+    ExecutionSide,
+    ExecutionOrderType,
+)
 
 logger = structlog.get_logger()
 
@@ -810,19 +815,20 @@ async def _execute_live_order(
                 "reasoning_log": add_coin_reasoning_log(state, reasoning),
             }
 
-        # Create Upbit client and execute order (using runtime or environment keys)
+        # Create Upbit client and execute via the broker-agnostic execution path.
         async with UpbitClient(
             access_key=get_upbit_access_key(),
             secret_key=get_upbit_secret_key(),
         ) as client:
-            # Place the order
-            order = await client.place_order(
-                market=market,
-                side=side,
-                ord_type=ord_type,
+            exec_side = ExecutionSide.BUY if side == "bid" else ExecutionSide.SELL
+            result = await UpbitExecutionAdapter(client).place(
+                ticker=market,
+                side=exec_side,
+                qty=volume,
                 price=price,
-                volume=volume,
+                order_type=ExecutionOrderType.LIMIT,
             )
+            order = result.raw  # native Order — uuid/state/executed_volume used below
 
             logger.info(
                 "live_order_placed",
