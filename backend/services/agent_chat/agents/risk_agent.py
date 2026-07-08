@@ -306,8 +306,8 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
                         if data.get("suggested_take_profit_pct") is not None
                         else self._calculate_take_profit(risk_level),
                 )
-            except (ValueError, KeyError):
-                pass  # malformed structured payload -> regex fallback
+            except (ValueError, KeyError, TypeError):
+                pass  # malformed structured payload (incl. null confidence) -> regex fallback
 
         response = await self._call_llm(self.system_prompt, prompt)
 

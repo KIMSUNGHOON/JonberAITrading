@@ -112,7 +112,13 @@ class BaseDiscussionAgent(ABC):
         """
         try:
             return await self.llm.generate_structured(messages, schema, task=task)
-        except (ValueError, KeyError) as e:
+        except Exception as e:
+            # Broad by design: this method's contract is "dict or None so the
+            # caller uses the regex fallback". ValueError/KeyError (parse/missing
+            # keys) AND router-level failures (LLMAllBackendsFailed, timeout,
+            # network — all Exception, not ValueError) must degrade to regex,
+            # never escape vote() and get the vote dropped from consensus.
+            # (CancelledError subclasses BaseException, so it still propagates.)
             logger.warning("structured_vote_failed", agent=self.agent_type.value, error=str(e))
             return None
 

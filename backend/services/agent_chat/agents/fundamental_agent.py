@@ -267,8 +267,8 @@ PER: {per}배 / PBR: {pbr}배
                     reasoning=data.get("reasoning") or "",
                     key_factors=data.get("key_factors") or [],
                 )
-            except (ValueError, KeyError):
-                pass  # malformed structured payload -> regex fallback
+            except (ValueError, KeyError, TypeError):
+                pass  # malformed structured payload (incl. null confidence) -> regex fallback
 
         response = await self._call_llm(self.system_prompt, prompt)
         return AgentVote(

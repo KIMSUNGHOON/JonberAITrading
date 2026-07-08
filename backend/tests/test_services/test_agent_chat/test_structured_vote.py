@@ -120,3 +120,83 @@ async def test_risk_vote_falls_back_to_regex(mock_get):
     vote = await RiskDiscussionAgent().vote(_ctx(), [])
     assert vote.vote == VoteType.HOLD
     assert vote.suggested_position_pct is not None  # _calculate_* fallback populated it
+
+
+# --- Robust fallback guard (whole-feature review Important: fallback too narrow) ---
+
+from agents.llm.backends.base import LLMAllBackendsFailed
+
+
+@patch("services.agent_chat.agents.base_agent.get_llm_provider")
+async def test_structured_vote_returns_none_on_backend_failure(mock_get):
+    # A router-level failure (LLMAllBackendsFailed subclasses Exception, NOT
+    # ValueError) must degrade to None so the caller uses the regex fallback,
+    # instead of escaping vote() and getting the whole vote dropped from consensus.
+    provider = MagicMock()
+    provider.generate_structured = AsyncMock(side_effect=LLMAllBackendsFailed("all down"))
+    mock_get.return_value = provider
+    from services.agent_chat.agents.technical_agent import TechnicalDiscussionAgent
+    result = await TechnicalDiscussionAgent()._structured_vote([], schema=VOTE_SCHEMA)
+    assert result is None
+
+
+@pytest.mark.parametrize("module,cls", ANALYSTS)
+@patch("services.agent_chat.agents.base_agent.get_llm_provider")
+async def test_analyst_vote_falls_back_on_backend_failure(mock_get, module, cls):
+    # LLM backend failure must not escape vote(); regex fallback still yields a vote.
+    import importlib
+    provider = MagicMock()
+    provider.generate_structured = AsyncMock(side_effect=LLMAllBackendsFailed("all down"))
+    provider.generate = AsyncMock(return_value="최종 판단: 매수 (BUY), 신뢰도: 70%")
+    mock_get.return_value = provider
+    agent = getattr(importlib.import_module(module), cls)()
+    vote = await agent.vote(_ctx(), [])  # must not raise
+    assert vote.vote == VoteType.BUY
+
+
+@pytest.mark.parametrize("module,cls", ANALYSTS)
+@patch("services.agent_chat.agents.base_agent.get_llm_provider")
+async def test_analyst_vote_falls_back_on_null_confidence(mock_get, module, cls):
+    # generate_structured checks key PRESENCE only, so {"confidence": null} passes
+    # through; float(None) raises TypeError, which must trigger the regex fallback
+    # (not escape vote() and drop the vote).
+    import importlib
+    provider = MagicMock()
+    provider.generate_structured = AsyncMock(
+        return_value={"vote": "buy", "confidence": None})
+    provider.generate = AsyncMock(return_value="최종 판단: 매수 (BUY), 신뢰도: 70%")
+    mock_get.return_value = provider
+    agent = getattr(importlib.import_module(module), cls)()
+    vote = await agent.vote(_ctx(), [])  # must not raise
+    assert vote.vote == VoteType.BUY
+
+
+@patch("services.agent_chat.agents.base_agent.get_llm_provider")
+async def test_risk_vote_falls_back_on_null_confidence(mock_get):
+    provider = MagicMock()
+    provider.generate_structured = AsyncMock(
+        return_value={"vote": "hold", "confidence": None})
+    provider.generate = AsyncMock(return_value="위험도 판단: 보유 (HOLD), 신뢰도: 60%")
+    mock_get.return_value = provider
+    from services.agent_chat.agents.risk_agent import RiskDiscussionAgent
+    vote = await RiskDiscussionAgent().vote(_ctx(), [])  # must not raise
+    assert vote.vote == VoteType.HOLD
+    assert vote.suggested_position_pct is not None
+
+
+@patch("services.agent_chat.agents.base_agent.get_llm_provider")
+async def test_risk_vote_backfills_missing_structured_risk_fields(mock_get):
+    # Structured success WITHOUT the 3 risk fields: use the structured vote/confidence
+    # but backfill position/stop/take via _calculate_* (per-field fallback path).
+    provider = MagicMock()
+    provider.generate_structured = AsyncMock(
+        return_value={"vote": "hold", "confidence": 0.6})
+    provider.generate = AsyncMock(return_value="should-not-be-used")
+    mock_get.return_value = provider
+    from services.agent_chat.agents.risk_agent import RiskDiscussionAgent
+    vote = await RiskDiscussionAgent().vote(_ctx(), [])
+    assert vote.vote == VoteType.HOLD
+    assert vote.confidence == 0.6
+    assert vote.suggested_position_pct is not None
+    assert vote.suggested_stop_loss_pct is not None
+    assert vote.suggested_take_profit_pct is not None
