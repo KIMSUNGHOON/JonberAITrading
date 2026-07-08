@@ -594,7 +594,7 @@ async def re_analyze_node(state: dict) -> dict:
     # Clear previous analysis results for fresh re-analysis
     # Keep ticker and user_input, but reset analyses
     return {
-        "current_stage": AnalysisStage.DECOMPOSE,
+        "current_stage": AnalysisStage.DECOMPOSITION,
         "technical_analysis": None,
         "fundamental_analysis": None,
         "sentiment_analysis": None,

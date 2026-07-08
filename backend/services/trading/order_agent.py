@@ -23,6 +23,7 @@ from .market_hours import (
     is_valid_tick_price,
     get_krx_tick_size,
 )
+from services.kiwoom.models import OrderType as KiwoomOrderType
 
 logger = logging.getLogger(__name__)
 
@@ -337,11 +338,11 @@ class OrderAgent:
         order_id: str,
         order: OrderRequest,
     ) -> OrderResult:
-        """Execute order via Kiwoom API."""
-        # Map to Kiwoom order type
-        order_type_code = "00" if order.order_type == OrderType.LIMIT else "03"
-        side_code = "01" if order.side == OrderSide.BUY else "02"
+        """Execute order via the Kiwoom client (place_buy_order / place_sell_order).
 
+        Dispatches by side and passes the Kiwoom OrderType enum; the client returns
+        an OrderResponse (is_success == return_code == 0), not a raw dict.
+        """
         # Apply tick size rounding for limit orders
         price_to_use = 0
         if order.price and order.order_type == OrderType.LIMIT:
@@ -356,19 +357,35 @@ class OrderAgent:
                     f"(tick size: {get_krx_tick_size(order.price)})"
                 )
 
+        kiwoom_order_type = (
+            KiwoomOrderType.LIMIT
+            if order.order_type == OrderType.LIMIT
+            else KiwoomOrderType.MARKET
+        )
+        # Market orders send no price; limit orders send the tick-rounded price.
+        price_arg = (
+            int(price_to_use)
+            if order.order_type == OrderType.LIMIT and price_to_use
+            else None
+        )
+        place = (
+            self.kiwoom.place_buy_order
+            if order.side == OrderSide.BUY
+            else self.kiwoom.place_sell_order
+        )
+
         try:
-            response = await self.kiwoom.place_order(
-                order_type=side_code,
-                stock_code=order.ticker,
-                quantity=order.quantity,
-                price=price_to_use,
-                price_type=order_type_code,
+            response = await place(
+                stk_cd=order.ticker,
+                qty=order.quantity,
+                price=price_arg,
+                order_type=kiwoom_order_type,
             )
 
-            # Parse response
-            if response.get("rt_cd") == "0":
+            # Parse OrderResponse (return_code == 0 => success)
+            if response.is_success:
                 return OrderResult(
-                    order_id=response.get("order_no", order_id),
+                    order_id=response.ord_no or order_id,
                     ticker=order.ticker,
                     side=order.side,
                     requested_quantity=order.quantity,
@@ -385,7 +402,7 @@ class OrderAgent:
                     requested_quantity=order.quantity,
                     filled_quantity=0,
                     status="rejected",
-                    message=response.get("msg1", "Unknown error"),
+                    message=response.return_msg or "Unknown error",
                 )
 
         except Exception as e:
