@@ -115,9 +115,20 @@ async def submit_approval(request: ApprovalRequest):
 
     execution_status = None
 
+    # Inject the human decision INTO the graph checkpoint so the conditional edge
+    # (should_continue_*_execution) sees approval_status on resume. The old code
+    # passed None here, so the graph resumed WITHOUT the decision and always routed
+    # to 'end' — the execute node never fired and rejects never re-analyzed. This
+    # mirrors the resume_*_after_approval helpers' astream(update) pattern.
+    resume_update = {
+        "approval_status": request.decision,
+        "user_feedback": request.feedback,
+        "awaiting_approval": False,
+    }
+
     try:
-        # Continue from interrupt with updated state
-        async for event in graph.astream(None, config):
+        # Continue from interrupt with the decision applied to graph state
+        async for event in graph.astream(resume_update, config):
             for node_name, node_output in event.items():
                 if node_name != "__end__":
                     if isinstance(node_output, dict):
@@ -175,30 +186,23 @@ async def submit_approval(request: ApprovalRequest):
                         )
                         allocation_rationale = f"Added {stock_name or ticker} to Watch List"
 
-                    # Handle BUY/SELL actions - send to trade queue
-                    elif action in ("BUY", "SELL") and ticker:
-                        allocation = await coordinator.on_trade_approved(
-                            session_id=request.session_id,
-                            ticker=ticker,
-                            stock_name=stock_name,
-                            action=action,
-                            entry_price=proposal.get("entry_price", 0),
-                            stop_loss=proposal.get("stop_loss"),
-                            take_profit=proposal.get("take_profit"),
-                            risk_score=int(proposal.get("risk_score", 5) * 10),  # Convert 0-1 to 1-10
-                            quantity_override=proposal.get("quantity"),
+                    # Handle BUY/SELL/ADD/REDUCE - the graph execution node is the
+                    # SOLE executor: should_continue_*_execution -> "execute" already
+                    # placed the order above (mock-gated by KIWOOM_IS_MOCK / Upbit
+                    # paper mode). The coordinator is intentionally NOT called here to
+                    # avoid double execution.
+                    elif action in ("BUY", "SELL", "ADD", "REDUCE") and ticker:
+                        exec_status = state.get("execution_status", "completed")
+                        allocation_rationale = (
+                            f"{action} executed via trading graph ({exec_status})"
                         )
 
-                        # Store rationale for response message
-                        allocation_rationale = allocation.rationale
-
                         logger.info(
-                            "auto_trading_connected",
+                            "graph_execution_result",
                             session_id=request.session_id,
                             ticker=ticker,
                             action=action,
-                            quantity=allocation.quantity,
-                            rationale=allocation.rationale,
+                            execution_status=exec_status,
                         )
 
                 except Exception as e:
