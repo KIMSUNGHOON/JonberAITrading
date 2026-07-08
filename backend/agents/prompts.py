@@ -372,7 +372,7 @@ KR_STOCK_STRATEGIC_DECISION_PROMPT = """당신은 한국 주식 포트폴리오 
 기술적, 기본적, 심리, 리스크 분석을 종합하세요.
 
 결정 사항:
-- 명확한 행동: BUY, SELL, HOLD 중 선택
+- 명확한 행동: 현재 포지션을 고려해 BUY, SELL, HOLD, ADD, REDUCE, WATCH, AVOID 중 하나 선택
 - 거래 시: 수량, 진입가, 손절가, 익절가
 - 결정 근거 (모든 요인 고려)
 - 상승 시나리오 (Bull Case)
@@ -389,4 +389,11 @@ KR_STOCK_STRATEGIC_DECISION_PROMPT = """당신은 한국 주식 포트폴리오 
 중요:
 - 모든 응답은 반드시 한국어로 작성하세요. 영어를 사용하지 마세요.
 - 마크다운 형식으로 간결하게 작성하세요. 불필요한 빈 줄은 넣지 마세요.
-- 리스트 항목 사이에 빈 줄을 넣지 마세요."""
+- 리스트 항목 사이에 빈 줄을 넣지 마세요.
+
+결정은 다음 키를 가진 JSON 객체로 반환하세요:
+- "action": BUY/SELL/HOLD/ADD/REDUCE/WATCH/AVOID 중 현재 포지션을 고려해 하나
+- "confidence": 0.0~1.0 사이 숫자
+- "rationale": 결정 근거 (한국어)
+- "bull_case": 문자열 배열
+- "bear_case": 문자열 배열"""

@@ -21,6 +21,8 @@ from agents.graph.kr_stock_state import (
     get_all_kr_stock_analyses,
     kr_stock_analysis_dict_to_context_string,
 )
+from agents.graph.decision_policy import decide_action, position_feasible_set
+from agents.llm.tasks import DECISION_SCHEMA, TaskType
 from agents.llm_provider import get_llm_provider
 from agents.prompts import (
     KR_STOCK_RISK_ASSESSOR_PROMPT,
@@ -178,14 +180,27 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
     ]
 
     logger.debug("llm_request", node="kr_stock_strategic_decision")
-    response = await llm.generate(messages)
 
-    # Determine action considering existing position
-    action = _signal_to_action_with_position(
+    # Phase 3: the LLM decides the action (structured), guarded by position
+    # feasibility, with the existing rule signal as the fallback.
+    rule_action = _signal_to_action_with_position(
         signal=consensus_signal,
         has_position=has_position,
         position_pnl_pct=position_pnl_pct,
     )
+    action, response, decision_source = await decide_action(
+        llm,
+        messages,
+        trade_action_cls=TradeAction,
+        rule_action=rule_action,
+        feasible=position_feasible_set(has_position),
+        decision_schema=DECISION_SCHEMA,
+        task=TaskType.STRATEGIC_DECISION,
+    )
+    if not response:
+        response = (
+            f"[룰 기반 결정] 컨센서스 {consensus_signal.value} → {action.value} (LLM 실패)"
+        )
 
     logger.info(
         "kr_stock_action_determined",
@@ -194,6 +209,7 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         has_position=has_position,
         position_pnl_pct=position_pnl_pct,
         action=action.value,
+        decision_source=decision_source,
     )
 
     # Get risk parameters
