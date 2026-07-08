@@ -23,7 +23,11 @@ from .market_hours import (
     is_valid_tick_price,
     get_krx_tick_size,
 )
-from services.kiwoom.models import OrderType as KiwoomOrderType
+from services.execution import (
+    KiwoomExecutionAdapter,
+    ExecutionSide,
+    ExecutionOrderType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -357,35 +361,29 @@ class OrderAgent:
                     f"(tick size: {get_krx_tick_size(order.price)})"
                 )
 
-        kiwoom_order_type = (
-            KiwoomOrderType.LIMIT
+        exec_order_type = (
+            ExecutionOrderType.LIMIT
             if order.order_type == OrderType.LIMIT
-            else KiwoomOrderType.MARKET
+            else ExecutionOrderType.MARKET
         )
-        # Market orders send no price; limit orders send the tick-rounded price.
-        price_arg = (
-            int(price_to_use)
-            if order.order_type == OrderType.LIMIT and price_to_use
-            else None
-        )
-        place = (
-            self.kiwoom.place_buy_order
-            if order.side == OrderSide.BUY
-            else self.kiwoom.place_sell_order
+        exec_side = (
+            ExecutionSide.BUY if order.side == OrderSide.BUY else ExecutionSide.SELL
         )
 
         try:
-            response = await place(
-                stk_cd=order.ticker,
+            # Route through the single broker-agnostic execution path. The adapter
+            # sends the tick-rounded price for LIMIT and no price for MARKET.
+            result = await KiwoomExecutionAdapter(self.kiwoom).place(
+                ticker=order.ticker,
+                side=exec_side,
                 qty=order.quantity,
-                price=price_arg,
-                order_type=kiwoom_order_type,
+                price=price_to_use,
+                order_type=exec_order_type,
             )
 
-            # Parse OrderResponse (return_code == 0 => success)
-            if response.is_success:
+            if result.success:
                 return OrderResult(
-                    order_id=response.ord_no or order_id,
+                    order_id=result.order_id or order_id,
                     ticker=order.ticker,
                     side=order.side,
                     requested_quantity=order.quantity,
@@ -402,7 +400,7 @@ class OrderAgent:
                     requested_quantity=order.quantity,
                     filled_quantity=0,
                     status="rejected",
-                    message=response.return_msg or "Unknown error",
+                    message=result.message or "Unknown error",
                 )
 
         except Exception as e:

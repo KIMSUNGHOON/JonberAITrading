@@ -249,35 +249,33 @@ async def create_order(request: KRStockOrderRequest):
     client = await get_shared_kiwoom_client_async()
 
     try:
-        from services.kiwoom.models import OrderType as KiwoomOrderType
-
-        kiwoom_order_type = (
-            KiwoomOrderType.MARKET if request.ord_type == "market" else KiwoomOrderType.LIMIT
-        )
-        # Market orders send no price; limit orders send the requested price.
-        price_arg = (
-            int(request.price) if (request.ord_type == "limit" and request.price) else None
-        )
-        place = (
-            client.place_buy_order if request.side == "buy" else client.place_sell_order
+        from services.execution import (
+            KiwoomExecutionAdapter,
+            ExecutionSide,
+            ExecutionOrderType,
         )
 
-        order = await place(
-            stk_cd=request.stk_cd,
+        result = await KiwoomExecutionAdapter(client).place(
+            ticker=request.stk_cd,
+            side=ExecutionSide.BUY if request.side == "buy" else ExecutionSide.SELL,
             qty=request.quantity,
-            price=price_arg,
-            order_type=kiwoom_order_type,
+            price=request.price,
+            order_type=(
+                ExecutionOrderType.MARKET
+                if request.ord_type == "market"
+                else ExecutionOrderType.LIMIT
+            ),
         )
 
         logger.info(
             "order_created",
-            order_id=order.ord_no,
+            order_id=result.order_id,
             stk_cd=request.stk_cd,
             side=request.side,
         )
 
         return KRStockOrderResponse(
-            order_id=order.ord_no,
+            order_id=result.order_id,
             stk_cd=request.stk_cd,
             stk_nm=None,
             side=request.side,
@@ -286,7 +284,7 @@ async def create_order(request: KRStockOrderRequest):
             quantity=request.quantity,
             executed_quantity=0,
             remaining_quantity=request.quantity,
-            status="pending" if order.is_success else "rejected",
+            status="pending" if result.success else "rejected",
             created_at=datetime.now(timezone.utc),
         )
 
