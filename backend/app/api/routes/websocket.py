@@ -20,9 +20,20 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.api.routes.analysis import get_active_sessions
 from app.api.routes.coin import get_coin_sessions
 from app.api.routes.kr_stocks import get_kr_stock_sessions
+from services.session_manager import get_session_manager
 
 logger = structlog.get_logger()
 router = APIRouter()
+
+# /session/{id} wait intervals. When the session is tracked by the SessionManager,
+# pub/sub notifications are the primary wake source and the poll is only a safety
+# net (covers producers not yet migrated to sm, e.g. the approval resume path).
+# Legacy dict-only sessions keep the original 0.3s poll until their producers are
+# migrated.
+PUSH_SAFETY_POLL_SECONDS = 1.0
+LEGACY_POLL_SECONDS = 0.3
+# Keep the connection open briefly after the complete frame so slow clients read it.
+COMPLETE_LINGER_SECONDS = 2.0
 
 
 # -------------------------------------------
@@ -491,28 +502,254 @@ def _create_reasoning_summary(reasoning_log: list) -> str:
 # -------------------------------------------
 
 
+async def _get_session_snapshot(session_id: str) -> Optional[dict]:
+    """
+    Look up a session in legacy-dict format.
+
+    The legacy per-market dicts stay the read path for existing producers; the
+    SessionManager is the fallback so sm-only sessions (e.g. from the unified
+    analysis routes) stream too. Migrated producers write BOTH (legacy first,
+    then sm) so a pub/sub wake always observes a fresh legacy snapshot.
+    """
+    session = (
+        get_active_sessions().get(session_id)
+        or get_coin_sessions().get(session_id)
+        or get_kr_stock_sessions().get(session_id)
+    )
+    if session is None:
+        sm = await get_session_manager()
+        session = await sm.get_session_dict(session_id)
+    return session
+
+
+class _SessionFrameCursor:
+    """
+    Tracks what one /session connection has already been sent, so both wake
+    sources (SessionManager pub/sub push and the fallback poll) emit each
+    frame exactly once regardless of how often the loop wakes.
+    """
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.last_log_index = 0
+        self.last_status: Optional[str] = None
+        self.last_stage: Optional[str] = None
+        self.proposal_sent = False
+        self.last_position: Optional[dict] = None
+
+    async def emit(self, websocket: WebSocket, session: dict) -> bool:
+        """Send any not-yet-sent frames for this session. True when complete sent."""
+        session_id = self.session_id
+        state = session["state"]
+        current_status = session["status"]
+        reasoning_log = state.get("reasoning_log", [])
+
+        # Send new reasoning log entries
+        if len(reasoning_log) > self.last_log_index:
+            new_entries = reasoning_log[self.last_log_index:]
+            for entry in new_entries:
+                await websocket.send_json({
+                    "type": "reasoning",
+                    "data": entry,
+                    "session_id": session_id,
+                })
+            logger.debug(
+                "websocket_reasoning_sent",
+                session_id=session_id,
+                count=len(new_entries),
+            )
+            self.last_log_index = len(reasoning_log)
+
+        # Extract stage value from enum or string
+        stage = state.get("current_stage", "")
+        if hasattr(stage, "value"):
+            stage = stage.value
+        else:
+            stage = str(stage) if stage else ""
+
+        # Send status updates when status OR stage changes
+        if current_status != self.last_status or stage != self.last_stage:
+            await websocket.send_json({
+                "type": "status",
+                "session_id": session_id,
+                "data": {
+                    "status": current_status,
+                    "stage": stage,
+                    "awaiting_approval": state.get("awaiting_approval", False),
+                },
+            })
+            logger.debug(
+                "websocket_status_sent",
+                session_id=session_id,
+                status=current_status,
+                stage=stage,
+            )
+            self.last_status = current_status
+            self.last_stage = stage
+
+        # Send trade proposal when available (once)
+        # proposal is now a dict after serialization fix
+        if state.get("trade_proposal") and state.get("awaiting_approval") and not self.proposal_sent:
+            proposal = state["trade_proposal"]
+            action = proposal.get("action", "HOLD")
+            if hasattr(action, "value"):
+                action = action.value
+
+            # Support stock (ticker), coin (market), and Korean stock (stk_cd) proposals
+            ticker_or_market = proposal.get("ticker") or proposal.get("market") or proposal.get("stk_cd", "")
+            display_name = proposal.get("stk_nm") or proposal.get("korean_name") or ""
+
+            await websocket.send_json({
+                "type": "proposal",
+                "data": {
+                    "session_id": session_id,
+                    "id": str(proposal.get("id", "")),
+                    "ticker": str(ticker_or_market),
+                    "display_name": display_name,  # Include display name
+                    "action": str(action),
+                    "quantity": safe_int(proposal.get("quantity"), 0),
+                    "entry_price": safe_float(proposal.get("entry_price")),
+                    "stop_loss": safe_float(proposal.get("stop_loss")),
+                    "take_profit": safe_float(proposal.get("take_profit")),
+                    "risk_score": safe_float(proposal.get("risk_score"), 0.5),
+                    "rationale": str(proposal.get("rationale", "") or "")[:500],
+                },
+            })
+            self.proposal_sent = True
+            logger.info(
+                "websocket_proposal_sent",
+                session_id=session_id,
+                ticker=ticker_or_market,
+                action=action,
+            )
+
+        # Send position updates only when the payload actually changes
+        # (position is a dict after serialization)
+        if state.get("active_position"):
+            position = state["active_position"]
+            # Calculate PnL since Position is now a dict
+            # Use safe conversion for numpy types
+            entry_price = safe_float(position.get("entry_price"), 0)
+            current_price = safe_float(position.get("current_price"), 0)
+            quantity = safe_int(position.get("quantity"), 0)
+            pnl = (current_price - entry_price) * quantity
+            pnl_percent = ((current_price / entry_price) - 1) * 100 if entry_price else 0
+
+            # Support both stock (ticker) and coin (market) positions
+            position_ticker = position.get("ticker") or position.get("market", "")
+
+            position_data = {
+                "session_id": session_id,
+                "ticker": str(position_ticker),
+                "quantity": quantity,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "pnl": round(float(pnl), 2),
+                "pnl_percent": round(float(pnl_percent), 2),
+            }
+            if position_data != self.last_position:
+                await websocket.send_json({
+                    "type": "position",
+                    "data": position_data,
+                })
+                self.last_position = position_data
+
+        # Check for completion
+        if current_status in ("completed", "cancelled", "error"):
+            # Build complete message with detailed analysis results
+            complete_data = {
+                "status": current_status,
+                "error": session.get("error"),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            # Include analysis results if completed successfully
+            if current_status == "completed":
+                # INFO level logging for troubleshooting (visible in console)
+                tech_data = state.get("technical_analysis")
+                fund_data = state.get("fundamental_analysis")
+                sent_data = state.get("sentiment_analysis")
+                risk_data = state.get("risk_assessment")
+
+                logger.info(
+                    "websocket_complete_state_check",
+                    session_id=session_id,
+                    state_keys=list(state.keys()) if state else [],
+                    has_technical=tech_data is not None,
+                    has_fundamental=fund_data is not None,
+                    has_sentiment=sent_data is not None,
+                    has_risk=risk_data is not None,
+                    tech_type=type(tech_data).__name__ if tech_data else None,
+                )
+
+                # Extract analysis results from state
+                analysis_results = _extract_analysis_results(state)
+                logger.info(
+                    "websocket_analysis_results_extracted",
+                    session_id=session_id,
+                    has_results=analysis_results is not None,
+                    result_keys=list(analysis_results.keys()) if analysis_results else [],
+                )
+                if analysis_results:
+                    complete_data["analysis_results"] = analysis_results
+                else:
+                    # Log warning if no analysis results were extracted
+                    logger.warning(
+                        "websocket_no_analysis_results",
+                        session_id=session_id,
+                        state_keys=list(state.keys()) if state else [],
+                    )
+
+                # Include trade proposal
+                proposal = state.get("trade_proposal")
+                if proposal:
+                    complete_data["trade_proposal"] = _serialize_proposal(proposal, full=True)
+
+                # Include reasoning summary (last few entries)
+                reasoning_log = state.get("reasoning_log", [])
+                if reasoning_log:
+                    # Create a summary from the last synthesis/final entries
+                    complete_data["reasoning_summary"] = _create_reasoning_summary(reasoning_log)
+
+            await websocket.send_json({
+                "type": "complete",
+                "session_id": session_id,
+                "data": complete_data,
+            })
+            return True
+
+        return False
+
+
 @router.websocket("/session/{session_id}")
 async def websocket_session(websocket: WebSocket, session_id: str):
     """
     WebSocket endpoint for real-time session updates.
 
+    Push-first: subscribes to SessionManager pub/sub and treats notifications
+    as wake signals (state is re-read from the session snapshot, so coalesced/
+    dropped notifications never lose data). A poll remains as fallback — slow
+    (PUSH_SAFETY_POLL_SECONDS) for sm-tracked sessions to cover un-migrated
+    producers, and the original 0.3s for legacy dict-only sessions.
+
     Streams:
     - reasoning: New reasoning log entries
     - status: Status changes
     - proposal: Trade proposal when ready
-    - position: Position updates
+    - position: Position updates (only when the position actually changes)
     - complete: Session completion
 
     Client can send:
     - "ping": Heartbeat (server responds with "pong")
+    - "status": On-demand status frame
     """
     await manager.connect(session_id, websocket)
 
-    # Track what we've sent to avoid duplicates
-    last_log_index = 0
-    last_status: Optional[str] = None
-    last_stage: Optional[str] = None
-    proposal_sent = False
+    sm = await get_session_manager()
+    queue: Optional[asyncio.Queue] = None
+    cursor = _SessionFrameCursor(session_id)
+    recv_task: Optional[asyncio.Task] = None
+    queue_task: Optional[asyncio.Task] = None
 
     try:
         logger.debug(
@@ -520,221 +757,57 @@ async def websocket_session(websocket: WebSocket, session_id: str):
             session_id=session_id,
         )
 
+        queue = await sm.subscribe(session_id)
+        recv_task = asyncio.create_task(websocket.receive_text())
+        queue_task = asyncio.create_task(queue.get())
+
         while True:
-            # Check all session types: US stocks, coins, and Korean stocks (Kiwoom)
-            stock_sessions = get_active_sessions()
-            coin_sessions = get_coin_sessions()
-            kr_stock_sessions = get_kr_stock_sessions()
-
-            session = (
-                stock_sessions.get(session_id) or
-                coin_sessions.get(session_id) or
-                kr_stock_sessions.get(session_id)
-            )
-
-            if session:
-                state = session["state"]
-                current_status = session["status"]
-                reasoning_log = state.get("reasoning_log", [])
-
-                # Send new reasoning log entries
-                if len(reasoning_log) > last_log_index:
-                    new_entries = reasoning_log[last_log_index:]
-                    for entry in new_entries:
-                        await websocket.send_json({
-                            "type": "reasoning",
-                            "data": entry,
-                            "session_id": session_id,
-                        })
-                    logger.debug(
-                        "websocket_reasoning_sent",
-                        session_id=session_id,
-                        count=len(new_entries),
-                    )
-                    last_log_index = len(reasoning_log)
-
-                # Extract stage value from enum or string
-                stage = state.get("current_stage", "")
-                if hasattr(stage, "value"):
-                    stage = stage.value
-                else:
-                    stage = str(stage) if stage else ""
-
-                # Send status updates when status OR stage changes
-                if current_status != last_status or stage != last_stage:
-                    await websocket.send_json({
-                        "type": "status",
-                        "session_id": session_id,
-                        "data": {
-                            "status": current_status,
-                            "stage": stage,
-                            "awaiting_approval": state.get("awaiting_approval", False),
-                        },
-                    })
-                    logger.debug(
-                        "websocket_status_sent",
-                        session_id=session_id,
-                        status=current_status,
-                        stage=stage,
-                    )
-                    last_status = current_status
-                    last_stage = stage
-
-                # Send trade proposal when available (once)
-                # proposal is now a dict after serialization fix
-                if state.get("trade_proposal") and state.get("awaiting_approval") and not proposal_sent:
-                    proposal = state["trade_proposal"]
-                    action = proposal.get("action", "HOLD")
-                    if hasattr(action, "value"):
-                        action = action.value
-
-                    # Support stock (ticker), coin (market), and Korean stock (stk_cd) proposals
-                    ticker_or_market = proposal.get("ticker") or proposal.get("market") or proposal.get("stk_cd", "")
-                    display_name = proposal.get("stk_nm") or proposal.get("korean_name") or ""
-
-                    await websocket.send_json({
-                        "type": "proposal",
-                        "data": {
-                            "session_id": session_id,
-                            "id": str(proposal.get("id", "")),
-                            "ticker": str(ticker_or_market),
-                            "display_name": display_name,  # Include display name
-                            "action": str(action),
-                            "quantity": safe_int(proposal.get("quantity"), 0),
-                            "entry_price": safe_float(proposal.get("entry_price")),
-                            "stop_loss": safe_float(proposal.get("stop_loss")),
-                            "take_profit": safe_float(proposal.get("take_profit")),
-                            "risk_score": safe_float(proposal.get("risk_score"), 0.5),
-                            "rationale": str(proposal.get("rationale", "") or "")[:500],
-                        },
-                    })
-                    proposal_sent = True
-                    logger.info(
-                        "websocket_proposal_sent",
-                        session_id=session_id,
-                        ticker=ticker_or_market,
-                        action=action,
-                    )
-
-                # Send position updates (position is now a dict after serialization)
-                if state.get("active_position"):
-                    position = state["active_position"]
-                    # Calculate PnL since Position is now a dict
-                    # Use safe conversion for numpy types
-                    entry_price = safe_float(position.get("entry_price"), 0)
-                    current_price = safe_float(position.get("current_price"), 0)
-                    quantity = safe_int(position.get("quantity"), 0)
-                    pnl = (current_price - entry_price) * quantity
-                    pnl_percent = ((current_price / entry_price) - 1) * 100 if entry_price else 0
-
-                    # Support both stock (ticker) and coin (market) positions
-                    position_ticker = position.get("ticker") or position.get("market", "")
-
-                    await websocket.send_json({
-                        "type": "position",
-                        "data": {
-                        "session_id": session_id,
-                            "ticker": str(position_ticker),
-                            "quantity": quantity,
-                            "entry_price": entry_price,
-                            "current_price": current_price,
-                            "pnl": round(float(pnl), 2),
-                            "pnl_percent": round(float(pnl_percent), 2),
-                        },
-                    })
-
-                # Check for completion
-                if current_status in ("completed", "cancelled", "error"):
-                    # Build complete message with detailed analysis results
-                    complete_data = {
-                        "status": current_status,
-                        "error": session.get("error"),
-                        "completed_at": datetime.now(timezone.utc).isoformat(),
-                    }
-
-                    # Include analysis results if completed successfully
-                    if current_status == "completed":
-                        # INFO level logging for troubleshooting (visible in console)
-                        tech_data = state.get("technical_analysis")
-                        fund_data = state.get("fundamental_analysis")
-                        sent_data = state.get("sentiment_analysis")
-                        risk_data = state.get("risk_assessment")
-
-                        logger.info(
-                            "websocket_complete_state_check",
-                            session_id=session_id,
-                            state_keys=list(state.keys()) if state else [],
-                            has_technical=tech_data is not None,
-                            has_fundamental=fund_data is not None,
-                            has_sentiment=sent_data is not None,
-                            has_risk=risk_data is not None,
-                            tech_type=type(tech_data).__name__ if tech_data else None,
-                        )
-
-                        # Extract analysis results from state
-                        analysis_results = _extract_analysis_results(state)
-                        logger.info(
-                            "websocket_analysis_results_extracted",
-                            session_id=session_id,
-                            has_results=analysis_results is not None,
-                            result_keys=list(analysis_results.keys()) if analysis_results else [],
-                        )
-                        if analysis_results:
-                            complete_data["analysis_results"] = analysis_results
-                        else:
-                            # Log warning if no analysis results were extracted
-                            logger.warning(
-                                "websocket_no_analysis_results",
-                                session_id=session_id,
-                                state_keys=list(state.keys()) if state else [],
-                            )
-
-                        # Include trade proposal
-                        proposal = state.get("trade_proposal")
-                        if proposal:
-                            complete_data["trade_proposal"] = _serialize_proposal(proposal, full=True)
-
-                        # Include reasoning summary (last few entries)
-                        reasoning_log = state.get("reasoning_log", [])
-                        if reasoning_log:
-                            # Create a summary from the last synthesis/final entries
-                            complete_data["reasoning_summary"] = _create_reasoning_summary(reasoning_log)
-
-                    await websocket.send_json({
-                        "type": "complete",
-                        "session_id": session_id,
-                        "data": complete_data,
-                    })
+            session = await _get_session_snapshot(session_id)
+            if session is not None:
+                if await cursor.emit(websocket, session):
                     # Keep connection open for a bit, then close
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(COMPLETE_LINGER_SECONDS)
                     break
 
-            # Handle incoming messages (ping/pong)
-            try:
-                data = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=0.5,
-                )
+            in_sm = await sm.get_session(session_id) is not None
+            timeout = PUSH_SAFETY_POLL_SECONDS if in_sm else LEGACY_POLL_SECONDS
+
+            done, _pending = await asyncio.wait(
+                {recv_task, queue_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if queue_task in done:
+                # Notifications are wake signals only — drain any burst; the
+                # next loop iteration re-reads the snapshot and the cursor
+                # emits exactly the not-yet-sent frames.
+                queue_task.result()
+                while True:
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                queue_task = asyncio.create_task(queue.get())
+
+            if recv_task in done:
+                data = recv_task.result()  # raises WebSocketDisconnect on close
                 if data == "ping":
                     await websocket.send_text("pong")
                 elif data == "status":
                     # On-demand status request
-                    if session:
+                    fresh = await _get_session_snapshot(session_id)
+                    if fresh:
                         await websocket.send_json({
                             "type": "status",
                             "data": {
-                            "session_id": session_id,
-                                "status": session["status"],
-                                "stage": str(session["state"].get("current_stage", "")),
-                                "awaiting_approval": session["state"].get("awaiting_approval", False),
+                                "session_id": session_id,
+                                "status": fresh["status"],
+                                "stage": str(fresh["state"].get("current_stage", "")),
+                                "awaiting_approval": fresh["state"].get("awaiting_approval", False),
                             },
                         })
-
-            except asyncio.TimeoutError:
-                pass
-
-            # Polling interval
-            await asyncio.sleep(0.3)
+                recv_task = asyncio.create_task(websocket.receive_text())
 
     except WebSocketDisconnect:
         logger.info("websocket_client_disconnected", session_id=session_id)
@@ -745,6 +818,11 @@ async def websocket_session(websocket: WebSocket, session_id: str):
             error=str(e),
         )
     finally:
+        for task in (recv_task, queue_task):
+            if task is not None:
+                task.cancel()
+        if queue is not None:
+            await sm.unsubscribe(session_id, queue)
         manager.disconnect(session_id, websocket)
 
 

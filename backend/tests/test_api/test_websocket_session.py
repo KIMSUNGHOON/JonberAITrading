@@ -1,0 +1,316 @@
+"""P7 Phase 1: /ws/session/{id} push-first rewrite.
+
+The session WebSocket must PREFER SessionManager pub/sub notifications (instant
+push) and keep the legacy 0.3s dict-poll only as a per-session fallback. Reads
+stay on the legacy dicts (source of truth for the un-migrated producers) with a
+SessionManager fallback for sm-only sessions. Position frames are de-duplicated
+via a cursor instead of being re-sent every poll cycle.
+
+Headless: a fake WebSocket + a real SessionManager on a test SQLite db. The
+endpoint coroutine is invoked directly (same pattern as the P6/P7 ledger notes:
+"fake WebSocket + stubbed graph").
+"""
+
+import asyncio
+import contextlib
+import os
+
+import pytest
+from fastapi import WebSocketDisconnect
+
+import services.session_manager as sm_module
+from services.session_manager import MarketType, SessionManager, SessionStatus
+
+import app.api.routes.websocket as ws_module
+from app.api.routes.websocket import websocket_session
+
+TEST_DB_PATH = "data/test_ws_push_sessions.db"
+
+_DISCONNECT = object()
+
+
+class FakeWebSocket:
+    """Minimal stand-in for starlette's WebSocket used by websocket_session."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self.sent_text: list[str] = []
+        self.accepted = False
+        self._incoming: asyncio.Queue = asyncio.Queue()
+
+    async def accept(self):
+        self.accepted = True
+
+    async def send_json(self, message: dict):
+        self.sent.append(message)
+
+    async def send_text(self, text: str):
+        self.sent_text.append(text)
+
+    async def receive_text(self) -> str:
+        item = await self._incoming.get()
+        if item is _DISCONNECT:
+            raise WebSocketDisconnect(code=1000)
+        return item
+
+    def client_send(self, text: str):
+        self._incoming.put_nowait(text)
+
+    def client_disconnect(self):
+        self._incoming.put_nowait(_DISCONNECT)
+
+
+async def wait_for_frame(ws: FakeWebSocket, predicate, timeout: float = 1.0) -> dict:
+    """Poll the fake socket's outbox until a frame matches (or fail loudly)."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        for frame in ws.sent:
+            if predicate(frame):
+                return frame
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"expected frame not received within {timeout}s; sent={ws.sent}")
+
+
+@contextlib.asynccontextmanager
+async def running_ws(ws: FakeWebSocket, session_id: str):
+    """Run the endpoint as a task; always tear it down."""
+    task = asyncio.create_task(websocket_session(ws, session_id))
+    try:
+        yield task
+    finally:
+        if not task.done():
+            ws.client_disconnect()
+            try:
+                await asyncio.wait_for(task, timeout=3.0)
+            except (asyncio.TimeoutError, Exception):
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+
+
+@pytest.fixture
+async def sm(monkeypatch):
+    """Fresh SessionManager on a test db, installed as the process singleton."""
+    if os.path.exists(TEST_DB_PATH):
+        os.remove(TEST_DB_PATH)
+    monkeypatch.setattr(sm_module, "DB_PATH", TEST_DB_PATH)
+    manager = SessionManager()
+    await manager.initialize()
+    monkeypatch.setattr(sm_module, "_session_manager", manager)
+    yield manager
+    manager._sessions.clear()
+    if os.path.exists(TEST_DB_PATH):
+        os.remove(TEST_DB_PATH)
+
+
+@pytest.fixture
+def kr_sessions():
+    """Isolated view of the legacy KR session dict."""
+    from app.api.routes.kr_stocks.constants import kr_stock_sessions
+
+    saved = dict(kr_stock_sessions)
+    kr_stock_sessions.clear()
+    yield kr_stock_sessions
+    kr_stock_sessions.clear()
+    kr_stock_sessions.update(saved)
+
+
+@pytest.fixture
+def fast_linger(monkeypatch):
+    """Don't linger 2s after the complete frame in tests (new impl constant)."""
+    monkeypatch.setattr(ws_module, "COMPLETE_LINGER_SECONDS", 0.0, raising=False)
+
+
+@pytest.fixture
+def slow_polls(monkeypatch):
+    """Make both poll timeouts so slow that only push can deliver in time."""
+    monkeypatch.setattr(ws_module, "PUSH_SAFETY_POLL_SECONDS", 30.0, raising=False)
+    monkeypatch.setattr(ws_module, "LEGACY_POLL_SECONDS", 30.0, raising=False)
+
+
+def _legacy_kr_session(session_id: str, **state_extra) -> dict:
+    state = {
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+        "reasoning_log": [],
+        "current_stage": "data_collection",
+    }
+    state.update(state_extra)
+    return {
+        "session_id": session_id,
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+        "status": "running",
+        "state": state,
+        "created_at": None,
+        "error": None,
+    }
+
+
+# -------------------------------------------
+# Poll fallback (legacy dict sessions) — existing contract preserved
+# -------------------------------------------
+
+
+async def test_legacy_session_streams_reasoning_status_complete(sm, kr_sessions, fast_linger):
+    session = _legacy_kr_session("legacy-1", reasoning_log=["[t] 시작", "[t] 기술 분석"])
+    kr_sessions["legacy-1"] = session
+
+    ws = FakeWebSocket()
+    async with running_ws(ws, "legacy-1") as task:
+        await wait_for_frame(ws, lambda f: f.get("type") == "reasoning" and f.get("data") == "[t] 기술 분석")
+        status = await wait_for_frame(ws, lambda f: f.get("type") == "status")
+        assert status["data"]["status"] == "running"
+
+        session["state"]["reasoning_log"] = session["state"]["reasoning_log"] + ["[t] 종합"]
+        await wait_for_frame(ws, lambda f: f.get("type") == "reasoning" and f.get("data") == "[t] 종합")
+
+        session["status"] = "completed"
+        complete = await wait_for_frame(ws, lambda f: f.get("type") == "complete", timeout=4.0)
+        assert complete["data"]["status"] == "completed"
+        await asyncio.wait_for(task, timeout=4.0)
+
+    reasoning_frames = [f for f in ws.sent if f.get("type") == "reasoning"]
+    assert [f["data"] for f in reasoning_frames] == ["[t] 시작", "[t] 기술 분석", "[t] 종합"]
+
+
+async def test_legacy_ping_pong_and_on_demand_status(sm, kr_sessions, fast_linger):
+    kr_sessions["legacy-2"] = _legacy_kr_session("legacy-2")
+
+    ws = FakeWebSocket()
+    async with running_ws(ws, "legacy-2"):
+        await wait_for_frame(ws, lambda f: f.get("type") == "status")
+        ws.client_send("ping")
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while "pong" not in ws.sent_text and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+        assert "pong" in ws.sent_text
+
+
+async def test_legacy_proposal_sent_once(sm, kr_sessions, fast_linger):
+    session = _legacy_kr_session(
+        "legacy-3",
+        awaiting_approval=True,
+        trade_proposal={
+            "id": "p1",
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "action": "BUY",
+            "quantity": 10,
+            "entry_price": 70000,
+            "risk_score": 0.4,
+            "rationale": "테스트",
+        },
+    )
+    session["status"] = "awaiting_approval"
+    kr_sessions["legacy-3"] = session
+
+    ws = FakeWebSocket()
+    async with running_ws(ws, "legacy-3"):
+        await wait_for_frame(ws, lambda f: f.get("type") == "proposal")
+        await asyncio.sleep(1.0)  # several poll cycles
+        proposals = [f for f in ws.sent if f.get("type") == "proposal"]
+        assert len(proposals) == 1
+        assert proposals[0]["data"]["ticker"] == "005930"
+        assert proposals[0]["data"]["action"] == "BUY"
+
+
+async def test_position_frames_are_deduped(sm, kr_sessions, fast_linger):
+    session = _legacy_kr_session(
+        "pos-1",
+        active_position={
+            "ticker": "005930",
+            "entry_price": 70000,
+            "current_price": 71000,
+            "quantity": 10,
+        },
+    )
+    kr_sessions["pos-1"] = session
+
+    ws = FakeWebSocket()
+    async with running_ws(ws, "pos-1") as task:
+        await wait_for_frame(ws, lambda f: f.get("type") == "position")
+        await asyncio.sleep(1.0)  # ~3 poll cycles at the 0.3s legacy interval
+        positions = [f for f in ws.sent if f.get("type") == "position"]
+        assert len(positions) == 1, "unchanged position must not be re-sent every poll"
+
+        session["state"]["active_position"]["current_price"] = 72000
+        await wait_for_frame(
+            ws, lambda f: f.get("type") == "position" and f["data"]["current_price"] == 72000
+        )
+        positions = [f for f in ws.sent if f.get("type") == "position"]
+        assert len(positions) == 2
+
+        session["status"] = "completed"
+        await asyncio.wait_for(task, timeout=4.0)
+
+
+# -------------------------------------------
+# Push mode (SessionManager sessions)
+# -------------------------------------------
+
+
+async def test_sm_only_session_streams_via_push(sm, kr_sessions, fast_linger, slow_polls):
+    """A session living only in the SessionManager must stream via pub/sub push.
+
+    Both poll timeouts are patched to 30s, so any frame arriving within a second
+    can only have been delivered by a subscription wake-up — not by polling.
+    """
+    await sm.create_session(
+        "push-1",
+        MarketType.KIWOOM,
+        "005930",
+        "삼성전자",
+        stk_cd="005930",
+        stk_nm="삼성전자",
+        state={"reasoning_log": [], "current_stage": "data_collection"},
+    )
+
+    ws = FakeWebSocket()
+    async with running_ws(ws, "push-1") as task:
+        # Initial status frame is emitted immediately on connect (no poll wait).
+        status = await wait_for_frame(ws, lambda f: f.get("type") == "status", timeout=1.0)
+        assert status["data"]["status"] == "running"
+
+        await sm.update_state(
+            "push-1",
+            {"reasoning_log": ["[t] 푸시 엔트리"], "current_stage": "technical"},
+            last_node="technical_analysis",
+        )
+        frame = await wait_for_frame(ws, lambda f: f.get("type") == "reasoning", timeout=1.0)
+        assert frame["data"] == "[t] 푸시 엔트리"
+
+        await sm.update_status("push-1", SessionStatus.COMPLETED)
+        await wait_for_frame(ws, lambda f: f.get("type") == "complete", timeout=1.0)
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_push_mode_ping_pong(sm, kr_sessions, fast_linger, slow_polls):
+    await sm.create_session(
+        "push-2", MarketType.KIWOOM, "005930", "삼성전자", state={"reasoning_log": []}
+    )
+
+    ws = FakeWebSocket()
+    async with running_ws(ws, "push-2"):
+        await wait_for_frame(ws, lambda f: f.get("type") == "status", timeout=1.0)
+        ws.client_send("ping")
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while "pong" not in ws.sent_text and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+        assert "pong" in ws.sent_text
+
+
+async def test_subscriber_registered_and_cleaned_up(sm, kr_sessions, fast_linger):
+    await sm.create_session(
+        "push-3", MarketType.KIWOOM, "005930", "삼성전자", state={"reasoning_log": []}
+    )
+
+    ws = FakeWebSocket()
+    async with running_ws(ws, "push-3") as task:
+        await wait_for_frame(ws, lambda f: f.get("type") == "status", timeout=1.0)
+        assert sm._subscribers.get("push-3"), "endpoint must subscribe to sm pub/sub"
+
+        ws.client_disconnect()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert not sm._subscribers.get("push-3"), "subscription must be cleaned up on disconnect"
