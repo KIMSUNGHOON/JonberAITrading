@@ -26,6 +26,11 @@ from app.core.analysis_limiter import (
     release_analysis_slot,
 )
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+from services.session_manager import (
+    MarketType,
+    SessionStatus,
+    get_session_manager,
+)
 from .constants import kr_stock_sessions
 from .helpers import get_kr_stock_session
 
@@ -69,22 +74,37 @@ async def start_kr_stock_analysis(
     except Exception as e:
         logger.warning("failed_to_get_stock_name", stk_cd=stk_cd, error=str(e))
 
-    # Create session record
+    # Create session record (legacy dict = read path for REST/WS)
+    initial_state = {
+        "stk_cd": stk_cd,
+        "stk_nm": stk_nm,
+        "query": request.query,
+        "reasoning_log": [],
+        "current_stage": "data_collection",
+    }
     kr_stock_sessions[session_id] = {
         "session_id": session_id,
         "stk_cd": stk_cd,
         "stk_nm": stk_nm,
         "status": "running",
-        "state": {
-            "stk_cd": stk_cd,
-            "stk_nm": stk_nm,
-            "query": request.query,
-            "reasoning_log": [],
-            "current_stage": "data_collection",
-        },
+        "state": initial_state,
         "created_at": datetime.now(timezone.utc),
         "error": None,
     }
+
+    # Also register in the SessionManager so its pub/sub can push updates to
+    # the session WebSocket. The sm keeps an independent state copy — the
+    # producer mirrors every write (legacy first, then sm).
+    session_manager = await get_session_manager()
+    await session_manager.create_session(
+        session_id=session_id,
+        market_type=MarketType.KIWOOM,
+        ticker=stk_cd,
+        display_name=stk_nm or stk_cd,
+        stk_cd=stk_cd,
+        stk_nm=stk_nm,
+        state={**initial_state, "reasoning_log": []},
+    )
 
     # Run analysis in background
     background_tasks.add_task(
@@ -116,6 +136,10 @@ async def run_kr_stock_analysis_task(session_id: str):
         logger.error("kr_stock_session_not_found", session_id=session_id)
         return
 
+    # Mirror every session write to the SessionManager (legacy dict FIRST so a
+    # pub/sub wake-up always reads a fresh snapshot, then sm to fire the notify).
+    session_manager = await get_session_manager()
+
     # Acquire analysis slot (limits concurrent analyses)
     slot_acquired = await acquire_analysis_slot(timeout=60.0)
     if not slot_acquired:
@@ -126,6 +150,9 @@ async def run_kr_stock_analysis_task(session_id: str):
         )
         session["status"] = "error"
         session["error"] = "Analysis timeout"
+        await session_manager.update_status(
+            session_id, SessionStatus.ERROR, error="Analysis timeout"
+        )
         return
 
     try:
@@ -151,6 +178,10 @@ async def run_kr_stock_analysis_task(session_id: str):
                     # Update session state with node output
                     if isinstance(node_output, dict):
                         session["state"].update(node_output)
+                        # Mirror to sm — fires the WebSocket push notification
+                        await session_manager.update_state(
+                            session_id, node_output, last_node=node_name
+                        )
                     session["last_node"] = node_name
 
                     logger.debug(
@@ -163,6 +194,7 @@ async def run_kr_stock_analysis_task(session_id: str):
         state = session["state"]
         if state.get("awaiting_approval"):
             session["status"] = "awaiting_approval"
+            await session_manager.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
             logger.info(
                 "kr_stock_analysis_awaiting_approval",
                 session_id=session_id,
@@ -171,8 +203,12 @@ async def run_kr_stock_analysis_task(session_id: str):
         elif state.get("error"):
             session["status"] = "error"
             session["error"] = state.get("error")
+            await session_manager.update_status(
+                session_id, SessionStatus.ERROR, error=state.get("error")
+            )
         else:
             session["status"] = "completed"
+            await session_manager.update_status(session_id, SessionStatus.COMPLETED)
 
     except Exception as e:
         logger.error(
@@ -185,6 +221,7 @@ async def run_kr_stock_analysis_task(session_id: str):
         session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
             f"[Error] 분석 실패: {str(e)}"
         ]
+        await session_manager.update_status(session_id, SessionStatus.ERROR, error=str(e))
     finally:
         # Always release the analysis slot
         release_analysis_slot()
@@ -284,6 +321,11 @@ async def cancel_kr_stock_analysis(session_id: str):
 
     session["status"] = "cancelled"
     session["state"]["reasoning_log"].append("[System] 사용자가 분석을 취소했습니다")
+
+    # Mirror to sm — the notify wakes the WebSocket, which re-reads the fresh
+    # legacy snapshot (cancelled status + the appended log entry).
+    session_manager = await get_session_manager()
+    await session_manager.update_status(session_id, SessionStatus.CANCELLED)
 
     logger.info("kr_stock_analysis_cancelled", session_id=session_id)
 
