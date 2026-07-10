@@ -26,6 +26,13 @@ from app.core.analysis_limiter import (
     release_analysis_slot,
     update_session_status,
 )
+from services.session_manager import (
+    MarketType,
+    SessionStatus,
+    get_session_manager,
+    mirror_session_state,
+    mirror_session_status,
+)
 from .constants import coin_sessions, get_cached_markets
 from .helpers import get_coin_session
 
@@ -67,22 +74,44 @@ async def start_coin_analysis(
         if market_info:
             korean_name = market_info.korean_name
 
-    # Create session record
+    # Create session record (legacy dict = read path for REST/WS)
+    initial_state = {
+        "market": market,
+        "korean_name": korean_name,
+        "query": request.query,
+        "reasoning_log": [],
+        "current_stage": "data_collection",
+    }
     coin_sessions[session_id] = {
         "session_id": session_id,
         "market": market,
         "korean_name": korean_name,
         "status": "running",
-        "state": {
-            "market": market,
-            "korean_name": korean_name,
-            "query": request.query,
-            "reasoning_log": [],
-            "current_stage": "data_collection",
-        },
+        "state": initial_state,
         "created_at": datetime.now(timezone.utc),
         "error": None,
     }
+
+    # Also register in the SessionManager so its pub/sub can push updates to
+    # the session WebSocket. Best-effort: on failure the session degrades to
+    # the WS poll fallback, never a 500.
+    try:
+        session_manager = await get_session_manager()
+        await session_manager.create_session(
+            session_id=session_id,
+            market_type=MarketType.COIN,
+            ticker=market,
+            display_name=korean_name or market,
+            market=market,
+            korean_name=korean_name,
+            state={**initial_state, "reasoning_log": []},
+        )
+    except Exception as e:
+        logger.warning(
+            "sm_session_registration_failed",
+            session_id=session_id,
+            error=str(e),
+        )
 
     # Run analysis in background
     background_tasks.add_task(
@@ -119,6 +148,7 @@ async def run_coin_analysis_task(session_id: str):
             "[Error] 동시 분석 한도 초과 - 잠시 후 다시 시도해주세요."
         )
         update_session_status(session_id, "error", session["error"])
+        await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
         logger.warning(
             "coin_analysis_slot_timeout",
             session_id=session_id,
@@ -153,9 +183,12 @@ async def run_coin_analysis_task(session_id: str):
         async for event in graph.astream(initial_state, config):
             for node_name, node_output in event.items():
                 if node_name != "__end__":
-                    # Update session state with node output
+                    # Update session state with node output (legacy dict FIRST so
+                    # a pub/sub wake-up always reads a fresh snapshot, then the sm
+                    # mirror fires the WebSocket push notification)
                     if isinstance(node_output, dict):
                         session["state"].update(node_output)
+                        await mirror_session_state(session_id, node_output, last_node=node_name)
                     session["last_node"] = node_name
 
                     logger.debug(
@@ -166,9 +199,14 @@ async def run_coin_analysis_task(session_id: str):
 
         # Check if we hit the approval interrupt
         state = session["state"]
-        if state.get("awaiting_approval"):
+        if session["status"] == "cancelled":
+            # User cancelled mid-run (the graph kept streaming) — the terminal
+            # cancelled status must not be overwritten by this final write.
+            pass
+        elif state.get("awaiting_approval"):
             session["status"] = "awaiting_approval"
             update_session_status(session_id, "awaiting_approval")
+            await mirror_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
             logger.info(
                 "coin_analysis_awaiting_approval",
                 session_id=session_id,
@@ -178,9 +216,11 @@ async def run_coin_analysis_task(session_id: str):
             session["status"] = "error"
             session["error"] = state.get("error")
             update_session_status(session_id, "error", session["error"])
+            await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
         else:
             session["status"] = "completed"
             update_session_status(session_id, "completed")
+            await mirror_session_status(session_id, SessionStatus.COMPLETED)
 
     except Exception as e:
         logger.error(
@@ -194,6 +234,7 @@ async def run_coin_analysis_task(session_id: str):
             f"[Error] Analysis failed: {str(e)}"
         ]
         update_session_status(session_id, "error", str(e))
+        await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
 
     finally:
         # Always release the analysis slot
@@ -296,6 +337,10 @@ async def cancel_coin_analysis(session_id: str):
 
     session["status"] = "cancelled"
     session["state"]["reasoning_log"].append("[System] Analysis cancelled by user")
+
+    # Mirror to sm — the notify wakes the WebSocket, which re-reads the fresh
+    # legacy snapshot (cancelled status + the appended log entry).
+    await mirror_session_status(session_id, SessionStatus.CANCELLED)
 
     logger.info("coin_analysis_cancelled", session_id=session_id)
 
