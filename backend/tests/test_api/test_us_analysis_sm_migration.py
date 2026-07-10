@@ -196,6 +196,47 @@ async def test_delete_route_removes_sm_session(sm, us_sessions):
     )
 
 
+async def test_slot_timeout_mirrors_error(sm, us_sessions, monkeypatch):
+    session_id = "us-slot-1"
+    record = _seed_session(us_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    async def no_slot(timeout=60.0):
+        return False
+
+    monkeypatch.setattr("app.api.routes.analysis.acquire_analysis_slot", no_slot)
+
+    await run_analysis_task(session_id, dict(record["state"]))
+
+    assert record["status"] == "error"
+    assert (await sm.get_session(session_id)).status == SessionStatus.ERROR
+
+
+async def test_delete_mid_run_does_not_resurrect_sm_session(sm, us_sessions, monkeypatch):
+    """Pins the no-resurrection invariant: mirrors from a still-running task
+    after DELETE must not recreate the removed sm session (the WS sm fallback
+    would serve the deleted session again)."""
+    session_id = "us-deleterace-1"
+    record = _seed_session(us_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    class DeletingGraph:
+        async def astream(self, initial_state, config):
+            yield {"data_collection": {"reasoning_log": ["[t] collect"], "current_stage": "x"}}
+            # User deletes the session while the graph is still streaming
+            await delete_session(session_id)
+            yield {"technical_analysis": {"reasoning_log": ["[t] collect", "[t] tech"], "current_stage": "y"}}
+
+    _patch_graph(monkeypatch, DeletingGraph())
+
+    await run_analysis_task(session_id, dict(record["state"]))
+
+    assert session_id not in us_sessions
+    assert await sm.get_session(session_id) is None, (
+        "late mirrors from the running task must not resurrect the deleted sm session"
+    )
+
+
 async def test_analysis_task_survives_sm_mirror_failure(sm, us_sessions, monkeypatch):
     session_id = "us-guard-1"
     record = _seed_session(us_sessions, session_id)

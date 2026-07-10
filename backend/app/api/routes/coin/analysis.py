@@ -142,13 +142,15 @@ async def run_coin_analysis_task(session_id: str):
     # Acquire analysis slot (with timeout)
     slot_acquired = await acquire_analysis_slot(timeout=60.0)
     if not slot_acquired:
-        session["status"] = "error"
-        session["error"] = "분석 대기열이 가득 찼습니다. 잠시 후 다시 시도해주세요."
-        session["state"]["reasoning_log"].append(
-            "[Error] 동시 분석 한도 초과 - 잠시 후 다시 시도해주세요."
-        )
-        update_session_status(session_id, "error", session["error"])
-        await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
+        # Cancel-during-slot-wait: the terminal cancelled status wins.
+        if session["status"] != "cancelled":
+            session["status"] = "error"
+            session["error"] = "분석 대기열이 가득 찼습니다. 잠시 후 다시 시도해주세요."
+            session["state"]["reasoning_log"].append(
+                "[Error] 동시 분석 한도 초과 - 잠시 후 다시 시도해주세요."
+            )
+            update_session_status(session_id, "error", session["error"])
+            await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
         logger.warning(
             "coin_analysis_slot_timeout",
             session_id=session_id,
@@ -228,13 +230,15 @@ async def run_coin_analysis_task(session_id: str):
             session_id=session_id,
             error=str(e),
         )
-        session["status"] = "error"
-        session["error"] = str(e)
         session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
             f"[Error] Analysis failed: {str(e)}"
         ]
-        update_session_status(session_id, "error", str(e))
-        await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
+        # Cancel-mid-run: the terminal cancelled status wins over the error write.
+        if session["status"] != "cancelled":
+            session["status"] = "error"
+            session["error"] = str(e)
+            update_session_status(session_id, "error", str(e))
+            await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
 
     finally:
         # Always release the analysis slot

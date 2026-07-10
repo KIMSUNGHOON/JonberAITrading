@@ -154,9 +154,11 @@ async def run_kr_stock_analysis_task(session_id: str):
             session_id=session_id,
             active_count=get_active_analysis_count(),
         )
-        session["status"] = "error"
-        session["error"] = "Analysis timeout"
-        await mirror_session_status(session_id, SessionStatus.ERROR, error="Analysis timeout")
+        # Cancel-during-slot-wait: the terminal cancelled status wins.
+        if session["status"] != "cancelled":
+            session["status"] = "error"
+            session["error"] = "Analysis timeout"
+            await mirror_session_status(session_id, SessionStatus.ERROR, error="Analysis timeout")
         return
 
     try:
@@ -221,12 +223,14 @@ async def run_kr_stock_analysis_task(session_id: str):
             session_id=session_id,
             error=str(e),
         )
-        session["status"] = "error"
-        session["error"] = str(e)
         session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
             f"[Error] 분석 실패: {str(e)}"
         ]
-        await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
+        # Cancel-mid-run: the terminal cancelled status wins over the error write.
+        if session["status"] != "cancelled":
+            session["status"] = "error"
+            session["error"] = str(e)
+            await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
     finally:
         # Always release the analysis slot
         release_analysis_slot()

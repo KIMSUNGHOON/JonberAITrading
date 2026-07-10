@@ -347,6 +347,84 @@ async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, kr_sessions
     assert session.status == SessionStatus.CANCELLED
 
 
+async def test_state_error_branch_mirrors_error(sm, kr_sessions, monkeypatch):
+    """A graph that finishes cleanly WITH state['error'] set must mirror ERROR."""
+    session_id = "kr-stateerr-1"
+    record = _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    _patch_graph(
+        monkeypatch,
+        FakeGraph([
+            {"data_collection": {
+                "reasoning_log": ["[t] 수집 실패"],
+                "error": "키움 API 실패",
+            }},
+        ]),
+    )
+
+    await run_kr_stock_analysis_task(session_id)
+
+    assert record["status"] == "error"
+    session = await sm.get_session(session_id)
+    assert session.status == SessionStatus.ERROR
+    assert "키움" in (session.error or "")
+
+
+async def test_slot_timeout_mirrors_error(sm, kr_sessions, monkeypatch):
+    session_id = "kr-slot-1"
+    record = _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    async def no_slot(timeout=60.0):
+        return False
+
+    monkeypatch.setattr("app.api.routes.kr_stocks.analysis.acquire_analysis_slot", no_slot)
+
+    await run_kr_stock_analysis_task(session_id)
+
+    assert record["status"] == "error"
+    assert (await sm.get_session(session_id)).status == SessionStatus.ERROR
+
+
+async def test_cancel_during_slot_wait_keeps_cancelled(sm, kr_sessions, monkeypatch):
+    session_id = "kr-cancelslot-1"
+    record = _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    async def cancel_then_timeout(timeout=60.0):
+        await cancel_kr_stock_analysis(session_id)
+        return False
+
+    monkeypatch.setattr("app.api.routes.kr_stocks.analysis.acquire_analysis_slot", cancel_then_timeout)
+
+    await run_kr_stock_analysis_task(session_id)
+
+    assert record["status"] == "cancelled"
+    assert (await sm.get_session(session_id)).status == SessionStatus.CANCELLED
+
+
+async def test_cancel_then_graph_exception_keeps_cancelled(sm, kr_sessions, monkeypatch):
+    """Terminal cancelled must survive the exception path too (same invariant
+    as the normal-completion flap guard)."""
+    session_id = "kr-cancelerr-1"
+    record = _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    class CancelThenExplodeGraph:
+        async def astream(self, initial_state, config):
+            yield {"data_collection": {"reasoning_log": ["[t] 수집"], "current_stage": "x"}}
+            await cancel_kr_stock_analysis(session_id)
+            raise RuntimeError("LLM call failed")
+
+    _patch_graph(monkeypatch, CancelThenExplodeGraph())
+
+    await run_kr_stock_analysis_task(session_id)
+
+    assert record["status"] == "cancelled"
+    assert (await sm.get_session(session_id)).status == SessionStatus.CANCELLED
+
+
 # -------------------------------------------
 # Approval decisions must be mirrored to the SessionManager
 # -------------------------------------------
