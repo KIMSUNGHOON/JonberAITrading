@@ -37,6 +37,9 @@ logger = structlog.get_logger()
 MAX_CONCURRENT_ANALYSES = 3
 COMPLETED_SESSION_TTL = timedelta(hours=1)
 DB_PATH = "data/sessions.db"
+# Max buffered messages per WebSocket subscriber. On overflow the oldest is dropped
+# (realtime favors the latest state), so a slow/dead socket cannot grow unbounded.
+SUBSCRIBER_QUEUE_MAXSIZE = 256
 
 
 class MarketType(str, Enum):
@@ -397,13 +400,33 @@ class SessionManager:
         async with self._lock:
             if session_id in self._sessions:
                 session = self._sessions[session_id]
+
+                # Compute the reasoning-log delta BEFORE applying the update, so the
+                # WS can stream only the newly-appended entries instead of re-diffing
+                # the whole log.
+                reasoning_delta = None
+                if "reasoning_log" in state_updates:
+                    old_log = session.state.get("reasoning_log") or []
+                    new_log = state_updates.get("reasoning_log") or []
+                    if isinstance(new_log, list) and len(new_log) >= len(old_log):
+                        reasoning_delta = new_log[len(old_log):]
+
                 session.state.update(state_updates)
                 session.updated_at = datetime.now(timezone.utc)
                 if last_node:
                     session.last_node = last_node
 
                 await self._save_session(session)
-                await self._notify_subscribers(session_id, {"type": "state_update", "updates": list(state_updates.keys())})
+
+                payload: Dict[str, Any] = {
+                    "type": "state_update",
+                    "updates": list(state_updates.keys()),
+                }
+                if last_node:
+                    payload["last_node"] = last_node
+                if reasoning_delta:
+                    payload["reasoning_delta"] = reasoning_delta
+                await self._notify_subscribers(session_id, payload)
 
     async def get_all_sessions(
         self,
@@ -617,7 +640,7 @@ class SessionManager:
         """Subscribe to session updates."""
         await self.initialize()
 
-        queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_MAXSIZE)
         async with self._lock:
             if session_id not in self._subscribers:
                 self._subscribers[session_id] = set()
@@ -634,13 +657,25 @@ class SessionManager:
                     del self._subscribers[session_id]
 
     async def _notify_subscribers(self, session_id: str, message: Dict[str, Any]) -> None:
-        """Notify all subscribers of a session update."""
+        """Notify all subscribers of a session update.
+
+        Queues are bounded; on overflow we drop the OLDEST buffered message and keep
+        the newest (realtime favors the latest state) so a slow/dead socket cannot
+        accumulate or lose the most recent update.
+        """
         if session_id in self._subscribers:
             for queue in list(self._subscribers[session_id]):
                 try:
                     queue.put_nowait(message)
                 except asyncio.QueueFull:
-                    pass
+                    try:
+                        queue.get_nowait()  # drop oldest
+                    except asyncio.QueueEmpty:
+                        pass
+                    try:
+                        queue.put_nowait(message)
+                    except asyncio.QueueFull:
+                        pass  # give up this one (should not happen after a drop)
 
 
 # -------------------------------------------
