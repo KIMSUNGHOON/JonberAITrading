@@ -23,6 +23,7 @@ from app.api.schemas.approval import (
     PendingProposalSummary,
 )
 from app.dependencies import get_trading_coordinator
+from services.session_manager import mirror_session_state, mirror_session_status
 from services.telegram import get_telegram_notifier
 from app.api.routes.websocket import (
     broadcast_trade_executed,
@@ -104,6 +105,19 @@ async def submit_approval(request: ApprovalRequest):
                         value=value,
                     )
 
+    # Mirror the decision into the SessionManager (best-effort, no-op for
+    # sessions not tracked there). Without this, sm-tracked sessions stay
+    # AWAITING_APPROVAL forever (never TTL-cleaned) and the session WebSocket's
+    # sm fallback would replay the already-decided proposal after a restart.
+    decision_updates = {
+        "approval_status": request.decision,
+        "user_feedback": request.feedback,
+        "awaiting_approval": False,
+    }
+    if request.decision == "modified" and state.get("trade_proposal"):
+        decision_updates["trade_proposal"] = state["trade_proposal"]
+    await mirror_session_state(request.session_id, decision_updates)
+
     # Resume graph execution - select appropriate graph based on session type
     if request.session_id in kr_stock_sessions:
         graph = get_kr_stock_trading_graph()
@@ -135,6 +149,10 @@ async def submit_approval(request: ApprovalRequest):
                 if node_name != "__end__":
                     if isinstance(node_output, dict):
                         state.update(node_output)
+                        # Legacy first, then sm mirror (fires the WS push notify)
+                        await mirror_session_state(
+                            request.session_id, node_output, last_node=node_name
+                        )
                     session["last_node"] = node_name
 
         # Track allocation result for response message
@@ -227,6 +245,9 @@ async def submit_approval(request: ApprovalRequest):
             # modified
             session["status"] = "completed"
             execution_status = state.get("execution_status", "completed")
+
+        # Mirror the final status to the SessionManager (completed/running/cancelled)
+        await mirror_session_status(request.session_id, session["status"])
 
         # Log state AFTER approval to verify analysis results are preserved
         logger.info(
@@ -341,6 +362,7 @@ async def submit_approval(request: ApprovalRequest):
         )
         session["status"] = "error"
         session["error"] = str(e)
+        await mirror_session_status(request.session_id, "error", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process approval: {str(e)}",

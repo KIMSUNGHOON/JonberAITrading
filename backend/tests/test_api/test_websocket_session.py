@@ -117,15 +117,15 @@ def kr_sessions():
 
 @pytest.fixture
 def fast_linger(monkeypatch):
-    """Don't linger 2s after the complete frame in tests (new impl constant)."""
-    monkeypatch.setattr(ws_module, "COMPLETE_LINGER_SECONDS", 0.0, raising=False)
+    """Don't linger 2s after the complete frame in tests."""
+    monkeypatch.setattr(ws_module, "COMPLETE_LINGER_SECONDS", 0.0)
 
 
 @pytest.fixture
 def slow_polls(monkeypatch):
     """Make both poll timeouts so slow that only push can deliver in time."""
-    monkeypatch.setattr(ws_module, "PUSH_SAFETY_POLL_SECONDS", 30.0, raising=False)
-    monkeypatch.setattr(ws_module, "LEGACY_POLL_SECONDS", 30.0, raising=False)
+    monkeypatch.setattr(ws_module, "PUSH_SAFETY_POLL_SECONDS", 30.0)
+    monkeypatch.setattr(ws_module, "LEGACY_POLL_SECONDS", 30.0)
 
 
 def _legacy_kr_session(session_id: str, **state_extra) -> dict:
@@ -185,6 +185,18 @@ async def test_legacy_ping_pong_and_on_demand_status(sm, kr_sessions, fast_linge
         while "pong" not in ws.sent_text and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
         assert "pong" in ws.sent_text
+
+        # On-demand "status" command: a status frame with session_id nested in
+        # data (distinct shape from change-driven status frames).
+        ws.client_send("status")
+        on_demand = await wait_for_frame(
+            ws,
+            lambda f: f.get("type") == "status" and f.get("data", {}).get("session_id") == "legacy-2",
+            timeout=2.0,
+        )
+        assert on_demand["data"]["status"] == "running"
+        assert on_demand["data"]["stage"] == "data_collection"
+        assert on_demand["data"]["awaiting_approval"] is False
 
 
 async def test_legacy_proposal_sent_once(sm, kr_sessions, fast_linger):
@@ -284,6 +296,10 @@ async def test_sm_only_session_streams_via_push(sm, kr_sessions, fast_linger, sl
         await wait_for_frame(ws, lambda f: f.get("type") == "complete", timeout=1.0)
         await asyncio.wait_for(task, timeout=2.0)
 
+    # Inter-frame ordering: every reasoning frame precedes the complete frame.
+    types = [f["type"] for f in ws.sent]
+    assert max(i for i, t in enumerate(types) if t == "reasoning") < types.index("complete")
+
 
 async def test_push_mode_ping_pong(sm, kr_sessions, fast_linger, slow_polls):
     await sm.create_session(
@@ -298,6 +314,52 @@ async def test_push_mode_ping_pong(sm, kr_sessions, fast_linger, slow_polls):
         while "pong" not in ws.sent_text and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.02)
         assert "pong" in ws.sent_text
+
+
+async def test_safety_poll_covers_legacy_only_updates_for_sm_session(sm, kr_sessions, fast_linger, monkeypatch):
+    """The PUSH_SAFETY_POLL exists for producers not yet migrated to sm (e.g. the
+    approval-resume path): a session tracked in sm whose LEGACY dict changes with
+    NO sm notification must still get frames within the safety-poll interval.
+
+    Legacy poll is disabled (30s) so only the safety poll can deliver — disabling
+    PUSH_SAFETY_POLL_SECONDS would fail this test.
+    """
+    monkeypatch.setattr(ws_module, "LEGACY_POLL_SECONDS", 30.0)
+
+    session = _legacy_kr_session("safety-1")
+    kr_sessions["safety-1"] = session
+    await sm.create_session(
+        "safety-1", MarketType.KIWOOM, "005930", "삼성전자", state={"reasoning_log": []}
+    )
+
+    ws = FakeWebSocket()
+    async with running_ws(ws, "safety-1") as task:
+        await wait_for_frame(ws, lambda f: f.get("type") == "status", timeout=1.0)
+
+        # Un-migrated producer: legacy-only write, NO sm notify fired.
+        session["status"] = "completed"
+        complete = await wait_for_frame(ws, lambda f: f.get("type") == "complete", timeout=3.0)
+        assert complete["data"]["status"] == "completed"
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_cursor_emits_pending_frames_before_complete(sm):
+    """Frame order within one wake: reasoning/status must precede the complete
+    frame, so a client that stops reading at 'complete' misses nothing."""
+    ws = FakeWebSocket()
+    cursor = ws_module._SessionFrameCursor("cursor-1")
+    session = {
+        "session_id": "cursor-1",
+        "status": "completed",
+        "error": None,
+        "state": {"reasoning_log": ["[t] a", "[t] b"], "current_stage": "done"},
+    }
+
+    completed = await cursor.emit(ws, session)
+
+    assert completed is True
+    types = [f["type"] for f in ws.sent]
+    assert types == ["reasoning", "reasoning", "status", "complete"]
 
 
 async def test_subscriber_registered_and_cleaned_up(sm, kr_sessions, fast_linger):

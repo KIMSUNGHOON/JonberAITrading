@@ -722,6 +722,50 @@ async def run_session_cleanup_task() -> None:
 
 
 # -------------------------------------------
+# Best-effort Producer Mirrors
+# -------------------------------------------
+# Producers write the legacy per-market dicts FIRST (still the read path), then
+# mirror to the SessionManager so its pub/sub notifies WebSocket subscribers.
+# The mirror must never break the producer: any failure is logged and swallowed
+# (the WS degrades to its poll fallback). No-ops for sessions not tracked in sm.
+
+
+async def mirror_session_state(
+    session_id: str,
+    state_updates: Dict[str, Any],
+    last_node: Optional[str] = None,
+) -> None:
+    """Best-effort state mirror (fires a state_update notification)."""
+    try:
+        manager = await get_session_manager()
+        await manager.update_state(session_id, state_updates, last_node=last_node)
+    except Exception as e:
+        logger.warning(
+            "sm_state_mirror_failed",
+            session_id=session_id,
+            error=str(e),
+        )
+
+
+async def mirror_session_status(
+    session_id: str,
+    status: "SessionStatus | str",
+    error: Optional[str] = None,
+) -> None:
+    """Best-effort status mirror (fires a status notification)."""
+    try:
+        manager = await get_session_manager()
+        st = status if isinstance(status, SessionStatus) else SessionStatus(status)
+        await manager.update_status(session_id, st, error=error)
+    except Exception as e:
+        logger.warning(
+            "sm_status_mirror_failed",
+            session_id=session_id,
+            error=str(e),
+        )
+
+
+# -------------------------------------------
 # Convenience Functions (Backward Compatibility)
 # -------------------------------------------
 

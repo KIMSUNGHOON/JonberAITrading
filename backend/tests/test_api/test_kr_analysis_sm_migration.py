@@ -280,6 +280,163 @@ async def test_cancel_route_mirrors_cancelled_status(sm, kr_sessions):
 
 
 # -------------------------------------------
+# Producer robustness: sm mirror failures must not affect the analysis
+# -------------------------------------------
+
+
+async def test_analysis_task_survives_sm_mirror_failure(sm, kr_sessions, monkeypatch):
+    """A SessionManager hiccup (e.g. SQLite lock) must not abort a healthy run."""
+    session_id = "kr-guard-1"
+    record = _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("sqlite down")
+
+    monkeypatch.setattr(sm, "update_state", boom)
+    monkeypatch.setattr(sm, "update_status", boom)
+
+    _patch_graph(
+        monkeypatch,
+        FakeGraph([
+            {"data_collection": {"reasoning_log": ["[t] 수집"], "current_stage": "done"}},
+        ]),
+    )
+
+    await run_kr_stock_analysis_task(session_id)
+
+    assert record["status"] == "completed", "mirror failure must not fail the analysis"
+    assert record["error"] is None
+
+
+async def test_start_route_survives_sm_registration_failure(sm, kr_sessions, fake_kiwoom, monkeypatch):
+    """sm registration failure must degrade to poll-only, not 500 the start route."""
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("sqlite down")
+
+    monkeypatch.setattr(sm, "create_session", boom)
+
+    response = await start_kr_stock_analysis(
+        KRStockAnalysisRequest(stk_cd="005930"), BackgroundTasks()
+    )
+
+    assert response.status == "started"
+    assert response.session_id in kr_sessions
+
+
+async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, kr_sessions, monkeypatch):
+    """User cancel during a run must stick — the task's final status write must not flap it."""
+    session_id = "kr-cancelflap-1"
+    record = _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    class CancellingGraph:
+        async def astream(self, initial_state, config):
+            yield {"data_collection": {"reasoning_log": ["[t] 수집"], "current_stage": "x"}}
+            # User cancels while the graph is still streaming
+            await cancel_kr_stock_analysis(session_id)
+            yield {"technical_analysis": {"reasoning_log": ["[t] 수집", "[t] 기술"], "current_stage": "y"}}
+
+    _patch_graph(monkeypatch, CancellingGraph())
+
+    await run_kr_stock_analysis_task(session_id)
+
+    assert record["status"] == "cancelled"
+    session = await sm.get_session(session_id)
+    assert session.status == SessionStatus.CANCELLED
+
+
+# -------------------------------------------
+# Approval decisions must be mirrored to the SessionManager
+# -------------------------------------------
+
+
+class FakeApprovalGraph:
+    """Stub for the graph resume in approval.py (aupdate_state + astream(None))."""
+
+    def __init__(self, events):
+        self._events = events
+        self.state_update = None
+
+    async def aupdate_state(self, config, update):
+        self.state_update = update
+
+    async def astream(self, inp, config):
+        for event in self._events:
+            yield event
+
+
+async def _seed_awaiting_approval(sm, kr_sessions, session_id: str) -> dict:
+    record = _seed_session(kr_sessions, session_id)
+    proposal = {
+        "id": "p1",
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+        "action": "HOLD",
+        "quantity": 0,
+        "entry_price": 70000,
+    }
+    record["status"] = "awaiting_approval"
+    record["state"]["awaiting_approval"] = True
+    record["state"]["trade_proposal"] = proposal
+    await _seed_sm_session(sm, session_id)
+    await sm.update_state(
+        session_id, {"awaiting_approval": True, "trade_proposal": dict(proposal)}
+    )
+    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+    return record
+
+
+async def test_approval_approved_mirrors_completed_to_sm(sm, kr_sessions, monkeypatch):
+    """Without the mirror, decided sessions stay AWAITING_APPROVAL in sm forever
+    (never TTL-cleaned) and replay a stale proposal from the WS sm-fallback after
+    a backend restart."""
+    from app.api.routes.approval import submit_approval
+    from app.api.schemas.approval import ApprovalRequest
+
+    session_id = "kr-approve-1"
+    record = await _seed_awaiting_approval(sm, kr_sessions, session_id)
+
+    graph = FakeApprovalGraph([
+        {"kr_stock_execution": {
+            "execution_status": "skipped",
+            "reasoning_log": ["[t] 실행 스킵"],
+        }},
+    ])
+    monkeypatch.setattr("app.api.routes.approval.get_kr_stock_trading_graph", lambda: graph)
+
+    await submit_approval(ApprovalRequest(session_id=session_id, decision="approved"))
+
+    assert record["status"] == "completed"  # legacy behavior unchanged
+    session = await sm.get_session(session_id)
+    assert session.status == SessionStatus.COMPLETED
+    assert session.state.get("awaiting_approval") is False
+    # resume-loop node outputs mirrored too (keeps sm state fresh for restart recovery)
+    assert session.state.get("execution_status") == "skipped"
+
+
+async def test_approval_rejected_mirrors_running_to_sm(sm, kr_sessions, monkeypatch):
+    from app.api.routes.approval import submit_approval
+    from app.api.schemas.approval import ApprovalRequest
+
+    session_id = "kr-reject-1"
+    record = await _seed_awaiting_approval(sm, kr_sessions, session_id)
+
+    graph = FakeApprovalGraph([])
+    monkeypatch.setattr("app.api.routes.approval.get_kr_stock_trading_graph", lambda: graph)
+
+    await submit_approval(
+        ApprovalRequest(session_id=session_id, decision="rejected", feedback="재분석")
+    )
+
+    assert record["status"] == "running"
+    session = await sm.get_session(session_id)
+    assert session.status == SessionStatus.RUNNING
+    assert session.state.get("awaiting_approval") is False
+
+
+# -------------------------------------------
 # End-to-end: producer push reaches the session WebSocket without polling
 # -------------------------------------------
 
@@ -330,3 +487,6 @@ async def test_ws_streams_kr_analysis_via_push_end_to_end(sm, kr_sessions, monke
 
     reasoning = [f["data"] for f in ws.sent if f.get("type") == "reasoning"]
     assert reasoning == ["[t] 수집", "[t] 기술"]
+    # Inter-frame ordering: every reasoning frame precedes the complete frame.
+    types = [f["type"] for f in ws.sent]
+    assert max(i for i, t in enumerate(types) if t == "reasoning") < types.index("complete")

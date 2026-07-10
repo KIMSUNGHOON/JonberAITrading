@@ -30,6 +30,8 @@ from services.session_manager import (
     MarketType,
     SessionStatus,
     get_session_manager,
+    mirror_session_state,
+    mirror_session_status,
 )
 from .constants import kr_stock_sessions
 from .helpers import get_kr_stock_session
@@ -94,17 +96,25 @@ async def start_kr_stock_analysis(
 
     # Also register in the SessionManager so its pub/sub can push updates to
     # the session WebSocket. The sm keeps an independent state copy — the
-    # producer mirrors every write (legacy first, then sm).
-    session_manager = await get_session_manager()
-    await session_manager.create_session(
-        session_id=session_id,
-        market_type=MarketType.KIWOOM,
-        ticker=stk_cd,
-        display_name=stk_nm or stk_cd,
-        stk_cd=stk_cd,
-        stk_nm=stk_nm,
-        state={**initial_state, "reasoning_log": []},
-    )
+    # producer mirrors every write (legacy first, then sm). Best-effort: on
+    # failure the session degrades to the WS poll fallback, never a 500.
+    try:
+        session_manager = await get_session_manager()
+        await session_manager.create_session(
+            session_id=session_id,
+            market_type=MarketType.KIWOOM,
+            ticker=stk_cd,
+            display_name=stk_nm or stk_cd,
+            stk_cd=stk_cd,
+            stk_nm=stk_nm,
+            state={**initial_state, "reasoning_log": []},
+        )
+    except Exception as e:
+        logger.warning(
+            "sm_session_registration_failed",
+            session_id=session_id,
+            error=str(e),
+        )
 
     # Run analysis in background
     background_tasks.add_task(
@@ -136,10 +146,6 @@ async def run_kr_stock_analysis_task(session_id: str):
         logger.error("kr_stock_session_not_found", session_id=session_id)
         return
 
-    # Mirror every session write to the SessionManager (legacy dict FIRST so a
-    # pub/sub wake-up always reads a fresh snapshot, then sm to fire the notify).
-    session_manager = await get_session_manager()
-
     # Acquire analysis slot (limits concurrent analyses)
     slot_acquired = await acquire_analysis_slot(timeout=60.0)
     if not slot_acquired:
@@ -150,9 +156,7 @@ async def run_kr_stock_analysis_task(session_id: str):
         )
         session["status"] = "error"
         session["error"] = "Analysis timeout"
-        await session_manager.update_status(
-            session_id, SessionStatus.ERROR, error="Analysis timeout"
-        )
+        await mirror_session_status(session_id, SessionStatus.ERROR, error="Analysis timeout")
         return
 
     try:
@@ -175,13 +179,12 @@ async def run_kr_stock_analysis_task(session_id: str):
         async for event in graph.astream(initial_state, config):
             for node_name, node_output in event.items():
                 if node_name != "__end__":
-                    # Update session state with node output
+                    # Update session state with node output (legacy dict FIRST so
+                    # a pub/sub wake-up always reads a fresh snapshot, then the sm
+                    # mirror fires the WebSocket push notification)
                     if isinstance(node_output, dict):
                         session["state"].update(node_output)
-                        # Mirror to sm — fires the WebSocket push notification
-                        await session_manager.update_state(
-                            session_id, node_output, last_node=node_name
-                        )
+                        await mirror_session_state(session_id, node_output, last_node=node_name)
                     session["last_node"] = node_name
 
                     logger.debug(
@@ -192,9 +195,13 @@ async def run_kr_stock_analysis_task(session_id: str):
 
         # Check if we hit the approval interrupt
         state = session["state"]
-        if state.get("awaiting_approval"):
+        if session["status"] == "cancelled":
+            # User cancelled mid-run (the graph kept streaming) — the terminal
+            # cancelled status must not be overwritten by this final write.
+            pass
+        elif state.get("awaiting_approval"):
             session["status"] = "awaiting_approval"
-            await session_manager.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+            await mirror_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
             logger.info(
                 "kr_stock_analysis_awaiting_approval",
                 session_id=session_id,
@@ -203,12 +210,10 @@ async def run_kr_stock_analysis_task(session_id: str):
         elif state.get("error"):
             session["status"] = "error"
             session["error"] = state.get("error")
-            await session_manager.update_status(
-                session_id, SessionStatus.ERROR, error=state.get("error")
-            )
+            await mirror_session_status(session_id, SessionStatus.ERROR, error=state.get("error"))
         else:
             session["status"] = "completed"
-            await session_manager.update_status(session_id, SessionStatus.COMPLETED)
+            await mirror_session_status(session_id, SessionStatus.COMPLETED)
 
     except Exception as e:
         logger.error(
@@ -221,7 +226,7 @@ async def run_kr_stock_analysis_task(session_id: str):
         session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
             f"[Error] 분석 실패: {str(e)}"
         ]
-        await session_manager.update_status(session_id, SessionStatus.ERROR, error=str(e))
+        await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
     finally:
         # Always release the analysis slot
         release_analysis_slot()
@@ -324,8 +329,7 @@ async def cancel_kr_stock_analysis(session_id: str):
 
     # Mirror to sm — the notify wakes the WebSocket, which re-reads the fresh
     # legacy snapshot (cancelled status + the appended log entry).
-    session_manager = await get_session_manager()
-    await session_manager.update_status(session_id, SessionStatus.CANCELLED)
+    await mirror_session_status(session_id, SessionStatus.CANCELLED)
 
     logger.info("kr_stock_analysis_cancelled", session_id=session_id)
 
