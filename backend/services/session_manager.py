@@ -765,6 +765,19 @@ async def mirror_session_status(
         )
 
 
+async def mirror_session_removal(session_id: str) -> None:
+    """Best-effort removal mirror (keeps sm from serving deleted sessions)."""
+    try:
+        manager = await get_session_manager()
+        await manager.remove_session(session_id)
+    except Exception as e:
+        logger.warning(
+            "sm_removal_mirror_failed",
+            session_id=session_id,
+            error=str(e),
+        )
+
+
 # -------------------------------------------
 # Convenience Functions (Backward Compatibility)
 # -------------------------------------------

@@ -28,6 +28,14 @@ from app.core.analysis_limiter import (
     register_session,
     update_session_status,
 )
+from services.session_manager import (
+    MarketType,
+    SessionStatus,
+    get_session_manager,
+    mirror_session_removal,
+    mirror_session_state,
+    mirror_session_status,
+)
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -87,7 +95,7 @@ async def start_analysis(
     # Initialize state
     initial_state = create_initial_state(ticker, request.query)
 
-    # Create session record
+    # Create session record (legacy dict = read path for REST/WS)
     active_sessions[session_id] = {
         "session_id": session_id,
         "ticker": ticker,
@@ -96,6 +104,25 @@ async def start_analysis(
         "created_at": datetime.now(timezone.utc),
         "error": None,
     }
+
+    # Also register in the SessionManager so its pub/sub can push updates to
+    # the session WebSocket. Best-effort: on failure the session degrades to
+    # the WS poll fallback, never a 500.
+    try:
+        session_manager = await get_session_manager()
+        await session_manager.create_session(
+            session_id=session_id,
+            market_type=MarketType.STOCK,
+            ticker=ticker,
+            display_name=ticker,
+            state={**initial_state, "reasoning_log": list(initial_state.get("reasoning_log", []))},
+        )
+    except Exception as e:
+        logger.warning(
+            "sm_session_registration_failed",
+            session_id=session_id,
+            error=str(e),
+        )
 
     # Run analysis in background
     background_tasks.add_task(
@@ -135,6 +162,7 @@ async def run_analysis_task(session_id: str, initial_state: dict):
             "[Error] Concurrent analysis limit reached - please try again later."
         ]
         update_session_status(session_id, "error", session["error"])
+        await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
         logger.warning(
             "analysis_slot_timeout",
             session_id=session_id,
@@ -156,9 +184,12 @@ async def run_analysis_task(session_id: str, initial_state: dict):
         async for event in graph.astream(initial_state, config):
             for node_name, node_output in event.items():
                 if node_name != "__end__":
-                    # Update session state
+                    # Update session state (legacy dict FIRST so a pub/sub
+                    # wake-up always reads a fresh snapshot, then the sm mirror
+                    # fires the WebSocket push notification)
                     if isinstance(node_output, dict):
                         session["state"].update(node_output)
+                        await mirror_session_state(session_id, node_output, last_node=node_name)
                     session["last_node"] = node_name
 
                     logger.debug(
@@ -172,6 +203,7 @@ async def run_analysis_task(session_id: str, initial_state: dict):
         if state.get("awaiting_approval"):
             session["status"] = "awaiting_approval"
             update_session_status(session_id, "awaiting_approval")
+            await mirror_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
             logger.info(
                 "analysis_awaiting_approval",
                 session_id=session_id,
@@ -180,6 +212,7 @@ async def run_analysis_task(session_id: str, initial_state: dict):
         else:
             session["status"] = "completed"
             update_session_status(session_id, "completed")
+            await mirror_session_status(session_id, SessionStatus.COMPLETED)
 
     except Exception as e:
         logger.error(
@@ -190,6 +223,7 @@ async def run_analysis_task(session_id: str, initial_state: dict):
         session["status"] = "error"
         session["error"] = str(e)
         update_session_status(session_id, "error", str(e))
+        await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
 
     finally:
         # Always release the analysis slot
@@ -335,6 +369,10 @@ async def delete_session(session_id: str):
         )
 
     del active_sessions[session_id]
+
+    # Mirror the removal — otherwise the session WebSocket's sm fallback would
+    # keep serving the deleted session.
+    await mirror_session_removal(session_id)
 
     logger.info("session_deleted", session_id=session_id)
 
