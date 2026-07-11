@@ -17,7 +17,7 @@ from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.llm_provider import get_llm_provider, reset_llm_provider
-from app.api.routes import analysis, approval, websocket, coin, kr_stocks, chat, settings as settings_routes, trading, scanner, agent_chat
+from app.api.routes import approval, websocket, coin, kr_stocks, chat, settings as settings_routes, trading, scanner, agent_chat, translate
 from app.config import settings
 from app.core.analysis_limiter import cleanup_old_sessions
 from app.logging_config import configure_logging, RequestLoggingMiddleware
@@ -210,7 +210,7 @@ if settings.DEBUG:
 # (router, sub-path, tag-name). An empty sub-path means the router carries its
 # own internal prefix (e.g. indicators -> /indicators, agent_chat -> /agent-chat).
 _API_ROUTERS: list[tuple[APIRouter, str, str]] = [
-    (analysis.router, "analysis", "Analysis"),
+    (translate.router, "analysis", "Translate"),
     (approval.router, "approval", "Approval"),
     (coin.router, "coin", "Coin"),
     (kr_stocks.router, "kr_stocks", "Korean Stocks"),

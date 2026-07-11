@@ -17,7 +17,6 @@ from typing import Optional, Any
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.api.routes.analysis import get_active_sessions
 from app.api.routes.coin import get_coin_sessions
 from app.api.routes.kr_stocks import get_kr_stock_sessions
 from services.session_manager import get_session_manager
@@ -507,13 +506,12 @@ async def _get_session_snapshot(session_id: str) -> Optional[dict]:
     Look up a session in legacy-dict format.
 
     The legacy per-market dicts stay the read path for existing producers; the
-    SessionManager is the fallback so sm-only sessions (e.g. from the unified
-    analysis routes) stream too. Migrated producers write BOTH (legacy first,
-    then sm) so a pub/sub wake always observes a fresh legacy snapshot.
+    SessionManager is the fallback so sm-only sessions stream too. Producers
+    write BOTH (legacy first, then sm) so a pub/sub wake always observes a
+    fresh legacy snapshot.
     """
     session = (
-        get_active_sessions().get(session_id)
-        or get_coin_sessions().get(session_id)
+        get_coin_sessions().get(session_id)
         or get_kr_stock_sessions().get(session_id)
     )
     if session is None:

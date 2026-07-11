@@ -6,7 +6,7 @@ Export routers for inclusion in main app.
 
 from app.api.routes import (
     agent_chat,
-    analysis,
+    translate,
     approval,
     chat,
     coin,
@@ -17,7 +17,7 @@ from app.api.routes import (
 
 __all__ = [
     "agent_chat",
-    "analysis",
+    "translate",
     "approval",
     "chat",
     "coin",

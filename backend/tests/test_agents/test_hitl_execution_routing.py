@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agents.graph.nodes import should_continue_to_execution
 from agents.graph.kr_stock_nodes.execution import (
     should_continue_kr_stock_execution,
     kr_stock_execution_node,
@@ -19,7 +18,6 @@ from agents.graph.coin_nodes import should_continue_coin_execution
 from services.kiwoom.models import OrderResponse
 
 ROUTERS = [
-    should_continue_to_execution,
     should_continue_kr_stock_execution,
     should_continue_coin_execution,
 ]
