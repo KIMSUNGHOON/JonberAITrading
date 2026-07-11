@@ -528,8 +528,7 @@ async def test_ws_streams_kr_analysis_via_push_end_to_end(sm, kr_sessions, monke
     import app.api.routes.websocket as ws_module
 
     # Polls so slow that only pub/sub push can deliver frames in time.
-    monkeypatch.setattr(ws_module, "PUSH_SAFETY_POLL_SECONDS", 30.0)
-    monkeypatch.setattr(ws_module, "LEGACY_POLL_SECONDS", 30.0)
+    monkeypatch.setattr(ws_module, "SAFETY_POLL_SECONDS", 30.0)
     monkeypatch.setattr(ws_module, "COMPLETE_LINGER_SECONDS", 0.0)
 
     session_id = "kr-e2e-1"

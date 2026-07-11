@@ -123,9 +123,15 @@ def fast_linger(monkeypatch):
 
 @pytest.fixture
 def slow_polls(monkeypatch):
-    """Make both poll timeouts so slow that only push can deliver in time."""
-    monkeypatch.setattr(ws_module, "PUSH_SAFETY_POLL_SECONDS", 30.0)
-    monkeypatch.setattr(ws_module, "LEGACY_POLL_SECONDS", 30.0)
+    """Make the safety poll so slow that only push can deliver in time."""
+    monkeypatch.setattr(ws_module, "SAFETY_POLL_SECONDS", 30.0)
+
+
+@pytest.fixture
+def fast_poll(monkeypatch):
+    """Speed the safety poll up for tests that exercise poll-fallback mechanics
+    (sessions without sm pub/sub, e.g. after a failed sm registration)."""
+    monkeypatch.setattr(ws_module, "SAFETY_POLL_SECONDS", 0.1)
 
 
 def _legacy_kr_session(session_id: str, **state_extra) -> dict:
@@ -152,7 +158,7 @@ def _legacy_kr_session(session_id: str, **state_extra) -> dict:
 # -------------------------------------------
 
 
-async def test_legacy_session_streams_reasoning_status_complete(sm, kr_sessions, fast_linger):
+async def test_legacy_session_streams_reasoning_status_complete(sm, kr_sessions, fast_linger, fast_poll):
     session = _legacy_kr_session("legacy-1", reasoning_log=["[t] 시작", "[t] 기술 분석"])
     kr_sessions["legacy-1"] = session
 
@@ -174,7 +180,7 @@ async def test_legacy_session_streams_reasoning_status_complete(sm, kr_sessions,
     assert [f["data"] for f in reasoning_frames] == ["[t] 시작", "[t] 기술 분석", "[t] 종합"]
 
 
-async def test_legacy_ping_pong_and_on_demand_status(sm, kr_sessions, fast_linger):
+async def test_legacy_ping_pong_and_on_demand_status(sm, kr_sessions, fast_linger, fast_poll):
     kr_sessions["legacy-2"] = _legacy_kr_session("legacy-2")
 
     ws = FakeWebSocket()
@@ -199,7 +205,7 @@ async def test_legacy_ping_pong_and_on_demand_status(sm, kr_sessions, fast_linge
         assert on_demand["data"]["awaiting_approval"] is False
 
 
-async def test_legacy_proposal_sent_once(sm, kr_sessions, fast_linger):
+async def test_legacy_proposal_sent_once(sm, kr_sessions, fast_linger, fast_poll):
     session = _legacy_kr_session(
         "legacy-3",
         awaiting_approval=True,
@@ -227,7 +233,7 @@ async def test_legacy_proposal_sent_once(sm, kr_sessions, fast_linger):
         assert proposals[0]["data"]["action"] == "BUY"
 
 
-async def test_position_frames_are_deduped(sm, kr_sessions, fast_linger):
+async def test_position_frames_are_deduped(sm, kr_sessions, fast_linger, fast_poll):
     session = _legacy_kr_session(
         "pos-1",
         active_position={
@@ -242,7 +248,7 @@ async def test_position_frames_are_deduped(sm, kr_sessions, fast_linger):
     ws = FakeWebSocket()
     async with running_ws(ws, "pos-1") as task:
         await wait_for_frame(ws, lambda f: f.get("type") == "position")
-        await asyncio.sleep(1.0)  # ~3 poll cycles at the 0.3s legacy interval
+        await asyncio.sleep(1.0)  # ~10 poll cycles at the patched 0.1s interval
         positions = [f for f in ws.sent if f.get("type") == "position"]
         assert len(positions) == 1, "unchanged position must not be re-sent every poll"
 
@@ -316,16 +322,11 @@ async def test_push_mode_ping_pong(sm, kr_sessions, fast_linger, slow_polls):
         assert "pong" in ws.sent_text
 
 
-async def test_safety_poll_covers_legacy_only_updates_for_sm_session(sm, kr_sessions, fast_linger, monkeypatch):
-    """The PUSH_SAFETY_POLL exists for producers not yet migrated to sm (e.g. the
-    approval-resume path): a session tracked in sm whose LEGACY dict changes with
-    NO sm notification must still get frames within the safety-poll interval.
-
-    Legacy poll is disabled (30s) so only the safety poll can deliver — disabling
-    PUSH_SAFETY_POLL_SECONDS would fail this test.
-    """
-    monkeypatch.setattr(ws_module, "LEGACY_POLL_SECONDS", 30.0)
-
+async def test_safety_poll_covers_legacy_only_updates_for_sm_session(sm, kr_sessions, fast_linger):
+    """The safety poll covers producers that write the legacy dict with NO sm
+    notification (e.g. an un-migrated path): frames must still arrive within
+    the poll interval. Disabling SAFETY_POLL_SECONDS would fail this test
+    (runs at the real 1.0s default — no patching)."""
     session = _legacy_kr_session("safety-1")
     kr_sessions["safety-1"] = session
     await sm.create_session(

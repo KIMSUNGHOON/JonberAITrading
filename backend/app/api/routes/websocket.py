@@ -25,13 +25,13 @@ from services.session_manager import get_session_manager
 logger = structlog.get_logger()
 router = APIRouter()
 
-# /session/{id} wait intervals. When the session is tracked by the SessionManager,
-# pub/sub notifications are the primary wake source and the poll is only a safety
-# net (covers producers not yet migrated to sm, e.g. the approval resume path).
-# Legacy dict-only sessions keep the original 0.3s poll until their producers are
-# migrated.
-PUSH_SAFETY_POLL_SECONDS = 1.0
-LEGACY_POLL_SECONDS = 0.3
+# /session/{id} wait interval. SessionManager pub/sub notifications are the
+# primary wake source (all analysis producers register + mirror into sm as of
+# P7 Phase 2); this poll is only the safety net — it covers sessions whose sm
+# registration failed (producers degrade to legacy-dict-only writes) and any
+# producer path that writes without notifying. The old 0.3s legacy fast poll
+# was deleted with the last un-migrated producer.
+SAFETY_POLL_SECONDS = 1.0
 # Keep the connection open briefly after the complete frame so slow clients read it.
 COMPLETE_LINGER_SECONDS = 2.0
 
@@ -728,9 +728,9 @@ async def websocket_session(websocket: WebSocket, session_id: str):
 
     Push-first: subscribes to SessionManager pub/sub and treats notifications
     as wake signals (state is re-read from the session snapshot, so coalesced/
-    dropped notifications never lose data). A poll remains as fallback — slow
-    (PUSH_SAFETY_POLL_SECONDS) for sm-tracked sessions to cover un-migrated
-    producers, and the original 0.3s for legacy dict-only sessions.
+    dropped notifications never lose data). A slow poll (SAFETY_POLL_SECONDS)
+    remains as the only fallback, covering sessions without sm pub/sub (failed
+    sm registration) and producer writes that don't notify.
 
     Streams:
     - reasoning: New reasoning log entries
@@ -769,12 +769,9 @@ async def websocket_session(websocket: WebSocket, session_id: str):
                     await asyncio.sleep(COMPLETE_LINGER_SECONDS)
                     break
 
-            in_sm = await sm.get_session(session_id) is not None
-            timeout = PUSH_SAFETY_POLL_SECONDS if in_sm else LEGACY_POLL_SECONDS
-
             done, _pending = await asyncio.wait(
                 {recv_task, queue_task},
-                timeout=timeout,
+                timeout=SAFETY_POLL_SECONDS,
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
