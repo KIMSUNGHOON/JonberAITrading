@@ -64,7 +64,6 @@ const CLEAN_SET = [
   'src/components/coin/CoinOpenOrders.tsx',
   'src/components/coin/CoinAccountBalance.tsx',
   'src/components/coin/CoinInfo.tsx',
-  'src/components/coin/CoinMarketList.tsx',
   'src/components/coin/CoinPriceTicker.tsx',
   'src/components/coin/CoinTradeHistory.tsx',
   // Spot-checked (d-follow-2 t2): already zero raw-color hits, added with no edits.

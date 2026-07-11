@@ -3,14 +3,13 @@
 export type ViewKey =
   | 'dashboard' | 'analysis' | 'analysis-detail' | 'workflow'
   | 'positions' | 'charts' | 'basket' | 'scanner' | 'agent-chat'
-  | 'trading' | 'trades' | 'history';
+  | 'trading' | 'trades';
 
 /** Static path for a view. Detail views need a sessionId. */
 export function viewToPath(view: ViewKey, sessionId?: string): string {
   switch (view) {
     case 'dashboard': return '/';
     case 'analysis': return '/analysis';
-    case 'history': return '/analysis';
     case 'analysis-detail': return sessionId ? `/analysis/${sessionId}` : '/analysis';
     case 'workflow': return sessionId ? `/workflow/${sessionId}` : '/analysis';
     case 'positions': return '/positions';

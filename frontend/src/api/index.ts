@@ -3,5 +3,4 @@
  */
 
 export * from './client';
-export * from './indicators';
 export * from './websocket';
