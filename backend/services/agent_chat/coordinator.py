@@ -20,6 +20,28 @@ from services.agent_chat.models import (
     TradeDecision,
 )
 from services.agent_chat.chat_room import ChatRoom
+
+# -------------------------------------------
+# Room-created hooks
+# -------------------------------------------
+# Lets outer layers (e.g. the WebSocket route) wire ChatRoom callbacks the
+# moment a room is created — for BOTH the watch-list auto path and manual
+# /discuss — without the coordinator importing route modules (no cycle).
+
+_room_created_hooks: List[Callable] = []
+
+
+def register_room_created_hook(hook: Callable) -> None:
+    """Register a callable invoked with each newly created ChatRoom."""
+    _room_created_hooks.append(hook)
+
+
+def _fire_room_created(room: "ChatRoom") -> None:
+    for hook in _room_created_hooks:
+        try:
+            hook(room)
+        except Exception as e:
+            logger.warning("room_created_hook_failed", error=str(e))
 from services.agent_chat.position_manager import (
     PositionManager,
     get_position_manager,
@@ -291,6 +313,7 @@ class ChatCoordinator:
 
             # Register callbacks
             room.on_status_change(self._on_room_status_change)
+            _fire_room_created(room)
 
             self._active_rooms[ticker] = room
 
@@ -635,12 +658,18 @@ class ChatCoordinator:
         """
         Start a manual discussion for a stock (not from watch list).
 
+        The discussion runs as a BACKGROUND task and the (still-running)
+        ChatSession is returned immediately, so clients can subscribe to the
+        session WebSocket and stream the debate live. Unlike the watch-list
+        auto path, the manual path never executes the resulting decision
+        (_handle_decision) — manual discussions are advisory-only.
+
         Args:
             ticker: Stock ticker
             stock_name: Stock name
 
         Returns:
-            Completed ChatSession
+            The ChatSession (running; poll or subscribe for progress)
         """
         logger.info(
             "starting_manual_discussion",
@@ -655,24 +684,39 @@ class ChatCoordinator:
         # Fetch context
         context = await self._fetch_market_context(ticker, stock_name)
 
-        # Create and run room
+        # Create the room and run it in the background
         room = ChatRoom(
             ticker=ticker,
             stock_name=stock_name,
             context=context,
         )
+        _fire_room_created(room)
 
         self._active_rooms[ticker] = room
+        asyncio.create_task(self._run_manual_discussion(ticker, room))
 
+        return room.session
+
+    async def _run_manual_discussion(self, ticker: str, room: ChatRoom) -> None:
+        """Run a manually-started discussion in the background.
+
+        Mirrors the old synchronous post-completion steps (history + last-
+        discussion timestamp). Deliberately does NOT call _handle_decision:
+        that is the watch-list auto path's job — the manual path must never
+        place orders (live trading FROZEN).
+        """
         try:
             session = await room.start()
 
-            # Store in history
             self._session_history.append(session)
             self._last_discussion[ticker] = datetime.now()
 
-            return session
-
+        except Exception as e:
+            logger.error(
+                "manual_discussion_failed",
+                ticker=ticker,
+                error=str(e),
+            )
         finally:
             self._active_rooms.pop(ticker, None)
 

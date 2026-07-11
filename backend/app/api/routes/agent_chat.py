@@ -16,9 +16,11 @@ from services.agent_chat import (
     get_chat_coordinator,
     ChatSession,
     AgentMessage,
+    MessageType,
     SessionStatus,
     DecisionAction,
 )
+from services.agent_chat.coordinator import register_room_created_hook
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/agent-chat", tags=["Agent Group Chat"])
@@ -163,32 +165,39 @@ def _session_to_detail(session: ChatSession) -> dict:
             }
             for m in session.all_messages
         ],
-        "votes": [
-            {
-                "agent_type": v.agent_type.value,
-                "vote": v.vote.value,
-                "confidence": v.confidence,
-                "weight": _AGENT_WEIGHTS.get(v.agent_type.value, 0.25),
-                "weighted_score": round(
-                    _AGENT_WEIGHTS.get(v.agent_type.value, 0.25) * v.confidence, 4
-                ),
-                "reasoning": v.reasoning,
-            }
-            for v in session.votes
-        ],
+        "votes": [_vote_to_dict(v) for v in session.votes],
         "consensus_level": session.consensus_level,
-        "decision": {
-            "action": session.decision.action.value,
-            "confidence": session.decision.confidence,
-            "consensus_level": session.decision.consensus_level,
-            "entry_price": session.decision.entry_price,
-            "stop_loss": session.decision.stop_loss,
-            "take_profit": session.decision.take_profit,
-            "quantity": session.decision.quantity,
-            "key_factors": session.decision.key_factors,
-            "dissenting_opinions": session.decision.dissenting_opinions,
-            "rationale": session.decision.rationale,
-        } if session.decision else None,
+        "decision": _decision_to_dict(session.decision) if session.decision else None,
+    }
+
+
+def _vote_to_dict(vote) -> dict:
+    """Convert a vote to the dict shape the FE expects (REST detail + WS frame)."""
+    return {
+        "agent_type": vote.agent_type.value,
+        "vote": vote.vote.value,
+        "confidence": vote.confidence,
+        "weight": _AGENT_WEIGHTS.get(vote.agent_type.value, 0.25),
+        "weighted_score": round(
+            _AGENT_WEIGHTS.get(vote.agent_type.value, 0.25) * vote.confidence, 4
+        ),
+        "reasoning": vote.reasoning,
+    }
+
+
+def _decision_to_dict(decision) -> dict:
+    """Convert a decision to the dict shape the FE expects (REST detail + WS frame)."""
+    return {
+        "action": decision.action.value,
+        "confidence": decision.confidence,
+        "consensus_level": decision.consensus_level,
+        "entry_price": decision.entry_price,
+        "stop_loss": decision.stop_loss,
+        "take_profit": decision.take_profit,
+        "quantity": decision.quantity,
+        "key_factors": decision.key_factors,
+        "dissenting_opinions": decision.dissenting_opinions,
+        "rationale": decision.rationale,
     }
 
 
@@ -293,8 +302,9 @@ async def start_discussion(request: StartDiscussionRequest):
     """
     Start a manual discussion for a stock.
 
-    Triggers agents to analyze and discuss the stock immediately.
-    The discussion runs synchronously and returns the completed session.
+    The discussion runs in the BACKGROUND and this returns immediately with
+    the session id — connect to /agent-chat/ws/{session_id} (or poll the
+    session detail) to follow it live.
     """
     try:
         coordinator = await get_chat_coordinator()
@@ -316,7 +326,7 @@ async def start_discussion(request: StartDiscussionRequest):
             stock_name=session.stock_name,
             status=session.status.value,
             started_at=session.started_at.isoformat() if session.started_at else "",
-            message=f"Discussion completed for {request.stock_name}",
+            message=f"Discussion started for {request.stock_name}",
         )
 
     except ValueError as e:
@@ -504,6 +514,52 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+
+
+def _wire_room_to_websocket(room) -> None:
+    """
+    Wire a ChatRoom's callbacks to the WS ConnectionManager.
+
+    Registered as a room-created hook so EVERY room (watch-list auto path and
+    manual /discuss) pushes frames in the exact shapes the FE hook
+    (useAgentChatWebSocket) already expects: 'message' (+ a derived 'vote'
+    frame on VOTE messages) and 'status_change' (+ a derived 'decision' frame
+    once DECIDED — session.finalize runs before the DECIDED emit).
+    """
+    session_id = room.session.id
+
+    async def _forward_message(message) -> None:
+        await manager.send_message(session_id, {
+            "type": "message",
+            "session_id": session_id,
+            "message": _message_to_dict(message),
+        })
+        # Votes are emitted as chat messages; the vote itself is already in
+        # session.votes at this point — derive the dedicated 'vote' frame.
+        if message.message_type == MessageType.VOTE and room.session.votes:
+            await manager.send_message(session_id, {
+                "type": "vote",
+                "session_id": session_id,
+                "vote": _vote_to_dict(room.session.votes[-1]),
+            })
+
+    async def _forward_status(status, session) -> None:
+        await manager.broadcast_status(
+            session_id, status.value, _session_to_detail(session)
+        )
+        if status == SessionStatus.DECIDED and session.decision:
+            await manager.send_message(session_id, {
+                "type": "decision",
+                "session_id": session_id,
+                "decision": _decision_to_dict(session.decision),
+            })
+
+    room.on_message(_forward_message)
+    room.on_status_change(_forward_status)
+
+
+# Every ChatRoom created from now on streams to the WS.
+register_room_created_hook(_wire_room_to_websocket)
 
 
 @router.websocket("/ws/{session_id}")
