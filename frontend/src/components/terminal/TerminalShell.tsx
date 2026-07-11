@@ -33,7 +33,6 @@ const NAV_ICONS: Partial<Record<ViewKey, React.ReactNode>> = {
 
 const MARKETS: { id: 'kiwoom' | 'stock' | 'coin'; label: string; sim?: boolean }[] = [
   { id: 'kiwoom', label: 'KR · KRX' },
-  { id: 'stock', label: 'US', sim: true },
   { id: 'coin', label: 'COIN' },
 ];
 

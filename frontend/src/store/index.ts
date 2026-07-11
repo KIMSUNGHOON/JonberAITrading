@@ -417,7 +417,7 @@ const initialChatState: ChatState = {
 // No need for manual localStorage reading
 
 const initialUIState: UIState = {
-  activeMarket: 'stock',
+  activeMarket: 'kiwoom',
   stockRegion: 'us',
   showChartPanel: true,
   showSettingsModal: false,

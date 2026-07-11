@@ -38,7 +38,6 @@ export function buildCommands(_ctx: CommandCtx): Command[] {
 
   const market: Command[] = [
     { id: 'market:kr', title: 'KR', group: '마켓', run: (c) => c.setActiveMarket('kiwoom') },
-    { id: 'market:us', title: 'US', group: '마켓', run: (c) => c.setActiveMarket('stock') },
     { id: 'market:coin', title: 'COIN', group: '마켓', run: (c) => c.setActiveMarket('coin') },
   ];
 

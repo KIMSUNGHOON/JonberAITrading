@@ -1,18 +1,17 @@
 /**
- * MarketTabs Component (Redesigned)
+ * MarketTabs Component
  *
- * Two main markets: Stock and Crypto
- * Stock has sub-regions: US and Korea
+ * Two markets: Stock (KR · Kiwoom) and Crypto (Upbit).
+ * The US stock stack is FROZEN (no broker, sim-only) — the Stock tab routes
+ * straight to the Korean market.
  */
 
 import { TrendingUp, Bitcoin, Lock } from 'lucide-react';
-import { useStore, type StockRegion } from '@/store';
+import { useStore } from '@/store';
 
 export function MarketTabs() {
   const activeMarket = useStore((state) => state.activeMarket);
-  const stockRegion = useStore((state) => state.stockRegion);
   const setActiveMarket = useStore((state) => state.setActiveMarket);
-  const setStockRegion = useStore((state) => state.setStockRegion);
   const upbitApiConfigured = useStore((state) => state.upbitApiConfigured);
   const kiwoomApiConfigured = useStore((state) => state.kiwoomApiConfigured);
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
@@ -22,16 +21,11 @@ export function MarketTabs() {
   const isCoin = activeMarket === 'coin';
 
   const handleStockClick = () => {
-    // When clicking Stock tab, use the current region to determine market
-    if (stockRegion === 'kr') {
-      if (!kiwoomApiConfigured) {
-        setShowSettingsModal(true);
-        return;
-      }
-      setActiveMarket('kiwoom');
-    } else {
-      setActiveMarket('stock');
+    if (!kiwoomApiConfigured) {
+      setShowSettingsModal(true);
+      return;
     }
+    setActiveMarket('kiwoom');
   };
 
   const handleCoinClick = () => {
@@ -40,19 +34,6 @@ export function MarketTabs() {
       return;
     }
     setActiveMarket('coin');
-  };
-
-  const handleRegionChange = (region: StockRegion) => {
-    setStockRegion(region);
-    if (region === 'kr') {
-      if (!kiwoomApiConfigured) {
-        setShowSettingsModal(true);
-        return;
-      }
-      setActiveMarket('kiwoom');
-    } else {
-      setActiveMarket('stock');
-    }
   };
 
   return (
@@ -73,6 +54,9 @@ export function MarketTabs() {
         >
           <TrendingUp size={16} className="flex-shrink-0" />
           <span className="truncate">Stock</span>
+          {!kiwoomApiConfigured && (
+            <Lock size={12} className="text-amber-300 opacity-70 flex-shrink-0" />
+          )}
         </button>
 
         {/* Crypto Tab */}
@@ -95,45 +79,6 @@ export function MarketTabs() {
         </button>
       </div>
 
-      {/* Stock Region Selector (only shown when Stock is active) */}
-      {isStock && (
-        <div className="flex gap-1 p-0.5 bg-surface rounded-lg w-full">
-          {/* US Stock */}
-          <button
-            onClick={() => handleRegionChange('us')}
-            className={`
-              flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-md
-              text-xs font-medium transition-all duration-200 min-w-0
-              ${stockRegion === 'us'
-                ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
-                : 'text-gray-500 hover:text-gray-300 hover:bg-surface-light border border-transparent'
-              }
-            `}
-          >
-            <span className="text-sm flex-shrink-0">🇺🇸</span>
-            <span className="truncate">US</span>
-          </button>
-
-          {/* Korea Stock */}
-          <button
-            onClick={() => handleRegionChange('kr')}
-            className={`
-              flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-md
-              text-xs font-medium transition-all duration-200 min-w-0
-              ${stockRegion === 'kr'
-                ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
-                : 'text-gray-500 hover:text-gray-300 hover:bg-surface-light border border-transparent'
-              }
-            `}
-          >
-            <span className="text-sm flex-shrink-0">🇰🇷</span>
-            <span className="truncate">Korea</span>
-            {!kiwoomApiConfigured && (
-              <Lock size={10} className="text-amber-400 opacity-70 flex-shrink-0" />
-            )}
-          </button>
-        </div>
-      )}
     </div>
   );
 }
