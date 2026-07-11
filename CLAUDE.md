@@ -28,7 +28,7 @@ The system provides autonomous market analysis with human-in-the-loop (HITL) app
 
 - **Real-time Updates**: WebSocket connections stream reasoning logs and position updates
 
-- **Data Fallback**: Always use yfinance with graceful fallback to mock data in `data/mock/`
+- **Markets**: KR stocks (Kiwoom) + crypto (Upbit) only — the US/yfinance stack was removed (R2, 2026-07-11)
 
 ## Development Commands
 
@@ -99,7 +99,6 @@ cd backend && pytest -v
 | `LLM_PROVIDER` | Provider type | `ollama` (Win/macOS) or `vllm` (Linux) |
 | `LLM_BASE_URL` | OpenAI-compatible endpoint | `http://localhost:11434/v1` |
 | `LLM_MODEL` | Model name | `deepseek-r1:14b` |
-| `MARKET_DATA_MODE` | Data source | `live` or `mock` |
 | `REDIS_URL` | Redis connection | `redis://localhost:6379` |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | (required for notifications) |
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | (required for notifications) |

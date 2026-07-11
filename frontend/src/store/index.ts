@@ -1466,7 +1466,17 @@ export const useStore = create<Store>()(
                 ? parseHistoryDates(persisted.kiwoom.history as KiwoomHistoryItem[])
                 : [],
             },
-            basket: persisted.basket ?? currentState.basket,
+            // Drop basket items whose market no longer exists (the US 'stock'
+            // market was removed; items persisted before that would misroute
+            // their Analyze action and poison activeMarket).
+            basket: persisted.basket
+              ? {
+                  ...persisted.basket,
+                  items: (persisted.basket.items ?? []).filter(
+                    (item) => item.marketType === 'coin' || item.marketType === 'kiwoom'
+                  ),
+                }
+              : currentState.basket,
             hasVisited: persisted.hasVisited ?? currentState.hasVisited,
             chartConfig: persisted.chartConfig ?? currentState.chartConfig,
             sidebarCollapsed: persisted.sidebarCollapsed ?? currentState.sidebarCollapsed,
