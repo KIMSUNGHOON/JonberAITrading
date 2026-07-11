@@ -6,6 +6,7 @@
  */
 
 import { useEffect, useRef, useCallback, useState } from 'react';
+import { ManagedSocket } from '@/api/wsCore';
 
 // -------------------------------------------
 // Types
@@ -72,10 +73,7 @@ export function useTradeNotifications(
     autoConnect = true,
   } = options;
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const pingIntervalRef = useRef<number | null>(null);
-  const reconnectAttemptsRef = useRef(0);
-  const isClosingRef = useRef(false);
+  const socketRef = useRef<ManagedSocket | null>(null);
 
   const [isConnected, setIsConnected] = useState(false);
   const [notifications, setNotifications] = useState<TradeNotification[]>([]);
@@ -91,35 +89,10 @@ export function useTradeNotifications(
     onDisconnectRef.current = onDisconnect;
   }, [onNotification, onConnect, onDisconnect]);
 
-  const getWebSocketUrl = useCallback(() => {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = import.meta.env.VITE_WS_URL || `${wsProtocol}//${window.location.host}`;
-    return `${wsHost}/ws/trade-notifications`;
-  }, []);
-
-  const startPingInterval = useCallback(() => {
-    if (pingIntervalRef.current) {
-      clearInterval(pingIntervalRef.current);
-    }
-    pingIntervalRef.current = window.setInterval(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send('ping');
-      }
-    }, 25000);
-  }, []);
-
-  const stopPingInterval = useCallback(() => {
-    if (pingIntervalRef.current) {
-      clearInterval(pingIntervalRef.current);
-      pingIntervalRef.current = null;
-    }
-  }, []);
-
-  const handleMessage = useCallback((event: MessageEvent) => {
-    if (event.data === 'pong') return;
-
+  // Heartbeat replies are swallowed by the core.
+  const handleMessage = useCallback((raw: string) => {
     try {
-      const message = JSON.parse(event.data);
+      const message = JSON.parse(raw);
 
       // Skip heartbeat and connected messages
       if (message.type === 'heartbeat' || message.type === 'connected') {
@@ -150,78 +123,44 @@ export function useTradeNotifications(
     }
   }, []);
 
-  const handleReconnect = useCallback(() => {
-    const maxAttempts = 10;
-    const baseDelay = 1000;
-
-    if (reconnectAttemptsRef.current >= maxAttempts) {
-      console.error('[TradeNotifications] Max reconnection attempts reached');
-      return;
-    }
-
-    const delay = Math.min(baseDelay * Math.pow(2, reconnectAttemptsRef.current), 30000);
-    console.log(`[TradeNotifications] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1})`);
-
-    setTimeout(() => {
-      reconnectAttemptsRef.current++;
-      connect();
-    }, delay);
-  }, []);
-
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+    if (socketRef.current?.isConnected()) {
       console.warn('[TradeNotifications] Already connected');
       return;
     }
 
-    isClosingRef.current = false;
-    const url = getWebSocketUrl();
-    console.log('[TradeNotifications] Connecting to:', url);
+    // Drop any stale socket (e.g. one still backing off) before replacing it.
+    socketRef.current?.disconnect();
 
-    try {
-      const ws = new WebSocket(url);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        console.log('[TradeNotifications] Connected');
-        reconnectAttemptsRef.current = 0;
+    // Policy values preserved from the pre-core implementation:
+    // max 10 attempts, 1s base delay, 30s backoff cap, 25s heartbeat.
+    const socket = new ManagedSocket({
+      path: '/ws/trade-notifications',
+      label: 'TradeNotifications',
+      maxReconnectAttempts: 10,
+      baseReconnectDelayMs: 1000,
+      reconnectCapMs: 30000,
+      pingIntervalMs: 25000,
+      onOpen: () => {
         setIsConnected(true);
-        startPingInterval();
         onConnectRef.current?.();
-      };
-
-      ws.onclose = (event) => {
-        console.log('[TradeNotifications] Disconnected:', event.code, event.reason);
-        stopPingInterval();
+      },
+      onClose: () => {
         setIsConnected(false);
         onDisconnectRef.current?.();
+      },
+      onMessage: handleMessage,
+    });
 
-        if (!isClosingRef.current) {
-          handleReconnect();
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error('[TradeNotifications] Error:', error);
-      };
-
-      ws.onmessage = handleMessage;
-    } catch (error) {
-      console.error('[TradeNotifications] Connection error:', error);
-      handleReconnect();
-    }
-  }, [getWebSocketUrl, startPingInterval, stopPingInterval, handleMessage, handleReconnect]);
+    socketRef.current = socket;
+    socket.connect();
+  }, [handleMessage]);
 
   const disconnect = useCallback(() => {
-    isClosingRef.current = true;
-    stopPingInterval();
-
-    if (wsRef.current) {
-      wsRef.current.close(1000, 'Client disconnect');
-      wsRef.current = null;
-    }
+    socketRef.current?.disconnect();
+    socketRef.current = null;
     setIsConnected(false);
-  }, [stopPingInterval]);
+  }, []);
 
   const clearNotifications = useCallback(() => {
     setNotifications([]);

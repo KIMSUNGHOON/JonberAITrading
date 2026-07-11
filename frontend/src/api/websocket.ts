@@ -10,6 +10,8 @@
 
 import type { TradeProposal, CoinTradeProposal, KRStockTradeProposal, Position, SessionStatus, DetailedAnalysisResults } from '@/types';
 import type { MarketType } from '@/store';
+import { ManagedSocket } from './wsCore';
+import type { ConnectionState } from './wsCore';
 
 // -------------------------------------------
 // Types
@@ -24,10 +26,8 @@ export type WebSocketMessageType =
   | 'heartbeat'
   | 'sessions';
 
-/**
- * Connection state for better tracking
- */
-export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
+// Re-exported for existing consumers; the canonical enum lives in wsCore.
+export type { ConnectionState } from './wsCore';
 
 /**
  * Event types for EventEmitter-like pattern
@@ -134,111 +134,44 @@ export interface WebSocketHandlers {
 // -------------------------------------------
 
 export class TradingWebSocket {
-  private ws: WebSocket | null = null;
-  private sessionId: string;
+  private socket: ManagedSocket;
   private handlers: WebSocketHandlers;
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private reconnectDelay = 1000;
-  private pingInterval: number | null = null;
-  private isClosing = false;
-  private _connectionState: ConnectionState = 'disconnected';
   private messageBuffer: WebSocketMessage[] = [];
 
   constructor(sessionId: string, handlers: WebSocketHandlers = {}) {
-    this.sessionId = sessionId;
     this.handlers = handlers;
+    // Policy values preserved from the pre-core implementation:
+    // max 5 attempts, 1s base delay, UNCAPPED backoff, 30s heartbeat.
+    this.socket = new ManagedSocket({
+      path: `/ws/session/${sessionId}`,
+      label: 'WebSocket',
+      maxReconnectAttempts: 5,
+      baseReconnectDelayMs: 1000,
+      reconnectCapMs: null,
+      pingIntervalMs: 30000,
+      onOpen: () => {
+        this.flushMessageBuffer();
+        this.handlers.onConnect?.();
+      },
+      onClose: () => this.handlers.onDisconnect?.(),
+      onError: (error) => this.handlers.onError?.(error),
+      onStateChange: (state) => this.handlers.onConnectionStateChange?.(state),
+      onMessage: (raw) => this.handleMessage(raw),
+    });
   }
 
   /**
    * Get current connection state.
    */
   get connectionState(): ConnectionState {
-    return this._connectionState;
-  }
-
-  /**
-   * Set connection state and notify handlers.
-   */
-  private setConnectionState(state: ConnectionState): void {
-    if (this._connectionState !== state) {
-      this._connectionState = state;
-      this.handlers.onConnectionStateChange?.(state);
-    }
-  }
-
-  /**
-   * Get WebSocket URL based on current environment.
-   */
-  private getWebSocketUrl(): string {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Backend WebSocket is mounted at /ws, not /api/ws
-    // VITE_WS_URL should be the base URL without /ws (e.g., ws://localhost:8000)
-    // If not set, use the current host which will be proxied by Vite in dev
-    const wsHost = import.meta.env.VITE_WS_URL || `${wsProtocol}//${window.location.host}`;
-    const url = `${wsHost}/ws/session/${this.sessionId}`;
-    console.log('[WebSocket] Constructed URL:', url);
-    return url;
+    return this.socket.state;
   }
 
   /**
    * Connect to WebSocket server.
    */
   connect(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      console.warn('WebSocket already connected');
-      return;
-    }
-
-    this.isClosing = false;
-    const url = this.getWebSocketUrl();
-    console.log('Connecting to WebSocket:', url);
-    this.setConnectionState('connecting');
-
-    try {
-      this.ws = new WebSocket(url);
-      this.setupEventListeners();
-    } catch (error) {
-      console.error('WebSocket connection error:', error);
-      this.setConnectionState('disconnected');
-      this.handleReconnect();
-    }
-  }
-
-  /**
-   * Setup WebSocket event listeners.
-   */
-  private setupEventListeners(): void {
-    if (!this.ws) return;
-
-    this.ws.onopen = () => {
-      console.log('WebSocket connected');
-      this.reconnectAttempts = 0;
-      this.setConnectionState('connected');
-      this.startPingInterval();
-      this.flushMessageBuffer();
-      this.handlers.onConnect?.();
-    };
-
-    this.ws.onclose = (event) => {
-      console.log('WebSocket closed:', event.code, event.reason);
-      this.stopPingInterval();
-      this.setConnectionState('disconnected');
-      this.handlers.onDisconnect?.();
-
-      if (!this.isClosing) {
-        this.handleReconnect();
-      }
-    };
-
-    this.ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
-      this.handlers.onError?.(error);
-    };
-
-    this.ws.onmessage = (event) => {
-      this.handleMessage(event);
-    };
+    this.socket.connect();
   }
 
   /**
@@ -278,16 +211,12 @@ export class TradingWebSocket {
   }
 
   /**
-   * Handle incoming WebSocket messages.
+   * Handle incoming WebSocket messages (heartbeat replies already swallowed
+   * by the core).
    */
-  private handleMessage(event: MessageEvent): void {
+  private handleMessage(raw: string): void {
     try {
-      // Handle pong response
-      if (event.data === 'pong') {
-        return;
-      }
-
-      const message: WebSocketMessage = JSON.parse(event.data);
+      const message: WebSocketMessage = JSON.parse(raw);
       console.log('[WebSocket] Received message:', message.type, message.data);
 
       if (message.type === 'status') {
@@ -308,75 +237,25 @@ export class TradingWebSocket {
   }
 
   /**
-   * Start ping interval to keep connection alive.
-   */
-  private startPingInterval(): void {
-    this.pingInterval = window.setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send('ping');
-      }
-    }, 30000);
-  }
-
-  /**
-   * Stop ping interval.
-   */
-  private stopPingInterval(): void {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
-  }
-
-  /**
-   * Handle reconnection with exponential backoff.
-   */
-  private handleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('Max reconnection attempts reached');
-      this.setConnectionState('disconnected');
-      return;
-    }
-
-    this.setConnectionState('reconnecting');
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts);
-    console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts + 1})`);
-
-    setTimeout(() => {
-      this.reconnectAttempts++;
-      this.connect();
-    }, delay);
-  }
-
-  /**
    * Request current status.
    */
   requestStatus(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send('status');
-    }
+    this.socket.send('status');
   }
 
   /**
    * Disconnect from WebSocket server.
    */
   disconnect(): void {
-    this.isClosing = true;
-    this.stopPingInterval();
     this.messageBuffer = []; // Clear any buffered messages
-
-    if (this.ws) {
-      this.ws.close(1000, 'Client disconnect');
-      this.ws = null;
-    }
-    this.setConnectionState('disconnected');
+    this.socket.disconnect();
   }
 
   /**
    * Check if connected.
    */
   isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.socket.isConnected();
   }
 
   /**
@@ -599,13 +478,8 @@ export interface TickerWebSocketHandlers {
  *   unsubscribe(); // Remove this callback
  */
 export class TickerWebSocket {
-  private ws: WebSocket | null = null;
+  private socket: ManagedSocket;
   private handlers: TickerWebSocketHandlers;
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 10;
-  private reconnectDelay = 1000;
-  private pingInterval: number | null = null;
-  private isClosing = false;
   private pendingSubscriptions: string[] = [];
 
   // Track subscriptions per market with reference counting
@@ -617,6 +491,27 @@ export class TickerWebSocket {
 
   constructor(handlers: TickerWebSocketHandlers = {}) {
     this.handlers = handlers;
+    // Policy values preserved from the pre-core implementation:
+    // max 10 attempts, 1s base delay, 30s backoff cap, 25s heartbeat.
+    this.socket = new ManagedSocket({
+      path: '/ws/ticker',
+      label: 'TickerWebSocket',
+      maxReconnectAttempts: 10,
+      baseReconnectDelayMs: 1000,
+      reconnectCapMs: 30000,
+      pingIntervalMs: 25000,
+      onOpen: () => {
+        this.handlers.onConnect?.();
+        // Subscribe to pending markets
+        if (this.pendingSubscriptions.length > 0) {
+          this.subscribe(this.pendingSubscriptions);
+          this.pendingSubscriptions = [];
+        }
+      },
+      onClose: () => this.handlers.onDisconnect?.(),
+      onError: (error) => this.handlers.onError?.(error),
+      onMessage: (raw) => this.handleMessage(raw),
+    });
   }
 
   /**
@@ -705,86 +600,19 @@ export class TickerWebSocket {
   }
 
   /**
-   * Get WebSocket URL for ticker endpoint.
-   */
-  private getWebSocketUrl(): string {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = import.meta.env.VITE_WS_URL || `${wsProtocol}//${window.location.host}`;
-    return `${wsHost}/ws/ticker`;
-  }
-
-  /**
    * Connect to WebSocket server.
    */
   connect(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      console.warn('TickerWebSocket already connected');
-      return;
-    }
-
-    this.isClosing = false;
-    const url = this.getWebSocketUrl();
-    console.log('Connecting to Ticker WebSocket:', url);
-
-    try {
-      this.ws = new WebSocket(url);
-      this.setupEventListeners();
-    } catch (error) {
-      console.error('TickerWebSocket connection error:', error);
-      this.handleReconnect();
-    }
+    this.socket.connect();
   }
 
   /**
-   * Setup WebSocket event listeners.
+   * Handle incoming WebSocket messages (heartbeat replies already swallowed
+   * by the core).
    */
-  private setupEventListeners(): void {
-    if (!this.ws) return;
-
-    this.ws.onopen = () => {
-      console.log('TickerWebSocket connected');
-      this.reconnectAttempts = 0;
-      this.startPingInterval();
-      this.handlers.onConnect?.();
-
-      // Subscribe to pending markets
-      if (this.pendingSubscriptions.length > 0) {
-        this.subscribe(this.pendingSubscriptions);
-        this.pendingSubscriptions = [];
-      }
-    };
-
-    this.ws.onclose = (event) => {
-      console.log('TickerWebSocket closed:', event.code, event.reason);
-      this.stopPingInterval();
-      this.handlers.onDisconnect?.();
-
-      if (!this.isClosing) {
-        this.handleReconnect();
-      }
-    };
-
-    this.ws.onerror = (error) => {
-      console.error('TickerWebSocket error:', error);
-      this.handlers.onError?.(error);
-    };
-
-    this.ws.onmessage = (event) => {
-      this.handleMessage(event);
-    };
-  }
-
-  /**
-   * Handle incoming WebSocket messages.
-   */
-  private handleMessage(event: MessageEvent): void {
+  private handleMessage(raw: string): void {
     try {
-      // Handle pong response
-      if (event.data === 'pong') {
-        return;
-      }
-
-      const message = JSON.parse(event.data);
+      const message = JSON.parse(raw);
 
       switch (message.type) {
         case 'ticker': {
@@ -836,12 +664,11 @@ export class TickerWebSocket {
   subscribe(markets: string[]): void {
     if (!markets.length) return;
 
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        action: 'subscribe',
-        markets: markets.map(m => m.toUpperCase()),
-      }));
-    } else {
+    const payload = JSON.stringify({
+      action: 'subscribe',
+      markets: markets.map(m => m.toUpperCase()),
+    });
+    if (!this.socket.send(payload)) {
       // Queue for when connected
       this.pendingSubscriptions.push(...markets);
     }
@@ -853,12 +680,10 @@ export class TickerWebSocket {
   unsubscribe(markets: string[]): void {
     if (!markets.length) return;
 
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        action: 'unsubscribe',
-        markets: markets.map(m => m.toUpperCase()),
-      }));
-    }
+    this.socket.send(JSON.stringify({
+      action: 'unsubscribe',
+      markets: markets.map(m => m.toUpperCase()),
+    }));
 
     // Remove from pending
     this.pendingSubscriptions = this.pendingSubscriptions.filter(
@@ -867,71 +692,23 @@ export class TickerWebSocket {
   }
 
   /**
-   * Start ping interval to keep connection alive.
-   */
-  private startPingInterval(): void {
-    this.pingInterval = window.setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send('ping');
-      }
-    }, 25000);
-  }
-
-  /**
-   * Stop ping interval.
-   */
-  private stopPingInterval(): void {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
-  }
-
-  /**
-   * Handle reconnection with exponential backoff.
-   */
-  private handleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('TickerWebSocket: Max reconnection attempts reached');
-      return;
-    }
-
-    const delay = Math.min(
-      this.reconnectDelay * Math.pow(2, this.reconnectAttempts),
-      30000
-    );
-    console.log(`TickerWebSocket: Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts + 1})`);
-
-    setTimeout(() => {
-      this.reconnectAttempts++;
-      this.connect();
-    }, delay);
-  }
-
-  /**
    * Disconnect from WebSocket server.
    */
   disconnect(): void {
-    this.isClosing = true;
-    this.stopPingInterval();
-
     // Clear all pending unsubscriptions
     for (const timeoutId of this.pendingUnsubscriptions.values()) {
       clearTimeout(timeoutId);
     }
     this.pendingUnsubscriptions.clear();
 
-    if (this.ws) {
-      this.ws.close(1000, 'Client disconnect');
-      this.ws = null;
-    }
+    this.socket.disconnect();
   }
 
   /**
    * Check if connected.
    */
   isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.socket.isConnected();
   }
 
   /**

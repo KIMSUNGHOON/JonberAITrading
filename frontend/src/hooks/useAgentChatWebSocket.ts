@@ -7,6 +7,8 @@
  */
 
 import { useEffect, useRef, useCallback, useState } from 'react';
+import { ManagedSocket } from '@/api/wsCore';
+import type { ConnectionState } from '@/api/wsCore';
 import type {
   AgentChatMessage,
   AgentChatSessionDetail,
@@ -90,16 +92,6 @@ export interface UseAgentChatWebSocketResult {
 }
 
 /**
- * Get WebSocket URL for Agent Chat session.
- */
-function getAgentChatWebSocketUrl(sessionId: string): string {
-  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsHost = import.meta.env.VITE_WS_URL || `${wsProtocol}//${window.location.host}`;
-  // Agent Chat WebSocket endpoint
-  return `${wsHost}/api/agent-chat/ws/${sessionId}`;
-}
-
-/**
  * Hook to manage WebSocket connection for an Agent Chat session.
  *
  * @example
@@ -122,47 +114,16 @@ export function useAgentChatWebSocket({
   onConnect,
   onDisconnect,
 }: UseAgentChatWebSocketOptions): UseAgentChatWebSocketResult {
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectAttemptsRef = useRef(0);
-  const reconnectTimeoutRef = useRef<number | null>(null);
-  const pingIntervalRef = useRef<number | null>(null);
-  const isClosingRef = useRef(false);
+  const socketRef = useRef<ManagedSocket | null>(null);
   const connectedSessionRef = useRef<string | null>(null);
 
-  const [connectionState, setConnectionState] = useState<'disconnected' | 'connecting' | 'connected' | 'reconnecting'>('disconnected');
+  const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
   const [lastError, setLastError] = useState<string | null>(null);
 
-  const maxReconnectAttempts = 5;
-  const reconnectDelay = 1000;
-  const pingInterval = 30000;
-
-  // Start ping interval
-  const startPingInterval = useCallback(() => {
-    stopPingInterval();
-    pingIntervalRef.current = window.setInterval(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send('ping');
-      }
-    }, pingInterval);
-  }, []);
-
-  // Stop ping interval
-  const stopPingInterval = useCallback(() => {
-    if (pingIntervalRef.current) {
-      clearInterval(pingIntervalRef.current);
-      pingIntervalRef.current = null;
-    }
-  }, []);
-
-  // Handle incoming messages
-  const handleMessage = useCallback((event: globalThis.MessageEvent) => {
+  // Handle incoming messages (heartbeat replies swallowed by the core)
+  const handleMessage = useCallback((raw: string) => {
     try {
-      // Handle pong response
-      if (event.data === 'pong') {
-        return;
-      }
-
-      const data: AgentChatWsMessage = JSON.parse(event.data);
+      const data: AgentChatWsMessage = JSON.parse(raw);
       console.log('[AgentChatWebSocket] Received:', data.type);
 
       switch (data.type) {
@@ -200,76 +161,39 @@ export function useAgentChatWebSocket({
     }
   }, [onMessage, onStatusChange, onVote, onDecision, onError]);
 
-  // Handle reconnection
-  const handleReconnect = useCallback(() => {
-    if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
-      console.error('[AgentChatWebSocket] Max reconnection attempts reached');
-      setConnectionState('disconnected');
-      return;
-    }
-
-    setConnectionState('reconnecting');
-    const delay = reconnectDelay * Math.pow(2, reconnectAttemptsRef.current);
-    console.log(`[AgentChatWebSocket] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1})`);
-
-    reconnectTimeoutRef.current = window.setTimeout(() => {
-      reconnectAttemptsRef.current++;
-      if (connectedSessionRef.current) {
-        connectToSession(connectedSessionRef.current);
-      }
-    }, delay);
-  }, []);
-
   // Connect to session
   const connectToSession = useCallback((sid: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+    if (socketRef.current?.isConnected()) {
       console.warn('[AgentChatWebSocket] Already connected');
       return;
     }
 
-    isClosingRef.current = false;
-    const url = getAgentChatWebSocketUrl(sid);
-    console.log('[AgentChatWebSocket] Connecting to:', url);
-    setConnectionState('connecting');
+    // Drop any stale socket (e.g. one still backing off) before replacing it.
+    socketRef.current?.disconnect();
 
-    try {
-      const ws = new WebSocket(url);
-
-      ws.onopen = () => {
-        console.log('[AgentChatWebSocket] Connected');
-        reconnectAttemptsRef.current = 0;
-        setConnectionState('connected');
+    // Policy values preserved from the pre-core implementation:
+    // max 5 attempts, 1s base delay, UNCAPPED backoff, 30s heartbeat.
+    const socket = new ManagedSocket({
+      path: `/api/agent-chat/ws/${sid}`,
+      label: 'AgentChatWebSocket',
+      maxReconnectAttempts: 5,
+      baseReconnectDelayMs: 1000,
+      reconnectCapMs: null,
+      pingIntervalMs: 30000,
+      onOpen: () => {
         setLastError(null);
-        startPingInterval();
         onConnect?.();
-      };
+      },
+      onClose: () => onDisconnect?.(),
+      onError: () => setLastError('WebSocket connection error'),
+      onStateChange: setConnectionState,
+      onMessage: handleMessage,
+    });
 
-      ws.onclose = (event) => {
-        console.log('[AgentChatWebSocket] Closed:', event.code, event.reason);
-        stopPingInterval();
-        setConnectionState('disconnected');
-        onDisconnect?.();
-
-        if (!isClosingRef.current && connectedSessionRef.current) {
-          handleReconnect();
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error('[AgentChatWebSocket] Error:', error);
-        setLastError('WebSocket connection error');
-      };
-
-      ws.onmessage = handleMessage;
-
-      wsRef.current = ws;
-      connectedSessionRef.current = sid;
-    } catch (error) {
-      console.error('[AgentChatWebSocket] Connection error:', error);
-      setConnectionState('disconnected');
-      handleReconnect();
-    }
-  }, [handleMessage, handleReconnect, startPingInterval, stopPingInterval, onConnect, onDisconnect]);
+    socketRef.current = socket;
+    connectedSessionRef.current = sid;
+    socket.connect();
+  }, [handleMessage, onConnect, onDisconnect]);
 
   // Public connect function
   const connect = useCallback(() => {
@@ -279,22 +203,11 @@ export function useAgentChatWebSocket({
 
   // Public disconnect function
   const disconnect = useCallback(() => {
-    isClosingRef.current = true;
-    stopPingInterval();
-
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-
-    if (wsRef.current) {
-      wsRef.current.close(1000, 'Client disconnect');
-      wsRef.current = null;
-    }
-
+    socketRef.current?.disconnect();
+    socketRef.current = null;
     connectedSessionRef.current = null;
     setConnectionState('disconnected');
-  }, [stopPingInterval]);
+  }, []);
 
   // Auto-connect/disconnect effect
   useEffect(() => {
