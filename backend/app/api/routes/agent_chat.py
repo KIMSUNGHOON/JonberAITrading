@@ -495,13 +495,19 @@ class ConnectionManager:
                 del self.active_connections[session_id]
 
     async def send_message(self, session_id: str, message: dict):
-        """Send a message to all clients watching a session."""
-        if session_id in self.active_connections:
-            for connection in self.active_connections[session_id]:
-                try:
-                    await connection.send_json(message)
-                except Exception:
-                    pass
+        """Send a message to all clients watching a session.
+
+        Iterates a COPY (a disconnecting client mutates the live list mid-await)
+        and prunes sockets whose send fails so dead entries don't accumulate.
+        """
+        dead: list[WebSocket] = []
+        for connection in list(self.active_connections.get(session_id, [])):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                dead.append(connection)
+        for connection in dead:
+            self.disconnect(connection, session_id)
 
     async def broadcast_status(self, session_id: str, status: str, session: dict):
         """Broadcast status change to all clients."""
@@ -568,6 +574,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     WebSocket endpoint for real-time session updates.
 
     Connect to receive:
+    - An immediate status_change snapshot of the session (if it exists)
     - New messages as they're generated
     - Status changes (analyzing, discussing, voting, decided)
     - Final decision announcement
@@ -575,6 +582,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await manager.connect(websocket, session_id)
 
     try:
+        # Send an initial snapshot so a client that connects mid-discussion —
+        # or just after the final frame — starts from the current state instead
+        # of waiting for the next emit (the FE suppresses its REST poll while
+        # the socket is connected).
+        try:
+            coordinator = await get_chat_coordinator()
+            session = coordinator.get_session_by_id(session_id)
+            if session is not None:
+                await websocket.send_json({
+                    "type": "status_change",
+                    "session_id": session_id,
+                    "status": session.status.value,
+                    "session": _session_to_detail(session),
+                })
+        except Exception as e:
+            logger.warning("agent_chat_ws_snapshot_failed", session_id=session_id, error=str(e))
+
         while True:
             # Keep connection alive
             data = await websocket.receive_text()

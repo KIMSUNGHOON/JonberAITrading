@@ -654,22 +654,27 @@ class ChatCoordinator:
         self,
         ticker: str,
         stock_name: str,
+        wait: bool = False,
     ) -> ChatSession:
         """
         Start a manual discussion for a stock (not from watch list).
 
-        The discussion runs as a BACKGROUND task and the (still-running)
-        ChatSession is returned immediately, so clients can subscribe to the
-        session WebSocket and stream the debate live. Unlike the watch-list
-        auto path, the manual path never executes the resulting decision
-        (_handle_decision) — manual discussions are advisory-only.
+        By default the discussion runs as a BACKGROUND task and the (still-
+        running) ChatSession is returned immediately, so clients can subscribe
+        to the session WebSocket and stream the debate live. With wait=True
+        the call blocks until the debate completes and returns the DECIDED
+        session (raising on failure) — the contract PositionManager depends on
+        to read session.decision. Either way the manual path never executes
+        the decision itself (_handle_decision is the watch-list auto path's
+        job) — callers decide what to do with it.
 
         Args:
             ticker: Stock ticker
             stock_name: Stock name
+            wait: Block until the discussion completes (old synchronous contract)
 
         Returns:
-            The ChatSession (running; poll or subscribe for progress)
+            The ChatSession (completed if wait=True, else running)
         """
         logger.info(
             "starting_manual_discussion",
@@ -684,7 +689,7 @@ class ChatCoordinator:
         # Fetch context
         context = await self._fetch_market_context(ticker, stock_name)
 
-        # Create the room and run it in the background
+        # Create the room
         room = ChatRoom(
             ticker=ticker,
             stock_name=stock_name,
@@ -693,6 +698,19 @@ class ChatCoordinator:
         _fire_room_created(room)
 
         self._active_rooms[ticker] = room
+
+        if wait:
+            # Old synchronous contract: return the completed session, raise on
+            # failure (the caller's discussion budget must not be consumed by
+            # failures).
+            try:
+                session = await room.start()
+                self._session_history.append(session)
+                self._last_discussion[ticker] = datetime.now()
+                return session
+            finally:
+                self._active_rooms.pop(ticker, None)
+
         asyncio.create_task(self._run_manual_discussion(ticker, room))
 
         return room.session
@@ -717,6 +735,10 @@ class ChatCoordinator:
                 ticker=ticker,
                 error=str(e),
             )
+            # The session id was already handed out by /discuss — keep the
+            # (CANCELLED) session queryable instead of letting the id dangle
+            # as a permanent 404.
+            self._session_history.append(room.session)
         finally:
             self._active_rooms.pop(ticker, None)
 

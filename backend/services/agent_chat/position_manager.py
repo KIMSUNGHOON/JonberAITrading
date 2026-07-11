@@ -711,10 +711,14 @@ class PositionManager:
         )
 
         try:
-            # Start discussion via coordinator
+            # Start discussion via coordinator. wait=True: block until the
+            # debate completes — session.decision is read right below, so the
+            # async default (returns a still-running session, decision=None)
+            # would make _apply_decision dead code.
             session = await self._chat_coordinator.start_manual_discussion(
                 ticker=position.ticker,
                 stock_name=position.stock_name,
+                wait=True,
             )
 
             position.discussion_count += 1

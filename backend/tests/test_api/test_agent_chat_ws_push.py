@@ -188,6 +188,108 @@ async def test_room_created_hook_fires_on_manual_start(coordinator, hook_registr
 
 
 # -------------------------------------------
+# wait=True: the blocking contract PositionManager depends on
+# -------------------------------------------
+
+
+class DecidingFakeRoom(FakeRoom):
+    async def start(self):
+        self.session.decision = TradeDecision(
+            action=DecisionAction.SELL,
+            confidence=0.85,
+            consensus_level=0.9,
+            rationale="손절 근접",
+        )
+        self.session.status = SessionStatus.DECIDED
+        return self.session
+
+
+class FailingFakeRoom(FakeRoom):
+    async def start(self):
+        # Mirrors ChatRoom.start: sets CANCELLED, then re-raises.
+        self.session.status = SessionStatus.CANCELLED
+        raise RuntimeError("discussion blew up")
+
+
+async def test_wait_true_blocks_until_decided(coordinator):
+    """PositionManager awaits the completed session (old synchronous contract) —
+    wait=True must return a DECIDED session with the decision populated."""
+    import services.agent_chat.coordinator as cm
+    cm.ChatRoom = DecidingFakeRoom
+
+    session = await coordinator.start_manual_discussion("005930", "삼성전자", wait=True)
+
+    assert session.status == SessionStatus.DECIDED
+    assert session.decision is not None
+    assert "005930" not in coordinator._active_rooms
+    assert coordinator._session_history[-1] is session
+
+
+async def test_wait_true_propagates_failure(coordinator):
+    """Old contract: a failed discussion RAISES to the caller (PositionManager
+    catches it and skips the discussion-budget increment)."""
+    import services.agent_chat.coordinator as cm
+    cm.ChatRoom = FailingFakeRoom
+
+    with pytest.raises(RuntimeError):
+        await coordinator.start_manual_discussion("005930", "삼성전자", wait=True)
+
+    assert "005930" not in coordinator._active_rooms
+
+
+async def test_position_manager_calls_with_wait(monkeypatch):
+    """PositionManager._trigger_discussion must use wait=True — with the async
+    default it would read session.decision before the debate even starts and
+    _apply_decision would be dead code."""
+    from services.agent_chat.position_manager import (
+        MonitoredPosition,
+        PositionEvent,
+        PositionEventType,
+        PositionManager,
+    )
+
+    calls = []
+
+    class FakeCoordinator:
+        async def start_manual_discussion(self, ticker, stock_name, wait=False):
+            calls.append(wait)
+            return ChatSession(ticker=ticker, stock_name=stock_name)
+
+    pm = PositionManager()
+    pm.set_chat_coordinator(FakeCoordinator())
+
+    position = MonitoredPosition(
+        ticker="005930", stock_name="삼성전자", quantity=10, avg_price=70000,
+        current_price=66000, stop_loss=65000,
+    )
+    event = PositionEvent(
+        ticker="005930",
+        event_type=PositionEventType.STOP_LOSS_NEAR,
+        current_price=66000,
+        trigger_value=65000,
+        message="손절가 근접",
+    )
+
+    await pm._trigger_discussion(event, position)
+
+    assert calls == [True], "PositionManager must await the COMPLETED session"
+
+
+async def test_failed_async_discussion_recorded_as_cancelled(coordinator):
+    """A /discuss session id must never dangle: if the background run fails,
+    the CANCELLED session still lands in history (REST detail keeps working)."""
+    import services.agent_chat.coordinator as cm
+    cm.ChatRoom = FailingFakeRoom
+
+    session = await coordinator.start_manual_discussion("005930", "삼성전자")
+    await _wait_until(lambda: "005930" not in coordinator._active_rooms)
+
+    stored = coordinator.get_session_by_id(session.id)
+    assert stored is not None, "failed session must remain queryable (was a 404 dangle)"
+    assert stored.status == SessionStatus.CANCELLED
+
+
+# -------------------------------------------
 # WS forwarding: ChatRoom callbacks → ConnectionManager frames
 # -------------------------------------------
 
@@ -277,3 +379,74 @@ async def test_route_module_registers_the_ws_wiring_hook(hook_registry):
 
     hooks = coordinator_module._room_created_hooks
     assert route_module._wire_room_to_websocket in hooks
+
+
+async def test_send_message_prunes_dead_connections():
+    """A dead socket must be pruned and must not stop delivery to healthy ones
+    (send_message is now the delivery path for every agent-chat frame)."""
+    from app.api.routes.agent_chat import ConnectionManager
+
+    class DeadWS:
+        async def send_json(self, message):
+            raise RuntimeError("socket closed")
+
+    mgr = ConnectionManager()
+    dead, healthy = DeadWS(), FakeWS()
+    mgr.active_connections["s1"] = [dead, healthy]
+
+    await mgr.send_message("s1", {"type": "message", "session_id": "s1"})
+
+    assert healthy.sent == [{"type": "message", "session_id": "s1"}]
+    assert dead not in mgr.active_connections.get("s1", []), "dead socket must be pruned"
+
+
+async def test_ws_endpoint_sends_snapshot_on_connect(monkeypatch):
+    """A client connecting mid-discussion (or just after the last frame) must
+    receive an immediate status_change snapshot — otherwise the FE suppresses
+    its poll while 'live' and stays stale forever."""
+    import contextlib
+    from fastapi import WebSocketDisconnect
+
+    import app.api.routes.agent_chat as route_module
+
+    session = ChatSession(ticker="005930", stock_name="삼성전자")
+    session.status = SessionStatus.DISCUSSING
+
+    class FakeCoordinator:
+        def get_session_by_id(self, session_id):
+            return session if session_id == session.id else None
+
+    async def fake_get_coordinator():
+        return FakeCoordinator()
+
+    monkeypatch.setattr(route_module, "get_chat_coordinator", fake_get_coordinator)
+
+    disconnect = object()
+
+    class EndpointFakeWS(FakeWS):
+        def __init__(self):
+            super().__init__()
+            self.accepted = False
+            self._incoming: asyncio.Queue = asyncio.Queue()
+
+        async def accept(self):
+            self.accepted = True
+
+        async def receive_text(self):
+            item = await self._incoming.get()
+            if item is disconnect:
+                raise WebSocketDisconnect(code=1000)
+            return item
+
+    ws = EndpointFakeWS()
+    task = asyncio.create_task(route_module.websocket_endpoint(ws, session.id))
+    try:
+        await _wait_until(lambda: len(ws.sent) >= 1)
+        snapshot = ws.sent[0]
+        assert snapshot["type"] == "status_change"
+        assert snapshot["status"] == "discussing"
+        assert snapshot["session"]["id"] == session.id
+    finally:
+        ws._incoming.put_nowait(disconnect)
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(task, timeout=2.0)
