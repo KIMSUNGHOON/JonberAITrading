@@ -261,4 +261,78 @@ describe('ManagedSocket', () => {
     socket.connect();
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
+
+  it('delivers onOpen/onError/onClose, with onOpen fired while the socket is sendable', () => {
+    // All four adapters hang resume logic on these callbacks (buffer flush,
+    // pending-subscription flush, isConnected state) — dropping or reordering
+    // any of them must fail a test.
+    const events: string[] = [];
+    const socket: ManagedSocket = new ManagedSocket({
+      path: '/ws/test',
+      onOpen: () => {
+        // e.g. TickerWebSocket flushes queued subscriptions from onOpen —
+        // the socket must already be open when it fires.
+        events.push(socket.send('sub') ? 'open:sendable' : 'open:not-sendable');
+      },
+      onClose: () => events.push('close'),
+      onError: () => events.push('error'),
+    });
+
+    socket.connect();
+    const ws = lastSocket();
+    ws.simulateOpen();
+    expect(events).toEqual(['open:sendable']);
+    expect(ws.sent).toContain('sub');
+
+    ws.onerror?.('boom');
+    expect(events).toEqual(['open:sendable', 'error']);
+
+    ws.simulateServerClose();
+    expect(events).toEqual(['open:sendable', 'error', 'close']);
+  });
+
+  it('a reused instance reconnects on server drops after disconnect() → connect()', () => {
+    // TradingWebSocket/TickerWebSocket embed ONE ManagedSocket for their
+    // lifetime and forward connect()/disconnect() — the clean-shutdown latch
+    // must reset on reuse or a reused socket would ignore server drops forever.
+    const socket = new ManagedSocket({ path: '/ws/test', baseReconnectDelayMs: 1000 });
+    socket.connect();
+    lastSocket().simulateOpen();
+    socket.disconnect();
+
+    socket.connect(); // reuse the same instance
+    lastSocket().simulateOpen();
+    lastSocket().simulateServerClose(); // server drop after reuse
+
+    expect(socket.state).toBe('reconnecting');
+    vi.advanceTimersByTime(1000);
+    expect(FakeWebSocket.instances).toHaveLength(3); // initial + reuse + reconnect
+  });
+
+  it('recovers with backoff when the WebSocket constructor throws', () => {
+    // A malformed VITE_WS_URL (SyntaxError) or ws: from an https page
+    // (SecurityError) throws synchronously — the socket must retry with
+    // backoff instead of freezing in 'connecting'.
+    let throwOnce = true;
+    class ThrowingFakeWebSocket extends FakeWebSocket {
+      constructor(url: string) {
+        if (throwOnce) {
+          throwOnce = false;
+          throw new Error('bad url');
+        }
+        super(url);
+      }
+    }
+    vi.stubGlobal('WebSocket', ThrowingFakeWebSocket);
+
+    const socket = new ManagedSocket({ path: '/ws/test', baseReconnectDelayMs: 1000 });
+    socket.connect(); // constructor throws
+    expect(socket.state).toBe('reconnecting');
+    expect(FakeWebSocket.instances).toHaveLength(0);
+
+    vi.advanceTimersByTime(1000); // retry succeeds
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    lastSocket().simulateOpen();
+    expect(socket.state).toBe('connected');
+  });
 });
