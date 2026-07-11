@@ -12,7 +12,6 @@ import {
   type IChartApi,
   type ISeriesApi,
   type CandlestickData,
-  type HistogramData,
   type LineData,
   ColorType,
   CrosshairMode,
@@ -220,9 +219,9 @@ export function TradingChart({
 
           candles = transformedCandles.map(({ volume, ...rest }) => rest);
         } else {
-          // Fall back to mock data for US stock tickers (not yet supported)
-          const data = generateMockData(ticker, timeframe);
-          candles = data.candles;
+          // No live data source for this ticker — render the honest error
+          // state instead of fabricated candles.
+          throw new Error('No chart data source for this symbol');
         }
 
         if (!isMounted || !chartRef.current || !candlestickSeriesRef.current) return;
@@ -343,10 +342,6 @@ export function TradingChart({
               : 'rgba(239, 68, 68, 0.5)',
         }));
         volumeSeriesRef.current?.setData(volumeData);
-      } else if (!isCoinMarket && !isKRStock) {
-        // Fall back to mock volume data for US stocks
-        const volumeData = generateVolumeData(ticker, timeframe);
-        volumeSeriesRef.current.setData(volumeData);
       }
     } else {
       if (volumeSeriesRef.current) {
@@ -379,93 +374,6 @@ export function TradingChart({
 // -------------------------------------------
 // Helper Functions
 // -------------------------------------------
-
-function generateMockData(
-  ticker: string,
-  timeframe: TimeFrame
-): { candles: CandlestickData[] } {
-  const candles: CandlestickData[] = [];
-  const now = new Date();
-
-  // Determine time interval based on timeframe
-  const intervals: Record<TimeFrame, number> = {
-    '1m': 60 * 1000,
-    '5m': 5 * 60 * 1000,
-    '15m': 15 * 60 * 1000,
-    '1h': 60 * 60 * 1000,
-    '1d': 24 * 60 * 60 * 1000,
-    '1w': 7 * 24 * 60 * 60 * 1000,
-    '1M': 30 * 24 * 60 * 60 * 1000,
-  };
-
-  const interval = intervals[timeframe];
-  const numCandles = 200;
-
-  // Generate price based on ticker hash for consistency
-  let basePrice = 100 + (ticker.charCodeAt(0) % 50) * 3;
-  let price = basePrice;
-
-  for (let i = numCandles - 1; i >= 0; i--) {
-    const time = Math.floor((now.getTime() - i * interval) / 1000);
-
-    // Random walk
-    const change = (Math.random() - 0.48) * 2;
-    const volatility = basePrice * 0.02;
-
-    const open = price;
-    const close = price + change * volatility;
-    const high = Math.max(open, close) + Math.random() * volatility * 0.5;
-    const low = Math.min(open, close) - Math.random() * volatility * 0.5;
-
-    candles.push({
-      time: time as any,
-      open: Number(open.toFixed(2)),
-      high: Number(high.toFixed(2)),
-      low: Number(low.toFixed(2)),
-      close: Number(close.toFixed(2)),
-    });
-
-    price = close;
-  }
-
-  return { candles };
-}
-
-function generateVolumeData(
-  ticker: string,
-  timeframe: TimeFrame
-): HistogramData[] {
-  const data: HistogramData[] = [];
-  const now = new Date();
-
-  const intervals: Record<TimeFrame, number> = {
-    '1m': 60 * 1000,
-    '5m': 5 * 60 * 1000,
-    '15m': 15 * 60 * 1000,
-    '1h': 60 * 60 * 1000,
-    '1d': 24 * 60 * 60 * 1000,
-    '1w': 7 * 24 * 60 * 60 * 1000,
-    '1M': 30 * 24 * 60 * 60 * 1000,
-  };
-
-  const interval = intervals[timeframe];
-  const numCandles = 200;
-  const baseVolume = 1000000 + (ticker.charCodeAt(0) % 10) * 500000;
-
-  for (let i = numCandles - 1; i >= 0; i--) {
-    const time = Math.floor((now.getTime() - i * interval) / 1000);
-    const volume = baseVolume * (0.5 + Math.random());
-    const isUp = Math.random() > 0.5;
-
-    data.push({
-      time: time as any,
-      value: volume,
-      color: isUp ? 'rgba(34, 197, 94, 0.5)' : 'rgba(239, 68, 68, 0.5)',
-    });
-  }
-
-  return data;
-}
 
 function calculateSMA(
   period: number,

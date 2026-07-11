@@ -48,7 +48,6 @@ function App() {
   // Check if there's a notification (awaiting approval or new messages)
   const awaitingApproval = useStore((state) => {
     switch (state.activeMarket) {
-      case 'stock': return state.stock.awaitingApproval;
       case 'coin': return state.coin.awaitingApproval;
       case 'kiwoom': return state.kiwoom.awaitingApproval;
     }

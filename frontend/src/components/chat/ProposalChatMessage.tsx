@@ -20,8 +20,8 @@ import {
 import { format } from 'date-fns';
 import ReactMarkdown from 'react-markdown';
 import { useStore } from '@/store';
-import { cancelSession, cancelCoinSession, cancelKRStockSession, translateText } from '@/api/client';
-import type { TradeProposal, CoinTradeProposal, KRStockTradeProposal } from '@/types';
+import { cancelCoinSession, cancelKRStockSession, translateText } from '@/api/client';
+import type { CoinTradeProposal, KRStockTradeProposal } from '@/types';
 
 type Language = 'original' | 'en' | 'ko';
 
@@ -31,7 +31,7 @@ interface TranslatedContent {
   bear_case?: string;
 }
 
-type AnyTradeProposal = TradeProposal | CoinTradeProposal | KRStockTradeProposal;
+type AnyTradeProposal = CoinTradeProposal | KRStockTradeProposal;
 
 interface ProposalChatMessageProps {
   proposal: AnyTradeProposal;
@@ -40,7 +40,6 @@ interface ProposalChatMessageProps {
 
 // Helper to get display name
 function getProposalDisplayName(proposal: AnyTradeProposal): string {
-  if ('ticker' in proposal) return proposal.ticker;
   if ('market' in proposal) {
     const coinProposal = proposal as CoinTradeProposal;
     return coinProposal.korean_name || proposal.market.replace('KRW-', '');
@@ -62,19 +61,15 @@ function isKiwoomProposal(proposal: AnyTradeProposal): proposal is KRStockTradeP
 }
 
 // Helper to format currency
-function formatCurrency(value: number | null, isCoin: boolean, isKiwoom: boolean): string {
+function formatCurrency(value: number | null): string {
   if (value === null) return 'N/A';
-  if (isCoin || isKiwoom) {
-    return `₩${value.toLocaleString('ko-KR')}`;
-  }
-  return `$${value.toFixed(2)}`;
+  return `₩${value.toLocaleString('ko-KR')}`;
 }
 
 // Helper to format quantity
-function formatQuantity(quantity: number, isCoin: boolean, isKiwoom: boolean): string {
+function formatQuantity(quantity: number, isCoin: boolean): string {
   if (isCoin) return `₩${quantity.toLocaleString('ko-KR')}`;
-  if (isKiwoom) return `${quantity.toLocaleString('ko-KR')}주`;
-  return `${quantity} shares`;
+  return `${quantity.toLocaleString('ko-KR')}주`;
 }
 
 export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessageProps) {
@@ -144,10 +139,8 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
   };
 
   // Get cancel actions for different market types
-  const setStockProposal = useStore((state) => state.setStockProposal);
   const setCoinProposal = useStore((state) => state.setCoinProposal);
   const setKiwoomProposal = useStore((state) => state.setKiwoomProposal);
-  const stockSessionId = useStore((state) => state.stock.activeSessionId);
   const coinSessionId = useStore((state) => state.coin.activeSessionId);
   const kiwoomSessionId = useStore((state) => state.kiwoom.activeSessionId);
   const setActiveMarket = useStore((state) => state.setActiveMarket);
@@ -167,9 +160,6 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
       } else if (isCoin && coinSessionId) {
         await cancelCoinSession(coinSessionId);
         setCoinProposal(null);
-      } else if (stockSessionId) {
-        await cancelSession(stockSessionId);
-        setStockProposal(null);
       }
     } catch (error) {
       console.error('Failed to cancel analysis:', error);
@@ -224,24 +214,24 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <span className="text-gray-500 block text-xs">Quantity</span>
-                <span className="font-medium">{formatQuantity(proposal.quantity, isCoin, isKiwoom)}</span>
+                <span className="font-medium">{formatQuantity(proposal.quantity, isCoin)}</span>
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Entry Price</span>
                 <span className="font-medium">
-                  {formatCurrency(proposal.entry_price, isCoin, isKiwoom)}
+                  {formatCurrency(proposal.entry_price)}
                 </span>
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Stop Loss</span>
                 <span className="font-medium text-red-400">
-                  {formatCurrency(proposal.stop_loss, isCoin, isKiwoom)}
+                  {formatCurrency(proposal.stop_loss)}
                 </span>
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Take Profit</span>
                 <span className="font-medium text-green-400">
-                  {formatCurrency(proposal.take_profit, isCoin, isKiwoom)}
+                  {formatCurrency(proposal.take_profit)}
                 </span>
               </div>
             </div>
@@ -347,9 +337,6 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
                 } else if (isCoin) {
                   setActiveMarket('coin');
                   setCoinProposal(proposal as CoinTradeProposal);
-                } else {
-                  setActiveMarket('stock');
-                  setStockProposal(proposal as TradeProposal);
                 }
                 setAwaitingApproval(true);
               }}
@@ -368,9 +355,6 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
                   } else if (isCoin) {
                     setActiveMarket('coin');
                     setCoinProposal(proposal as CoinTradeProposal);
-                  } else {
-                    setActiveMarket('stock');
-                    setStockProposal(proposal as TradeProposal);
                   }
                   setAwaitingApproval(true);
                 }}

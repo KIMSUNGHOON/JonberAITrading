@@ -6,7 +6,6 @@
  * NO backing field and render an honest em-dash (—) rather than fabricated data.
  * For coin, prices are refreshed via getCoinTickers (batched, 30s) written back
  * into the store — the same path BasketWidget uses — so the two stay in sync.
- * US ('stock') has no live feed, so its rows show stored/entered values only.
  */
 import { useEffect } from 'react';
 import { useShallow } from 'zustand/shallow';

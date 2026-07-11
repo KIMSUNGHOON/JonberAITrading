@@ -159,7 +159,6 @@ describe('Navigation Bug Investigation', () => {
 
       // Switch markets
       useStore.getState().setActiveMarket('coin');
-      useStore.getState().setActiveMarket('stock');
       useStore.getState().setActiveMarket('kiwoom');
 
       // Session should still exist

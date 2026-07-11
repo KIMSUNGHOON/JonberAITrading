@@ -31,7 +31,7 @@ const NAV_ICONS: Partial<Record<ViewKey, React.ReactNode>> = {
   trades: <Receipt size={17} />,
 };
 
-const MARKETS: { id: 'kiwoom' | 'stock' | 'coin'; label: string; sim?: boolean }[] = [
+const MARKETS: { id: 'kiwoom' | 'coin'; label: string; sim?: boolean }[] = [
   { id: 'kiwoom', label: 'KR · KRX' },
   { id: 'coin', label: 'COIN' },
 ];
@@ -129,7 +129,7 @@ export function TerminalShell() {
 
       {/* ── status line ── */}
       <div className="flex items-center gap-4 h-6 px-3 bg-card border-t border-hairline text-[11px] text-muted whitespace-nowrap overflow-x-auto flex-none font-mono tabular-nums">
-        <span className="uppercase">{activeMarket === 'kiwoom' ? 'KRX' : activeMarket === 'coin' ? 'UPBIT' : 'US'}</span>
+        <span className="uppercase">{activeMarket === 'kiwoom' ? 'KRX' : 'UPBIT'}</span>
         <span className="text-up">● live</span>
         <span className="text-ink">{clock} KST</span>
         {/* Trading mode indicator. The app is PAPER/mock-only (live trading is

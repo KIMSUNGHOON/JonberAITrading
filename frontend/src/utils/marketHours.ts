@@ -4,16 +4,13 @@
  * Provides market open/close times and status for different markets.
  *
  * Market Hours:
- * - US Stock (NYSE/NASDAQ): 9:30 AM - 4:00 PM ET (Eastern Time)
- *   - Pre-market: 4:00 AM - 9:30 AM ET
- *   - After-hours: 4:00 PM - 8:00 PM ET
  * - Korean Stock (KRX): 9:00 AM - 3:30 PM KST (Korea Standard Time)
  *   - Pre-market: 8:30 AM - 9:00 AM KST
  *   - After-hours: 3:40 PM - 6:00 PM KST (단일가)
  * - Crypto: 24/7 (always open)
  */
 
-export type MarketType = 'stock' | 'kiwoom' | 'coin';
+export type MarketType = 'kiwoom' | 'coin';
 
 export interface MarketStatus {
   isOpen: boolean;
@@ -26,7 +23,6 @@ export interface MarketStatus {
 }
 
 export interface AllMarketsStatus {
-  stock: MarketStatus;
   kiwoom: MarketStatus;
   coin: MarketStatus;
 }
@@ -84,70 +80,6 @@ function formatTimeDiff(ms: number): string {
     return `${hours}시간 ${minutes}분`;
   }
   return `${minutes}분`;
-}
-
-/**
- * Get US Stock Market (NYSE/NASDAQ) status
- * Trading hours: 9:30 AM - 4:00 PM ET
- */
-export function getUSStockMarketStatus(): MarketStatus {
-  const etTimezone = 'America/New_York';
-  const now = getTimeInTimezone(etTimezone);
-  const hours = now.getHours();
-  const minutes = now.getMinutes();
-  const currentMinutes = hours * 60 + minutes;
-
-  // Market times in minutes from midnight
-  const preMarketStart = 4 * 60; // 4:00 AM
-  const marketOpen = 9 * 60 + 30; // 9:30 AM
-  const marketClose = 16 * 60; // 4:00 PM
-  const afterHoursEnd = 20 * 60; // 8:00 PM
-
-  const isWeekdayNow = isWeekday(now);
-
-  let status: MarketStatus['status'];
-  let statusKr: string;
-  let nextChange: string;
-
-  if (!isWeekdayNow) {
-    status = 'closed';
-    statusKr = '휴장 (주말)';
-    nextChange = '월요일 개장';
-  } else if (currentMinutes < preMarketStart) {
-    status = 'closed';
-    statusKr = '휴장';
-    const diff = (preMarketStart - currentMinutes) * 60 * 1000;
-    nextChange = `프리마켓 ${formatTimeDiff(diff)} 후`;
-  } else if (currentMinutes < marketOpen) {
-    status = 'pre-market';
-    statusKr = '프리마켓';
-    const diff = (marketOpen - currentMinutes) * 60 * 1000;
-    nextChange = `정규장 ${formatTimeDiff(diff)} 후`;
-  } else if (currentMinutes < marketClose) {
-    status = 'open';
-    statusKr = '장중';
-    const diff = (marketClose - currentMinutes) * 60 * 1000;
-    nextChange = `마감 ${formatTimeDiff(diff)} 후`;
-  } else if (currentMinutes < afterHoursEnd) {
-    status = 'after-hours';
-    statusKr = '애프터마켓';
-    const diff = (afterHoursEnd - currentMinutes) * 60 * 1000;
-    nextChange = `종료 ${formatTimeDiff(diff)} 후`;
-  } else {
-    status = 'closed';
-    statusKr = '휴장';
-    nextChange = '내일 프리마켓';
-  }
-
-  return {
-    isOpen: status === 'open',
-    status,
-    statusKr,
-    openTime: '09:30',
-    closeTime: '16:00',
-    nextChange,
-    timezone: 'ET',
-  };
 }
 
 /**
@@ -235,8 +167,6 @@ export function getCryptoMarketStatus(): MarketStatus {
  */
 export function getMarketStatus(marketType: MarketType): MarketStatus {
   switch (marketType) {
-    case 'stock':
-      return getUSStockMarketStatus();
     case 'kiwoom':
       return getKRStockMarketStatus();
     case 'coin':
@@ -251,7 +181,6 @@ export function getMarketStatus(marketType: MarketType): MarketStatus {
  */
 export function getAllMarketsStatus(): AllMarketsStatus {
   return {
-    stock: getUSStockMarketStatus(),
     kiwoom: getKRStockMarketStatus(),
     coin: getCryptoMarketStatus(),
   };

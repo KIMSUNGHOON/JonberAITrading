@@ -6,8 +6,6 @@
 
 import axios, { type AxiosInstance, type AxiosError } from 'axios';
 import type {
-  AnalysisRequest,
-  AnalysisResponse,
   ApprovalRequest,
   ApprovalResponse,
   SessionStatus,
@@ -190,72 +188,6 @@ class ApiClient {
       return error.message;
     }
     return 'Network error';
-  }
-
-  // -------------------------------------------
-  // Analysis Endpoints
-  // -------------------------------------------
-
-  /**
-   * Start a new analysis session.
-   */
-  async startAnalysis(request: AnalysisRequest): Promise<AnalysisResponse> {
-    const response = await this.client.post<AnalysisResponse>(
-      '/analysis/start',
-      request
-    );
-    return response.data;
-  }
-
-  /**
-   * Get current status of an analysis session.
-   */
-  async getSessionStatus(sessionId: string): Promise<{
-    session_id: string;
-    ticker: string;
-    status: SessionStatus;
-    current_stage: string | null;
-    analyses_count: number;
-    awaiting_approval: boolean;
-    error: string | null;
-  }> {
-    const response = await this.client.get(`/analysis/status/${sessionId}`);
-    return response.data;
-  }
-
-  /**
-   * Get full analysis state.
-   */
-  async getSessionState(sessionId: string): Promise<{
-    session_id: string;
-    state: Record<string, unknown>;
-    status: SessionStatus;
-  }> {
-    const response = await this.client.get(`/analysis/state/${sessionId}`);
-    return response.data;
-  }
-
-  /**
-   * Cancel an analysis session.
-   */
-  async cancelSession(sessionId: string): Promise<{ success: boolean }> {
-    const response = await this.client.post(`/analysis/cancel/${sessionId}`);
-    return response.data;
-  }
-
-  /**
-   * List all active sessions.
-   */
-  async listSessions(): Promise<
-    Array<{
-      session_id: string;
-      ticker: string;
-      status: SessionStatus;
-      created_at: string;
-    }>
-  > {
-    const response = await this.client.get('/analysis/sessions');
-    return response.data;
   }
 
   // -------------------------------------------
@@ -1839,20 +1771,6 @@ export const apiClient = new ApiClient();
 // -------------------------------------------
 // Convenience Functions
 // -------------------------------------------
-
-export const startAnalysis = (request: AnalysisRequest) =>
-  apiClient.startAnalysis(request);
-
-export const getSessionStatus = (sessionId: string) =>
-  apiClient.getSessionStatus(sessionId);
-
-export const getSessionState = (sessionId: string) =>
-  apiClient.getSessionState(sessionId);
-
-export const cancelSession = (sessionId: string) =>
-  apiClient.cancelSession(sessionId);
-
-export const listSessions = () => apiClient.listSessions();
 
 export const getPendingProposal = (sessionId: string) =>
   apiClient.getPendingProposal(sessionId);

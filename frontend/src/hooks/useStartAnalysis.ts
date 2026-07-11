@@ -13,16 +13,15 @@
  */
 
 import { useStore, type MarketType, type SessionData } from '@/store';
-import { startKRStockAnalysis, startCoinAnalysis, startAnalysis } from '@/api/client';
+import { startKRStockAnalysis, startCoinAnalysis } from '@/api/client';
 import { wsManager, type WebSocketHandlers } from '@/api/websocket';
 import type { KRStockTradeProposal, SessionStatus } from '@/types';
 
 export function useStartAnalysis() {
   const setActiveMarket = useStore((state) => state.setActiveMarket);
 
-  // Legacy session actions (single-session mode for stock/coin)
+  // Legacy session actions (single-session mode for coin)
   const startCoinSession = useStore((state) => state.startCoinSession);
-  const startStockSession = useStore((state) => state.startStockSession);
 
   // Multi-session actions for Kiwoom
   const addKiwoomSession = useStore((state) => state.addKiwoomSession);
@@ -133,17 +132,11 @@ export function useStartAnalysis() {
       setActiveKiwoomSession(sessionId);
 
       return sessionId;
-    } else if (marketType === 'coin') {
+    } else {
       // For coin, use legacy single-session mode for now
       const response = await startCoinAnalysis({ market: ticker });
       const sessionId = response.session_id;
       startCoinSession(sessionId, ticker, displayName);
-      return sessionId;
-    } else {
-      // For US stock, use legacy single-session mode
-      const response = await startAnalysis({ ticker });
-      const sessionId = response.session_id;
-      startStockSession(sessionId, ticker);
       return sessionId;
     }
   };

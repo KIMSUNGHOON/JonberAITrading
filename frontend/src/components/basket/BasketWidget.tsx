@@ -24,7 +24,6 @@ import {
   X,
   Bitcoin,
   Building2,
-  LineChart,
   Loader2,
   ChevronRight,
 } from 'lucide-react';
@@ -46,8 +45,6 @@ import type { KRStockInfo } from '@/types';
 // Market type icon component
 function MarketIcon({ marketType }: { marketType: MarketType }) {
   switch (marketType) {
-    case 'stock':
-      return <LineChart className="w-3.5 h-3.5 text-green-400" />; // color-ok: market identity, not directional
     case 'coin':
       return <Bitcoin className="w-3.5 h-3.5 text-yellow-400" />; // color-ok: market identity, not directional
     case 'kiwoom':
@@ -56,10 +53,7 @@ function MarketIcon({ marketType }: { marketType: MarketType }) {
 }
 
 // Format currency based on market type
-function formatCurrency(price: number, marketType: MarketType): string {
-  if (marketType === 'stock') {
-    return `$${price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  }
+function formatCurrency(price: number, _marketType: MarketType): string {
   // KRW for coin and kiwoom
   if (price >= 1000000) {
     return `₩${(price / 10000).toFixed(0)}만`;
@@ -168,7 +162,7 @@ function ApiNotConfiguredWarning({
   marketType: MarketType;
   onConfigure: () => void;
 }) {
-  const marketName = marketType === 'coin' ? 'Upbit' : marketType === 'kiwoom' ? 'Kiwoom' : 'Stock';
+  const marketName = marketType === 'coin' ? 'Upbit' : 'Kiwoom';
 
   return (
     <div className="px-3 py-2 bg-warn/10 border border-warn/30 rounded-lg">
@@ -472,18 +466,6 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
           setBasketItemError(ticker, 'Kiwoom API 미등록');
         }
         addedCount++;
-      } else {
-        // US stock
-        addToBasket({
-          marketType: 'stock',
-          ticker,
-          displayName: ticker,
-          price: 0,
-          prevPrice: 0,
-          changeRate: 0,
-          change: 'EVEN',
-        });
-        addedCount++;
       }
     }
 
@@ -708,7 +690,6 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
             >
               <option value="kiwoom">한국 주식</option>
               <option value="coin">코인</option>
-              <option value="stock">미국 주식</option>
             </select>
             <div className="relative flex-1">
               <input

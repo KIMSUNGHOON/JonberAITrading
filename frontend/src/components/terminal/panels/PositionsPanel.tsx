@@ -3,9 +3,8 @@
  *
  * Data comes from REST (per-market), NOT the store: the store's activePosition
  * is a single analysis-derived object with no stop/take. Kiwoom + coin have
- * exact column matches; US ('stock') has no positions endpoint, so it shows an
- * honest "미연동" state instead of a fabricated table. Polls every 10s, keyed on
- * activeMarket so switching the market tab re-fetches (the tile never remounts).
+ * exact column matches. Polls every 10s, keyed on activeMarket so switching
+ * the market tab re-fetches (the tile never remounts).
  */
 import { useEffect, useState } from 'react';
 import { useStore, selectChartSymbol } from '@/store';
@@ -25,7 +24,7 @@ interface Row {
   take: number | null;
 }
 
-type FetchState = 'loading' | 'ready' | 'error' | 'unsupported';
+type FetchState = 'loading' | 'ready' | 'error';
 
 function usePositions() {
   const activeMarket = useStore((s) => s.activeMarket);
@@ -37,11 +36,6 @@ function usePositions() {
     let alive = true;
 
     async function run(showLoading: boolean) {
-      // US has no live positions endpoint — be honest, never fabricate.
-      if (activeMarket === 'stock') {
-        setState('unsupported');
-        return;
-      }
       if (showLoading) setState('loading');
       setErr(null);
       try {
@@ -102,7 +96,6 @@ export function PositionsPanel() {
   const setChartSymbol = useStore((s) => s.setChartSymbol);
   const chartSymbol = useStore(selectChartSymbol);
 
-  if (state === 'unsupported') return <Awaiting label="US 포지션 미연동 (SIM)" />;
   if (state === 'loading') return <Awaiting label="포지션 로드 중…" />;
   if (state === 'error') return <Awaiting label={`포지션 오류 · ${err ?? '연결 실패'}`} />;
   if (rows.length === 0) return <Awaiting label="보유 포지션 없음 · 체결 시 표시" />;

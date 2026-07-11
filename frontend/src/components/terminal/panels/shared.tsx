@@ -36,30 +36,22 @@ export function fmtPct(n: number | null | undefined): string {
 }
 
 /**
- * Market-aware price. US ('stock') is USD; coin/kiwoom are KRW.
+ * Market-aware price. Coin/kiwoom are KRW.
  * KRW prices under 100 keep up to 4 decimals (small-cap coins); otherwise
  * integer KRW. A 0 or missing price renders DASH (never a misleading 0.00).
  */
-export function fmtPrice(n: number | null | undefined, market: MarketType): string {
+export function fmtPrice(n: number | null | undefined, _market: MarketType): string {
   if (n == null || !Number.isFinite(n) || n === 0) return DASH;
-  if (market === 'stock') {
-    return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  }
   if (n < 100) return `₩${n.toLocaleString('ko-KR', { maximumFractionDigits: 4 })}`;
   return `₩${Math.round(n).toLocaleString('ko-KR')}`;
 }
 
 /**
- * Compact KRW/USD for KV tiles (총자산/가용): 1.2억 / 340만 / $12.3k.
+ * Compact KRW for KV tiles (총자산/가용): 1.2억 / 340만.
  * Keeps the dense tile readable without dropping magnitude. DASH when missing.
  */
-export function fmtMoneyCompact(n: number | null | undefined, market: MarketType): string {
+export function fmtMoneyCompact(n: number | null | undefined, _market: MarketType): string {
   if (n == null || !Number.isFinite(n)) return DASH;
-  if (market === 'stock') {
-    if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
-    if (Math.abs(n) >= 1_000) return `$${(n / 1_000).toFixed(1)}k`;
-    return `$${n.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
-  }
   if (Math.abs(n) >= 100_000_000) return `₩${(n / 100_000_000).toFixed(2)}억`;
   if (Math.abs(n) >= 10_000) return `₩${(n / 10_000).toFixed(0)}만`;
   return `₩${Math.round(n).toLocaleString('ko-KR')}`;
@@ -67,5 +59,5 @@ export function fmtMoneyCompact(n: number | null | undefined, market: MarketType
 
 /** Label for the active market (matches the status line / command bar). */
 export function marketLabelOf(market: MarketType): string {
-  return market === 'kiwoom' ? 'KRX' : market === 'coin' ? 'UPBIT' : 'US';
+  return market === 'kiwoom' ? 'KRX' : 'UPBIT';
 }

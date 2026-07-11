@@ -204,7 +204,7 @@ export interface AnalysisHistoryItem {
   analyses: AnalysisSummary[];
 
   // Trade proposal
-  tradeProposal: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal: CoinTradeProposal | KRStockTradeProposal | null;
 
   // Reasoning summary (condensed from full log)
   reasoningSummary: string | null;
@@ -212,22 +212,6 @@ export interface AnalysisHistoryItem {
   // Metadata
   duration: number | null;  // Analysis duration in ms
   dataVersion: string;  // Schema version for migration
-}
-
-export interface TradeProposal {
-  id: string;
-  ticker: string;
-  action: TradeAction;
-  quantity: number;
-  entry_price: number | null;
-  stop_loss: number | null;
-  take_profit: number | null;
-  risk_score: number;
-  position_size_pct: number;
-  rationale: string;
-  bull_case: string;
-  bear_case: string;
-  created_at: string;
 }
 
 export interface Position {
@@ -244,18 +228,6 @@ export interface SessionInfo {
   ticker: string;
   status: SessionStatus;
   created_at?: string;
-}
-
-export interface AnalysisStatus {
-  session_id: string;
-  ticker: string;
-  status: SessionStatus;
-  current_stage: string | null;
-  awaiting_approval: boolean;
-  trade_proposal: TradeProposal | null;
-  analyses: AnalysisSummary[];
-  reasoning_log: string[];
-  error: string | null;
 }
 
 // -------------------------------------------
@@ -281,11 +253,6 @@ export interface WSStatusMessage {
   };
 }
 
-export interface WSProposalMessage {
-  type: 'proposal';
-  data: TradeProposal;
-}
-
 export interface WSPositionMessage {
   type: 'position';
   data: Position;
@@ -306,7 +273,7 @@ export interface WSCompleteMessage {
 export type ChatMessageRole = 'user' | 'assistant' | 'system' | 'proposal';
 
 // Union type for all proposal types
-export type AnyTradeProposal = TradeProposal | CoinTradeProposal | KRStockTradeProposal;
+export type AnyTradeProposal = CoinTradeProposal | KRStockTradeProposal;
 
 export interface ChatMessage {
   id: string;
@@ -355,10 +322,6 @@ export interface ChartConfig {
 // API Request Types
 // -------------------------------------------
 
-export interface AnalysisRequest {
-  ticker: string;
-}
-
 export type ApprovalDecision = 'approved' | 'rejected' | 'modified' | 'cancelled';
 
 export interface ApprovalRequest {
@@ -376,16 +339,6 @@ export interface ApiResponse<T> {
   data: T;
   error?: string;
 }
-
-export interface StartAnalysisResponse {
-  session_id: string;
-  ticker: string;
-  status: string;
-  message: string;
-}
-
-// Alias for backward compatibility
-export type AnalysisResponse = StartAnalysisResponse;
 
 export interface ApprovalResponse {
   session_id: string;
@@ -779,7 +732,7 @@ export interface KRStockAccountResponse {
 // Multi-Session Support Types
 // -------------------------------------------
 
-export type MarketType = 'stock' | 'coin' | 'kiwoom';
+export type MarketType = 'coin' | 'kiwoom';
 
 /**
  * Unified session data for multi-session support.
@@ -787,14 +740,14 @@ export type MarketType = 'stock' | 'coin' | 'kiwoom';
  */
 export interface SessionData {
   sessionId: string;
-  ticker: string;           // stock: ticker, coin: market, kiwoom: stk_cd
+  ticker: string;           // coin: market, kiwoom: stk_cd
   displayName: string;      // Human-readable name (종목명)
   marketType: MarketType;
   status: SessionStatus;
   currentStage: string | null;
   reasoningLog: string[];
   analyses: AnalysisSummary[];
-  tradeProposal: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal: CoinTradeProposal | KRStockTradeProposal | null;
   awaitingApproval: boolean;
   activePosition: Position | null;
   error: string | null;

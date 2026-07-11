@@ -67,18 +67,8 @@ export function TradesPage({ onBack }: TradesPageProps) {
             </section>
           )}
 
-          {/* Placeholder for US Stock trades */}
-          {activeMarket === 'stock' && (
-            <section>
-              <h2 className="text-lg font-semibold mb-3">US Stock Trades</h2>
-              <div className="card p-8 text-center">
-                <p className="text-dim">US Stock trade history coming soon</p>
-              </div>
-            </section>
-          )}
-
           {/* Empty state */}
-          {!upbitApiConfigured && !kiwoomApiConfigured && activeMarket !== 'stock' && (
+          {!upbitApiConfigured && !kiwoomApiConfigured && (
             <div className="card p-8 text-center">
               <p className="text-dim">
                 Configure your API keys in Settings to view trade history

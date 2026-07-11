@@ -26,8 +26,8 @@ vi.mock('@/api/client', () => ({ submitApproval: (...a: unknown[]) => submitAppr
 
 beforeEach(() => {
   mockState = {
-    activeMarket: 'stock',
-    stock: {
+    activeMarket: 'kiwoom',
+    kiwoom: {
       tradeProposal: null,
       activeSessionId: null,
       status: 'idle',
@@ -46,11 +46,12 @@ describe('OrderTicketRail — idle', () => {
 describe('OrderTicketRail — active', () => {
   it('renders the ticket: ACTION, symbol, SL/TP, risk, buttons', () => {
     mockState = {
-      activeMarket: 'stock',
-      stock: {
+      activeMarket: 'kiwoom',
+      kiwoom: {
         tradeProposal: {
           id: 'p1',
-          ticker: 'AAPL',
+          stk_cd: '005930',
+          stk_nm: '삼성전자',
           action: 'BUY',
           quantity: 10,
           entry_price: 100,
@@ -71,7 +72,7 @@ describe('OrderTicketRail — active', () => {
     };
     render(<OrderTicketRail />);
     expect(screen.getByText('BUY')).toBeInTheDocument();
-    expect(screen.getByText('AAPL')).toBeInTheDocument();
+    expect(screen.getByText('삼성전자')).toBeInTheDocument();
     expect(screen.getByText('Medium Risk')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /approve/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /reject|re-analyze/i })).toBeInTheDocument();
@@ -82,11 +83,12 @@ describe('OrderTicketRail — decisions', () => {
   beforeEach(() => {
     submitApproval.mockClear();
     mockState = {
-      activeMarket: 'stock',
-      stock: {
+      activeMarket: 'kiwoom',
+      kiwoom: {
         tradeProposal: {
           id: 'p1',
-          ticker: 'AAPL',
+          stk_cd: '005930',
+          stk_nm: '삼성전자',
           action: 'BUY',
           quantity: 10,
           entry_price: 100,
@@ -105,7 +107,6 @@ describe('OrderTicketRail — decisions', () => {
         awaitingApproval: true,
       },
       setAwaitingApproval: vi.fn(),
-      setTradeProposal: vi.fn(),
       setStatus: vi.fn(),
       setError: vi.fn(),
       addChatMessage: vi.fn(),

@@ -79,32 +79,28 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
   // Get counts for badges - use primitive selectors to avoid infinite loops
   const basketItemsCount = useStore((state) => state.basket.items.length);
   const activeMarket = useStore((state) => state.activeMarket);
-  const stockPosition = useStore((state) => state.stock.activePosition);
   const coinPosition = useStore((state) => state.coin.activePosition);
   const kiwoomPosition = useStore((state) => state.kiwoom.activePosition);
 
   // Get running session counts from each market
-  const stockStatus = useStore((state) => state.stock.status);
   const coinStatus = useStore((state) => state.coin.status);
   const kiwoomSessions = useStore((state) => state.kiwoom.sessions);
 
   // Calculate active position based on current market
   const activePosition = useMemo(() => {
-    if (activeMarket === 'stock') return stockPosition;
     if (activeMarket === 'coin') return coinPosition;
     return kiwoomPosition;
-  }, [activeMarket, stockPosition, coinPosition, kiwoomPosition]);
+  }, [activeMarket, coinPosition, kiwoomPosition]);
 
   // Calculate running analyses count
   const runningCount = useMemo(() => {
     let count = 0;
-    if (stockStatus === 'running' || stockStatus === 'awaiting_approval') count++;
     if (coinStatus === 'running' || coinStatus === 'awaiting_approval') count++;
     count += kiwoomSessions.filter(
       s => s.status === 'running' || s.status === 'awaiting_approval'
     ).length;
     return count;
-  }, [stockStatus, coinStatus, kiwoomSessions]);
+  }, [coinStatus, kiwoomSessions]);
 
   return (
     <div className={`h-full flex flex-col overflow-hidden ${collapsed ? 'p-2' : 'p-3'}`}>

@@ -81,18 +81,8 @@ export function PositionsPage({ onBack }: PositionsPageProps) {
             </section>
           )}
 
-          {/* Placeholder for US Stock positions */}
-          {activeMarket === 'stock' && (
-            <section>
-              <h2 className="text-[11px] font-semibold uppercase tracking-wide text-muted mb-2">US Stock Positions</h2>
-              <div className="card p-5 text-center">
-                <p className="text-dim text-sm">US Stock position tracking coming soon</p>
-              </div>
-            </section>
-          )}
-
           {/* Empty state */}
-          {!upbitApiConfigured && !kiwoomApiConfigured && activeMarket !== 'stock' && (
+          {!upbitApiConfigured && !kiwoomApiConfigured && (
             <div className="card p-5 text-center">
               <p className="text-dim text-sm">
                 Configure your API keys in Settings to view positions

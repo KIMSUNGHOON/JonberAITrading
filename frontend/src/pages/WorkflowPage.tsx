@@ -42,7 +42,6 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
   const { ticker, status } = useStore(useShallow(selectSession));
   const currentStage = useStore((state) => {
     switch (state.activeMarket) {
-      case 'stock': return state.stock.currentStage;
       case 'coin': return state.coin.currentStage;
       case 'kiwoom': return state.kiwoom.currentStage;
     }

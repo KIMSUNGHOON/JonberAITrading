@@ -60,8 +60,6 @@ interface AnalysisDetailPageProps {
 // precedent as AnalysisPage's MarketIcon/getMarketColor.
 function MarketIcon({ marketType, size = 16 }: { marketType: MarketType; size?: number }) {
   switch (marketType) {
-    case 'stock':
-      return <TrendingUp size={size} className="text-green-400" />; // color-ok: market identity, not directional
     case 'coin':
       return <Bitcoin size={size} className="text-yellow-400" />;
     case 'kiwoom':
@@ -71,7 +69,6 @@ function MarketIcon({ marketType, size = 16 }: { marketType: MarketType; size?: 
 
 function getMarketLabel(marketType: MarketType): string {
   switch (marketType) {
-    case 'stock': return 'US Stock';
     case 'coin': return 'Crypto';
     case 'kiwoom': return 'KR Stock';
   }
@@ -535,7 +532,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
 
   const displayName = getDisplayName(analysis);
   const action = getAction(analysis);
-  const marketType: MarketType = 'market' in analysis ? 'coin' : 'stk_cd' in analysis ? 'kiwoom' : 'stock';
+  const marketType: MarketType = 'market' in analysis ? 'coin' : 'kiwoom';
 
   // Get analysis results from the new structure (Phase 9)
   const analysisResults = 'analysisResults' in analysis

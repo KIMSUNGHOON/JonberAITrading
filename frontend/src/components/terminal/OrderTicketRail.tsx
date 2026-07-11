@@ -24,7 +24,6 @@ export function OrderTicketRail() {
   const currentStage = useStore(selectCurrentStage);
   const awaitingApproval = useStore(selectAwaitingApproval);
   const setAwaitingApproval = useStore((s) => s.setAwaitingApproval);
-  const setTradeProposal = useStore((s) => s.setTradeProposal);
   const setStatus = useStore((s) => s.setStatus);
   const setError = useStore((s) => s.setError);
   const addChatMessage = useStore((s) => s.addChatMessage);
@@ -34,7 +33,7 @@ export function OrderTicketRail() {
   const [feedback, setFeedback] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const approveRef = useRef<HTMLButtonElement>(null);
-  const marketType = active ? getProposalMarketType(proposal!) : 'stock';
+  const marketType = active ? getProposalMarketType(proposal!) : 'kiwoom';
   const { status: marketStatus, countdownFormatted, nextEventFormatted } = useMarketHours({
     market: marketType === 'kiwoom' ? 'krx' : 'crypto',
     enableCountdown: true,
@@ -64,10 +63,7 @@ export function OrderTicketRail() {
     const symbol = getProposalSymbol(proposal!);
     const label = `${proposal!.action.toUpperCase()} ${proposal!.quantity} ${symbol}`;
     if (decision === 'cancelled') {
-      setTradeProposal(null);
       setStatus('cancelled');
-    } else if (decision === 'rejected') {
-      setTradeProposal(null);
     }
     try {
       await submitApproval(buildApprovalRequest(sessionId, decision, feedback));

@@ -16,7 +16,6 @@ import {
   XCircle,
   AlertCircle,
   ChevronRight,
-  TrendingUp,
   Bitcoin,
   Building2,
   Clock,
@@ -36,8 +35,6 @@ interface AnalysisPageProps {
 function MarketIcon({ marketType, size = 16 }: { marketType: MarketType; size?: number }) {
   const className = `text-current`;
   switch (marketType) {
-    case 'stock':
-      return <TrendingUp size={size} className={className} />;
     case 'coin':
       return <Bitcoin size={size} className={className} />;
     case 'kiwoom':
@@ -50,7 +47,6 @@ function MarketIcon({ marketType, size = 16 }: { marketType: MarketType; size?: 
 // their distinct hues rather than routing through pnlColor.
 function getMarketColor(marketType: MarketType): string {
   switch (marketType) {
-    case 'stock': return 'text-green-400'; // color-ok: market identity, not directional
     case 'coin': return 'text-yellow-400';
     case 'kiwoom': return 'text-blue-400';
   }
@@ -58,7 +54,6 @@ function getMarketColor(marketType: MarketType): string {
 
 function getMarketLabel(marketType: MarketType): string {
   switch (marketType) {
-    case 'stock': return 'US Stock';
     case 'coin': return 'Crypto';
     case 'kiwoom': return 'KR Stock';
   }
@@ -151,7 +146,6 @@ export function AnalysisPage(_props: AnalysisPageProps) {
   const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
 
   // Get individual market states
-  const stockSession = useStore((state) => state.stock);
   const coinSession = useStore((state) => state.coin);
   const kiwoomState = useStore((state) => state.kiwoom);
 
@@ -159,7 +153,6 @@ export function AnalysisPage(_props: AnalysisPageProps) {
   const history = useStore(selectTickerHistory);
 
   // Get remove actions for delete functionality
-  const removeStockHistoryItem = useStore((state) => state.removeStockHistoryItem);
   const removeCoinHistoryItem = useStore((state) => state.removeCoinHistoryItem);
   const removeKiwoomHistoryItem = useStore((state) => state.removeKiwoomHistoryItem);
 
@@ -167,21 +160,6 @@ export function AnalysisPage(_props: AnalysisPageProps) {
   const activeSessions = useMemo((): ActiveSession[] => {
     const sessions: ActiveSession[] = [];
     const addedSessionIds = new Set<string>();
-
-    // Stock session - only include running or awaiting_approval
-    if (stockSession.activeSessionId &&
-        (stockSession.status === 'running' || stockSession.status === 'awaiting_approval')) {
-      sessions.push({
-        sessionId: stockSession.activeSessionId,
-        ticker: stockSession.ticker,
-        displayName: stockSession.ticker,
-        marketType: 'stock',
-        status: stockSession.status,
-        currentStage: stockSession.currentStage,
-        reasoningLog: stockSession.reasoningLog,
-      });
-      addedSessionIds.add(stockSession.activeSessionId);
-    }
 
     // Coin session - only include running or awaiting_approval
     if (coinSession.activeSessionId &&
@@ -233,7 +211,7 @@ export function AnalysisPage(_props: AnalysisPageProps) {
     }
 
     return sessions;
-  }, [stockSession, coinSession, kiwoomState]);
+  }, [coinSession, kiwoomState]);
 
   // Filter sessions based on status filter
   const filteredActiveSessions = useMemo(() => {
@@ -292,12 +270,9 @@ export function AnalysisPage(_props: AnalysisPageProps) {
     if ('market' in item) {
       // Coin history item
       removeCoinHistoryItem(item.sessionId);
-    } else if ('stk_cd' in item) {
+    } else {
       // Kiwoom history item
       removeKiwoomHistoryItem(item.sessionId);
-    } else {
-      // Stock history item
-      removeStockHistoryItem(item.sessionId);
     }
   };
 
@@ -435,7 +410,7 @@ export function AnalysisPage(_props: AnalysisPageProps) {
                 {completedAnalyses.map((item) => {
                   const displayName = getDisplayName(item);
                   const action = getAction(item);
-                  const itemMarket: MarketType = 'market' in item ? 'coin' : 'stk_cd' in item ? 'kiwoom' : 'stock';
+                  const itemMarket: MarketType = 'market' in item ? 'coin' : 'kiwoom';
 
                   return (
                     <button

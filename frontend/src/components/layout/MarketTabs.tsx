@@ -17,7 +17,7 @@ export function MarketTabs() {
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
 
   // Determine effective market for display
-  const isStock = activeMarket === 'stock' || activeMarket === 'kiwoom';
+  const isStock = activeMarket === 'kiwoom';
   const isCoin = activeMarket === 'coin';
 
   const handleStockClick = () => {

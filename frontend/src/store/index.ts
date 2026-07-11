@@ -2,7 +2,7 @@
  * Zustand Store for Agentic Trading
  *
  * Manages global application state with COMPLETE ISOLATION between:
- * - Stock analysis (stocks via yfinance)
+ * - Kiwoom analysis (Korean stocks via Kiwoom)
  * - Coin analysis (cryptocurrency via Upbit)
  *
  * Each market type has its own:
@@ -20,7 +20,6 @@ import type {
   ChatMessage,
   Position,
   SessionStatus,
-  TradeProposal,
   ChartConfig,
   TimeFrame,
   CoinTradeProposal,
@@ -57,15 +56,10 @@ interface HistoryItem {
   completedAt?: Date | null;
   analysisResults?: DetailedAnalysisResults | null;
   analyses?: AnalysisSummary[];
-  tradeProposal?: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal?: CoinTradeProposal | KRStockTradeProposal | null;
   reasoningSummary?: string | null;
   duration?: number | null;  // Analysis duration in ms
   dataVersion?: string;  // Schema version: '1.0' = legacy, '2.0' = with detailed results
-}
-
-// Stock-specific history
-interface StockHistoryItem extends HistoryItem {
-  type: 'stock';
 }
 
 // Coin-specific history
@@ -84,7 +78,7 @@ interface KiwoomHistoryItem extends HistoryItem {
 }
 
 // Combined ticker history (for backward compatibility)
-type TickerHistoryItem = StockHistoryItem | CoinHistoryItem | KiwoomHistoryItem;
+type TickerHistoryItem = CoinHistoryItem | KiwoomHistoryItem;
 
 // Base analysis state (shared structure)
 interface BaseAnalysisState {
@@ -95,14 +89,6 @@ interface BaseAnalysisState {
   analyses: AnalysisSummary[];
   awaitingApproval: boolean;
   error: string | null;
-}
-
-// Stock-specific state
-interface StockState extends BaseAnalysisState {
-  ticker: string;
-  tradeProposal: TradeProposal | null;
-  activePosition: Position | null;
-  history: StockHistoryItem[];
 }
 
 // Coin-specific state
@@ -140,8 +126,7 @@ interface ChatState {
   isTyping: boolean;
 }
 
-type MarketType = 'stock' | 'coin' | 'kiwoom';
-type StockRegion = 'us' | 'kr';
+type MarketType = 'coin' | 'kiwoom';
 type Language = 'en' | 'ko';
 
 type ChatPopupSize = 'small' | 'medium' | 'large';
@@ -149,7 +134,6 @@ type ChatPopupSize = 'small' | 'medium' | 'large';
 interface UIState {
   // Market selection
   activeMarket: MarketType;
-  stockRegion: StockRegion;  // US or Korea within stock market
 
   // Panels
   showChartPanel: boolean;
@@ -221,23 +205,6 @@ interface BasketActions {
   setBasketUpdating: (updating: boolean) => void;
 }
 
-interface StockActions {
-  // Stock session actions
-  startStockSession: (sessionId: string, ticker: string) => void;
-  setStockStatus: (status: SessionStatus) => void;
-  setStockStage: (stage: string) => void;
-  addStockReasoning: (entry: string) => void;
-  setStockAnalyses: (analyses: AnalysisSummary[]) => void;
-  addStockAnalysis: (analysis: AnalysisSummary) => void;
-  setStockProposal: (proposal: TradeProposal | null) => void;
-  setStockAwaitingApproval: (awaiting: boolean) => void;
-  setStockPosition: (position: Position | null) => void;
-  setStockError: (error: string | null) => void;
-  resetStock: () => void;
-  // History management
-  removeStockHistoryItem: (sessionId: string) => void;
-}
-
 interface CoinActions {
   // Coin session actions
   startCoinSession: (sessionId: string, market: string, koreanName?: string) => void;
@@ -305,7 +272,6 @@ interface ChatActions {
 
 interface UIActions {
   setActiveMarket: (market: MarketType) => void;
-  setStockRegion: (region: StockRegion) => void;
   setShowChartPanel: (show: boolean) => void;
   setShowSettingsModal: (show: boolean) => void;
   setMobileMenuOpen: (open: boolean) => void;
@@ -335,7 +301,6 @@ interface LegacyActions {
   addReasoningEntry: (entry: string) => void;
   setAnalyses: (analyses: AnalysisSummary[]) => void;
   addAnalysis: (analysis: AnalysisSummary) => void;
-  setTradeProposal: (proposal: TradeProposal | null) => void;
   setAwaitingApproval: (awaiting: boolean) => void;
   setActivePosition: (position: Position | null) => void;
   setError: (error: string | null) => void;
@@ -343,29 +308,14 @@ interface LegacyActions {
 }
 
 type Store = {
-  stock: StockState;
   coin: CoinState;
   kiwoom: KiwoomState;
   basket: BasketState;
-} & ChatState & UIState & StockActions & CoinActions & KiwoomActions & ChatActions & UIActions & BasketActions & LegacyActions;
+} & ChatState & UIState & CoinActions & KiwoomActions & ChatActions & UIActions & BasketActions & LegacyActions;
 
 // -------------------------------------------
 // Initial States
 // -------------------------------------------
-
-const initialStockState: StockState = {
-  activeSessionId: null,
-  ticker: '',
-  status: 'idle',
-  currentStage: null,
-  reasoningLog: [],
-  analyses: [],
-  tradeProposal: null,
-  awaitingApproval: false,
-  activePosition: null,
-  error: null,
-  history: [],
-};
 
 const initialCoinState: CoinState = {
   activeSessionId: null,
@@ -418,7 +368,6 @@ const initialChatState: ChatState = {
 
 const initialUIState: UIState = {
   activeMarket: 'kiwoom',
-  stockRegion: 'us',
   showChartPanel: true,
   showSettingsModal: false,
   isMobileMenuOpen: false,
@@ -448,7 +397,6 @@ const initialUIState: UIState = {
 
 // Type for persisted state (partial)
 interface PersistedState {
-  stock: { history: StockHistoryItem[] };
   coin: { history: CoinHistoryItem[] };
   kiwoom: { history: KiwoomHistoryItem[] };
   basket: BasketState;
@@ -463,143 +411,11 @@ export const useStore = create<Store>()(
     persist(
       (set, get) => ({
       // Initial states
-      stock: initialStockState,
       coin: initialCoinState,
       kiwoom: initialKiwoomState,
       basket: initialBasketState,
       ...initialChatState,
       ...initialUIState,
-
-      // -------------------------------------------
-      // Stock Actions
-      // -------------------------------------------
-      startStockSession: (sessionId, ticker) =>
-        set((state) => {
-          const upperTicker = ticker.toUpperCase();
-          const existingIndex = state.stock.history.findIndex(
-            (h) => h.sessionId === sessionId
-          );
-          let newHistory = [...state.stock.history];
-          if (existingIndex === -1) {
-            newHistory = [
-              {
-                type: 'stock' as const,
-                ticker: upperTicker,
-                sessionId,
-                timestamp: new Date(),
-                status: 'running' as const,
-              },
-              ...state.stock.history,
-            ].slice(0, 20);
-          }
-          return {
-            stock: {
-              ...initialStockState,
-              activeSessionId: sessionId,
-              ticker: upperTicker,
-              status: 'running',
-              history: newHistory,
-            },
-          };
-        }),
-
-      setStockStatus: (status) =>
-        set((state) => {
-          const newHistory = state.stock.history.map((h) =>
-            h.sessionId === state.stock.activeSessionId ? { ...h, status } : h
-          );
-          return {
-            stock: { ...state.stock, status, history: newHistory },
-          };
-        }),
-
-      setStockStage: (stage) =>
-        set((state) => ({
-          stock: { ...state.stock, currentStage: stage },
-        })),
-
-      addStockReasoning: (entry) =>
-        set((state) => ({
-          stock: {
-            ...state.stock,
-            reasoningLog: [...state.stock.reasoningLog, entry],
-          },
-        })),
-
-      setStockAnalyses: (analyses) =>
-        set((state) => ({
-          stock: { ...state.stock, analyses },
-        })),
-
-      addStockAnalysis: (analysis) =>
-        set((state) => ({
-          stock: {
-            ...state.stock,
-            analyses: [...state.stock.analyses, analysis],
-          },
-        })),
-
-      setStockProposal: (proposal) =>
-        set((state) => {
-          // Add proposal message to chat if proposal exists
-          const newMessages = proposal
-            ? [
-                ...state.messages,
-                {
-                  id: generateUUID(),
-                  role: 'proposal' as const,
-                  content: `Trade Proposal for ${proposal.ticker}`,
-                  timestamp: new Date(),
-                  metadata: { proposal },
-                },
-              ]
-            : state.messages;
-
-          return {
-            stock: { ...state.stock, tradeProposal: proposal },
-            messages: newMessages,
-            chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
-          };
-        }),
-
-      setStockAwaitingApproval: (awaiting) =>
-        set((state) => {
-          // NOTE: Dialog opening is handled ONLY by setStockProposal to prevent race conditions
-          // When both status and proposal messages arrive close together, only proposal setter opens dialog
-          return {
-            stock: { ...state.stock, awaitingApproval: awaiting },
-          };
-        }),
-
-      setStockPosition: (position) =>
-        set((state) => ({
-          stock: { ...state.stock, activePosition: position },
-        })),
-
-      setStockError: (error) =>
-        set((state) => ({
-          stock: {
-            ...state.stock,
-            error,
-            status: error ? 'error' : state.stock.status,
-          },
-        })),
-
-      resetStock: () =>
-        set((state) => ({
-          stock: {
-            ...initialStockState,
-            history: state.stock.history,
-          },
-        })),
-
-      removeStockHistoryItem: (sessionId) =>
-        set((state) => ({
-          stock: {
-            ...state.stock,
-            history: state.stock.history.filter(h => h.sessionId !== sessionId),
-          },
-        })),
 
       // -------------------------------------------
       // Coin Actions
@@ -1362,16 +1178,12 @@ export const useStore = create<Store>()(
       // -------------------------------------------
       // UI Actions
       // -------------------------------------------
-      setActiveMarket: (market) => set((state) => ({
+      setActiveMarket: (market) => set(() => ({
         activeMarket: market,
-        // Sync stockRegion when switching markets
-        stockRegion: market === 'kiwoom' ? 'kr' : market === 'stock' ? state.stockRegion : state.stockRegion,
         // Clear any explicitly-picked chart symbol so the chart falls back to
         // the newly-active market's session ticker instead of a stale symbol.
         chartSymbol: null,
       })),
-
-      setStockRegion: (region) => set({ stockRegion: region }),
 
       setShowChartPanel: (show) => set({ showChartPanel: show }),
 
@@ -1518,13 +1330,11 @@ export const useStore = create<Store>()(
 
       // -------------------------------------------
       // Legacy Actions (for backward compatibility)
-      // These delegate to stock, coin, or kiwoom based on activeMarket
+      // These delegate to coin or kiwoom based on activeMarket
       // -------------------------------------------
       startSession: (sessionId, ticker) => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().startStockSession(sessionId, ticker);
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().startCoinSession(sessionId, ticker);
         } else {
           get().startKiwoomSession(sessionId, ticker);
@@ -1533,9 +1343,7 @@ export const useStore = create<Store>()(
 
       setStatus: (status) => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().setStockStatus(status);
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().setCoinStatus(status);
         } else {
           get().setKiwoomStatus(status);
@@ -1544,9 +1352,7 @@ export const useStore = create<Store>()(
 
       setCurrentStage: (stage) => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().setStockStage(stage);
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().setCoinStage(stage);
         } else {
           get().setKiwoomStage(stage);
@@ -1555,9 +1361,7 @@ export const useStore = create<Store>()(
 
       addReasoningEntry: (entry) => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().addStockReasoning(entry);
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().addCoinReasoning(entry);
         } else {
           get().addKiwoomReasoning(entry);
@@ -1566,9 +1370,7 @@ export const useStore = create<Store>()(
 
       setAnalyses: (analyses) => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().setStockAnalyses(analyses);
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().setCoinAnalyses(analyses);
         } else {
           get().setKiwoomAnalyses(analyses);
@@ -1577,28 +1379,16 @@ export const useStore = create<Store>()(
 
       addAnalysis: (analysis) => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().addStockAnalysis(analysis);
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().addCoinAnalysis(analysis);
         } else {
           get().addKiwoomAnalysis(analysis);
         }
       },
 
-      setTradeProposal: (proposal) => {
-        const market = get().activeMarket;
-        if (market === 'stock') {
-          get().setStockProposal(proposal);
-        }
-        // Coin and Kiwoom proposals use different types, so skip
-      },
-
       setAwaitingApproval: (awaiting) => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().setStockAwaitingApproval(awaiting);
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().setCoinAwaitingApproval(awaiting);
         } else {
           get().setKiwoomAwaitingApproval(awaiting);
@@ -1607,9 +1397,7 @@ export const useStore = create<Store>()(
 
       setActivePosition: (position) => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().setStockPosition(position);
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().setCoinPosition(position);
         } else {
           get().setKiwoomPosition(position);
@@ -1618,9 +1406,7 @@ export const useStore = create<Store>()(
 
       setError: (error) => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().setStockError(error);
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().setCoinError(error);
         } else {
           get().setKiwoomError(error);
@@ -1629,9 +1415,7 @@ export const useStore = create<Store>()(
 
       reset: () => {
         const market = get().activeMarket;
-        if (market === 'stock') {
-          get().resetStock();
-        } else if (market === 'coin') {
+        if (market === 'coin') {
           get().resetCoin();
         } else {
           get().resetKiwoom();
@@ -1643,8 +1427,10 @@ export const useStore = create<Store>()(
         version: 1,
         storage: createJSONStorage(() => localStorage),
         // Only persist history and settings, not active sessions
+        // NOTE: activeMarket is deliberately NOT persisted, and `merge` below
+        // only picks known keys — so a stale `stock` slice (or a 'stock'
+        // activeMarket) left in localStorage by old sessions is ignored.
         partialize: (state): PersistedState => ({
-          stock: { history: state.stock.history },
           coin: { history: state.coin.history },
           kiwoom: { history: state.kiwoom.history },
           basket: state.basket,
@@ -1668,12 +1454,6 @@ export const useStore = create<Store>()(
 
           return {
             ...currentState,
-            stock: {
-              ...currentState.stock,
-              history: persisted.stock?.history
-                ? parseHistoryDates(persisted.stock.history as StockHistoryItem[])
-                : [],
-            },
             coin: {
               ...currentState.coin,
               history: persisted.coin?.history
@@ -1705,7 +1485,6 @@ export const useStore = create<Store>()(
 
 // Helper to get current market data
 const getMarketData = (state: Store) => {
-  if (state.activeMarket === 'stock') return state.stock;
   if (state.activeMarket === 'coin') return state.coin;
   return state.kiwoom;
 };
@@ -1715,9 +1494,7 @@ export const selectSession = (state: Store) => {
   const market = state.activeMarket;
   const data = getMarketData(state);
   let ticker: string;
-  if (market === 'stock') {
-    ticker = state.stock.ticker;
-  } else if (market === 'coin') {
+  if (market === 'coin') {
     ticker = state.coin.market;
   } else {
     ticker = state.kiwoom.stk_cd;
@@ -1758,13 +1535,9 @@ export const selectChartSymbol = (state: Store) => state.chartSymbol;
 
 // Get current market's history
 export const selectTickerHistory = (state: Store): TickerHistoryItem[] => {
-  if (state.activeMarket === 'stock') return state.stock.history;
   if (state.activeMarket === 'coin') return state.coin.history;
   return state.kiwoom.history;
 };
-
-// Select stock-specific state
-export const selectStock = (state: Store) => state.stock;
 
 // Select coin-specific state
 export const selectCoin = (state: Store) => state.coin;
@@ -1838,7 +1611,6 @@ export const selectActiveSessionId = (state: Store) => {
 };
 
 export const selectTicker = (state: Store) => {
-  if (state.activeMarket === 'stock') return state.stock.ticker;
   if (state.activeMarket === 'coin') return state.coin.market;
   return state.kiwoom.stk_cd;
 };
@@ -1889,19 +1661,6 @@ export interface ActiveSession {
 // Get ALL active sessions from ALL markets (for main dashboard)
 export const selectAllActiveSessions = (state: Store): ActiveSession[] => {
   const sessions: ActiveSession[] = [];
-
-  // Stock session
-  if (state.stock.activeSessionId && state.stock.status !== 'idle') {
-    sessions.push({
-      sessionId: state.stock.activeSessionId,
-      ticker: state.stock.ticker,
-      displayName: state.stock.ticker,
-      marketType: 'stock',
-      status: state.stock.status,
-      currentStage: state.stock.currentStage,
-      reasoningLog: state.stock.reasoningLog,
-    });
-  }
 
   // Coin session
   if (state.coin.activeSessionId && state.coin.status !== 'idle') {
@@ -1957,26 +1716,11 @@ export interface RecentAnalysisItem {
   marketType: MarketType;
   timestamp: Date;
   status: SessionStatus | 'idle';
-  tradeProposal: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal: CoinTradeProposal | KRStockTradeProposal | null;
 }
 
 export const selectRecentCompletedAnalyses = (state: Store): RecentAnalysisItem[] => {
   const allHistory: RecentAnalysisItem[] = [];
-
-  // Stock history - include completed, awaiting_approval, and cancelled
-  state.stock.history.forEach((h) => {
-    if (h.status === 'completed' || h.status === 'awaiting_approval' || h.status === 'cancelled') {
-      allHistory.push({
-        sessionId: h.sessionId,
-        ticker: h.ticker,
-        displayName: h.ticker,
-        marketType: 'stock',
-        timestamp: h.timestamp,
-        status: h.status,
-        tradeProposal: h.sessionId === state.stock.activeSessionId ? state.stock.tradeProposal : null,
-      });
-    }
-  });
 
   // Coin history - include completed, awaiting_approval, and cancelled
   state.coin.history.forEach((h) => {
@@ -2015,5 +1759,5 @@ export const selectRecentCompletedAnalyses = (state: Store): RecentAnalysisItem[
 };
 
 // Export types
-export type { TickerHistoryItem, StockHistoryItem, CoinHistoryItem, KiwoomHistoryItem, MarketType, StockRegion, ChatPopupSize, Language };
+export type { TickerHistoryItem, CoinHistoryItem, KiwoomHistoryItem, MarketType, ChatPopupSize, Language };
 export type { SessionData } from '@/types';

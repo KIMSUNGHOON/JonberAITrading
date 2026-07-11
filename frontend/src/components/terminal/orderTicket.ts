@@ -3,11 +3,11 @@
  * Symbol/market/currency helpers are ported from the retired ApprovalDialog.
  */
 import type {
-  TradeProposal, CoinTradeProposal, KRStockTradeProposal,
+  CoinTradeProposal, KRStockTradeProposal,
   ApprovalRequest, ApprovalDecision,
 } from '@/types';
 
-export type AnyTradeProposal = TradeProposal | CoinTradeProposal | KRStockTradeProposal;
+export type AnyTradeProposal = CoinTradeProposal | KRStockTradeProposal;
 
 export function getProposalSymbol(proposal: AnyTradeProposal): string {
   if ('stk_cd' in proposal && proposal.stk_cd) {
@@ -15,23 +15,20 @@ export function getProposalSymbol(proposal: AnyTradeProposal): string {
     return k.stk_nm || k.stk_cd;
   }
   if ('market' in proposal && proposal.market) return proposal.market;
-  if ('ticker' in proposal && proposal.ticker) return proposal.ticker;
   return 'UNKNOWN';
 }
 
-export function getProposalMarketType(proposal: AnyTradeProposal): 'stock' | 'coin' | 'kiwoom' {
+export function getProposalMarketType(proposal: AnyTradeProposal): 'coin' | 'kiwoom' {
   if ('stk_cd' in proposal) return 'kiwoom';
-  if ('market' in proposal) return 'coin';
-  return 'stock';
+  return 'coin';
 }
 
 export function formatCurrency(
   value: number | null | undefined,
-  marketType: 'stock' | 'coin' | 'kiwoom',
+  _marketType: 'coin' | 'kiwoom',
 ): string {
   if (value === null || value === undefined) return 'N/A';
-  if (marketType === 'kiwoom' || marketType === 'coin') return `₩${value.toLocaleString('ko-KR')}`;
-  return `$${value.toFixed(2)}`;
+  return `₩${value.toLocaleString('ko-KR')}`;
 }
 
 /** Risk 0-10 → dense-terminal tokens (green→amber→red = up→warn→down, NOT accent). */

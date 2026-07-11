@@ -4,7 +4,6 @@
  * No store slice backs account balances; data comes from REST per market:
  *   kiwoom → getKRStockAccount
  *   coin   → getCoinAccounts (+ getCoinPositions for P&L, which accounts lack)
- *   stock  → no endpoint → honest '—'
  * Polls every 30s (Kiwoom is throttled through the 800ms request queue, so keep
  * the cadence gentle). The 4-cell grid keeps the exact honest empty-state.
  */
@@ -32,11 +31,6 @@ function usePortfolioSummary() {
     let alive = true;
 
     async function run() {
-      // US has no account endpoint — leave the honest '—' KVs.
-      if (activeMarket === 'stock') {
-        setSummary(EMPTY);
-        return;
-      }
       try {
         if (activeMarket === 'kiwoom') {
           const acct = await getKRStockAccount();

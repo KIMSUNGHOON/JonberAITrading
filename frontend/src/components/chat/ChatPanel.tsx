@@ -78,20 +78,6 @@ export function ChatPanel() {
       };
     }
 
-    // Check Stock (US) session
-    if (!activeAnalysis && state.stock.activeSessionId) {
-      activeAnalysis = {
-        ticker: state.stock.ticker,
-        displayName: state.stock.ticker,
-        marketType: 'stock',
-        status: state.stock.status,
-        recommendation: state.stock.tradeProposal?.action,
-        entryPrice: state.stock.tradeProposal?.entry_price ?? undefined,
-        stopLoss: state.stock.tradeProposal?.stop_loss ?? undefined,
-        takeProfit: state.stock.tradeProposal?.take_profit ?? undefined,
-      };
-    }
-
     // Get recent trade decisions from history
     const recentDecisions: Array<{
       ticker: string;

@@ -35,13 +35,13 @@ describe('isTicketActive', () => {
     expect(isTicketActive(null, 'sess-1')).toBe(false);
   });
   it('false when no session', () => {
-    expect(isTicketActive({ ticker: 'AAPL' } as any, null)).toBe(false);
+    expect(isTicketActive({ stk_cd: '005930' } as any, null)).toBe(false);
   });
   it('false when symbol resolves to UNKNOWN', () => {
     expect(isTicketActive({} as any, 'sess-1')).toBe(false);
   });
   it('true when proposal + session + resolvable symbol', () => {
-    expect(isTicketActive({ ticker: 'AAPL' } as any, 'sess-1')).toBe(true);
+    expect(isTicketActive({ stk_cd: '005930' } as any, 'sess-1')).toBe(true);
   });
 });
 
@@ -59,12 +59,13 @@ describe('buildApprovalRequest', () => {
 });
 
 describe('helpers ported from ApprovalDialog', () => {
-  it('getProposalSymbol resolves ticker', () => {
-    expect(getProposalSymbol({ ticker: 'TSLA' } as any)).toBe('TSLA');
+  it('getProposalSymbol resolves symbols', () => {
+    expect(getProposalSymbol({ market: 'KRW-BTC' } as any)).toBe('KRW-BTC');
+    expect(getProposalSymbol({ stk_cd: '005930', stk_nm: '삼성전자' } as any)).toBe('삼성전자');
   });
-  it('formatCurrency: US dollars vs KR won', () => {
-    expect(formatCurrency(1234.5, 'stock')).toBe('$1234.50');
+  it('formatCurrency: KR won', () => {
     expect(formatCurrency(1000, 'coin')).toBe('₩1,000');
-    expect(formatCurrency(null, 'stock')).toBe('N/A');
+    expect(formatCurrency(1234567, 'kiwoom')).toBe('₩1,234,567');
+    expect(formatCurrency(null, 'kiwoom')).toBe('N/A');
   });
 });

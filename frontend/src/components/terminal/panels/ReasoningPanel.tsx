@@ -14,11 +14,9 @@ export function ReasoningPanel() {
   const reasoningLog = useStore(selectReasoningLog);
   const status = useStore(selectStatus);
   const currentStage = useStore((s) =>
-    s.activeMarket === 'stock'
-      ? s.stock.currentStage
-      : s.activeMarket === 'coin'
-        ? s.coin.currentStage
-        : s.kiwoom.currentStage,
+    s.activeMarket === 'coin'
+      ? s.coin.currentStage
+      : s.kiwoom.currentStage,
   );
   const running = status === 'running';
 

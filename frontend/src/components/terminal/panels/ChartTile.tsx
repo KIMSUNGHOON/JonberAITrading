@@ -5,9 +5,8 @@
  * (candles need only ticker+timeframe).
  *
  * TradingChart is h-full and self-fetches candles (coin → Upbit, 6-digit → KR).
- * HONESTY GATE: US ('stock') / unknown symbols would fall to generateMockData
- * (random-walk fake candles), so we render an explicit awaiting state instead of
- * charting fabricated data.
+ * HONESTY GATE: unknown symbols have no live data source, so we render an
+ * explicit awaiting state instead of charting fabricated data.
  */
 import { useStore, selectTicker, selectChartConfig, selectChartSymbol } from '@/store';
 import { TradingChart } from '@/components/chart/TradingChart';
@@ -22,19 +21,12 @@ export function ChartTile() {
   const picked = useStore(selectChartSymbol);
   const sessionTicker = useStore(selectTicker);
   const cfg = useStore(selectChartConfig);
-  const market = useStore((s) => s.activeMarket);
 
   const symbol = picked || sessionTicker;
 
   if (!symbol || !hasRealCandles(symbol)) {
     return (
-      <Awaiting
-        label={
-          market === 'stock'
-            ? 'US 실시간 차트 미연동 (SIM) · 관심종목/포지션 행 클릭'
-            : '차트 대기 · 관심종목 행 클릭 또는 :analyze <종목>'
-        }
-      />
+      <Awaiting label="차트 대기 · 관심종목 행 클릭 또는 :analyze <종목>" />
     );
   }
 
