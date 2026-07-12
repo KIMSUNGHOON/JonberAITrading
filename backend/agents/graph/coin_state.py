@@ -257,6 +257,7 @@ class CoinTradingState(TypedDict, total=False):
     # HITL state
     awaiting_approval: bool
     approval_status: Optional[str]
+    approval_actor: Optional[str]  # 'user' | 'system' — R3 audit trail
     user_feedback: Optional[str]
 
     # Re-analysis state
@@ -323,6 +324,7 @@ def create_coin_initial_state(
         # HITL state
         "awaiting_approval": False,
         "approval_status": None,
+        "approval_actor": None,
         "user_feedback": None,
 
         # Re-analysis state

@@ -197,7 +197,7 @@ class RiskParameters(BaseModel):
     max_daily_loss_pct: float = Field(
         default=3.0,
         ge=0.1, le=20.0,
-        description="Daily realized-loss circuit breaker as % of account value (autonomous mode)"
+        description="Daily realized-loss breaker %, autonomous mode (enforced via the gate seam; inert until a realized-P&L source is wired)"
     )
     max_open_positions: int = Field(
         default=5,
@@ -366,6 +366,11 @@ class QueuedTrade(BaseModel):
     # Queue status
     status: QueueStatus = QueueStatus.PENDING
     reason: str = ""  # Why it was queued (e.g., "Market closed")
+
+    # R3: True when this trade originated from an autonomous engine — the
+    # queue processor must RE-check the autonomy gate before executing it
+    # (mode flips / breaker trips between queueing and execution must win).
+    autonomous: bool = False
 
     # Timestamps
     queued_at: datetime = Field(default_factory=datetime.now)

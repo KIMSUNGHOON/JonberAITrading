@@ -376,6 +376,34 @@ async def test_status_frame_carries_auto_approve_at_when_present(sm):
     assert "auto_approve_at" not in [f for f in ws2.sent if f["type"] == "status"][0]["data"]
 
 
+async def test_countdown_arrival_triggers_a_status_frame(sm):
+    """SAFETY-UX (review fix): the injector writes auto_approve_at AFTER the
+    awaiting_approval transition — an already-connected client must still get
+    a status frame when the countdown appears (and when it is cleared)."""
+    ws = FakeWebSocket()
+    cursor = ws_module._SessionFrameCursor("auto-3")
+    session = {
+        "session_id": "auto-3",
+        "status": "awaiting_approval",
+        "error": None,
+        "state": {"reasoning_log": [], "current_stage": "approval", "awaiting_approval": True},
+    }
+
+    await cursor.emit(ws, session)  # awaiting transition frame (no countdown yet)
+    session["state"]["auto_approve_at"] = "2026-07-12T10:00:00+00:00"
+    await cursor.emit(ws, session)  # same status/stage — countdown appeared
+
+    status_frames = [f for f in ws.sent if f["type"] == "status"]
+    assert len(status_frames) == 2, "countdown appearance must emit a frame"
+    assert status_frames[1]["data"]["auto_approve_at"] == "2026-07-12T10:00:00+00:00"
+
+    session["state"].pop("auto_approve_at")
+    await cursor.emit(ws, session)  # countdown cleared
+    status_frames = [f for f in ws.sent if f["type"] == "status"]
+    assert len(status_frames) == 3
+    assert "auto_approve_at" not in status_frames[2]["data"]
+
+
 async def test_cursor_emits_pending_frames_before_complete(sm):
     """Frame order within one wake: reasoning/status must precede the complete
     frame, so a client that stops reading at 'complete' misses nothing."""

@@ -76,12 +76,39 @@ async def _default_mode_provider(market: str) -> str:
     return await storage.get_app_setting(f"trading_mode:{market}", "hitl")
 
 
+def _client_is_mock(client) -> bool:
+    """A Kiwoom client is paper ONLY if both its flag and its bound URL say so."""
+    return bool(
+        getattr(client, "is_mock", False)
+        and getattr(client, "base_url", None) == getattr(client, "MOCK_URL", object())
+    )
+
+
 async def _default_paper_provider(market: str) -> bool:
     if market == "kiwoom":
-        # Runtime-aware (settings modal can flip it), falls back to env.
+        # 1. Runtime intent flag (settings modal can flip it; falls back to env).
         from app.api.routes.settings import get_kiwoom_is_mock
 
-        return bool(get_kiwoom_is_mock())
+        if not get_kiwoom_is_mock():
+            return False
+
+        # 2. Bind to the clients that ACTUALLY execute — the intent flag alone
+        # is not enough: a client/coordinator constructed while live keeps its
+        # live base URL even after the flag is flipped back to paper.
+        from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+
+        shared = await get_shared_kiwoom_client_async()
+        if not _client_is_mock(shared):
+            return False
+
+        import app.dependencies as deps
+
+        coordinator = getattr(deps, "_trading_coordinator_instance", None)
+        captured = getattr(coordinator, "_kiwoom", None) if coordinator else None
+        if captured is not None and not _client_is_mock(captured):
+            return False
+
+        return True
     if market == "coin":
         return settings.UPBIT_TRADING_MODE == "paper"
     return False  # unknown market: not provably paper → deny
@@ -99,19 +126,19 @@ async def _default_daily_loss_provider(market: str) -> float:
 
 
 async def _default_positions_count_provider(market: str) -> int:
-    from services.storage_service import get_storage_service
-
-    storage = await get_storage_service()
     if market == "coin":
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
         return len(await storage.get_coin_positions())
     if market == "kiwoom":
-        try:
-            positions = await storage.get_kr_stock_positions()
-        except AttributeError:
-            # Same semantics as the positions REST route: no KR position
-            # store yet → no tracked positions.
-            return 0
-        return len(positions or [])
+        # Storage has no KR position store — count from the broker (the mock
+        # server in paper mode). Errors bubble to the gate's fail-closed wrap.
+        from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+
+        client = await get_shared_kiwoom_client_async()
+        balance = await client.get_account_balance()
+        return len(balance.holdings or [])
     raise ValueError(f"unknown market: {market}")
 
 

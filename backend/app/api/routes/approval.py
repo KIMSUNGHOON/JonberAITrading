@@ -90,6 +90,8 @@ async def submit_decision(
     state["user_feedback"] = feedback
     state["awaiting_approval"] = False
     state["approval_actor"] = actor
+    # A decision voids any pending autonomous-approval countdown (R3).
+    state.pop("auto_approve_at", None)
 
     # Apply modifications if provided (proposal is now a dict)
     if decision == "modified" and modifications:
@@ -114,6 +116,7 @@ async def submit_decision(
         "user_feedback": feedback,
         "awaiting_approval": False,
         "approval_actor": actor,
+        "auto_approve_at": None,
     }
     if decision == "modified" and state.get("trade_proposal"):
         decision_updates["trade_proposal"] = state["trade_proposal"]

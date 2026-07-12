@@ -82,6 +82,10 @@ class RiskParamsUpdateRequest(BaseModel):
     max_total_stock_pct: Optional[float] = Field(None, ge=0.1, le=1.0)
     sudden_move_threshold_pct: Optional[float] = Field(None, ge=1.0, le=30.0)
     max_daily_trades: Optional[int] = Field(None, ge=1, le=100)
+    # R3 autonomy safety rails (enforced by services/autonomy/gate.py)
+    max_daily_loss_pct: Optional[float] = Field(None, ge=0.1, le=20.0)
+    max_open_positions: Optional[int] = Field(None, ge=1, le=50)
+    max_trade_notional_krw: Optional[float] = Field(None, ge=10_000)
     stop_loss_mode: Optional[str] = None
     take_profit_mode: Optional[str] = None
 
@@ -296,6 +300,15 @@ async def update_risk_params(
 
     if request.max_daily_trades is not None:
         params.max_daily_trades = request.max_daily_trades
+
+    if request.max_daily_loss_pct is not None:
+        params.max_daily_loss_pct = request.max_daily_loss_pct
+
+    if request.max_open_positions is not None:
+        params.max_open_positions = request.max_open_positions
+
+    if request.max_trade_notional_krw is not None:
+        params.max_trade_notional_krw = request.max_trade_notional_krw
 
     if request.stop_loss_mode is not None:
         params.stop_loss_mode = StopLossMode(request.stop_loss_mode)

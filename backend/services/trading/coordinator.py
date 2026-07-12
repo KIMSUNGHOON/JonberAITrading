@@ -223,9 +223,15 @@ class ExecutionCoordinator:
         take_profit: Optional[float],
         risk_score: int,
         quantity_override: Optional[int] = None,
+        autonomous: bool = False,
     ) -> AllocationPlan:
         """
         Handle an approved trade from the analysis system.
+
+        autonomous=True marks trades originated by an autonomy engine (R3):
+        if such a trade gets QUEUED, the queue processor re-checks the shared
+        autonomy gate before executing it — a mode flip to HITL or a tripped
+        limit between queueing and execution must win.
 
         Args:
             session_id: Analysis session ID
@@ -301,6 +307,7 @@ class ExecutionCoordinator:
                 take_profit=take_profit,
                 risk_score=risk_score,
                 reason=queue_reason,
+                autonomous=autonomous,
             )
 
             return AllocationPlan(
@@ -967,6 +974,7 @@ class ExecutionCoordinator:
         take_profit: Optional[float],
         risk_score: int,
         reason: str,
+        autonomous: bool = False,
     ) -> QueuedTrade:
         """Add a trade to the queue for later execution."""
         queued_trade = QueuedTrade(
@@ -979,6 +987,7 @@ class ExecutionCoordinator:
             take_profit=take_profit,
             risk_score=risk_score,
             reason=reason,
+            autonomous=autonomous,
         )
 
         self._state.trade_queue.append(queued_trade)
@@ -1075,6 +1084,30 @@ class ExecutionCoordinator:
                     details={"queue_id": trade.id},
                 )
 
+                # R3: autonomy-originated trades must pass the gate AGAIN at
+                # execution time — the verdict from queueing time is stale
+                # (mode may have been flipped to HITL, a limit may have tripped).
+                if trade.autonomous:
+                    from services.autonomy import check_autonomy
+
+                    gate = await check_autonomy(
+                        "kiwoom",
+                        action=trade.action,
+                        quantity=trade.quantity,
+                        entry_price=trade.entry_price,
+                    )
+                    if not gate.allowed:
+                        trade.status = QueueStatus.CANCELLED
+                        self._log_activity(
+                            ActivityType.TRADE_DEQUEUED,
+                            f"Queued autonomous trade cancelled by gate: {trade.action} "
+                            f"{trade.ticker} ({gate.check}: {gate.reason})",
+                            agent="order",
+                            ticker=trade.ticker,
+                            details={"queue_id": trade.id, "gate_check": gate.check},
+                        )
+                        continue
+
                 # Execute the trade
                 allocation = await self.on_trade_approved(
                     session_id=trade.session_id,
@@ -1086,6 +1119,7 @@ class ExecutionCoordinator:
                     take_profit=trade.take_profit,
                     risk_score=trade.risk_score,
                     quantity_override=trade.quantity,
+                    autonomous=trade.autonomous,
                 )
 
                 trade.allocation = allocation

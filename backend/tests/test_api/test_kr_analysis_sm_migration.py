@@ -504,11 +504,16 @@ async def test_approval_records_actor(sm, kr_sessions, monkeypatch):
     graph = FakeApprovalGraph([])
     monkeypatch.setattr("app.api.routes.approval.get_kr_stock_trading_graph", lambda: graph)
 
+    # A pending autonomous countdown must be voided by any decision
+    kr_sessions[session_id]["state"]["auto_approve_at"] = "2026-07-12T10:00:00+00:00"
+
     await submit_decision(session_id, "approved", actor="system")
 
     session = await sm.get_session(session_id)
     assert session.state.get("approval_actor") == "system"
     assert graph.state_update.get("approval_actor") == "system"  # audit trail in the checkpoint
+    assert "auto_approve_at" not in kr_sessions[session_id]["state"]
+    assert session.state.get("auto_approve_at") is None
 
     # The route path records 'user'
     session_id2 = "kr-actor-2"

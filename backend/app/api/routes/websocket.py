@@ -534,6 +534,7 @@ class _SessionFrameCursor:
         self.last_stage: Optional[str] = None
         self.proposal_sent = False
         self.last_position: Optional[dict] = None
+        self.last_auto_approve_at: Optional[str] = None
 
     async def emit(self, websocket: WebSocket, session: dict) -> bool:
         """Send any not-yet-sent frames for this session. True when complete sent."""
@@ -565,17 +566,24 @@ class _SessionFrameCursor:
         else:
             stage = str(stage) if stage else ""
 
-        # Send status updates when status OR stage changes
-        if current_status != self.last_status or stage != self.last_stage:
+        # Send status updates when status OR stage changes — or when the
+        # autonomous-approval countdown appears/changes (R3): the injector
+        # writes auto_approve_at AFTER the awaiting_approval transition, so an
+        # already-connected client would otherwise never receive it.
+        auto_approve_at = state.get("auto_approve_at") or None
+        if (
+            current_status != self.last_status
+            or stage != self.last_stage
+            or auto_approve_at != self.last_auto_approve_at
+        ):
             status_data = {
                 "status": current_status,
                 "stage": stage,
                 "awaiting_approval": state.get("awaiting_approval", False),
             }
-            # R3 (additive, optional): rail countdown for a pending autonomous
-            # approval. Only present while the injector has one scheduled.
-            if state.get("auto_approve_at"):
-                status_data["auto_approve_at"] = state["auto_approve_at"]
+            # Additive, optional: only present while a countdown is pending.
+            if auto_approve_at:
+                status_data["auto_approve_at"] = auto_approve_at
             await websocket.send_json({
                 "type": "status",
                 "session_id": session_id,
@@ -589,6 +597,7 @@ class _SessionFrameCursor:
             )
             self.last_status = current_status
             self.last_stage = stage
+            self.last_auto_approve_at = auto_approve_at
 
         # Send trade proposal when available (once)
         # proposal is now a dict after serialization fix

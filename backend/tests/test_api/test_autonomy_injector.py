@@ -201,6 +201,60 @@ async def test_submit_failure_leaves_session_awaiting(sm, fast_grace, gate_allow
     assert session["state"]["awaiting_approval"] is True
 
 
+async def test_stale_timer_stands_down_when_proposal_changed(sm, fast_grace, gate_allow, submit_recorder):
+    """SAFETY (review fix): a reject→re-analyze cycle mutates the SAME session
+    dict and can re-arm awaiting with a NEW proposal — the stale timer must
+    never approve a proposal it did not announce."""
+    session_id = "inj-6"
+    session = _awaiting_session(session_id)
+    await _seed_sm(sm, session_id)
+
+    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+    # During the grace: re-analysis replaced the proposal (new id), awaiting re-armed.
+    session["state"]["trade_proposal"] = {"id": "p2-NEW", "action": "BUY", "quantity": 1, "entry_price": 1000}
+
+    await asyncio.sleep(0.2)
+    assert submit_recorder == []
+    assert "auto_approve_at" not in session["state"], "stale countdown must be cleared"
+
+
+async def test_recorded_decision_blocks_stale_timer(sm, fast_grace, gate_allow, submit_recorder):
+    """approval_status set (a decision was recorded) must stand the timer down
+    even if awaiting flags look re-armed (mid-reject resume window)."""
+    session_id = "inj-7"
+    session = _awaiting_session(session_id)
+    await _seed_sm(sm, session_id)
+
+    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+    session["state"]["approval_status"] = "rejected"  # decision recorded; flags still awaiting
+
+    await asyncio.sleep(0.2)
+    assert submit_recorder == []
+
+
+async def test_recheck_deny_clears_countdown(sm, fast_grace, monkeypatch, submit_recorder):
+    verdicts = [
+        GateDecision(allowed=True, reason="ok", check="all"),
+        GateDecision(allowed=False, reason="mode off", check="market_mode"),
+    ]
+
+    async def flip_gate(market, **kwargs):
+        return verdicts.pop(0)
+
+    monkeypatch.setattr(injector_module, "check_autonomy", flip_gate)
+
+    session_id = "inj-8"
+    session = _awaiting_session(session_id)
+    await _seed_sm(sm, session_id)
+
+    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+    await asyncio.sleep(0.2)
+
+    assert "auto_approve_at" not in session["state"]
+    sm_session = await sm.get_session(session_id)
+    assert sm_session.state.get("auto_approve_at") is None
+
+
 async def test_kr_producer_invokes_injector(sm, monkeypatch):
     """The KR analysis task must hand awaiting sessions to the injector."""
     from app.api.routes.kr_stocks.constants import kr_stock_sessions

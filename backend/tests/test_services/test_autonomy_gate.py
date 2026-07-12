@@ -130,6 +130,83 @@ async def test_non_increasing_actions_skip_position_and_notional_checks(master_o
     assert decision.allowed
 
 
+async def test_default_paper_provider_binds_to_executing_clients(master_on, monkeypatch):
+    """SAFETY (review-critical fix): the runtime intent flag alone is not
+    paper-proof — a coordinator built while LIVE keeps its live client after
+    the flag is flipped back. The provider must deny then."""
+    from services.autonomy.gate import _default_paper_provider
+
+    class FakeClient:
+        MOCK_URL = "https://mockapi.kiwoom.com"
+
+        def __init__(self, is_mock):
+            self.is_mock = is_mock
+            self.base_url = self.MOCK_URL if is_mock else "https://api.kiwoom.com"
+
+    monkeypatch.setattr("app.api.routes.settings.get_kiwoom_is_mock", lambda: True)
+
+    async def shared_mock():
+        return FakeClient(is_mock=True)
+
+    monkeypatch.setattr(
+        "app.core.kiwoom_singleton.get_shared_kiwoom_client_async", shared_mock
+    )
+
+    import app.dependencies as deps
+
+    class FakeCoordinator:
+        pass
+
+    # Coordinator captured a LIVE client → deny despite the paper flag.
+    live_coord = FakeCoordinator()
+    live_coord._kiwoom = FakeClient(is_mock=False)
+    monkeypatch.setattr(deps, "_trading_coordinator_instance", live_coord)
+    assert await _default_paper_provider("kiwoom") is False
+
+    # Coordinator's client is genuinely mock → allow.
+    mock_coord = FakeCoordinator()
+    mock_coord._kiwoom = FakeClient(is_mock=True)
+    monkeypatch.setattr(deps, "_trading_coordinator_instance", mock_coord)
+    assert await _default_paper_provider("kiwoom") is True
+
+    # No coordinator constructed yet → the shared client decides.
+    monkeypatch.setattr(deps, "_trading_coordinator_instance", None)
+    assert await _default_paper_provider("kiwoom") is True
+
+
+async def test_queued_autonomous_trade_is_regated_at_execution(master_on, monkeypatch):
+    """SAFETY (review fix): a gate verdict from queueing time is stale — the
+    queue processor must re-check before executing autonomy-originated trades
+    (a mode flip to HITL between queueing and execution must win)."""
+    import services.autonomy as autonomy_pkg
+    from services.trading.coordinator import ExecutionCoordinator
+    from services.trading.models import QueueStatus
+
+    coordinator = ExecutionCoordinator(kiwoom_client=None)
+    coordinator.add_to_queue(
+        session_id="s1", ticker="005930", stock_name="삼성전자", action="BUY",
+        entry_price=50_000, stop_loss=None, take_profit=None, risk_score=5,
+        reason="Market closed", autonomous=True,
+    )
+
+    executed = []
+
+    async def record_on_trade_approved(*args, **kwargs):
+        executed.append(kwargs.get("ticker") or (args and args[1]))
+
+    coordinator.on_trade_approved = record_on_trade_approved
+
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="trading_mode:kiwoom is 'hitl'", check="market_mode")
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
+
+    await coordinator.process_trade_queue()
+
+    assert executed == [], "gate-denied queued autonomous trade must not execute"
+    assert coordinator._state.trade_queue[0].status == QueueStatus.CANCELLED
+
+
 async def test_provider_exception_is_fail_closed(master_on):
     async def boom(market):
         raise RuntimeError("broker unreachable")

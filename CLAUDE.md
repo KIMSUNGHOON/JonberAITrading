@@ -103,6 +103,7 @@ cd backend && pytest -v
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | (required for notifications) |
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | (required for notifications) |
 | `TELEGRAM_ENABLED` | Enable Telegram | `false` |
+| `AUTONOMY_ENABLED` | 자율 매매 마스터 게이트 (R3) — off면 모든 자율 실행 거부 | `false` |
 
 ## Project Structure
 

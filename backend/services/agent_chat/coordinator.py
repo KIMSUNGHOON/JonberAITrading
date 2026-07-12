@@ -485,6 +485,9 @@ class ChatCoordinator:
                     take_profit=decision.take_profit,
                     risk_score=int((1 - decision.confidence) * 10),
                     quantity_override=decision.quantity,
+                    # R3: mark as autonomy-originated so a QUEUED trade gets a
+                    # fresh gate check at execution time.
+                    autonomous=True,
                 )
 
                 logger.info(

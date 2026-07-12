@@ -84,7 +84,16 @@ async def maybe_schedule_auto_approve(session_id: str, market: str, session: dic
 
         await _notify_pending(session_id, market, fields, grace_secs)
 
-        asyncio.create_task(_auto_approve_after_grace(session_id, market, session))
+        # Pin the proposal identity: the grace task may only approve the exact
+        # proposal it announced. A reject→re-analyze cycle mutates the SAME
+        # session dict in place and can re-arm awaiting_approval with a NEW
+        # proposal — without this pin the stale timer could approve a proposal
+        # the user never saw (and with zero grace).
+        proposal_id = (session["state"].get("trade_proposal") or {}).get("id")
+
+        asyncio.create_task(
+            _auto_approve_after_grace(session_id, market, session, proposal_id)
+        )
         logger.info(
             "auto_approve_scheduled",
             session_id=session_id,
@@ -96,15 +105,45 @@ async def maybe_schedule_auto_approve(session_id: str, market: str, session: dic
         logger.error("auto_approve_schedule_failed", session_id=session_id, error=str(e))
 
 
-async def _auto_approve_after_grace(session_id: str, market: str, session: dict) -> None:
+async def _clear_countdown(session_id: str, session: dict) -> None:
+    """Remove a no-longer-valid auto_approve_at from state + the sm mirror so
+    late-joining WS clients and restart recovery never see a stale countdown."""
+    session["state"].pop("auto_approve_at", None)
+    await mirror_session_state(session_id, {"auto_approve_at": None})
+
+
+async def _auto_approve_after_grace(
+    session_id: str, market: str, session: dict, proposal_id: str | None
+) -> None:
     try:
         await asyncio.sleep(AUTONOMY_GRACE_SECONDS)
 
-        # Manual decisions during the grace always win.
-        if session.get("status") != "awaiting_approval" or not session["state"].get(
-            "awaiting_approval"
+        state = session["state"]
+
+        # Manual decisions during the grace always win. approval_status is set
+        # the moment ANY decision is recorded — it also guards the brief
+        # mid-reject window where the resuming graph re-emits
+        # awaiting_approval=True before re_analyze clears it.
+        if (
+            session.get("status") != "awaiting_approval"
+            or not state.get("awaiting_approval")
+            or state.get("approval_status")
         ):
             logger.info("auto_approve_stood_down_manual", session_id=session_id)
+            return
+
+        # Only the exact proposal we announced may be approved. A re-analysis
+        # produced a NEW proposal → this timer is stale; the fresh awaiting
+        # state gets its own injector run (or plain HITL).
+        current_id = (state.get("trade_proposal") or {}).get("id")
+        if proposal_id is None or current_id != proposal_id:
+            logger.info(
+                "auto_approve_stood_down_proposal_changed",
+                session_id=session_id,
+                scheduled_for=proposal_id,
+                current=current_id,
+            )
+            await _clear_countdown(session_id, session)
             return
 
         # Re-check the gate — the mode may have been flipped or a limit tripped
@@ -116,6 +155,7 @@ async def _auto_approve_after_grace(session_id: str, market: str, session: dict)
             await mirror_session_state(
                 session_id, {"reasoning_log": session["state"]["reasoning_log"]}
             )
+            await _clear_countdown(session_id, session)
             logger.info(
                 "auto_approve_cancelled_at_recheck",
                 session_id=session_id,
