@@ -331,17 +331,25 @@ async def cancel_order(order_id: str):
     client = await get_shared_kiwoom_client_async()
 
     try:
-        result = await client.cancel_order(order_id)
+        # kt10003은 종목코드가 필수 — 미체결 목록에서 주문번호로 찾는다.
+        pending = await client.get_pending_orders()
+        target = next((o for o in pending if o.ord_no == order_id), None)
+        if target is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"미체결 주문을 찾을 수 없습니다: {order_id}",
+            )
 
-        logger.info("order_cancelled", order_id=order_id)
+        # qty=0 → 잔량 전부 취소 (kt10003 스펙)
+        await client.cancel_order(org_ord_no=order_id, stk_cd=target.stk_cd)
+
+        logger.info("order_cancelled", order_id=order_id, stk_cd=target.stk_cd)
 
         return KRStockOrderCancelResponse(
             order_id=order_id,
-            stk_cd=result.stk_cd if hasattr(result, "stk_cd") else "000000",
+            stk_cd=target.stk_cd,
             status="cancelled",
-            cancelled_quantity=result.cancelled_quantity
-            if hasattr(result, "cancelled_quantity")
-            else 0,
+            cancelled_quantity=target.rmn_qty,
         )
 
     except HTTPException:

@@ -180,6 +180,9 @@ class OrderResponse(BaseModel):
     """주문 응답 (kt10000~kt10003)"""
 
     ord_no: str = Field(..., description="주문번호")
+    base_orig_ord_no: Optional[str] = Field(
+        default=None, description="모주문번호 (정정/취소 응답 — 주문 체인 추적용)"
+    )
     dmst_stex_tp: Optional[str] = Field(default=None, description="거래소구분")
     return_code: int = Field(..., description="응답코드")
     return_msg: str = Field(..., description="응답메시지")

@@ -480,10 +480,17 @@ class OrderAgent:
             logger.warning(f"[OrderAgent] Order {order_id} not found in pending")
             return False
 
+        order = self._pending_orders[order_id]
         if self.kiwoom:
             try:
                 await self.limiter.wait_for_slot()
-                await self.kiwoom.cancel_order(order_id)
+                # kt10003 계약: 원주문번호 + 종목코드 필수 (qty 생략=잔량 전부 취소).
+                # 주의: order_id는 내부 UUID라 브로커 주문번호와 다름 — 이 경로는
+                # 현재 호출자가 없으며, 브로커 취소가 필요해지면 실행 시점의
+                # 브로커 ord_no 추적이 선행돼야 한다.
+                await self.kiwoom.cancel_order(
+                    org_ord_no=order_id, stk_cd=order.ticker
+                )
             except Exception as e:
                 logger.error(f"[OrderAgent] Cancel failed: {e}")
                 return False

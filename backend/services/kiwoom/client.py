@@ -958,6 +958,7 @@ class KiwoomClient:
 
         return OrderResponse(
             ord_no=result.get("ord_no", ""),
+            base_orig_ord_no=result.get("base_orig_ord_no"),
             dmst_stex_tp=result.get("dmst_stex_tp"),
             return_code=int(result.get("return_code", 0)),
             return_msg=result.get("return_msg", ""),
@@ -1004,6 +1005,7 @@ class KiwoomClient:
 
         return OrderResponse(
             ord_no=result.get("ord_no", ""),
+            base_orig_ord_no=result.get("base_orig_ord_no"),
             dmst_stex_tp=result.get("dmst_stex_tp"),
             return_code=int(result.get("return_code", 0)),
             return_msg=result.get("return_msg", ""),
@@ -1015,30 +1017,30 @@ class KiwoomClient:
         stk_cd: str,
         qty: int,
         price: int,
-        order_type: OrderType = OrderType.LIMIT,
         exchange: Exchange = Exchange.KRX,
     ) -> OrderResponse:
         """
         주식 정정주문 (kt10002)
 
+        공식 계약 (주문.md:185-194; 감사 C1): 필드는 orig_ord_no/stk_cd/
+        mdfy_qty/mdfy_uv/dmst_stex_tp — trde_tp는 kt10002에 존재하지 않는다.
+
         Args:
             org_ord_no: 원주문번호
             stk_cd: 종목코드
             qty: 정정수량
-            price: 정정가격
-            order_type: 주문유형
+            price: 정정단가
             exchange: 거래소
 
         Returns:
             OrderResponse 객체
         """
         data = {
-            "org_ord_no": org_ord_no,
+            "orig_ord_no": org_ord_no,
             "dmst_stex_tp": exchange.value,
             "stk_cd": stk_cd,
-            "ord_qty": str(qty),
-            "ord_uv": str(price),
-            "trde_tp": order_type.value,
+            "mdfy_qty": str(qty),
+            "mdfy_uv": str(price),
         }
 
         result = await self._request(
@@ -1053,6 +1055,7 @@ class KiwoomClient:
 
         return OrderResponse(
             ord_no=result.get("ord_no", ""),
+            base_orig_ord_no=result.get("base_orig_ord_no"),
             dmst_stex_tp=result.get("dmst_stex_tp"),
             return_code=int(result.get("return_code", 0)),
             return_msg=result.get("return_msg", ""),
@@ -1062,26 +1065,29 @@ class KiwoomClient:
         self,
         org_ord_no: str,
         stk_cd: str,
-        qty: int,
+        qty: int = 0,
         exchange: Exchange = Exchange.KRX,
     ) -> OrderResponse:
         """
         주식 취소주문 (kt10003)
 
+        공식 계약 (주문.md:263-268; 감사 C2): 필드는 orig_ord_no/stk_cd/
+        cncl_qty/dmst_stex_tp. cncl_qty '0'은 잔량 전부 취소.
+
         Args:
             org_ord_no: 원주문번호
             stk_cd: 종목코드
-            qty: 취소수량
+            qty: 취소수량 (0=잔량 전부 취소, 기본값)
             exchange: 거래소
 
         Returns:
             OrderResponse 객체
         """
         data = {
-            "org_ord_no": org_ord_no,
+            "orig_ord_no": org_ord_no,
             "dmst_stex_tp": exchange.value,
             "stk_cd": stk_cd,
-            "ord_qty": str(qty),
+            "cncl_qty": str(qty),
         }
 
         result = await self._request(
@@ -1096,6 +1102,7 @@ class KiwoomClient:
 
         return OrderResponse(
             ord_no=result.get("ord_no", ""),
+            base_orig_ord_no=result.get("base_orig_ord_no"),
             dmst_stex_tp=result.get("dmst_stex_tp"),
             return_code=int(result.get("return_code", 0)),
             return_msg=result.get("return_msg", ""),
