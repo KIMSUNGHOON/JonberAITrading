@@ -22,6 +22,9 @@ def _client_with_fake_http(body):
     captured = {}
 
     class FakeResp:
+        status_code = 200
+        headers = {}
+
         def json(self):
             return body
 

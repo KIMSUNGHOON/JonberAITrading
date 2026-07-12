@@ -311,5 +311,5 @@ class TestKiwoomAuthExpireParsing:
             await auth._issue_token()
 
             assert auth._token is not None
-            # Token should be valid (fallback to 24 hours)
-            assert auth._token.expires_dt > datetime.now()
+            # Token should be valid (fallback to 24 hours); expires_dt is KST tz-aware
+            assert not auth._token.is_expired

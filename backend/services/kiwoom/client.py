@@ -20,7 +20,13 @@ import structlog
 
 from .auth import KiwoomAuth
 from .cache import KiwoomCache, make_cache_key
-from .errors import KiwoomError, KiwoomErrorCode, KiwoomNetworkError, KiwoomRateLimitError
+from .errors import (
+    KiwoomAuthError,
+    KiwoomError,
+    KiwoomErrorCode,
+    KiwoomNetworkError,
+    KiwoomRateLimitError,
+)
 from .rate_limiter import KiwoomRateLimiter, get_request_type
 from .models import (
     AccountBalance,
@@ -153,9 +159,10 @@ class KiwoomClient:
         data: Optional[dict] = None,
         cont_yn: str = "",
         next_key: str = "",
-    ) -> dict:
+        with_continuation: bool = False,
+    ):
         """
-        공통 API 요청 메서드 (429 에러 시 자동 재시도)
+        공통 API 요청 메서드 (레이트리밋 재시도 + 토큰만료 재발급-재시도 1회)
 
         Args:
             api_id: API ID (예: ka10001)
@@ -163,9 +170,11 @@ class KiwoomClient:
             data: Request body
             cont_yn: 연속조회여부 (Y/N)
             next_key: 연속조회키
+            with_continuation: True면 (result, {"cont_yn","next_key"}) 튜플 반환.
+                연속조회 값은 응답 HTTP **헤더**로 온다 (공식 계약).
 
         Returns:
-            API 응답 딕셔너리
+            API 응답 딕셔너리 (with_continuation=True면 (dict, dict) 튜플)
 
         Raises:
             KiwoomError: API 에러
@@ -173,13 +182,25 @@ class KiwoomClient:
             KiwoomRateLimitError: Rate limit 초과 (재시도 후에도 실패)
         """
         last_error: Optional[Exception] = None
+        auth_retried = False
 
-        for attempt in range(self.MAX_RETRY_ATTEMPTS):
+        attempt = 0
+        while attempt < self.MAX_RETRY_ATTEMPTS:
             try:
-                return await self._request_once(api_id, endpoint, data, cont_yn, next_key)
+                result, continuation = await self._request_once(
+                    api_id, endpoint, data, cont_yn, next_key
+                )
+                if with_continuation:
+                    return result, continuation
+                return result
             except KiwoomError as e:
-                # Check if it's a rate limit error (1700 code in message)
-                if "1700" in str(e) or "429" in str(e) or "허용된 요청 개수" in str(e):
+                if e.is_token_expired and not auth_retried:
+                    # 토큰 만료/무효 — 재발급 후 1회만 재시도 (시도 횟수 미소모)
+                    auth_retried = True
+                    logger.warning("kiwoom_token_expired_reissue", api_id=api_id, code=e.code)
+                    self.auth.invalidate_token()
+                    continue
+                if e.is_rate_limit:
                     last_error = e
                     # Exponential backoff: 1s, 2s, 4s
                     delay = self.RETRY_BASE_DELAY * (2 ** attempt)
@@ -191,8 +212,9 @@ class KiwoomClient:
                         delay=delay,
                     )
                     await asyncio.sleep(delay)
+                    attempt += 1
                 else:
-                    # Non-rate-limit error, don't retry
+                    # Non-retryable error
                     raise
 
         # All retries exhausted
@@ -201,9 +223,7 @@ class KiwoomClient:
             api_id=api_id,
             attempts=self.MAX_RETRY_ATTEMPTS,
         )
-        raise last_error or KiwoomRateLimitError(
-            message="Rate limit 재시도 횟수 초과",
-        )
+        raise last_error or KiwoomRateLimitError()
 
     async def _request_once(
         self,
@@ -212,7 +232,7 @@ class KiwoomClient:
         data: Optional[dict] = None,
         cont_yn: str = "",
         next_key: str = "",
-    ) -> dict:
+    ) -> tuple[dict, dict]:
         """
         단일 API 요청 메서드
 
@@ -224,16 +244,15 @@ class KiwoomClient:
             next_key: 연속조회키
 
         Returns:
-            API 응답 딕셔너리
+            (API 응답 딕셔너리, 연속조회 정보 {"cont_yn","next_key"}) —
+            연속조회 값은 응답 HTTP 헤더에서 읽는다 (공식 계약; body에는 없음)
         """
         # Rate Limiting (이용약관 제11조)
         if self._rate_limiter:
             request_type = get_request_type(api_id)
             acquired = await self._rate_limiter.acquire(request_type)
             if not acquired:
-                raise KiwoomRateLimitError(
-                    message="Rate limit 대기 시간 초과",
-                )
+                raise KiwoomRateLimitError()
 
         client = await self._get_client()
         token = await self.auth.get_token()
@@ -264,15 +283,32 @@ class KiwoomClient:
                 headers=headers,
             )
 
-            result = response.json()
+            # HTTP 401 — 토큰 무효 (body 없이 올 수 있음). _request가 재발급-재시도.
+            if response.status_code == 401:
+                raise KiwoomAuthError(
+                    code=KiwoomErrorCode.TOKEN_EXPIRED,
+                    message="HTTP 401 Unauthorized",
+                )
 
-            # 에러 체크
+            try:
+                result = response.json()
+            except ValueError:
+                # 비-JSON 응답 (게이트웨이 오류 페이지 등)
+                raise KiwoomError(
+                    code=KiwoomErrorCode.SYSTEM_ERROR,
+                    message=f"비-JSON 응답 (HTTP {response.status_code})",
+                    api_id=api_id,
+                )
+
+            # 에러 체크 (비숫자 코드는 판정 제외 — 참조 구현 normalize_return_code)
             return_code = result.get("return_code")
             if return_code is not None:
                 if isinstance(return_code, str):
-                    return_code = int(return_code) if return_code.lstrip("-").isdigit() else 0
+                    return_code = (
+                        int(return_code) if return_code.lstrip("-").isdigit() else None
+                    )
 
-                if return_code != 0:
+                if return_code is not None and return_code != 0:
                     logger.error(
                         "kiwoom_api_error",
                         api_id=api_id,
@@ -287,7 +323,12 @@ class KiwoomClient:
                 success=True,
             )
 
-            return result
+            resp_headers = response.headers or {}
+            continuation = {
+                "cont_yn": resp_headers.get("cont-yn", "N") or "N",
+                "next_key": resp_headers.get("next-key", "") or "",
+            }
+            return result, continuation
 
         except httpx.HTTPError as e:
             logger.error(
@@ -1105,12 +1146,13 @@ class KiwoomClient:
         next_key = ""
 
         while True:
-            response = await self._request(
+            response, continuation = await self._request(
                 api_id="ka10099",
                 endpoint="/api/dostk/stkinfo",
                 data={"mrkt_tp": market_type.value},
                 cont_yn=cont_yn if cont_yn == "Y" else "",
                 next_key=next_key if cont_yn == "Y" else "",
+                with_continuation=True,
             )
 
             # 응답 파싱
@@ -1144,9 +1186,9 @@ class KiwoomClient:
                         error=str(e),
                     )
 
-            # 연속 조회 확인
-            cont_yn = response.get("cont-yn", "N")
-            next_key = response.get("next-key", "")
+            # 연속 조회 확인 (응답 HTTP 헤더 기반 — 공식 계약)
+            cont_yn = continuation["cont_yn"]
+            next_key = continuation["next_key"]
 
             if cont_yn != "Y":
                 break

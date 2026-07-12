@@ -5,11 +5,14 @@ Data models for Kiwoom Securities REST API requests and responses.
 Based on KiwoomRESTAPI.xlsx specification.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+# 키움 서버 시간대 (토큰 expires_dt 비교 기준)
+KST = timezone(timedelta(hours=9))
 
 
 class OrderType(str, Enum):
@@ -52,8 +55,11 @@ class KiwoomToken(BaseModel):
 
     @property
     def is_expired(self) -> bool:
-        """토큰 만료 여부 확인"""
-        return datetime.now() >= self.expires_dt
+        """토큰 만료 여부 확인 (KST 기준; naive expires_dt는 KST로 간주)"""
+        expires = self.expires_dt
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=KST)
+        return datetime.now(KST) >= expires
 
     @property
     def authorization_header(self) -> str:

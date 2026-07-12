@@ -8,7 +8,7 @@ OAuth2 token management for Kiwoom Securities REST API.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -18,6 +18,9 @@ from .errors import KiwoomAuthError, KiwoomErrorCode, KiwoomNetworkError
 from .models import KiwoomToken
 
 logger = structlog.get_logger()
+
+# 키움 서버 시간대 — expires_dt는 KST 문자열로 온다
+KST = timezone(timedelta(hours=9))
 
 
 class KiwoomAuth:
@@ -107,9 +110,32 @@ class KiwoomAuth:
         if self._token is None:
             return True
 
-        # 만료 시간에서 여유 시간을 뺀 시점보다 현재가 늦으면 갱신
-        refresh_threshold = self._token.expires_dt - timedelta(seconds=self.TOKEN_REFRESH_MARGIN)
-        return datetime.now() >= refresh_threshold
+        # 만료 시간에서 여유 시간을 뺀 시점보다 현재가 늦으면 갱신 (KST 기준 비교;
+        # naive expires_dt는 KST로 간주)
+        expires = self._token.expires_dt
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=KST)
+        refresh_threshold = expires - timedelta(seconds=self.TOKEN_REFRESH_MARGIN)
+        return datetime.now(KST) >= refresh_threshold
+
+    def invalidate_token(self) -> None:
+        """로컬 토큰 무효화 — 다음 get_token()이 새 토큰을 발급받게 한다.
+
+        서버가 토큰 만료/무효(8005 등, HTTP 401)를 반환했을 때 클라이언트가
+        재발급-재시도하기 위해 호출한다. 서버측 폐기(revoke)는 하지 않는다.
+        """
+        self._token = None
+
+    @staticmethod
+    def _parse_expires_dt(expires_dt_str: Optional[str]) -> datetime:
+        """expires_dt 문자열을 KST tz-aware datetime으로 파싱 (실패 시 24h 후)."""
+        if expires_dt_str:
+            for fmt in ["%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"]:
+                try:
+                    return datetime.strptime(expires_dt_str, fmt).replace(tzinfo=KST)
+                except ValueError:
+                    continue
+        return datetime.now(KST) + timedelta(hours=24)
 
     async def _issue_token(self, max_retries: int = 3, base_delay: float = 1.0):
         """
@@ -210,23 +236,8 @@ class KiwoomAuth:
                         message="응답에 토큰이 없습니다",
                     )
 
-                # 만료 시간 파싱 (YYYYMMDDHHMMSS 또는 ISO 형식)
-                try:
-                    if expires_dt_str:
-                        # 다양한 형식 시도
-                        for fmt in ["%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"]:
-                            try:
-                                expires_dt = datetime.strptime(expires_dt_str, fmt)
-                                break
-                            except ValueError:
-                                continue
-                        else:
-                            # 파싱 실패 시 기본 24시간
-                            expires_dt = datetime.now() + timedelta(hours=24)
-                    else:
-                        expires_dt = datetime.now() + timedelta(hours=24)
-                except Exception:
-                    expires_dt = datetime.now() + timedelta(hours=24)
+                # 만료 시간 파싱 — 서버가 KST 문자열로 주므로 KST tz-aware로
+                expires_dt = self._parse_expires_dt(expires_dt_str)
 
                 self._token = KiwoomToken(
                     token=token,
@@ -270,13 +281,16 @@ class KiwoomAuth:
         try:
             logger.info("kiwoom_auth_revoking_token")
 
+            # 공식 계약: revoke body는 appkey/secretkey/token 3필드 (참조 구현
+            # kiwoom/core/auth.py:180-189; authorization 헤더 아님)
             response = await client.post(
                 f"{self.base_url}/oauth2/revoke",
-                json={"token": self._token.token},
-                headers={
-                    "api-id": "au10002",
-                    "authorization": self._token.authorization_header,
+                json={
+                    "appkey": self.app_key,
+                    "secretkey": self.secret_key,
+                    "token": self._token.token,
                 },
+                headers={"api-id": "au10002"},
             )
 
             data = response.json()
