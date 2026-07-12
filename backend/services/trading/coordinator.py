@@ -41,6 +41,21 @@ from .strategy_engine import StrategyEngine
 logger = logging.getLogger(__name__)
 
 
+# Actions that grow exposure map to a BUY order; everything else reduces it and
+# maps to SELL. An ADD mis-mapped to SELL reverses an autonomous add-to-position
+# into a liquidation — audit finding A1 (2026-07-12). Mirrors the gate's
+# POSITION_INCREASING_ACTIONS so side and cap logic stay in agreement.
+_BUY_SIDE_ACTIONS = {"BUY", "ADD"}
+
+
+def _order_side_for_action(action: str) -> OrderSide:
+    """Resolve the order side for a trade action.
+
+    BUY/ADD increase exposure → BUY side. SELL/REDUCE decrease it → SELL side.
+    """
+    return OrderSide.BUY if action in _BUY_SIDE_ACTIONS else OrderSide.SELL
+
+
 class ExecutionCoordinator:
     """
     Central coordinator for the auto-trading system.
@@ -308,12 +323,13 @@ class ExecutionCoordinator:
                 risk_score=risk_score,
                 reason=queue_reason,
                 autonomous=autonomous,
+                quantity=quantity_override,
             )
 
             return AllocationPlan(
                 ticker=ticker,
                 stock_name=stock_name,
-                side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
+                side=_order_side_for_action(action),
                 quantity=0,
                 entry_price=entry_price,
                 estimated_amount=0,
@@ -333,7 +349,7 @@ class ExecutionCoordinator:
             return AllocationPlan(
                 ticker=ticker,
                 stock_name=stock_name,
-                side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
+                side=_order_side_for_action(action),
                 quantity=0,
                 entry_price=entry_price,
                 estimated_amount=0,
@@ -345,7 +361,7 @@ class ExecutionCoordinator:
         await self._refresh_account_info()
 
         # Calculate allocation
-        side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
+        side = _order_side_for_action(action)
         allocation = self.portfolio_agent.calculate_allocation(
             account=self._state.account,
             ticker=ticker,
@@ -975,14 +991,22 @@ class ExecutionCoordinator:
         risk_score: int,
         reason: str,
         autonomous: bool = False,
+        quantity: Optional[int] = None,
     ) -> QueuedTrade:
-        """Add a trade to the queue for later execution."""
+        """Add a trade to the queue for later execution.
+
+        quantity carries the size decided at queueing time. It MUST be preserved
+        for autonomous trades: the execution-time re-gate's notional cap denies
+        a BUY/ADD of unknown size (fail-closed), so dropping it would cancel
+        every queued autonomous buy — audit finding A5 (2026-07-12).
+        """
         queued_trade = QueuedTrade(
             session_id=session_id,
             ticker=ticker,
             stock_name=stock_name,
             action=action,
             entry_price=entry_price,
+            quantity=quantity,
             stop_loss=stop_loss,
             take_profit=take_profit,
             risk_score=risk_score,

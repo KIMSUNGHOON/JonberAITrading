@@ -133,6 +133,11 @@ class MonitoredPosition(BaseModel):
     events_triggered: List[str] = Field(default_factory=list)
     discussion_count: int = 0
 
+    # Set once when an autonomous defensive close is blocked by the gate, so the
+    # human is notified once per denied episode instead of every monitor cycle
+    # (the *_HIT events are not de-duped). Reset when the gate next allows.
+    close_gate_denied_notified: bool = False
+
     @property
     def unrealized_pnl(self) -> float:
         return (self.current_price - self.avg_price) * self.quantity
@@ -764,8 +769,45 @@ class PositionManager:
         position: MonitoredPosition,
         reason: str,
     ) -> None:
-        """Execute position close via trading coordinator."""
+        """Execute an autonomous defensive close via the trading coordinator.
+
+        Stop-loss / take-profit / agent-decision SELLs are autonomous actions, so
+        they MUST pass the shared autonomy gate — the same one the offensive BUY
+        path enforces (master env → mode → paper-only → daily-loss breaker).
+        Before this fix the close went straight to the broker, bypassing the gate
+        entirely (audit A2, 2026-07-12). A denied close leaves the position
+        monitored so a human can act on it.
+        """
         try:
+            from services.autonomy import check_autonomy
+
+            gate = await check_autonomy(
+                "kiwoom",
+                action="SELL",
+                quantity=position.quantity,
+                entry_price=position.current_price,
+            )
+            if not gate.allowed:
+                logger.warning(
+                    "defensive_close_gate_denied",
+                    ticker=position.ticker,
+                    reason=reason,
+                    check=gate.check,
+                    gate_reason=gate.reason,
+                )
+                # Notify once per denied episode, not on every monitor cycle —
+                # the *_HIT events re-fire each cycle and the denied position
+                # stays monitored, so an un-throttled notice would flood the
+                # channel (matches the gate's once-per-day breaker throttle).
+                if not position.close_gate_denied_notified:
+                    position.close_gate_denied_notified = True
+                    await self._notify_close_gate_denied(position, reason, gate.reason)
+                return
+
+            # Gate allowed: clear the denied-notice latch so a future denial for
+            # this position notifies again.
+            position.close_gate_denied_notified = False
+
             from app.dependencies import get_trading_coordinator
             trading_coord = await get_trading_coordinator()
 
@@ -783,6 +825,28 @@ class PositionManager:
         except Exception as e:
             logger.error(
                 "close_position_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_close_gate_denied(
+        self, position: MonitoredPosition, reason: str, gate_reason: str
+    ) -> None:
+        """Best-effort Telegram notice when the autonomy gate blocks a defensive
+        close — the human must know a stop-loss/take-profit did NOT execute and
+        the position is still open."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚫 자율 청산 게이트 거부 ({position.ticker}, {reason}): {gate_reason}. "
+                    f"포지션은 유지되며 수동 조치가 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "close_gate_denied_notify_failed",
                 ticker=position.ticker,
                 error=str(e),
             )
