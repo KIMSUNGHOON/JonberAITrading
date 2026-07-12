@@ -346,6 +346,18 @@ class KiwoomClient:
     # ============================================================
 
     @staticmethod
+    def _strip_stock_prefix(code: str) -> str:
+        """계좌 응답 종목코드의 시장 접두사 제거 (예: "A005930" -> "005930").
+
+        kt00004/ka10075/ka10076 응답의 stk_cd는 접두사가 붙어 온다
+        (계좌.md:2128 응답 예제) — 시세/주문 TR의 6자리 코드와 대조하려면
+        스트립이 필요하다.
+        """
+        if code and len(code) > 6 and code[0].isalpha():
+            return code[1:]
+        return code or ""
+
+    @staticmethod
     def _parse_signed_price(value: str | int | None) -> int:
         """
         부호가 포함된 가격 문자열 파싱
@@ -647,14 +659,15 @@ class KiwoomClient:
             data={"qry_tp": qry_tp},
         )
 
-        # API 응답 필드명 매핑 (문서와 실제 응답이 다름)
-        # entr: 예수금, ord_alow_amt: 주문가능금액, pymn_alow_amt: 출금가능금액
+        # 공식 계약 키 (계좌.md kt00001): entr=예수금, ord_alow_amt=주문가능금액,
+        # pymn_alow_amt=출금가능금액, d1_entra/d2_entra=D+1/D+2 추정예수금
+        # (d1_pymn_alow_amt는 '출금'가능금액 — 감사 MINOR: 라벨과 값이 어긋났었음)
         cash_balance = CashBalance(
-            dnca_tot_amt=self._parse_signed_price(result.get("entr", result.get("dnca_tot_amt", 0))),
-            ord_psbl_amt=self._parse_signed_price(result.get("ord_alow_amt", result.get("ord_psbl_amt", 0))),
-            sttl_psbk_amt=self._parse_signed_price(result.get("pymn_alow_amt", result.get("sttl_psbk_amt", 0))),
-            d1_ord_psbl_amt=self._parse_signed_price(result.get("d1_pymn_alow_amt", result.get("d1_ord_psbl_amt", 0))),
-            d2_ord_psbl_amt=self._parse_signed_price(result.get("d2_pymn_alow_amt", result.get("d2_ord_psbl_amt", 0))),
+            dnca_tot_amt=self._parse_signed_price(result.get("entr")),
+            ord_psbl_amt=self._parse_signed_price(result.get("ord_alow_amt")),
+            sttl_psbk_amt=self._parse_signed_price(result.get("pymn_alow_amt")),
+            d1_ord_psbl_amt=self._parse_signed_price(result.get("d1_entra")),
+            d2_ord_psbl_amt=self._parse_signed_price(result.get("d2_entra")),
         )
 
         # 캐시 저장
@@ -694,35 +707,39 @@ class KiwoomClient:
             },
         )
 
-        # API 응답 필드명 매핑 (문서와 실제 응답이 다름)
-        # entr: 예수금, tot_pur_amt: 총매입금액, aset_evlt_amt: 자산평가금액
-        # lspft_amt: 손익금액, lspft_rt: 손익률, d2_entra: D+2예수금
-
-        # 보유 종목 파싱 (stk_acnt_evlt_prst 배열)
-        holdings_data = result.get("stk_acnt_evlt_prst", result.get("output2", []))
+        # 응답 파싱 — 공식 계약 키 (계좌.md kt00004 응답 사양; 감사 C4/C5/M1)
+        # 보유종목 리스트: stk_acnt_evlt_prst, 아이템 키 rmnd_qty/avg_prc/pl_amt/pl_rt
+        holdings_data = result.get("stk_acnt_evlt_prst", [])
         if not isinstance(holdings_data, list):
             holdings_data = []
 
         holdings = [
             Holding(
-                stk_cd=h.get("stk_cd", ""),
+                stk_cd=self._strip_stock_prefix(h.get("stk_cd", "")),
                 stk_nm=h.get("stk_nm", ""),
-                hldg_qty=int(h.get("hldg_qty", h.get("hold_qty", 0))),
-                avg_buy_prc=self._parse_signed_price(h.get("avg_buy_prc", h.get("pchs_avg_pric", h.get("avg_unpr", 0)))),
-                cur_prc=self._parse_signed_price(h.get("cur_prc", h.get("prpr", h.get("now_pric", 0)))),
-                evlu_amt=self._parse_signed_price(h.get("evlu_amt", h.get("evlt_amt", 0))),
-                evlu_pfls_amt=self._parse_signed_price(h.get("evlu_pfls_amt", h.get("evlt_lspft_amt", 0))),
-                evlu_pfls_rt=self._parse_float(h.get("evlu_pfls_rt", h.get("evlt_lspft_rt", 0))),
+                hldg_qty=int(h.get("rmnd_qty") or 0),
+                avg_buy_prc=self._parse_signed_price(h.get("avg_prc")),
+                cur_prc=self._parse_signed_price(h.get("cur_prc")),
+                evlu_amt=self._parse_signed_price(h.get("evlt_amt")),
+                # 손익은 부호 보존 (음수 손실이 abs로 뒤집히면 안 됨)
+                evlu_pfls_amt=self._parse_change(h.get("pl_amt")),
+                evlu_pfls_rt=self._parse_float(h.get("pl_rt")),
             )
             for h in holdings_data
         ]
 
+        # 합계: tot_est_amt=유가잔고평가액(주식만; aset_evlt_amt는 예수금 포함이라
+        # total_value에서 현금 이중 계상됨). kt00004에 평가손익 합계 필드는 없어
+        # 정의대로 계산한다 (lspft_amt는 '누적투자원금' — 손익이 아님).
+        pchs_amt = self._parse_signed_price(result.get("tot_pur_amt"))
+        evlu_amt = self._parse_signed_price(result.get("tot_est_amt"))
+        evlu_pfls_amt = evlu_amt - pchs_amt
         account_balance = AccountBalance(
-            pchs_amt=self._parse_signed_price(result.get("tot_pur_amt", result.get("pchs_amt", 0))),
-            evlu_amt=self._parse_signed_price(result.get("aset_evlt_amt", result.get("tot_est_amt", result.get("evlu_amt", 0)))),
-            evlu_pfls_amt=self._parse_signed_price(result.get("lspft_amt", result.get("evlu_pfls_amt", 0))),
-            evlu_pfls_rt=self._parse_float(result.get("lspft_rt", result.get("lspft_ratio", result.get("evlu_pfls_rt", 0)))),
-            d2_ord_psbl_amt=self._parse_signed_price(result.get("d2_entra", result.get("d2_ord_psbl_amt", 0))),
+            pchs_amt=pchs_amt,
+            evlu_amt=evlu_amt,
+            evlu_pfls_amt=evlu_pfls_amt,
+            evlu_pfls_rt=(evlu_pfls_amt / pchs_amt * 100.0) if pchs_amt else 0.0,
+            d2_ord_psbl_amt=self._parse_signed_price(result.get("d2_entra")),
             holdings=holdings,
         )
 
@@ -734,54 +751,66 @@ class KiwoomClient:
 
     async def get_pending_orders(
         self,
-        all_stk_tp: str = "1",
         trde_tp: str = "0",
-        stex_tp: str = "KRX",
+        stex_tp: str = "0",
+        stk_cd: Optional[str] = None,
     ) -> list[PendingOrder]:
         """
         미체결요청 (ka10075)
 
+        공식 계약 (계좌.md:441-447; 감사 C6):
+        - all_stk_tp: 0=전체, 1=종목 — stk_cd 지정 여부로 자동 결정
+        - trde_tp: 0=전체, 1=매도, 2=매수
+        - stex_tp: 0=통합, 1=KRX, 2=NXT (1자리 코드)
+
         Args:
-            all_stk_tp: 전종목여부 - "0":특정종목, "1":전종목
-            trde_tp: 거래구분 - "0":전체, "1":매수, "2":매도
-            stex_tp: 거래소구분 - "KRX":한국거래소, "NXT":코넥스
+            trde_tp: 매매구분 - "0":전체, "1":매도, "2":매수
+            stex_tp: 거래소구분 - "0":통합, "1":KRX, "2":NXT
+            stk_cd: 지정 시 해당 종목만 조회
 
         Returns:
             PendingOrder 리스트
         """
         # 캐시 조회
-        cache_key = make_cache_key("pending_orders", all_stk_tp, trde_tp, stex_tp)
+        cache_key = make_cache_key("pending_orders", trde_tp, stex_tp, stk_cd or "")
         if self._cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
 
+        data = {
+            "all_stk_tp": "1" if stk_cd else "0",
+            "trde_tp": trde_tp,
+            "stex_tp": stex_tp,
+        }
+        if stk_cd:
+            data["stk_cd"] = stk_cd
+
         result = await self._request(
             api_id="ka10075",
             endpoint="/api/dostk/acnt",
-            data={
-                "all_stk_tp": all_stk_tp,
-                "trde_tp": trde_tp,
-                "stex_tp": stex_tp,
-            },
+            data=data,
         )
 
-        output = result.get("output", [])
+        # 응답 리스트 키는 oso (계좌.md:463); 아이템 키 ord_pric/cntr_qty/oso_qty/tm
+        output = result.get("oso", [])
         if not isinstance(output, list):
             output = [output] if output else []
 
         pending_orders = [
             PendingOrder(
                 ord_no=item.get("ord_no", ""),
-                stk_cd=item.get("stk_cd", ""),
+                stk_cd=self._strip_stock_prefix(item.get("stk_cd", "")),
                 stk_nm=item.get("stk_nm", ""),
-                ord_qty=int(item.get("ord_qty", 0)),
-                ord_uv=int(item.get("ord_uv", 0)),
-                ccld_qty=int(item.get("ccld_qty", 0)),
-                rmn_qty=int(item.get("rmn_qty", 0)),
-                ord_dt=item.get("ord_dt", ""),
-                ord_tm=item.get("ord_tm", ""),
-                buy_sell_tp=item.get("buy_sell_tp", ""),
+                ord_qty=int(item.get("ord_qty") or 0),
+                ord_uv=self._parse_signed_price(item.get("ord_pric")),
+                ccld_qty=int(item.get("cntr_qty") or 0),
+                rmn_qty=int(item.get("oso_qty") or 0),
+                ord_dt="",  # ka10075 응답에 주문일자 필드 없음
+                ord_tm=item.get("tm", ""),
+                buy_sell_tp=self._normalize_buy_sell(
+                    item.get("trde_tp"), item.get("io_tp_nm")
+                ),
             )
             for item in output
         ]
@@ -792,44 +821,91 @@ class KiwoomClient:
 
         return pending_orders
 
-    async def get_filled_orders(self) -> list[FilledOrder]:
+    @staticmethod
+    def _normalize_buy_sell(trde_tp: Optional[str], io_tp_nm: Optional[str]) -> str:
+        """매수/매도를 소비자 계약("1"=매수, "2"=매도)으로 정규화.
+
+        ka10075/ka10076의 trde_tp는 1=매도, 2=매수로 소비자 계약과 **반대**다
+        (계좌.md:445; 감사 C6의 반전 발견). io_tp_nm 텍스트("+매수"/"-매도")를
+        우선 신뢰하고, 없으면 trde_tp 코드를 뒤집어 매핑한다.
+        """
+        name = io_tp_nm or ""
+        if "매수" in name:
+            return "1"
+        if "매도" in name:
+            return "2"
+        if trde_tp == "2":
+            return "1"  # 스펙 2=매수
+        if trde_tp == "1":
+            return "2"  # 스펙 1=매도
+        return ""
+
+    async def get_filled_orders(
+        self,
+        sell_tp: str = "0",
+        stex_tp: str = "0",
+        stk_cd: Optional[str] = None,
+    ) -> list[FilledOrder]:
         """
         체결요청 (ka10076)
+
+        공식 계약 (계좌.md:626-631; 감사 C7): qry_tp/sell_tp/stex_tp는 필수 —
+        누락 시 서버가 요청을 거부한다 (모의서버 실증: "필수입력 파라미터=qry_tp").
+
+        Args:
+            sell_tp: 매도수구분 - "0":전체, "1":매도, "2":매수
+            stex_tp: 거래소구분 - "0":통합, "1":KRX, "2":NXT
+            stk_cd: 지정 시 해당 종목만 조회
 
         Returns:
             FilledOrder 리스트
         """
         # 캐시 조회
-        cache_key = make_cache_key("filled_orders")
+        cache_key = make_cache_key("filled_orders", sell_tp, stex_tp, stk_cd or "")
         if self._cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached
 
+        data = {
+            "qry_tp": "1" if stk_cd else "0",
+            "sell_tp": sell_tp,
+            "stex_tp": stex_tp,
+        }
+        if stk_cd:
+            data["stk_cd"] = stk_cd
+
         result = await self._request(
             api_id="ka10076",
             endpoint="/api/dostk/acnt",
-            data={},
+            data=data,
         )
 
-        output = result.get("output", [])
+        # 응답 리스트 키는 cntr (계좌.md:647); 체결금액/체결일자 필드는 응답에
+        # 없으므로 금액은 체결량×체결가로 계산하고 일자는 빈 값으로 둔다.
+        output = result.get("cntr", [])
         if not isinstance(output, list):
             output = [output] if output else []
 
-        filled_orders = [
-            FilledOrder(
-                ord_no=item.get("ord_no", ""),
-                stk_cd=item.get("stk_cd", ""),
-                stk_nm=item.get("stk_nm", ""),
-                ccld_qty=int(item.get("ccld_qty", 0)),
-                ccld_uv=int(item.get("ccld_uv", 0)),
-                ccld_amt=int(item.get("ccld_amt", 0)),
-                ccld_dt=item.get("ccld_dt", ""),
-                ccld_tm=item.get("ccld_tm", ""),
-                buy_sell_tp=item.get("buy_sell_tp", ""),
+        filled_orders = []
+        for item in output:
+            ccld_qty = int(item.get("cntr_qty") or 0)
+            ccld_uv = self._parse_signed_price(item.get("cntr_pric"))
+            filled_orders.append(
+                FilledOrder(
+                    ord_no=item.get("ord_no", ""),
+                    stk_cd=self._strip_stock_prefix(item.get("stk_cd", "")),
+                    stk_nm=item.get("stk_nm", ""),
+                    ccld_qty=ccld_qty,
+                    ccld_uv=ccld_uv,
+                    ccld_amt=ccld_qty * ccld_uv,
+                    ccld_dt="",  # ka10076 응답에 체결일자 필드 없음
+                    ccld_tm=item.get("ord_tm", ""),
+                    buy_sell_tp=self._normalize_buy_sell(
+                        item.get("trde_tp"), item.get("io_tp_nm")
+                    ),
+                )
             )
-            for item in output
-        ]
 
         # 캐시 저장
         if self._cache:
