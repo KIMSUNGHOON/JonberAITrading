@@ -117,11 +117,27 @@ async def _default_paper_provider(market: str) -> bool:
 async def _default_daily_loss_provider(market: str) -> float:
     """Today's realized loss as % of account value (≥0; 0 = no loss).
 
-    No market currently records realized P&L in storage (coin_trades has no
-    pnl column; KR trades aren't stored), so there is no data source to sum —
-    return 0. The breaker is fully enforced through this seam the moment a
-    realized-P&L source exists; unit tests exercise it via injected providers.
+    kiwoom: 브로커의 당일 실현손익(ka10074)을 계좌 평가액(주식 평가 + D+2
+    예수금) 대비 %로 환산한다 (Phase B2). 조회 실패·평가액 0은 예외로
+    전파한다 — 게이트의 breaker 랩이 deny 처리하므로 fail-closed.
+
+    coin: 실현 P&L 소스가 아직 없어(coin_trades에 pnl 컬럼 없음) 0 반환 —
+    브레이커 비활성. coin 운용을 시작할 때 배선한다.
     """
+    if market == "kiwoom":
+        import app.core.kiwoom_singleton as kiwoom_singleton
+
+        client = await kiwoom_singleton.get_shared_kiwoom_client_async()
+        pnl = await client.get_realized_pnl()  # 당일 (KST)
+        if pnl.realized_pnl >= 0:
+            return 0.0
+        balance = await client.get_account_balance()
+        account_value = balance.evlu_amt + balance.d2_ord_psbl_amt
+        if account_value <= 0:
+            raise ValueError(
+                "계좌 평가액이 0이라 당일 손실률을 계산할 수 없습니다 (fail-closed)"
+            )
+        return abs(pnl.realized_pnl) / account_value * 100.0
     return 0.0
 
 

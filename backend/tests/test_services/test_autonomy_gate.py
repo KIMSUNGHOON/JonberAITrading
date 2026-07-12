@@ -215,3 +215,85 @@ async def test_provider_exception_is_fail_closed(master_on):
     assert not decision.allowed
     assert decision.check == "max_positions"
     assert "broker unreachable" in decision.reason
+
+
+class TestDefaultDailyLossProvider:
+    """Phase B2: kiwoom 기본 daily-loss 프로바이더가 ka10074 실현손익에 배선됨.
+
+    조회 실패는 예외 전파 → 게이트 체인의 기존 fail-closed 랩이 deny 처리.
+    coin은 실현 P&L 소스 부재로 0(비활성) 유지 — 사유 문서화.
+    """
+
+    def _mock_client(self, monkeypatch, realized_pnl, evlu_amt=0, d2=0, pnl_exc=None):
+        from unittest.mock import AsyncMock
+
+        from services.kiwoom.models import AccountBalance, RealizedPnl
+
+        client = AsyncMock()
+        if pnl_exc is not None:
+            client.get_realized_pnl.side_effect = pnl_exc
+        else:
+            client.get_realized_pnl.return_value = RealizedPnl(
+                strt_dt="20260712", end_dt="20260712", realized_pnl=realized_pnl
+            )
+        client.get_account_balance.return_value = AccountBalance(
+            evlu_amt=evlu_amt, d2_ord_psbl_amt=d2
+        )
+
+        async def fake_get_client():
+            return client
+
+        import app.core.kiwoom_singleton as singleton
+
+        monkeypatch.setattr(
+            singleton, "get_shared_kiwoom_client_async", fake_get_client
+        )
+        return client
+
+    @pytest.mark.asyncio
+    async def test_kiwoom_loss_pct_from_realized_pnl(self, monkeypatch):
+        # 당일 실현손실 -100,000 / 자산 (주식 3,000,000 + 예수금 2,000,000) = 2%
+        self._mock_client(monkeypatch, realized_pnl=-100_000,
+                          evlu_amt=3_000_000, d2=2_000_000)
+        pct = await gate_module._default_daily_loss_provider("kiwoom")
+        assert pct == pytest.approx(2.0)
+
+    @pytest.mark.asyncio
+    async def test_kiwoom_profit_or_flat_is_zero_loss(self, monkeypatch):
+        client = self._mock_client(monkeypatch, realized_pnl=50_000)
+        pct = await gate_module._default_daily_loss_provider("kiwoom")
+        assert pct == 0.0
+        client.get_account_balance.assert_not_called()  # 손실 없으면 계좌 조회 불필요
+
+    @pytest.mark.asyncio
+    async def test_kiwoom_lookup_failure_propagates_for_fail_closed(self, monkeypatch):
+        self._mock_client(monkeypatch, realized_pnl=0,
+                          pnl_exc=RuntimeError("mockapi down"))
+        with pytest.raises(RuntimeError):
+            await gate_module._default_daily_loss_provider("kiwoom")
+
+    @pytest.mark.asyncio
+    async def test_kiwoom_zero_account_value_raises(self, monkeypatch):
+        # 손실은 있는데 자산 평가가 0 — 손실률 계산 불가는 통과가 아니라 예외
+        self._mock_client(monkeypatch, realized_pnl=-100_000, evlu_amt=0, d2=0)
+        with pytest.raises(ValueError):
+            await gate_module._default_daily_loss_provider("kiwoom")
+
+    @pytest.mark.asyncio
+    async def test_coin_stays_zero(self):
+        assert await gate_module._default_daily_loss_provider("coin") == 0.0
+
+    @pytest.mark.asyncio
+    async def test_gate_denies_when_default_provider_lookup_fails(
+        self, master_on, monkeypatch
+    ):
+        # 통합: 기본 프로바이더 조회 실패 → 게이트 deny (fail-closed)
+        self._mock_client(monkeypatch, realized_pnl=0,
+                          pnl_exc=RuntimeError("mockapi down"))
+        providers = _providers()
+        providers.pop("daily_loss_provider")  # 기본 프로바이더 사용
+        decision = await check_autonomy(
+            "kiwoom", action="HOLD", quantity=None, entry_price=None, **providers
+        )
+        assert decision.allowed is False
+        assert decision.check == "daily_loss_breaker"
