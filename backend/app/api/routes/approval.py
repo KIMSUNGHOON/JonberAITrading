@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from agents.graph.coin_trading_graph import get_coin_trading_graph
 from agents.graph.kr_stock_graph import get_kr_stock_trading_graph
+from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from app.api.routes.coin import get_coin_sessions
 from app.api.routes.kr_stocks import get_kr_stock_sessions
 from app.api.schemas.approval import (
@@ -237,9 +238,23 @@ async def submit_decision(
                     # Don't fail the approval, just log the error
 
         elif decision == "rejected":
-            # Re-analysis requested - session continues running
-            session["status"] = "running"
-            execution_status = "re_analyzing"
+            # Re-analysis requested. The resume above ran the graph back to
+            # either the approval interrupt (new proposal awaiting) or the end.
+            new_proposal_awaiting = bool(
+                state.get("awaiting_approval") and not state.get("approval_status")
+            )
+            if new_proposal_awaiting:
+                # 재분석이 새 제안으로 다시 인터럽트에 도달 — status를 producer
+                # 경로와 동일하게 정합시키고 injector를 재암한다 (B3; 기존
+                # 제안 ID 피닝이 이중 승인을 방지). 게이트 deny/hitl이면
+                # maybe_schedule_auto_approve가 아무것도 쓰지 않는다(plain HITL).
+                session["status"] = "awaiting_approval"
+                execution_status = "awaiting_approval"
+                market = "kiwoom" if session_id in kr_stock_sessions else "coin"
+                await maybe_schedule_auto_approve(session_id, market, session)
+            else:
+                session["status"] = "running"
+                execution_status = "re_analyzing"
         elif decision == "cancelled":
             # User cancelled the workflow
             session["status"] = "cancelled"
