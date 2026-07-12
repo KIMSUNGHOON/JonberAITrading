@@ -9,6 +9,7 @@ import { Clock, X, RefreshCw, AlertCircle } from 'lucide-react';
 import { getCoinOrders, cancelCoinOrder } from '@/api/client';
 import { pnlColor } from '@/utils/pnl';
 import type { CoinOrder } from '@/types';
+import { friendlyCoinError } from '@/utils/errors';
 
 interface CoinOpenOrdersProps {
   market?: string;
@@ -32,7 +33,7 @@ export function CoinOpenOrders({ market, onOrderCancel }: CoinOpenOrdersProps) {
       });
       setOrders(response.orders);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load orders');
+      setError(friendlyCoinError(err instanceof Error ? err.message : 'Failed to load orders'));
     } finally {
       setIsLoading(false);
     }

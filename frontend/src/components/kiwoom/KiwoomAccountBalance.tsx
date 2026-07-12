@@ -159,7 +159,7 @@ export function KiwoomAccountBalance() {
           </div>
           <div>
             <h3 className="font-semibold">계좌 정보</h3>
-            <p className="text-xs text-dim">한국투자증권</p>
+            <p className="text-xs text-dim">키움증권</p>
           </div>
         </div>
         <button

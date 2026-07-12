@@ -6,7 +6,7 @@
 import { useEffect, useState } from 'react';
 import { Outlet } from 'react-router-dom';
 import {
-  LayoutDashboard, Activity, BarChart3, Wallet, ShoppingBasket, Receipt,
+  LayoutDashboard, Activity, Wallet, ShoppingBasket, Receipt,
   Bot, Scan, MessageSquare, Settings, Bell,
 } from 'lucide-react';
 import { useStore } from '@/store';
@@ -22,7 +22,6 @@ import { OrderTicketRail } from './OrderTicketRail';
 const NAV_ICONS: Partial<Record<ViewKey, React.ReactNode>> = {
   dashboard: <LayoutDashboard size={17} />,
   analysis: <Activity size={17} />,
-  charts: <BarChart3 size={17} />,
   positions: <Wallet size={17} />,
   basket: <ShoppingBasket size={17} />,
   'agent-chat': <MessageSquare size={17} />,

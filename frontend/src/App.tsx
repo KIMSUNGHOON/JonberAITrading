@@ -19,7 +19,6 @@ import { getUpbitApiStatus, getKiwoomApiStatus, getTradingMode } from '@/api/cli
 import { SessionBridge } from '@/routes/SessionBridge';
 import { BasketPage } from '@/pages/BasketPage';
 import { PositionsPage } from '@/pages/PositionsPage';
-import { ChartsPage } from '@/pages/ChartsPage';
 import { TradesPage } from '@/pages/TradesPage';
 import { AnalysisPage } from '@/pages/AnalysisPage';
 import { WorkflowPage } from '@/pages/WorkflowPage';
@@ -96,7 +95,6 @@ function App() {
           <Route path="analysis/:sessionId" element={<SessionBridge><AnalysisDetailPage /></SessionBridge>} />
           <Route path="workflow/:sessionId" element={<SessionBridge><WorkflowPage /></SessionBridge>} />
           <Route path="positions" element={<PositionsPage />} />
-          <Route path="charts" element={<ChartsPage />} />
           <Route path="watchlist" element={<BasketPage />} />
           <Route path="scanner" element={<ScannerResultsPage />} />
           <Route path="agent-chat" element={<div className="p-3 md:p-4"><AgentChatDashboard /></div>} />

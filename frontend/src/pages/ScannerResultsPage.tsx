@@ -359,7 +359,11 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
                     </td>
                   </tr>
                 ) : (
-                  filteredResults.map((result) => (
+                  filteredResults.map((result) => {
+                    // 감사 발견: 분석 실패(인증 오류 등) 행이 "HOLD 50%"처럼
+                    // 표시돼 실패가 분석 결과로 위장됨 — 실패는 실패로 표기.
+                    const isFailed = (result.summary || '').startsWith('분석 실패');
+                    return (
                     <tr
                       key={`${result.stk_cd}-${result.scanned_at}`}
                       className="hover:bg-elevated/40 transition-colors"
@@ -376,6 +380,11 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
                         </span>
                       </td>
                       <td className="px-4 py-3 text-center">
+                        {isFailed ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-1 rounded border border-down/40 bg-elevated text-xs font-medium text-down">
+                            실패
+                          </span>
+                        ) : (
                         <span
                           className={`inline-flex items-center gap-1 px-2 py-1 rounded border border-hairline bg-elevated text-xs font-medium ${
                             ACTION_TEXT_COLOR[result.action] ?? 'text-muted'
@@ -384,6 +393,7 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
                           {ACTION_ICONS[result.action]}
                           {result.action}
                         </span>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-right font-mono tabular-nums text-ink">
                         {result.current_price > 0
@@ -391,6 +401,9 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
                           : '-'}
                       </td>
                       <td className="px-4 py-3 text-center">
+                        {isFailed ? (
+                          <span className="text-xs text-dim">—</span>
+                        ) : (
                         <div className="flex items-center justify-center">
                           <div className="w-16 h-2 bg-elevated rounded-full overflow-hidden">
                             <div
@@ -408,6 +421,7 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
                             {(result.confidence * 100).toFixed(0)}%
                           </span>
                         </div>
+                        )}
                       </td>
                       <td className="px-4 py-3">
                         <div className="max-w-xs truncate text-sm text-ink" title={result.summary}>
@@ -427,7 +441,8 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
                         </button>
                       </td>
                     </tr>
-                  ))
+                    );
+                  })
                 )}
               </tbody>
             </table>

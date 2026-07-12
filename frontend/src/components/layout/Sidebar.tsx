@@ -7,7 +7,6 @@
 
 import { useMemo } from 'react';
 import {
-  BarChart3,
   Settings,
   Wallet,
   BookOpen,
@@ -126,13 +125,6 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
           active={activeView === 'analysis'}
           badge={runningCount > 0 ? String(runningCount) : undefined}
           onClick={() => goTo('analysis')}
-          collapsed={collapsed}
-        />
-        <NavItem
-          icon={<BarChart3 className="w-5 h-5" />}
-          label={t('nav_charts')}
-          active={activeView === 'charts'}
-          onClick={() => goTo('charts')}
           collapsed={collapsed}
         />
         <NavItem

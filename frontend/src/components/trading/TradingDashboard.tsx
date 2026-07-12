@@ -403,7 +403,7 @@ export default function TradingDashboard() {
                   <div className="flex justify-between">
                     <span className="text-muted">{t('trading_cash')}</span>
                     <span className="text-ink tabular-nums">
-                      {(portfolio.cash_ratio * 100).toFixed(0)}%
+                      {portfolio.cash_ratio.toFixed(0)}%
                     </span>
                   </div>
                   <div className="flex justify-between pt-2 border-t border-hairline">

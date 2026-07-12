@@ -8,6 +8,7 @@ import { useState, useEffect } from 'react';
 import { Wallet, RefreshCw, AlertCircle } from 'lucide-react';
 import { getCoinAccounts } from '@/api/client';
 import type { CoinAccount } from '@/types';
+import { friendlyCoinError } from '@/utils/errors';
 
 interface CoinAccountBalanceProps {
   onRefresh?: () => void;
@@ -27,7 +28,7 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
       setAccounts(response.accounts);
       setTotalKrw(response.total_krw_value);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load accounts');
+      setError(friendlyCoinError(err instanceof Error ? err.message : 'Failed to load accounts'));
     } finally {
       setIsLoading(false);
     }
