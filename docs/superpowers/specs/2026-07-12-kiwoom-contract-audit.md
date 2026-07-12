@@ -43,3 +43,16 @@ kt10000/kt10001 매수·매도(시장가 `ord_uv:""` 포함 스펙과 바이트 
 ## 스모크 결과 (A2, 장외 1회차)
 
 `scripts/kiwoom_readonly_smoke.py` — 7/8 PASS (유일 실패 = C7 ka10076, 모의서버가 필수 파라미터 누락 거부). 주문 메서드 몽키패치 봉쇄 가드 자체 검증 포함. 수정 완료 후 재실행 + 장중 1회차 예정.
+
+## 수정 결과 (Phase A1 완료, 2026-07-12)
+
+| 커밋 | 범위 | 해소 |
+|---|---|---|
+| `1235dd2` | 전송 계층 | C9(헤더 연속조회+ka10099 페이징), M5(토큰 KST/revoke body/401·8005 재발급-재시도/비-JSON 방어), M6(양수 에러코드+is_rate_limit·is_token_expired), MINOR(1700 substring→코드 비교, 비숫자 return_code 통일) |
+| `f99638a` | 계좌 4 TR | C4(보유종목 스펙 키+부호 보존), C5(A 접두사 스트립), C6(ka10075 요청·파싱+매수/매도 정규화), C7(ka10076 필수 요청+cntr 파싱), M1(tot_est_amt 기반 합계·평가손익 계산), kt00001 D+1/D+2 라벨 정합 |
+| `85cefba` | 주문 정정/취소 | C1(kt10002 orig_ord_no/mdfy_qty/mdfy_uv, trde_tp 제거), C2(kt10003 cncl_qty, 0=전량), C3(취소 라우트 stk_cd 확보+404, order_agent 시그니처 정합), MINOR(base_orig_ord_no 파싱) |
+| `32716c1` | 시세/차트 | C8(호가 *_fpr_*/*_{n}th_pre_* 체계), M2(flo_stk/acml_tr_pbmn), M3(marketCode 판정), M4(수정주가 기본 1+거래대금 백만원→원) |
+
+**게이트**: kiwoom 스위트 272 pass + 신규 계약 테스트 4파일(프로토콜 13/계좌 9/주문 4/시세 6), broad 스윕 673 pass(실패 4 전부 기존), **모의서버 스모크 8/8 PASS**(ka10076 실서버 검증 포함). 장중 스모크 1회차는 다음 개장 시 Phase C 시작 전 실행 예정.
+
+**미수정(기록만)**: LIMIT+가격없음 클라이언트 가드 없음(서버 거부에 의존), 모의서버 KRX-only인데 NXT/SOR 차단 없음(기본 KRX라 기본 경로 안전), order_agent 내부 UUID≠브로커 ord_no(호출자 없는 경로, 주석 명시), rate_limiter 선언 5/s vs 실효 1.4/s(보수적 방향이라 안전), 죽은 KIS 폴백 키 일부 잔존(무해).
