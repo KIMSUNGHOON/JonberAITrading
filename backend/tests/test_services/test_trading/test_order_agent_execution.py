@@ -4,6 +4,10 @@ and parse the returned OrderResponse.
 Pre-fix, _execute_kiwoom_order called a nonexistent self.kiwoom.place_order(...) and
 dict-parsed response.get('rt_cd') — so every approved KR BUY/SELL AttributeError'd and
 was silently rejected. Mock-only (spec'd client): never touches a live broker.
+
+R5-P1 A3: an accepted order is NO LONGER assumed filled — _execute_kiwoom_order now
+confirms the actual fill via ka10076 (get_filled_orders). These dispatch tests supply
+a matching fill so the accept→confirm→filled path is exercised end to end.
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -11,20 +15,29 @@ from unittest.mock import AsyncMock, MagicMock
 from services.trading.order_agent import OrderAgent
 from services.trading.models import OrderRequest, OrderSide, OrderType
 from services.kiwoom.client import KiwoomClient
-from services.kiwoom.models import OrderResponse, OrderType as KiwoomOrderType
+from services.kiwoom.models import FilledOrder, OrderResponse, OrderType as KiwoomOrderType
 
 
-def _mock_kiwoom(ord_no="0001093", return_code=0, return_msg="정상"):
+def _fill(ord_no, qty, price=70000):
+    return FilledOrder(
+        ord_no=ord_no, stk_cd="005930", stk_nm="삼성전자", ccld_qty=qty,
+        ccld_uv=price, ccld_amt=qty * price, ccld_dt="", ccld_tm="", buy_sell_tp="",
+    )
+
+
+def _mock_kiwoom(ord_no="0001093", return_code=0, return_msg="정상", filled_qty=None):
     client = MagicMock(spec=KiwoomClient)
     resp = OrderResponse(ord_no=ord_no, return_code=return_code, return_msg=return_msg)
     client.place_buy_order = AsyncMock(return_value=resp)
     client.place_sell_order = AsyncMock(return_value=resp)
+    fills = [_fill(ord_no, filled_qty)] if filled_qty else []
+    client.get_filled_orders = AsyncMock(return_value=fills)
     return client
 
 
 async def test_buy_dispatches_place_buy_order_and_fills():
-    client = _mock_kiwoom(ord_no="B123")
-    agent = OrderAgent(kiwoom_client=client)
+    client = _mock_kiwoom(ord_no="B123", filled_qty=10)
+    agent = OrderAgent(kiwoom_client=client, fill_confirm_attempts=1, fill_confirm_interval=0)
     order = OrderRequest(ticker="005930", side=OrderSide.BUY, quantity=10,
                          price=70000, order_type=OrderType.LIMIT)
     result = await agent._execute_kiwoom_order("oid1", order)
@@ -35,12 +48,13 @@ async def test_buy_dispatches_place_buy_order_and_fills():
     assert kwargs["qty"] == 10
     assert kwargs["order_type"] == KiwoomOrderType.LIMIT
     assert result.status == "filled"
+    assert result.filled_quantity == 10
     assert result.order_id == "B123"
 
 
 async def test_sell_dispatches_place_sell_order():
-    client = _mock_kiwoom()
-    agent = OrderAgent(kiwoom_client=client)
+    client = _mock_kiwoom(filled_qty=5)
+    agent = OrderAgent(kiwoom_client=client, fill_confirm_attempts=1, fill_confirm_interval=0)
     order = OrderRequest(ticker="005930", side=OrderSide.SELL, quantity=5,
                          price=71000, order_type=OrderType.LIMIT)
     result = await agent._execute_kiwoom_order("oid2", order)
@@ -50,8 +64,8 @@ async def test_sell_dispatches_place_sell_order():
 
 
 async def test_market_order_sends_none_price_and_market_type():
-    client = _mock_kiwoom()
-    agent = OrderAgent(kiwoom_client=client)
+    client = _mock_kiwoom(filled_qty=3)
+    agent = OrderAgent(kiwoom_client=client, fill_confirm_attempts=1, fill_confirm_interval=0)
     order = OrderRequest(ticker="005930", side=OrderSide.BUY, quantity=3,
                          order_type=OrderType.MARKET)  # no price
     await agent._execute_kiwoom_order("oid3", order)

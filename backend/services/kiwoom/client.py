@@ -933,6 +933,7 @@ class KiwoomClient:
         sell_tp: str = "0",
         stex_tp: str = "0",
         stk_cd: Optional[str] = None,
+        use_cache: bool = True,
     ) -> list[FilledOrder]:
         """
         체결요청 (ka10076)
@@ -944,13 +945,15 @@ class KiwoomClient:
             sell_tp: 매도수구분 - "0":전체, "1":매도, "2":매수
             stex_tp: 거래소구분 - "0":통합, "1":KRX, "2":NXT
             stk_cd: 지정 시 해당 종목만 조회
+            use_cache: False면 5s 캐시를 우회한다 — 주문 체결 확인 폴링 루프는
+                매 폴에서 최신 체결을 봐야 하므로 캐시를 건너뛴다 (R5-P1 리뷰 #1).
 
         Returns:
             FilledOrder 리스트
         """
         # 캐시 조회
         cache_key = make_cache_key("filled_orders", sell_tp, stex_tp, stk_cd or "")
-        if self._cache:
+        if self._cache and use_cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached

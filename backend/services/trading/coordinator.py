@@ -6,8 +6,9 @@ Analysis → Approval → Portfolio → Order → Monitor
 """
 
 import asyncio
+import json
 import logging
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List, Callable, Awaitable
 
 from .models import (
@@ -115,6 +116,21 @@ class ExecutionCoordinator:
         self._strategy: Optional[TradingStrategy] = None
         self._strategy_engine: Optional[StrategyEngine] = None
 
+        # Open-queue scheduler (R5-P1): auto-process the queue on the KRX
+        # closed→open transition while the system is already running.
+        self._market_was_open = False
+        self._queue_scheduler_task: Optional[asyncio.Task] = None
+        self._queue_scheduler_interval = 30.0
+        # Re-entrancy guard: process_trade_queue is now reachable from start(),
+        # the scheduler, and manual API calls — concurrent runs would double-
+        # execute PENDING/PROCESSING trades (review #6).
+        self._processing_queue = False
+
+        # Automatic persistence is only active within a session (start→stop), so
+        # a coordinator built in a unit test does not write to the shared DB. The
+        # explicit _persist_state/_restore_state helpers ignore this flag.
+        self._persistence_active = False
+
     # -------------------------------------------
     # Activity Logging
     # -------------------------------------------
@@ -157,6 +173,15 @@ class ExecutionCoordinator:
         # Fetch initial account info
         await self._refresh_account_info()
 
+        # Restore restart-critical state (positions+stops, queue, daily count)
+        # BEFORE the monitor starts so recovered stops are watched immediately.
+        await self._restore_state()
+
+        # Activate persistence BEFORE the startup queue drain below, so trades
+        # executed at open are persisted — otherwise a crash before the next
+        # persist re-executes them and loses their stop defense (review #3).
+        self._persistence_active = True
+
         # Start risk monitor
         await self.risk_monitor.start()
 
@@ -178,12 +203,30 @@ class ExecutionCoordinator:
             logger.info("[Coordinator] Processing pending trade queue after start")
             await self.process_trade_queue()
 
+        # Seed the scheduler's edge state and start watching for the KRX
+        # closed→open transition so a queue built overnight processes at open.
+        self._market_was_open = market_session.is_open
+        if self._queue_scheduler_task is None or self._queue_scheduler_task.done():
+            self._queue_scheduler_task = asyncio.create_task(
+                self._queue_scheduler_loop()
+            )
+
     async def stop(self):
         """Stop the auto-trading system."""
         logger.info("[Coordinator] Stopping auto-trading system")
 
         await self.risk_monitor.stop()
         self._state.mode = TradingMode.STOPPED
+
+        # Stop the open-queue scheduler.
+        if self._queue_scheduler_task is not None:
+            self._queue_scheduler_task.cancel()
+            self._queue_scheduler_task = None
+
+        # Persist restart-critical state on graceful shutdown, then deactivate.
+        if self._persistence_active:
+            await self._persist_state()
+        self._persistence_active = False
 
         self._log_activity(
             ActivityType.SYSTEM_STOP,
@@ -591,6 +634,7 @@ class ExecutionCoordinator:
         # Update trade count
         if result.filled_quantity > 0:
             self._state.daily_trades_count += 1
+            self._schedule_persist()
 
         await self._notify_state_change()
 
@@ -599,10 +643,8 @@ class ExecutionCoordinator:
     async def _execute_order_from_monitor(self, order: OrderRequest):
         """Execute order from risk monitor (stop-loss/take-profit)."""
         result = await self._execute_order(order)
-
-        if result.filled_quantity > 0:
-            # Remove position
-            self._remove_position(order.ticker)
+        # Track the ACTUAL fill: full → remove, partial → reduce, none → retain.
+        self._apply_sell_fill(order.ticker, result.filled_quantity)
 
     # -------------------------------------------
     # Position Management
@@ -647,6 +689,7 @@ class ExecutionCoordinator:
         )
 
         logger.info(f"[Coordinator] Position added/updated: {position.ticker}")
+        self._schedule_persist()
 
     def _remove_position(self, ticker: str):
         """Remove a position from tracking."""
@@ -682,6 +725,125 @@ class ExecutionCoordinator:
             )
 
         logger.info(f"[Coordinator] Position removed: {ticker}")
+        self._schedule_persist()
+
+    def _apply_sell_fill(self, ticker: str, filled_quantity: int) -> None:
+        """Reconcile position tracking with the ACTUAL fill of a SELL/close (A3).
+
+        Full fill → remove; partial → reduce and keep monitoring the remainder;
+        none → keep the position. A sell that did not fill must NOT orphan the
+        exposure — previously the close removed the position unconditionally, so a
+        rejected/unfilled sell dropped a still-open position from all defense.
+        """
+        if filled_quantity <= 0:
+            logger.warning(
+                f"[Coordinator] SELL for {ticker} did not fill — position retained"
+            )
+            return
+        position = next(
+            (p for p in self._state.positions if p.ticker == ticker), None
+        )
+        if position is None:
+            return
+        if filled_quantity >= position.quantity:
+            self._remove_position(ticker)
+        else:
+            position.quantity -= filled_quantity
+            position.last_updated = datetime.now()
+            # Re-register so the monitor watches the reduced size (keeps stops).
+            self.risk_monitor.remove_position(ticker)
+            self.risk_monitor.add_position(position)
+            self._schedule_persist()
+            logger.info(
+                f"[Coordinator] Position {ticker} reduced by {filled_quantity}; "
+                f"{position.quantity} remaining"
+            )
+
+    # -------------------------------------------
+    # State Persistence (R5-P1 A4)
+    # -------------------------------------------
+    #
+    # Positions (with stop levels), the trade queue, and the daily trade count
+    # lived only in memory, so a restart left the risk monitor watching nothing —
+    # stop-losses became a silent no-op. Persist them to SQLite (app_settings
+    # blob) and reload on start so defense and queued autonomous trades survive a
+    # restart. Stops are the coordinator's own data — the broker does not know
+    # them — so the local state IS the source of truth to persist.
+
+    _STATE_KEY = "trading:coordinator_state"
+
+    async def _persist_state(self) -> None:
+        """Best-effort persist of restart-critical state. Never raises — a storage
+        failure must not break trading."""
+        try:
+            from services.storage_service import get_storage_service
+
+            blob = json.dumps(
+                {
+                    "positions": [
+                        p.model_dump(mode="json") for p in self._state.positions
+                    ],
+                    "trade_queue": [
+                        t.model_dump(mode="json") for t in self._state.trade_queue
+                    ],
+                    "daily_trades_count": self._state.daily_trades_count,
+                    "daily_count_date": date.today().isoformat(),
+                }
+            )
+            storage = await get_storage_service()
+            await storage.set_app_setting(self._STATE_KEY, blob)
+        except Exception as e:
+            logger.error(f"[Coordinator] Failed to persist state: {e}")
+
+    async def _restore_state(self) -> None:
+        """Reload restart-critical state. Positions (with stops) are re-registered
+        with the risk monitor so defense resumes; the daily count resets on a new
+        calendar day. Best-effort — a corrupt/missing blob starts clean."""
+        try:
+            from services.storage_service import get_storage_service
+
+            storage = await get_storage_service()
+            blob = await storage.get_app_setting(self._STATE_KEY)
+            if not blob:
+                return
+            data = json.loads(blob)
+
+            # Positions + stops → re-register with the risk monitor.
+            self._state.positions = [
+                ManagedPosition.model_validate(p) for p in data.get("positions", [])
+            ]
+            for position in self._state.positions:
+                self.risk_monitor.add_position(position)
+
+            # Queued trades.
+            self._state.trade_queue = [
+                QueuedTrade.model_validate(t) for t in data.get("trade_queue", [])
+            ]
+
+            # Daily count — reset on a new calendar day.
+            if data.get("daily_count_date") == date.today().isoformat():
+                self._state.daily_trades_count = int(data.get("daily_trades_count", 0))
+            else:
+                self._state.daily_trades_count = 0
+
+            logger.info(
+                f"[Coordinator] Restored {len(self._state.positions)} positions, "
+                f"{len(self._state.trade_queue)} queued trades, "
+                f"daily_count={self._state.daily_trades_count}"
+            )
+        except Exception as e:
+            logger.error(f"[Coordinator] Failed to restore state: {e}")
+
+    def _schedule_persist(self) -> None:
+        """Fire-and-forget persist from a (possibly sync) mutator. No-op outside a
+        session, or without a running loop (a coordinator built in a unit test)."""
+        if not self._persistence_active:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._persist_state())
 
     # -------------------------------------------
     # Account & Price Data
@@ -796,6 +958,17 @@ class ExecutionCoordinator:
             new_sl = data.get("stop_loss")
             if new_sl:
                 self.risk_monitor.update_stop_loss(alert.ticker, new_sl)
+                # Also update the ManagedPosition so the adjusted stop is what
+                # gets persisted — otherwise a restart reverts it to the old
+                # value stored on the position (review #4).
+                position = next(
+                    (p for p in self._state.positions if p.ticker == alert.ticker),
+                    None,
+                )
+                if position is not None:
+                    position.stop_loss = new_sl
+                    position.last_updated = datetime.now()
+                self._schedule_persist()
 
         elif action == "EXECUTE_STOP_LOSS" and alert.ticker:
             config = self.risk_monitor._watching.get(alert.ticker)
@@ -825,8 +998,10 @@ class ExecutionCoordinator:
                     price=price,
                     reason="User-confirmed stop-loss",
                 )
-                await self._execute_order(order)
-                self._remove_position(alert.ticker)
+                result = await self._execute_order(order)
+                # Track the ACTUAL fill — a rejected/unfilled sell keeps the
+                # position under defense instead of orphaning it (review #8).
+                self._apply_sell_fill(alert.ticker, result.filled_quantity)
 
         elif action == "EXECUTE_TAKE_PROFIT" and alert.ticker:
             config = self.risk_monitor._watching.get(alert.ticker)
@@ -856,8 +1031,8 @@ class ExecutionCoordinator:
                     price=price,
                     reason="User-confirmed take-profit",
                 )
-                await self._execute_order(order)
-                self._remove_position(alert.ticker)
+                result = await self._execute_order(order)
+                self._apply_sell_fill(alert.ticker, result.filled_quantity)
 
         elif action == "HOLD":
             # Do nothing, just acknowledge
@@ -889,8 +1064,10 @@ class ExecutionCoordinator:
             reason="User-initiated close",
         )
 
-        await self._execute_order(order)
-        self._remove_position(ticker)
+        result = await self._execute_order(order)
+        # Only drop/reduce tracking by the ACTUAL fill — a rejected or unfilled
+        # sell must keep the position under defense (A3).
+        self._apply_sell_fill(ticker, result.filled_quantity)
 
     # -------------------------------------------
     # State Access
@@ -1030,6 +1207,7 @@ class ExecutionCoordinator:
         )
 
         logger.info(f"[Coordinator] Trade queued: {queued_trade.id}")
+        self._schedule_persist()
         return queued_trade
 
     def get_trade_queue(self, include_all: bool = False) -> List[QueuedTrade]:
@@ -1065,6 +1243,7 @@ class ExecutionCoordinator:
 
                 self._state.trade_queue.pop(i)
                 logger.info(f"[Coordinator] Trade dismissed from queue: {queue_id}")
+                self._schedule_persist()
                 return True
         return False
 
@@ -1083,11 +1262,26 @@ class ExecutionCoordinator:
                 )
 
                 logger.info(f"[Coordinator] Queued trade cancelled: {queue_id}")
+                self._schedule_persist()
                 return True
         return False
 
     async def process_trade_queue(self):
-        """Process pending trades in queue (call when market opens)."""
+        """Process pending trades in queue (call when market opens).
+
+        Re-entrancy-guarded: a second concurrent call returns immediately so a
+        trade already being processed is not executed twice.
+        """
+        if self._processing_queue:
+            logger.info("[Coordinator] process_trade_queue already running — skipping")
+            return
+        self._processing_queue = True
+        try:
+            await self._process_trade_queue_inner()
+        finally:
+            self._processing_queue = False
+
+    async def _process_trade_queue_inner(self):
         pending_trades = self.get_trade_queue()
         if not pending_trades:
             return
@@ -1161,7 +1355,36 @@ class ExecutionCoordinator:
                 trade.error_message = str(e)
 
         self._complete_agent_task("order", True)
+        if self._persistence_active:
+            await self._persist_state()
         await self._notify_state_change()
+
+    async def _check_queue_on_market_open(self) -> None:
+        """One scheduler tick: process the queue on a KRX closed→open transition.
+
+        start() already drains the queue if the market is open at start time; this
+        covers the case where the system is started (or a trade is queued) while
+        the market is closed and the market opens later. Only the EDGE triggers —
+        an already-open market is not re-processed every tick. The execution-time
+        re-gate (R5-P0) re-checks autonomy safety when each queued trade runs.
+        """
+        is_open = self._market_hours.get_market_session(MarketType.KRX).is_open
+        if is_open and not self._market_was_open and self.get_trade_queue():
+            logger.info("[Coordinator] Market opened — processing queued trades")
+            await self.process_trade_queue()
+        self._market_was_open = is_open
+
+    async def _queue_scheduler_loop(self) -> None:
+        """Periodically check for the market-open transition until stopped."""
+        try:
+            while True:
+                await asyncio.sleep(self._queue_scheduler_interval)
+                try:
+                    await self._check_queue_on_market_open()
+                except Exception as e:
+                    logger.error(f"[Coordinator] Queue scheduler error: {e}")
+        except asyncio.CancelledError:
+            pass
 
     # -------------------------------------------
     # Watch List Management

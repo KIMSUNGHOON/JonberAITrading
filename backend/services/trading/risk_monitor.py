@@ -380,8 +380,11 @@ class RiskMonitor:
         )
 
         try:
+            # The order executor (coordinator) reconciles position tracking with
+            # the ACTUAL fill (remove on full, reduce on partial, keep on none) —
+            # do NOT unconditionally remove here or it clobbers a re-registered
+            # partial remainder / a retained unfilled position (review #5b).
             await self._execute_order(order)
-            self.remove_position(ticker)
 
             alert = TradingAlert(
                 id=str(uuid.uuid4())[:8],
@@ -428,8 +431,9 @@ class RiskMonitor:
         )
 
         try:
+            # See _execute_stop_loss: the executor reconciles by actual fill; do
+            # not unconditionally remove here (review #5b).
             await self._execute_order(order)
-            self.remove_position(ticker)
 
             alert = TradingAlert(
                 id=str(uuid.uuid4())[:8],

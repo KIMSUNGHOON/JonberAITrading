@@ -192,6 +192,8 @@ class OrderAgent:
         self,
         kiwoom_client=None,
         rate_limiter: Optional[KiwoomRateLimiter] = None,
+        fill_confirm_attempts: int = 3,
+        fill_confirm_interval: float = 0.5,
     ):
         """
         Initialize Order Agent.
@@ -199,9 +201,14 @@ class OrderAgent:
         Args:
             kiwoom_client: Kiwoom API client
             rate_limiter: Rate limiter instance
+            fill_confirm_attempts: how many times to poll ka10076 for the fill
+                before reporting the confirmed (possibly partial/zero) quantity
+            fill_confirm_interval: seconds between fill-confirmation polls
         """
         self.kiwoom = kiwoom_client
         self.limiter = rate_limiter or KiwoomRateLimiter()
+        self._fill_confirm_attempts = max(1, fill_confirm_attempts)
+        self._fill_confirm_interval = fill_confirm_interval
 
         # Order tracking
         self._pending_orders: dict = {}
@@ -223,7 +230,7 @@ class OrderAgent:
             OrderResult with execution details
         """
         logger.info(
-            f"[OrderAgent] Executing order: {order.side.value} "
+            f"[OrderAgent] Executing order: {order.side} "
             f"{order.quantity} {order.ticker} @ {order.price or 'market'}"
         )
 
@@ -382,15 +389,33 @@ class OrderAgent:
             )
 
             if result.success:
+                # An accepted order is NOT a filled order — confirm the ACTUAL
+                # fill via ka10076 (체결내역) instead of assuming full fill at the
+                # limit price (audit A3). A limit order may fill partially or not
+                # at all; reporting an assumed full fill made the coordinator
+                # track phantom positions and drop unsold ones.
+                broker_ord_no = result.order_id or order_id
+                filled_qty, avg_price = await self._confirm_kiwoom_fill(
+                    ticker=order.ticker,
+                    order_no=broker_ord_no,
+                    requested_qty=order.quantity,
+                    fallback_price=order.price or 0,
+                )
+                if filled_qty >= order.quantity:
+                    status = "filled"
+                elif filled_qty > 0:
+                    status = "partial"
+                else:
+                    status = "pending"
                 return OrderResult(
-                    order_id=result.order_id or order_id,
+                    order_id=broker_ord_no,
                     ticker=order.ticker,
                     side=order.side,
                     requested_quantity=order.quantity,
-                    filled_quantity=order.quantity,  # Assume filled
-                    avg_price=order.price or 0,
-                    status="filled",
-                    filled_at=datetime.now(),
+                    filled_quantity=filled_qty,
+                    avg_price=avg_price,
+                    status=status,
+                    filled_at=datetime.now() if filled_qty > 0 else None,
                 )
             else:
                 return OrderResult(
@@ -405,6 +430,51 @@ class OrderAgent:
 
         except Exception as e:
             raise OrderExecutionError(f"Kiwoom API error: {e}")
+
+    async def _confirm_kiwoom_fill(
+        self,
+        ticker: str,
+        order_no: str,
+        requested_qty: int,
+        fallback_price: float,
+    ) -> tuple[int, float]:
+        """Confirm the actual fill of an accepted Kiwoom order via ka10076.
+
+        Polls the fill list (체결내역) up to fill_confirm_attempts times, matching
+        by order number and summing 체결수량. Returns (filled_qty, avg_price).
+        Fills are asynchronous, so a just-placed limit order may show 0 — that is
+        reported faithfully (assume nothing). A query failure is treated as an
+        unconfirmed fill (0), never as a full fill.
+        """
+        filled_qty = 0
+        avg_price = fallback_price
+        for attempt in range(self._fill_confirm_attempts):
+            try:
+                # Bypass the 5s cache — every poll must see the latest fills,
+                # else all retries within the TTL replay the same stale snapshot.
+                fills = await self.kiwoom.get_filled_orders(
+                    stk_cd=ticker, use_cache=False
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[OrderAgent] Fill confirmation query failed for {order_no}: {e}"
+                )
+                fills = []
+
+            matching = [
+                f for f in fills if f.ord_no == order_no and f.ccld_qty > 0
+            ]
+            filled_qty = sum(f.ccld_qty for f in matching)
+            if filled_qty > 0:
+                value = sum(f.ccld_qty * f.ccld_uv for f in matching)
+                avg_price = value / filled_qty
+
+            if filled_qty >= requested_qty:
+                break
+            if attempt < self._fill_confirm_attempts - 1:
+                await asyncio.sleep(self._fill_confirm_interval)
+
+        return filled_qty, avg_price
 
     async def _simulate_order(
         self,
