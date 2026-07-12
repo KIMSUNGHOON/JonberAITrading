@@ -173,20 +173,20 @@ class TestKiwoomClientOrderbook:
 
     @pytest.mark.asyncio
     async def test_get_orderbook_success(self, client):
-        """Test successful orderbook retrieval"""
+        """Test successful orderbook retrieval (공식 스펙 키 — 시세.md ka10004)"""
         response = {
             "return_code": 0,
             "output": {
-                "sell_hoga_1": 55100,
-                "sell_hoga_qty_1": 1000,
-                "sell_hoga_2": 55200,
-                "sell_hoga_qty_2": 2000,
-                "buy_hoga_1": 55000,
-                "buy_hoga_qty_1": 1500,
-                "buy_hoga_2": 54900,
-                "buy_hoga_qty_2": 2500,
-                "tot_sell_qty": 50000,
-                "tot_buy_qty": 60000
+                "sel_fpr_bid": "55100",
+                "sel_fpr_req": "1000",
+                "sel_2th_pre_bid": "55200",
+                "sel_2th_pre_req": "2000",
+                "buy_fpr_bid": "55000",
+                "buy_fpr_req": "1500",
+                "buy_2th_pre_bid": "54900",
+                "buy_2th_pre_req": "2500",
+                "tot_sel_req": "50000",
+                "tot_buy_req": "60000"
             }
         }
 

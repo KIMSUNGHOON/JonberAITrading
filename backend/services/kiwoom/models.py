@@ -299,13 +299,13 @@ class StockListItem(BaseModel):
 
     @property
     def is_kospi(self) -> bool:
-        """코스피 종목 여부"""
-        return self.market_code in ("10", "0") or "코스피" in self.market_name
+        """코스피 종목 여부 (marketCode 도메인: 0=코스피, 10=코스닥 — 종목정보.md:3148)"""
+        return self.market_code == "0" or "코스피" in self.market_name
 
     @property
     def is_kosdaq(self) -> bool:
         """코스닥 종목 여부"""
-        return self.market_code == "20" or "코스닥" in self.market_name
+        return self.market_code == "10" or "코스닥" in self.market_name
 
     @property
     def is_normal(self) -> bool:

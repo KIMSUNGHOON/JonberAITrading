@@ -442,7 +442,8 @@ class KiwoomClient:
             prdy_vrss=prdy_vrss,
             prdy_ctrt=prdy_ctrt,
             acml_vol=self._parse_signed_price(output.get("trde_qty", output.get("acml_vol", 0))),
-            acml_tr_pbmn=self._parse_signed_price(output.get("acml_tr_pbmn", 0)),
+            # ka10001 응답에 누적거래대금 필드는 없다 (감사 M2) — 항상 0
+            acml_tr_pbmn=0,
             strt_prc=self._parse_signed_price(output.get("open_pric", output.get("strt_prc", 0))),
             high_prc=self._parse_signed_price(output.get("high_pric", output.get("high_prc", 0))),
             low_prc=self._parse_signed_price(output.get("low_pric", output.get("low_prc", 0))),
@@ -452,7 +453,8 @@ class KiwoomClient:
             pbr=self._parse_float(output.get("pbr")) if output.get("pbr") else None,
             eps=int(self._parse_float(output.get("eps"))) if output.get("eps") else None,
             bps=int(self._parse_float(output.get("bps"))) if output.get("bps") else None,
-            lstg_stqt=self._parse_signed_price(output.get("lstg_stqt")) if output.get("lstg_stqt") else None,
+            # 상장주식수의 스펙 키는 flo_stk (감사 M2 — lstg_stqt는 미존재 키)
+            lstg_stqt=self._parse_signed_price(output.get("flo_stk")) if output.get("flo_stk") else None,
             mrkt_tot_amt=self._parse_signed_price(output.get("mac", output.get("mrkt_tot_amt"))) if output.get("mac") or output.get("mrkt_tot_amt") else None,
         )
 
@@ -489,28 +491,38 @@ class KiwoomClient:
         if isinstance(output, list) and len(output) > 0:
             output = output[0]
 
-        # 매도호가 파싱
-        sell_hogas = []
-        for i in range(1, 11):
-            price = output.get(f"sell_hoga_{i}", output.get(f"ofr_prc{i}", 0))
-            qty = output.get(f"sell_hoga_qty_{i}", output.get(f"ofr_qty{i}", 0))
-            if price:
-                sell_hogas.append(OrderbookUnit(price=int(price), quantity=int(qty)))
+        # 공식 계약 키 (시세.md:90-137; 감사 C8): 1호가는 *_fpr_*(최우선),
+        # 2~10호가는 *_{n}th_pre_* — 기존 sell_hoga_*/ofr_prc* 키는 스펙에
+        # 없어 호가 전체가 조용히 빈 리스트로 반환됐었다.
+        def _hoga_keys(side: str, level: int) -> tuple[str, str]:
+            if level == 1:
+                return f"{side}_fpr_bid", f"{side}_fpr_req"
+            return f"{side}_{level}th_pre_bid", f"{side}_{level}th_pre_req"
 
-        # 매수호가 파싱
+        sell_hogas = []
         buy_hogas = []
         for i in range(1, 11):
-            price = output.get(f"buy_hoga_{i}", output.get(f"bid_prc{i}", 0))
-            qty = output.get(f"buy_hoga_qty_{i}", output.get(f"bid_qty{i}", 0))
+            price_key, qty_key = _hoga_keys("sel", i)
+            price = self._parse_signed_price(output.get(price_key))
             if price:
-                buy_hogas.append(OrderbookUnit(price=int(price), quantity=int(qty)))
+                sell_hogas.append(OrderbookUnit(
+                    price=price,
+                    quantity=self._parse_signed_price(output.get(qty_key)),
+                ))
+            price_key, qty_key = _hoga_keys("buy", i)
+            price = self._parse_signed_price(output.get(price_key))
+            if price:
+                buy_hogas.append(OrderbookUnit(
+                    price=price,
+                    quantity=self._parse_signed_price(output.get(qty_key)),
+                ))
 
         orderbook = Orderbook(
             stk_cd=stk_cd,
             sell_hogas=sell_hogas,
             buy_hogas=buy_hogas,
-            tot_sell_qty=int(output.get("tot_sell_qty", output.get("total_ofr_qty", 0))),
-            tot_buy_qty=int(output.get("tot_buy_qty", output.get("total_bid_qty", 0))),
+            tot_sell_qty=self._parse_signed_price(output.get("tot_sel_req")),
+            tot_buy_qty=self._parse_signed_price(output.get("tot_buy_req")),
         )
 
         # 캐시 저장
@@ -523,7 +535,7 @@ class KiwoomClient:
         self,
         stk_cd: str,
         base_dt: Optional[str] = None,
-        upd_stkpc_tp: str = "0",
+        upd_stkpc_tp: str = "1",
     ) -> list[ChartData]:
         """
         주식일봉차트조회요청 (ka10081)
@@ -531,7 +543,7 @@ class KiwoomClient:
         Args:
             stk_cd: 종목코드
             base_dt: 기준일자 (YYYYMMDD), None이면 오늘
-            upd_stkpc_tp: 수정주가구분 ("0" or "1")
+            upd_stkpc_tp: 수정주가구분 — "1":수정주가(기본; 액면분할 등 기업행위 보정), "0":원주가
 
         Returns:
             ChartData 리스트
@@ -574,7 +586,10 @@ class KiwoomClient:
                 low_prc=self._parse_signed_price(item.get("low_pric", item.get("low_prc", 0))),
                 clos_prc=self._parse_signed_price(item.get("cur_prc", item.get("clos_prc", 0))),
                 acml_vol=self._parse_signed_price(item.get("trde_qty", item.get("acml_vol", 0))),
-                acml_tr_pbmn=self._parse_signed_price(item.get("trde_prica")) if item.get("trde_prica") else None,
+                # trde_prica 단위는 백만원 (kiwoom_api_spec.json; 감사 M4) —
+                # 하류(REST 응답·mock 경로)는 원 단위를 기대하므로 환산
+                acml_tr_pbmn=self._parse_signed_price(item.get("trde_prica")) * 1_000_000
+                if item.get("trde_prica") else None,
             )
             for item in output
         ]
@@ -589,7 +604,7 @@ class KiwoomClient:
         self,
         stk_cd: str,
         base_dt: Optional[str] = None,
-        upd_stkpc_tp: str = "0",
+        upd_stkpc_tp: str = "1",
     ) -> pd.DataFrame:
         """
         일봉 차트를 DataFrame으로 반환
@@ -597,7 +612,7 @@ class KiwoomClient:
         Args:
             stk_cd: 종목코드
             base_dt: 기준일자 (YYYYMMDD)
-            upd_stkpc_tp: 수정주가구분 ("0" or "1")
+            upd_stkpc_tp: 수정주가구분 — "1":수정주가(기본; 액면분할 등 기업행위 보정), "0":원주가
 
         Returns:
             OHLCV DataFrame
