@@ -193,6 +193,23 @@ class RiskParameters(BaseModel):
         description="Maximum total stock allocation as % of total equity"
     )
 
+    # Autonomy safety rails (R3 — enforced by services/autonomy/gate.py)
+    max_daily_loss_pct: float = Field(
+        default=3.0,
+        ge=0.1, le=20.0,
+        description="Daily realized-loss circuit breaker as % of account value (autonomous mode)"
+    )
+    max_open_positions: int = Field(
+        default=5,
+        ge=1, le=50,
+        description="Maximum concurrent open positions for autonomous BUY/ADD"
+    )
+    max_trade_notional_krw: float = Field(
+        default=1_000_000,
+        ge=10_000,
+        description="Per-trade notional cap in KRW for autonomous BUY/ADD"
+    )
+
     # Risk thresholds
     sudden_move_threshold_pct: float = Field(
         default=10.0,

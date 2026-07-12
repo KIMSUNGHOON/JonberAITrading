@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     KIWOOM_ACCOUNT_NO: str | None = None
     KIWOOM_IS_MOCK: bool = True  # True: 모의투자, False: 실거래
 
+    # Autonomy master gate (R3). False = trading_mode toggles are inert and
+    # every autonomous execution path is denied at the shared gate.
+    AUTONOMY_ENABLED: bool = False
+
     # -------------------------------------------
     # Naver API Configuration (News Search)
     # https://developers.naver.com/apps

@@ -102,6 +102,57 @@ async def get_settings_status():
 
 
 # -------------------------------------------
+# Trading Mode (Autonomous | HITL) — R3
+# -------------------------------------------
+
+from typing import Literal
+from pydantic import BaseModel
+
+
+class TradingModeResponse(BaseModel):
+    """Per-market trading mode + the autonomy master gate state."""
+    kiwoom: Literal["hitl", "autonomous"]
+    coin: Literal["hitl", "autonomous"]
+    master_enabled: bool
+
+
+class TradingModeUpdate(BaseModel):
+    """Set one market's trading mode."""
+    market: Literal["kiwoom", "coin"]
+    mode: Literal["hitl", "autonomous"]
+
+
+async def _trading_mode_response() -> TradingModeResponse:
+    from services.storage_service import get_storage_service
+
+    storage = await get_storage_service()
+    return TradingModeResponse(
+        kiwoom=await storage.get_app_setting("trading_mode:kiwoom", "hitl"),
+        coin=await storage.get_app_setting("trading_mode:coin", "hitl"),
+        master_enabled=settings.AUTONOMY_ENABLED,
+    )
+
+
+@router.get("/trading-mode", response_model=TradingModeResponse)
+async def get_trading_mode():
+    """Get per-market Autonomous|HITL mode (persisted; default hitl)."""
+    return await _trading_mode_response()
+
+
+@router.put("/trading-mode", response_model=TradingModeResponse)
+async def set_trading_mode(update: TradingModeUpdate):
+    """Set one market's trading mode. The autonomy gate additionally requires
+    AUTONOMY_ENABLED and paper mode — this toggle alone never enables live
+    autonomous trading."""
+    from services.storage_service import get_storage_service
+
+    storage = await get_storage_service()
+    await storage.set_app_setting(f"trading_mode:{update.market}", update.mode)
+    logger.info("trading_mode_updated", market=update.market, mode=update.mode)
+    return await _trading_mode_response()
+
+
+# -------------------------------------------
 # Upbit API Key Endpoints
 # -------------------------------------------
 
