@@ -113,6 +113,16 @@ class StorageService:
                     )
                 """)
 
+                # App settings table (generic key-value; e.g. trading_mode:kiwoom)
+                # — runtime settings that must survive restarts (R3).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # Create indexes for better query performance
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
@@ -784,6 +794,37 @@ class StorageService:
         except Exception as e:
             logger.error("coin_position_delete_failed", market=market, error=str(e))
             return False
+
+    # -------------------------------------------
+    # App Settings (persisted key-value)
+    # -------------------------------------------
+
+    async def get_app_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Get a persisted app setting (e.g. 'trading_mode:kiwoom')."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            async with conn.execute(
+                "SELECT value FROM app_settings WHERE key = ?", (key,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else default
+
+    async def set_app_setting(self, key: str, value: str) -> None:
+        """Set (upsert) a persisted app setting."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            await conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, value),
+            )
+            await conn.commit()
+        logger.debug("app_setting_saved", key=key)
 
     # -------------------------------------------
     # Health Check
