@@ -1,0 +1,219 @@
+"""
+Shared Autonomy Gate (R3)
+
+The SINGLE policy point every autonomous execution request must pass. Exactly
+two consumers: the analysis-pipeline auto-approve injector and the
+ChatCoordinator execution path — both autonomy engines share one policy.
+
+Check chain (first failure denies):
+    master_gate → market_mode → paper_only → daily_loss_breaker
+    → max_positions (BUY/ADD only) → notional_cap (BUY/ADD only)
+
+Design rules:
+- FAIL-CLOSED: any provider error converts to a deny with the failing check's
+  name. Autonomy only acts when every check is affirmatively green.
+- The paper_only check is HARDCODED — no setting can produce autonomous+live.
+  (Relaxing it is an explicit, separate P3 change.)
+- Limits come from RiskParameters (max_daily_loss_pct / max_open_positions /
+  max_trade_notional_krw), adjustable via the existing risk-params API.
+
+Spec: docs/superpowers/specs/2026-07-11-r3-autonomous-hitl-mode-design.md §2.1
+"""
+
+from dataclasses import dataclass
+from datetime import date
+from typing import Awaitable, Callable, Optional
+
+import structlog
+
+from app.config import settings
+from services.trading.models import RiskParameters
+
+logger = structlog.get_logger()
+
+# Actions that grow exposure — the only ones subject to position/notional caps.
+POSITION_INCREASING_ACTIONS = {"BUY", "ADD"}
+
+Provider = Callable[[str], Awaitable]
+
+# Circuit-breaker Telegram notice: at most once per local date.
+_last_breaker_notice_date: Optional[date] = None
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    allowed: bool
+    reason: str  # "ok" when allowed; deny reason otherwise
+    check: str   # failed check name; "all" when allowed
+
+
+def _deny(check: str, reason: str) -> GateDecision:
+    logger.info("autonomy_gate_denied", check=check, reason=reason)
+    return GateDecision(allowed=False, reason=reason, check=check)
+
+
+async def _notify_breaker(message: str) -> None:
+    """Best-effort Telegram notice when the daily-loss breaker trips."""
+    try:
+        from services.telegram import get_telegram_notifier
+
+        notifier = await get_telegram_notifier()
+        if notifier.is_ready:
+            await notifier.send_message(message)
+    except Exception as e:  # never let notification failure affect the gate
+        logger.warning("breaker_notify_failed", error=str(e))
+
+
+# -------------------------------------------
+# Default providers
+# -------------------------------------------
+
+
+async def _default_mode_provider(market: str) -> str:
+    from services.storage_service import get_storage_service
+
+    storage = await get_storage_service()
+    return await storage.get_app_setting(f"trading_mode:{market}", "hitl")
+
+
+async def _default_paper_provider(market: str) -> bool:
+    if market == "kiwoom":
+        # Runtime-aware (settings modal can flip it), falls back to env.
+        from app.api.routes.settings import get_kiwoom_is_mock
+
+        return bool(get_kiwoom_is_mock())
+    if market == "coin":
+        return settings.UPBIT_TRADING_MODE == "paper"
+    return False  # unknown market: not provably paper → deny
+
+
+async def _default_daily_loss_provider(market: str) -> float:
+    """Today's realized loss as % of account value (≥0; 0 = no loss).
+
+    No market currently records realized P&L in storage (coin_trades has no
+    pnl column; KR trades aren't stored), so there is no data source to sum —
+    return 0. The breaker is fully enforced through this seam the moment a
+    realized-P&L source exists; unit tests exercise it via injected providers.
+    """
+    return 0.0
+
+
+async def _default_positions_count_provider(market: str) -> int:
+    from services.storage_service import get_storage_service
+
+    storage = await get_storage_service()
+    if market == "coin":
+        return len(await storage.get_coin_positions())
+    if market == "kiwoom":
+        try:
+            positions = await storage.get_kr_stock_positions()
+        except AttributeError:
+            # Same semantics as the positions REST route: no KR position
+            # store yet → no tracked positions.
+            return 0
+        return len(positions or [])
+    raise ValueError(f"unknown market: {market}")
+
+
+def _default_risk_params() -> RiskParameters:
+    """Runtime risk params if the trading coordinator exists, else defaults."""
+    import app.dependencies as deps
+
+    coordinator = getattr(deps, "_trading_coordinator_instance", None)
+    params = getattr(coordinator, "risk_params", None)
+    return params if isinstance(params, RiskParameters) else RiskParameters()
+
+
+# -------------------------------------------
+# The gate
+# -------------------------------------------
+
+
+async def check_autonomy(
+    market: str,
+    *,
+    action: str,
+    quantity: Optional[float],
+    entry_price: Optional[float],
+    mode_provider: Optional[Provider] = None,
+    paper_provider: Optional[Provider] = None,
+    daily_loss_provider: Optional[Provider] = None,
+    positions_count_provider: Optional[Provider] = None,
+    risk_params_provider: Optional[Callable[[], RiskParameters]] = None,
+) -> GateDecision:
+    """Decide whether an autonomous execution is allowed. Fail-closed."""
+    global _last_breaker_notice_date
+
+    mode_provider = mode_provider or _default_mode_provider
+    paper_provider = paper_provider or _default_paper_provider
+    daily_loss_provider = daily_loss_provider or _default_daily_loss_provider
+    positions_count_provider = positions_count_provider or _default_positions_count_provider
+    risk_params_provider = risk_params_provider or _default_risk_params
+
+    # 1. Master gate (env)
+    if not settings.AUTONOMY_ENABLED:
+        return _deny("master_gate", "AUTONOMY_ENABLED is off")
+
+    # 2. Per-market mode
+    try:
+        mode = await mode_provider(market)
+    except Exception as e:
+        return _deny("market_mode", str(e))
+    if mode != "autonomous":
+        return _deny("market_mode", f"trading_mode:{market} is '{mode}'")
+
+    # 3. Paper-only — HARDCODED. Autonomous+live is impossible (P3 change only).
+    try:
+        is_paper = await paper_provider(market)
+    except Exception as e:
+        return _deny("paper_only", str(e))
+    if not is_paper:
+        return _deny("paper_only", f"{market} is not in paper/mock mode")
+
+    try:
+        params = risk_params_provider()
+    except Exception as e:
+        return _deny("risk_params", str(e))
+
+    # 4. Daily-loss circuit breaker (re-computed per request — the check IS the breaker)
+    try:
+        loss_pct = float(await daily_loss_provider(market))
+    except Exception as e:
+        return _deny("daily_loss_breaker", str(e))
+    if loss_pct >= params.max_daily_loss_pct:
+        today = date.today()
+        if _last_breaker_notice_date != today:
+            _last_breaker_notice_date = today
+            await _notify_breaker(
+                f"⛔ 자율 매매 서킷 브레이커 발동: 당일 실현 손실 {loss_pct:.2f}% ≥ "
+                f"한도 {params.max_daily_loss_pct:.2f}%. 오늘 자율 승인은 전면 중단됩니다 (HITL은 정상)."
+            )
+        return _deny(
+            "daily_loss_breaker",
+            f"daily loss {loss_pct:.2f}% >= limit {params.max_daily_loss_pct:.2f}%",
+        )
+
+    # 5 + 6 apply only to exposure-increasing actions.
+    if action in POSITION_INCREASING_ACTIONS:
+        # 5. Max concurrent positions
+        try:
+            count = int(await positions_count_provider(market))
+        except Exception as e:
+            return _deny("max_positions", str(e))
+        if count >= params.max_open_positions:
+            return _deny(
+                "max_positions",
+                f"open positions {count} >= limit {params.max_open_positions}",
+            )
+
+        # 6. Per-trade notional cap (unknown size = fail-closed)
+        if quantity is None or entry_price is None:
+            return _deny("notional_cap", "quantity/entry_price unknown for a BUY/ADD")
+        notional = float(quantity) * float(entry_price)
+        if notional > params.max_trade_notional_krw:
+            return _deny(
+                "notional_cap",
+                f"notional ₩{notional:,.0f} > cap ₩{params.max_trade_notional_krw:,.0f}",
+            )
+
+    return GateDecision(allowed=True, reason="ok", check="all")
