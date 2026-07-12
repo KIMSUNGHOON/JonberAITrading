@@ -38,6 +38,15 @@ def resolve_action(llm_action, fallback_action, feasible: frozenset):
     return fallback_action, "rule_guardrail"
 
 
+def _case_text(value):
+    """Normalize a structured bull/bear case to `str | None` (schema: array)."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return "\n".join(str(item) for item in value)
+    return str(value)
+
+
 async def decide_action(llm, messages, *, trade_action_cls, rule_action, feasible,
                         decision_schema, task):
     """LLM structured decision, guarded by `feasible`, with the rule as fallback.
@@ -46,15 +55,19 @@ async def decide_action(llm, messages, *, trade_action_cls, rule_action, feasibl
     source in {'llm','rule_guardrail','rule_fallback'}. On the fallback path
     `rationale` may be '' and bull_case/bear_case are None (the caller extracts
     them from the rationale text). On the llm/rule_guardrail path bull_case/
-    bear_case are the LLM's structured arrays (may be None if the model omitted
-    the optional fields).
+    bear_case are STRINGS (None if the model omitted the optional fields) —
+    DECISION_SCHEMA declares them as arrays, so they are joined here: the
+    proposal models type these fields as str, and passing the raw array
+    crashed the decision nodes with a ValidationError (found live, R3-P2
+    2026-07-12).
     """
     try:
         decision = await llm.generate_structured(messages, decision_schema, task=task)
         llm_action = trade_action_cls(str(decision["action"]).upper())
         action, source = resolve_action(llm_action, rule_action, feasible)
         return (action, (decision.get("rationale") or ""), source,
-                decision.get("bull_case"), decision.get("bear_case"))
+                _case_text(decision.get("bull_case")),
+                _case_text(decision.get("bear_case")))
     except (ValueError, KeyError):
         try:
             return rule_action, (await llm.generate(messages)), "rule_fallback", None, None

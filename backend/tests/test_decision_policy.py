@@ -101,4 +101,37 @@ async def test_decide_action_threads_structured_bull_bear():
         llm, [], trade_action_cls=TradeAction, rule_action=TradeAction.HOLD,
         feasible=FEASIBLE_WITHOUT_POSITION, decision_schema={"required": []}, task="t",
     )
-    assert result == (TradeAction.BUY, "r", "llm", ["up1"], ["down1"])
+    # Arrays are joined to strings (proposal models type these fields str).
+    assert result == (TradeAction.BUY, "r", "llm", "up1", "down1")
+
+
+async def test_decide_action_normalizes_structured_case_arrays_to_strings():
+    """LIVE-VERIFICATION BUG (R3-P2, 2026-07-12): DECISION_SCHEMA declares
+    bull_case/bear_case as ARRAYS of strings, but both proposal models type the
+    fields as str — a real LLM returning arrays crashed the decision node with
+    a pydantic ValidationError (analysis → error). decide_action must hand
+    callers strings."""
+    llm = _StubLLM(structured={
+        "action": "hold", "confidence": 0.7, "rationale": "r",
+        "bull_case": ["Neutral Fear & Greed", "no forced breakdown"],
+        "bear_case": ["Price rejected three times"],
+    })
+    action, rationale, source, bull, bear = await decide_action(
+        llm, [], trade_action_cls=TradeAction, rule_action=TradeAction.HOLD,
+        feasible=FEASIBLE_WITHOUT_POSITION, decision_schema={"required": []}, task="t",
+    )
+    assert bull == "Neutral Fear & Greed\nno forced breakdown"
+    assert bear == "Price rejected three times"
+
+
+async def test_decide_action_passes_string_and_none_cases_through():
+    llm = _StubLLM(structured={
+        "action": "hold", "confidence": 0.7, "rationale": "r",
+        "bull_case": "already a string",
+    })
+    *_, bull, bear = await decide_action(
+        llm, [], trade_action_cls=TradeAction, rule_action=TradeAction.HOLD,
+        feasible=FEASIBLE_WITHOUT_POSITION, decision_schema={"required": []}, task="t",
+    )
+    assert bull == "already a string"
+    assert bear is None
