@@ -43,14 +43,16 @@ conda activate agentic-trading
 ```bash
 conda activate agentic-trading
 cd backend
-uvicorn app.main:app --reload --port 8000
+python run_dev.py --reload   # 8000부터 빈 포트 자동 선택 (타 앱이 8000 점유 시 8001+로 비켜 뜸)
+# 고정 포트가 필요하면: uvicorn app.main:app --reload --port 8001
 ```
 
 ### Frontend
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev   # dev 프록시가 백엔드 포트(8000~8005)를 자동 탐지해 연결
+# 수동 지정: BACKEND_ORIGIN=http://127.0.0.1:8001 npm run dev (또는 frontend/.env.local)
 ```
 
 ### LLM Server
