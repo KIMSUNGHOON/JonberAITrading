@@ -32,6 +32,9 @@ export function useStartAnalysis() {
   const setKiwoomSessionAwaitingApproval = useStore(
     (state) => state.setKiwoomSessionAwaitingApproval
   );
+  const setKiwoomSessionAutoApproveAt = useStore(
+    (state) => state.setKiwoomSessionAutoApproveAt
+  );
   const setKiwoomSessionError = useStore((state) => state.setKiwoomSessionError);
   const setActiveKiwoomSession = useStore((state) => state.setActiveKiwoomSession);
 
@@ -49,6 +52,8 @@ export function useStartAnalysis() {
       updateKiwoomSessionStatus(sessionId, data.status as SessionStatus);
       updateKiwoomSessionStage(sessionId, data.stage);
       setKiwoomSessionAwaitingApproval(sessionId, data.awaiting_approval);
+      // R3: autonomous approval countdown deadline (absent = no pending auto-approve)
+      setKiwoomSessionAutoApproveAt(sessionId, data.auto_approve_at ?? null);
     },
     onProposal: (data) => {
       const proposal: KRStockTradeProposal = {
@@ -112,6 +117,7 @@ export function useStartAnalysis() {
         analyses: [],
         tradeProposal: null,
         awaitingApproval: false,
+        autoApproveAt: null,
         activePosition: null,
         error: null,
         createdAt: new Date(),

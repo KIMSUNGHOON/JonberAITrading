@@ -53,6 +53,8 @@ export function TerminalShell() {
   const activeMarket = useStore((s) => s.activeMarket);
   const setActiveMarket = useStore((s) => s.setActiveMarket);
   const setShowSettingsModal = useStore((s) => s.setShowSettingsModal);
+  // R3: active market's trading mode chip (HITL | AUTO); null until fetched.
+  const activeTradingMode = useStore((s) => s.tradingModes?.[s.activeMarket] ?? null);
   const clock = useClock();
   const { open, setOpen } = useCommandPalette();
 
@@ -138,6 +140,11 @@ export function TerminalShell() {
             mis-label real vs paper trading. Wire to the backend's real trading
             mode (KIWOOM_IS_MOCK / UPBIT_TRADING_MODE) before ever showing LIVE. */}
         <span className="text-warn">PAPER</span>
+        {activeTradingMode !== null && (
+          <span className={activeTradingMode === 'autonomous' ? 'text-accent' : 'text-dim'}>
+            {activeTradingMode === 'autonomous' ? 'AUTO' : 'HITL'}
+          </span>
+        )}
         <span className="text-accent">P&amp;L GRN-UP</span>
         <span>WS 1/1</span>
         <span className="ml-auto text-dim">⌘K command · j/k rows · :help</span>

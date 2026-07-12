@@ -32,6 +32,7 @@ beforeEach(() => {
       activeSessionId: null,
       status: 'idle',
       currentStage: null,
+      sessions: [],
     },
   };
 });
@@ -68,6 +69,7 @@ describe('OrderTicketRail — active', () => {
         status: 'awaiting_approval',
         currentStage: null,
         awaitingApproval: true,
+        sessions: [],
       },
     };
     render(<OrderTicketRail />);
@@ -105,6 +107,7 @@ describe('OrderTicketRail — decisions', () => {
         status: 'awaiting_approval',
         currentStage: null,
         awaitingApproval: true,
+        sessions: [],
       },
       setAwaitingApproval: vi.fn(),
       setStatus: vi.fn(),
@@ -126,5 +129,80 @@ describe('OrderTicketRail — decisions', () => {
     fireEvent.keyDown(window, { key: 'Enter', metaKey: true }); // ⌘⏎ focuses Approve
     expect(submitApproval).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: /approve/i })).toHaveFocus();
+  });
+});
+
+describe('OrderTicketRail — R3 autonomous mode', () => {
+  // Active-proposal state with a kiwoom multi-session entry carrying the
+  // auto-approve deadline (the countdown reads sessions[], not legacy fields).
+  function activeAutonomousState(autoApproveAt: string | null) {
+    return {
+      activeMarket: 'kiwoom',
+      tradingModes: { kiwoom: 'autonomous', coin: 'hitl' },
+      kiwoom: {
+        tradeProposal: {
+          id: 'p1',
+          stk_cd: '005930',
+          stk_nm: '삼성전자',
+          action: 'BUY',
+          quantity: 10,
+          entry_price: 100,
+          stop_loss: 90,
+          take_profit: 120,
+          risk_score: 5,
+          position_size_pct: 10,
+          rationale: 'Strong momentum with support at 95.',
+          bull_case: 'Upside case',
+          bear_case: 'Downside case',
+          created_at: new Date().toISOString(),
+        },
+        activeSessionId: 'sess-1',
+        status: 'awaiting_approval',
+        currentStage: null,
+        awaitingApproval: true,
+        sessions: [{ sessionId: 'sess-1', autoApproveAt }],
+      },
+    };
+  }
+
+  it('renders the AUTONOMOUS chip in idle state when the active market mode is autonomous', () => {
+    mockState.tradingModes = { kiwoom: 'autonomous', coin: 'hitl' };
+    render(<OrderTicketRail />);
+    expect(screen.getByText('AUTONOMOUS')).toBeInTheDocument();
+    expect(screen.getByText('NO PENDING ORDER')).toBeInTheDocument();
+  });
+
+  it('renders no chip when trading modes are not loaded (null)', () => {
+    mockState.tradingModes = null;
+    render(<OrderTicketRail />);
+    expect(screen.queryByText('AUTONOMOUS')).not.toBeInTheDocument();
+  });
+
+  it('renders no chip when the active market mode is hitl', () => {
+    mockState.tradingModes = { kiwoom: 'hitl', coin: 'autonomous' };
+    render(<OrderTicketRail />);
+    expect(screen.queryByText('AUTONOMOUS')).not.toBeInTheDocument();
+  });
+
+  it('keeps the chip and shows a countdown on an active proposal with a future autoApproveAt', () => {
+    mockState = activeAutonomousState(new Date(Date.now() + 30_000).toISOString());
+    render(<OrderTicketRail />);
+    expect(screen.getByText('AUTONOMOUS')).toBeInTheDocument();
+    expect(screen.getByText(/자율 승인까지 \d+초/)).toBeInTheDocument();
+    // The veto stays the EXISTING buttons — no new controls.
+    expect(screen.getByRole('button', { name: /reject/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /approve/i })).toBeInTheDocument();
+  });
+
+  it('shows the processing message once the deadline has passed', () => {
+    mockState = activeAutonomousState(new Date(Date.now() - 1_000).toISOString());
+    render(<OrderTicketRail />);
+    expect(screen.getByText('자율 승인 처리 중…')).toBeInTheDocument();
+  });
+
+  it('shows no countdown when the active session has no autoApproveAt', () => {
+    mockState = activeAutonomousState(null);
+    render(<OrderTicketRail />);
+    expect(screen.queryByText(/자율 승인/)).not.toBeInTheDocument();
   });
 });

@@ -15,7 +15,7 @@ import { ChatToggleButton } from '@/components/chat/ChatToggleButton';
 import { ChatPopup } from '@/components/chat/ChatPopup';
 import { Toast } from '@/components/ui/Toast';
 import { TradeNotificationToast } from '@/components/ui/TradeNotificationToast';
-import { getUpbitApiStatus, getKiwoomApiStatus } from '@/api/client';
+import { getUpbitApiStatus, getKiwoomApiStatus, getTradingMode } from '@/api/client';
 import { SessionBridge } from '@/routes/SessionBridge';
 import { BasketPage } from '@/pages/BasketPage';
 import { PositionsPage } from '@/pages/PositionsPage';
@@ -33,6 +33,7 @@ function App() {
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
   const setUpbitApiConfigured = useStore((state) => state.setUpbitApiConfigured);
   const setKiwoomApiConfigured = useStore((state) => state.setKiwoomApiConfigured);
+  const setTradingModes = useStore((state) => state.setTradingModes);
   const error = useStore(selectError);
   const setError = useStore((state) => state.setError);
 
@@ -73,9 +74,17 @@ function App() {
       } catch (err) {
         console.error('Failed to check Kiwoom API status:', err);
       }
+
+      // R3: fetch per-market trading modes (Autonomous | HITL). Silent on
+      // failure — modes stay null and the mode badges simply don't render.
+      try {
+        setTradingModes(await getTradingMode());
+      } catch {
+        // modes stay null
+      }
     }
     checkApiStatus();
-  }, [setUpbitApiConfigured, setKiwoomApiConfigured]);
+  }, [setUpbitApiConfigured, setKiwoomApiConfigured, setTradingModes]);
 
   return (
     <div className="h-screen overflow-hidden">

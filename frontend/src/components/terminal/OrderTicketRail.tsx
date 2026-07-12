@@ -28,7 +28,32 @@ export function OrderTicketRail() {
   const setError = useStore((s) => s.setError);
   const addChatMessage = useStore((s) => s.addChatMessage);
 
+  // R3 autonomous mode: badge for the active market + auto-approve countdown
+  // (kiwoom multi-session only — coin has no live WS status consumer).
+  const activeMarket = useStore((s) => s.activeMarket);
+  const tradingModes = useStore((s) => s.tradingModes);
+  const autoApproveAt = useStore((s) =>
+    s.activeMarket === 'kiwoom'
+      ? s.kiwoom.sessions.find((x) => x.sessionId === s.kiwoom.activeSessionId)
+          ?.autoApproveAt ?? null
+      : null
+  );
+  const isAutonomous = tradingModes?.[activeMarket] === 'autonomous';
+
   const active = awaitingApproval && isTicketActive(proposal, sessionId);
+
+  // Tick every 1s while an auto-approve deadline is pending so the countdown
+  // re-renders; the remaining seconds are derived from Date.now() vs the ISO.
+  const [nowTs, setNowTs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!autoApproveAt) return;
+    setNowTs(Date.now());
+    const id = setInterval(() => setNowTs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [autoApproveAt]);
+  const autoApproveSecondsLeft = autoApproveAt
+    ? Math.max(0, Math.ceil((Date.parse(autoApproveAt) - nowTs) / 1000))
+    : null;
 
   const [feedback, setFeedback] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -84,8 +109,13 @@ export function OrderTicketRail() {
 
   return (
     <aside className="w-64 flex-none border-l border-hairline bg-card flex flex-col min-h-0 overflow-y-auto">
-      <div className="flex-none px-3 py-2 border-b border-hairline text-[11px] font-semibold uppercase tracking-wide text-muted">
-        Order
+      <div className="flex-none px-3 py-2 border-b border-hairline text-[11px] font-semibold uppercase tracking-wide text-muted flex items-center justify-between gap-2">
+        <span>Order</span>
+        {isAutonomous && (
+          <span className="text-[10px] font-normal tracking-wide text-accent bg-elevated border border-hairline rounded px-1.5 py-px">
+            AUTONOMOUS
+          </span>
+        )}
       </div>
       {!active && (
         <div className="flex-1 flex flex-col items-center justify-center gap-1 p-4 text-center">
@@ -103,6 +133,16 @@ export function OrderTicketRail() {
               <div className="text-dim mt-0.5">이 주문은 다음 장 오픈 시 실행됩니다</div>
               <div className="mt-1 flex justify-between tabular-nums"><span className="text-dim">예상 실행</span><span className="text-ink">{nextEventFormatted}</span></div>
               <div className="flex justify-between tabular-nums"><span className="text-dim">대기</span><span className="text-warn">{countdownFormatted}</span></div>
+            </div>
+          )}
+          {autoApproveAt !== null && (
+            <div className="rounded border border-hairline bg-elevated px-2 py-1.5 text-[11px]">
+              <div className="text-accent font-medium tabular-nums">
+                {autoApproveSecondsLeft !== null && autoApproveSecondsLeft > 0
+                  ? `자율 승인까지 ${autoApproveSecondsLeft}초`
+                  : '자율 승인 처리 중…'}
+              </div>
+              <div className="text-dim mt-0.5">REJECT로 즉시 거부할 수 있습니다</div>
             </div>
           )}
           <div className={`inline-flex items-center gap-1.5 self-start rounded border border-hairline bg-elevated px-2 py-1 font-bold ${actionTextColor(proposal!.action)}`}>

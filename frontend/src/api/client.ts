@@ -21,6 +21,8 @@ import type {
   CoinTradeListResponse,
   CoinTradeRecord,
   SettingsStatus,
+  TradingMode,
+  TradingModeResponse,
   UpbitApiKeyRequest,
   UpbitApiKeyResponse,
   UpbitApiKeyStatus,
@@ -497,6 +499,28 @@ class ApiClient {
    */
   async getSettings(): Promise<SettingsStatus> {
     const response = await this.client.get<SettingsStatus>('/settings');
+    return response.data;
+  }
+
+  /**
+   * Get per-market trading mode (R3 Autonomous | HITL) + master gate.
+   */
+  async getTradingMode(): Promise<TradingModeResponse> {
+    const response = await this.client.get<TradingModeResponse>('/settings/trading-mode');
+    return response.data;
+  }
+
+  /**
+   * Set the trading mode for one market. Returns the full updated state.
+   */
+  async setTradingMode(
+    market: 'kiwoom' | 'coin',
+    mode: TradingMode
+  ): Promise<TradingModeResponse> {
+    const response = await this.client.put<TradingModeResponse>(
+      '/settings/trading-mode',
+      { market, mode }
+    );
     return response.data;
   }
 
@@ -1808,6 +1832,11 @@ export const getCoinOrderbook = (market: string) => apiClient.getCoinOrderbook(m
 
 // Settings API
 export const getSettings = () => apiClient.getSettings();
+
+export const getTradingMode = () => apiClient.getTradingMode();
+
+export const setTradingMode = (market: 'kiwoom' | 'coin', mode: TradingMode) =>
+  apiClient.setTradingMode(market, mode);
 
 export const getUpbitApiStatus = () => apiClient.getUpbitApiStatus();
 

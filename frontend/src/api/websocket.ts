@@ -57,6 +57,9 @@ export interface StatusMessage {
     status: string;
     stage: string;
     awaiting_approval: boolean;
+    // R3 autonomous mode (additive): ISO deadline of the pending auto-approve
+    // grace window. Only present while an autonomous approval is pending.
+    auto_approve_at?: string;
   };
 }
 

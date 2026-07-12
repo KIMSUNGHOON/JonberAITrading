@@ -42,7 +42,7 @@ import {
 import { useTranslations } from '@/utils/translations';
 import { pnlColor } from '@/utils/pnl';
 import type {
-  TradingMode,
+  AutoTradingMode,
   ManagedPosition,
   TradingAlert,
 } from '@/types';
@@ -52,7 +52,7 @@ import type {
 // -------------------------------------------
 
 interface StatusBadgeProps {
-  mode: TradingMode | string;
+  mode: AutoTradingMode | string;
 }
 
 function StatusBadge({ mode }: StatusBadgeProps) {

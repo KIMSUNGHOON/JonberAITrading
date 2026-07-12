@@ -26,6 +26,8 @@ import type {
   KRStockTradeProposal,
   SessionData,
   DetailedAnalysisResults,
+  TradingMode,
+  TradingModeResponse,
 } from '@/types';
 
 // UUID 생성 함수 (crypto.randomUUID 폴백)
@@ -168,6 +170,12 @@ interface UIState {
 
   // Language preference for UI and analysis reports
   language: Language;
+
+  // R3 trading modes (Autonomous | HITL) per market. null until fetched from
+  // GET /settings/trading-mode (components fetch; the store only holds state).
+  // NOT persisted.
+  tradingModes: { kiwoom: TradingMode; coin: TradingMode } | null;
+  autonomyMasterEnabled: boolean;
 }
 
 // -------------------------------------------
@@ -247,6 +255,7 @@ interface KiwoomActions {
   addKiwoomSessionReasoning: (sessionId: string, entry: string) => void;
   setKiwoomSessionProposal: (sessionId: string, proposal: KRStockTradeProposal | null) => void;
   setKiwoomSessionAwaitingApproval: (sessionId: string, awaiting: boolean) => void;
+  setKiwoomSessionAutoApproveAt: (sessionId: string, iso: string | null) => void;
   setKiwoomSessionError: (sessionId: string, error: string | null) => void;
 
   // Phase 9: Complete session with detailed analysis results
@@ -291,6 +300,8 @@ interface UIActions {
   setSelectedSessionId: (sessionId: string | null) => void;
   // Language preference
   setLanguage: (language: Language) => void;
+  // R3 trading modes — sync setter fed by callers (fetch stays in components/hooks)
+  setTradingModes: (resp: TradingModeResponse) => void;
 }
 
 // Legacy actions for backward compatibility
@@ -389,6 +400,9 @@ const initialUIState: UIState = {
   selectedSessionId: null,
   // Language preference (default: Korean)
   language: 'ko',
+  // R3 trading modes — unknown until fetched
+  tradingModes: null,
+  autonomyMasterEnabled: false,
 };
 
 // -------------------------------------------
@@ -595,6 +609,7 @@ export const useStore = create<Store>()(
             analyses: [],
             tradeProposal: null,
             awaitingApproval: false,
+            autoApproveAt: null,
             activePosition: null,
             error: null,
             createdAt: now,
@@ -635,10 +650,16 @@ export const useStore = create<Store>()(
           const newHistory = state.kiwoom.history.map((h) =>
             h.sessionId === state.kiwoom.activeSessionId ? { ...h, status } : h
           );
-          // Also update sessions[] array to keep in sync
+          // Also update sessions[] array to keep in sync. A status change away
+          // from awaiting_approval invalidates any pending auto-approve countdown.
           const newSessions = state.kiwoom.sessions.map((s) =>
             s.sessionId === state.kiwoom.activeSessionId
-              ? { ...s, status: status as SessionStatus, updatedAt: new Date() }
+              ? {
+                  ...s,
+                  status: status as SessionStatus,
+                  autoApproveAt: status === 'awaiting_approval' ? s.autoApproveAt : null,
+                  updatedAt: new Date(),
+                }
               : s
           );
           return {
@@ -950,9 +971,16 @@ export const useStore = create<Store>()(
             existingSessions: state.kiwoom.sessions.map(s => ({ id: s.sessionId, status: s.status })),
             activeSessionId: state.kiwoom.activeSessionId,
           });
+          // A status change away from awaiting_approval invalidates any pending
+          // auto-approve countdown (manual decision / completion / error).
           const newSessions = state.kiwoom.sessions.map(s =>
             s.sessionId === sessionId
-              ? { ...s, status, updatedAt: new Date() }
+              ? {
+                  ...s,
+                  status,
+                  autoApproveAt: status === 'awaiting_approval' ? s.autoApproveAt : null,
+                  updatedAt: new Date(),
+                }
               : s
           );
           // Also update history to keep status in sync
@@ -1064,11 +1092,30 @@ export const useStore = create<Store>()(
           };
         }),
 
+      setKiwoomSessionAutoApproveAt: (sessionId, iso) =>
+        set((state) => ({
+          kiwoom: {
+            ...state.kiwoom,
+            sessions: state.kiwoom.sessions.map(s =>
+              s.sessionId === sessionId
+                ? { ...s, autoApproveAt: iso, updatedAt: new Date() }
+                : s
+            ),
+          },
+        })),
+
       setKiwoomSessionError: (sessionId, error) =>
         set((state) => {
           const newSessions = state.kiwoom.sessions.map(s =>
             s.sessionId === sessionId
-              ? { ...s, error, status: error ? 'error' as const : s.status, updatedAt: new Date() }
+              ? {
+                  ...s,
+                  error,
+                  status: error ? 'error' as const : s.status,
+                  // An error ends the approval wait — drop any auto-approve countdown.
+                  autoApproveAt: error ? null : s.autoApproveAt,
+                  updatedAt: new Date(),
+                }
               : s
           );
           const isActive = state.kiwoom.activeSessionId === sessionId;
@@ -1101,6 +1148,8 @@ export const useStore = create<Store>()(
                   ...s,
                   status: 'completed' as const,
                   tradeProposal: data.tradeProposal ?? s.tradeProposal,
+                  // Completion ends the approval wait — drop any auto-approve countdown.
+                  autoApproveAt: null,
                   updatedAt: now,
                 }
               : s
@@ -1213,6 +1262,12 @@ export const useStore = create<Store>()(
       setSelectedSessionId: (sessionId) => set({ selectedSessionId: sessionId }),
 
       setLanguage: (language) => set({ language }),
+
+      setTradingModes: (resp) =>
+        set({
+          tradingModes: { kiwoom: resp.kiwoom, coin: resp.coin },
+          autonomyMasterEnabled: resp.master_enabled,
+        }),
 
       setChartTimeframe: (timeframe) =>
         set((state) => ({
@@ -1770,4 +1825,4 @@ export const selectRecentCompletedAnalyses = (state: Store): RecentAnalysisItem[
 
 // Export types
 export type { TickerHistoryItem, CoinHistoryItem, KiwoomHistoryItem, MarketType, ChatPopupSize, Language };
-export type { SessionData } from '@/types';
+export type { SessionData, TradingMode } from '@/types';

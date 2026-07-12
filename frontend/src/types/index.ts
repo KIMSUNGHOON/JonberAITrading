@@ -749,10 +749,26 @@ export interface SessionData {
   analyses: AnalysisSummary[];
   tradeProposal: CoinTradeProposal | KRStockTradeProposal | null;
   awaitingApproval: boolean;
+  // R3 autonomous mode: ISO timestamp of the pending auto-approve deadline
+  // (from WS status frames while an autonomous approval grace window is open).
+  // null whenever the session is not awaiting an autonomous approval.
+  autoApproveAt: string | null;
   activePosition: Position | null;
   error: string | null;
   createdAt: Date;
   updatedAt: Date;
+}
+
+// -------------------------------------------
+// R3: Trading Mode (Autonomous | HITL) Types
+// -------------------------------------------
+
+export type TradingMode = 'hitl' | 'autonomous';
+
+export interface TradingModeResponse {
+  kiwoom: TradingMode;
+  coin: TradingMode;
+  master_enabled: boolean;
 }
 
 // Kiwoom Settings Types
@@ -871,7 +887,9 @@ export interface IndicatorsSummaryResponse {
 // Auto-Trading Types
 // -------------------------------------------
 
-export type TradingMode = 'active' | 'paused' | 'stopped';
+// Auto-trading ENGINE state (renamed from TradingMode to avoid colliding with
+// the R3 per-market Autonomous|HITL TradingMode above).
+export type AutoTradingMode = 'active' | 'paused' | 'stopped';
 export type StopLossMode = 'user_approval' | 'agent_auto';
 export type PositionStatus = 'pending' | 'partial' | 'filled' | 'closing' | 'closed';
 export type AlertType =
@@ -938,7 +956,7 @@ export interface TradingAlert {
 }
 
 export interface TradingState {
-  mode: TradingMode;
+  mode: AutoTradingMode;
   account: TradingAccountInfo;
   positions: ManagedPosition[];
   pending_orders: unknown[];

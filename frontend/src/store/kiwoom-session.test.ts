@@ -21,6 +21,7 @@ function createMockSession(overrides: Partial<SessionData> = {}): SessionData {
     analyses: [],
     tradeProposal: null,
     awaitingApproval: false,
+    autoApproveAt: null,
     activePosition: null,
     error: null,
     createdAt: new Date(),
