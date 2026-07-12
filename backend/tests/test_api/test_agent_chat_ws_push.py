@@ -170,6 +170,51 @@ async def test_manual_discussion_never_executes_decision(coordinator):
 
 
 # -------------------------------------------
+# R3: coordinator execution must pass the shared autonomy gate
+# -------------------------------------------
+
+
+async def test_coordinator_execution_gated(monkeypatch):
+    """The watch-list auto path executed with NO gate before R3 — every
+    execution now needs the shared autonomy gate's approval."""
+    from services.autonomy import GateDecision
+    import services.agent_chat.coordinator as cm
+
+    coord = ChatCoordinator()
+    executed = []
+
+    async def record_execute(ticker, decision):
+        executed.append(ticker)
+
+    async def noop(*args, **kwargs):
+        return None
+
+    coord._execute_trade = record_execute
+    coord._notify_decision = noop
+
+    decision = TradeDecision(
+        action=DecisionAction.BUY, confidence=0.9, consensus_level=0.9,
+        rationale="테스트", quantity=10, entry_price=50_000,
+    )
+
+    # Gate denies → no execution
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="AUTONOMY_ENABLED is off", check="master_gate")
+
+    monkeypatch.setattr(cm, "check_autonomy", deny_gate)
+    await coord._handle_decision("005930", decision)
+    assert executed == []
+
+    # Gate allows → existing execution path runs
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(cm, "check_autonomy", allow_gate)
+    await coord._handle_decision("005930", decision)
+    assert executed == ["005930"]
+
+
+# -------------------------------------------
 # Room-created hook: the route layer's wiring point
 # -------------------------------------------
 

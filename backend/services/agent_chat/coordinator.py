@@ -20,6 +20,7 @@ from services.agent_chat.models import (
     TradeDecision,
 )
 from services.agent_chat.chat_room import ChatRoom
+from services.autonomy import check_autonomy
 
 # -------------------------------------------
 # Room-created hooks
@@ -400,17 +401,51 @@ class ChatCoordinator:
             except Exception as e:
                 logger.warning("decision_callback_failed", error=str(e))
 
-        # Execute trade if action required
+        # Execute trade if action required — every coordinator execution must
+        # pass the shared autonomy gate (R3): master env gate + trading_mode +
+        # paper-only + daily-loss breaker + position/notional caps. Before R3
+        # this path executed unconditionally once the coordinator was started.
         if decision.action in (
             DecisionAction.BUY,
             DecisionAction.SELL,
             DecisionAction.ADD,
             DecisionAction.REDUCE,
         ):
-            await self._execute_trade(ticker, decision)
+            gate = await check_autonomy(
+                "kiwoom",
+                action=decision.action.value,
+                quantity=decision.quantity,
+                entry_price=decision.entry_price,
+            )
+            if gate.allowed:
+                await self._execute_trade(ticker, decision)
+            else:
+                logger.warning(
+                    "coordinator_execution_gate_denied",
+                    ticker=ticker,
+                    action=decision.action.value,
+                    check=gate.check,
+                    reason=gate.reason,
+                )
+                await self._notify_gate_denied(ticker, decision, gate.reason)
 
         # Send Telegram notification
         await self._notify_decision(ticker, decision)
+
+    async def _notify_gate_denied(
+        self, ticker: str, decision: TradeDecision, reason: str
+    ) -> None:
+        """Best-effort Telegram notice when the autonomy gate blocks execution."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚫 자율 실행 게이트 거부 ({ticker} {decision.action.value}): {reason}"
+                )
+        except Exception as e:
+            logger.warning("gate_denied_notify_failed", ticker=ticker, error=str(e))
 
     async def _execute_trade(
         self,
