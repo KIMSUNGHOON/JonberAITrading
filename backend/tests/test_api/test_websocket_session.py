@@ -344,6 +344,38 @@ async def test_safety_poll_covers_legacy_only_updates_for_sm_session(sm, kr_sess
         await asyncio.wait_for(task, timeout=2.0)
 
 
+async def test_status_frame_carries_auto_approve_at_when_present(sm):
+    """R3: the rail countdown rides the status frame (additive optional field)."""
+    ws = FakeWebSocket()
+    cursor = ws_module._SessionFrameCursor("auto-1")
+    session = {
+        "session_id": "auto-1",
+        "status": "awaiting_approval",
+        "error": None,
+        "state": {
+            "reasoning_log": [],
+            "current_stage": "approval",
+            "awaiting_approval": True,
+            "auto_approve_at": "2026-07-12T10:00:00+00:00",
+        },
+    }
+
+    await cursor.emit(ws, session)
+
+    status_frames = [f for f in ws.sent if f["type"] == "status"]
+    assert status_frames[0]["data"]["auto_approve_at"] == "2026-07-12T10:00:00+00:00"
+
+    # Absent from sessions without it
+    ws2 = FakeWebSocket()
+    cursor2 = ws_module._SessionFrameCursor("auto-2")
+    session2 = {
+        "session_id": "auto-2", "status": "running", "error": None,
+        "state": {"reasoning_log": [], "current_stage": "x"},
+    }
+    await cursor2.emit(ws2, session2)
+    assert "auto_approve_at" not in [f for f in ws2.sent if f["type"] == "status"][0]["data"]
+
+
 async def test_cursor_emits_pending_frames_before_complete(sm):
     """Frame order within one wake: reasoning/status must precede the complete
     frame, so a client that stops reading at 'complete' misses nothing."""

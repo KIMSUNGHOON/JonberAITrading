@@ -26,6 +26,7 @@ from app.core.analysis_limiter import (
     release_analysis_slot,
     update_session_status,
 )
+from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from services.session_manager import (
     MarketType,
     SessionStatus,
@@ -214,6 +215,9 @@ async def run_coin_analysis_task(session_id: str):
                 session_id=session_id,
                 market=market,
             )
+            # R3: in autonomous mode (gate-checked) this schedules a 60s-grace
+            # auto-approval; in HITL mode (or any gate deny) it is a no-op.
+            await maybe_schedule_auto_approve(session_id, "coin", session)
         elif state.get("error"):
             session["status"] = "error"
             session["error"] = state.get("error")

@@ -567,14 +567,19 @@ class _SessionFrameCursor:
 
         # Send status updates when status OR stage changes
         if current_status != self.last_status or stage != self.last_stage:
+            status_data = {
+                "status": current_status,
+                "stage": stage,
+                "awaiting_approval": state.get("awaiting_approval", False),
+            }
+            # R3 (additive, optional): rail countdown for a pending autonomous
+            # approval. Only present while the injector has one scheduled.
+            if state.get("auto_approve_at"):
+                status_data["auto_approve_at"] = state["auto_approve_at"]
             await websocket.send_json({
                 "type": "status",
                 "session_id": session_id,
-                "data": {
-                    "status": current_status,
-                    "stage": stage,
-                    "awaiting_approval": state.get("awaiting_approval", False),
-                },
+                "data": status_data,
             })
             logger.debug(
                 "websocket_status_sent",

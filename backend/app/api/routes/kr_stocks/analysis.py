@@ -26,6 +26,7 @@ from app.core.analysis_limiter import (
     release_analysis_slot,
 )
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from services.session_manager import (
     MarketType,
     SessionStatus,
@@ -209,6 +210,9 @@ async def run_kr_stock_analysis_task(session_id: str):
                 session_id=session_id,
                 stk_cd=stk_cd,
             )
+            # R3: in autonomous mode (gate-checked) this schedules a 60s-grace
+            # auto-approval; in HITL mode (or any gate deny) it is a no-op.
+            await maybe_schedule_auto_approve(session_id, "kiwoom", session)
         elif state.get("error"):
             session["status"] = "error"
             session["error"] = state.get("error")
