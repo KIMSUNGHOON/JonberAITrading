@@ -69,6 +69,7 @@ async def main() -> int:
         ("get_pending_orders", lambda: client.get_pending_orders()),
         ("get_filled_orders", lambda: client.get_filled_orders()),
         ("get_current_price", lambda: client.get_current_price(stk_cd)),
+        ("get_realized_pnl", lambda: client.get_realized_pnl()),
     ]
 
     failures = 0

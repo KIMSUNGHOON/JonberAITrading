@@ -271,6 +271,36 @@ class FilledOrder(BaseModel):
     buy_sell_tp: str = Field(..., description="매수매도구분")
 
 
+class DailyRealizedPnlRow(BaseModel):
+    """일자별 실현손익 행 (ka10074 dt_rlzt_pl 아이템)"""
+
+    dt: str = Field(..., description="일자 (YYYYMMDD)")
+    buy_amount: int = Field(default=0, description="매수금액")
+    sell_amount: int = Field(default=0, description="매도금액")
+    sell_pnl: int = Field(default=0, description="당일매도손익 (부호 보존)")
+    commission: int = Field(default=0, description="당일매매수수료")
+    tax: int = Field(default=0, description="당일매매세금")
+
+
+class RealizedPnl(BaseModel):
+    """기간 실현손익 (ka10074 응답).
+
+    daily-loss 브레이커와 성과 리포트의 데이터 소스 — realized_pnl은
+    부호를 보존한다 (손실 음수).
+    """
+
+    strt_dt: str = Field(..., description="조회 시작일 (YYYYMMDD)")
+    end_dt: str = Field(..., description="조회 종료일 (YYYYMMDD)")
+    total_buy_amount: int = Field(default=0, description="총매수금액")
+    total_sell_amount: int = Field(default=0, description="총매도금액")
+    realized_pnl: int = Field(default=0, description="실현손익 (부호 보존)")
+    commission: int = Field(default=0, description="매매수수료")
+    tax: int = Field(default=0, description="매매세금")
+    daily: list[DailyRealizedPnlRow] = Field(
+        default_factory=list, description="일자별 실현손익 (손익 발생 일자만)"
+    )
+
+
 class MarketType(str, Enum):
     """시장 구분 (ka10099 mrkt_tp)"""
 

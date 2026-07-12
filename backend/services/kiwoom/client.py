@@ -12,6 +12,7 @@ Rate Limiting:
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -32,6 +33,7 @@ from .models import (
     AccountBalance,
     CashBalance,
     ChartData,
+    DailyRealizedPnlRow,
     Exchange,
     FilledOrder,
     Holding,
@@ -42,11 +44,15 @@ from .models import (
     OrderResponse,
     OrderType,
     PendingOrder,
+    RealizedPnl,
     StockBasicInfo,
     StockListItem,
 )
 
 logger = structlog.get_logger()
+
+# 키움 서버 시간대 (실현손익 기본 조회일 계산)
+KST = timezone(timedelta(hours=9))
 
 
 class KiwoomClient:
@@ -835,6 +841,73 @@ class KiwoomClient:
             self._cache.set(cache_key, pending_orders)
 
         return pending_orders
+
+    async def get_realized_pnl(
+        self,
+        strt_dt: Optional[str] = None,
+        end_dt: Optional[str] = None,
+    ) -> RealizedPnl:
+        """
+        일자별실현손익요청 (ka10074)
+
+        daily-loss 브레이커(당일)와 성과 리포트(기간)의 데이터 소스.
+        스펙 주의: 실현손익이 발생한 일자만 데이터가 채워진다 — 무거래
+        기간이면 합계 0 + 빈 리스트가 정상이다. 손익은 부호를 보존한다.
+
+        Args:
+            strt_dt: 시작일자 YYYYMMDD (기본: 오늘 KST)
+            end_dt: 종료일자 YYYYMMDD (기본: strt_dt)
+
+        Returns:
+            RealizedPnl 객체
+        """
+        if strt_dt is None:
+            strt_dt = datetime.now(KST).strftime("%Y%m%d")
+        if end_dt is None:
+            end_dt = strt_dt
+
+        # 캐시 조회 (당일 값은 체결마다 변함 — 계좌 계열 짧은 TTL 사용)
+        cache_key = make_cache_key("realized_pnl", strt_dt, end_dt)
+        if self._cache:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        result = await self._request(
+            api_id="ka10074",
+            endpoint="/api/dostk/acnt",
+            data={"strt_dt": strt_dt, "end_dt": end_dt},
+        )
+
+        rows = result.get("dt_rlzt_pl", [])
+        if not isinstance(rows, list):
+            rows = [rows] if rows else []
+
+        pnl = RealizedPnl(
+            strt_dt=strt_dt,
+            end_dt=end_dt,
+            total_buy_amount=self._parse_signed_price(result.get("tot_buy_amt")),
+            total_sell_amount=self._parse_signed_price(result.get("tot_sell_amt")),
+            realized_pnl=self._parse_change(result.get("rlzt_pl")),
+            commission=self._parse_signed_price(result.get("trde_cmsn")),
+            tax=self._parse_signed_price(result.get("trde_tax")),
+            daily=[
+                DailyRealizedPnlRow(
+                    dt=row.get("dt", ""),
+                    buy_amount=self._parse_signed_price(row.get("buy_amt")),
+                    sell_amount=self._parse_signed_price(row.get("sell_amt")),
+                    sell_pnl=self._parse_change(row.get("tdy_sel_pl")),
+                    commission=self._parse_signed_price(row.get("tdy_trde_cmsn")),
+                    tax=self._parse_signed_price(row.get("tdy_trde_tax")),
+                )
+                for row in rows
+            ],
+        )
+
+        if self._cache:
+            self._cache.set(cache_key, pnl)
+
+        return pnl
 
     @staticmethod
     def _normalize_buy_sell(trde_tp: Optional[str], io_tp_nm: Optional[str]) -> str:
