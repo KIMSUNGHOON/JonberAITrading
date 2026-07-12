@@ -143,3 +143,6 @@ plans/
 
 # Old backend logs
 backend/2025-*
+
+# Official Kiwoom REST API reference clone (separate repo, not ours)
+Kiwoom-REST-API/
