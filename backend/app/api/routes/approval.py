@@ -39,28 +39,30 @@ router = APIRouter()
 # -------------------------------------------
 
 
-@router.post("/decide", response_model=ApprovalResponse)
-async def submit_approval(request: ApprovalRequest):
+async def submit_decision(
+    session_id: str,
+    decision: str,
+    feedback: str | None = None,
+    modifications: dict | None = None,
+    actor: str = "user",
+):
     """
-    Submit approval decision for a pending trade proposal.
+    Apply an approval decision and resume the LangGraph workflow from the
+    approval interrupt.
 
-    This resumes the LangGraph workflow from the approval interrupt.
-
-    Args:
-        request: Approval decision with session_id and decision
-
-    Returns:
-        Updated status after decision is processed
+    Extracted from the /decide route (R3) so the autonomy injector can submit
+    decisions programmatically with actor='system'. Raises the same
+    HTTPExceptions as the route; the route is a thin wrapper (actor='user').
     """
     # Search all session types: coin and Korean stock
     coin_sessions = get_coin_sessions()
     kr_stock_sessions = get_kr_stock_sessions()
-    session = coin_sessions.get(request.session_id) or kr_stock_sessions.get(request.session_id)
+    session = coin_sessions.get(session_id) or kr_stock_sessions.get(session_id)
 
     if not session:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {request.session_id} not found",
+            detail=f"Session {session_id} not found",
         )
 
     state = session["state"]
@@ -74,8 +76,8 @@ async def submit_approval(request: ApprovalRequest):
     # Log state BEFORE approval to verify analysis results exist
     logger.info(
         "approval_state_before",
-        session_id=request.session_id,
-        decision=request.decision,
+        session_id=session_id,
+        decision=decision,
         has_technical=state.get("technical_analysis") is not None,
         has_fundamental=state.get("fundamental_analysis") is not None,
         has_sentiment=state.get("sentiment_analysis") is not None,
@@ -84,20 +86,21 @@ async def submit_approval(request: ApprovalRequest):
     )
 
     # Update state with approval decision
-    state["approval_status"] = request.decision
-    state["user_feedback"] = request.feedback
+    state["approval_status"] = decision
+    state["user_feedback"] = feedback
     state["awaiting_approval"] = False
+    state["approval_actor"] = actor
 
     # Apply modifications if provided (proposal is now a dict)
-    if request.decision == "modified" and request.modifications:
+    if decision == "modified" and modifications:
         proposal = state.get("trade_proposal")
         if proposal:
-            for key, value in request.modifications.items():
+            for key, value in modifications.items():
                 if key in proposal:
                     proposal[key] = value
                     logger.debug(
                         "proposal_modified",
-                        session_id=request.session_id,
+                        session_id=session_id,
                         field=key,
                         value=value,
                     )
@@ -107,20 +110,21 @@ async def submit_approval(request: ApprovalRequest):
     # AWAITING_APPROVAL forever (never TTL-cleaned) and the session WebSocket's
     # sm fallback would replay the already-decided proposal after a restart.
     decision_updates = {
-        "approval_status": request.decision,
-        "user_feedback": request.feedback,
+        "approval_status": decision,
+        "user_feedback": feedback,
         "awaiting_approval": False,
+        "approval_actor": actor,
     }
-    if request.decision == "modified" and state.get("trade_proposal"):
+    if decision == "modified" and state.get("trade_proposal"):
         decision_updates["trade_proposal"] = state["trade_proposal"]
-    await mirror_session_state(request.session_id, decision_updates)
+    await mirror_session_state(session_id, decision_updates)
 
     # Resume graph execution - select appropriate graph based on session type
-    if request.session_id in kr_stock_sessions:
+    if session_id in kr_stock_sessions:
         graph = get_kr_stock_trading_graph()
     else:
         graph = get_coin_trading_graph()
-    config = {"configurable": {"thread_id": request.session_id}}
+    config = {"configurable": {"thread_id": session_id}}
 
     execution_status = None
 
@@ -131,9 +135,10 @@ async def submit_approval(request: ApprovalRequest):
     # LangGraph resume, and it also lets should_continue_*_execution see
     # approval_status (the old astream(None)-without-update routed to 'end').
     resume_update = {
-        "approval_status": request.decision,
-        "user_feedback": request.feedback,
+        "approval_status": decision,
+        "user_feedback": feedback,
         "awaiting_approval": False,
+        "approval_actor": actor,
     }
 
     try:
@@ -146,7 +151,7 @@ async def submit_approval(request: ApprovalRequest):
                         state.update(node_output)
                         # Legacy first, then sm mirror (fires the WS push notify)
                         await mirror_session_state(
-                            request.session_id, node_output, last_node=node_name
+                            session_id, node_output, last_node=node_name
                         )
                     session["last_node"] = node_name
 
@@ -154,7 +159,7 @@ async def submit_approval(request: ApprovalRequest):
         allocation_rationale = None
 
         # Update session status based on decision
-        if request.decision == "approved":
+        if decision == "approved":
             session["status"] = "completed"
             execution_status = state.get("execution_status", "completed")
 
@@ -179,7 +184,7 @@ async def submit_approval(request: ApprovalRequest):
                         synthesis = state.get("synthesis", {})
 
                         coordinator.add_to_watch_list(
-                            session_id=request.session_id,
+                            session_id=session_id,
                             ticker=ticker,
                             stock_name=stock_name,
                             signal=technical.get("signal", "hold"),
@@ -195,7 +200,7 @@ async def submit_approval(request: ApprovalRequest):
 
                         logger.info(
                             "watch_list_added",
-                            session_id=request.session_id,
+                            session_id=session_id,
                             ticker=ticker,
                             stock_name=stock_name,
                         )
@@ -214,7 +219,7 @@ async def submit_approval(request: ApprovalRequest):
 
                         logger.info(
                             "graph_execution_result",
-                            session_id=request.session_id,
+                            session_id=session_id,
                             ticker=ticker,
                             action=action,
                             execution_status=exec_status,
@@ -223,16 +228,16 @@ async def submit_approval(request: ApprovalRequest):
                 except Exception as e:
                     logger.error(
                         "auto_trading_connection_failed",
-                        session_id=request.session_id,
+                        session_id=session_id,
                         error=str(e),
                     )
                     # Don't fail the approval, just log the error
 
-        elif request.decision == "rejected":
+        elif decision == "rejected":
             # Re-analysis requested - session continues running
             session["status"] = "running"
             execution_status = "re_analyzing"
-        elif request.decision == "cancelled":
+        elif decision == "cancelled":
             # User cancelled the workflow
             session["status"] = "cancelled"
             execution_status = "cancelled"
@@ -242,12 +247,12 @@ async def submit_approval(request: ApprovalRequest):
             execution_status = state.get("execution_status", "completed")
 
         # Mirror the final status to the SessionManager (completed/running/cancelled)
-        await mirror_session_status(request.session_id, session["status"])
+        await mirror_session_status(session_id, session["status"])
 
         # Log state AFTER approval to verify analysis results are preserved
         logger.info(
             "approval_state_after",
-            session_id=request.session_id,
+            session_id=session_id,
             has_technical=state.get("technical_analysis") is not None,
             has_fundamental=state.get("fundamental_analysis") is not None,
             has_sentiment=state.get("sentiment_analysis") is not None,
@@ -257,7 +262,7 @@ async def submit_approval(request: ApprovalRequest):
 
         logger.info(
             "approval_processed",
-            session_id=request.session_id,
+            session_id=session_id,
             final_status=session["status"],
             execution_status=execution_status,
         )
@@ -270,7 +275,7 @@ async def submit_approval(request: ApprovalRequest):
 
         # WebSocket broadcast for real-time UI updates
         try:
-            if request.decision == "approved":
+            if decision == "approved":
                 if action == "WATCH":
                     technical = state.get("technical_analysis", {})
                     await broadcast_watch_added(
@@ -279,7 +284,7 @@ async def submit_approval(request: ApprovalRequest):
                         signal=technical.get("signal", "hold"),
                         confidence=technical.get("confidence", 0.5),
                         current_price=proposal.get("entry_price", 0),
-                        session_id=request.session_id,
+                        session_id=session_id,
                     )
                 elif action in ("BUY", "SELL"):
                     # Check if trade was queued or executed immediately
@@ -290,7 +295,7 @@ async def submit_approval(request: ApprovalRequest):
                             action=action,
                             quantity=proposal.get("quantity", 0),
                             price=proposal.get("entry_price", 0),
-                            session_id=request.session_id,
+                            session_id=session_id,
                         )
                     else:
                         await broadcast_trade_executed(
@@ -300,14 +305,14 @@ async def submit_approval(request: ApprovalRequest):
                             quantity=proposal.get("quantity", 0),
                             price=proposal.get("entry_price", 0),
                             total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
-                            session_id=request.session_id,
+                            session_id=session_id,
                         )
-            elif request.decision == "rejected":
+            elif decision == "rejected":
                 await broadcast_trade_rejected(
                     ticker=ticker,
                     stock_name=stock_name,
-                    reason=request.feedback,
-                    session_id=request.session_id,
+                    reason=feedback,
+                    session_id=session_id,
                 )
         except Exception as we:
             logger.warning("websocket_broadcast_failed", error=str(we))
@@ -316,7 +321,7 @@ async def submit_approval(request: ApprovalRequest):
         try:
             telegram = await get_telegram_notifier()
             if telegram.is_ready:
-                if request.decision == "approved":
+                if decision == "approved":
                     # WATCH action sends watch list notification
                     if action == "WATCH":
                         technical = state.get("technical_analysis", {})
@@ -340,11 +345,11 @@ async def submit_approval(request: ApprovalRequest):
                             price=proposal.get("entry_price", 0),
                             total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
                         )
-                elif request.decision == "rejected":
+                elif decision == "rejected":
                     await telegram.send_trade_rejected(
                         ticker=ticker,
                         stock_name=stock_name,
-                        reason=request.feedback or "User rejected the proposal",
+                        reason=feedback or "User rejected the proposal",
                     )
         except Exception as te:
             logger.warning("telegram_notification_failed", error=str(te))
@@ -352,40 +357,52 @@ async def submit_approval(request: ApprovalRequest):
     except Exception as e:
         logger.error(
             "approval_processing_failed",
-            session_id=request.session_id,
+            session_id=session_id,
             error=str(e),
         )
         session["status"] = "error"
         session["error"] = str(e)
-        await mirror_session_status(request.session_id, "error", error=str(e))
+        await mirror_session_status(session_id, "error", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process approval: {str(e)}",
         )
 
     # Build response message
-    if request.decision == "approved":
+    if decision == "approved":
         if allocation_rationale and "watch list" in allocation_rationale.lower():
             message = f"{allocation_rationale}"
         elif allocation_rationale and "queued" in allocation_rationale.lower():
             message = f"Trade approved. {allocation_rationale}"
         else:
             message = "Trade approved and executed successfully."
-    elif request.decision == "rejected":
+    elif decision == "rejected":
         message = "Trade rejected. Re-analyzing with your feedback..."
-    elif request.decision == "cancelled":
+    elif decision == "cancelled":
         message = "Analysis cancelled by user."
     else:  # modified
         message = "Trade modified and executed with changes."
 
     return ApprovalResponse(
-        session_id=request.session_id,
-        decision=request.decision,
+        session_id=session_id,
+        decision=decision,
         status=session["status"],
         message=message,
         execution_status=execution_status,
     )
 
+
+
+@router.post("/decide", response_model=ApprovalResponse)
+async def submit_approval(request: ApprovalRequest):
+    """HITL decide endpoint — thin wrapper over submit_decision (actor='user')."""
+    return await submit_decision(
+        request.session_id,
+        request.decision,
+        feedback=request.feedback,
+        modifications=request.modifications,
+        actor="user",
+    )
 
 @router.get("/pending", response_model=PendingApprovalsResponse)
 async def list_pending_approvals():

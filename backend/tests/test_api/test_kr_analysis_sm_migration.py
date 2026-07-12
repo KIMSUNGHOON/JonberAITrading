@@ -494,6 +494,32 @@ async def test_approval_approved_mirrors_completed_to_sm(sm, kr_sessions, monkey
     assert session.state.get("execution_status") == "skipped"
 
 
+async def test_approval_records_actor(sm, kr_sessions, monkeypatch):
+    """R3: every decision records WHO decided — 'user' via the route, 'system'
+    via the extracted submit_decision (the autonomy injector's entry point)."""
+    from app.api.routes.approval import submit_decision
+
+    session_id = "kr-actor-1"
+    await _seed_awaiting_approval(sm, kr_sessions, session_id)
+    graph = FakeApprovalGraph([])
+    monkeypatch.setattr("app.api.routes.approval.get_kr_stock_trading_graph", lambda: graph)
+
+    await submit_decision(session_id, "approved", actor="system")
+
+    session = await sm.get_session(session_id)
+    assert session.state.get("approval_actor") == "system"
+    assert graph.state_update.get("approval_actor") == "system"  # audit trail in the checkpoint
+
+    # The route path records 'user'
+    session_id2 = "kr-actor-2"
+    record2 = await _seed_awaiting_approval(sm, kr_sessions, session_id2)
+    from app.api.routes.approval import submit_approval
+    from app.api.schemas.approval import ApprovalRequest
+
+    await submit_approval(ApprovalRequest(session_id=session_id2, decision="approved"))
+    assert record2["state"].get("approval_actor") == "user"
+
+
 async def test_approval_rejected_mirrors_running_to_sm(sm, kr_sessions, monkeypatch):
     from app.api.routes.approval import submit_approval
     from app.api.schemas.approval import ApprovalRequest
