@@ -146,7 +146,11 @@ class KRStockTradeProposalResponse(BaseModel):
     id: str = Field(description="Proposal ID")
     stk_cd: str = Field(description="Stock code")
     stk_nm: Optional[str] = Field(default=None, description="Stock name")
-    action: Literal["BUY", "SELL", "HOLD"] = Field(description="Recommended action")
+    # All 7 KR TradeActions (agents.graph.kr_stock_state.TradeAction) — the
+    # graph proposes WATCH/AVOID/ADD/REDUCE too, not just order-shaped actions.
+    action: Literal["BUY", "SELL", "HOLD", "ADD", "REDUCE", "WATCH", "AVOID"] = Field(
+        description="Recommended action"
+    )
     quantity: int = Field(description="Recommended quantity (shares)")
     entry_price: Optional[int] = Field(default=None, description="Entry price (KRW)")
     stop_loss: Optional[int] = Field(default=None, description="Stop-loss price (KRW)")
