@@ -53,6 +53,10 @@ class TrackedOrder(BaseModel):
     take_profit: Optional[float] = None
     source_queue_id: Optional[str] = None
     source_session_id: Optional[str] = None
+    # Analysis risk score (1-10) carried from the originating proposal, so a
+    # post-fill position registers with the same risk the placement-fill path
+    # would have set on the position (F3 review LOW-a).
+    risk_score: Optional[int] = None
     placed_at: datetime = Field(default_factory=datetime.now)
     trade_date: str = ""  # YYYYMMDD local
     status: TrackedOrderStatus = TrackedOrderStatus.TRACKING
@@ -76,10 +80,19 @@ class PendingOrderTracker:
         self._orders: dict[str, TrackedOrder] = {}
 
     def register(self, order: TrackedOrder) -> None:
-        """Start tracking an order. A duplicate ord_no is ignored — the first
-        registration wins, since a later re-register would otherwise reset
-        filled_quantity/filled_amount and break the fill diff."""
-        if order.ord_no in self._orders:
+        """Start tracking an order.
+
+        A duplicate ord_no is ignored while the existing entry is still
+        TRACKING — the first registration wins, since a re-register would
+        reset filled_quantity/filled_amount and break the fill diff.
+
+        A TERMINAL entry (FILLED/EXPIRED/CANCELLED) is REPLACED instead:
+        brokers can reuse order numbers (notably across days), and a stale
+        terminal record must not silently swallow a new order's tracking
+        (F3 review M1b).
+        """
+        existing = self._orders.get(order.ord_no)
+        if existing is not None and existing.status == TrackedOrderStatus.TRACKING:
             return
         self._orders[order.ord_no] = order
 
@@ -106,15 +119,23 @@ class PendingOrderTracker:
 
         Re-applying an identical snapshot yields new_qty <= 0 for every
         order, so nothing is emitted (idempotent).
+
+        Matching requires BOTH ord_no AND ticker (stk_cd): brokers can reuse
+        order numbers, and a same-ord_no fill for a different stock must never
+        poison this order's diff arithmetic (F3 review M1a).
         """
         by_order: dict[str, list[FilledOrder]] = {}
         for fill in fills:
             by_order.setdefault(fill.ord_no, []).append(fill)
 
         deltas: list[FillDelta] = []
-        for ord_no, matching in by_order.items():
+        for ord_no, candidates in by_order.items():
             order = self._orders.get(ord_no)
             if order is None or order.status != TrackedOrderStatus.TRACKING:
+                continue
+
+            matching = [f for f in candidates if f.stk_cd == order.ticker]
+            if not matching:
                 continue
 
             snapshot_qty = sum(f.ccld_qty for f in matching)
@@ -157,9 +178,20 @@ class PendingOrderTracker:
         return expired
 
     def to_payload(self) -> list[dict]:
-        """JSON-safe snapshot of every tracked order (any status), for
-        persistence by the caller."""
-        return [o.model_dump(mode="json") for o in self._orders.values()]
+        """JSON-safe snapshot for persistence by the caller.
+
+        TRACKING orders are always kept. TERMINAL orders (FILLED/EXPIRED/
+        CANCELLED) are kept only for their own trade_date's day — same-day
+        FILLED records are the reconciler's stop-provenance source and the
+        day's idempotency evidence, while older terminal records would grow
+        the blob without bound (F3 review M2).
+        """
+        today = datetime.now().strftime("%Y%m%d")
+        return [
+            o.model_dump(mode="json")
+            for o in self._orders.values()
+            if o.status == TrackedOrderStatus.TRACKING or o.trade_date == today
+        ]
 
     @classmethod
     def from_payload(cls, raw: list[dict]) -> "PendingOrderTracker":

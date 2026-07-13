@@ -33,6 +33,8 @@ async def register_fill_as_position(
     take_profit: Optional[float],
     session_id: Optional[str] = None,
     source: str = "fill_tracker",
+    stop_loss_mode=None,  # Optional[StopLossMode]
+    risk_score: Optional[int] = None,
 ) -> None:
     """Register a filled position into both monitoring engines.
 
@@ -41,11 +43,22 @@ async def register_fill_as_position(
     itself; PositionManager.update_position assigns absolutely, so the
     existing-ticker branch sums existing.quantity + delta before passing it.
 
+    `stop_loss_mode`/`risk_score` are optional so the fill-tracker poll path
+    registers with the SAME semantics as the placement-fill path (which sets
+    both on the position); when omitted, the ManagedPosition model defaults
+    apply — existing consumers are unaffected (F3 review LOW-a).
+
     Coordinator registration happens first and unconditionally. PositionManager
     mirroring is best-effort: any failure (including PM not running) is caught
     and logged, never raised, since the coordinator registration already
     completed.
     """
+    optional_fields = {}
+    if stop_loss_mode is not None:
+        optional_fields["stop_loss_mode"] = stop_loss_mode
+    if risk_score is not None:
+        optional_fields["risk_score"] = risk_score
+
     coordinator._add_position(
         ManagedPosition(
             ticker=ticker,
@@ -60,6 +73,7 @@ async def register_fill_as_position(
             stop_loss=stop_loss,
             take_profit=take_profit,
             analysis_session_id=session_id,
+            **optional_fields,
         )
     )
 

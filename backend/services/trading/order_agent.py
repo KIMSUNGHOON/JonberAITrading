@@ -493,7 +493,20 @@ class OrderAgent:
         original_order: OrderRequest,
         results: List[OrderResult],
     ) -> OrderResult:
-        """Aggregate multiple split order results."""
+        """Aggregate multiple split order results.
+
+        F3 CRITICAL fix: 0 total fill is NOT "rejected" when at least one part
+        was ACCEPTED by the broker — an accepted-but-unfilled split is
+        "pending", exactly like a single order, so the coordinator registers
+        the remainder with the fill tracker. (The motivating incident was a
+        3-way split BUY, 0-fill at placement, fully filled hours later —
+        mapping it to "rejected" made it invisible to every defense engine.)
+        "rejected" only when EVERY part failed placement.
+
+        The per-part results (each with its own broker ord_no) are exposed via
+        `parts` — ka10076 fill tracking matches by ord_no, so consumers must
+        track each broker order individually, not the aggregate.
+        """
         total_filled = sum(r.filled_quantity for r in results)
         total_value = sum(r.filled_quantity * r.avg_price for r in results)
         avg_price = total_value / total_filled if total_filled > 0 else 0
@@ -503,6 +516,8 @@ class OrderAgent:
             status = "filled"
         elif total_filled > 0:
             status = "partial"
+        elif any(r.status != "rejected" for r in results):
+            status = "pending"
         else:
             status = "rejected"
 
@@ -516,6 +531,7 @@ class OrderAgent:
             status=status,
             filled_at=datetime.now() if total_filled > 0 else None,
             message=f"Split order: {len(results)} parts",
+            parts=list(results) if results else None,
         )
 
     async def cancel_order(self, order_id: str) -> bool:

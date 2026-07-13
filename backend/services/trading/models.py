@@ -274,6 +274,12 @@ class OrderResult(BaseModel):
     status: str  # pending, partial, filled, rejected, cancelled
     message: Optional[str] = None
 
+    # F3: split orders place SEVERAL broker orders, each with its own ord_no —
+    # the aggregate's order_id alone cannot drive per-order fill tracking
+    # (ka10076 matches by ord_no). Set by OrderAgent._aggregate_results so the
+    # fill tracker can register each part individually. None for single orders.
+    parts: Optional[List["OrderResult"]] = None
+
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.now)
     filled_at: Optional[datetime] = None

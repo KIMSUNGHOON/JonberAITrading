@@ -16,7 +16,7 @@ coordinator._add_position은 자체적으로 평균 합산하지만 PM.update_po
 from unittest.mock import AsyncMock, MagicMock
 
 from services.agent_chat.position_manager import MonitoredPosition, PositionManager
-from services.trading.models import ManagedPosition
+from services.trading.models import ManagedPosition, StopLossMode
 from services.trading.position_registration import register_fill_as_position
 
 
@@ -189,6 +189,48 @@ async def test_pm_not_running_skips_mirror_without_error(monkeypatch):
     )
 
     assert coordinator._add_position.call_count == 1
+
+
+async def test_optional_stop_mode_and_risk_score_thread_into_managed_position(monkeypatch):
+    """F3 review LOW-a: 폴링 경로가 발주 시점 체결 경로(coordinator.py:597-600)와
+    같은 의미로 등록되도록 stop_loss_mode/risk_score를 선택 인자로 스레딩한다.
+    미전달 시엔 ManagedPosition 기본값 유지(기존 3소비자 하위호환)."""
+    coordinator = _coordinator()
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(_pm(existing=None))),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=10,
+        avg_price=70000.0,
+        stop_loss=66500.0,
+        take_profit=77000.0,
+        stop_loss_mode=StopLossMode.AGENT_AUTO,
+        risk_score=6,
+    )
+
+    pos = coordinator._add_position.call_args.args[0]
+    assert pos.stop_loss_mode == StopLossMode.AGENT_AUTO
+    assert pos.risk_score == 6
+
+    # 미전달이면 모델 기본값 그대로 (하위호환)
+    coordinator2 = _coordinator()
+    await register_fill_as_position(
+        coordinator2,
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=10,
+        avg_price=70000.0,
+        stop_loss=66500.0,
+        take_profit=77000.0,
+    )
+    pos2 = coordinator2._add_position.call_args.args[0]
+    assert pos2.stop_loss_mode == StopLossMode.USER_APPROVAL
+    assert pos2.risk_score is None
 
 
 async def test_pm_lookup_failure_does_not_prevent_coordinator_registration(monkeypatch):

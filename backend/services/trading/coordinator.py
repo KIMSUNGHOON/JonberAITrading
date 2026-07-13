@@ -634,34 +634,48 @@ class ExecutionCoordinator:
         # exposure that nothing is watching yet — track the remainder so the
         # scheduler's ka10076 poll can pick up the post-fill later. SELL
         # unfilled remainders are out of scope (R5-P4).
+        #
+        # Split orders (F3 review CRITICAL): the aggregate carries per-part
+        # results in `result.parts`, each with its OWN broker ord_no. ka10076
+        # matches by ord_no, so every unfilled/partial part is tracked as its
+        # own TrackedOrder — one aggregate entry would poison the diff
+        # arithmetic (several broker orders summed against one total).
         if side == OrderSide.BUY and result.status in ("pending", "partial"):
-            remaining = order.quantity - result.filled_quantity
-            if remaining > 0:
+            registered: List[str] = []
+            for part in (result.parts or [result]):
+                if part.status not in ("pending", "partial"):
+                    continue
+                remaining = part.requested_quantity - part.filled_quantity
+                if remaining <= 0:
+                    continue
                 self.fill_tracker.register(
                     TrackedOrder(
-                        ord_no=result.order_id,
+                        ord_no=part.order_id,
                         ticker=ticker,
                         stock_name=stock_name or ticker,
                         side="buy",
-                        total_quantity=order.quantity,
-                        filled_quantity=result.filled_quantity,
-                        filled_amount=result.filled_quantity * result.avg_price,
+                        total_quantity=part.requested_quantity,
+                        filled_quantity=part.filled_quantity,
+                        filled_amount=part.filled_quantity * part.avg_price,
                         limit_price=entry_price,
                         stop_loss=stop_loss,
                         take_profit=take_profit,
                         source_queue_id=queue_id,
                         source_session_id=session_id,
+                        risk_score=risk_score,
                         trade_date=date.today().strftime("%Y%m%d"),
                     )
                 )
+                registered.append(f"{part.order_id}:{remaining}주")
+            if registered:
                 self._schedule_persist()
                 self._log_activity(
                     ActivityType.ORDER_PLACED,
-                    f"미체결 잔량 추적 등록: {stock_name or ticker} {remaining}주 "
-                    f"(ord_no={result.order_id})",
+                    f"미체결 잔량 추적 등록: {stock_name or ticker} "
+                    f"({', '.join(registered)})",
                     agent="order",
                     ticker=ticker,
-                    details={"ord_no": result.order_id, "remaining": remaining},
+                    details={"tracked": registered},
                 )
 
         return allocation
@@ -890,6 +904,25 @@ class ExecutionCoordinator:
                 logger.info(
                     f"[Coordinator] Expired {len(stale)} stale tracked orders on restore"
                 )
+
+            # F3 review M1c: restoring while the KRX session is CLOSED — the
+            # post-close ka10076 snapshot is final, so run ONE last poll (a
+            # fill that landed while the backend was down still becomes a
+            # defended position) and expire whatever remains. Kills overnight
+            # 30s polling and next-day tracking against reused ord_nos.
+            # Expiry here is log-only (no alerts — restart storm prevention).
+            if self.fill_tracker.tracking():
+                market_open = self._market_hours.get_market_session(
+                    MarketType.KRX
+                ).is_open
+                if not market_open:
+                    await self._poll_tracked_fills()
+                    closed_out = self.fill_tracker.expire_stale(today=None)
+                    if closed_out:
+                        logger.info(
+                            f"[Coordinator] Expired {len(closed_out)} tracked "
+                            f"orders on restore (market closed)"
+                        )
 
             logger.info(
                 f"[Coordinator] Restored {len(self._state.positions)} positions, "
@@ -1447,6 +1480,10 @@ class ExecutionCoordinator:
             logger.info("[Coordinator] Market opened — processing queued trades")
             await self.process_trade_queue()
         elif not is_open and self._market_was_open:
+            # F3 review HIGH: poll BEFORE expiring — the post-close ka10076
+            # snapshot is final and includes closing-auction fills; expiring
+            # first would drop a fill that landed on this very edge.
+            await self._poll_tracked_fills()
             await self._expire_tracked_orders_on_market_close()
         self._market_was_open = is_open
 
@@ -1518,6 +1555,10 @@ class ExecutionCoordinator:
                 take_profit=order.take_profit,
                 session_id=order.source_session_id,
                 source="fill_tracker",
+                # Match the placement-fill path's position semantics
+                # (stop_loss_mode from risk params, risk from the proposal).
+                stop_loss_mode=self.risk_params.stop_loss_mode,
+                risk_score=order.risk_score,
             )
 
             self._log_activity(
