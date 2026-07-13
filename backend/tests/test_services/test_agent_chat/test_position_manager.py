@@ -4,11 +4,15 @@ Tests for PositionManager
 Unit tests for the PositionManager that monitors positions in real-time.
 """
 
+import json
+from types import SimpleNamespace
+
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta
 
+import services.storage_service as ss
 from services.agent_chat.position_manager import (
     PositionManager,
     PositionManagerConfig,
@@ -23,6 +27,25 @@ from services.agent_chat.position_manager import (
 # -------------------------------------------
 # Fixtures
 # -------------------------------------------
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def temp_storage(tmp_path, monkeypatch):
+    """Isolated SQLite storage wired into the get_storage_service() singleton
+    (pattern from tests/test_services/test_r5_p1_execution_reliability.py).
+
+    autouse: PositionManager's add/update/remove_position now fire a
+    fire-and-forget persist task whenever a running event loop is present
+    (every ``async def`` test in this file). Without this fixture those
+    background writes would hit the REAL on-disk storage.db — the same file
+    the live :8001 backend uses — so every test in this module gets an
+    isolated DB whether or not it cares about persistence.
+    """
+    storage = ss.StorageService(db_path=tmp_path / "test_storage.db")
+    await storage.initialize()
+    monkeypatch.setattr(ss, "_storage_service", storage)
+    yield storage
+    monkeypatch.setattr(ss, "_storage_service", None)
 
 
 @pytest.fixture
@@ -597,3 +620,225 @@ class TestEventHistory:
         events = position_manager.get_events(limit=5)
 
         assert len(events) == 5
+
+
+# -------------------------------------------
+# Stop-Level Persistence Tests (F3 Task 7)
+# -------------------------------------------
+#
+# PositionManager stop levels (stop_loss/take_profit/trailing_stop_pct) lived
+# only in memory — a backend restart silently dropped every stop, requiring
+# manual re-registration. These pin the persist -> restart-simulation ->
+# restore round trip via SQLite (app_settings blob), mirroring
+# tests/test_services/test_r5_p1_execution_reliability.py's coordinator tests.
+
+_STOPS_KEY = "agent_chat:position_manager_state"
+
+
+def _fake_holding(ticker: str, name: str, qty: int, avg_price: int, cur_price: int):
+    """Minimal stand-in for services.kiwoom.models.Holding — sync_from_account
+    only reads these five attributes."""
+    return SimpleNamespace(
+        stk_cd=ticker,
+        stk_nm=name,
+        hldg_qty=qty,
+        avg_buy_prc=avg_price,
+        cur_prc=cur_price,
+    )
+
+
+def _fake_kiwoom_client(holdings):
+    account = SimpleNamespace(holdings=holdings)
+    client = AsyncMock()
+    client.get_account_balance = AsyncMock(return_value=account)
+    return client
+
+
+class TestStopLevelPersistence:
+    """Tests for stop-level persist/restore across a simulated restart."""
+
+    @pytest.mark.asyncio
+    async def test_update_position_persists_stops(self, position_manager, temp_storage):
+        """(a) update_position(stop_loss=...) is reflected in the storage blob
+        once explicitly persisted."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+        )
+
+        position_manager.update_position(
+            ticker="005930",
+            stop_loss=68875,
+            take_profit=79750,
+            trailing_stop_pct=5.0,
+        )
+        await position_manager._persist_stops()
+
+        blob = await temp_storage.get_app_setting(_STOPS_KEY)
+        assert blob is not None
+        data = json.loads(blob)
+        assert data["stops"]["005930"] == {
+            "stop_loss": 68875,
+            "take_profit": 79750,
+            "trailing_stop_pct": 5.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_restore_stop_overlay_restores_synced_tickers(self, config, temp_storage):
+        """(b) restart simulation: a fresh PM instance syncs two tickers from
+        the broker, then restore_stop_overlay() brings back their stops."""
+        pm1 = PositionManager(config=config)
+        pm1.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            stop_loss=68875,
+            take_profit=79750,
+        )
+        pm1.add_position(
+            ticker="000660",
+            stock_name="SK하이닉스",
+            quantity=10,
+            avg_price=115000,
+            stop_loss=110000,
+        )
+        await pm1._persist_stops()
+
+        # Simulate a restart: brand-new PM instance with nothing in memory.
+        pm2 = PositionManager(config=config)
+        holdings = [
+            _fake_holding("005930", "삼성전자", 100, 72500, 73000),
+            _fake_holding("000660", "SK하이닉스", 10, 115000, 116000),
+        ]
+        with patch(
+            "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+            AsyncMock(return_value=_fake_kiwoom_client(holdings)),
+        ):
+            await pm2.sync_from_account()
+
+        assert pm2.get_position("005930").stop_loss is None  # not yet restored
+
+        restored = await pm2.restore_stop_overlay()
+
+        assert restored == 2
+        pos_1 = pm2.get_position("005930")
+        assert pos_1.stop_loss == 68875
+        assert pos_1.take_profit == 79750
+        pos_2 = pm2.get_position("000660")
+        assert pos_2.stop_loss == 110000
+
+    @pytest.mark.asyncio
+    async def test_restore_stop_overlay_session_value_wins(self, config, temp_storage):
+        """Restore must NOT clobber a stop already set this session (e.g. by a
+        fresher broker sync or a manual update) — only None fields are filled."""
+        pm1 = PositionManager(config=config)
+        pm1.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            stop_loss=68875,
+        )
+        await pm1._persist_stops()
+
+        pm2 = PositionManager(config=config)
+        holdings = [_fake_holding("005930", "삼성전자", 100, 72500, 73000)]
+        with patch(
+            "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+            AsyncMock(return_value=_fake_kiwoom_client(holdings)),
+        ):
+            await pm2.sync_from_account()
+
+        # Session already set a different stop-loss before restore runs.
+        pm2.update_position(ticker="005930", stop_loss=70000)
+
+        restored = await pm2.restore_stop_overlay()
+
+        assert restored == 0
+        assert pm2.get_position("005930").stop_loss == 70000
+
+    @pytest.mark.asyncio
+    async def test_restore_stop_overlay_drops_stale_ticker_from_blob(
+        self, config, temp_storage
+    ):
+        """(c) a blob entry for a ticker the broker no longer confirms held is
+        discarded — both from the live overlay and from the blob itself."""
+        pm1 = PositionManager(config=config)
+        pm1.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            stop_loss=68875,
+        )
+        pm1.add_position(
+            ticker="999999",
+            stock_name="청산됨",
+            quantity=10,
+            avg_price=10000,
+            stop_loss=9000,
+        )
+        await pm1._persist_stops()
+
+        # Restart: broker sync only confirms 005930 — 999999 was fully sold.
+        pm2 = PositionManager(config=config)
+        holdings = [_fake_holding("005930", "삼성전자", 100, 72500, 73000)]
+        with patch(
+            "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+            AsyncMock(return_value=_fake_kiwoom_client(holdings)),
+        ):
+            await pm2.sync_from_account()
+
+        restored = await pm2.restore_stop_overlay()
+
+        assert restored == 1
+        assert pm2.get_position("999999") is None
+
+        blob = await temp_storage.get_app_setting(_STOPS_KEY)
+        data = json.loads(blob)
+        assert "999999" not in data["stops"]
+        assert data["stops"]["005930"]["stop_loss"] == 68875
+
+    @pytest.mark.asyncio
+    async def test_remove_position_removes_from_blob(self, position_manager, temp_storage):
+        """(d) remove_position drops the ticker from the persisted blob too."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            stop_loss=68875,
+        )
+        await position_manager._persist_stops()
+
+        blob = await temp_storage.get_app_setting(_STOPS_KEY)
+        assert "005930" in json.loads(blob)["stops"]
+
+        position_manager.remove_position("005930")
+        await position_manager._persist_stops()
+
+        blob = await temp_storage.get_app_setting(_STOPS_KEY)
+        data = json.loads(blob)
+        assert "005930" not in data.get("stops", {})
+
+    @pytest.mark.asyncio
+    async def test_restore_stop_overlay_no_blob_is_noop(self, position_manager, temp_storage):
+        """No persisted blob at all (fresh install) -> 0 restored, no crash."""
+        restored = await position_manager.restore_stop_overlay()
+        assert restored == 0
+
+    def test_schedule_persist_stops_without_running_loop_is_safe(self, position_manager):
+        """Sync caller with no running event loop: the fire-and-forget hook
+        must not raise (mutators call it unconditionally)."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            stop_loss=68875,
+        )
+        position_manager.update_position(ticker="005930", stop_loss=70000)
+        assert position_manager.remove_position("005930") is True

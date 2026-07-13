@@ -6,6 +6,7 @@ Triggers agent discussions for position management decisions.
 """
 
 import asyncio
+import json
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional, Callable, Any
@@ -360,6 +361,7 @@ class PositionManager:
         )
 
         self._positions[ticker] = position
+        self._schedule_persist_stops()
 
         logger.info(
             "position_added",
@@ -407,6 +409,7 @@ class PositionManager:
             position.trailing_stop_pct = trailing_stop_pct
 
         position.last_check = datetime.now()
+        self._schedule_persist_stops()
 
         return position
 
@@ -414,6 +417,7 @@ class PositionManager:
         """Remove a position from monitoring."""
         if ticker in self._positions:
             del self._positions[ticker]
+            self._schedule_persist_stops()
             logger.info("position_removed", ticker=ticker)
             return True
         return False
@@ -1057,6 +1061,119 @@ class PositionManager:
 
         except Exception as e:
             logger.error("position_sync_failed", error=str(e))
+
+    # -------------------------------------------
+    # Stop-Level Persistence (F3 Task 7)
+    # -------------------------------------------
+    #
+    # Stop-loss / take-profit / trailing-stop levels lived only in memory, so a
+    # backend restart silently dropped all of them — the operator had to
+    # manually re-register stops after every restart before defense resumed.
+    # These levels are agent-chat's own data (the broker doesn't know them), so
+    # local state IS the source of truth to persist — mirrors the R5-P1
+    # ExecutionCoordinator._persist_state/_schedule_persist pattern
+    # (services/trading/coordinator.py).
+
+    _STOPS_KEY = "agent_chat:position_manager_state"
+
+    def _schedule_persist_stops(self) -> None:
+        """Fire-and-forget persist from a (possibly sync) mutator. No-op without
+        a running event loop — e.g. a PositionManager built directly in a unit
+        test, or a sync caller invoked outside any async context (reconciler /
+        sync_from_account call add/update/remove_position synchronously). Never
+        raises."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            loop.create_task(self._persist_stops())
+        except Exception as e:
+            logger.warning("position_manager_persist_schedule_failed", error=str(e))
+
+    async def _persist_stops(self) -> None:
+        """Persist stop levels for all currently-monitored positions.
+
+        Best-effort — never raises, since it also runs from the fire-and-forget
+        hook above where there is nothing to catch the exception.
+        """
+        try:
+            from services.storage_service import get_storage_service
+
+            blob = json.dumps({
+                "stops": {
+                    ticker: {
+                        "stop_loss": position.stop_loss,
+                        "take_profit": position.take_profit,
+                        "trailing_stop_pct": position.trailing_stop_pct,
+                    }
+                    for ticker, position in self._positions.items()
+                }
+            })
+            storage = await get_storage_service()
+            await storage.set_app_setting(self._STOPS_KEY, blob)
+        except Exception as e:
+            logger.error("position_manager_persist_failed", error=str(e))
+
+    async def restore_stop_overlay(self) -> int:
+        """Restore persisted stop levels onto currently-monitored positions.
+
+        Meant to be called once, right after `sync_from_account()`, so
+        `self._positions` already reflects the current broker holdings:
+        - A ticker in the blob that is no longer held is dropped (never
+          resurrected as a position) — the final re-save below rewrites the
+          blob from `self._positions`, which naturally excludes it.
+        - A ticker still held has its stop fields restored ONLY where the
+          field is currently None — a value already set this session (by a
+          fresher broker sync or a manual update) wins over the stale blob.
+
+        Returns the number of tickers whose stops were restored.
+        """
+        try:
+            from services.storage_service import get_storage_service
+
+            storage = await get_storage_service()
+            blob = await storage.get_app_setting(self._STOPS_KEY)
+            if not blob:
+                return 0
+
+            data = json.loads(blob)
+            stops = data.get("stops") or {}
+            if not stops:
+                return 0
+
+            restored = 0
+            for ticker, saved in stops.items():
+                position = self._positions.get(ticker)
+                if position is None:
+                    # Not among the synced holdings — no resurrection; dropped
+                    # from the blob by the unconditional re-save below.
+                    continue
+
+                kwargs: Dict[str, float] = {}
+                if position.stop_loss is None and saved.get("stop_loss") is not None:
+                    kwargs["stop_loss"] = saved["stop_loss"]
+                if position.take_profit is None and saved.get("take_profit") is not None:
+                    kwargs["take_profit"] = saved["take_profit"]
+                if (
+                    position.trailing_stop_pct is None
+                    and saved.get("trailing_stop_pct") is not None
+                ):
+                    kwargs["trailing_stop_pct"] = saved["trailing_stop_pct"]
+
+                if kwargs:
+                    self.update_position(ticker, **kwargs)
+                    restored += 1
+
+            # Unconditional re-save: reflects the restores above and drops any
+            # blob ticker no longer present in self._positions.
+            await self._persist_stops()
+
+            logger.info("position_manager_stops_restored", count=restored)
+            return restored
+        except Exception as e:
+            logger.error("position_manager_restore_failed", error=str(e))
+            return 0
 
 
 # -------------------------------------------

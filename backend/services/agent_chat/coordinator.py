@@ -131,6 +131,11 @@ class ChatCoordinator:
         # Sync positions from account
         await self._position_manager.sync_from_account()
 
+        # Restore persisted stop levels (F3 Task 7) — must run AFTER the sync
+        # above so it only ever restores stops onto tickers the broker still
+        # confirms are held.
+        await self._position_manager.restore_stop_overlay()
+
         # Schedule periodic watch list check
         self._scheduler.add_job(
             self._check_watch_list,
