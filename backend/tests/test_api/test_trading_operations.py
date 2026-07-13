@@ -195,6 +195,33 @@ async def test_operations_holding_stops_trading_coordinator_wins():
     assert res.errors == {}
 
 
+async def test_operations_holding_stops_per_field_coalescing():
+    """양쪽 소스 모두 존재 + 코디네이터 stop_loss=None/take_profit 有 →
+    stop_loss는 PM 값, take_profit은 코디네이터 값 (per-FIELD coalescing —
+    ManagedPosition 존재 자체가 agent-chat 스탑을 가리면 안 된다)."""
+    holding = Holding(stk_cd="005930", stk_nm="삼성전자", hldg_qty=10,
+                      avg_buy_prc=260000, cur_prc=266000, evlu_amt=2660000,
+                      evlu_pfls_amt=60000, evlu_pfls_rt=2.31)
+    pos = ManagedPosition(ticker="005930", stock_name="삼성전자", quantity=10,
+                          avg_price=260000.0, stop_loss=None, take_profit=289440.0)
+    pm = MagicMock()
+    pm.get_position.return_value = _chat_position(stop_loss=250000.0, take_profit=222222.0)
+
+    with patch.object(trading_mod, "get_session_manager",
+                      AsyncMock(return_value=_sm([]))), \
+         patch.object(trading_mod, "get_shared_kiwoom_client_async",
+                      AsyncMock(return_value=_kiwoom(holdings=[holding]))), \
+         patch.object(trading_mod, "get_chat_coordinator",
+                      AsyncMock(return_value=_chat_coordinator(pm))):
+        res = await trading_mod.get_operations(
+            market="kiwoom", coordinator=_coordinator(positions=[pos]))
+
+    assert res.holding[0].stop_loss == 250000.0    # PM이 보충 (코디네이터 None)
+    assert res.holding[0].take_profit == 289440.0  # 코디네이터 값 우선 (non-None)
+    pm.get_position.assert_called_once_with("005930")
+    assert res.errors == {}
+
+
 async def test_operations_holding_survives_agent_chat_coordinator_failure():
     """agent-chat 코디네이터 조회 실패 → holding은 브로커 데이터로 정상 반환, 스탑=None, errors 無."""
     holding = Holding(stk_cd="005930", stk_nm="삼성전자", hldg_qty=10,

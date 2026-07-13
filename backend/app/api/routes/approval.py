@@ -24,6 +24,7 @@ from app.api.schemas.approval import (
 from app.dependencies import get_trading_coordinator
 from services.session_manager import (
     MarketType,
+    SessionStatus,
     get_session_manager,
     mirror_session_state,
     mirror_session_status,
@@ -584,9 +585,20 @@ async def _adopt_session_from_manager(
     row) and register it into the correct dict so the rest of submit_decision
     — and any later lookups — work unchanged.
 
-    Fail-closed: only KIWOOM (kr stock) and COIN sessions are adopted. A
-    lookup miss, sm error, or any other market_type returns None so the
-    caller 404s.
+    Fail-closed, validated BEFORE any registration (no zombie entries on
+    failed probes):
+    - only sm status == AWAITING_APPROVAL is adoptable. A settled session
+      (cancelled/completed/error/running) returns None so the caller 404s —
+      even if its state dict still says awaiting_approval=True (the cancel
+      path clears status but not state; if the CANCELLED mirror write failed
+      silently the row could survive the restart load filter, and adopting it
+      would let an approve resume a proposal the user already vetoed).
+    - only KIWOOM (kr stock) and COIN market types are adopted; anything else
+      returns None so the caller 404s.
+    - the state-level awaiting_approval check runs before registration too: a
+      status=AWAITING_APPROVAL row whose state says it is NOT awaiting (mirror
+      lag) is returned WITHOUT being registered, so the caller 400s and the
+      legacy dict stays clean.
     """
     try:
         manager = await get_session_manager()
@@ -602,12 +614,18 @@ async def _adopt_session_from_manager(
     if sm_session is None:
         return None
 
+    if sm_session.status != SessionStatus.AWAITING_APPROVAL:
+        logger.warning(
+            "sm_session_adopt_refused_not_awaiting_status",
+            session_id=session_id,
+            sm_status=str(sm_session.status),
+        )
+        return None
+
     if sm_session.market_type == MarketType.KIWOOM:
-        legacy_session = sm_session.to_legacy_dict()
-        kr_stock_sessions[session_id] = legacy_session
+        target_dict = kr_stock_sessions
     elif sm_session.market_type == MarketType.COIN:
-        legacy_session = sm_session.to_legacy_dict()
-        coin_sessions[session_id] = legacy_session
+        target_dict = coin_sessions
     else:
         logger.warning(
             "sm_session_adopt_unsupported_market_type",
@@ -615,6 +633,20 @@ async def _adopt_session_from_manager(
             market_type=str(sm_session.market_type),
         )
         return None
+
+    legacy_session = sm_session.to_legacy_dict()
+
+    # State-level awaiting check BEFORE registering: return unregistered so
+    # the caller's own awaiting check raises 400 without leaving a zombie
+    # entry in the legacy dict.
+    if not legacy_session["state"].get("awaiting_approval"):
+        logger.warning(
+            "sm_session_adopt_refused_state_not_awaiting",
+            session_id=session_id,
+        )
+        return legacy_session
+
+    target_dict[session_id] = legacy_session
 
     logger.info(
         "sm_session_adopted",

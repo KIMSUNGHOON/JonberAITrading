@@ -1274,11 +1274,15 @@ async def get_operations(
             stops = {p.ticker: p for p in coordinator.state.positions}
 
             # 스탑 소스 2순위: agent-chat PositionManager (services/agent_chat/
-            # position_manager.py). 트레이딩 코디네이터에 해당 티커의 ManagedPosition이
-            # 없을 때만(지연) 조회 — 있으면 그 소스가 우선(1순위). 조회 자체가 실패하거나
-            # 코디네이터/포지션매니저가 미기동이어도 홀딩 섹션은 그대로 살아남는다
-            # (agent_chat.py:753 GET /positions와 동일한 방어: get_chat_coordinator →
-            # position_manager None 체크).
+            # position_manager.py). 필드별 coalescing — 트레이딩 코디네이터
+            # ManagedPosition의 stop_loss/take_profit 각각이 None이 아니면 그 값이
+            # 우선(1순위)이고, None인 필드만 PositionManager에서 보충한다(포지션
+            # 존재 자체가 스탑을 가리지 않도록; 예: 코디네이터 포지션에
+            # stop_loss=None인데 agent-chat 스탑이 걸려 있는 경우). 양 필드가 모두
+            # 코디네이터에서 채워지면 PM은 조회하지 않는다(지연). 조회 자체가
+            # 실패하거나 코디네이터/포지션매니저가 미기동이어도 홀딩 섹션은 그대로
+            # 살아남는다 (agent_chat.py:753 GET /positions와 동일한 방어:
+            # get_chat_coordinator → position_manager None 체크).
             chat_pm_box: Dict[str, Any] = {}
 
             async def _chat_pm():
@@ -1292,15 +1296,18 @@ async def get_operations(
 
             async def _stops_for(ticker: str):
                 managed = stops.get(ticker)
-                if managed is not None:
-                    return managed.stop_loss, managed.take_profit
+                stop_loss = getattr(managed, "stop_loss", None)
+                take_profit = getattr(managed, "take_profit", None)
+                if stop_loss is not None and take_profit is not None:
+                    return stop_loss, take_profit
                 pm = await _chat_pm()
-                if pm is None:
-                    return None, None
-                pos = pm.get_position(ticker)
-                if pos is None:
-                    return None, None
-                return pos.stop_loss, pos.take_profit
+                pos = pm.get_position(ticker) if pm is not None else None
+                if pos is not None:
+                    if stop_loss is None:
+                        stop_loss = pos.stop_loss
+                    if take_profit is None:
+                        take_profit = pos.take_profit
+                return stop_loss, take_profit
 
             # balance.holdings = services.kiwoom.models.Holding (kt00004) —
             # 실제 필드는 hldg_qty/avg_buy_prc/cur_prc/evlu_pfls_amt/evlu_pfls_rt

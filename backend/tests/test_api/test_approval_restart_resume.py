@@ -12,6 +12,13 @@ re-adopt a legacy-compatible dict into the correct dict (kr vs coin, chosen
 by market_type) so the rest of submit_decision (state mutation, graph resume,
 WS mirrors) runs unchanged, and subsequent lookups hit the legacy dict
 directly.
+
+Hardening (adversarial review): adoption is gated on sm status ==
+AWAITING_APPROVAL and validated BEFORE registration — a CANCELLED row whose
+state dict still says awaiting_approval=True (cancel clears status, not
+state; a silently-failed CANCELLED mirror could leave such a row surviving
+the restart load filter) must NOT be adoptable, or an approve would resume a
+proposal the user already vetoed.
 """
 
 from unittest.mock import AsyncMock
@@ -22,15 +29,25 @@ import app.api.routes.approval as approval_module
 from services.session_manager import AnalysisSession, MarketType, SessionStatus
 
 
-def _sm_kiwoom_session(session_id: str, *, awaiting_approval: bool = True) -> AnalysisSession:
+def _sm_session(
+    session_id: str,
+    *,
+    market_type: MarketType = MarketType.KIWOOM,
+    status: SessionStatus = SessionStatus.AWAITING_APPROVAL,
+    awaiting_approval: bool = True,
+) -> AnalysisSession:
+    if market_type == MarketType.KIWOOM:
+        kwargs = {"ticker": "005930", "display_name": "삼성전자",
+                  "stk_cd": "005930", "stk_nm": "삼성전자"}
+    elif market_type == MarketType.COIN:
+        kwargs = {"ticker": "KRW-BTC", "display_name": "비트코인",
+                  "market": "KRW-BTC", "korean_name": "비트코인"}
+    else:
+        kwargs = {"ticker": "AAPL", "display_name": "Apple Inc"}
     return AnalysisSession(
         session_id=session_id,
-        market_type=MarketType.KIWOOM,
-        ticker="005930",
-        display_name="삼성전자",
-        status=SessionStatus.AWAITING_APPROVAL if awaiting_approval else SessionStatus.COMPLETED,
-        stk_cd="005930",
-        stk_nm="삼성전자",
+        market_type=market_type,
+        status=status,
         state={
             "awaiting_approval": awaiting_approval,
             "approval_status": None,
@@ -42,6 +59,7 @@ def _sm_kiwoom_session(session_id: str, *, awaiting_approval: bool = True) -> An
             },
             "reasoning_log": [],
         },
+        **kwargs,
     )
 
 
@@ -128,47 +146,55 @@ def wired(monkeypatch):
     def set_graph(graph):
         monkeypatch.setattr(approval_module, "get_kr_stock_trading_graph", lambda: graph)
 
-    return coin_sessions, kr_stock_sessions, reschedule_calls, set_sm_session, set_graph
+    def set_coin_graph(graph):
+        monkeypatch.setattr(approval_module, "get_coin_trading_graph", lambda: graph)
+
+    return {
+        "coin_sessions": coin_sessions,
+        "kr_stock_sessions": kr_stock_sessions,
+        "reschedule_calls": reschedule_calls,
+        "set_sm_session": set_sm_session,
+        "set_graph": set_graph,
+        "set_coin_graph": set_coin_graph,
+    }
 
 
 @pytest.mark.asyncio
 async def test_approve_after_restart_falls_back_to_session_manager(wired):
     """Legacy dicts empty; sm has an AWAITING_APPROVAL kiwoom session -> no 404."""
-    coin_sessions, kr_stock_sessions, _reschedule_calls, set_sm_session, set_graph = wired
     session_id = "restart-approve-1"
-    set_sm_session(_sm_kiwoom_session(session_id))
+    wired["set_sm_session"](_sm_session(session_id))
     graph = _FakeGraph(
         [{"execution": {"execution_status": "completed", "awaiting_approval": False}}]
     )
-    set_graph(graph)
+    wired["set_graph"](graph)
 
     result = await approval_module.submit_decision(session_id, "approved")
 
     assert result.session_id == session_id
     assert result.status == "completed"
     # Decision applied to the (adopted) session state.
-    assert kr_stock_sessions[session_id]["state"]["approval_status"] == "approved"
-    assert kr_stock_sessions[session_id]["state"]["awaiting_approval"] is False
+    assert wired["kr_stock_sessions"][session_id]["state"]["approval_status"] == "approved"
+    assert wired["kr_stock_sessions"][session_id]["state"]["awaiting_approval"] is False
     # Resume machinery was actually invoked (not a fork / no-op).
     graph.aupdate_state.assert_awaited_once()
     resume_config, resume_update = graph.aupdate_state.await_args.args
     assert resume_config == {"configurable": {"thread_id": session_id}}
     assert resume_update["approval_status"] == "approved"
     # Re-adopted into the legacy dict so subsequent lookups hit it directly.
-    assert session_id in kr_stock_sessions
-    assert session_id not in coin_sessions
+    assert session_id in wired["kr_stock_sessions"]
+    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio
 async def test_reject_after_restart_falls_back_to_session_manager(wired):
     """Same restart scenario, decision='rejected' -> no 404, rejection path runs."""
-    coin_sessions, kr_stock_sessions, _reschedule_calls, set_sm_session, set_graph = wired
     session_id = "restart-reject-1"
-    set_sm_session(_sm_kiwoom_session(session_id))
+    wired["set_sm_session"](_sm_session(session_id))
     graph = _FakeGraph(
         [{"re_analyze": {"approval_status": None}}, {"finalize": {"awaiting_approval": False}}]
     )
-    set_graph(graph)
+    wired["set_graph"](graph)
 
     result = await approval_module.submit_decision(session_id, "rejected", feedback="too pricey")
 
@@ -183,8 +209,35 @@ async def test_reject_after_restart_falls_back_to_session_manager(wired):
     resume_config, resume_update = graph.aupdate_state.await_args.args
     assert resume_config == {"configurable": {"thread_id": session_id}}
     assert resume_update["approval_status"] == "rejected"
-    assert kr_stock_sessions[session_id]["status"] == "running"
-    assert session_id in kr_stock_sessions
+    assert wired["kr_stock_sessions"][session_id]["status"] == "running"
+    assert session_id in wired["kr_stock_sessions"]
+
+
+@pytest.mark.asyncio
+async def test_coin_session_adopted_into_coin_dict_and_coin_graph_resumed(wired):
+    """COIN market adoption happy path: registered into coin_sessions, coin resume invoked."""
+    session_id = "restart-coin-1"
+    wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.COIN))
+    coin_graph = _FakeGraph(
+        [{"execution": {"execution_status": "completed", "awaiting_approval": False}}]
+    )
+    wired["set_coin_graph"](coin_graph)
+    # If the kr graph were (wrongly) selected, this sentinel would blow up.
+    wired["set_graph"](None)
+
+    result = await approval_module.submit_decision(session_id, "approved")
+
+    assert result.session_id == session_id
+    assert result.status == "completed"
+    # Registered into the COIN dict, not the KR one.
+    assert session_id in wired["coin_sessions"]
+    assert session_id not in wired["kr_stock_sessions"]
+    assert wired["coin_sessions"][session_id]["market"] == "KRW-BTC"
+    # The COIN graph's resume machinery ran.
+    coin_graph.aupdate_state.assert_awaited_once()
+    resume_config, resume_update = coin_graph.aupdate_state.await_args.args
+    assert resume_config == {"configurable": {"thread_id": session_id}}
+    assert resume_update["approval_status"] == "approved"
 
 
 @pytest.mark.asyncio
@@ -192,8 +245,7 @@ async def test_unknown_session_still_404s(wired):
     """Miss in both legacy dicts AND session_manager -> 404 preserved."""
     from fastapi import HTTPException
 
-    _coin_sessions, _kr_stock_sessions, _reschedule_calls, set_sm_session, _set_graph = wired
-    set_sm_session(None)
+    wired["set_sm_session"](None)
 
     with pytest.raises(HTTPException) as exc_info:
         await approval_module.submit_decision("does-not-exist", "approved")
@@ -203,15 +255,64 @@ async def test_unknown_session_still_404s(wired):
 
 @pytest.mark.asyncio
 async def test_sm_session_not_awaiting_approval_400s(wired):
-    """sm session exists but is already settled -> 400, not 404."""
+    """sm status row says awaiting but state says settled (mirror lag) -> 400, not 404.
+
+    Also: the failed probe must NOT leave a zombie entry in the legacy dicts.
+    """
     from fastapi import HTTPException
 
-    _coin_sessions, _kr_stock_sessions, _reschedule_calls, set_sm_session, _set_graph = wired
     session_id = "restart-settled-1"
-    set_sm_session(_sm_kiwoom_session(session_id, awaiting_approval=False))
+    wired["set_sm_session"](
+        _sm_session(session_id, status=SessionStatus.AWAITING_APPROVAL, awaiting_approval=False)
+    )
 
     with pytest.raises(HTTPException) as exc_info:
         await approval_module.submit_decision(session_id, "approved")
 
     assert exc_info.value.status_code == 400
     assert "not awaiting approval" in exc_info.value.detail
+    assert session_id not in wired["kr_stock_sessions"]
+    assert session_id not in wired["coin_sessions"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sm_session_is_never_adopted(wired):
+    """status=CANCELLED but state.awaiting_approval=True (failed mirror write) -> 404.
+
+    The cancel path clears the sm STATUS but not state["awaiting_approval"];
+    if the CANCELLED mirror write failed silently, the row could survive the
+    restart load filter with a stale awaiting state. Adopting it would let an
+    approve resume a proposal the user already vetoed — the status gate must
+    refuse (404) and must not register anything.
+    """
+    from fastapi import HTTPException
+
+    session_id = "restart-cancelled-1"
+    wired["set_sm_session"](
+        _sm_session(session_id, status=SessionStatus.CANCELLED, awaiting_approval=True)
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "approved")
+
+    assert exc_info.value.status_code == 404
+    assert session_id not in wired["kr_stock_sessions"]
+    assert session_id not in wired["coin_sessions"]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_market_type_fails_closed_404(wired):
+    """market_type=STOCK (US stack removed) -> 404, never adopted."""
+    from fastapi import HTTPException
+
+    session_id = "restart-stock-1"
+    wired["set_sm_session"](
+        _sm_session(session_id, market_type=MarketType.STOCK)
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "approved")
+
+    assert exc_info.value.status_code == 404
+    assert session_id not in wired["kr_stock_sessions"]
+    assert session_id not in wired["coin_sessions"]
