@@ -90,6 +90,7 @@ async def submit_decision(
     feedback: str | None = None,
     modifications: dict | None = None,
     actor: str = "user",
+    expected_proposal_id: str | None = None,
 ):
     """
     Apply an approval decision and resume the LangGraph workflow from the
@@ -103,10 +104,19 @@ async def submit_decision(
     _decision_locks above). The autonomy injector calls this only from a
     detached asyncio task after its grace sleep — never from within this call
     chain — so the lock cannot deadlock.
+
+    expected_proposal_id (system actor only, CRITICAL/F4b): the autonomy
+    injector's grace-window timer already checks the proposal id BEFORE
+    calling this function, but that check runs OUTSIDE the per-session lock.
+    A reject -> re-analysis cycle can replace state["trade_proposal"] with a
+    NEW id in the window between that outside check and the timer actually
+    acquiring the lock here — see _submit_decision_locked, which re-validates
+    the pin AFTER the lock is held, closing that TOCTOU race. Never passed
+    (stays None) for actor='user'.
     """
     async with _session_decision_lock(session_id):
         return await _submit_decision_locked(
-            session_id, decision, feedback, modifications, actor
+            session_id, decision, feedback, modifications, actor, expected_proposal_id
         )
 
 
@@ -116,6 +126,7 @@ async def _submit_decision_locked(
     feedback: str | None = None,
     modifications: dict | None = None,
     actor: str = "user",
+    expected_proposal_id: str | None = None,
 ):
     # Search all session types: coin and Korean stock
     coin_sessions = get_coin_sessions()
@@ -139,6 +150,24 @@ async def _submit_decision_locked(
         )
 
     state = session["state"]
+
+    # CRITICAL (F4b t1): re-validate the pinned proposal id INSIDE the lock.
+    # The injector's outside pre-check (see _autonomy_injector) can pass, then
+    # a reject -> re-analysis replaces state["trade_proposal"] with a NEW id
+    # before this stale timer actually acquires the per-session lock. Without
+    # this check, that timer would approve a proposal the user never saw.
+    # Scoped to actor=='system' only — user decisions never pin an id and
+    # this must never affect the user-facing /decide route.
+    if actor == "system" and expected_proposal_id is not None:
+        current_proposal_id = (state.get("trade_proposal") or {}).get("id")
+        if current_proposal_id != expected_proposal_id:
+            logger.info(
+                "auto_approve_stood_down_inside_lock",
+                session_id=session_id,
+                scheduled_for=expected_proposal_id,
+                current=current_proposal_id,
+            )
+            return {"status": "stood_down", "reason": "proposal_changed"}
 
     if not state.get("awaiting_approval"):
         if decision == "cancelled":

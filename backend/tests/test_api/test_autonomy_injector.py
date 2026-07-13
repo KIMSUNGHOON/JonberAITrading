@@ -57,8 +57,20 @@ def gate_allow(monkeypatch):
 def submit_recorder(monkeypatch):
     calls = []
 
-    async def fake_submit(session_id, decision, feedback=None, modifications=None, actor="user"):
-        calls.append({"session_id": session_id, "decision": decision, "actor": actor})
+    async def fake_submit(
+        session_id,
+        decision,
+        feedback=None,
+        modifications=None,
+        actor="user",
+        expected_proposal_id=None,
+    ):
+        calls.append({
+            "session_id": session_id,
+            "decision": decision,
+            "actor": actor,
+            "expected_proposal_id": expected_proposal_id,
+        })
 
     monkeypatch.setattr("app.api.routes.approval.submit_decision", fake_submit)
     return calls
@@ -123,6 +135,7 @@ async def test_auto_approves_after_grace_as_system(sm, fast_grace, gate_allow, s
         "session_id": session_id,
         "decision": "approved",
         "actor": "system",
+        "expected_proposal_id": "p1",
     }
     # Gate ran twice: pre-check + re-check after the grace
     assert len(gate_allow) == 2

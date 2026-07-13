@@ -168,7 +168,18 @@ async def _auto_approve_after_grace(
         # module level from a routes module would create a cycle.
         from app.api.routes import approval
 
-        await approval.submit_decision(session_id, "approved", actor="system")
+        # expected_proposal_id closes the TOCTOU window: submit_decision
+        # re-validates this pin INSIDE its per-session lock (see
+        # approval._submit_decision_locked) in case the outside check above
+        # passed but a reject -> re-analysis replaced the proposal before this
+        # call actually acquired the lock. A stand-down there returns a plain
+        # dict ({"status": "stood_down", ...}) rather than raising — this
+        # call site doesn't need to inspect it (no mutation happened either
+        # way) and the log line below is harmlessly imprecise in that rare
+        # race (belt-and-braces logging is not worth the extra branch here).
+        await approval.submit_decision(
+            session_id, "approved", actor="system", expected_proposal_id=proposal_id
+        )
         logger.info("auto_approved", session_id=session_id, market=market)
     except Exception as e:
         # Fail-closed: the session stays awaiting_approval; HITL owns it.

@@ -135,3 +135,80 @@ async def test_approved_never_rearms(wired):
 
     assert sessions["s3"]["status"] == "completed"
     assert reschedule_calls == []
+
+
+# --- Task 1 (F4b, CRITICAL): atomic proposal-ID pin -------------------------
+#
+# The autonomy injector's grace-window timer checks the proposal id BEFORE
+# calling submit_decision (see _autonomy_injector._auto_approve_after_grace).
+# But that check happens OUTSIDE the per-session decision lock: a reject ->
+# re-analysis can replace state["trade_proposal"] with a NEW id in the window
+# between that outside check and the timer actually acquiring the lock inside
+# submit_decision. Without a check taken INSIDE the lock, the stale timer can
+# still approve a proposal the user never saw. These tests pin the fix.
+
+@pytest.mark.asyncio
+async def test_system_approve_stands_down_when_proposal_replaced(wired):
+    """TOCTOU: proposal replaced ("P1" -> "P2") between the injector's outside
+    pin check and the lock being acquired -> stand down silently. No resume,
+    no state mutation, no status change."""
+    sessions, reschedule_calls, set_graph = wired
+    sessions["s4"] = _kr_session("s4")
+    sessions["s4"]["state"]["trade_proposal"]["id"] = "P2"  # replaced while stale timer waited
+    graph = _FakeGraph([])
+    set_graph(graph)
+
+    result = await approval_module.submit_decision(
+        "s4", "approved", actor="system", expected_proposal_id="P1"
+    )
+
+    assert result == {"status": "stood_down", "reason": "proposal_changed"}
+    graph.aupdate_state.assert_not_awaited()
+    assert sessions["s4"]["status"] == "awaiting_approval"
+    assert sessions["s4"]["state"]["approval_status"] is None
+    assert sessions["s4"]["state"]["awaiting_approval"] is True
+    assert reschedule_calls == []
+
+
+@pytest.mark.asyncio
+async def test_system_approve_proceeds_when_id_matches(wired):
+    """The pinned id still matches what's live -> normal approval proceeds."""
+    sessions, reschedule_calls, set_graph = wired
+    sessions["s5"] = _kr_session("s5")
+    sessions["s5"]["state"]["trade_proposal"]["id"] = "P1"
+    graph = _FakeGraph([
+        {"execution": {"execution_status": "completed", "awaiting_approval": False}},
+    ])
+    set_graph(graph)
+
+    result = await approval_module.submit_decision(
+        "s5", "approved", actor="system", expected_proposal_id="P1"
+    )
+
+    assert result.status == "completed"
+    assert result.decision == "approved"
+    graph.aupdate_state.assert_awaited_once()
+    assert sessions["s5"]["state"]["approval_status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_user_decision_ignores_expected_id(wired):
+    """actor='user' must never be stood down by the pin check -- it is scoped
+    to actor=='system' only. Defense-in-depth: even a mismatched
+    expected_proposal_id (never sent by the real user-facing route) must not
+    change user-decision behavior."""
+    sessions, reschedule_calls, set_graph = wired
+    sessions["s6"] = _kr_session("s6")
+    sessions["s6"]["state"]["trade_proposal"]["id"] = "P1"
+    graph = _FakeGraph([
+        {"execution": {"execution_status": "completed", "awaiting_approval": False}},
+    ])
+    set_graph(graph)
+
+    result = await approval_module.submit_decision(
+        "s6", "approved", actor="user", expected_proposal_id="MISMATCH"
+    )
+
+    assert result.status == "completed"
+    graph.aupdate_state.assert_awaited_once()
+    assert sessions["s6"]["state"]["approval_status"] == "approved"
