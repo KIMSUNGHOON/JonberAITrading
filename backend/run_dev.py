@@ -10,7 +10,13 @@ uvicorn을 직접 쓰면 그 경우 기동이 실패하므로, 8000부터 빈 �
 """
 
 import argparse
+import faulthandler
+import signal
 import socket
+
+# 이벤트 루프 스톨 진단용: `kill -USR1 <pid>`로 전 스레드 파이썬 스택을
+# stderr(로그 파일)에 덤프한다 — sudo/py-spy 없이 라이브 프로세스 관찰.
+faulthandler.register(signal.SIGUSR1)
 
 
 def find_free_port(start: int = 8000, attempts: int = 6) -> int:
