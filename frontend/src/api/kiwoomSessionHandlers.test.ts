@@ -127,6 +127,128 @@ describe('rehydrateKiwoomSessions', () => {
     await rehydrateKiwoomSessions();
     expect(addKiwoomSession).not.toHaveBeenCalled();
   });
+
+  // P0-2: purge — restart-orphaned zombie session cards must disappear from
+  // the store instead of lingering to 404 on click. The server's operations
+  // board (analyzing ∪ awaiting) is truth; a non-terminal store session it no
+  // longer lists is gone server-side and must be removed here.
+  it('서버가 더 이상 나열하지 않는 비터미널 스토어 세션은 removeKiwoomSession으로 제거한다', async () => {
+    const removeKiwoomSession = vi.fn();
+    mockState = {
+      kiwoom: {
+        sessions: [
+          { sessionId: 'A', status: 'running' },
+          { sessionId: 'B', status: 'awaiting_approval' },
+        ],
+      },
+      addKiwoomSession: vi.fn().mockReturnValue(true),
+      setKiwoomSessionProposal: vi.fn(),
+      setKiwoomSessionAwaitingApproval: vi.fn(),
+      setKiwoomSessionAutoApproveAt: vi.fn(),
+      removeKiwoomSession,
+    };
+    // Server only still knows about A — B is a zombie left over from a
+    // restart (or the awaiting proposal was resolved while we were offline).
+    getOperations.mockResolvedValue({
+      analyzing: [{ session_id: 'A', ticker: '005930', name: null,
+                    status: 'running', current_stage: null, started_at: null }],
+      awaiting: [], watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: {},
+    });
+
+    const { rehydrateKiwoomSessions } = await import('./kiwoomSessionHandlers');
+    await rehydrateKiwoomSessions();
+
+    expect(removeKiwoomSession).toHaveBeenCalledTimes(1);
+    expect(removeKiwoomSession).toHaveBeenCalledWith('B');
+  });
+
+  it('터미널 상태(completed/cancelled/error) 스토어 세션은 서버 목록에 없어도 제거하지 않는다(히스토리 보존)', async () => {
+    const removeKiwoomSession = vi.fn();
+    mockState = {
+      kiwoom: {
+        sessions: [
+          { sessionId: 'C', status: 'completed' },
+          { sessionId: 'D', status: 'cancelled' },
+          { sessionId: 'E', status: 'error' },
+        ],
+      },
+      addKiwoomSession: vi.fn().mockReturnValue(true),
+      setKiwoomSessionProposal: vi.fn(),
+      setKiwoomSessionAwaitingApproval: vi.fn(),
+      setKiwoomSessionAutoApproveAt: vi.fn(),
+      removeKiwoomSession,
+    };
+    // Server knows about none of them (fully finished/history-only sessions
+    // drop out of the operations board) — must NOT be treated as zombies.
+    getOperations.mockResolvedValue({
+      analyzing: [], awaiting: [], watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: {},
+    });
+
+    const { rehydrateKiwoomSessions } = await import('./kiwoomSessionHandlers');
+    await rehydrateKiwoomSessions();
+
+    expect(removeKiwoomSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('createKiwoomWebSocketHandlers — WS reconnect re-triggers rehydrate', () => {
+  it('does NOT rehydrate on the initial connect (connecting → connected, no reconnecting in between)', async () => {
+    mockState = {
+      kiwoom: { sessions: [{ sessionId: 'RC-1', status: 'running' }] },
+      addKiwoomSession: vi.fn().mockReturnValue(true),
+      setKiwoomSessionProposal: vi.fn(),
+      setKiwoomSessionAwaitingApproval: vi.fn(),
+      setKiwoomSessionAutoApproveAt: vi.fn(),
+      removeKiwoomSession: vi.fn(),
+    };
+    getOperations.mockResolvedValue({
+      analyzing: [], awaiting: [], watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: {},
+    });
+
+    const handlers = createKiwoomWebSocketHandlers('RC-1');
+    handlers.onConnectionStateChange?.('connecting');
+    handlers.onConnectionStateChange?.('connected');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(getOperations).not.toHaveBeenCalled();
+  });
+
+  it('re-runs rehydrateKiwoomSessions once the socket recovers from a genuine drop (…→reconnecting→…→connected)', async () => {
+    const removeKiwoomSession = vi.fn();
+    mockState = {
+      // RC-1 itself is gone server-side by the time it reconnects (e.g. the
+      // backend restarted while the socket was down) — the reconnect-driven
+      // rehydrate must purge it, proving the full pipeline ran, not just a
+      // bare getOperations ping.
+      kiwoom: { sessions: [{ sessionId: 'RC-1', status: 'running' }] },
+      addKiwoomSession: vi.fn().mockReturnValue(true),
+      setKiwoomSessionProposal: vi.fn(),
+      setKiwoomSessionAwaitingApproval: vi.fn(),
+      setKiwoomSessionAutoApproveAt: vi.fn(),
+      removeKiwoomSession,
+    };
+    getOperations.mockResolvedValue({
+      analyzing: [], awaiting: [], watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: {},
+    });
+
+    const handlers = createKiwoomWebSocketHandlers('RC-1');
+    // Initial connect — must not fire.
+    handlers.onConnectionStateChange?.('connecting');
+    handlers.onConnectionStateChange?.('connected');
+    // Drop + recover cycle, matching ManagedSocket's real state sequence.
+    handlers.onConnectionStateChange?.('disconnected');
+    handlers.onConnectionStateChange?.('reconnecting');
+    handlers.onConnectionStateChange?.('connecting');
+    handlers.onConnectionStateChange?.('connected');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(getOperations).toHaveBeenCalledTimes(1);
+    expect(removeKiwoomSession).toHaveBeenCalledWith('RC-1');
+  });
 });
 
 describe('createKiwoomWebSocketHandlers — reasoning delta batching', () => {

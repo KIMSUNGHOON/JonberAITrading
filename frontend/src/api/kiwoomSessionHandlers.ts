@@ -59,6 +59,11 @@ function flushReasoningBuffer(sessionId: string): void {
 
 export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandlers {
   const store = () => useStore.getState();
+  // Tracks whether this session's socket has passed through 'reconnecting'
+  // since the last 'connected' state — i.e. distinguishes a genuine drop+
+  // recover cycle from the initial connect (which goes straight from
+  // 'connecting' to 'connected' and must NOT re-trigger a rehydrate).
+  let droppedConnection = false;
   return {
     onReasoning: (entry) => {
       let buffer = reasoningBuffers.get(sessionId);
@@ -124,6 +129,22 @@ export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandl
       // the only lifecycle hook TradingWebSocket exposes for "socket closed".
       flushReasoningBuffer(sessionId);
     },
+    onConnectionStateChange: (state) => {
+      // A dropped socket (backend restart, network blip, etc.) means the FE
+      // was out of sync with the server for a stretch — the session may have
+      // finished, been cancelled, or vanished entirely while we couldn't hear
+      // about it. Re-running the same server-truth reconciliation used on
+      // page load (rehydrateKiwoomSessions) on RECOVERY from a drop catches
+      // that without requiring a manual page refresh. Gated on having seen
+      // 'reconnecting' first so the initial connect (which never passes
+      // through that state) doesn't fire a redundant rehydrate.
+      if (state === 'reconnecting') {
+        droppedConnection = true;
+      } else if (state === 'connected' && droppedConnection) {
+        droppedConnection = false;
+        void rehydrateKiwoomSessions();
+      }
+    },
   };
 }
 
@@ -146,14 +167,24 @@ export function ensureKiwoomSessionStreaming(sessionId: string): void {
 /**
  * Rehydrate running/awaiting Kiwoom sessions from the server (session_manager
  * SQLite) into the store after a page refresh, and reconnect their WebSocket
- * streams.
+ * streams. Also PURGES the reverse case: store sessions the server no longer
+ * lists at all.
+ *
+ * Why the purge matters: the store can hold a session the server has since
+ * forgotten (backend restart, in-memory session lost, etc.) — that renders as
+ * a zombie proposal/analysis card that 404s the moment the user clicks it.
+ * Only non-terminal sessions (running/awaiting_approval) are purged; terminal
+ * ones (completed/cancelled/error) are legitimate local history and are never
+ * touched here, server-known or not.
  *
  * Ordering matters: running sessions are added FIRST, awaiting sessions LAST.
  * addKiwoomSession sets activeSessionId to whatever it just added and mirrors
  * that session's fields into the legacy single-session store fields, which
  * OrderTicketRail (the HITL approval rail) reads exclusively. Adding awaiting
  * sessions last — and calling the proposal/awaiting/autoApprove setters after
- * that — makes the restored proposal show up in the rail.
+ * that — makes the restored proposal show up in the rail. The purge sweep
+ * runs against a snapshot of the store taken BEFORE any of these additions,
+ * so it can never race with (or delete) a session this same call just added.
  *
  * Silent on failure: a broken /trading/operations call must not crash the app
  * on load, it just means sessions aren't rehydrated (the operations board
@@ -167,7 +198,12 @@ export async function rehydrateKiwoomSessions(): Promise<void> {
     return;
   }
   const store = useStore.getState();
-  const known = new Set(store.kiwoom.sessions.map((s) => s.sessionId));
+  const priorSessions = store.kiwoom.sessions;
+  const known = new Set(priorSessions.map((s) => s.sessionId));
+  const serverKnown = new Set<string>([
+    ...(ops.analyzing ?? []).map((a) => a.session_id),
+    ...(ops.awaiting ?? []).map((w) => w.session_id),
+  ]);
   const now = new Date();
 
   const build = (
@@ -216,5 +252,17 @@ export async function rehydrateKiwoomSessions(): Promise<void> {
     store.setKiwoomSessionAwaitingApproval(w.session_id, true);
     store.setKiwoomSessionAutoApproveAt(w.session_id, w.auto_approve_at ?? null);
     ensureKiwoomSessionStreaming(w.session_id); // rejection→re-analysis needs the stream
+  }
+
+  // Purge: drop non-terminal store sessions the server no longer lists at
+  // all. Swept from the pre-add snapshot (priorSessions), so a session this
+  // same call just added (always serverKnown by construction) can never be
+  // caught here. Terminal sessions are never purged — they're kept as history
+  // regardless of whether the server still lists them.
+  for (const session of priorSessions) {
+    const isNonTerminal = session.status === 'running' || session.status === 'awaiting_approval';
+    if (isNonTerminal && !serverKnown.has(session.sessionId)) {
+      store.removeKiwoomSession(session.sessionId);
+    }
   }
 }
