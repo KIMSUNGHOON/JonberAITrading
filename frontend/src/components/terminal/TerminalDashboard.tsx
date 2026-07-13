@@ -16,12 +16,11 @@ import { PositionsPanel } from './panels/PositionsPanel';
 import { PortfolioPanel } from './panels/PortfolioPanel';
 import { ScannerPanel } from './panels/ScannerPanel';
 import { DebatePanel } from './panels/DebatePanel';
-import { ReasoningPanel } from './panels/ReasoningPanel';
 import { ChartTile } from './panels/ChartTile';
 
 type PanelId =
   | 'operations' | 'watchlist' | 'chart' | 'portfolio'
-  | 'positions' | 'scanner' | 'debate' | 'reasoning';
+  | 'positions' | 'scanner' | 'debate';
 
 const TITLES: Record<PanelId, string> = {
   operations: 'Operations · 운용 파이프라인',
@@ -31,11 +30,12 @@ const TITLES: Record<PanelId, string> = {
   positions: 'Positions',
   scanner: 'Scanner · KOSPI+KOSDAQ',
   debate: 'Agent debate',
-  reasoning: 'Reasoning · tail -f',
 };
 
-// 레이아웃 v2 — OPERATIONS 상단 와이드
-const STORAGE_KEY = 'jonber.dashboard.layout.v2';
+// 레이아웃 v3 — REASONING 타일 제거(perf: 스트리밍 델타가 uncapped 로그를 강제
+// 스크롤과 함께 매 delta마다 전체 재렌더 — 배치 플러시로도 tile 자체는 불필요해
+// 제거; v2 저장 레이아웃은 삭제된 'reasoning' id를 참조하므로 키를 새로 부여)
+const STORAGE_KEY = 'jonber.dashboard.layout.v3';
 
 const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
   type: 'split',
@@ -48,7 +48,7 @@ const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
       children: [
         { type: 'split', direction: 'column', splitPercentages: [64, 36], children: ['watchlist', 'chart'] },
         { type: 'split', direction: 'column', splitPercentages: [16, 62, 22], children: ['portfolio', 'positions', 'scanner'] },
-        { type: 'split', direction: 'column', splitPercentages: [46, 54], children: ['debate', 'reasoning'] },
+        'debate',
       ],
     },
   ],
@@ -63,7 +63,6 @@ function renderBody(id: PanelId) {
     case 'positions': return <PositionsPanel />;
     case 'scanner': return <ScannerPanel />;
     case 'debate': return <DebatePanel />;
-    case 'reasoning': return <ReasoningPanel />;
   }
 }
 

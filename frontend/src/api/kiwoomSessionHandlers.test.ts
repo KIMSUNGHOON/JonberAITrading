@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // wsManager is the shared per-session WebSocket manager; spy on has()/connect().
 // vi.hoisted so the (hoisted) vi.mock factory can reference it without a TDZ.
@@ -23,7 +23,7 @@ vi.mock('@/store', () => ({
   }),
 }));
 
-import { ensureKiwoomSessionStreaming } from './kiwoomSessionHandlers';
+import { createKiwoomWebSocketHandlers, ensureKiwoomSessionStreaming } from './kiwoomSessionHandlers';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -126,5 +126,146 @@ describe('rehydrateKiwoomSessions', () => {
     const { rehydrateKiwoomSessions } = await import('./kiwoomSessionHandlers');
     await rehydrateKiwoomSessions();
     expect(addKiwoomSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('createKiwoomWebSocketHandlers — reasoning delta batching', () => {
+  // Perf fix: every reasoning WS delta used to call the store directly (one
+  // store-wide re-render per streamed token/chunk). onReasoning now buffers
+  // entries per session and flushes them as ONE batch call after a 300ms
+  // window (or immediately, out-of-band, ahead of a status/proposal/complete
+  // frame for the same session so those can never overtake buffered lines).
+  let addKiwoomSessionReasoningBatch: ReturnType<typeof vi.fn>;
+  let updateKiwoomSessionStatus: ReturnType<typeof vi.fn>;
+  let updateKiwoomSessionStage: ReturnType<typeof vi.fn>;
+  let setKiwoomSessionAwaitingApproval: ReturnType<typeof vi.fn>;
+  let setKiwoomSessionAutoApproveAt: ReturnType<typeof vi.fn>;
+  let setKiwoomSessionProposal: ReturnType<typeof vi.fn>;
+  let setKiwoomSessionError: ReturnType<typeof vi.fn>;
+  const callOrder: string[] = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    callOrder.length = 0;
+    addKiwoomSessionReasoningBatch = vi.fn(() => callOrder.push('batch'));
+    updateKiwoomSessionStatus = vi.fn(() => callOrder.push('status'));
+    updateKiwoomSessionStage = vi.fn();
+    setKiwoomSessionAwaitingApproval = vi.fn();
+    setKiwoomSessionAutoApproveAt = vi.fn();
+    setKiwoomSessionProposal = vi.fn(() => callOrder.push('proposal'));
+    setKiwoomSessionError = vi.fn();
+    mockState = {
+      kiwoom: { sessions: [] },
+      addKiwoomSessionReasoningBatch,
+      updateKiwoomSessionStatus,
+      updateKiwoomSessionStage,
+      setKiwoomSessionAwaitingApproval,
+      setKiwoomSessionAutoApproveAt,
+      setKiwoomSessionProposal,
+      setKiwoomSessionError,
+    };
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('buffers reasoning deltas and flushes them as one batch call after the window', () => {
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onReasoning?.('[Technical] line one');
+    handlers.onReasoning?.('[Technical] line two');
+
+    // Within the 300ms window: no store call yet.
+    expect(addKiwoomSessionReasoningBatch).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(300);
+
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledTimes(1);
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledWith('S1', [
+      '[Technical] line one',
+      '[Technical] line two',
+    ]);
+  });
+
+  it('flushes the buffer BEFORE handling a status update that arrives mid-window', () => {
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onReasoning?.('[Risk] buffered line');
+    // Status frame arrives before the 300ms timer fires.
+    handlers.onStatus?.({ status: 'running', stage: 'risk_assessment', awaiting_approval: false });
+
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledTimes(1);
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledWith('S1', ['[Risk] buffered line']);
+    expect(callOrder).toEqual(['batch', 'status']); // reasoning lands before the status update
+    expect(updateKiwoomSessionStatus).toHaveBeenCalledTimes(1);
+
+    // The pending timer for the flushed buffer must be cleared — advancing
+    // past the original window must not cause a second (empty) batch call.
+    vi.advanceTimersByTime(300);
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('flushes the buffer BEFORE handling a proposal that arrives mid-window', () => {
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onReasoning?.('[Strategic] weighing entry');
+    handlers.onProposal?.({
+      id: 'p1', ticker: '005930', action: 'buy', quantity: 10,
+      entry_price: 70000, stop_loss: 68000, take_profit: 75000,
+      risk_score: 0.4, rationale: 'momentum',
+    });
+
+    expect(callOrder).toEqual(['batch', 'proposal']);
+  });
+
+  it('flushes any remaining buffer on onComplete', () => {
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onReasoning?.('[Execution] final line');
+    handlers.onComplete?.({ status: 'completed' });
+
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledTimes(1);
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledWith('S1', ['[Execution] final line']);
+  });
+
+  it('flushes any remaining buffer on onDisconnect (socket close)', () => {
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onReasoning?.('[Sentiment] last streamed line');
+    handlers.onDisconnect?.();
+
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledTimes(1);
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledWith('S1', ['[Sentiment] last streamed line']);
+  });
+
+  it('does not call the batch action when onStatus arrives with an empty buffer', () => {
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onStatus?.({ status: 'running', stage: 'technical_analysis', awaiting_approval: false });
+
+    expect(addKiwoomSessionReasoningBatch).not.toHaveBeenCalled();
+    expect(updateKiwoomSessionStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps separate sessions independent (no cross-session buffer bleed)', () => {
+    const h1 = createKiwoomWebSocketHandlers('S1');
+    const h2 = createKiwoomWebSocketHandlers('S2');
+
+    h1.onReasoning?.('[Technical] s1 line');
+    h2.onReasoning?.('[Technical] s2 line a');
+    h2.onReasoning?.('[Technical] s2 line b');
+
+    h2.onComplete?.({ status: 'completed' }); // flush only S2's buffer
+
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledTimes(1);
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledWith('S2', [
+      '[Technical] s2 line a',
+      '[Technical] s2 line b',
+    ]);
+
+    vi.advanceTimersByTime(300); // S1's own timer still fires independently
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledTimes(2);
+    expect(addKiwoomSessionReasoningBatch).toHaveBeenLastCalledWith('S1', ['[Technical] s1 line']);
   });
 });

@@ -208,6 +208,48 @@ describe('Kiwoom Session Management', () => {
     });
   });
 
+  describe('addKiwoomSessionReasoningBatch', () => {
+    it('appends every entry in a single update (one subscriber notification)', () => {
+      const session = createMockSession({ sessionId: 'test-session', reasoningLog: ['line-0'] });
+      useStore.getState().addKiwoomSession(session);
+
+      let notifications = 0;
+      const unsubscribe = useStore.subscribe(() => {
+        notifications += 1;
+      });
+
+      useStore.getState().addKiwoomSessionReasoningBatch('test-session', ['line-1', 'line-2', 'line-3']);
+      unsubscribe();
+
+      expect(notifications).toBe(1);
+      const updatedSession = useStore.getState().kiwoom.sessions[0];
+      expect(updatedSession.reasoningLog).toEqual(['line-0', 'line-1', 'line-2', 'line-3']);
+    });
+
+    it('mirrors into the legacy reasoningLog field when the session is active', () => {
+      const session = createMockSession({ sessionId: 'active-session', reasoningLog: [] });
+      useStore.getState().addKiwoomSession(session); // becomes activeSessionId
+
+      useStore.getState().addKiwoomSessionReasoningBatch('active-session', ['a', 'b']);
+
+      expect(useStore.getState().kiwoom.reasoningLog).toEqual(['a', 'b']);
+    });
+
+    it('does not touch the legacy mirror for a non-active session', () => {
+      const active = createMockSession({ sessionId: 'active-session' });
+      const other = createMockSession({ sessionId: 'other-session', reasoningLog: [] });
+      useStore.getState().addKiwoomSession(other);
+      useStore.getState().addKiwoomSession(active); // active becomes activeSessionId
+
+      useStore.getState().addKiwoomSessionReasoningBatch('other-session', ['x']);
+
+      const otherSession = useStore.getState().kiwoom.sessions.find((s) => s.sessionId === 'other-session');
+      expect(otherSession?.reasoningLog).toEqual(['x']);
+      // legacy mirror still reflects the active session, untouched by the other session's batch
+      expect(useStore.getState().kiwoom.reasoningLog).toEqual(active.reasoningLog);
+    });
+  });
+
   describe('setKiwoomSessionError', () => {
     it('should set error and update status to error', () => {
       const session = createMockSession({ sessionId: 'test-session', status: 'running' });

@@ -18,13 +18,68 @@ import { wsManager, type WebSocketHandlers } from '@/api/websocket';
 import { getOperations } from '@/api/client';
 import type { KRStockTradeProposal, SessionData, SessionStatus } from '@/types';
 
+// -------------------------------------------
+// Reasoning delta batching
+// -------------------------------------------
+//
+// Root cause of the streaming perf hit: every reasoning WS delta previously
+// called addKiwoomSessionReasoning directly (one store-wide set() per token),
+// firing at LLM streaming frequency and re-rendering every store subscriber.
+// Buffer deltas per session and flush them as ONE batched store update instead.
+//
+// Module-scoped (not per-handlers-instance) because it must survive across
+// createKiwoomWebSocketHandlers() calls for the same sessionId — flushing is
+// keyed purely by sessionId, so a stray call after a session no longer exists
+// in the store is harmless (the batch action's session-map .map is a no-op).
+const REASONING_FLUSH_MS = 300;
+const reasoningBuffers = new Map<string, string[]>();
+const reasoningTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * Flush a session's buffered reasoning entries into the store in one batched
+ * update, and clear its pending timer (if any). Safe to call with an empty/
+ * absent buffer (no-op) — callers invoke this defensively before any other
+ * handling for the session so a proposal/status/complete frame can never
+ * overtake reasoning lines still sitting in the buffer.
+ */
+function flushReasoningBuffer(sessionId: string): void {
+  const timer = reasoningTimers.get(sessionId);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    reasoningTimers.delete(sessionId);
+  }
+  const buffer = reasoningBuffers.get(sessionId);
+  if (buffer && buffer.length > 0) {
+    reasoningBuffers.delete(sessionId);
+    useStore.getState().addKiwoomSessionReasoningBatch(sessionId, buffer);
+  } else {
+    reasoningBuffers.delete(sessionId);
+  }
+}
+
 export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandlers {
   const store = () => useStore.getState();
   return {
     onReasoning: (entry) => {
-      store().addKiwoomSessionReasoning(sessionId, entry);
+      let buffer = reasoningBuffers.get(sessionId);
+      if (!buffer) {
+        buffer = [];
+        reasoningBuffers.set(sessionId, buffer);
+      }
+      buffer.push(entry);
+      // First entry in a window arms the flush timer; later entries in the
+      // same window just append (no immediate store call).
+      if (!reasoningTimers.has(sessionId)) {
+        reasoningTimers.set(
+          sessionId,
+          setTimeout(() => flushReasoningBuffer(sessionId), REASONING_FLUSH_MS),
+        );
+      }
     },
     onStatus: (data) => {
+      // Ordering: buffered reasoning lines must land before this status update
+      // (a mid-window status frame must not overtake reasoning still buffered).
+      flushReasoningBuffer(sessionId);
       store().updateKiwoomSessionStatus(sessionId, data.status as SessionStatus);
       store().updateKiwoomSessionStage(sessionId, data.stage);
       store().setKiwoomSessionAwaitingApproval(sessionId, data.awaiting_approval);
@@ -32,6 +87,7 @@ export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandl
       store().setKiwoomSessionAutoApproveAt(sessionId, data.auto_approve_at ?? null);
     },
     onProposal: (data) => {
+      flushReasoningBuffer(sessionId);
       const proposal: KRStockTradeProposal = {
         id: data.id,
         stk_cd: data.ticker,
@@ -51,13 +107,22 @@ export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandl
       store().setKiwoomSessionProposal(sessionId, proposal);
     },
     onComplete: (data) => {
+      flushReasoningBuffer(sessionId);
       if (data.error) {
         store().setKiwoomSessionError(sessionId, data.error);
       }
       store().updateKiwoomSessionStatus(sessionId, data.status as SessionStatus);
     },
     onError: () => {
+      flushReasoningBuffer(sessionId);
       store().setKiwoomSessionError(sessionId, 'WebSocket connection error');
+    },
+    onDisconnect: () => {
+      // The WS core's onClose fires this on every close (clean disconnect AND
+      // a dropped connection ahead of a reconnect attempt) — flushing here is
+      // harmless in the reconnect case (buffer is just already empty) and is
+      // the only lifecycle hook TradingWebSocket exposes for "socket closed".
+      flushReasoningBuffer(sessionId);
     },
   };
 }

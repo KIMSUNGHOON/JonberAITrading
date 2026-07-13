@@ -253,6 +253,9 @@ interface KiwoomActions {
   updateKiwoomSessionStatus: (sessionId: string, status: SessionStatus) => void;
   updateKiwoomSessionStage: (sessionId: string, stage: string) => void;
   addKiwoomSessionReasoning: (sessionId: string, entry: string) => void;
+  // Batched variant: appends N buffered entries in a single set() — used by the
+  // WS handler's flush timer to avoid one store-wide re-render per streamed token.
+  addKiwoomSessionReasoningBatch: (sessionId: string, entries: string[]) => void;
   setKiwoomSessionProposal: (sessionId: string, proposal: KRStockTradeProposal | null) => void;
   setKiwoomSessionAwaitingApproval: (sessionId: string, awaiting: boolean) => void;
   setKiwoomSessionAutoApproveAt: (sessionId: string, iso: string | null) => void;
@@ -1025,6 +1028,27 @@ export const useStore = create<Store>()(
           const newSessions = state.kiwoom.sessions.map(s =>
             s.sessionId === sessionId
               ? { ...s, reasoningLog: [...s.reasoningLog, entry], updatedAt: new Date() }
+              : s
+          );
+          const isActive = state.kiwoom.activeSessionId === sessionId;
+          const session = newSessions.find(s => s.sessionId === sessionId);
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              ...(isActive && session ? { reasoningLog: session.reasoningLog } : {}),
+            },
+          };
+        }),
+
+      // Batched: appends every buffered entry in ONE set() call (one subscriber
+      // notification instead of N) — see addKiwoomSessionReasoning above for the
+      // per-entry semantics this mirrors (session-map update + legacy mirror).
+      addKiwoomSessionReasoningBatch: (sessionId, entries) =>
+        set((state) => {
+          const newSessions = state.kiwoom.sessions.map(s =>
+            s.sessionId === sessionId
+              ? { ...s, reasoningLog: [...s.reasoningLog, ...entries], updatedAt: new Date() }
               : s
           );
           const isActive = state.kiwoom.activeSessionId === sessionId;

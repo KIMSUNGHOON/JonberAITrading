@@ -1,7 +1,9 @@
 /**
  * ReasoningWire — presentation-only dense "tail -f" of agent reasoning lines.
  *
- * Shared by the dashboard ReasoningPanel tile and WorkflowPage. Renders raw
+ * Used by WorkflowPage (the dashboard's REASONING tile was removed as a perf
+ * fix — this component's uncapped-log + per-delta scrollIntoView was one of
+ * the two root causes of streaming-frequency re-renders). Renders raw
  * monospace lines with a numbered gutter, colorizes the [Agent] prefix, shows a
  * pulsing head for the current stage while running, and auto-scrolls to newest.
  * All data arrives via props — no store coupling.
