@@ -5,6 +5,11 @@ register_fill_as_position은 (1) ExecutionCoordinator._add_position을 항상 �
 (1)을 되돌리거나 예외를 전파하지 않는다. PM에 이미 사용자가 설정한 스탑(non-None)이
 있으면 신규 체결값으로 덮어쓰지 않는다(coalesce).
 
+F3 전반에서 `quantity`는 증분 체결량(FillDelta.new_fill_qty)이다 —
+coordinator._add_position은 자체적으로 평균 합산하지만 PM.update_position은
+절대값 할당이므로, 기존 PM 포지션이 있으면 existing.quantity + delta로 합산해
+넘겨야 한다(2-트랜치 체결 20+28=48 시나리오).
+
 지연 import(함수 내부 import)를 쓰므로 patch 지점은 헬퍼 모듈이 아니라 원본
 `services.agent_chat.coordinator.get_chat_coordinator`.
 """
@@ -62,6 +67,9 @@ async def test_new_position_registers_in_both_engines_with_stops(monkeypatch):
     assert pos.stock_name == "삼성전자"
     assert pos.quantity == 10
     assert pos.avg_price == 70000.0
+    # current_price 누락 시 Pydantic 기본값 0 → unrealized_pnl_pct가 상시 -100%,
+    # portfolio_agent 노출 계산도 0으로 잡힘 — coordinator.py:594 관례대로 avg_price.
+    assert pos.current_price == 70000.0
     assert pos.stop_loss == 66500.0
     assert pos.take_profit == 77000.0
     assert pos.analysis_session_id == "sess-1"
@@ -109,14 +117,78 @@ async def test_existing_pm_stop_is_preserved_but_quantity_updates(monkeypatch):
     assert coordinator._add_position.call_count == 1
 
     # PM: 기존 티커 → update_position, stop_loss는 기존 non-None이라 미전달(None),
-    # take_profit은 기존 None이었으므로 신규값 전달, quantity는 항상 갱신
+    # take_profit은 기존 None이었으므로 신규값 전달, quantity는 증분 합산(5+15=20)
     pm.add_position.assert_not_called()
     pm.update_position.assert_called_once_with(
         ticker="005930",
-        quantity=15,
+        quantity=20,
         stop_loss=None,
         take_profit=77000.0,
     )
+
+
+async def test_incremental_fill_delta_sums_into_existing_pm_quantity(monkeypatch):
+    """2-트랜치 체결: PM 기존 20주 + 증분 28주 → update_position(quantity=48).
+
+    quantity는 F3 전반에서 증분 델타(FillDelta.new_fill_qty)다. PM.update_position은
+    절대값 할당이므로 델타를 그대로 넘기면 PM이 28로 끝나고 코디네이터는 48 —
+    PM이 20주를 조용히 과소보고한다.
+    """
+    coordinator = _coordinator()
+    existing = MonitoredPosition(
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=20,
+        avg_price=260000.0,
+        current_price=260000.0,
+        stop_loss=None,
+        take_profit=None,
+    )
+    pm = _pm(existing=existing)
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(pm)),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=28,
+        avg_price=260000.0,
+        stop_loss=246560.0,
+        take_profit=289440.0,
+    )
+
+    assert coordinator._add_position.call_count == 1
+    pm.add_position.assert_not_called()
+    pm.update_position.assert_called_once_with(
+        ticker="005930",
+        quantity=48,
+        stop_loss=246560.0,
+        take_profit=289440.0,
+    )
+
+
+async def test_pm_not_running_skips_mirror_without_error(monkeypatch):
+    """챗 코디네이터는 있으나 미기동(position_manager is None) → 스킵, 예외 없음."""
+    coordinator = _coordinator()
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(None)),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=10,
+        avg_price=70000.0,
+        stop_loss=66500.0,
+        take_profit=77000.0,
+    )
+
+    assert coordinator._add_position.call_count == 1
 
 
 async def test_pm_lookup_failure_does_not_prevent_coordinator_registration(monkeypatch):

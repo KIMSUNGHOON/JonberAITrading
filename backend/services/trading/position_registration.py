@@ -36,6 +36,11 @@ async def register_fill_as_position(
 ) -> None:
     """Register a filled position into both monitoring engines.
 
+    `quantity` is the INCREMENTAL fill delta (FillDelta.new_fill_qty), not an
+    absolute holding. Coordinator._add_position averages/sums incrementally by
+    itself; PositionManager.update_position assigns absolutely, so the
+    existing-ticker branch sums existing.quantity + delta before passing it.
+
     Coordinator registration happens first and unconditionally. PositionManager
     mirroring is best-effort: any failure (including PM not running) is caught
     and logged, never raised, since the coordinator registration already
@@ -47,6 +52,11 @@ async def register_fill_as_position(
             stock_name=stock_name,
             quantity=quantity,
             avg_price=avg_price,
+            # coordinator.py:589-599 관례: 등록 시점 현재가=체결가. 누락 시
+            # Pydantic 기본값 0 → unrealized_pnl_pct 상시 -100%,
+            # portfolio_agent 노출 계산이 0으로 잡힌다(이후 아무도
+            # _state.positions[].current_price를 갱신하지 않음).
+            current_price=avg_price,
             stop_loss=stop_loss,
             take_profit=take_profit,
             analysis_session_id=session_id,
@@ -82,9 +92,12 @@ async def register_fill_as_position(
             # coalesce: PM에 이미 사용자가 설정한 스탑(non-None)이 있으면
             # 신규 체결값으로 덮어쓰지 않는다. update_position 자체도 None
             # 인자는 무시(coalesce)하므로, 기존값이 None일 때만 넘긴다.
+            # quantity는 증분 델타 → update_position은 절대값 할당이므로
+            # 기존 보유량에 합산해 넘긴다(2-트랜치 20+28=48; 델타를 그대로
+            # 넘기면 PM만 28로 과소보고).
             position_manager.update_position(
                 ticker=ticker,
-                quantity=quantity,
+                quantity=existing.quantity + quantity,
                 stop_loss=stop_loss if existing.stop_loss is None else None,
                 take_profit=take_profit if existing.take_profit is None else None,
             )
