@@ -281,6 +281,25 @@ async def test_operations_awaiting_proposal_is_slimmed():
     }
 
 
+async def test_operations_awaiting_approval_actionable_reflects_state_flag():
+    """Zombie-resurrection guard: an sm row stuck in AWAITING_APPROVAL whose
+    state['awaiting_approval'] was cleared (e.g. a cancel whose mirror later
+    failed) must surface as non-actionable so the board can't offer a doomed
+    approve/reject on it."""
+    actionable = _session("s-actionable", SessionStatus.AWAITING_APPROVAL,
+                          state={"awaiting_approval": True})
+    zombie = _session("s-zombie", SessionStatus.AWAITING_APPROVAL,
+                      state={"awaiting_approval": False})
+
+    with patch.object(trading_mod, "get_session_manager",
+                      AsyncMock(return_value=_sm([actionable, zombie]))):
+        res = await trading_mod.get_operations(market="kiwoom", coordinator=_coordinator())
+
+    by_id = {a.session_id: a for a in res.awaiting}
+    assert by_id["s-actionable"].actionable is True
+    assert by_id["s-zombie"].actionable is False
+
+
 async def test_operations_coin_market_returns_sessions_only():
     """coin: 세션만 채우고 KR 전용 섹션은 null + errors 없음(비해당)."""
     coin_sess = AnalysisSession(session_id="c1", market_type=MarketType.COIN,

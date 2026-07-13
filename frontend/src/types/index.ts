@@ -1447,6 +1447,10 @@ export interface OperationsAwaiting {
   name: string | null;
   proposal: Record<string, unknown> | null;
   auto_approve_at: string | null;
+  // Zombie-resurrection guard: false when the sm row's status is
+  // AWAITING_APPROVAL but its state["awaiting_approval"] flag was already
+  // cleared (e.g. a cancel whose mirror failed) — approve/reject would 400.
+  actionable?: boolean;
 }
 
 export interface OperationsOpenOrder {

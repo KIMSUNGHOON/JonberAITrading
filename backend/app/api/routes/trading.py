@@ -1138,6 +1138,11 @@ class OperationsAwaiting(BaseModel):
     name: Optional[str] = None
     proposal: Optional[Dict[str, Any]] = None  # session.state["trade_proposal"] 원본
     auto_approve_at: Optional[str] = None
+    # Zombie-resurrection guard: a sm row can be stuck at status=AWAITING_APPROVAL
+    # while its state["awaiting_approval"] was already cleared (e.g. a cancel whose
+    # sm mirror failed) — surface that mismatch so the board can't offer a doomed
+    # approve/reject on an unapprovable session.
+    actionable: bool = True
 
 
 class OperationsOpenOrder(BaseModel):
@@ -1241,6 +1246,7 @@ async def get_operations(
                     name=s.display_name,
                     proposal=_slim_proposal(s.state.get("trade_proposal")),
                     auto_approve_at=s.state.get("auto_approve_at"),
+                    actionable=bool(s.state.get("awaiting_approval")),
                 ))
         res["analyzing"], res["awaiting"] = analyzing, awaiting
     except Exception as e:  # noqa: BLE001 — 섹션 독립 강등

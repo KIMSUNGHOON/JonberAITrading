@@ -280,6 +280,83 @@ async def test_cancel_route_mirrors_cancelled_status(sm, kr_sessions):
 
 
 # -------------------------------------------
+# Zombie-resurrection guard: cancel must clear awaiting_approval on BOTH the
+# legacy dict AND the sm mirror (they are independent dicts — sm gets a copy
+# at registration, see test_start_route_registers_sm_session above), and any
+# sm-mirror failure must be surfaced loudly instead of swallowed.
+# -------------------------------------------
+
+
+async def test_cancel_clears_awaiting_flag_on_legacy_and_sm(sm, kr_sessions):
+    session_id = "kr-cancel-clear-1"
+    record = _seed_session(kr_sessions, session_id)
+    record["status"] = "awaiting_approval"
+    record["state"]["awaiting_approval"] = True
+    record["state"]["trade_proposal"] = {"id": "p1", "action": "HOLD"}
+    await _seed_sm_session(sm, session_id)
+    await sm.update_state(session_id, {"awaiting_approval": True})
+    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+
+    await cancel_kr_stock_analysis(session_id)
+
+    # Legacy dict cleared (pinned)
+    assert record["state"]["awaiting_approval"] is False
+    assert record["state"]["approval_status"] == "cancelled"
+
+    # sm mirror cleared too — without this, a restart resurrects the session
+    # as AWAITING_APPROVAL with awaiting_approval still True (zombie).
+    session = await sm.get_session(session_id)
+    assert session.state.get("awaiting_approval") is False
+    assert session.state.get("approval_status") == "cancelled"
+    assert session.status == SessionStatus.CANCELLED
+
+
+async def test_cancel_mirror_failure_is_surfaced_not_swallowed(sm, kr_sessions, monkeypatch):
+    """A failing sm mirror during cancel must not silently plant a zombie —
+    the local cancel still succeeds, but the response says mirror_failed=True
+    and the failure is logged at error (not warning) level."""
+    session_id = "kr-cancel-mirror-fail-1"
+    _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("sqlite down")
+
+    monkeypatch.setattr(sm, "update_status", boom)
+
+    logged = {}
+
+    def fake_error(event, **kwargs):
+        logged["event"] = event
+        logged["kwargs"] = kwargs
+
+    from app.api.routes.kr_stocks import analysis as analysis_mod
+
+    monkeypatch.setattr(analysis_mod.logger, "error", fake_error)
+
+    response = await cancel_kr_stock_analysis(session_id)
+
+    # Local cancel still succeeds despite the mirror failure
+    assert kr_sessions[session_id]["status"] == "cancelled"
+    assert kr_sessions[session_id]["state"]["awaiting_approval"] is False
+
+    assert response["mirror_failed"] is True
+    assert logged["event"] == "kr_stock_analysis_cancel_mirror_failed"
+    assert logged["kwargs"]["session_id"] == session_id
+    assert "sqlite down" in logged["kwargs"]["error"]
+
+
+async def test_cancel_mirror_success_reports_mirror_failed_false(sm, kr_sessions):
+    session_id = "kr-cancel-mirror-ok-1"
+    _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    response = await cancel_kr_stock_analysis(session_id)
+
+    assert response["mirror_failed"] is False
+
+
+# -------------------------------------------
 # Producer robustness: sm mirror failures must not affect the analysis
 # -------------------------------------------
 

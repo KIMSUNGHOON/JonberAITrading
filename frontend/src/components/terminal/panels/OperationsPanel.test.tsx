@@ -165,6 +165,20 @@ it('승인대기 항목의 취소 버튼이 cancelled decision으로 submitAppro
   expect(getOperations.mock.calls.length).toBeGreaterThanOrEqual(2); // 액션 후 재조회
 });
 
+it('actionable=false인 승인대기 항목은 승인/거부가 비활성화되고 취소만 가능하다 (좀비 부활 방지)', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    awaiting: [{ session_id: 's6', ticker: '005930', name: '삼성전자',
+                 proposal: { action: 'BUY', entry_price: 70000 },
+                 auto_approve_at: null, actionable: false }],
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
+  expect(screen.getByRole('button', { name: '승인' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: '거부' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: '취소' })).not.toBeDisabled();
+});
+
 it('미체결 취소 버튼이 cancelKRStockOrder를 호출하고 재조회한다', async () => {
   getOperations.mockResolvedValue({
     ...BASE,

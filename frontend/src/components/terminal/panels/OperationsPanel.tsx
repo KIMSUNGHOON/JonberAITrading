@@ -171,6 +171,8 @@ function AwaitingColumn({
         const take = typeof proposal.take_profit === 'number' ? proposal.take_profit : null;
         const risk = typeof proposal.risk_score === 'number' ? proposal.risk_score : null;
         const isSubmitting = submitting === a.session_id;
+        const notActionable = a.actionable === false;
+        const disabledTitle = '세션 상태 불일치 — 취소만 가능';
         return (
           <div key={a.session_id} className={CARD}>
             <div className="font-semibold">{a.name || a.ticker}</div>
@@ -181,19 +183,19 @@ function AwaitingColumn({
             <div className="flex gap-2 mt-1">
               <button
                 type="button"
-                disabled={isSubmitting}
+                disabled={isSubmitting || notActionable}
                 onClick={() => onDecide(a.session_id, 'approved')}
-                title="제안을 승인합니다 (WATCH는 워치리스트 등록)"
-                className="text-up font-medium disabled:opacity-50"
+                title={notActionable ? disabledTitle : '제안을 승인합니다 (WATCH는 워치리스트 등록)'}
+                className={`text-up font-medium disabled:opacity-50 ${notActionable ? 'cursor-not-allowed' : ''}`}
               >
                 승인
               </button>
               <button
                 type="button"
-                disabled={isSubmitting}
+                disabled={isSubmitting || notActionable}
                 onClick={() => onDecide(a.session_id, 'rejected')}
-                title="거부하고 재분석을 요청합니다 — 잠시 후 새 제안이 돌아옵니다"
-                className="text-warn font-medium disabled:opacity-50"
+                title={notActionable ? disabledTitle : '거부하고 재분석을 요청합니다 — 잠시 후 새 제안이 돌아옵니다'}
+                className={`text-warn font-medium disabled:opacity-50 ${notActionable ? 'cursor-not-allowed' : ''}`}
               >
                 거부
               </button>

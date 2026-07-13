@@ -336,12 +336,40 @@ async def cancel_kr_stock_analysis(session_id: str):
         )
 
     session["status"] = "cancelled"
+    session["state"]["awaiting_approval"] = False
+    session["state"]["approval_status"] = "cancelled"
     session["state"]["reasoning_log"].append("[System] 사용자가 분석을 취소했습니다")
 
     # Mirror to sm — the notify wakes the WebSocket, which re-reads the fresh
     # legacy snapshot (cancelled status + the appended log entry).
-    await mirror_session_status(session_id, SessionStatus.CANCELLED)
+    #
+    # Zombie-resurrection guard (live-confirmed 2x): the sm's AnalysisSession.state
+    # is an INDEPENDENT copy of the legacy dict (made at registration time, see
+    # start_kr_stock_analysis), so clearing awaiting_approval on `session["state"]`
+    # above does NOT touch the sm/SQLite side. If the mirror below silently fails,
+    # the sm row stays AWAITING_APPROVAL with awaiting_approval still True — a
+    # restart then resurrects this cancelled session as a visible-but-unapprovable
+    # zombie (approve → 400 "Session is not awaiting approval"). Do not swallow
+    # that failure: log it loudly and tell the caller via `mirror_failed`.
+    mirror_failed = False
+    try:
+        manager = await get_session_manager()
+        await manager.update_status(session_id, SessionStatus.CANCELLED)
+        await manager.update_state(
+            session_id,
+            {"awaiting_approval": False, "approval_status": "cancelled"},
+        )
+    except Exception as e:
+        mirror_failed = True
+        logger.error(
+            "kr_stock_analysis_cancel_mirror_failed",
+            session_id=session_id,
+            error=str(e),
+        )
 
     logger.info("kr_stock_analysis_cancelled", session_id=session_id)
 
-    return {"message": f"세션 {session_id}이 취소되었습니다"}
+    return {
+        "message": f"세션 {session_id}이 취소되었습니다",
+        "mirror_failed": mirror_failed,
+    }
