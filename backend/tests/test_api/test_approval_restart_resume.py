@@ -550,6 +550,98 @@ async def test_concurrent_cancel_during_slow_reject_is_serialized(wired, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_cancel_of_approved_session_is_rejected_409(wired, monkeypatch):
+    """awaiting_approval=False + approval_status='approved' + cancel -> 409.
+
+    DEFECT this guards (P0-4): if approve resumed the graph and the execution
+    node placed a broker order, but the process died (or a concurrent cancel
+    raced in) before the final status mirror at the end of the resume ran,
+    the session is left with awaiting_approval=False and
+    approval_status='approved' — the exact shape the zombie-cancel branch
+    otherwise treats as "safe to terminate". A broker position may actually
+    exist here, so cancel must be refused (409), not silently marked
+    cancelled. No state mutation, no status mirror.
+    """
+    from fastapi import HTTPException
+
+    session_id = "approved-zombie-cancel-1"
+    wired["kr_stock_sessions"][session_id] = {
+        "session_id": session_id,
+        "status": "completed",
+        "state": {
+            "awaiting_approval": False,
+            "approval_status": "approved",
+            "trade_proposal": {"id": "prop-1", "action": "BUY", "quantity": 1, "entry_price": 70000},
+            "reasoning_log": [],
+        },
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+    }
+    graph = _FakeGraph([])
+    wired["set_graph"](graph)
+
+    mirrored_statuses = []
+
+    async def capture_mirror_status(sid, st, error=None):
+        mirrored_statuses.append(st)
+
+    monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "cancelled")
+
+    assert exc_info.value.status_code == 409
+    assert "체결 확인" in exc_info.value.detail
+
+    state = wired["kr_stock_sessions"][session_id]["state"]
+    assert state["approval_status"] == "approved"  # not overwritten to cancelled
+    assert wired["kr_stock_sessions"][session_id]["status"] == "completed"  # unchanged
+    assert mirrored_statuses == []  # no status mirror performed
+    graph.aupdate_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_non_approved_settled_session_still_200s(wired, monkeypatch):
+    """awaiting_approval=False + approval_status='rejected' (NOT 'approved') + cancel -> 200.
+
+    Pins that the 409 masquerade guard is scoped ONLY to approval_status ==
+    'approved' — every other settled/stale shape keeps the pre-existing
+    zombie-cancel tolerance from 9c57fca unchanged.
+    """
+    session_id = "non-approved-zombie-cancel-1"
+    wired["kr_stock_sessions"][session_id] = {
+        "session_id": session_id,
+        "status": "running",
+        "state": {
+            "awaiting_approval": False,
+            "approval_status": "rejected",
+            "trade_proposal": {"id": "prop-1", "action": "BUY", "quantity": 1, "entry_price": 70000},
+            "reasoning_log": [],
+        },
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+    }
+    graph = _FakeGraph([])
+    wired["set_graph"](graph)
+
+    mirrored_statuses = []
+
+    async def capture_mirror_status(sid, st, error=None):
+        mirrored_statuses.append(st)
+
+    monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+
+    result = await approval_module.submit_decision(session_id, "cancelled")
+
+    assert result.status == "cancelled"
+    assert result.execution_status == "cancelled"
+    state = wired["kr_stock_sessions"][session_id]["state"]
+    assert state["approval_status"] == "cancelled"
+    assert mirrored_statuses == [SessionStatus.CANCELLED]
+    graph.aupdate_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_completion_preserves_cancel_marked_during_resume(wired, monkeypatch):
     """approval_status flipped to "cancelled" DURING the resume -> preserved.
 

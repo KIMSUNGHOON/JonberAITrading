@@ -142,6 +142,22 @@ async def _submit_decision_locked(
 
     if not state.get("awaiting_approval"):
         if decision == "cancelled":
+            # Masquerade guard (P0-4): if this session's last recorded decision
+            # was "approved", awaiting_approval=False does NOT mean "safely
+            # settled" the way it does for a plain stale-flag/reject/cancel
+            # zombie below — it can also mean approve resumed the graph, the
+            # execution node placed a broker order, and the process died (or
+            # a concurrent cancel raced in) before the final status mirror at
+            # the end of the resume ran. In that window a real broker position
+            # may already exist. Returning 200 "cancelled" here would tell the
+            # user a possibly-executed trade was cleanly cancelled. Refuse
+            # instead — no state mutation, no status mirror — and make the
+            # caller confirm the actual fill before treating it as dead.
+            if state.get("approval_status") == "approved":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="실행 중일 수 있어 취소 불가 — 체결 확인 필요",
+                )
             # Cancel-zombie tolerance: the operations board lists a session as
             # actionable off the session_manager row (sm.status ==
             # AWAITING_APPROVAL — checked above, in _adopt_session_from_manager,
