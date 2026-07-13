@@ -5,7 +5,7 @@ Provides endpoints for auto-trading system control and monitoring.
 """
 
 import logging
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -29,6 +29,12 @@ from services.trading import (
     get_all_presets,
 )
 from app.dependencies import get_trading_coordinator
+from services.session_manager import (
+    MarketType as SessionMarketType,
+    SessionStatus,
+    get_session_manager,
+)
+from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 
 logger = logging.getLogger(__name__)
 
@@ -1109,3 +1115,186 @@ async def get_agent_states(
     return {
         "agents": coordinator.get_agent_states(),
     }
+
+
+# ─── Operations pipeline aggregate (spec 2026-07-13-operations-pipeline-board) ───
+
+class OperationsAnalyzing(BaseModel):
+    session_id: str
+    ticker: str
+    name: Optional[str] = None
+    status: str
+    current_stage: Optional[str] = None
+    started_at: Optional[str] = None
+
+
+class OperationsAwaiting(BaseModel):
+    session_id: str
+    ticker: str
+    name: Optional[str] = None
+    proposal: Optional[Dict[str, Any]] = None  # session.state["trade_proposal"] 원본
+    auto_approve_at: Optional[str] = None
+
+
+class OperationsOpenOrder(BaseModel):
+    order_id: str
+    stk_cd: str
+    stk_nm: Optional[str] = None
+    side: str  # "buy" | "sell"
+    price: Optional[int] = None
+    quantity: int
+    remaining_quantity: int
+    executed_quantity: int = 0
+    created_at: Optional[str] = None
+
+
+class OperationsPendingBuy(BaseModel):
+    queue: Optional[List[Dict[str, Any]]] = None
+    open_orders: Optional[List[OperationsOpenOrder]] = None
+
+
+class OperationsHolding(BaseModel):
+    ticker: str
+    name: Optional[str] = None
+    quantity: int
+    avg_price: float
+    current_price: float
+    pnl: float
+    pnl_pct: float
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+
+
+class OperationsFill(BaseModel):
+    ticker: str
+    name: Optional[str] = None
+    side: str  # "buy" | "sell"
+    quantity: int
+    price: int
+    time: str  # HHMMSS
+
+
+class OperationsResponse(BaseModel):
+    analyzing: Optional[List[OperationsAnalyzing]] = None
+    awaiting: Optional[List[OperationsAwaiting]] = None
+    watching: Optional[List[Dict[str, Any]]] = None
+    pending_buy: OperationsPendingBuy
+    holding: Optional[List[OperationsHolding]] = None
+    today_fills: Optional[List[OperationsFill]] = None
+    errors: Dict[str, str] = {}
+
+
+@router.get("/operations", response_model=OperationsResponse)
+async def get_operations(
+    market: str = "kiwoom",
+    coordinator=Depends(get_trading_coordinator),
+):
+    """운용 파이프라인 스냅샷 — 섹션별 독립 수집, 실패는 null+errors(위장 금지)."""
+    errors: Dict[str, str] = {}
+    res: Dict[str, Any] = {
+        "analyzing": None, "awaiting": None, "watching": None,
+        "pending_buy": OperationsPendingBuy(), "holding": None,
+        "today_fills": None, "errors": errors,
+    }
+
+    # 1) 세션 (분석중 / 승인대기) — SQLite 영속이라 재시작도 견딤
+    try:
+        sm = await get_session_manager()
+        mt = SessionMarketType.COIN if market == "coin" else SessionMarketType.KIWOOM
+        sessions = await sm.get_all_sessions(market_type=mt)
+        analyzing, awaiting = [], []
+        for s in sessions.values():
+            if s.status == SessionStatus.RUNNING:
+                analyzing.append(OperationsAnalyzing(
+                    session_id=s.session_id, ticker=s.ticker,
+                    name=s.display_name, status=s.status.value,
+                    current_stage=s.state.get("current_stage"),
+                    started_at=s.created_at.isoformat() if s.created_at else None,
+                ))
+            elif s.status == SessionStatus.AWAITING_APPROVAL:
+                awaiting.append(OperationsAwaiting(
+                    session_id=s.session_id, ticker=s.ticker,
+                    name=s.display_name,
+                    proposal=s.state.get("trade_proposal"),
+                    auto_approve_at=s.state.get("auto_approve_at"),
+                ))
+        res["analyzing"], res["awaiting"] = analyzing, awaiting
+    except Exception as e:  # noqa: BLE001 — 섹션 독립 강등
+        errors["sessions"] = str(e)
+
+    if market != "kiwoom":
+        # 코인: 큐/감시/브로커 섹션은 비해당(null, errors 없음)
+        return OperationsResponse(**res)
+
+    # 2) 감시 / 큐 (코디네이터 인메모리 — 실패 가능성 낮음, 그래도 독립)
+    try:
+        res["watching"] = [w.model_dump() for w in coordinator.get_watch_list()]
+    except Exception as e:  # noqa: BLE001
+        errors["watching"] = str(e)
+    queue_items: Optional[List[Dict[str, Any]]] = None
+    try:
+        queue_items = [t.model_dump() for t in coordinator.get_trade_queue()]
+    except Exception as e:  # noqa: BLE001
+        errors["queue"] = str(e)
+
+    # 3) 브로커 3종 — 각각 독립 수집
+    open_orders: Optional[List[OperationsOpenOrder]] = None
+    try:
+        client = await get_shared_kiwoom_client_async()
+    except Exception as e:  # noqa: BLE001
+        client = None
+        for k in ("open_orders", "holding", "today_fills"):
+            errors[k] = str(e)
+
+    if client is not None:
+        try:
+            raw = await client.get_pending_orders()
+            open_orders = [
+                OperationsOpenOrder(
+                    order_id=o.ord_no, stk_cd=o.stk_cd, stk_nm=o.stk_nm,
+                    # 소비자 계약(services/kiwoom/models.py, client._normalize_buy_sell):
+                    # buy_sell_tp "1"=매수, "2"=매도. PendingOrder에는 trde_tp 필드가
+                    # 없다 — buy_sell_tp가 유일한 매매구분 소스(orders.py:156 동일 관례).
+                    side="buy" if o.buy_sell_tp in ("1", "01", "매수") else "sell",
+                    price=o.ord_uv, quantity=o.ord_qty,
+                    remaining_quantity=o.rmn_qty, executed_quantity=o.ccld_qty,
+                    created_at=o.ord_tm,
+                )
+                for o in raw
+            ]
+        except Exception as e:  # noqa: BLE001
+            errors["open_orders"] = str(e)
+
+        try:
+            balance = await client.get_account_balance()
+            stops = {p.ticker: p for p in coordinator.state.positions}
+            res["holding"] = [
+                OperationsHolding(
+                    ticker=h.stk_cd, name=h.stk_nm, quantity=h.quantity,
+                    avg_price=float(h.avg_buy_price),
+                    current_price=float(h.current_price),
+                    pnl=float(h.profit_loss), pnl_pct=float(h.profit_loss_rate),
+                    stop_loss=getattr(stops.get(h.stk_cd), "stop_loss", None),
+                    take_profit=getattr(stops.get(h.stk_cd), "take_profit", None),
+                )
+                for h in balance.holdings
+            ]
+        except Exception as e:  # noqa: BLE001
+            errors["holding"] = str(e)
+
+        try:
+            fills = await client.get_filled_orders()
+            res["today_fills"] = [
+                OperationsFill(
+                    ticker=f.stk_cd, name=f.stk_nm,
+                    # buy_sell_tp "1"=매수(buy) — see note above.
+                    side="buy" if f.buy_sell_tp == "1" else "sell",
+                    quantity=f.ccld_qty, price=f.ccld_uv, time=f.ccld_tm,
+                )
+                for f in fills
+            ]
+        except Exception as e:  # noqa: BLE001
+            errors["today_fills"] = str(e)
+
+    res["pending_buy"] = OperationsPendingBuy(queue=queue_items, open_orders=open_orders)
+    return OperationsResponse(**res)
