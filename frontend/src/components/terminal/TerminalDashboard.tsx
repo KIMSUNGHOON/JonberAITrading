@@ -10,6 +10,7 @@
 import { useState } from 'react';
 import { Mosaic, MosaicWindow, type MosaicNode } from 'react-mosaic-component';
 import 'react-mosaic-component/react-mosaic-component.css';
+import { OperationsPanel } from './panels/OperationsPanel';
 import { WatchlistPanel } from './panels/WatchlistPanel';
 import { PositionsPanel } from './panels/PositionsPanel';
 import { PortfolioPanel } from './panels/PortfolioPanel';
@@ -19,10 +20,12 @@ import { ReasoningPanel } from './panels/ReasoningPanel';
 import { ChartTile } from './panels/ChartTile';
 
 type PanelId =
-  | 'watchlist' | 'chart' | 'portfolio' | 'positions' | 'scanner' | 'debate' | 'reasoning';
+  | 'operations' | 'watchlist' | 'chart' | 'portfolio'
+  | 'positions' | 'scanner' | 'debate' | 'reasoning';
 
 const TITLES: Record<PanelId, string> = {
-  watchlist: 'Watchlist',
+  operations: 'Operations · 운용 파이프라인',
+  watchlist: 'Basket',            // ← 서버 워치리스트와 구분 (스펙 §7)
   chart: 'Chart',
   portfolio: 'Portfolio',
   positions: 'Positions',
@@ -31,21 +34,29 @@ const TITLES: Record<PanelId, string> = {
   reasoning: 'Reasoning · tail -f',
 };
 
-const STORAGE_KEY = 'jonber.dashboard.layout.v1';
+// 레이아웃 v2 — OPERATIONS 상단 와이드
+const STORAGE_KEY = 'jonber.dashboard.layout.v2';
 
 const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
   type: 'split',
-  direction: 'row',
-  splitPercentages: [40, 30, 30],
+  direction: 'column',
+  splitPercentages: [34, 66],
   children: [
-    { type: 'split', direction: 'column', splitPercentages: [64, 36], children: ['watchlist', 'chart'] },
-    { type: 'split', direction: 'column', splitPercentages: [16, 62, 22], children: ['portfolio', 'positions', 'scanner'] },
-    { type: 'split', direction: 'column', splitPercentages: [46, 54], children: ['debate', 'reasoning'] },
+    'operations',
+    {
+      type: 'split', direction: 'row', splitPercentages: [40, 30, 30],
+      children: [
+        { type: 'split', direction: 'column', splitPercentages: [64, 36], children: ['watchlist', 'chart'] },
+        { type: 'split', direction: 'column', splitPercentages: [16, 62, 22], children: ['portfolio', 'positions', 'scanner'] },
+        { type: 'split', direction: 'column', splitPercentages: [46, 54], children: ['debate', 'reasoning'] },
+      ],
+    },
   ],
 };
 
 function renderBody(id: PanelId) {
   switch (id) {
+    case 'operations': return <OperationsPanel />;
     case 'watchlist': return <WatchlistPanel />;
     case 'chart': return <ChartTile />;
     case 'portfolio': return <PortfolioPanel />;

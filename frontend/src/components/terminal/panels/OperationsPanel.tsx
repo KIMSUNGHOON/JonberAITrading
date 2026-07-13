@@ -1,0 +1,506 @@
+/**
+ * OPERATIONS pipeline board — the top-wide tile showing the full autonomous
+ * operations flow in one glance: 분석중 → 승인대기 → 감시 → 매수대기 → 보유 →
+ * 오늘체결. Each column is independently sourced server-side (Task 1); a
+ * section that failed renders "조회 실패" honestly rather than faking a 0
+ * count, and a section that's genuinely non-applicable (coin queue/broker
+ * columns) is hidden outright. Polls every 5s and refetches immediately on
+ * any trade-notification push so the board tracks live state without a
+ * manual refresh.
+ */
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useStore } from '@/store';
+import {
+  getOperations, submitApproval, cancelKRStockSession, convertWatchToQueue,
+  removeFromWatchList, dismissTrade, cancelKRStockOrder,
+} from '@/api/client';
+import { useTradeNotifications } from '@/hooks/useTradeNotifications';
+import type { OperationsResponse } from '@/types';
+import { pnlColor } from '@/utils/pnl';
+import { Awaiting, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
+
+type FetchState = 'loading' | 'ready' | 'error';
+const POLL_MS = 5_000;
+
+function useOperations() {
+  const activeMarket = useStore((s) => s.activeMarket);
+  const [data, setData] = useState<OperationsResponse | null>(null);
+  const [state, setState] = useState<FetchState>('loading');
+  const [err, setErr] = useState<string | null>(null);
+  const aliveRef = useRef(true);
+
+  const refetch = useCallback(async (showLoading = false) => {
+    if (showLoading) setState('loading');
+    try {
+      const res = await getOperations(activeMarket === 'coin' ? 'coin' : 'kiwoom');
+      if (!aliveRef.current) return;
+      setData(res);
+      setState('ready');
+      setErr(null);
+    } catch (e) {
+      if (!aliveRef.current) return;
+      setErr(e instanceof Error ? e.message : '로드 실패');
+      setState('error');
+    }
+  }, [activeMarket]);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    refetch(true);
+    const id = setInterval(() => refetch(false), POLL_MS);
+    return () => { aliveRef.current = false; clearInterval(id); };
+  }, [refetch]);
+
+  // 체결/큐/워치 이벤트 push 시 즉시 재조회
+  useTradeNotifications({ onNotification: () => refetch(false), autoConnect: true });
+
+  return { activeMarket, data, state, err, refetch };
+}
+
+// -------------------------------------------
+// Column header
+// -------------------------------------------
+
+function ColumnHeader({
+  label, items, errorKey, errors,
+}: {
+  label: string;
+  items: unknown[] | null;
+  errorKey: string;
+  errors: Record<string, string>;
+}) {
+  const failed = items === null && errors[errorKey] != null;
+  return (
+    <div
+      className="text-[10px] text-muted font-semibold tracking-wide px-2.5 py-1.5 border-b border-hairline sticky top-0 bg-card flex-none"
+      title={failed ? errors[errorKey] : undefined}
+    >
+      {failed ? <span className="text-down">{label} · 조회 실패</span> : `${label} · ${items?.length ?? 0}`}
+    </div>
+  );
+}
+
+/** Column is hidden outright when its data is null with NO errors entry (non-applicable, e.g. coin). */
+function columnVisible(items: unknown[] | null, errorKey: string, errors: Record<string, string>): boolean {
+  return items !== null || errors[errorKey] != null;
+}
+
+const COLUMN_WRAP = 'min-w-[150px] flex-1 border-r border-hairline/60 last:border-r-0 flex flex-col overflow-y-auto';
+const CARD = 'px-2.5 py-1.5 border-b border-hairline/40 text-[11px]';
+
+// -------------------------------------------
+// 분석중
+// -------------------------------------------
+
+function AnalyzingColumn({
+  items, errors, navigate, onCancel,
+}: {
+  items: OperationsResponse['analyzing'];
+  errors: Record<string, string>;
+  navigate: (path: string) => void;
+  onCancel: (sessionId: string) => void;
+}) {
+  if (!columnVisible(items, 'sessions', errors)) return null;
+  return (
+    <div className={COLUMN_WRAP}>
+      <ColumnHeader label="분석중" items={items} errorKey="sessions" errors={errors} />
+      {(items ?? []).map((a) => (
+        <div
+          key={a.session_id}
+          className={`${CARD} cursor-pointer hover:bg-elevated/40`}
+          onClick={() => navigate(`/workflow/${a.session_id}`)}
+        >
+          <div className="flex items-start justify-between gap-1">
+            <div>
+              <div className="font-semibold">{a.name || a.ticker}</div>
+              <div className="text-muted">{a.current_stage ?? DASH}</div>
+            </div>
+            <button
+              type="button"
+              aria-label="분석 취소"
+              onClick={(e) => { e.stopPropagation(); onCancel(a.session_id); }}
+              className="text-dim hover:text-down flex-none"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// -------------------------------------------
+// 승인대기
+// -------------------------------------------
+
+function AwaitingCountdown({ autoApproveAt }: { autoApproveAt: string }) {
+  const [nowTs, setNowTs] = useState(() => Date.now());
+  useEffect(() => {
+    setNowTs(Date.now());
+    const id = setInterval(() => setNowTs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [autoApproveAt]);
+  const secondsLeft = Math.max(0, Math.ceil((Date.parse(autoApproveAt) - nowTs) / 1000));
+  return (
+    <div className="text-accent font-medium tabular-nums">
+      {secondsLeft > 0 ? `자율 승인까지 ${secondsLeft}초` : '자율 승인 처리 중…'}
+    </div>
+  );
+}
+
+function AwaitingColumn({
+  items, errors, activeMarket, submitting, onDecide,
+}: {
+  items: OperationsResponse['awaiting'];
+  errors: Record<string, string>;
+  activeMarket: 'kiwoom' | 'coin';
+  submitting: string | null;
+  onDecide: (sessionId: string, decision: 'approved' | 'rejected') => void;
+}) {
+  if (!columnVisible(items, 'sessions', errors)) return null;
+  return (
+    <div className={COLUMN_WRAP}>
+      <ColumnHeader label="승인대기" items={items} errorKey="sessions" errors={errors} />
+      {(items ?? []).map((a) => {
+        const proposal = a.proposal ?? {};
+        const action = typeof proposal.action === 'string' ? proposal.action : DASH;
+        const entry = typeof proposal.entry_price === 'number' ? proposal.entry_price : null;
+        const stop = typeof proposal.stop_loss === 'number' ? proposal.stop_loss : null;
+        const take = typeof proposal.take_profit === 'number' ? proposal.take_profit : null;
+        const risk = typeof proposal.risk_score === 'number' ? proposal.risk_score : null;
+        const isSubmitting = submitting === a.session_id;
+        return (
+          <div key={a.session_id} className={CARD}>
+            <div className="font-semibold">{a.name || a.ticker}</div>
+            <div className="text-muted">
+              {action} · 진입 {fmtPrice(entry, activeMarket)} · 손절 {fmtPrice(stop, activeMarket)} · 익절 {fmtPrice(take, activeMarket)} · 리스크 {risk ?? DASH}
+            </div>
+            {a.auto_approve_at && <AwaitingCountdown autoApproveAt={a.auto_approve_at} />}
+            <div className="flex gap-2 mt-1">
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={() => onDecide(a.session_id, 'approved')}
+                className="text-up font-medium disabled:opacity-50"
+              >
+                승인
+              </button>
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={() => onDecide(a.session_id, 'rejected')}
+                className="text-warn font-medium disabled:opacity-50"
+              >
+                거부
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// -------------------------------------------
+// 감시
+// -------------------------------------------
+
+function WatchingColumn({
+  items, errors, onConvert, onRemove,
+}: {
+  items: OperationsResponse['watching'];
+  errors: Record<string, string>;
+  onConvert: (watchId: string) => void;
+  onRemove: (watchId: string) => void;
+}) {
+  if (!columnVisible(items, 'watching', errors)) return null;
+  return (
+    <div className={COLUMN_WRAP}>
+      <ColumnHeader label="감시" items={items} errorKey="watching" errors={errors} />
+      {(items ?? []).map((raw, i) => {
+        const w = raw as Record<string, unknown>;
+        const id = w.id as string;
+        const ticker = w.ticker as string;
+        const name = (w.stock_name as string | null) ?? ticker;
+        const currentPrice = w.current_price as number | null;
+        const targetEntry = w.target_entry_price as number | null;
+        return (
+          <div key={id ?? i} className={CARD}>
+            <div className="font-semibold">{name}</div>
+            <div className="text-muted">
+              현재 {fmtPrice(currentPrice, 'kiwoom')} · 목표진입 {fmtPrice(targetEntry, 'kiwoom')}
+            </div>
+            <div className="flex gap-2 mt-1">
+              <button type="button" onClick={() => onConvert(id)} className="text-accent font-medium">
+                큐 전환
+              </button>
+              <button type="button" onClick={() => onRemove(id)} className="text-dim hover:text-down font-medium">
+                제거
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// -------------------------------------------
+// 매수대기
+// -------------------------------------------
+
+function PendingBuyColumn({
+  pendingBuy, errors, activeMarket, onDismiss, onCancelOrder,
+}: {
+  pendingBuy: OperationsResponse['pending_buy'];
+  errors: Record<string, string>;
+  activeMarket: 'kiwoom' | 'coin';
+  onDismiss: (queueId: string) => void;
+  onCancelOrder: (orderId: string) => void;
+}) {
+  const { queue, open_orders: openOrders } = pendingBuy;
+  const queueVisible = columnVisible(queue, 'queue', errors);
+  const ordersVisible = columnVisible(openOrders, 'open_orders', errors);
+  if (!queueVisible && !ordersVisible) return null;
+
+  const count = (queue?.length ?? 0) + (openOrders?.length ?? 0);
+  const queueFailed = queue === null && errors.queue != null;
+  const ordersFailed = openOrders === null && errors.open_orders != null;
+  const anyFailed = queueFailed || ordersFailed;
+  const failReason = errors.queue ?? errors.open_orders;
+
+  return (
+    <div className={COLUMN_WRAP}>
+      <div
+        className="text-[10px] text-muted font-semibold tracking-wide px-2.5 py-1.5 border-b border-hairline sticky top-0 bg-card flex-none"
+        title={anyFailed ? failReason : undefined}
+      >
+        {anyFailed ? <span className="text-down">매수대기 · 조회 실패</span> : `매수대기 · ${count}`}
+      </div>
+      {(queue ?? []).map((raw, i) => {
+        const q = raw as Record<string, unknown>;
+        const id = q.id as string;
+        const ticker = (q.ticker as string) ?? '';
+        const name = (q.stock_name as string | null) ?? ticker;
+        const action = q.action as string | undefined;
+        const quantity = q.quantity as number | null;
+        const entry = q.entry_price as number | null;
+        return (
+          <div key={id ?? i} className={CARD}>
+            <div className="font-semibold flex items-center gap-1.5">
+              {name}
+              <span className="text-[9px] px-1 py-px rounded bg-warn/10 text-warn font-medium">대기</span>
+            </div>
+            <div className="text-muted">
+              {action ?? DASH} {fmtInt(quantity)}주 @{fmtPrice(entry, activeMarket)}
+            </div>
+            <button type="button" onClick={() => onDismiss(id)} className="text-dim hover:text-down font-medium mt-1">
+              대기 취소
+            </button>
+          </div>
+        );
+      })}
+      {(openOrders ?? []).map((o) => (
+        <div key={o.order_id} className={CARD}>
+          <div className="font-semibold">{o.stk_nm || o.stk_cd}</div>
+          <div className="text-muted">
+            미체결 {fmtInt(o.remaining_quantity)}주 @{fmtPrice(o.price, activeMarket)}
+          </div>
+          <button
+            type="button"
+            onClick={() => onCancelOrder(o.order_id)}
+            className="text-dim hover:text-down font-medium mt-1"
+          >
+            주문 취소
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// -------------------------------------------
+// 보유
+// -------------------------------------------
+
+function HoldingColumn({
+  items, errors, activeMarket, navigate,
+}: {
+  items: OperationsResponse['holding'];
+  errors: Record<string, string>;
+  activeMarket: 'kiwoom' | 'coin';
+  navigate: (path: string) => void;
+}) {
+  if (!columnVisible(items, 'holding', errors)) return null;
+  return (
+    <div className={COLUMN_WRAP}>
+      <ColumnHeader label="보유" items={items} errorKey="holding" errors={errors} />
+      {(items ?? []).map((h, i) => (
+        <div
+          key={`${h.ticker}-${i}`}
+          className={`${CARD} cursor-pointer hover:bg-elevated/40`}
+          onClick={() => navigate('/positions')}
+        >
+          <div className="font-semibold">{h.name || h.ticker}</div>
+          <div className="text-muted">
+            {fmtInt(h.quantity)}주 · 평단 {fmtPrice(h.avg_price, activeMarket)} · 현재 {fmtPrice(h.current_price, activeMarket)}
+          </div>
+          <div className={pnlColor(h.pnl)}>
+            {fmtInt(h.pnl)} ({fmtPct(h.pnl_pct)})
+          </div>
+          <div className="text-dim">
+            STOP {h.stop_loss != null ? fmtPrice(h.stop_loss, activeMarket) : DASH} · TAKE {h.take_profit != null ? fmtPrice(h.take_profit, activeMarket) : DASH}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// -------------------------------------------
+// 오늘체결
+// -------------------------------------------
+
+function formatFillTime(hhmmss: string): string {
+  if (hhmmss.length < 4) return hhmmss;
+  return `${hhmmss.slice(0, 2)}:${hhmmss.slice(2, 4)}`;
+}
+
+function TodayFillsColumn({
+  items, errors, activeMarket, navigate,
+}: {
+  items: OperationsResponse['today_fills'];
+  errors: Record<string, string>;
+  activeMarket: 'kiwoom' | 'coin';
+  navigate: (path: string) => void;
+}) {
+  if (!columnVisible(items, 'today_fills', errors)) return null;
+  return (
+    <div className={COLUMN_WRAP}>
+      <ColumnHeader label="오늘체결" items={items} errorKey="today_fills" errors={errors} />
+      {(items ?? []).map((f, i) => (
+        <div
+          key={`${f.ticker}-${i}`}
+          className={`${CARD} cursor-pointer hover:bg-elevated/40`}
+          onClick={() => navigate('/trades')}
+        >
+          <div className="font-semibold">{f.name || f.ticker}</div>
+          <div className="text-muted">
+            {f.side === 'buy' ? '매수' : '매도'} {fmtInt(f.quantity)}주 @{fmtPrice(f.price, activeMarket)} · {formatFillTime(f.time)}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// -------------------------------------------
+// Main
+// -------------------------------------------
+
+export function OperationsPanel() {
+  const { activeMarket, data, state, err, refetch } = useOperations();
+  const navigate = useNavigate();
+  const [submittingSession, setSubmittingSession] = useState<string | null>(null);
+
+  const handleCancelAnalysis = useCallback(async (sessionId: string) => {
+    try {
+      await cancelKRStockSession(sessionId);
+    } finally {
+      refetch();
+    }
+  }, [refetch]);
+
+  const handleDecide = useCallback(async (sessionId: string, decision: 'approved' | 'rejected') => {
+    setSubmittingSession(sessionId);
+    try {
+      await submitApproval({ session_id: sessionId, decision });
+    } finally {
+      setSubmittingSession(null);
+      refetch();
+    }
+  }, [refetch]);
+
+  const handleConvertWatch = useCallback(async (watchId: string) => {
+    try {
+      await convertWatchToQueue({ watch_id: watchId });
+    } finally {
+      refetch();
+    }
+  }, [refetch]);
+
+  const handleRemoveWatch = useCallback(async (watchId: string) => {
+    try {
+      await removeFromWatchList(watchId);
+    } finally {
+      refetch();
+    }
+  }, [refetch]);
+
+  const handleDismissQueue = useCallback(async (queueId: string) => {
+    try {
+      await dismissTrade(queueId);
+    } finally {
+      refetch();
+    }
+  }, [refetch]);
+
+  const handleCancelOrder = useCallback(async (orderId: string) => {
+    try {
+      await cancelKRStockOrder(orderId);
+    } finally {
+      refetch();
+    }
+  }, [refetch]);
+
+  if (state === 'loading') return <Awaiting label="운용 현황 로드 중…" />;
+  if (state === 'error') return <Awaiting label={`운용 현황 오류 · ${err}`} />;
+  if (!data) return <Awaiting label="운용 현황 로드 중…" />;
+
+  const market = activeMarket === 'coin' ? 'coin' : 'kiwoom';
+
+  return (
+    <div className="flex h-full gap-0 overflow-x-auto">
+      <AnalyzingColumn
+        items={data.analyzing}
+        errors={data.errors}
+        navigate={navigate}
+        onCancel={handleCancelAnalysis}
+      />
+      <AwaitingColumn
+        items={data.awaiting}
+        errors={data.errors}
+        activeMarket={market}
+        submitting={submittingSession}
+        onDecide={handleDecide}
+      />
+      <WatchingColumn
+        items={data.watching}
+        errors={data.errors}
+        onConvert={handleConvertWatch}
+        onRemove={handleRemoveWatch}
+      />
+      <PendingBuyColumn
+        pendingBuy={data.pending_buy}
+        errors={data.errors}
+        activeMarket={market}
+        onDismiss={handleDismissQueue}
+        onCancelOrder={handleCancelOrder}
+      />
+      <HoldingColumn
+        items={data.holding}
+        errors={data.errors}
+        activeMarket={market}
+        navigate={navigate}
+      />
+      <TodayFillsColumn
+        items={data.today_fills}
+        errors={data.errors}
+        activeMarket={market}
+        navigate={navigate}
+      />
+    </div>
+  );
+}

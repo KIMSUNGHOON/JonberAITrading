@@ -1,0 +1,107 @@
+import { it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+
+const getOperations = vi.fn();
+const submitApproval = vi.fn().mockResolvedValue({});
+const cancelKRStockOrder = vi.fn().mockResolvedValue({});
+vi.mock('@/api/client', () => ({
+  getOperations: (...a: unknown[]) => getOperations(...a),
+  submitApproval: (...a: unknown[]) => submitApproval(...a),
+  cancelKRStockSession: vi.fn(),
+  convertWatchToQueue: vi.fn(),
+  removeFromWatchList: vi.fn(),
+  dismissTrade: vi.fn(),
+  cancelKRStockOrder: (...a: unknown[]) => cancelKRStockOrder(...a),
+}));
+vi.mock('@/hooks/useTradeNotifications', () => ({
+  useTradeNotifications: () => ({ isConnected: true, notifications: [] }),
+}));
+const navigate = vi.fn();
+vi.mock('react-router-dom', () => ({ useNavigate: () => navigate }));
+let mockState: Record<string, unknown>;
+vi.mock('@/store', async () => {
+  const actual = await vi.importActual<object>('@/store');
+  return {
+    ...actual,
+    useStore: (sel: (s: unknown) => unknown) => sel(mockState),
+  };
+});
+
+import { OperationsPanel } from './OperationsPanel';
+
+const BASE = {
+  analyzing: [], awaiting: [], watching: [],
+  pending_buy: { queue: [], open_orders: [] },
+  holding: [], today_fills: [], errors: {},
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockState = { activeMarket: 'kiwoom' };
+});
+
+it('전 컬럼 헤더와 카운트를 렌더한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    analyzing: [{ session_id: 's1', ticker: '005930', name: '삼성전자',
+                  status: 'running', current_stage: 'technical_analysis',
+                  started_at: null }],
+    pending_buy: {
+      queue: [],
+      open_orders: [{ order_id: 'o1', stk_cd: '005930', stk_nm: '삼성전자',
+                      side: 'buy', price: 260000, quantity: 48,
+                      remaining_quantity: 48, executed_quantity: 0,
+                      created_at: null }],
+    },
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/분석중 · 1/)).toBeInTheDocument());
+  expect(screen.getByText(/매수대기 · 1/)).toBeInTheDocument();
+  expect(screen.getByText(/미체결 48주/)).toBeInTheDocument();
+});
+
+it('승인대기 항목의 승인 버튼이 submitApproval을 호출한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    awaiting: [{ session_id: 's2', ticker: '000660', name: 'SK하이닉스',
+                 proposal: { action: 'WATCH', entry_price: 1968000,
+                             stop_loss: 1810560, take_profit: 2125440,
+                             risk_score: 0.7 },
+                 auto_approve_at: null }],
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: '승인' }));
+  await waitFor(() =>
+    expect(submitApproval).toHaveBeenCalledWith(
+      expect.objectContaining({ session_id: 's2', decision: 'approved' })));
+});
+
+it('섹션 오류는 조회 실패로 정직 표기한다 (0 위장 금지)', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    pending_buy: { queue: [], open_orders: null },
+    errors: { open_orders: 'kiwoom down' },
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/조회 실패/)).toBeInTheDocument());
+  expect(screen.queryByText(/매수대기 · 0/)).not.toBeInTheDocument();
+});
+
+it('미체결 취소 버튼이 cancelKRStockOrder를 호출하고 재조회한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    pending_buy: {
+      queue: [],
+      open_orders: [{ order_id: 'o9', stk_cd: '005930', stk_nm: '삼성전자',
+                      side: 'buy', price: 260000, quantity: 48,
+                      remaining_quantity: 48, executed_quantity: 0,
+                      created_at: null }],
+    },
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/매수대기 · 1/)).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: '주문 취소' }));
+  await waitFor(() => expect(cancelKRStockOrder).toHaveBeenCalledWith('o9'));
+  expect(getOperations.mock.calls.length).toBeGreaterThanOrEqual(2); // 액션 후 재조회
+});
