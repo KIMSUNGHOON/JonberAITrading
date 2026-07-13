@@ -13,6 +13,7 @@ Supported TradeAction types:
 - AVOID: 매수 금지 (미보유 + SELL 시그널) - 거래 미실행
 """
 
+from datetime import date
 from typing import Literal, Optional
 
 import structlog
@@ -31,6 +32,7 @@ from services.execution import (
     ExecutionSide,
     ExecutionOrderType,
 )
+from services.trading.fill_confirm import confirm_kiwoom_fill
 
 logger = structlog.get_logger()
 
@@ -263,73 +265,176 @@ async def kr_stock_execution_node(state: dict) -> dict:
             return_code=order_response.return_code,
         )
 
-        # Calculate position quantity change
-        existing_qty = existing_position.get("quantity", 0) if existing_position else 0
-        quantity_change = _calculate_position_quantity_change(action, quantity)
+        # An accepted order is NOT a filled order — confirm the ACTUAL fill via
+        # ka10076 (체결내역) instead of assuming full fill at the limit price.
+        # A limit order may fill partially or not at all; reporting an assumed
+        # full fill fabricated ghost positions for shares the broker never
+        # actually filled (F3 audit; mirrors OrderAgent._confirm_kiwoom_fill).
+        # A query failure inside confirm_kiwoom_fill is reported as 0 fill,
+        # never as an assumed full fill.
+        filled_qty, avg_fill_price = await confirm_kiwoom_fill(
+            client,
+            ticker=stk_cd,
+            order_no=order_response.ord_no,
+            requested_qty=quantity,
+            fallback_price=entry_price,
+        )
+        remaining_qty = max(0, quantity - filled_qty)
 
-        # Create/update position record based on action type
-        if action == TradeAction.ADD:
-            # ADD: Merge with existing position (existing_position is guaranteed non-None here)
-            new_quantity = existing_qty + quantity
-            avg_price = _calculate_average_price(
-                existing_price=existing_position.get("entry_price", 0),
-                existing_qty=existing_qty,
-                new_price=entry_price,
-                new_qty=quantity,
-            )
-            position = KRStockPosition(
-                stk_cd=stk_cd,
-                stk_nm=stk_nm,
-                quantity=new_quantity,
-                entry_price=avg_price,
-                current_price=entry_price,
-                stop_loss=proposal.get("stop_loss") or existing_position.get("stop_loss"),
-                take_profit=proposal.get("take_profit") or existing_position.get("take_profit"),
-            )
-        elif action == TradeAction.REDUCE and existing_position:
-            # Reduce existing position
-            new_quantity = max(0, existing_qty - quantity)
-            position = KRStockPosition(
-                stk_cd=stk_cd,
-                stk_nm=stk_nm,
-                quantity=new_quantity,
-                entry_price=existing_position.get("entry_price", entry_price),
-                current_price=entry_price,
-                stop_loss=existing_position.get("stop_loss") if new_quantity > 0 else None,
-                take_profit=existing_position.get("take_profit") if new_quantity > 0 else None,
-            )
-        else:
-            # BUY (new position) or SELL (position closed)
-            position = KRStockPosition(
-                stk_cd=stk_cd,
-                stk_nm=stk_nm,
-                quantity=quantity_change,
-                entry_price=entry_price,
-                current_price=entry_price,
-                stop_loss=proposal.get("stop_loss"),
-                take_profit=proposal.get("take_profit"),
-            )
+        logger.info(
+            "kr_stock_fill_confirmed",
+            stk_cd=stk_cd,
+            action=action.value,
+            order_no=order_response.ord_no,
+            requested_qty=quantity,
+            filled_qty=filled_qty,
+            remaining_qty=remaining_qty,
+        )
+
+        # Calculate position quantity change — driven by the CONFIRMED fill,
+        # never the requested quantity. A 0 fill produces no position at all
+        # (position stays None → omitted from the returned state so any
+        # existing position is left untouched rather than clobbered).
+        existing_qty = existing_position.get("quantity", 0) if existing_position else 0
+        avg_fill_price_int = round(avg_fill_price)
+
+        position: Optional[KRStockPosition] = None
+        if filled_qty > 0:
+            # Create/update position record based on action type
+            if action == TradeAction.ADD:
+                # ADD: Merge with existing position (existing_position is guaranteed non-None here)
+                new_quantity = existing_qty + filled_qty
+                avg_price = _calculate_average_price(
+                    existing_price=existing_position.get("entry_price", 0),
+                    existing_qty=existing_qty,
+                    new_price=avg_fill_price,
+                    new_qty=filled_qty,
+                )
+                position = KRStockPosition(
+                    stk_cd=stk_cd,
+                    stk_nm=stk_nm,
+                    quantity=new_quantity,
+                    entry_price=avg_price,
+                    current_price=avg_fill_price_int,
+                    stop_loss=proposal.get("stop_loss") or existing_position.get("stop_loss"),
+                    take_profit=proposal.get("take_profit") or existing_position.get("take_profit"),
+                )
+            elif action == TradeAction.REDUCE and existing_position:
+                # Reduce existing position by the CONFIRMED sold quantity
+                new_quantity = max(0, existing_qty - filled_qty)
+                position = KRStockPosition(
+                    stk_cd=stk_cd,
+                    stk_nm=stk_nm,
+                    quantity=new_quantity,
+                    entry_price=existing_position.get("entry_price", avg_fill_price_int),
+                    current_price=avg_fill_price_int,
+                    stop_loss=existing_position.get("stop_loss") if new_quantity > 0 else None,
+                    take_profit=existing_position.get("take_profit") if new_quantity > 0 else None,
+                )
+            else:
+                # BUY (new position) or SELL (position reduced/closed) — the
+                # CONFIRMED fill, not the requested quantity, drives the delta.
+                quantity_change = _calculate_position_quantity_change(action, filled_qty)
+                position = KRStockPosition(
+                    stk_cd=stk_cd,
+                    stk_nm=stk_nm,
+                    quantity=quantity_change,
+                    entry_price=avg_fill_price_int,
+                    current_price=avg_fill_price_int,
+                    stop_loss=proposal.get("stop_loss"),
+                    take_profit=proposal.get("take_profit"),
+                )
+
+        # Mirror the confirmed fill into the trading coordinator's own
+        # monitoring (RiskMonitor / agent-chat PositionManager) and, for any
+        # still-unfilled remainder of a BUY-side order, register it with the
+        # coordinator's fill tracker so the scheduler's ka10076 poll can pick
+        # up the post-fill later — otherwise a partial/zero fill at placement
+        # time would go unwatched by every defense engine once this node
+        # returns. SELL/REDUCE unfilled remainders are explicitly out of
+        # scope here (mirrors coordinator.py's own R5-P4 scope boundary).
+        #
+        # Best-effort: a coordinator failure must never crash the graph run,
+        # so this entire block is exception-boxed and the execution_status
+        # computed below is unaffected by it.
+        if _is_buy_action(action):
+            try:
+                from app.dependencies import get_trading_coordinator
+                from services.trading.pending_order_tracker import TrackedOrder
+                from services.trading.position_registration import (
+                    register_fill_as_position,
+                )
+
+                coordinator = await get_trading_coordinator()
+
+                if filled_qty > 0:
+                    await register_fill_as_position(
+                        coordinator,
+                        ticker=stk_cd,
+                        stock_name=stk_nm,
+                        quantity=filled_qty,
+                        avg_price=avg_fill_price,
+                        stop_loss=proposal.get("stop_loss"),
+                        take_profit=proposal.get("take_profit"),
+                        session_id=state.get("session_id"),
+                        source="kr_graph_execution",
+                    )
+
+                if remaining_qty > 0:
+                    coordinator.fill_tracker.register(
+                        TrackedOrder(
+                            ord_no=order_response.ord_no,
+                            ticker=stk_cd,
+                            stock_name=stk_nm,
+                            side="buy",
+                            total_quantity=quantity,
+                            filled_quantity=filled_qty,
+                            filled_amount=filled_qty * avg_fill_price,
+                            limit_price=entry_price,
+                            stop_loss=proposal.get("stop_loss"),
+                            take_profit=proposal.get("take_profit"),
+                            source_session_id=state.get("session_id"),
+                            trade_date=date.today().strftime("%Y%m%d"),
+                        )
+                    )
+            except Exception as coord_err:
+                logger.warning(
+                    "kr_stock_fill_registration_failed",
+                    stk_cd=stk_cd,
+                    action=action.value,
+                    error=str(coord_err),
+                )
+
+        execution_status = "completed" if filled_qty > 0 else "placed_pending_fill"
 
         # Build reasoning message with action-specific details
         if action == TradeAction.ADD:
+            reported_total = position.quantity if position else existing_qty
             reasoning = (
-                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} +{quantity}주 @ {entry_price:,}원, "
-                f"기존 {existing_qty}주 → 총 {position.quantity}주, 주문번호: {order_response.ord_no}"
+                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} +{filled_qty}/{quantity}주(체결/요청) "
+                f"@ {avg_fill_price_int:,}원, 기존 {existing_qty}주 → 총 {reported_total}주, "
+                f"주문번호: {order_response.ord_no}"
             )
         elif action == TradeAction.REDUCE:
+            reported_remaining = position.quantity if position else existing_qty
             reasoning = (
-                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} -{quantity}주 @ {entry_price:,}원, "
-                f"기존 {existing_qty}주 → 잔여 {position.quantity}주, 주문번호: {order_response.ord_no}"
+                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} -{filled_qty}/{quantity}주(체결/요청) "
+                f"@ {avg_fill_price_int:,}원, 기존 {existing_qty}주 → 잔여 {reported_remaining}주, "
+                f"주문번호: {order_response.ord_no}"
+            )
+        elif filled_qty <= 0:
+            reasoning = (
+                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} {quantity}주 @ {entry_price:,}원, "
+                f"체결 미확인 — 체결 추적 중 (주문번호: {order_response.ord_no})"
             )
         else:
             reasoning = (
-                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} {quantity}주 @ {entry_price:,}원, "
-                f"주문번호: {order_response.ord_no}"
+                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} {filled_qty}/{quantity}주(체결/요청) "
+                f"@ {avg_fill_price_int:,}원, 주문번호: {order_response.ord_no}"
             )
 
-        return {
-            "execution_status": "completed",
-            "active_position": position.model_dump(),
+        response_update = {
+            "execution_status": execution_status,
             "order_response": {
                 "ord_no": order_response.ord_no,
                 "return_code": order_response.return_code,
@@ -339,6 +444,9 @@ async def kr_stock_execution_node(state: dict) -> dict:
             "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
             "messages": [AIMessage(content=reasoning)],
         }
+        if position is not None:
+            response_update["active_position"] = position.model_dump()
+        return response_update
 
     except Exception as e:
         error_msg = str(e)

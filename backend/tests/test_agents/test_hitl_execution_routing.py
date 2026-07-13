@@ -15,7 +15,7 @@ from agents.graph.kr_stock_nodes.execution import (
     kr_stock_execution_node,
 )
 from agents.graph.coin_nodes import should_continue_coin_execution
-from services.kiwoom.models import OrderResponse
+from services.kiwoom.models import FilledOrder, OrderResponse
 
 ROUTERS = [
     should_continue_kr_stock_execution,
@@ -39,13 +39,34 @@ def test_non_execute_statuses_route_to_end(router, status):
     assert router({"approval_status": status}) == "end"
 
 
+@patch("services.trading.position_registration.register_fill_as_position", new_callable=AsyncMock)
+@patch("app.dependencies.get_trading_coordinator")
 @patch("agents.graph.kr_stock_nodes.execution.get_shared_kiwoom_client_async")
-async def test_kr_execute_approved_buy_places_mock_order(mock_get_client):
+async def test_kr_execute_approved_buy_places_mock_order(
+    mock_get_client, mock_get_coordinator, mock_register
+):
+    # The execute node now confirms the ACTUAL fill (ka10076) instead of
+    # assuming placement==fill — the fake client must report a real fill for
+    # this to reach "completed" (see test_kr_execution_fill_confirm.py for
+    # the 0/partial/exception fill-confirmation branches).
     client = MagicMock()
     client.place_buy_order = AsyncMock(
         return_value=OrderResponse(ord_no="X1", return_code=0, return_msg="정상")
     )
+    client.get_filled_orders = AsyncMock(
+        return_value=[
+            FilledOrder(
+                ord_no="X1", stk_cd="005930", stk_nm="삼성전자",
+                ccld_qty=10, ccld_uv=70000, ccld_amt=700000,
+                ccld_dt="", ccld_tm="", buy_sell_tp="매수",
+            )
+        ]
+    )
     mock_get_client.return_value = client
+    # A mocked coordinator — this test isn't exercising coordinator wiring
+    # (that's test_kr_execution_fill_confirm.py's job), just guarding against
+    # the real global singleton being touched.
+    mock_get_coordinator.return_value = MagicMock()
     state = {
         "approval_status": "approved",
         "trade_proposal": {"stk_cd": "005930", "stk_nm": "삼성전자", "action": "BUY",
