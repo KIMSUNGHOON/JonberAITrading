@@ -15,24 +15,30 @@ wires an isolated SQLite into the `get_storage_service()` singleton;
 `_stub_market`/`_FakeKiwoomClient`/`_filled` are the same shapes used there.
 """
 
+import asyncio
 from datetime import date, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import services.storage_service as ss
-from services.kiwoom.models import FilledOrder, OrderResponse
+from services.agent_chat.position_manager import MonitoredPosition
+from services.kiwoom.models import AccountBalance, FilledOrder, Holding, OrderResponse
 from services.trading.coordinator import ExecutionCoordinator
 from services.trading.models import (
+    ManagedPosition,
     OrderRequest,
     OrderResult,
     OrderSide,
     OrderType,
+    QueueStatus,
     StopLossMode,
     TradingMode,
 )
 from services.trading.order_agent import OrderAgent
 from services.trading.pending_order_tracker import TrackedOrder, TrackedOrderStatus
+from services.trading.reconciler import ReconcileReport, reconcile
 
 pytestmark = pytest.mark.asyncio
 
@@ -794,3 +800,376 @@ async def test_poll_exception_leaves_tracked_state_unchanged(temp_storage):
     assert order.filled_quantity == 20
     assert coord._state.positions == []
     assert alerts == []
+
+
+# -------------------------------------------
+# F3 t6: broker-local reconciler
+#
+# reconcile(coordinator) reads get_account_balance() as truth and converges
+# the coordinator and the agent-chat PositionManager toward it: adopts
+# broker-only "orphan" holdings, removes positions the broker no longer
+# holds (unless a TRACKING sell explains a transient zero), and fixes any
+# quantity drift between an engine and the broker.
+# -------------------------------------------
+
+
+def _holding(stk_cd="005930", stk_nm="삼성전자", qty=48, avg=260_000, cur=260_000):
+    evlu_amt = cur * qty
+    pfls_amt = (cur - avg) * qty
+    pfls_rt = ((cur - avg) / avg * 100) if avg else 0.0
+    return Holding(
+        stk_cd=stk_cd,
+        stk_nm=stk_nm,
+        hldg_qty=qty,
+        avg_buy_prc=avg,
+        cur_prc=cur,
+        evlu_amt=evlu_amt,
+        evlu_pfls_amt=pfls_amt,
+        evlu_pfls_rt=pfls_rt,
+    )
+
+
+class _BalanceKiwoomClient:
+    """Minimal Kiwoom client: reports get_account_balance() from a fixed
+    holdings list (or raises, for the failure-path test)."""
+
+    def __init__(self, holdings=None, raise_error=False):
+        self._holdings = holdings if holdings is not None else []
+        self._raise_error = raise_error
+        self.balance_calls = 0
+
+    async def get_account_balance(self, qry_tp="0", exchange=None):
+        self.balance_calls += 1
+        if self._raise_error:
+            raise RuntimeError("kt00004 down")
+        return AccountBalance(holdings=list(self._holdings))
+
+
+def _chat_coordinator(pm):
+    """A stand-in for ChatCoordinator exposing only `.position_manager`,
+    matching the shape `_get_position_manager` reads (same pattern as
+    test_position_registration.py)."""
+    return SimpleNamespace(position_manager=pm)
+
+
+class _FakePM:
+    """A tiny stand-in for agent_chat.PositionManager with real (not mocked)
+    absolute-assignment semantics — needed for the convergence test, which
+    re-reads state across two reconcile() calls."""
+
+    def __init__(self, positions=None):
+        self._positions = dict(positions or {})
+
+    def get_position(self, ticker):
+        return self._positions.get(ticker)
+
+    def get_all_positions(self):
+        return list(self._positions.values())
+
+    def add_position(self, *, ticker, stock_name, quantity, avg_price,
+                      current_price=None, stop_loss=None, take_profit=None,
+                      trailing_stop_pct=None):
+        position = MonitoredPosition(
+            ticker=ticker,
+            stock_name=stock_name,
+            quantity=quantity,
+            avg_price=avg_price,
+            current_price=current_price or avg_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+        self._positions[ticker] = position
+        return position
+
+    def update_position(self, ticker, quantity=None, current_price=None,
+                         stop_loss=None, take_profit=None, trailing_stop_pct=None):
+        position = self._positions.get(ticker)
+        if position is None:
+            return None
+        if quantity is not None:
+            position.quantity = quantity
+        if current_price is not None:
+            position.current_price = current_price
+        if stop_loss is not None:
+            position.stop_loss = stop_loss
+        if take_profit is not None:
+            position.take_profit = take_profit
+        return position
+
+    def remove_position(self, ticker):
+        return self._positions.pop(ticker, None) is not None
+
+
+def _patch_pm(monkeypatch, pm):
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(pm)),
+    )
+
+
+def _managed_position(ticker="005930", quantity=48, avg=260_000,
+                       stop_loss=246_560, take_profit=289_440):
+    return ManagedPosition(
+        ticker=ticker,
+        stock_name="삼성전자",
+        quantity=quantity,
+        avg_price=avg,
+        current_price=avg,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+
+
+# 1) orphan + fill_tracker FILLED record -> adopt with that stop, notify once
+async def test_reconcile_orphan_adopts_using_fill_tracker_stop(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(holdings=[_holding(qty=48, avg=260_000, cur=265_000)])
+    )
+    coord.fill_tracker.register(
+        _tracked_order(
+            ord_no="OLD1",
+            total=48,
+            filled=48,
+            status=TrackedOrderStatus.FILLED,
+            stop_loss=246_560,
+            take_profit=289_440,
+        )
+    )
+    _patch_pm(monkeypatch, None)
+
+    alerts = []
+
+    async def _capture(a):
+        alerts.append(a)
+
+    coord.set_alert_callback(_capture)
+
+    report = await reconcile(coord)
+
+    assert report == ReconcileReport(orphans_adopted=1, externally_closed=0, quantity_fixed=0)
+    assert len(coord._state.positions) == 1
+    position = coord._state.positions[0]
+    assert position.ticker == "005930"
+    assert position.quantity == 48
+    assert position.stop_loss == 246_560
+    assert position.take_profit == 289_440
+    assert len(alerts) == 1
+    assert alerts[0].ticker == "005930"
+
+
+# 2) orphan + no tracker record but a COMPLETED BUY in trade_queue -> that stop
+async def test_reconcile_orphan_adopts_using_trade_queue_stop(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(holdings=[_holding(qty=48, avg=260_000, cur=260_000)])
+    )
+    queued = coord.add_to_queue(
+        session_id="s1",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="BUY",
+        entry_price=260_000,
+        stop_loss=250_000,
+        take_profit=280_000,
+        risk_score=6,
+        reason="장 마감",
+        autonomous=False,
+        quantity=48,
+    )
+    queued.status = QueueStatus.COMPLETED
+    _patch_pm(monkeypatch, None)
+
+    report = await reconcile(coord)
+
+    assert report.orphans_adopted == 1
+    position = coord._state.positions[0]
+    assert position.stop_loss == 250_000
+    assert position.take_profit == 280_000
+
+
+# 3) orphan + no provenance at all -> default ±8% off avg price, notified as such
+async def test_reconcile_orphan_falls_back_to_default_stop(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(holdings=[_holding(qty=10, avg=250_000, cur=250_000)])
+    )
+    _patch_pm(monkeypatch, None)
+
+    alerts = []
+
+    async def _capture(a):
+        alerts.append(a)
+
+    coord.set_alert_callback(_capture)
+
+    report = await reconcile(coord)
+
+    assert report.orphans_adopted == 1
+    position = coord._state.positions[0]
+    assert position.stop_loss == pytest.approx(230_000)
+    assert position.take_profit == pytest.approx(270_000)
+    assert "기본 스탑" in alerts[0].message
+
+
+# 4) reverse: coordinator manages it, broker no longer does -> remove both, notify
+async def test_reconcile_removes_position_absent_from_broker(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(kiwoom_client=_BalanceKiwoomClient(holdings=[]))
+    coord._add_position(_managed_position())
+    _patch_pm(monkeypatch, None)
+
+    alerts = []
+
+    async def _capture(a):
+        alerts.append(a)
+
+    coord.set_alert_callback(_capture)
+
+    report = await reconcile(coord)
+
+    assert report.externally_closed == 1
+    assert coord._state.positions == []
+    assert len(alerts) == 1
+
+
+# 5) reverse exception: a TRACKING sell for the ticker suppresses the removal
+async def test_reconcile_reverse_check_skips_when_tracking_sell_exists(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(kiwoom_client=_BalanceKiwoomClient(holdings=[]))
+    coord._add_position(_managed_position())
+    coord.fill_tracker.register(
+        _tracked_order(ord_no="SELL1", ticker="005930", side="sell", total=10, filled=0)
+    )
+    _patch_pm(monkeypatch, None)
+
+    report = await reconcile(coord)
+
+    assert report.externally_closed == 0
+    assert len(coord._state.positions) == 1
+
+
+# 6) quantity mismatch (broker 30 vs managed 48) -> corrected to broker qty
+async def test_reconcile_fixes_quantity_mismatch(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(holdings=[_holding(qty=30, avg=260_000, cur=260_000)])
+    )
+    coord._add_position(_managed_position(quantity=48))
+    _patch_pm(monkeypatch, None)
+
+    alerts = []
+
+    async def _capture(a):
+        alerts.append(a)
+
+    coord.set_alert_callback(_capture)
+
+    report = await reconcile(coord)
+
+    assert report.quantity_fixed == 1
+    assert coord._state.positions[0].quantity == 30
+    assert len(alerts) == 1
+
+
+# 7) get_account_balance failure -> all-zero report, managed state untouched
+async def test_reconcile_returns_empty_report_on_balance_fetch_failure(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(kiwoom_client=_BalanceKiwoomClient(raise_error=True))
+    coord._add_position(_managed_position(quantity=48))
+    _patch_pm(monkeypatch, None)
+
+    report = await reconcile(coord)
+
+    assert report == ReconcileReport(orphans_adopted=0, externally_closed=0, quantity_fixed=0)
+    assert len(coord._state.positions) == 1
+    assert coord._state.positions[0].quantity == 48
+
+
+# 8) double-count-window convergence (F3 t3 review subtlety): PositionManager
+# syncs ABSOLUTE broker quantities while the fill tracker applies INCREMENTAL
+# deltas — a race can leave PM double-counted (its own sync plus a delta the
+# broker snapshot already included) while the coordinator, which only ever
+# applied the single delta, stays correct. Broker truth wins for both sides;
+# PM's update_position assigns absolutely so one correction converges it, and
+# re-reconciling finds nothing left to fix.
+async def test_reconcile_converges_pm_double_count_window(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(holdings=[_holding(qty=48, avg=260_000, cur=260_000)])
+    )
+    coord._add_position(_managed_position(quantity=48))  # already correct
+    pm = _FakePM({
+        "005930": MonitoredPosition(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=76,  # double-counted: 48 (sync) + 28 (incremental delta)
+            avg_price=260_000,
+            current_price=260_000,
+            stop_loss=246_560,
+            take_profit=289_440,
+        )
+    })
+    _patch_pm(monkeypatch, pm)
+
+    alerts = []
+
+    async def _capture(a):
+        alerts.append(a)
+
+    coord.set_alert_callback(_capture)
+
+    report = await reconcile(coord)
+
+    assert report.quantity_fixed == 1
+    assert coord._state.positions[0].quantity == 48  # untouched — already correct
+    assert pm.get_position("005930").quantity == 48  # corrected to broker truth
+    assert len(alerts) == 1
+
+    # Stable fixed point — re-reconciling finds nothing left to fix.
+    report2 = await reconcile(coord)
+    assert report2 == ReconcileReport(orphans_adopted=0, externally_closed=0, quantity_fixed=0)
+    assert len(alerts) == 1  # no duplicate notification
+
+
+# 9) decision 1, reverse direction: coordinator already manages it, PM doesn't
+# -> PM gets backfilled directly from the coordinator's data (not counted as
+# an "orphan adoption" — the broker holding was already known/trusted).
+async def test_reconcile_backfills_pm_when_only_coordinator_manages(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(holdings=[_holding(qty=48, avg=260_000, cur=260_000)])
+    )
+    coord._add_position(_managed_position(quantity=48))
+    pm = _FakePM({})
+    _patch_pm(monkeypatch, pm)
+
+    report = await reconcile(coord)
+
+    assert report.orphans_adopted == 0
+    assert report.quantity_fixed == 0
+    pm_position = pm.get_position("005930")
+    assert pm_position is not None
+    assert pm_position.quantity == 48
+    assert pm_position.stop_loss == 246_560
+
+
+# 10) wiring: the 30s queue-scheduler loop calls reconcile() every 2nd tick
+async def test_scheduler_calls_reconcile_every_second_tick(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    coord._check_queue_on_market_open = AsyncMock()
+    coord._poll_tracked_fills = AsyncMock()
+
+    calls = []
+
+    async def _fake_reconcile(c):
+        calls.append(c)
+        return ReconcileReport()
+
+    monkeypatch.setattr("services.trading.coordinator.reconcile", _fake_reconcile)
+
+    tick_count = {"n": 0}
+
+    async def _fake_sleep(_seconds):
+        tick_count["n"] += 1
+        if tick_count["n"] > 2:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr("asyncio.sleep", _fake_sleep)
+
+    await coord._queue_scheduler_loop()
+
+    assert tick_count["n"] == 3  # two ticks ran, the third stopped the loop
+    assert len(calls) == 1  # reconcile fired exactly once, on the 2nd tick
+    assert calls[0] is coord

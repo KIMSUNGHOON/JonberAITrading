@@ -103,6 +103,13 @@ class PendingOrderTracker:
             if o.status == TrackedOrderStatus.TRACKING
         ]
 
+    def all_orders(self) -> list[TrackedOrder]:
+        """Every tracked order regardless of status (TRACKING/FILLED/EXPIRED/
+        CANCELLED). Used by the reconciler (F3 t6) to search FILLED orders for
+        stop-loss provenance and to spot in-flight TRACKING sells, without
+        reaching into `_orders` directly."""
+        return list(self._orders.values())
+
     def apply_fills(self, fills: list[FilledOrder]) -> list[FillDelta]:
         """Diff a ka10076 snapshot against tracked orders.
 

@@ -42,6 +42,7 @@ from .strategy import TradingStrategy
 from .strategy_engine import StrategyEngine
 from .pending_order_tracker import PendingOrderTracker, TrackedOrder
 from .position_registration import register_fill_as_position
+from .reconciler import reconcile
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,12 @@ class ExecutionCoordinator:
         # post-fill went unwatched by every defense engine. Tracks the
         # remainder and reconciles it against ka10076 on the scheduler tick.
         self.fill_tracker = PendingOrderTracker()
+
+        # F3 t6: counts scheduler ticks so the broker-local reconciler runs
+        # every 2nd tick (60s at the default 30s interval) instead of every
+        # tick — it does a full get_account_balance() call plus per-ticker
+        # PositionManager lookups, heavier than the fill-tracker poll.
+        self._reconcile_tick_count = 0
 
     # -------------------------------------------
     # Activity Logging
@@ -1624,6 +1631,9 @@ class ExecutionCoordinator:
                 try:
                     await self._check_queue_on_market_open()
                     await self._poll_tracked_fills()
+                    self._reconcile_tick_count += 1
+                    if self._reconcile_tick_count % 2 == 0:
+                        await reconcile(self)
                 except Exception as e:
                     logger.error(f"[Coordinator] Queue scheduler error: {e}")
         except asyncio.CancelledError:
