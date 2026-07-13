@@ -55,6 +55,8 @@ import type {
   AddToWatchListResponse,
   ConvertWatchToQueueRequest,
   ConvertWatchToQueueResponse,
+  // Operations Types
+  OperationsResponse,
   // Scanner Types
   ScanProgressResponse,
   ScanResultsResponse,
@@ -1434,6 +1436,16 @@ class ApiClient {
   }
 
   /**
+   * Get operations pipeline snapshot for a market.
+   */
+  async getOperations(market: 'kiwoom' | 'coin' = 'kiwoom'): Promise<OperationsResponse> {
+    const response = await this.client.get<OperationsResponse>('/trading/operations', {
+      params: { market },
+    });
+    return response.data;
+  }
+
+  /**
    * Add a stock to watch list.
    */
   async addToWatchList(request: AddToWatchListRequest): Promise<AddToWatchListResponse> {
@@ -2044,6 +2056,10 @@ export const removeFromWatchList = (watchId: string) =>
 
 export const convertWatchToQueue = (request: ConvertWatchToQueueRequest) =>
   apiClient.convertWatchToQueue(request);
+
+// Operations API
+export const getOperations = (market: 'kiwoom' | 'coin' = 'kiwoom') =>
+  apiClient.getOperations(market);
 
 // Background Scanner API
 export const startScan = (request?: StartScanRequest) =>

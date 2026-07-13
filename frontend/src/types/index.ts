@@ -1429,3 +1429,70 @@ export interface MarketStatus {
   next_close: string | null;
   countdown_seconds: number;
 }
+
+// ─── Operations pipeline board (2026-07-13) ───
+
+export interface OperationsAnalyzing {
+  session_id: string;
+  ticker: string;
+  name: string | null;
+  status: string;
+  current_stage: string | null;
+  started_at: string | null;
+}
+
+export interface OperationsAwaiting {
+  session_id: string;
+  ticker: string;
+  name: string | null;
+  proposal: Record<string, unknown> | null;
+  auto_approve_at: string | null;
+}
+
+export interface OperationsOpenOrder {
+  order_id: string;
+  stk_cd: string;
+  stk_nm: string | null;
+  side: 'buy' | 'sell';
+  price: number | null;
+  quantity: number;
+  remaining_quantity: number;
+  executed_quantity: number;
+  created_at: string | null;
+}
+
+export interface OperationsPendingBuy {
+  queue: Array<Record<string, unknown>> | null;
+  open_orders: OperationsOpenOrder[] | null;
+}
+
+export interface OperationsHolding {
+  ticker: string;
+  name: string | null;
+  quantity: number;
+  avg_price: number;
+  current_price: number;
+  pnl: number;
+  pnl_pct: number;
+  stop_loss: number | null;
+  take_profit: number | null;
+}
+
+export interface OperationsFill {
+  ticker: string;
+  name: string | null;
+  side: 'buy' | 'sell';
+  quantity: number;
+  price: number;
+  time: string;
+}
+
+export interface OperationsResponse {
+  analyzing: OperationsAnalyzing[] | null;
+  awaiting: OperationsAwaiting[] | null;
+  watching: Array<Record<string, unknown>> | null;
+  pending_buy: OperationsPendingBuy;
+  holding: OperationsHolding[] | null;
+  today_fills: OperationsFill[] | null;
+  errors: Record<string, string>;
+}
