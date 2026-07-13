@@ -20,7 +20,7 @@ Session Types:
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 import aiosqlite
@@ -132,6 +132,49 @@ class AnalysisSession:
         return base
 
 
+# -------------------------------------------
+# Stranded-session reconciliation (restart shape repair)
+# -------------------------------------------
+# TradeAction values that never carry execution risk — these skip the
+# proposal-age staleness gate below (only BUY/SELL-ish actions are gated).
+_NO_TRADE_ACTIONS = {"HOLD", "WATCH", "AVOID"}
+# A trade proposal older than this, discovered mid-restart, is considered too
+# stale to safely resume toward approval (market conditions may have moved).
+_PROPOSAL_AGE_LIMIT = timedelta(hours=6)
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    """Parse an ISO datetime string (or pass through a datetime) into an
+    aware UTC datetime.
+
+    Returns None if `value` is None or unparseable. Naive datetimes/strings
+    (no tzinfo) are assumed to be UTC rather than raising on comparison.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+@dataclass
+class ReconcileReport:
+    """Outcome of a single reconcile_stranded_sessions() pass."""
+    flipped: List[str] = field(default_factory=list)
+    errored: List[str] = field(default_factory=list)
+    cancelled: List[str] = field(default_factory=list)
+    kept: List[str] = field(default_factory=list)
+
+
 class SessionManager:
     """
     Unified session manager with SQLite persistence.
@@ -221,6 +264,15 @@ class SessionManager:
             # Load active sessions from SQLite (running and awaiting_approval)
             await self._load_active_sessions()
 
+            # Repair the shape of any session an unclean restart stranded
+            # mid-graph (running with no live task behind it, or awaiting
+            # approval with a decision the HITL layer never got to act on).
+            # Runs on the just-loaded sessions before anything else can see
+            # them. NOTE: reconcile_stranded_sessions() does NOT acquire
+            # self._lock itself — we are already holding it here, and
+            # asyncio.Lock is not reentrant (re-acquiring would deadlock).
+            reconcile_report = await self.reconcile_stranded_sessions()
+
             # Initialize semaphore
             self._analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
 
@@ -228,6 +280,9 @@ class SessionManager:
             logger.info(
                 "session_manager_initialized",
                 loaded_sessions=len(self._sessions),
+                reconciled_flipped=len(reconcile_report.flipped),
+                reconciled_errored=len(reconcile_report.errored),
+                reconciled_cancelled=len(reconcile_report.cancelled),
             )
 
     async def _load_active_sessions(self) -> None:
@@ -274,6 +329,148 @@ class SessionManager:
             market=row["market"],
             korean_name=row["korean_name"],
         )
+
+    async def reconcile_stranded_sessions(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        checkpoint_next: Optional[Callable[[str], Awaitable[Optional[tuple]]]] = None,
+    ) -> ReconcileReport:
+        """
+        Repair the shape of sessions an unclean restart stranded mid-graph.
+
+        A killed process can leave a session in a shape that no longer means
+        what it says: RUNNING with no task actually running behind it (the
+        classic "immortal zombie" that 404s on approve — nothing will ever
+        move it out of RUNNING again), or AWAITING_APPROVAL with a decision
+        already recorded in state but never acted on. This walks all loaded
+        sessions once and flips each into a shape that is safe to resume
+        or that fails closed.
+
+        Rules (see specs/.../task-1-brief.md for the full shape table):
+          - RUNNING + awaiting_approval flag + a trade_proposal in state:
+            this is a graph parked at (or just before) the HITL interrupt.
+              - BUY/SELL proposals older than 6h are considered stale
+                (market may have moved) -> ERROR.
+              - If `checkpoint_next` is supplied and does NOT report the
+                graph's next node as an "approval" step, we can't trust
+                that a resume would actually re-enter HITL -> ERROR.
+              - Otherwise -> flip to AWAITING_APPROVAL (with a cleared
+                approval_status so the next real decision isn't shadowed
+                by a stale one from before restart).
+          - RUNNING otherwise (no awaiting flag / no proposal) -> ERROR:
+            there is no live task, so this session could never reach
+            AWAITING_APPROVAL or COMPLETED on its own again.
+          - AWAITING_APPROVAL with approval_status == "approved" but the
+            awaiting_approval flag already cleared: an approval decision
+            was recorded but we cannot tell whether execution happened
+            before the process died -> ERROR (uncertain fill, never
+            silently resumed).
+          - AWAITING_APPROVAL with approval_status == "cancelled": the
+            decision was recorded but the status mirror never caught up
+            -> CANCELLED (pure shape correction, no new decision made).
+          - Everything else (a normal, still-pending AWAITING_APPROVAL)
+            is left as-is -> kept.
+
+        A stale `auto_approve_at` deadline is always cleared regardless of
+        branch: the in-process 60s grace-period injector that owned it is
+        gone after a restart, so the deadline can never fire and must not
+        be trusted by any UI reading it back.
+
+        Locking: this method does NOT acquire self._lock. It is invoked by
+        initialize() from inside its own `async with self._lock:` block, and
+        self._lock (asyncio.Lock) is not reentrant, so acquiring it here
+        would deadlock initialize() on every startup. Callers outside
+        initialize() (tests, or a future manual admin trigger) call this
+        directly without holding the lock; that's an accepted trade-off
+        because this only ever runs once, at startup, before any
+        concurrent session traffic exists.
+
+        Args:
+            now: Injectable "current time" for tests; defaults to
+                datetime.now(timezone.utc).
+            checkpoint_next: Injectable async lookup of
+                `(session_id) -> Optional[tuple[str, ...]]` describing the
+                graph checkpoint's pending next node(s) for that session.
+                Production wiring (a real LangGraph checkpointer lookup) is
+                not part of this task; None (the default) skips the check.
+
+        Returns:
+            ReconcileReport with the session_ids that were flipped to
+            AWAITING_APPROVAL, errored, cancelled, or kept unchanged.
+        """
+        now = now or datetime.now(timezone.utc)
+        rep = ReconcileReport()
+
+        for sid, s in list(self._sessions.items()):
+            st = s.state or {}
+            awaiting = bool(st.get("awaiting_approval"))
+            appr = st.get("approval_status")
+            prop = st.get("trade_proposal") or None
+
+            # A restart always invalidates any pending auto-approve deadline
+            # (the injector task that would fire it is gone).
+            changed_common = st.pop("auto_approve_at", None) is not None
+
+            if s.status == SessionStatus.RUNNING and awaiting and prop:
+                action = str(prop.get("action") or "").upper()
+
+                stale = False
+                if action not in _NO_TRADE_ACTIONS:
+                    created = (
+                        _parse_dt(prop.get("created_at"))
+                        or _parse_dt(s.created_at)
+                        or now
+                    )
+                    stale = (now - created) > _PROPOSAL_AGE_LIMIT
+
+                parked_ok = True
+                if checkpoint_next is not None:
+                    nxt = await checkpoint_next(sid)
+                    parked_ok = bool(nxt) and "approval" in tuple(nxt)
+
+                if stale or not parked_ok:
+                    s.status = SessionStatus.ERROR
+                    s.error = "서버 재시작으로 분석 중단 (제안 만료/체크포인트 불일치)"
+                    rep.errored.append(sid)
+                else:
+                    s.status = SessionStatus.AWAITING_APPROVAL
+                    st["approval_status"] = None  # new decision must overwrite, not be shadowed
+                    rep.flipped.append(sid)
+
+            elif s.status == SessionStatus.RUNNING:
+                s.status = SessionStatus.ERROR
+                s.error = "서버 재시작으로 분석 중단"
+                rep.errored.append(sid)
+
+            elif (
+                s.status == SessionStatus.AWAITING_APPROVAL
+                and not awaiting
+                and appr == "approved"
+            ):
+                s.status = SessionStatus.ERROR
+                s.error = "실행 중단 — 체결 확인 필요"
+                rep.errored.append(sid)
+
+            elif s.status == SessionStatus.AWAITING_APPROVAL and appr == "cancelled":
+                s.status = SessionStatus.CANCELLED
+                rep.cancelled.append(sid)
+
+            else:
+                rep.kept.append(sid)
+
+            if sid in rep.flipped or sid in rep.errored or sid in rep.cancelled or changed_common:
+                s.updated_at = now
+                await self._save_session(s)
+
+        logger.info(
+            "session_reconcile_done",
+            flipped=len(rep.flipped),
+            errored=len(rep.errored),
+            cancelled=len(rep.cancelled),
+            kept=len(rep.kept),
+        )
+        return rep
 
     async def create_session(
         self,
