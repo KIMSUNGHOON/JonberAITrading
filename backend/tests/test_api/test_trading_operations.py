@@ -1,13 +1,10 @@
 """GET /api/trading/operations aggregate endpoint tests."""
-from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 from app.api.routes import trading as trading_mod
 from services.session_manager import AnalysisSession, MarketType, SessionStatus
 from services.trading.models import ManagedPosition, QueuedTrade, WatchedStock
-from services.kiwoom.models import FilledOrder, PendingOrder
+from services.kiwoom.models import FilledOrder, Holding, PendingOrder
 
 
 def _session(sid, status, state=None, stk_cd="005930", stk_nm="삼성전자"):
@@ -77,9 +74,13 @@ async def test_operations_aggregates_all_sections():
     fill = FilledOrder(ord_no="0090001", stk_cd="005930", stk_nm="삼성전자",
                        ccld_qty=5, ccld_uv=265000, ccld_amt=1325000,
                        ccld_dt="20260713", ccld_tm="101000", buy_sell_tp="1")
-    holding = MagicMock(stk_cd="005930", stk_nm="삼성전자", quantity=10,
-                        avg_buy_price=260000, current_price=266000,
-                        eval_amount=2660000, profit_loss=60000, profit_loss_rate=2.31)
+    # Real Holding model (kt00004) — fields are hldg_qty/avg_buy_prc/cur_prc/
+    # evlu_pfls_amt/evlu_pfls_rt (services/kiwoom/models.py:196-206), so a wrong
+    # field name in the handler mapping fails loudly here instead of degrading
+    # to null via the handler's per-section except.
+    holding = Holding(stk_cd="005930", stk_nm="삼성전자", hldg_qty=10,
+                      avg_buy_prc=260000, cur_prc=266000, evlu_amt=2660000,
+                      evlu_pfls_amt=60000, evlu_pfls_rt=2.31)
 
     with patch.object(trading_mod, "get_session_manager",
                       AsyncMock(return_value=_sm([running, awaiting]))), \
@@ -102,6 +103,8 @@ async def test_operations_aggregates_all_sections():
     # holding: 브로커 수량/평단 + 코디네이터 스탑 병합
     h = res.holding[0]
     assert h.quantity == 10 and h.stop_loss == 246560.0 and h.take_profit == 289440.0
+    assert h.avg_price == 260000.0 and h.current_price == 266000.0
+    assert h.pnl == 60000.0 and h.pnl_pct == 2.31
     assert res.today_fills[0].side == "buy"  # buy_sell_tp "1" == 매수
     assert res.errors == {}
 

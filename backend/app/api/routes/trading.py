@@ -1268,12 +1268,16 @@ async def get_operations(
         try:
             balance = await client.get_account_balance()
             stops = {p.ticker: p for p in coordinator.state.positions}
+            # balance.holdings = services.kiwoom.models.Holding (kt00004) —
+            # 실제 필드는 hldg_qty/avg_buy_prc/cur_prc/evlu_pfls_amt/evlu_pfls_rt
+            # (quantity/avg_buy_price 등은 API 스키마 KRStockHolding의 이름;
+            # kr_stocks/orders.py:68-73의 매핑과 동일 소스·동일 변환).
             res["holding"] = [
                 OperationsHolding(
-                    ticker=h.stk_cd, name=h.stk_nm, quantity=h.quantity,
-                    avg_price=float(h.avg_buy_price),
-                    current_price=float(h.current_price),
-                    pnl=float(h.profit_loss), pnl_pct=float(h.profit_loss_rate),
+                    ticker=h.stk_cd, name=h.stk_nm, quantity=h.hldg_qty,
+                    avg_price=float(h.avg_buy_prc),
+                    current_price=float(h.cur_prc),
+                    pnl=float(h.evlu_pfls_amt), pnl_pct=float(h.evlu_pfls_rt),
                     stop_loss=getattr(stops.get(h.stk_cd), "stop_loss", None),
                     take_profit=getattr(stops.get(h.stk_cd), "take_profit", None),
                 )
