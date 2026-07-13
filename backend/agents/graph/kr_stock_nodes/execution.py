@@ -375,6 +375,35 @@ async def kr_stock_execution_node(state: dict) -> dict:
                     take_profit=proposal.get("take_profit"),
                 )
 
+            # P1-1: record the confirmed fill for /trades — regardless of
+            # action type (BUY/ADD/SELL/REDUCE), matching the coordinator's
+            # own choke points. Lazy-imported (mirrors this file's existing
+            # convention for coordinator side effects below) so tests can
+            # patch it at its origin module. Best-effort: a recording
+            # failure must never fail the graph run.
+            try:
+                from services.trading.trade_log import record_trade_fill
+
+                record_trade_fill(
+                    stk_cd=stk_cd,
+                    stk_nm=stk_nm,
+                    side="buy" if _is_buy_action(action) else "sell",
+                    order_type="limit",
+                    price=avg_fill_price,
+                    quantity=quantity,
+                    executed_quantity=filled_qty,
+                    status="completed" if filled_qty >= quantity else "partial",
+                    order_id=order_response.ord_no,
+                    session_id=state.get("session_id"),
+                )
+            except Exception as trade_log_err:
+                logger.warning(
+                    "kr_stock_trade_log_failed",
+                    stk_cd=stk_cd,
+                    action=action.value,
+                    error=str(trade_log_err),
+                )
+
         # Mirror the confirmed fill into the trading coordinator's own
         # monitoring (RiskMonitor / agent-chat PositionManager) and, for any
         # still-unfilled remainder of a BUY-side order, register it with the

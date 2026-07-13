@@ -113,6 +113,30 @@ class StorageService:
                     )
                 """)
 
+                # KR stock trades table (P1-1: the /trades tab had no backing
+                # storage — nothing recorded a fill anywhere, and the route
+                # masked the missing methods as an empty list via
+                # `except AttributeError`). Mirrors coin_trades' shape,
+                # adapted to KRStockTradeRecord's field names.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS kr_stock_trades (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT,
+                        stk_cd TEXT NOT NULL,
+                        stk_nm TEXT,
+                        side TEXT NOT NULL,
+                        order_type TEXT NOT NULL,
+                        price INTEGER NOT NULL,
+                        quantity INTEGER NOT NULL,
+                        executed_quantity INTEGER NOT NULL,
+                        fee INTEGER DEFAULT 0,
+                        total_krw INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        order_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # App settings table (generic key-value; e.g. trading_mode:kiwoom)
                 # — runtime settings that must survive restarts (R3).
                 await conn.execute("""
@@ -156,6 +180,20 @@ class StorageService:
                 # Index for side filtering (buy/sell statistics)
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_coin_trades_side ON coin_trades(side)"
+                )
+
+                # KR stock trades indexes (mirrors coin_trades' set above)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_kr_stock_trades_stk_cd ON kr_stock_trades(stk_cd)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_kr_stock_trades_created ON kr_stock_trades(created_at DESC)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_kr_stock_trades_stk_cd_created ON kr_stock_trades(stk_cd, created_at DESC)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_kr_stock_trades_session ON kr_stock_trades(session_id)"
                 )
 
                 # Additional indexes for common query patterns
@@ -794,6 +832,144 @@ class StorageService:
         except Exception as e:
             logger.error("coin_position_delete_failed", market=market, error=str(e))
             return False
+
+    # -------------------------------------------
+    # KR Stock Trading Operations (P1-1)
+    # -------------------------------------------
+
+    async def add_kr_stock_trade(self, record: dict[str, Any]) -> bool:
+        """
+        Save a KR stock trade record (a confirmed fill).
+
+        Args:
+            record: Trade data dictionary with keys:
+                - id, session_id, stk_cd, stk_nm, side, order_type, price,
+                - quantity, executed_quantity, fee, total_krw, status, order_id
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO kr_stock_trades
+                    (id, session_id, stk_cd, stk_nm, side, order_type, price,
+                     quantity, executed_quantity, fee, total_krw, status, order_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"],
+                        record.get("session_id"),
+                        record["stk_cd"],
+                        record.get("stk_nm"),
+                        record["side"],
+                        record["order_type"],
+                        record["price"],
+                        record["quantity"],
+                        record["executed_quantity"],
+                        record.get("fee", 0),
+                        record["total_krw"],
+                        record["status"],
+                        record.get("order_id"),
+                        record.get("created_at", datetime.now()),
+                    ),
+                )
+                await conn.commit()
+                logger.debug("kr_stock_trade_saved", trade_id=record["id"])
+                return True
+        except Exception as e:
+            logger.error(
+                "kr_stock_trade_save_failed", trade_id=record.get("id"), error=str(e)
+            )
+            return False
+
+    async def get_kr_stock_trades(
+        self,
+        stk_cd: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        Get KR stock trade history, newest first.
+
+        Args:
+            stk_cd: Filter by stock code (optional)
+            limit: Maximum records to return
+            offset: Offset for pagination
+
+        Returns:
+            List of trade records
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                if stk_cd:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM kr_stock_trades
+                        WHERE stk_cd = ?
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (stk_cd, limit, offset),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM kr_stock_trades
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (limit, offset),
+                    )
+
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("kr_stock_trades_get_failed", error=str(e))
+            return []
+
+    async def get_kr_stock_trade(self, trade_id: str) -> Optional[dict[str, Any]]:
+        """Get a single KR stock trade by ID."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM kr_stock_trades WHERE id = ?",
+                    (trade_id,),
+                )
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error("kr_stock_trade_get_failed", trade_id=trade_id, error=str(e))
+            return None
+
+    async def get_kr_stock_trades_count(self, stk_cd: Optional[str] = None) -> int:
+        """Get total count of KR stock trades for pagination."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                if stk_cd:
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM kr_stock_trades WHERE stk_cd = ?",
+                        (stk_cd,),
+                    )
+                else:
+                    cursor = await conn.execute("SELECT COUNT(*) FROM kr_stock_trades")
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error("kr_stock_trades_count_failed", error=str(e))
+            return 0
 
     # -------------------------------------------
     # App Settings (persisted key-value)

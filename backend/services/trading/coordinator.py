@@ -43,6 +43,7 @@ from .strategy_engine import StrategyEngine
 from .pending_order_tracker import PendingOrderTracker, TrackedOrder
 from .position_registration import register_fill_as_position
 from .reconciler import reconcile
+from .trade_log import record_trade_fill
 
 logger = logging.getLogger(__name__)
 
@@ -707,6 +708,30 @@ class ExecutionCoordinator:
             self._state.daily_trades_count += 1
             self._schedule_persist()
 
+            # P1-1: record the fill for /trades — BUY only here. Every SELL
+            # caller of _execute_order also calls _apply_sell_fill right
+            # after, which is the single choke point for SELL fills; a
+            # side-agnostic record here would double-count those. Gated by
+            # _persistence_active (same rule as _schedule_persist) so a
+            # coordinator built in a unit test never writes to real storage.
+            if self._persistence_active and order.side in (OrderSide.BUY, "buy"):
+                record_trade_fill(
+                    stk_cd=order.ticker,
+                    stk_nm=order.stock_name,
+                    side="buy",
+                    order_type=getattr(order.order_type, "value", order.order_type),
+                    price=result.avg_price or order.price or 0,
+                    quantity=result.requested_quantity,
+                    executed_quantity=result.filled_quantity,
+                    status=(
+                        "completed"
+                        if result.filled_quantity >= result.requested_quantity
+                        else "partial"
+                    ),
+                    order_id=result.order_id,
+                    session_id=order.session_id,
+                )
+
         await self._notify_state_change()
 
         return result
@@ -715,7 +740,7 @@ class ExecutionCoordinator:
         """Execute order from risk monitor (stop-loss/take-profit)."""
         result = await self._execute_order(order)
         # Track the ACTUAL fill: full → remove, partial → reduce, none → retain.
-        self._apply_sell_fill(order.ticker, result.filled_quantity)
+        self._apply_sell_fill(order.ticker, result.filled_quantity, order=order, result=result)
 
     # -------------------------------------------
     # Position Management
@@ -798,19 +823,50 @@ class ExecutionCoordinator:
         logger.info(f"[Coordinator] Position removed: {ticker}")
         self._schedule_persist()
 
-    def _apply_sell_fill(self, ticker: str, filled_quantity: int) -> None:
+    def _apply_sell_fill(
+        self,
+        ticker: str,
+        filled_quantity: int,
+        *,
+        order: Optional[OrderRequest] = None,
+        result: Optional[OrderResult] = None,
+    ) -> None:
         """Reconcile position tracking with the ACTUAL fill of a SELL/close (A3).
 
         Full fill → remove; partial → reduce and keep monitoring the remainder;
         none → keep the position. A sell that did not fill must NOT orphan the
         exposure — previously the close removed the position unconditionally, so a
         rejected/unfilled sell dropped a still-open position from all defense.
+
+        `order`/`result` are optional so existing bare callers keep working,
+        but every current call site passes both — this is the single choke
+        point for recording a SELL fill (/trades, P1-1), independent of
+        whether we still have a locally tracked position for `ticker`.
         """
         if filled_quantity <= 0:
             logger.warning(
                 f"[Coordinator] SELL for {ticker} did not fill — position retained"
             )
             return
+
+        if self._persistence_active and order is not None and result is not None:
+            record_trade_fill(
+                stk_cd=ticker,
+                stk_nm=order.stock_name,
+                side="sell",
+                order_type=getattr(order.order_type, "value", order.order_type),
+                price=result.avg_price or order.price or 0,
+                quantity=result.requested_quantity,
+                executed_quantity=filled_quantity,
+                status=(
+                    "completed"
+                    if filled_quantity >= result.requested_quantity
+                    else "partial"
+                ),
+                order_id=result.order_id,
+                session_id=order.session_id,
+            )
+
         position = next(
             (p for p in self._state.positions if p.ticker == ticker), None
         )
@@ -1107,7 +1163,7 @@ class ExecutionCoordinator:
                 result = await self._execute_order(order)
                 # Track the ACTUAL fill — a rejected/unfilled sell keeps the
                 # position under defense instead of orphaning it (review #8).
-                self._apply_sell_fill(alert.ticker, result.filled_quantity)
+                self._apply_sell_fill(alert.ticker, result.filled_quantity, order=order, result=result)
 
         elif action == "EXECUTE_TAKE_PROFIT" and alert.ticker:
             config = self.risk_monitor._watching.get(alert.ticker)
@@ -1138,7 +1194,7 @@ class ExecutionCoordinator:
                     reason="User-confirmed take-profit",
                 )
                 result = await self._execute_order(order)
-                self._apply_sell_fill(alert.ticker, result.filled_quantity)
+                self._apply_sell_fill(alert.ticker, result.filled_quantity, order=order, result=result)
 
         elif action == "HOLD":
             # Do nothing, just acknowledge
@@ -1173,7 +1229,7 @@ class ExecutionCoordinator:
         result = await self._execute_order(order)
         # Only drop/reduce tracking by the ACTUAL fill — a rejected or unfilled
         # sell must keep the position under defense (A3).
-        self._apply_sell_fill(ticker, result.filled_quantity)
+        self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
 
     # -------------------------------------------
     # State Access
@@ -1552,6 +1608,26 @@ class ExecutionCoordinator:
 
         for delta in deltas:
             order = delta.order
+
+            # P1-1: record this post-fill discovery for /trades. `quantity`
+            # is the tracked order's full requested size; `executed_quantity`
+            # is just the NEW portion this poll tick uncovered (delta), since
+            # a single order can surface several of these rows across ticks.
+            if self._persistence_active:
+                order_status = getattr(order.status, "value", order.status)
+                record_trade_fill(
+                    stk_cd=order.ticker,
+                    stk_nm=order.stock_name or order.ticker,
+                    side=order.side,
+                    order_type="limit",
+                    price=delta.avg_fill_price,
+                    quantity=order.total_quantity,
+                    executed_quantity=delta.new_fill_qty,
+                    status="completed" if order_status == "filled" else "partial",
+                    order_id=order.ord_no,
+                    session_id=order.source_session_id,
+                )
+
             await register_fill_as_position(
                 self,
                 ticker=order.ticker,

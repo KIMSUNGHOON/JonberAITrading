@@ -17,6 +17,16 @@ from agents.graph.kr_stock_nodes.execution import (
 from agents.graph.coin_nodes import should_continue_coin_execution
 from services.kiwoom.models import FilledOrder, OrderResponse
 
+
+@pytest.fixture(autouse=True)
+def _no_real_trade_log(monkeypatch):
+    """P1-1: kr_stock_execution_node now records confirmed fills via
+    services.trading.trade_log.record_trade_fill (lazy-imported, no session
+    gate) — neutralize it here so test_kr_execute_approved_buy_places_mock_order
+    (a real full fill) never reaches for the real storage.db."""
+    monkeypatch.setattr("services.trading.trade_log.record_trade_fill", MagicMock())
+
+
 ROUTERS = [
     should_continue_kr_stock_execution,
     should_continue_coin_execution,

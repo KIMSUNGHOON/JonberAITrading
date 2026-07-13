@@ -27,6 +27,17 @@ from services.trading.pending_order_tracker import TrackedOrder
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def _no_real_trade_log(monkeypatch):
+    """P1-1: the node now records every confirmed fill via
+    services.trading.trade_log.record_trade_fill (lazy-imported, so patching
+    its origin module reaches the node's call site too). Unlike the
+    coordinator's _persistence_active gate, this node has no session concept
+    to guard it, so these unit tests must neutralize it themselves — without
+    this, a fire-and-forget task would reach for the real storage.db."""
+    monkeypatch.setattr("services.trading.trade_log.record_trade_fill", MagicMock())
+
+
 async def _no_sleep(_seconds):
     return None
 
