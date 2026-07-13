@@ -14,8 +14,8 @@
 
 import { useStore, type MarketType, type SessionData } from '@/store';
 import { startKRStockAnalysis, startCoinAnalysis } from '@/api/client';
-import { wsManager, type WebSocketHandlers } from '@/api/websocket';
-import type { KRStockTradeProposal, SessionStatus } from '@/types';
+import { wsManager } from '@/api/websocket';
+import { createKiwoomWebSocketHandlers } from '@/api/kiwoomSessionHandlers';
 
 export function useStartAnalysis() {
   const setActiveMarket = useStore((state) => state.setActiveMarket);
@@ -23,67 +23,11 @@ export function useStartAnalysis() {
   // Legacy session actions (single-session mode for coin)
   const startCoinSession = useStore((state) => state.startCoinSession);
 
-  // Multi-session actions for Kiwoom
+  // Multi-session actions for Kiwoom. The per-session WS handler factory lives
+  // in api/kiwoomSessionHandlers (shared with SessionBridge) so every path that
+  // opens a Kiwoom session streams identically.
   const addKiwoomSession = useStore((state) => state.addKiwoomSession);
-  const updateKiwoomSessionStatus = useStore((state) => state.updateKiwoomSessionStatus);
-  const updateKiwoomSessionStage = useStore((state) => state.updateKiwoomSessionStage);
-  const addKiwoomSessionReasoning = useStore((state) => state.addKiwoomSessionReasoning);
-  const setKiwoomSessionProposal = useStore((state) => state.setKiwoomSessionProposal);
-  const setKiwoomSessionAwaitingApproval = useStore(
-    (state) => state.setKiwoomSessionAwaitingApproval
-  );
-  const setKiwoomSessionAutoApproveAt = useStore(
-    (state) => state.setKiwoomSessionAutoApproveAt
-  );
-  const setKiwoomSessionError = useStore((state) => state.setKiwoomSessionError);
   const setActiveKiwoomSession = useStore((state) => state.setActiveKiwoomSession);
-
-  // Create WebSocket handlers for a Kiwoom session. Self-contained: only
-  // touches multi-session store actions keyed by sessionId (no component
-  // -local state — the original BasketWidget version also referenced its
-  // local `analyzingItems` set here, but keyed by sessionId, which never
-  // matches an `analyzingItems` entry since those are keyed by basket item
-  // id; that reference was inert and is intentionally dropped here).
-  const createKiwoomWebSocketHandlers = (sessionId: string): WebSocketHandlers => ({
-    onReasoning: (entry) => {
-      addKiwoomSessionReasoning(sessionId, entry);
-    },
-    onStatus: (data) => {
-      updateKiwoomSessionStatus(sessionId, data.status as SessionStatus);
-      updateKiwoomSessionStage(sessionId, data.stage);
-      setKiwoomSessionAwaitingApproval(sessionId, data.awaiting_approval);
-      // R3: autonomous approval countdown deadline (absent = no pending auto-approve)
-      setKiwoomSessionAutoApproveAt(sessionId, data.auto_approve_at ?? null);
-    },
-    onProposal: (data) => {
-      const proposal: KRStockTradeProposal = {
-        id: data.id,
-        stk_cd: data.ticker,
-        stk_nm: null,
-        action: data.action.toUpperCase() as 'BUY' | 'SELL' | 'HOLD',
-        quantity: data.quantity,
-        entry_price: data.entry_price,
-        stop_loss: data.stop_loss,
-        take_profit: data.take_profit,
-        risk_score: data.risk_score,
-        position_size_pct: 0,
-        rationale: data.rationale,
-        bull_case: '',
-        bear_case: '',
-        created_at: new Date().toISOString(),
-      };
-      setKiwoomSessionProposal(sessionId, proposal);
-    },
-    onComplete: (data) => {
-      if (data.error) {
-        setKiwoomSessionError(sessionId, data.error);
-      }
-      updateKiwoomSessionStatus(sessionId, data.status as SessionStatus);
-    },
-    onError: () => {
-      setKiwoomSessionError(sessionId, 'WebSocket connection error');
-    },
-  });
 
   /**
    * Start an analysis for a ticker on the given market. Switches the active
