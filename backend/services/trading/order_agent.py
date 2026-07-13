@@ -28,6 +28,7 @@ from services.execution import (
     ExecutionSide,
     ExecutionOrderType,
 )
+from .fill_confirm import confirm_kiwoom_fill
 
 logger = logging.getLogger(__name__)
 
@@ -440,41 +441,19 @@ class OrderAgent:
     ) -> tuple[int, float]:
         """Confirm the actual fill of an accepted Kiwoom order via ka10076.
 
-        Polls the fill list (체결내역) up to fill_confirm_attempts times, matching
-        by order number and summing 체결수량. Returns (filled_qty, avg_price).
-        Fills are asynchronous, so a just-placed limit order may show 0 — that is
-        reported faithfully (assume nothing). A query failure is treated as an
-        unconfirmed fill (0), never as a full fill.
+        Thin delegation to the shared `fill_confirm.confirm_kiwoom_fill` helper
+        (also used by the LangGraph execution node), passing this agent's
+        configured attempts/interval.
         """
-        filled_qty = 0
-        avg_price = fallback_price
-        for attempt in range(self._fill_confirm_attempts):
-            try:
-                # Bypass the 5s cache — every poll must see the latest fills,
-                # else all retries within the TTL replay the same stale snapshot.
-                fills = await self.kiwoom.get_filled_orders(
-                    stk_cd=ticker, use_cache=False
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[OrderAgent] Fill confirmation query failed for {order_no}: {e}"
-                )
-                fills = []
-
-            matching = [
-                f for f in fills if f.ord_no == order_no and f.ccld_qty > 0
-            ]
-            filled_qty = sum(f.ccld_qty for f in matching)
-            if filled_qty > 0:
-                value = sum(f.ccld_qty * f.ccld_uv for f in matching)
-                avg_price = value / filled_qty
-
-            if filled_qty >= requested_qty:
-                break
-            if attempt < self._fill_confirm_attempts - 1:
-                await asyncio.sleep(self._fill_confirm_interval)
-
-        return filled_qty, avg_price
+        return await confirm_kiwoom_fill(
+            self.kiwoom,
+            ticker=ticker,
+            order_no=order_no,
+            requested_qty=requested_qty,
+            fallback_price=fallback_price,
+            attempts=self._fill_confirm_attempts,
+            interval=self._fill_confirm_interval,
+        )
 
     async def _simulate_order(
         self,
