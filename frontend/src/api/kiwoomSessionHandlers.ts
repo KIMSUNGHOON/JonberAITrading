@@ -15,7 +15,8 @@
  */
 import { useStore } from '@/store';
 import { wsManager, type WebSocketHandlers } from '@/api/websocket';
-import type { KRStockTradeProposal, SessionStatus } from '@/types';
+import { getOperations } from '@/api/client';
+import type { KRStockTradeProposal, SessionData, SessionStatus } from '@/types';
 
 export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandlers {
   const store = () => useStore.getState();
@@ -74,5 +75,81 @@ export function ensureKiwoomSessionStreaming(sessionId: string): void {
     .kiwoom.sessions.find((s) => s.sessionId === sessionId);
   if (session && !wsManager.has(sessionId)) {
     wsManager.connect(sessionId, createKiwoomWebSocketHandlers(sessionId));
+  }
+}
+
+/**
+ * Rehydrate running/awaiting Kiwoom sessions from the server (session_manager
+ * SQLite) into the store after a page refresh, and reconnect their WebSocket
+ * streams.
+ *
+ * Ordering matters: running sessions are added FIRST, awaiting sessions LAST.
+ * addKiwoomSession sets activeSessionId to whatever it just added and mirrors
+ * that session's fields into the legacy single-session store fields, which
+ * OrderTicketRail (the HITL approval rail) reads exclusively. Adding awaiting
+ * sessions last — and calling the proposal/awaiting/autoApprove setters after
+ * that — makes the restored proposal show up in the rail.
+ *
+ * Silent on failure: a broken /trading/operations call must not crash the app
+ * on load, it just means sessions aren't rehydrated (the operations board
+ * surfaces its own error state).
+ */
+export async function rehydrateKiwoomSessions(): Promise<void> {
+  let ops;
+  try {
+    ops = await getOperations('kiwoom');
+  } catch {
+    return;
+  }
+  const store = useStore.getState();
+  const known = new Set(store.kiwoom.sessions.map((s) => s.sessionId));
+  const now = new Date();
+
+  const build = (
+    sid: string, ticker: string, name: string | null,
+    status: SessionStatus, stage: string | null, awaiting: boolean,
+  ): SessionData => ({
+    sessionId: sid, ticker, displayName: name || ticker,
+    marketType: 'kiwoom', status, currentStage: stage,
+    reasoningLog: [], analyses: [], tradeProposal: null,
+    awaitingApproval: awaiting, autoApproveAt: null, activePosition: null,
+    error: null, createdAt: now, updatedAt: now,
+  });
+
+  for (const a of ops.analyzing ?? []) {
+    if (known.has(a.session_id)) continue;
+    if (!store.addKiwoomSession(build(a.session_id, a.ticker, a.name,
+        'running', a.current_stage, false))) break; // max concurrent reached
+    if (a.current_stage) store.updateKiwoomSessionStage(a.session_id, a.current_stage);
+    ensureKiwoomSessionStreaming(a.session_id);
+  }
+
+  for (const w of ops.awaiting ?? []) {
+    if (known.has(w.session_id)) continue;
+    if (!store.addKiwoomSession(build(w.session_id, w.ticker, w.name,
+        'awaiting_approval', null, true))) break;
+    if (w.proposal) {
+      const p = w.proposal as Record<string, unknown>;
+      const proposal: KRStockTradeProposal = {
+        id: String(p.id ?? w.session_id),
+        stk_cd: w.ticker,
+        stk_nm: w.name,
+        action: String(p.action ?? 'HOLD') as KRStockTradeProposal['action'],
+        quantity: Number(p.quantity ?? 0),
+        entry_price: Number(p.entry_price ?? 0),
+        stop_loss: Number(p.stop_loss ?? 0),
+        take_profit: Number(p.take_profit ?? 0),
+        risk_score: Number(p.risk_score ?? 0),
+        position_size_pct: Number(p.position_size_pct ?? 0),
+        rationale: String(p.rationale ?? ''),
+        bull_case: String(p.bull_case ?? ''),
+        bear_case: String(p.bear_case ?? ''),
+        created_at: String(p.created_at ?? now.toISOString()),
+      };
+      store.setKiwoomSessionProposal(w.session_id, proposal);
+    }
+    store.setKiwoomSessionAwaitingApproval(w.session_id, true);
+    store.setKiwoomSessionAutoApproveAt(w.session_id, w.auto_approve_at ?? null);
+    ensureKiwoomSessionStreaming(w.session_id); // rejection→re-analysis needs the stream
   }
 }
