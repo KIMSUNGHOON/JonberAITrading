@@ -19,8 +19,10 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 import services.autonomy as autonomy_pkg
+import services.storage_service as ss
 from services.autonomy import GateDecision
 from services.trading.coordinator import ExecutionCoordinator
 from services.trading.market_hours import MarketSession
@@ -31,6 +33,22 @@ from services.trading.models import (
     QueueStatus,
     TradingMode,
 )
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _isolated_storage(tmp_path, monkeypatch):
+    """T7 fix (review CRITICAL 2): PositionManager mutators fire-and-forget
+    persist stop levels whenever a running event loop exists, so the real-PM
+    A2 tests below were writing their fixture stops (68875/79750) into the
+    LIVE data/storage.db. Isolate the whole module behind a temp SQLite DB
+    (same pattern as test_r5_p1_execution_reliability.py). Otherwise behavior
+    is unchanged: every test here monkeypatches the autonomy gate and none
+    reads app settings from storage."""
+    storage = ss.StorageService(db_path=tmp_path / "test_storage.db")
+    await storage.initialize()
+    monkeypatch.setattr(ss, "_storage_service", storage)
+    yield storage
+    monkeypatch.setattr(ss, "_storage_service", None)
 
 
 @pytest.fixture

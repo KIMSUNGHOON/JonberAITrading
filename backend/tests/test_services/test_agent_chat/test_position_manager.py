@@ -4,6 +4,7 @@ Tests for PositionManager
 Unit tests for the PositionManager that monitors positions in real-time.
 """
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta
 
 import services.storage_service as ss
+from services.agent_chat.models import DecisionAction
 from services.agent_chat.position_manager import (
     PositionManager,
     PositionManagerConfig,
@@ -842,3 +844,235 @@ class TestStopLevelPersistence:
         )
         position_manager.update_position(ticker="005930", stop_loss=70000)
         assert position_manager.remove_position("005930") is True
+
+
+# -------------------------------------------
+# Persist single-writer / race (T7 review CRITICAL 1)
+# -------------------------------------------
+
+
+class TestPersistSingleWriter:
+    """A stale fire-and-forget persist — scheduled by sync_from_account's
+    add_position BEFORE restore_stop_overlay ran, carrying a None-stops payload
+    — must never clobber restore's corrective save. Each set_app_setting opens
+    its own aiosqlite connection, so without a single-writer discipline the DB
+    landing order is unguaranteed and the blob can silently revert to null
+    stops right after they were restored."""
+
+    @pytest.mark.asyncio
+    async def test_delayed_stale_write_cannot_clobber_restore(
+        self, config, temp_storage, monkeypatch
+    ):
+        # A previous session persisted a stop for 005930.
+        await temp_storage.set_app_setting(
+            _STOPS_KEY,
+            json.dumps({"stops": {"005930": {
+                "stop_loss": 68875.0,
+                "take_profit": None,
+                "trailing_stop_pct": None,
+            }}}),
+        )
+
+        # Delay-inject the FIRST PM-originated write (the None-stops persist
+        # scheduled by add_position) so its DB landing happens after restore's
+        # corrective save would land — the reviewer's adversarial interleaving.
+        real_set = temp_storage.set_app_setting
+        calls = {"n": 0}
+
+        async def delayed_set(key, value):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await asyncio.sleep(0.15)
+            await real_set(key, value)
+
+        monkeypatch.setattr(temp_storage, "set_app_setting", delayed_set)
+
+        pm = PositionManager(config=config)
+        # sync_from_account shape: broker holding arrives with NO stops →
+        # schedules a fire-and-forget persist of a None-stops blob.
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=73000,
+        )
+        await asyncio.sleep(0.05)  # let the scheduled task reach the delayed write
+
+        restored = await pm.restore_stop_overlay()
+        assert restored == 1
+        assert pm.get_position("005930").stop_loss == 68875.0
+
+        await asyncio.sleep(0.3)  # let the delayed stale write land / drain
+
+        blob = await temp_storage.get_app_setting(_STOPS_KEY)
+        data = json.loads(blob)
+        assert data["stops"]["005930"]["stop_loss"] == 68875.0, (
+            "stale None-stops write landed after restore's corrective save — "
+            "the persisted stops silently reverted to null"
+        )
+
+
+# -------------------------------------------
+# Stop sanity validation (P0-2)
+# -------------------------------------------
+
+
+class TestStopSanity:
+    """_stops_sane guards BOTH stop-setting paths — agent-decision stops
+    (_apply_decision) and blob restore (restore_stop_overlay).
+
+    Root cause pinned here: the 2026-07-12 15:40 hang — a discussion decision
+    set stop_loss 1,993,680 ABOVE the price 1,845,000, so stop_loss_hit fired
+    on every monitor cycle → infinite event loop → CPU spin."""
+
+    def test_stops_sane_contract(self, position_manager):
+        sane = position_manager._stops_sane
+        assert sane(70000, 68000, 75000) is True
+        assert sane(70000, None, None) is True
+        assert sane(70000, 70000, None) is False    # stop >= price
+        assert sane(70000, 71000, None) is False
+        assert sane(70000, None, 70000) is False    # take <= price
+        assert sane(70000, None, 69000) is False
+        assert sane(0, 68000, None) is False        # unknown price → fail-closed
+        assert sane(-1, None, None) is False
+
+    # ---- decision path (_apply_decision HOLD/ADD) ----
+
+    def _pm_and_position(self, config, current_price=1_845_000.0):
+        pm = PositionManager(config=config)
+        pos = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=10,
+            avg_price=1_800_000,
+            current_price=current_price,
+            stop_loss=1_700_000,
+        )
+        return pm, pos
+
+    @staticmethod
+    def _decision(stop_loss=None, take_profit=None):
+        return SimpleNamespace(
+            action=DecisionAction.HOLD,
+            quantity=None,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+
+    @staticmethod
+    def _notifier():
+        notifier = MagicMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock()
+        return notifier
+
+    @pytest.mark.asyncio
+    async def test_decision_stop_above_price_rejected(self, config):
+        """(i) The 15:40-hang shape: decision stop 1,993,680 >= price 1,845,000
+        → rejected, existing stop kept, human notified."""
+        pm, pos = self._pm_and_position(config)
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, self._decision(stop_loss=1_993_680))
+
+        assert pos.stop_loss == 1_700_000, "insane decision stop must be rejected"
+        notifier.send_message.assert_awaited_once()
+        assert "결정 스탑 기각" in notifier.send_message.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_decision_take_below_price_rejected(self, config):
+        """(ii) take_profit <= current price → instant take-profit → rejected."""
+        pm, pos = self._pm_and_position(config)
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, self._decision(take_profit=1_500_000))
+
+        assert pos.take_profit is None, "insane decision take-profit must be rejected"
+        notifier.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_decision_valid_stops_applied(self, config):
+        """(iii) Sane stops from a decision are applied normally."""
+        pm, pos = self._pm_and_position(config)
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(
+                pos, self._decision(stop_loss=1_750_000, take_profit=1_950_000)
+            )
+
+        assert pos.stop_loss == 1_750_000
+        assert pos.take_profit == 1_950_000
+        notifier.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_decision_rejected_when_price_unknown(self, config):
+        """(iv) current_price == 0 → cannot validate → fail-closed reject."""
+        pm, pos = self._pm_and_position(config)
+        pos.current_price = 0
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, self._decision(stop_loss=1_750_000))
+
+        assert pos.stop_loss == 1_700_000
+        notifier.send_message.assert_awaited_once()
+
+    # ---- restore path (restore_stop_overlay) ----
+
+    @pytest.mark.asyncio
+    async def test_restore_drops_insane_blob_entries(self, config, temp_storage):
+        """(b) The live-pollution shape: fixture stops 68875/79750 persisted for
+        005930 while the stock now trades at 90,000 — take_profit 79,750 <=
+        price would fire an instant take-profit storm on the first monitor
+        cycle after restore. The polluted entry must be skipped AND its values
+        dropped from the blob; the sane entry restores normally."""
+        await temp_storage.set_app_setting(_STOPS_KEY, json.dumps({"stops": {
+            "005930": {
+                "stop_loss": 68875.0,
+                "take_profit": 79750.0,
+                "trailing_stop_pct": None,
+            },
+            "000660": {
+                "stop_loss": 110000.0,
+                "take_profit": 130000.0,
+                "trailing_stop_pct": None,
+            },
+        }}))
+
+        pm = PositionManager(config=config)
+        pm.add_position(
+            ticker="005930", stock_name="삼성전자", quantity=100,
+            avg_price=72500, current_price=90000,
+        )
+        pm.add_position(
+            ticker="000660", stock_name="SK하이닉스", quantity=10,
+            avg_price=115000, current_price=116000,
+        )
+
+        restored = await pm.restore_stop_overlay()
+
+        assert restored == 1, "only the sane entry may restore"
+        polluted = pm.get_position("005930")
+        assert polluted.stop_loss is None
+        assert polluted.take_profit is None
+        valid = pm.get_position("000660")
+        assert valid.stop_loss == 110000.0
+        assert valid.take_profit == 130000.0
+
+        # Polluted values dropped from the blob too (re-save reflects positions).
+        data = json.loads(await temp_storage.get_app_setting(_STOPS_KEY))
+        assert data["stops"]["005930"]["stop_loss"] is None
+        assert data["stops"]["005930"]["take_profit"] is None
+        assert data["stops"]["000660"]["stop_loss"] == 110000.0

@@ -260,6 +260,13 @@ class PositionManager:
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
+        # Stop-persistence single-writer state (T7 review C1). One DB write at
+        # a time; stale scheduled writes dropped by generation; identical
+        # payloads skipped. See _persist_stops.
+        self._persist_lock = asyncio.Lock()
+        self._persist_generation = 0
+        self._last_persisted_payload: Optional[str] = None
+
         # Callbacks
         self._on_event_callbacks: List[Callable] = []
         self._on_decision_callbacks: List[Callable] = []
@@ -855,6 +862,61 @@ class PositionManager:
                 error=str(e),
             )
 
+    @staticmethod
+    def _stops_sane(
+        current_price: Optional[float],
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+    ) -> bool:
+        """Sanity-validate proposed stop levels against the current price (P0-2).
+
+        Insane iff: price unknown/non-positive (cannot validate → fail-closed),
+        stop_loss at-or-above the current price (stop_loss_hit would fire on the
+        very next monitor cycle — the 2026-07-12 15:40 CPU-spin hang), or
+        take_profit at-or-below the current price (instant take-profit storm).
+
+        Shared by BOTH stop-setting paths: agent-decision stops
+        (_apply_decision) and blob restore (restore_stop_overlay).
+        """
+        if not current_price or current_price <= 0:
+            return False
+        if stop_loss is not None and stop_loss >= current_price:
+            return False
+        if take_profit is not None and take_profit <= current_price:
+            return False
+        return True
+
+    async def _notify_decision_stops_rejected(
+        self,
+        position: MonitoredPosition,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+    ) -> None:
+        """Best-effort Telegram notice when a discussion decision proposed an
+        insane stop level — the human must know the stop change was NOT applied
+        and the existing stops remain in force."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                parts = []
+                if stop_loss is not None:
+                    parts.append(f"손절 ₩{stop_loss:,.0f}")
+                if take_profit is not None:
+                    parts.append(f"익절 ₩{take_profit:,.0f}")
+                await notifier.send_message(
+                    f"⚠️ 결정 스탑 기각 ({position.ticker}): {' / '.join(parts)} — "
+                    f"현재가 ₩{position.current_price:,.0f} 기준 sanity 위반 "
+                    f"(손절 ≥ 현재가 또는 익절 ≤ 현재가). 기존 스탑 유지."
+                )
+        except Exception as e:
+            logger.warning(
+                "decision_stops_rejected_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
     async def _apply_decision(
         self,
         position: MonitoredPosition,
@@ -884,11 +946,31 @@ class PositionManager:
                         self.update_position(position.ticker, quantity=new_quantity)
 
             elif decision.action in (DecisionAction.HOLD, DecisionAction.ADD):
-                # Update stops if provided
-                if decision.stop_loss:
-                    self.update_position(position.ticker, stop_loss=decision.stop_loss)
-                if decision.take_profit:
-                    self.update_position(position.ticker, take_profit=decision.take_profit)
+                # Update stops if provided — after sanity validation (P0-2a).
+                new_stop = decision.stop_loss or None
+                new_take = decision.take_profit or None
+                if new_stop is not None or new_take is not None:
+                    if not self._stops_sane(position.current_price, new_stop, new_take):
+                        # Root cause of the 2026-07-12 15:40 hang: a decision
+                        # set stop_loss 1,993,680 ABOVE the price 1,845,000 →
+                        # stop_loss_hit fired every monitor cycle → CPU spin.
+                        # An insane proposal is rejected wholesale; existing
+                        # stops are kept and the human is notified.
+                        logger.warning(
+                            "decision_stops_rejected",
+                            ticker=position.ticker,
+                            stop_loss=new_stop,
+                            take_profit=new_take,
+                            current_price=position.current_price,
+                        )
+                        await self._notify_decision_stops_rejected(
+                            position, new_stop, new_take
+                        )
+                    else:
+                        if new_stop is not None:
+                            self.update_position(position.ticker, stop_loss=new_stop)
+                        if new_take is not None:
+                            self.update_position(position.ticker, take_profit=new_take)
 
             # Notify decision callbacks
             for callback in self._on_decision_callbacks:
@@ -1081,18 +1163,41 @@ class PositionManager:
         a running event loop — e.g. a PositionManager built directly in a unit
         test, or a sync caller invoked outside any async context (reconciler /
         sync_from_account call add/update/remove_position synchronously). Never
-        raises."""
+        raises.
+
+        Each scheduled write carries the generation current at schedule time;
+        a write that reaches the lock after a newer one was scheduled is stale
+        and gets dropped (see _persist_stops)."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        self._persist_generation += 1
+        generation = self._persist_generation
         try:
-            loop.create_task(self._persist_stops())
+            loop.create_task(self._persist_stops(generation=generation))
         except Exception as e:
             logger.warning("position_manager_persist_schedule_failed", error=str(e))
 
-    async def _persist_stops(self) -> None:
+    async def _persist_stops(self, generation: Optional[int] = None) -> None:
         """Persist stop levels for all currently-monitored positions.
+
+        Single-writer discipline (T7 review C1): every DB write happens under
+        one lock and the payload is serialized UNDER that lock, so a write can
+        never carry state older than its critical-section entry and writes land
+        in critical-section order. Additionally:
+        - generation guard: a scheduled write whose captured generation is
+          older than the newest scheduled one is dropped (its successor carries
+          fresher state);
+        - dirty-check: a payload identical to the last-written one is skipped.
+
+        Without this, two set_app_setting calls — each opening its own
+        aiosqlite connection — could land out of order, letting the None-stops
+        blob scheduled by sync_from_account silently revert the stops that
+        restore_stop_overlay had just saved.
+
+        ``generation=None`` marks a direct (never-stale) call: tests and
+        restore_stop_overlay's corrective save.
 
         Best-effort — never raises, since it also runs from the fire-and-forget
         hook above where there is nothing to catch the exception.
@@ -1100,18 +1205,24 @@ class PositionManager:
         try:
             from services.storage_service import get_storage_service
 
-            blob = json.dumps({
-                "stops": {
-                    ticker: {
-                        "stop_loss": position.stop_loss,
-                        "take_profit": position.take_profit,
-                        "trailing_stop_pct": position.trailing_stop_pct,
+            async with self._persist_lock:
+                if generation is not None and generation < self._persist_generation:
+                    return  # stale scheduled write — a newer one is pending/done
+                payload = json.dumps({
+                    "stops": {
+                        ticker: {
+                            "stop_loss": position.stop_loss,
+                            "take_profit": position.take_profit,
+                            "trailing_stop_pct": position.trailing_stop_pct,
+                        }
+                        for ticker, position in self._positions.items()
                     }
-                    for ticker, position in self._positions.items()
-                }
-            })
-            storage = await get_storage_service()
-            await storage.set_app_setting(self._STOPS_KEY, blob)
+                })
+                if payload == self._last_persisted_payload:
+                    return
+                storage = await get_storage_service()
+                await storage.set_app_setting(self._STOPS_KEY, payload)
+                self._last_persisted_payload = payload
         except Exception as e:
             logger.error("position_manager_persist_failed", error=str(e))
 
@@ -1126,6 +1237,9 @@ class PositionManager:
         - A ticker still held has its stop fields restored ONLY where the
           field is currently None — a value already set this session (by a
           fresher broker sync or a manual update) wins over the stale blob.
+        - An entry whose saved stops fail _stops_sane against the position's
+          current price (P0-2b: polluted/stale blob) is skipped entirely and
+          its values dropped from the blob by the re-save.
 
         Returns the number of tickers whose stops were restored.
         """
@@ -1148,6 +1262,23 @@ class PositionManager:
                 if position is None:
                     # Not among the synced holdings — no resurrection; dropped
                     # from the blob by the unconditional re-save below.
+                    continue
+
+                saved_stop = saved.get("stop_loss")
+                saved_take = saved.get("take_profit")
+                if not self._stops_sane(position.current_price, saved_stop, saved_take):
+                    # P0-2b: polluted/stale blob entry — e.g. a take_profit at
+                    # or below the current price would fire an instant
+                    # take-profit storm on the first monitor cycle after
+                    # restore. Skip the whole entry; the re-save below drops
+                    # the insane values from the blob.
+                    logger.warning(
+                        "restore_stops_insane_dropped",
+                        ticker=ticker,
+                        stop_loss=saved_stop,
+                        take_profit=saved_take,
+                        current_price=position.current_price,
+                    )
                     continue
 
                 kwargs: Dict[str, float] = {}
