@@ -175,7 +175,7 @@ function AwaitingColumn({
           <div key={a.session_id} className={CARD}>
             <div className="font-semibold">{a.name || a.ticker}</div>
             <div className="text-muted">
-              {action} · 진입 {fmtPrice(entry, activeMarket)} · 손절 {fmtPrice(stop, activeMarket)} · 익절 {fmtPrice(take, activeMarket)} · 리스크 {risk ?? DASH}
+              {action} · 진입 {fmtPrice(entry, activeMarket)} · 손절 {fmtPrice(stop, activeMarket)} · 익절 {fmtPrice(take, activeMarket)} · 리스크 {risk != null ? `${risk}/10` : DASH}
             </div>
             {a.auto_approve_at && <AwaitingCountdown autoApproveAt={a.auto_approve_at} />}
             <div className="flex gap-2 mt-1">

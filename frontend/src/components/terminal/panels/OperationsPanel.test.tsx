@@ -88,6 +88,46 @@ it('섹션 오류는 조회 실패로 정직 표기한다 (0 위장 금지)', as
   expect(screen.queryByText(/매수대기 · 0/)).not.toBeInTheDocument();
 });
 
+it('큐 조회 실패 시 헤더는 조회 실패, 살아있는 미체결 행은 계속 렌더한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    pending_buy: {
+      queue: null,
+      open_orders: [{ order_id: 'o2', stk_cd: '005930', stk_nm: '삼성전자',
+                      side: 'buy', price: 260000, quantity: 48,
+                      remaining_quantity: 48, executed_quantity: 0,
+                      created_at: null }],
+    },
+    errors: { queue: 'coordinator unavailable' },
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/매수대기 · 조회 실패/)).toBeInTheDocument());
+  // 합산 카운트 위장 금지
+  expect(screen.queryByText(/매수대기 · \d/)).not.toBeInTheDocument();
+  // 성공한 서브섹션(미체결)은 숨기지 않는다
+  expect(screen.getByText(/미체결 48주/)).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '주문 취소' })).toBeInTheDocument();
+});
+
+it('미체결 조회 실패 시 헤더는 조회 실패, 살아있는 큐 항목은 계속 렌더한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    pending_buy: {
+      queue: [{ id: 'q1', session_id: 's3', ticker: '005930',
+                stock_name: '삼성전자', action: 'BUY', entry_price: 260000,
+                quantity: 10, status: 'pending' }],
+      open_orders: null,
+    },
+    errors: { open_orders: 'kiwoom down' },
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/매수대기 · 조회 실패/)).toBeInTheDocument());
+  expect(screen.queryByText(/매수대기 · \d/)).not.toBeInTheDocument();
+  // 성공한 서브섹션(큐)은 숨기지 않는다 — 대기 배지 + 대기 취소 버튼
+  expect(screen.getByText('대기')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '대기 취소' })).toBeInTheDocument();
+});
+
 it('미체결 취소 버튼이 cancelKRStockOrder를 호출하고 재조회한다', async () => {
   getOperations.mockResolvedValue({
     ...BASE,
