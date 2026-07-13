@@ -132,6 +132,91 @@ async def test_operations_broker_failure_degrades_honestly():
     assert res.watching == [] and res.analyzing == []  # 타 섹션은 정상(빈 값)
 
 
+def _chat_coordinator(pm=None):
+    coord = MagicMock()
+    coord.position_manager = pm
+    return coord
+
+
+def _chat_position(stop_loss=None, take_profit=None):
+    pos = MagicMock()
+    pos.stop_loss = stop_loss
+    pos.take_profit = take_profit
+    return pos
+
+
+async def test_operations_holding_stops_from_agent_chat_position_manager():
+    """트레이딩 코디네이터에 스탑이 없으면(빈 positions) agent-chat PositionManager에서 병합."""
+    holding = Holding(stk_cd="005930", stk_nm="삼성전자", hldg_qty=10,
+                      avg_buy_prc=260000, cur_prc=266000, evlu_amt=2660000,
+                      evlu_pfls_amt=60000, evlu_pfls_rt=2.31)
+    pm = MagicMock()
+    pm.get_position.return_value = _chat_position(stop_loss=250000.0, take_profit=280000.0)
+
+    with patch.object(trading_mod, "get_session_manager",
+                      AsyncMock(return_value=_sm([]))), \
+         patch.object(trading_mod, "get_shared_kiwoom_client_async",
+                      AsyncMock(return_value=_kiwoom(holdings=[holding]))), \
+         patch.object(trading_mod, "get_chat_coordinator",
+                      AsyncMock(return_value=_chat_coordinator(pm))) as mock_get_chat_coord:
+        res = await trading_mod.get_operations(
+            market="kiwoom", coordinator=_coordinator())  # no trading-coordinator positions
+
+    assert res.holding[0].stop_loss == 250000.0
+    assert res.holding[0].take_profit == 280000.0
+    pm.get_position.assert_called_once_with("005930")
+    mock_get_chat_coord.assert_awaited()
+    assert res.errors == {}
+
+
+async def test_operations_holding_stops_trading_coordinator_wins():
+    """양쪽 다 있으면 트레이딩 코디네이터(ManagedPosition) 값이 우선."""
+    holding = Holding(stk_cd="005930", stk_nm="삼성전자", hldg_qty=10,
+                      avg_buy_prc=260000, cur_prc=266000, evlu_amt=2660000,
+                      evlu_pfls_amt=60000, evlu_pfls_rt=2.31)
+    pos = ManagedPosition(ticker="005930", stock_name="삼성전자", quantity=10,
+                          avg_price=260000.0, stop_loss=246560.0, take_profit=289440.0)
+    pm = MagicMock()
+    pm.get_position.return_value = _chat_position(stop_loss=111111.0, take_profit=222222.0)
+
+    with patch.object(trading_mod, "get_session_manager",
+                      AsyncMock(return_value=_sm([]))), \
+         patch.object(trading_mod, "get_shared_kiwoom_client_async",
+                      AsyncMock(return_value=_kiwoom(holdings=[holding]))), \
+         patch.object(trading_mod, "get_chat_coordinator",
+                      AsyncMock(return_value=_chat_coordinator(pm))) as mock_get_chat_coord:
+        res = await trading_mod.get_operations(
+            market="kiwoom", coordinator=_coordinator(positions=[pos]))
+
+    assert res.holding[0].stop_loss == 246560.0
+    assert res.holding[0].take_profit == 289440.0
+    pm.get_position.assert_not_called()
+    mock_get_chat_coord.assert_not_awaited()
+    assert res.errors == {}
+
+
+async def test_operations_holding_survives_agent_chat_coordinator_failure():
+    """agent-chat 코디네이터 조회 실패 → holding은 브로커 데이터로 정상 반환, 스탑=None, errors 無."""
+    holding = Holding(stk_cd="005930", stk_nm="삼성전자", hldg_qty=10,
+                      avg_buy_prc=260000, cur_prc=266000, evlu_amt=2660000,
+                      evlu_pfls_amt=60000, evlu_pfls_rt=2.31)
+
+    with patch.object(trading_mod, "get_session_manager",
+                      AsyncMock(return_value=_sm([]))), \
+         patch.object(trading_mod, "get_shared_kiwoom_client_async",
+                      AsyncMock(return_value=_kiwoom(holdings=[holding]))), \
+         patch.object(trading_mod, "get_chat_coordinator",
+                      AsyncMock(side_effect=RuntimeError("agent-chat down"))):
+        res = await trading_mod.get_operations(
+            market="kiwoom", coordinator=_coordinator())  # no trading-coordinator positions
+
+    assert res.holding[0].ticker == "005930"
+    assert res.holding[0].quantity == 10
+    assert res.holding[0].stop_loss is None
+    assert res.holding[0].take_profit is None
+    assert "holding" not in res.errors
+
+
 async def test_operations_coin_market_returns_sessions_only():
     """coin: 세션만 채우고 KR 전용 섹션은 null + errors 없음(비해당)."""
     coin_sess = AnalysisSession(session_id="c1", market_type=MarketType.COIN,

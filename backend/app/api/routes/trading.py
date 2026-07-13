@@ -35,6 +35,10 @@ from services.session_manager import (
     get_session_manager,
 )
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+# agent-chat PositionManager — 홀딩 스탑 병합용 보조 소스 (get_operations 참고).
+# 지연 조회(트레이딩 코디네이터에 스탑이 없을 때만 호출)이며 실패해도 홀딩 섹션은
+# 살아남는다(app/api/routes/agent_chat.py:753 GET /positions와 동일한 방어 패턴).
+from services.agent_chat.coordinator import get_chat_coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -1268,21 +1272,52 @@ async def get_operations(
         try:
             balance = await client.get_account_balance()
             stops = {p.ticker: p for p in coordinator.state.positions}
+
+            # 스탑 소스 2순위: agent-chat PositionManager (services/agent_chat/
+            # position_manager.py). 트레이딩 코디네이터에 해당 티커의 ManagedPosition이
+            # 없을 때만(지연) 조회 — 있으면 그 소스가 우선(1순위). 조회 자체가 실패하거나
+            # 코디네이터/포지션매니저가 미기동이어도 홀딩 섹션은 그대로 살아남는다
+            # (agent_chat.py:753 GET /positions와 동일한 방어: get_chat_coordinator →
+            # position_manager None 체크).
+            chat_pm_box: Dict[str, Any] = {}
+
+            async def _chat_pm():
+                if "pm" not in chat_pm_box:
+                    try:
+                        chat_coordinator = await get_chat_coordinator()
+                        chat_pm_box["pm"] = chat_coordinator.position_manager
+                    except Exception:  # noqa: BLE001 — enrichment only, never fail holding
+                        chat_pm_box["pm"] = None
+                return chat_pm_box["pm"]
+
+            async def _stops_for(ticker: str):
+                managed = stops.get(ticker)
+                if managed is not None:
+                    return managed.stop_loss, managed.take_profit
+                pm = await _chat_pm()
+                if pm is None:
+                    return None, None
+                pos = pm.get_position(ticker)
+                if pos is None:
+                    return None, None
+                return pos.stop_loss, pos.take_profit
+
             # balance.holdings = services.kiwoom.models.Holding (kt00004) —
             # 실제 필드는 hldg_qty/avg_buy_prc/cur_prc/evlu_pfls_amt/evlu_pfls_rt
             # (quantity/avg_buy_price 등은 API 스키마 KRStockHolding의 이름;
             # kr_stocks/orders.py:68-73의 매핑과 동일 소스·동일 변환).
-            res["holding"] = [
-                OperationsHolding(
+            holdings_out = []
+            for h in balance.holdings:
+                stop_loss, take_profit = await _stops_for(h.stk_cd)
+                holdings_out.append(OperationsHolding(
                     ticker=h.stk_cd, name=h.stk_nm, quantity=h.hldg_qty,
                     avg_price=float(h.avg_buy_prc),
                     current_price=float(h.cur_prc),
                     pnl=float(h.evlu_pfls_amt), pnl_pct=float(h.evlu_pfls_rt),
-                    stop_loss=getattr(stops.get(h.stk_cd), "stop_loss", None),
-                    take_profit=getattr(stops.get(h.stk_cd), "take_profit", None),
-                )
-                for h in balance.holdings
-            ]
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                ))
+            res["holding"] = holdings_out
         except Exception as e:  # noqa: BLE001
             errors["holding"] = str(e)
 
