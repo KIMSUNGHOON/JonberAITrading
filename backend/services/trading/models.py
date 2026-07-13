@@ -228,6 +228,19 @@ class RiskParameters(BaseModel):
     stop_loss_mode: StopLossMode = StopLossMode.USER_APPROVAL
     take_profit_mode: StopLossMode = StopLossMode.USER_APPROVAL
 
+    # Default stop/take levels applied to a newly tracked order when the
+    # proposal didn't specify its own (F3 — PendingOrderTracker consumers)
+    default_stop_loss_pct: float = Field(
+        default=8.0,
+        ge=0.5, le=30.0,
+        description="Default stop-loss distance from entry, %"
+    )
+    default_take_profit_pct: float = Field(
+        default=8.0,
+        ge=0.5, le=50.0,
+        description="Default take-profit distance from entry, %"
+    )
+
 
 # -------------------------------------------
 # Order Models
