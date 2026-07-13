@@ -22,7 +22,12 @@ from app.api.schemas.approval import (
     PendingProposalSummary,
 )
 from app.dependencies import get_trading_coordinator
-from services.session_manager import mirror_session_state, mirror_session_status
+from services.session_manager import (
+    MarketType,
+    get_session_manager,
+    mirror_session_state,
+    mirror_session_status,
+)
 from services.telegram import get_telegram_notifier
 from app.api.routes.websocket import (
     broadcast_trade_executed,
@@ -59,6 +64,16 @@ async def submit_decision(
     coin_sessions = get_coin_sessions()
     kr_stock_sessions = get_kr_stock_sessions()
     session = coin_sessions.get(session_id) or kr_stock_sessions.get(session_id)
+
+    if not session:
+        # These legacy dicts are process-local and empty after a restart. The
+        # session_manager SQLite row (and the LangGraph checkpoint, keyed by
+        # thread_id=session_id) both survive a restart — fall back to sm and
+        # re-adopt a legacy-shaped session into the correct dict so the rest
+        # of this function, and any subsequent lookups, work unchanged.
+        session = await _adopt_session_from_manager(
+            session_id, coin_sessions, kr_stock_sessions
+        )
 
     if not session:
         raise HTTPException(
@@ -551,6 +566,62 @@ async def get_pending_approval(session_id: str):
 # -------------------------------------------
 # Helper Functions
 # -------------------------------------------
+
+
+async def _adopt_session_from_manager(
+    session_id: str,
+    coin_sessions: dict,
+    kr_stock_sessions: dict,
+) -> dict | None:
+    """Re-adopt a session that survived a restart via session_manager.
+
+    The legacy in-memory dicts (coin/kr_stock) are process-local and lost on
+    restart, but the SessionManager's SQLite-backed row survives (as does the
+    LangGraph checkpoint keyed by thread_id=session_id — see P6 durable
+    persistence). On a legacy-dict miss, look the session up there and, if
+    found, convert it to the legacy-compatible shape (AnalysisSession.state
+    is shared by reference, so subsequent mutations here also reach the sm
+    row) and register it into the correct dict so the rest of submit_decision
+    — and any later lookups — work unchanged.
+
+    Fail-closed: only KIWOOM (kr stock) and COIN sessions are adopted. A
+    lookup miss, sm error, or any other market_type returns None so the
+    caller 404s.
+    """
+    try:
+        manager = await get_session_manager()
+        sm_session = await manager.get_session(session_id)
+    except Exception as e:
+        logger.warning(
+            "sm_session_adopt_lookup_failed",
+            session_id=session_id,
+            error=str(e),
+        )
+        return None
+
+    if sm_session is None:
+        return None
+
+    if sm_session.market_type == MarketType.KIWOOM:
+        legacy_session = sm_session.to_legacy_dict()
+        kr_stock_sessions[session_id] = legacy_session
+    elif sm_session.market_type == MarketType.COIN:
+        legacy_session = sm_session.to_legacy_dict()
+        coin_sessions[session_id] = legacy_session
+    else:
+        logger.warning(
+            "sm_session_adopt_unsupported_market_type",
+            session_id=session_id,
+            market_type=str(sm_session.market_type),
+        )
+        return None
+
+    logger.info(
+        "sm_session_adopted",
+        session_id=session_id,
+        market_type=str(sm_session.market_type),
+    )
+    return legacy_session
 
 
 def _get_analysis_summary(analysis) -> str | None:
