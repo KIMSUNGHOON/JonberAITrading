@@ -188,7 +188,11 @@ export function ensureKiwoomSessionStreaming(sessionId: string): void {
  *
  * Silent on failure: a broken /trading/operations call must not crash the app
  * on load, it just means sessions aren't rehydrated (the operations board
- * surfaces its own error state).
+ * surfaces its own error state). And when the request SUCCEEDS but the backend
+ * degraded its sessions section (HTTP 200 with analyzing/awaiting null +
+ * errors.sessions), the PURGE sweep is skipped — an unpopulated section is not
+ * proof that the server lists nothing, so we never mass-delete live cards on a
+ * partial fetch; the ADD path still runs on whatever data is present.
  */
 export async function rehydrateKiwoomSessions(): Promise<void> {
   let ops;
@@ -259,10 +263,27 @@ export async function rehydrateKiwoomSessions(): Promise<void> {
   // same call just added (always serverKnown by construction) can never be
   // caught here. Terminal sessions are never purged — they're kept as history
   // regardless of whether the server still lists them.
-  for (const session of priorSessions) {
-    const isNonTerminal = session.status === 'running' || session.status === 'awaiting_approval';
-    if (isNonTerminal && !serverKnown.has(session.sessionId)) {
-      store.removeKiwoomSession(session.sessionId);
+  //
+  // GUARD: the backend collects the sessions section independently and, on
+  // failure, returns HTTP 200 with analyzing/awaiting = null + errors.sessions
+  // set — a DEGRADED snapshot, not an empty one (the outer try/catch above only
+  // trips when the request itself throws; a 200 resolves fine). Treating that
+  // as "server lists nothing" would purge every live card, and this fires
+  // precisely during a backend restart (SQLite lock / session-manager
+  // mid-init) — which is also when the WS-reconnect trigger re-runs rehydrate.
+  // So the purge only runs when the sessions section is AUTHORITATIVE: no
+  // errors.sessions AND at least one of analyzing/awaiting actually present
+  // (on success both are arrays; on the error path both stay null). If the
+  // section is degraded we skip the sweep entirely — the ADD path above still
+  // ran on whatever was present, giving the exact pre-diff add-only behavior.
+  const sessionsSectionAuthoritative =
+    !ops.errors?.sessions && (ops.analyzing != null || ops.awaiting != null);
+  if (sessionsSectionAuthoritative) {
+    for (const session of priorSessions) {
+      const isNonTerminal = session.status === 'running' || session.status === 'awaiting_approval';
+      if (isNonTerminal && !serverKnown.has(session.sessionId)) {
+        store.removeKiwoomSession(session.sessionId);
+      }
     }
   }
 }

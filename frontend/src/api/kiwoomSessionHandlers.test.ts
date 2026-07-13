@@ -163,6 +163,67 @@ describe('rehydrateKiwoomSessions', () => {
     expect(removeKiwoomSession).toHaveBeenCalledWith('B');
   });
 
+  // CRITICAL regression: the backend collects the sessions section
+  // independently and, on failure, returns HTTP 200 with analyzing/awaiting =
+  // null + errors.sessions set (a DEGRADED snapshot, not an empty one). The
+  // outer try/catch here only catches the request THROWING — a 200 resolves
+  // fine. Treating null/null as "server lists nothing" would purge every live
+  // card, and this fires exactly during a backend restart — which is also when
+  // the WS-reconnect trigger runs rehydrate. Purge MUST be skipped.
+  it('세션 섹션이 실패(HTTP 200 + errors.sessions)하면 퍼지를 건너뛴다 — 라이브 카드 대량 삭제 방지', async () => {
+    const removeKiwoomSession = vi.fn();
+    mockState = {
+      kiwoom: { sessions: [{ sessionId: 'X', status: 'running' }] },
+      addKiwoomSession: vi.fn().mockReturnValue(true),
+      setKiwoomSessionProposal: vi.fn(),
+      setKiwoomSessionAwaitingApproval: vi.fn(),
+      setKiwoomSessionAutoApproveAt: vi.fn(),
+      removeKiwoomSession,
+    };
+    getOperations.mockResolvedValue({
+      analyzing: null, awaiting: null, watching: [],
+      pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: { sessions: 'boom' },
+    });
+
+    const { rehydrateKiwoomSessions } = await import('./kiwoomSessionHandlers');
+    await rehydrateKiwoomSessions();
+
+    expect(removeKiwoomSession).not.toHaveBeenCalled();
+  });
+
+  // Guard is keyed specifically on errors.sessions — an error in an UNRELATED
+  // section (queue, broker, …) must NOT suppress the purge, since the sessions
+  // section is still authoritative.
+  it('errors에 sessions 이외 키만 있으면(예: queue 실패) 퍼지는 정상 수행된다', async () => {
+    const removeKiwoomSession = vi.fn();
+    mockState = {
+      kiwoom: {
+        sessions: [
+          { sessionId: 'A', status: 'running' },
+          { sessionId: 'B', status: 'awaiting_approval' },
+        ],
+      },
+      addKiwoomSession: vi.fn().mockReturnValue(true),
+      setKiwoomSessionProposal: vi.fn(),
+      setKiwoomSessionAwaitingApproval: vi.fn(),
+      setKiwoomSessionAutoApproveAt: vi.fn(),
+      removeKiwoomSession,
+    };
+    getOperations.mockResolvedValue({
+      analyzing: [{ session_id: 'A', ticker: '005930', name: null,
+                    status: 'running', current_stage: null, started_at: null }],
+      awaiting: [], watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: { queue: 'boom' },
+    });
+
+    const { rehydrateKiwoomSessions } = await import('./kiwoomSessionHandlers');
+    await rehydrateKiwoomSessions();
+
+    expect(removeKiwoomSession).toHaveBeenCalledTimes(1);
+    expect(removeKiwoomSession).toHaveBeenCalledWith('B');
+  });
+
   it('터미널 상태(completed/cancelled/error) 스토어 세션은 서버 목록에 없어도 제거하지 않는다(히스토리 보존)', async () => {
     const removeKiwoomSession = vi.fn();
     mockState = {
