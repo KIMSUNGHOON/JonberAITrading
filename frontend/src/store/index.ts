@@ -1040,6 +1040,17 @@ export const useStore = create<Store>()(
 
       setKiwoomSessionProposal: (sessionId, proposal) =>
         set((state) => {
+          // Idempotency: re-delivery of the SAME proposal (same id) updates the
+          // stored fields silently — no new chat message, no popup force.
+          // Happens on refresh rehydration (rehydrateKiwoomSessions sets the
+          // proposal, then the fresh WS snapshot re-emits the proposal frame)
+          // and on /workflow route re-entry reconnecting the stream.
+          const currentProposal = state.kiwoom.sessions.find(
+            s => s.sessionId === sessionId
+          )?.tradeProposal;
+          const isSameProposal =
+            proposal !== null && currentProposal != null && currentProposal.id === proposal.id;
+
           const newSessions = state.kiwoom.sessions.map(s =>
             s.sessionId === sessionId
               ? { ...s, tradeProposal: proposal, updatedAt: new Date() }
@@ -1047,8 +1058,8 @@ export const useStore = create<Store>()(
           );
           const isActive = state.kiwoom.activeSessionId === sessionId;
 
-          // Add proposal message to chat if proposal exists
-          const newMessages = proposal
+          // Add proposal message to chat if a NEW proposal exists
+          const newMessages = proposal && !isSameProposal
             ? [
                 ...state.messages,
                 {
@@ -1068,7 +1079,7 @@ export const useStore = create<Store>()(
               ...(isActive ? { tradeProposal: proposal } : {}),
             },
             messages: newMessages,
-            chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
+            chatPopupOpen: proposal !== null && !isSameProposal ? true : state.chatPopupOpen,
           };
         }),
 

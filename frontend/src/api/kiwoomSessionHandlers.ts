@@ -120,7 +120,6 @@ export async function rehydrateKiwoomSessions(): Promise<void> {
     if (known.has(a.session_id)) continue;
     if (!store.addKiwoomSession(build(a.session_id, a.ticker, a.name,
         'running', a.current_stage, false))) break; // max concurrent reached
-    if (a.current_stage) store.updateKiwoomSessionStage(a.session_id, a.current_stage);
     ensureKiwoomSessionStreaming(a.session_id);
   }
 
@@ -136,9 +135,10 @@ export async function rehydrateKiwoomSessions(): Promise<void> {
         stk_nm: w.name,
         action: String(p.action ?? 'HOLD') as KRStockTradeProposal['action'],
         quantity: Number(p.quantity ?? 0),
-        entry_price: Number(p.entry_price ?? 0),
-        stop_loss: Number(p.stop_loss ?? 0),
-        take_profit: Number(p.take_profit ?? 0),
+        // number|null fields: preserve null (unknown) instead of coercing to 0
+        entry_price: p.entry_price != null ? Number(p.entry_price) : null,
+        stop_loss: p.stop_loss != null ? Number(p.stop_loss) : null,
+        take_profit: p.take_profit != null ? Number(p.take_profit) : null,
         risk_score: Number(p.risk_score ?? 0),
         position_size_pct: Number(p.position_size_pct ?? 0),
         rationale: String(p.rationale ?? ''),

@@ -73,12 +73,10 @@ describe('rehydrateKiwoomSessions', () => {
     const setKiwoomSessionProposal = vi.fn();
     const setKiwoomSessionAwaitingApproval = vi.fn();
     const setKiwoomSessionAutoApproveAt = vi.fn();
-    const setKiwoomSessionStage = vi.fn();
     mockState = {
       kiwoom: { sessions: [] },
       addKiwoomSession, setKiwoomSessionProposal,
       setKiwoomSessionAwaitingApproval, setKiwoomSessionAutoApproveAt,
-      updateKiwoomSessionStage: setKiwoomSessionStage,
     };
     getOperations.mockResolvedValue({
       analyzing: [{ session_id: 'run-1', ticker: '005930', name: '삼성전자',
@@ -106,8 +104,8 @@ describe('rehydrateKiwoomSessions', () => {
     expect(setKiwoomSessionProposal).toHaveBeenCalledWith('aw-1',
       expect.objectContaining({ action: 'WATCH', stk_cd: '000660' }));
     expect(setKiwoomSessionAwaitingApproval).toHaveBeenCalledWith('aw-1', true);
-    // running 세션만 WS 재연결 (awaiting은 상태 변화가 approval API로 옴)
-    expect(mockWsManager.connect).toHaveBeenCalledTimes(2); // run-1 + aw-1 (거부→재분석 스트림 대비)
+    // running과 awaiting 모두 WS 재연결 (awaiting도 거부→재분석 시 스트림 필요)
+    expect(mockWsManager.connect).toHaveBeenCalledTimes(2); // run-1 + aw-1
   });
 
   it('이미 스토어에 있는 세션은 중복 추가하지 않는다', async () => {
@@ -118,7 +116,6 @@ describe('rehydrateKiwoomSessions', () => {
       setKiwoomSessionProposal: vi.fn(),
       setKiwoomSessionAwaitingApproval: vi.fn(),
       setKiwoomSessionAutoApproveAt: vi.fn(),
-      updateKiwoomSessionStage: vi.fn(),
     };
     getOperations.mockResolvedValue({
       analyzing: [{ session_id: 'run-1', ticker: '005930', name: null,
