@@ -113,7 +113,7 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
     switch (trade.status) {
       case 'pending': return '대기';
       case 'processing': return '처리중';
-      case 'completed': return '완료';
+      case 'completed': return '발주됨';
       case 'failed': return '실패';
       case 'cancelled': return '취소됨';
       default: return trade.status;
@@ -242,7 +242,7 @@ function QueueItem({ trade, onCancel, onDismiss, cancelling, dismissing, nextExe
       {isCompleted && (
         <div className="mt-2 p-2 bg-up/10 border border-up/30 rounded text-xs text-up flex items-center gap-2">
           <CheckCircle className="w-4 h-4" />
-          <span>주문 완료 - {trade.executed_at ? formatTime(trade.executed_at) : ''}</span>
+          <span>발주 완료 (체결은 미체결 현황에서 확인) - {trade.executed_at ? formatTime(trade.executed_at) : ''}</span>
         </div>
       )}
     </div>
