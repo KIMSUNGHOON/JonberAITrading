@@ -701,6 +701,7 @@ class KiwoomClient:
         self,
         qry_tp: str = "0",
         exchange: Exchange = Exchange.KRX,
+        use_cache: bool = True,
     ) -> AccountBalance:
         """
         계좌평가현황요청 (kt00004)
@@ -708,13 +709,18 @@ class KiwoomClient:
         Args:
             qry_tp: 상장폐지조회구분 - "0":전체, "1":상장폐지종목제외
             exchange: 거래소 구분
+            use_cache: False면 30s 캐시를 우회한다 — 브로커-로컬 리컨실러는
+                체결 폴 직후의 최신 잔고를 봐야 하므로 캐시를 건너뛴다.
+                스테일 스냅샷은 방금 등록된 포지션을 '외부 매도'로 오판해
+                제거·재채택을 반복시킨다 (get_filled_orders와 동일 패턴;
+                F3 t6 리뷰 M1).
 
         Returns:
             AccountBalance 객체
         """
         # 캐시 조회
         cache_key = make_cache_key("account_balance", qry_tp, exchange.value)
-        if self._cache:
+        if self._cache and use_cache:
             cached = self._cache.get(cache_key)
             if cached is not None:
                 return cached

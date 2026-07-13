@@ -366,6 +366,32 @@ class TestKiwoomClientAccountBalance:
             assert balance.holdings[0].hldg_qty == 100
             assert balance.holdings[0].avg_buy_prc == 50000
 
+    @pytest.mark.asyncio
+    async def test_get_account_balance_fresh_fetch_bypasses_stored_snapshot(self, client):
+        """use_cache=False는 30s TTL 스냅샷을 우회해 재조회한다 —
+        get_filled_orders와 동일 패턴 (F3 t6 리뷰 M1: 리컨실러는 체결 폴
+        직후의 최신 잔고를 봐야 하며, 스테일 스냅샷은 방금 등록된 포지션을
+        '외부 매도'로 오판해 제거한다)."""
+        response = {
+            "return_code": 0,
+            "tot_pur_amt": "10000000",
+            "tot_est_amt": "11000000",
+            "d2_entra": "5000000",
+            "stk_acnt_evlt_prst": [],
+        }
+
+        with patch.object(client, '_request', new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = response
+
+            await client.get_account_balance()  # 스냅샷 저장
+            assert mock_request.call_count == 1
+
+            await client.get_account_balance()  # 기본값: 저장분 반환, 재조회 없음
+            assert mock_request.call_count == 1
+
+            await client.get_account_balance(use_cache=False)  # 리컨실러 경로: 재조회
+            assert mock_request.call_count == 2
+
 
 class TestKiwoomClientOrders:
     """Test order methods"""

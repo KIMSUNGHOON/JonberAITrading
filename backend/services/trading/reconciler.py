@@ -41,7 +41,11 @@ another client entirely.
    longer appears in the broker's holdings gets removed from both. Exception:
    if the fill tracker has a TRACKING sell order for that ticker, the zero
    holding may just be an in-flight sell not yet confirmed — skip it this
-   tick rather than risk a false-positive close.
+   tick rather than risk a false-positive close. Guard (review M2): if the
+   broker reports ZERO holdings while ≥1 position is managed, the entire
+   removal pass is skipped for the cycle (warning logged) — a malformed
+   kt00004 payload parses to an empty list, and that must never mass-remove
+   every local defense in one tick.
 
 3. **Quantity fix** — broker quantity is truth. For any ticker still present
    at the broker whose managed quantity disagrees, the coordinator's
@@ -51,6 +55,11 @@ another client entirely.
    operation here regardless of how either side drifted (including the
    PM-absolute-vs-fill-tracker-incremental double-count race described
    above: whichever side over/under-counted converges to the broker value).
+
+The balance is always fetched with `use_cache=False` (review M1): the
+client's 30s TTL entry can predate a fill the tracker poll registered
+seconds ago, and reconciling against that stale snapshot would remove the
+just-registered position as an "external close".
 
 A broker query failure aborts the whole pass (log and return an all-zero
 `ReconcileReport`) — managed state is left untouched for the next tick to
@@ -147,6 +156,8 @@ async def _adopt_orphans(coordinator, pm, holdings_by_ticker: dict, report: Reco
             # True orphan — neither engine knows it. register_fill_as_position
             # is safe here: both sides start from nothing, so the full
             # holding quantity is the correct increment on both.
+            # stop_loss_mode mirrors the fill-poll path's register semantics
+            # (coordinator risk params own the mode — review m1).
             await register_fill_as_position(
                 coordinator,
                 ticker=ticker,
@@ -156,12 +167,16 @@ async def _adopt_orphans(coordinator, pm, holdings_by_ticker: dict, report: Reco
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 source="reconciler",
+                stop_loss_mode=coordinator.risk_params.stop_loss_mode,
                 risk_score=risk_score,
             )
         else:
             # PM already tracks it (its own sync_from_account can populate a
             # ticker the coordinator never placed an order for) — see module
             # docstring for why register_fill_as_position is NOT used here.
+            # stop_loss_mode/risk_score parity with the true-orphan branch
+            # (review m1): a position adopted here must defend under the same
+            # mode and carry its provenance risk.
             coordinator._add_position(
                 ManagedPosition(
                     ticker=ticker,
@@ -171,6 +186,8 @@ async def _adopt_orphans(coordinator, pm, holdings_by_ticker: dict, report: Reco
                     current_price=float(holding.cur_prc),
                     stop_loss=stop_loss,
                     take_profit=take_profit,
+                    stop_loss_mode=coordinator.risk_params.stop_loss_mode,
+                    risk_score=risk_score,
                 )
             )
             if pm_pos.stop_loss is None or pm_pos.take_profit is None:
@@ -237,6 +254,21 @@ async def _detect_external_closes(coordinator, pm, holdings_by_ticker: dict, rep
         except Exception as e:
             logger.warning(f"[Reconciler] PM get_all_positions failed: {e}")
 
+    # Mass-removal guard (review M2): a SUCCESSFUL kt00004 response with an
+    # EMPTY holdings list is not trustworthy enough to liquidate every local
+    # position in one pass — the client manufactures [] from a malformed
+    # payload (client.py stk_acnt_evlt_prst non-list → []). Skip only the
+    # removal pass this cycle; adoption/quantity passes still ran/run. A
+    # genuine account-wide close simply keeps being skipped until an operator
+    # (or a non-empty snapshot) intervenes — fail-safe over fail-clean.
+    if managed_tickers and not holdings_by_ticker:
+        logger.warning(
+            f"[Reconciler] Broker reported ZERO holdings while "
+            f"{len(managed_tickers)} positions are managed — skipping the "
+            f"external-close pass this cycle (possible malformed/empty payload)"
+        )
+        return
+
     for ticker in managed_tickers:
         if ticker in holdings_by_ticker:
             continue
@@ -288,6 +320,12 @@ async def _fix_quantities(coordinator, pm, holdings_by_ticker: dict, report: Rec
         coordinator_pos = _find_position(coordinator.state.positions, ticker)
         if coordinator_pos is not None and coordinator_pos.quantity != broker_qty:
             coordinator_pos.quantity = broker_qty
+            # Refresh current_price from the broker BEFORE re-registering
+            # (review m2): RiskMonitor.add_position seeds last_price from
+            # position.current_price, and a stale price there can trip the
+            # sudden-move detector on the next real quote (PAUSED → all stop
+            # checks skipped).
+            coordinator_pos.current_price = float(holding.cur_prc)
             coordinator_pos.last_updated = datetime.now()
             coordinator.risk_monitor.remove_position(ticker)
             coordinator.risk_monitor.add_position(coordinator_pos)
@@ -330,7 +368,12 @@ async def reconcile(coordinator) -> ReconcileReport:
         return report
 
     try:
-        balance = await coordinator._kiwoom.get_account_balance()
+        # use_cache=False (review M1): the client's 30s TTL entry can predate
+        # a fill the tracker poll registered seconds ago — reconciling against
+        # that stale snapshot would remove the just-registered position as an
+        # "external close" and re-adopt it next pass (oscillation). Same
+        # reasoning as _poll_tracked_fills' ka10076 use_cache=False.
+        balance = await coordinator._kiwoom.get_account_balance(use_cache=False)
     except Exception as e:
         logger.error(f"[Reconciler] get_account_balance failed: {e}")
         return report

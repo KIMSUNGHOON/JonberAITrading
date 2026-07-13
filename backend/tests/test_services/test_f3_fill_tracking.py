@@ -831,15 +831,18 @@ def _holding(stk_cd="005930", stk_nm="삼성전자", qty=48, avg=260_000, cur=26
 
 class _BalanceKiwoomClient:
     """Minimal Kiwoom client: reports get_account_balance() from a fixed
-    holdings list (or raises, for the failure-path test)."""
+    holdings list (or raises, for the failure-path test). Records the
+    use_cache kwarg so tests can pin the fresh-snapshot contract (review M1)."""
 
     def __init__(self, holdings=None, raise_error=False):
         self._holdings = holdings if holdings is not None else []
         self._raise_error = raise_error
         self.balance_calls = 0
+        self.last_use_cache = None
 
-    async def get_account_balance(self, qry_tp="0", exchange=None):
+    async def get_account_balance(self, qry_tp="0", exchange=None, use_cache=True):
         self.balance_calls += 1
+        self.last_use_cache = use_cache
         if self._raise_error:
             raise RuntimeError("kt00004 down")
         return AccountBalance(holdings=list(self._holdings))
@@ -1009,10 +1012,19 @@ async def test_reconcile_orphan_falls_back_to_default_stop(temp_storage, monkeyp
     assert "기본 스탑" in alerts[0].message
 
 
-# 4) reverse: coordinator manages it, broker no longer does -> remove both, notify
+# 4) reverse: coordinator manages it, broker no longer does -> remove both,
+# notify. The broker snapshot stays NON-empty (another managed holding is
+# still there) — an all-empty snapshot is the M2 mass-removal guard's case.
 async def test_reconcile_removes_position_absent_from_broker(temp_storage, monkeypatch):
-    coord = ExecutionCoordinator(kiwoom_client=_BalanceKiwoomClient(holdings=[]))
-    coord._add_position(_managed_position())
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(
+            holdings=[_holding(stk_cd="000660", stk_nm="SK하이닉스", qty=10)]
+        )
+    )
+    coord._add_position(_managed_position())  # 005930 — gone at the broker
+    coord._add_position(
+        _managed_position(ticker="000660", quantity=10, stop_loss=None, take_profit=None)
+    )  # still held — keeps the snapshot non-empty and is itself untouched
     _patch_pm(monkeypatch, None)
 
     alerts = []
@@ -1025,14 +1037,24 @@ async def test_reconcile_removes_position_absent_from_broker(temp_storage, monke
     report = await reconcile(coord)
 
     assert report.externally_closed == 1
-    assert coord._state.positions == []
+    assert [p.ticker for p in coord._state.positions] == ["000660"]
     assert len(alerts) == 1
+    assert alerts[0].ticker == "005930"
 
 
-# 5) reverse exception: a TRACKING sell for the ticker suppresses the removal
+# 5) reverse exception: a TRACKING sell for the ticker suppresses the removal.
+# Broker snapshot kept NON-empty (another managed holding) so the skip is
+# attributable to the TRACKING-sell branch, not the M2 zero-holdings guard.
 async def test_reconcile_reverse_check_skips_when_tracking_sell_exists(temp_storage, monkeypatch):
-    coord = ExecutionCoordinator(kiwoom_client=_BalanceKiwoomClient(holdings=[]))
-    coord._add_position(_managed_position())
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(
+            holdings=[_holding(stk_cd="000660", stk_nm="SK하이닉스", qty=10)]
+        )
+    )
+    coord._add_position(_managed_position())  # 005930 — absent at the broker
+    coord._add_position(
+        _managed_position(ticker="000660", quantity=10, stop_loss=None, take_profit=None)
+    )
     coord.fill_tracker.register(
         _tracked_order(ord_no="SELL1", ticker="005930", side="sell", total=10, filled=0)
     )
@@ -1041,7 +1063,7 @@ async def test_reconcile_reverse_check_skips_when_tracking_sell_exists(temp_stor
     report = await reconcile(coord)
 
     assert report.externally_closed == 0
-    assert len(coord._state.positions) == 1
+    assert any(p.ticker == "005930" for p in coord._state.positions)
 
 
 # 6) quantity mismatch (broker 30 vs managed 48) -> corrected to broker qty
@@ -1173,3 +1195,160 @@ async def test_scheduler_calls_reconcile_every_second_tick(temp_storage, monkeyp
     assert tick_count["n"] == 3  # two ticks ran, the third stopped the loop
     assert len(calls) == 1  # reconcile fired exactly once, on the 2nd tick
     assert calls[0] is coord
+
+
+# -------------------------------------------
+# F3 t6 review fixes (M1/M2/m1/m2)
+# -------------------------------------------
+
+
+# M1: reconcile must read a FRESH balance snapshot — the client's 30s TTL
+# entry can predate a fill the poll just registered, and a stale snapshot
+# would remove the just-registered position as "외부 매도" (oscillation).
+async def test_reconcile_requests_fresh_balance_snapshot(temp_storage, monkeypatch):
+    fake = _BalanceKiwoomClient(holdings=[])
+    coord = ExecutionCoordinator(kiwoom_client=fake)
+    _patch_pm(monkeypatch, None)
+
+    await reconcile(coord)
+
+    assert fake.balance_calls == 1
+    assert fake.last_use_cache is False
+
+
+# M2: a SUCCESSFUL response with EMPTY holdings while positions are managed
+# must not mass-remove everything — the client manufactures [] from a
+# malformed kt00004 payload, so an empty list is not trustworthy enough to
+# liquidate all local defense in one pass. Skip the removal pass + warn;
+# adoption/quantity passes still run.
+async def test_reconcile_zero_holdings_skips_entire_removal_pass(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(kiwoom_client=_BalanceKiwoomClient(holdings=[]))
+    coord._add_position(_managed_position(ticker="005930"))
+    coord._add_position(_managed_position(ticker="000660", stop_loss=None, take_profit=None))
+    _patch_pm(monkeypatch, None)
+
+    warnings = []
+    import services.trading.reconciler as reconciler_module
+
+    monkeypatch.setattr(
+        reconciler_module.logger, "warning", lambda msg, *a, **k: warnings.append(str(msg))
+    )
+
+    alerts = []
+
+    async def _capture(a):
+        alerts.append(a)
+
+    coord.set_alert_callback(_capture)
+
+    report = await reconcile(coord)
+
+    assert report.externally_closed == 0
+    assert len(coord._state.positions) == 2  # nothing removed
+    assert alerts == []  # and no removal notifications
+    assert any("ZERO holdings" in w for w in warnings)  # warning logged
+
+
+# M2 guard must NOT block a genuine single-position close: broker holdings
+# are non-empty overall, just lacking the managed ticker -> still removed.
+async def test_reconcile_still_removes_missing_ticker_when_other_holdings_exist(
+    temp_storage, monkeypatch
+):
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(
+            holdings=[_holding(stk_cd="000660", stk_nm="SK하이닉스", qty=10)]
+        )
+    )
+    coord._add_position(_managed_position(ticker="005930"))
+    _patch_pm(monkeypatch, None)
+
+    report = await reconcile(coord)
+
+    assert report.externally_closed == 1
+    assert all(p.ticker != "005930" for p in coord._state.positions)
+
+
+# m1: the true-orphan adoption path must register with the coordinator's
+# stop_loss_mode and the provenance risk_score (parity with the fill-poll
+# path's register semantics).
+async def test_reconcile_true_orphan_carries_stop_mode_and_risk_score(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(kiwoom_client=_BalanceKiwoomClient(holdings=[_holding()]))
+    coord.risk_params.stop_loss_mode = StopLossMode.AGENT_AUTO
+    coord.fill_tracker.register(
+        _tracked_order(
+            ord_no="OLD1",
+            total=48,
+            filled=48,
+            status=TrackedOrderStatus.FILLED,
+            risk_score=7,
+        )
+    )
+    _patch_pm(monkeypatch, None)
+
+    report = await reconcile(coord)
+
+    assert report.orphans_adopted == 1
+    position = coord._state.positions[0]
+    assert position.stop_loss_mode == StopLossMode.AGENT_AUTO
+    assert position.risk_score == 7
+
+
+# m1: the bypass branch (PM already tracks the ticker) must carry the same
+# stop_loss_mode/risk_score on the directly-registered ManagedPosition.
+async def test_reconcile_bypass_branch_carries_stop_mode_and_risk_score(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(kiwoom_client=_BalanceKiwoomClient(holdings=[_holding()]))
+    coord.risk_params.stop_loss_mode = StopLossMode.AGENT_AUTO
+    coord.fill_tracker.register(
+        _tracked_order(
+            ord_no="OLD1",
+            total=48,
+            filled=48,
+            status=TrackedOrderStatus.FILLED,
+            risk_score=7,
+        )
+    )
+    pm = _FakePM({
+        "005930": MonitoredPosition(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=48,
+            avg_price=260_000,
+            current_price=260_000,
+            stop_loss=246_560,
+            take_profit=289_440,
+        )
+    })
+    _patch_pm(monkeypatch, pm)
+
+    report = await reconcile(coord)
+
+    assert report.orphans_adopted == 1
+    position = coord._state.positions[0]
+    assert position.stop_loss_mode == StopLossMode.AGENT_AUTO
+    assert position.risk_score == 7
+
+
+# m2: the quantity fix must refresh current_price from the broker BEFORE
+# re-registering with the RiskMonitor — a stale last_price can trip the
+# sudden-move detector (PAUSED -> all stop checks skipped). Also pins the
+# re-register itself (reviewer L4): the watch config reflects the corrected
+# quantity/price and keeps its stops.
+async def test_reconcile_quantity_fix_refreshes_price_and_risk_monitor(temp_storage, monkeypatch):
+    coord = ExecutionCoordinator(
+        kiwoom_client=_BalanceKiwoomClient(holdings=[_holding(qty=30, avg=260_000, cur=270_000)])
+    )
+    coord._add_position(_managed_position(quantity=48))  # current_price=260_000 (stale)
+    _patch_pm(monkeypatch, None)
+
+    report = await reconcile(coord)
+
+    assert report.quantity_fixed == 1
+    position = coord._state.positions[0]
+    assert position.quantity == 30
+    assert position.current_price == 270_000  # refreshed from broker cur_prc
+
+    config = coord.risk_monitor._watching["005930"]
+    assert config.quantity == 30
+    assert config.last_price == 270_000
+    assert config.stop_loss == 246_560  # stops preserved through the re-register
+    assert config.take_profit == 289_440
