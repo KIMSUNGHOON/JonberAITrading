@@ -85,6 +85,33 @@ async def submit_decision(
     state = session["state"]
 
     if not state.get("awaiting_approval"):
+        if decision == "cancelled":
+            # Cancel-zombie tolerance: the operations board lists a session as
+            # actionable off the session_manager row (sm.status ==
+            # AWAITING_APPROVAL — checked above, in _adopt_session_from_manager,
+            # or already true for a legacy-dict hit), but state["awaiting_approval"]
+            # can be stale/False (reject -> re-analysis cycles and mirror races
+            # desync the flag from the sm truth). Approve/reject/modified must
+            # stay fail-closed (strictness pinned below), but cancel executes
+            # nothing — there is no unsafe resume to guard against — so it must
+            # always succeed for a session found by EITHER truth. This is a pure
+            # termination mark: no graph resume, no legacy-dict (re-)registration.
+            state["approval_status"] = "cancelled"
+            state["awaiting_approval"] = False
+            state.pop("auto_approve_at", None)
+            session["status"] = "cancelled"
+            await mirror_session_status(session_id, SessionStatus.CANCELLED)
+            logger.info(
+                "approval_cancel_stale_flag_tolerated",
+                session_id=session_id,
+            )
+            return ApprovalResponse(
+                session_id=session_id,
+                decision=decision,
+                status=session["status"],
+                message="Analysis cancelled by user.",
+                execution_status="cancelled",
+            )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Session is not awaiting approval",

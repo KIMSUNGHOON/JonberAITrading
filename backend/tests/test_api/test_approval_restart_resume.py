@@ -301,6 +301,140 @@ async def test_cancelled_sm_session_is_never_adopted(wired):
 
 
 @pytest.mark.asyncio
+async def test_cancel_tolerates_stale_state_flag_on_legacy_session(wired, monkeypatch):
+    """Legacy dict hit, state["awaiting_approval"]=False (stale), decision='cancelled'.
+
+    Live defect (2026-07-13): reject -> re-analysis cycles and mirror races can
+    leave state["awaiting_approval"] False while the session_manager row (and
+    hence the ops board) still lists the session as AWAITING_APPROVAL. Cancel
+    must succeed anyway — it executes nothing, so there is no unsafe resume to
+    guard against. This is a pure termination mark: no graph resume.
+    """
+    session_id = "legacy-stale-cancel-1"
+    wired["kr_stock_sessions"][session_id] = {
+        "session_id": session_id,
+        "status": "awaiting_approval",
+        "state": {
+            "awaiting_approval": False,
+            "approval_status": None,
+            "trade_proposal": {"id": "prop-1", "action": "BUY", "quantity": 1, "entry_price": 70000},
+            "reasoning_log": [],
+        },
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+    }
+    graph = _FakeGraph([])
+    wired["set_graph"](graph)
+
+    mirrored_statuses = []
+
+    async def capture_mirror_status(sid, st, error=None):
+        mirrored_statuses.append((sid, st))
+
+    monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+
+    result = await approval_module.submit_decision(session_id, "cancelled")
+
+    assert result.session_id == session_id
+    assert result.decision == "cancelled"
+    assert result.status == "cancelled"
+    assert result.execution_status == "cancelled"
+
+    state = wired["kr_stock_sessions"][session_id]["state"]
+    assert state["approval_status"] == "cancelled"
+    assert state["awaiting_approval"] is False
+    assert wired["kr_stock_sessions"][session_id]["status"] == "cancelled"
+
+    assert mirrored_statuses == [(session_id, SessionStatus.CANCELLED)]
+
+    # Graph resume machinery was NOT invoked — nothing to safely resume.
+    graph.aupdate_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_approve_still_400s_on_stale_state_flag_legacy_session(wired):
+    """Same stale-flag session as above, decision='approved' -> still 400.
+
+    Pins that the cancel tolerance is scoped ONLY to decision='cancelled' —
+    approve/reject/modified keep the exact fail-closed 400 behavior.
+    """
+    from fastapi import HTTPException
+
+    session_id = "legacy-stale-approve-1"
+    wired["kr_stock_sessions"][session_id] = {
+        "session_id": session_id,
+        "status": "awaiting_approval",
+        "state": {
+            "awaiting_approval": False,
+            "approval_status": None,
+            "trade_proposal": {"id": "prop-1", "action": "BUY", "quantity": 1, "entry_price": 70000},
+            "reasoning_log": [],
+        },
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "approved")
+
+    assert exc_info.value.status_code == 400
+    assert "not awaiting approval" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_cancel_tolerates_stale_state_flag_on_sm_only_session(wired, monkeypatch):
+    """sm row status=AWAITING_APPROVAL, state flag False, decision='cancelled' -> 200.
+
+    Exercises the _adopt_session_from_manager path: the sm-status gate lets the
+    row through as "found", but its own state-level awaiting check (mirror lag)
+    normally returns the session UNREGISTERED so approve/reject 400 without
+    leaving a zombie legacy-dict entry. Cancel must still succeed here too, and
+    must NOT register the session into the legacy dict as an awaiting session.
+    """
+    session_id = "sm-stale-cancel-1"
+    wired["set_sm_session"](
+        _sm_session(session_id, status=SessionStatus.AWAITING_APPROVAL, awaiting_approval=False)
+    )
+
+    mirrored_statuses = []
+
+    async def capture_mirror_status(sid, st, error=None):
+        mirrored_statuses.append((sid, st))
+
+    monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+
+    result = await approval_module.submit_decision(session_id, "cancelled")
+
+    assert result.session_id == session_id
+    assert result.decision == "cancelled"
+    assert result.status == "cancelled"
+    assert result.execution_status == "cancelled"
+
+    assert mirrored_statuses == [(session_id, SessionStatus.CANCELLED)]
+
+    # Not (re-)registered into the legacy dict as an awaiting session.
+    assert session_id not in wired["kr_stock_sessions"]
+    assert session_id not in wired["coin_sessions"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_session_cancel_still_404s(wired):
+    """Miss in both legacy dicts AND session_manager, decision='cancelled' -> 404 unchanged.
+
+    The cancel tolerance only kicks in once a session is FOUND (by either
+    truth) but its state flag is stale — it must never mask a genuine 404.
+    """
+    from fastapi import HTTPException
+
+    wired["set_sm_session"](None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision("does-not-exist-cancel", "cancelled")
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_unsupported_market_type_fails_closed_404(wired):
     """market_type=STOCK (US stack removed) -> 404, never adopted."""
     from fastapi import HTTPException
