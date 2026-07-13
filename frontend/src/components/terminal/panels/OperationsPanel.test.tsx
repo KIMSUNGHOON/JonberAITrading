@@ -128,6 +128,25 @@ it('미체결 조회 실패 시 헤더는 조회 실패, 살아있는 큐 항목
   expect(screen.getByRole('button', { name: '대기 취소' })).toBeInTheDocument();
 });
 
+it('거부 액션 실패 시 오류를 표시하고 컬럼은 계속 렌더한다', async () => {
+  submitApproval.mockRejectedValueOnce(new Error('network down'));
+  getOperations.mockResolvedValue({
+    ...BASE,
+    awaiting: [{ session_id: 's4', ticker: '000660', name: 'SK하이닉스',
+                 proposal: { action: 'WATCH', entry_price: 1968000,
+                             stop_loss: 1810560, take_profit: 2125440,
+                             risk_score: 0.7 },
+                 auto_approve_at: null }],
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: '거부' }));
+  await waitFor(() => expect(screen.getByText(/거부 실패/)).toBeInTheDocument());
+  expect(screen.getByText(/network down/)).toBeInTheDocument();
+  // 보드는 계속 렌더한다 — 오류가 컬럼을 가리지 않는다
+  expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument();
+});
+
 it('미체결 취소 버튼이 cancelKRStockOrder를 호출하고 재조회한다', async () => {
   getOperations.mockResolvedValue({
     ...BASE,

@@ -404,10 +404,14 @@ export function OperationsPanel() {
   const { activeMarket, data, state, err, refetch } = useOperations();
   const navigate = useNavigate();
   const [submittingSession, setSubmittingSession] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const handleCancelAnalysis = useCallback(async (sessionId: string) => {
     try {
       await cancelKRStockSession(sessionId);
+      setActionError(null);
+    } catch (e) {
+      setActionError(`분석 취소 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
     } finally {
       refetch();
     }
@@ -417,6 +421,10 @@ export function OperationsPanel() {
     setSubmittingSession(sessionId);
     try {
       await submitApproval({ session_id: sessionId, decision });
+      setActionError(null);
+    } catch (e) {
+      const label = decision === 'approved' ? '승인' : '거부';
+      setActionError(`${label} 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
     } finally {
       setSubmittingSession(null);
       refetch();
@@ -426,6 +434,9 @@ export function OperationsPanel() {
   const handleConvertWatch = useCallback(async (watchId: string) => {
     try {
       await convertWatchToQueue({ watch_id: watchId });
+      setActionError(null);
+    } catch (e) {
+      setActionError(`큐 전환 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
     } finally {
       refetch();
     }
@@ -434,6 +445,9 @@ export function OperationsPanel() {
   const handleRemoveWatch = useCallback(async (watchId: string) => {
     try {
       await removeFromWatchList(watchId);
+      setActionError(null);
+    } catch (e) {
+      setActionError(`감시 제거 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
     } finally {
       refetch();
     }
@@ -442,6 +456,9 @@ export function OperationsPanel() {
   const handleDismissQueue = useCallback(async (queueId: string) => {
     try {
       await dismissTrade(queueId);
+      setActionError(null);
+    } catch (e) {
+      setActionError(`대기 취소 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
     } finally {
       refetch();
     }
@@ -450,6 +467,9 @@ export function OperationsPanel() {
   const handleCancelOrder = useCallback(async (orderId: string) => {
     try {
       await cancelKRStockOrder(orderId);
+      setActionError(null);
+    } catch (e) {
+      setActionError(`주문 취소 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
     } finally {
       refetch();
     }
@@ -462,45 +482,60 @@ export function OperationsPanel() {
   const market = activeMarket === 'coin' ? 'coin' : 'kiwoom';
 
   return (
-    <div className="flex h-full gap-0 overflow-x-auto">
-      <AnalyzingColumn
-        items={data.analyzing}
-        errors={data.errors}
-        navigate={navigate}
-        onCancel={handleCancelAnalysis}
-      />
-      <AwaitingColumn
-        items={data.awaiting}
-        errors={data.errors}
-        activeMarket={market}
-        submitting={submittingSession}
-        onDecide={handleDecide}
-      />
-      <WatchingColumn
-        items={data.watching}
-        errors={data.errors}
-        onConvert={handleConvertWatch}
-        onRemove={handleRemoveWatch}
-      />
-      <PendingBuyColumn
-        pendingBuy={data.pending_buy}
-        errors={data.errors}
-        activeMarket={market}
-        onDismiss={handleDismissQueue}
-        onCancelOrder={handleCancelOrder}
-      />
-      <HoldingColumn
-        items={data.holding}
-        errors={data.errors}
-        activeMarket={market}
-        navigate={navigate}
-      />
-      <TodayFillsColumn
-        items={data.today_fills}
-        errors={data.errors}
-        activeMarket={market}
-        navigate={navigate}
-      />
+    <div className="flex flex-col h-full min-h-0">
+      {actionError && (
+        <div className="flex-none flex items-center justify-between gap-2 px-2.5 py-1 border-b border-hairline bg-down/5 text-down text-[11px]">
+          <span>{actionError}</span>
+          <button
+            type="button"
+            aria-label="오류 닫기"
+            onClick={() => setActionError(null)}
+            className="text-dim hover:text-down flex-none"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+      <div className="flex flex-1 min-h-0 gap-0 overflow-x-auto">
+        <AnalyzingColumn
+          items={data.analyzing}
+          errors={data.errors}
+          navigate={navigate}
+          onCancel={handleCancelAnalysis}
+        />
+        <AwaitingColumn
+          items={data.awaiting}
+          errors={data.errors}
+          activeMarket={market}
+          submitting={submittingSession}
+          onDecide={handleDecide}
+        />
+        <WatchingColumn
+          items={data.watching}
+          errors={data.errors}
+          onConvert={handleConvertWatch}
+          onRemove={handleRemoveWatch}
+        />
+        <PendingBuyColumn
+          pendingBuy={data.pending_buy}
+          errors={data.errors}
+          activeMarket={market}
+          onDismiss={handleDismissQueue}
+          onCancelOrder={handleCancelOrder}
+        />
+        <HoldingColumn
+          items={data.holding}
+          errors={data.errors}
+          activeMarket={market}
+          navigate={navigate}
+        />
+        <TodayFillsColumn
+          items={data.today_fills}
+          errors={data.errors}
+          activeMarket={market}
+          navigate={navigate}
+        />
+      </div>
     </div>
   );
 }
