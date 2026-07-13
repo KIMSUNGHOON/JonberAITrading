@@ -912,6 +912,74 @@ class TestPersistSingleWriter:
             "the persisted stops silently reverted to null"
         )
 
+    @pytest.mark.asyncio
+    async def test_pending_write_cannot_land_before_restore_read(
+        self, config, temp_storage, monkeypatch
+    ):
+        """Final-review CRITICAL (C1) — the INVERSE interleaving of
+        test_delayed_stale_write_cannot_clobber_restore above.
+
+        In production, ChatCoordinator.start() awaits
+        sync_from_account() then immediately awaits restore_stop_overlay()
+        with no yield in between. sync_from_account's add_position calls
+        schedule a fire-and-forget None-stops persist synchronously; that
+        pending writer gets its FIRST chance to run at restore's own first
+        await. If it reaches the DB before restore's read, restore reads an
+        all-None blob, "restores" nothing, and its own unconditional
+        corrective re-save then cements the loss — the good stop is gone for
+        good, with no delayed-write window for the OTHER test to catch.
+
+        Delay-inject the READ (not the write, as above) so the pending write
+        gets a chance to land while restore's read is in flight."""
+        # A previous session persisted a good stop for 005930.
+        await temp_storage.set_app_setting(
+            _STOPS_KEY,
+            json.dumps({"stops": {"005930": {
+                "stop_loss": 68875.0,
+                "take_profit": None,
+                "trailing_stop_pct": None,
+            }}}),
+        )
+
+        real_get = temp_storage.get_app_setting
+
+        async def delayed_get(key, default=None):
+            # Yield BEFORE actually reading, so the pending None-stops write
+            # (already scheduled by add_position below) gets a window to
+            # land in the DB first — the adversarial ordering C1 describes.
+            await asyncio.sleep(0.15)
+            return await real_get(key, default)
+
+        monkeypatch.setattr(temp_storage, "get_app_setting", delayed_get)
+
+        pm = PositionManager(config=config)
+        # sync_from_account shape: broker holding arrives with NO stops →
+        # schedules a fire-and-forget persist of a None-stops blob. No sleep
+        # follows — mirrors "no yield occurs before restore_stop_overlay
+        # entry" from the finding.
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=73000,
+        )
+
+        restored = await pm.restore_stop_overlay()
+
+        assert restored == 1, (
+            "the pending None-stops write landed before restore's read — "
+            "restore saw an all-None blob and restored nothing"
+        )
+        assert pm.get_position("005930").stop_loss == 68875.0
+
+        blob = await temp_storage.get_app_setting(_STOPS_KEY)
+        data = json.loads(blob)
+        assert data["stops"]["005930"]["stop_loss"] == 68875.0, (
+            "restore's corrective re-save cemented the race's data loss "
+            "into the blob"
+        )
+
 
 # -------------------------------------------
 # Stop sanity validation (P0-2)
@@ -1076,3 +1144,36 @@ class TestStopSanity:
         assert data["stops"]["005930"]["stop_loss"] is None
         assert data["stops"]["005930"]["take_profit"] is None
         assert data["stops"]["000660"]["stop_loss"] == 110000.0
+
+    @pytest.mark.asyncio
+    async def test_restore_drop_notifies(self, config, temp_storage):
+        """(M1, final-review) A restore-drop was previously Telegram-silent —
+        the human had no way to learn a position came back up from a restart
+        with NO stop-loss/take-profit protection. The drop path must fire the
+        same best-effort notifier the decision-path rejection uses."""
+        await temp_storage.set_app_setting(_STOPS_KEY, json.dumps({"stops": {
+            "005930": {
+                "stop_loss": 68875.0,
+                "take_profit": 79750.0,
+                "trailing_stop_pct": None,
+            },
+        }}))
+
+        pm = PositionManager(config=config)
+        pm.add_position(
+            ticker="005930", stock_name="삼성전자", quantity=100,
+            avg_price=72500, current_price=90000,
+        )
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            restored = await pm.restore_stop_overlay()
+
+        assert restored == 0
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "복원 스탑 기각" in msg
+        assert "005930" in msg

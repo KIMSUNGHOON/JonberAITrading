@@ -762,11 +762,25 @@ class ExecutionCoordinator:
             existing.quantity = total_qty
             existing.avg_price = total_cost / total_qty
             existing.last_updated = datetime.now()
+            # I1 (final-review): coalesce stops onto the merged position —
+            # keep existing's non-None stops, only fill gaps from the
+            # incoming tranche.
+            if existing.stop_loss is None and position.stop_loss is not None:
+                existing.stop_loss = position.stop_loss
+            if existing.take_profit is None and position.take_profit is not None:
+                existing.take_profit = position.take_profit
+            watched = existing
         else:
             self._state.positions.append(position)
+            watched = position
 
-        # Add to risk monitor
-        self.risk_monitor.add_position(position)
+        # Add to risk monitor — MUST watch the merged position (`watched`),
+        # not the incoming delta `position`: add_position replaces
+        # WatchConfig wholesale, so after a merge the monitor would otherwise
+        # watch only the last tranche's quantity while the real position is
+        # the merged total — a stop trigger would then sell only that
+        # tranche (I1, final-review).
+        self.risk_monitor.add_position(watched)
 
         # Update risk agent status
         self._update_agent_status(

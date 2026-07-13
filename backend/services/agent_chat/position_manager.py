@@ -1226,6 +1226,37 @@ class PositionManager:
         except Exception as e:
             logger.error("position_manager_persist_failed", error=str(e))
 
+    async def _notify_restore_stops_dropped(
+        self,
+        ticker: str,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+        current_price: Optional[float],
+    ) -> None:
+        """Best-effort Telegram notice when a restart-restore blob entry fails
+        _stops_sane and is dropped (P0-2b/M1) — mirrors
+        _notify_decision_stops_rejected. Without this, a position could come
+        back up from a restart with NO stop-loss/take-profit protection and
+        nothing would surface that silently to the human."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                sl = f"{stop_loss:,.0f}" if stop_loss is not None else "-"
+                tp = f"{take_profit:,.0f}" if take_profit is not None else "-"
+                price = f"{current_price:,.0f}" if current_price else "알수없음"
+                await notifier.send_message(
+                    f"⚠️ 복원 스탑 기각: {ticker} 손절 {sl}/익절 {tp} — "
+                    f"현재가 {price} 기준 무효, 보호 미설정 상태"
+                )
+        except Exception as e:
+            logger.warning(
+                "restore_stops_dropped_notify_failed",
+                ticker=ticker,
+                error=str(e),
+            )
+
     async def restore_stop_overlay(self) -> int:
         """Restore persisted stop levels onto currently-monitored positions.
 
@@ -1243,9 +1274,35 @@ class PositionManager:
 
         Returns the number of tickers whose stops were restored.
         """
+        # Final-review CRITICAL (C1): sync_from_account's add_position calls
+        # (synchronous, called right before this coroutine with no yield in
+        # between per ChatCoordinator.start()) schedule fire-and-forget
+        # None-stops persists. Those pending writers get their FIRST chance
+        # to run at this coroutine's own first await — if one reached the DB
+        # before the read just below, we'd read an all-None blob, "restore"
+        # nothing, and the unconditional re-save at the end would cement
+        # that loss. Bumping the generation HERE, before any await, retires
+        # every writer scheduled before this call synchronously (no
+        # interleaving is possible before the first await) — the same
+        # generation-check gate _persist_stops already applies (~L1209).
+        self._persist_generation += 1
         try:
             from services.storage_service import get_storage_service
 
+            # Belt-and-braces (verified): do NOT additionally hold
+            # _persist_lock across this read. A writer that is already
+            # mid-critical-section when this call starts (e.g. sleeping
+            # inside its own `async with self._persist_lock` before its DB
+            # write, as in the sibling delayed-WRITE race test below) has
+            # already passed its generation check — serializing this read
+            # behind that lock would make it wait for that stale write to
+            # LAND and release the lock first, so the read would observe the
+            # very corruption this fix prevents, one step removed. The
+            # generation bump above is what closes the race: a writer
+            # scheduled before this point is retired by the check inside its
+            # own `_persist_stops` (~L1209) regardless of DB timing. The
+            # corrective `_persist_stops()` call below still goes through the
+            # lock and always wins because generation=None is never stale.
             storage = await get_storage_service()
             blob = await storage.get_app_setting(self._STOPS_KEY)
             if not blob:
@@ -1278,6 +1335,9 @@ class PositionManager:
                         stop_loss=saved_stop,
                         take_profit=saved_take,
                         current_price=position.current_price,
+                    )
+                    await self._notify_restore_stops_dropped(
+                        ticker, saved_stop, saved_take, position.current_price
                     )
                     continue
 
