@@ -423,6 +423,120 @@ async def test_cursor_emits_pending_frames_before_complete(sm):
     assert types == ["reasoning", "reasoning", "status", "complete"]
 
 
+# -------------------------------------------
+# Snapshot cap on initial connect replay
+# -------------------------------------------
+#
+# LIVE-CONFIRMED bug: on every /ws/session/{id} connect, the full
+# reasoning_log (hundreds of frames for a long session) was sent back-to-back
+# with no yielding. That burst broke the vite dev proxy (EPIPE -> close 1006)
+# ~2s after connect, the FE reconnected, and the full snapshot replayed again
+# -> infinite churn, plus the repeated full-log json-encode froze the loop.
+# _SessionFrameCursor.emit() now caps the *initial* replay (last_log_index
+# still 0) at SNAPSHOT_MAX_REASONING entries with a leading truncation
+# marker, while positioning the cursor at the true (uncapped) log length so
+# live deltas after connect keep streaming with no gap/dup.
+
+
+async def test_initial_snapshot_caps_reasoning_with_truncation_marker():
+    """(a) 300 entries -> at most 100 + 1 truncation marker, newest 100 in order."""
+    ws = FakeWebSocket()
+    cursor = ws_module._SessionFrameCursor("snap-300")
+    reasoning_log = [f"[t] entry {i}" for i in range(300)]
+    session = {
+        "session_id": "snap-300",
+        "status": "running",
+        "error": None,
+        "state": {"reasoning_log": reasoning_log, "current_stage": "data_collection"},
+    }
+
+    await cursor.emit(ws, session)
+
+    reasoning_frames = [f for f in ws.sent if f["type"] == "reasoning"]
+    assert len(reasoning_frames) == ws_module.SNAPSHOT_MAX_REASONING + 1
+    assert "생략" in reasoning_frames[0]["data"]
+    assert [f["data"] for f in reasoning_frames[1:]] == reasoning_log[-100:]
+    # Cursor tracks the true log length, not the capped send count.
+    assert cursor.last_log_index == 300
+
+
+async def test_initial_snapshot_cursor_continuity_no_gap_no_dup():
+    """(b) live entries appended after a capped connect still stream: no
+    duplicate of the last snapshot line, no gap."""
+    ws = FakeWebSocket()
+    cursor = ws_module._SessionFrameCursor("snap-cont")
+    reasoning_log = [f"[t] entry {i}" for i in range(300)]
+    session = {
+        "session_id": "snap-cont",
+        "status": "running",
+        "error": None,
+        "state": {"reasoning_log": reasoning_log, "current_stage": "data_collection"},
+    }
+
+    await cursor.emit(ws, session)  # capped initial snapshot
+
+    session["state"]["reasoning_log"] = reasoning_log + ["[t] live entry"]
+    await cursor.emit(ws, session)  # live delta after connect
+
+    reasoning_frames = [f for f in ws.sent if f["type"] == "reasoning"]
+    data = [f["data"] for f in reasoning_frames]
+    assert data[-1] == "[t] live entry"
+    assert data.count("[t] live entry") == 1
+    assert data.count("[t] entry 299") == 1, "last pre-connect line must not be re-sent"
+    assert data.count("[t] entry 0") == 0, "omitted lines never appear"
+
+
+async def test_short_session_under_cap_gets_no_marker():
+    """(c) 50 entries -> all 50 delivered, no truncation marker."""
+    ws = FakeWebSocket()
+    cursor = ws_module._SessionFrameCursor("snap-50")
+    reasoning_log = [f"[t] entry {i}" for i in range(50)]
+    session = {
+        "session_id": "snap-50",
+        "status": "running",
+        "error": None,
+        "state": {"reasoning_log": reasoning_log, "current_stage": "data_collection"},
+    }
+
+    await cursor.emit(ws, session)
+
+    reasoning_frames = [f for f in ws.sent if f["type"] == "reasoning"]
+    assert len(reasoning_frames) == 50
+    assert [f["data"] for f in reasoning_frames] == reasoning_log
+
+
+async def test_snapshot_replay_is_paced(monkeypatch):
+    """Snapshot replay yields every frame (sleep(0)) and takes a longer
+    breather every SNAPSHOT_PACE_SLEEP_EVERY frames, so the proxy can flush
+    instead of getting hit with hundreds of frames in one scheduler tick."""
+    sleep_calls: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        await real_sleep(0)  # keep the test itself fast
+
+    monkeypatch.setattr(ws_module.asyncio, "sleep", fake_sleep)
+
+    ws = FakeWebSocket()
+    cursor = ws_module._SessionFrameCursor("snap-pace")
+    reasoning_log = [f"[t] entry {i}" for i in range(300)]
+    session = {
+        "session_id": "snap-pace",
+        "status": "running",
+        "error": None,
+        "state": {"reasoning_log": reasoning_log, "current_stage": "data_collection"},
+    }
+
+    await cursor.emit(ws, session)
+
+    total_frames = ws_module.SNAPSHOT_MAX_REASONING + 1  # 100 entries + marker
+    yield_calls = [c for c in sleep_calls if c == 0]
+    assert len(yield_calls) == total_frames
+    throttle_calls = [c for c in sleep_calls if c == ws_module.SNAPSHOT_PACE_SLEEP_SECONDS]
+    assert len(throttle_calls) == total_frames // ws_module.SNAPSHOT_PACE_SLEEP_EVERY
+
+
 async def test_subscriber_registered_and_cleaned_up(sm, kr_sessions, fast_linger):
     await sm.create_session(
         "push-3", MarketType.KIWOOM, "005930", "삼성전자", state={"reasoning_log": []}

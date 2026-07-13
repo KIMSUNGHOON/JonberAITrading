@@ -34,6 +34,20 @@ SAFETY_POLL_SECONDS = 1.0
 # Keep the connection open briefly after the complete frame so slow clients read it.
 COMPLETE_LINGER_SECONDS = 2.0
 
+# Cap the initial full-log replay on connect: long sessions (hundreds of
+# reasoning entries) were serialized+sent back-to-back in a tight loop on
+# every reconnect, bursting past the dev proxy's buffer (EPIPE -> ws close
+# 1006) and pinning the event loop during json-encode. Only the initial
+# connect snapshot is capped — live deltas after connect are unaffected
+# because the cursor is positioned at the true (uncapped) log length, not
+# the capped send count, so no gap/dup appears once streaming continues.
+SNAPSHOT_MAX_REASONING = 100
+# Send pacing: yield to the loop after every frame, and take a slightly
+# longer breather every N frames, so the proxy can flush the socket buffer
+# instead of getting hit with a burst of hundreds of frames in one tick.
+SNAPSHOT_PACE_SLEEP_EVERY = 20
+SNAPSHOT_PACE_SLEEP_SECONDS = 0.01
+
 
 # -------------------------------------------
 # Connection Manager
@@ -546,17 +560,43 @@ class _SessionFrameCursor:
         # Send new reasoning log entries
         if len(reasoning_log) > self.last_log_index:
             new_entries = reasoning_log[self.last_log_index:]
-            for entry in new_entries:
+            # Only the very first batch this connection ever sees is a
+            # "snapshot replay" (last_log_index still at its initial 0);
+            # everything after that is an incremental live delta and must
+            # never be capped.
+            is_initial_snapshot = self.last_log_index == 0
+            frames_to_send = new_entries
+            if is_initial_snapshot and len(new_entries) > SNAPSHOT_MAX_REASONING:
+                omitted = len(new_entries) - SNAPSHOT_MAX_REASONING
+                frames_to_send = [
+                    f"... (이전 {omitted}줄 생략)",
+                    *new_entries[-SNAPSHOT_MAX_REASONING:],
+                ]
+
+            for i, entry in enumerate(frames_to_send, start=1):
                 await websocket.send_json({
                     "type": "reasoning",
                     "data": entry,
                     "session_id": session_id,
                 })
+                # Yield every frame so the event loop stays responsive and the
+                # proxy can flush; a longer breather every N frames caps the
+                # burst rate for long snapshot replays.
+                await asyncio.sleep(0)
+                if i % SNAPSHOT_PACE_SLEEP_EVERY == 0:
+                    await asyncio.sleep(SNAPSHOT_PACE_SLEEP_SECONDS)
+
             logger.debug(
                 "websocket_reasoning_sent",
                 session_id=session_id,
                 count=len(new_entries),
+                sent=len(frames_to_send),
+                truncated=frames_to_send is not new_entries,
             )
+            # Cursor tracks the true log length, not the capped send count —
+            # this is what keeps live streaming gap/dup-free after a capped
+            # snapshot: the next emit() only looks at entries appended past
+            # the REAL length, never re-sending anything already truncated.
             self.last_log_index = len(reasoning_log)
 
         # Extract stage value from enum or string
