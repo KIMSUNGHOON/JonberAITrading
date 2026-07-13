@@ -586,6 +586,35 @@ class ExecutionCoordinator:
                 },
             )
             self._complete_agent_task("order", success=True)
+
+            # P1-1 gap (PART 2, 2026-07-13): `_execute_order` only records BUY
+            # fills — its SELL branch defers to `_apply_sell_fill`, the choke
+            # point every OTHER SELL caller (RiskMonitor triggers,
+            # _execute_order_from_monitor) invokes right after. This
+            # on_trade_approved path (agent-chat direct decisions + queue
+            # replays) never calls `_apply_sell_fill`, so its SELL/REDUCE
+            # fills recorded nothing. Record them here with the same
+            # fire-and-forget helper, gated by `_persistence_active` like
+            # every other call site — and only for SELL, so a BUY approval
+            # (already recorded inside `_execute_order` above) is never
+            # double-counted.
+            if self._persistence_active and side == OrderSide.SELL:
+                record_trade_fill(
+                    stk_cd=ticker,
+                    stk_nm=stock_name,
+                    side="sell",
+                    order_type=getattr(order.order_type, "value", order.order_type),
+                    price=result.avg_price or entry_price or 0,
+                    quantity=result.requested_quantity,
+                    executed_quantity=result.filled_quantity,
+                    status=(
+                        "completed"
+                        if result.filled_quantity >= result.requested_quantity
+                        else "partial"
+                    ),
+                    order_id=result.order_id,
+                    session_id=session_id,
+                )
         else:
             self._log_activity(
                 ActivityType.ORDER_FAILED,
