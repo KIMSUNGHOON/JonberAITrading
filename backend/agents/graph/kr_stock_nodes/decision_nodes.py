@@ -310,9 +310,12 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
             # Build analysis summary
             analysis_summary = f"컨센서스: {consensus_signal.value} (신뢰도: {avg_confidence:.0%})"
 
-            # Add to watch list
+            # Add to watch list. `or`-fallback: the session_id KEY exists with
+            # value None when the route forgot to thread it (the dict.get
+            # default only covers a missing key) — None here failed WatchedStock
+            # validation and silently dropped every WATCH from the watch list.
             watched = coordinator.add_to_watch_list(
-                session_id=state.get("session_id", str(uuid.uuid4())),
+                session_id=state.get("session_id") or str(uuid.uuid4()),
                 ticker=stk_cd,
                 stock_name=stk_nm,
                 signal=consensus_signal.value,

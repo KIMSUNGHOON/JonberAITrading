@@ -169,11 +169,14 @@ async def run_kr_stock_analysis_task(session_id: str):
         # Get the trading graph
         graph = get_kr_stock_trading_graph()
 
-        # Create initial state
+        # Create initial state. session_id must be threaded into the graph
+        # state — nodes read it (e.g. the WATCH branch stamps it on the
+        # watch-list entry); leaving it None silently broke those consumers.
         initial_state = create_kr_stock_initial_state(
             stk_cd=stk_cd,
             stk_nm=stk_nm,
             user_query=session["state"].get("query"),
+            session_id=session_id,
         )
 
         config = {"configurable": {"thread_id": session_id}}
