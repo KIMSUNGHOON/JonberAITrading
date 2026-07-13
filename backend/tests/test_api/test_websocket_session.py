@@ -376,6 +376,43 @@ async def test_status_frame_carries_auto_approve_at_when_present(sm):
     assert "auto_approve_at" not in [f for f in ws2.sent if f["type"] == "status"][0]["data"]
 
 
+async def test_running_status_does_not_advertise_stale_proposal(sm):
+    """P0-3 (F4a t2): a restart-stranded session whose legacy status is still
+    "running" but whose state dict retained a stale awaiting_approval=True +
+    trade_proposal (e.g. the process died mid-approval) must NOT re-advertise
+    that proposal to a reconnecting tab. Only status == "awaiting_approval"
+    may emit a proposal frame."""
+    ws = FakeWebSocket()
+    cursor = ws_module._SessionFrameCursor("stale-1")
+    session = {
+        "session_id": "stale-1",
+        "status": "running",
+        "error": None,
+        "state": {
+            "reasoning_log": [],
+            "current_stage": "approval",
+            "awaiting_approval": True,
+            "trade_proposal": {
+                "id": "p1",
+                "stk_cd": "005930",
+                "stk_nm": "삼성전자",
+                "action": "BUY",
+                "quantity": 10,
+                "entry_price": 70000,
+                "risk_score": 0.4,
+                "rationale": "테스트",
+            },
+        },
+    }
+
+    await cursor.emit(ws, session)
+
+    assert not [f for f in ws.sent if f["type"] == "proposal"], (
+        "status=running must not emit a proposal frame even when state still "
+        "carries a stale awaiting_approval=True + trade_proposal"
+    )
+
+
 async def test_countdown_arrival_triggers_a_status_frame(sm):
     """SAFETY-UX (review fix): the injector writes auto_approve_at AFTER the
     awaiting_approval transition — an already-connected client must still get

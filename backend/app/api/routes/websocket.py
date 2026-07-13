@@ -641,7 +641,19 @@ class _SessionFrameCursor:
 
         # Send trade proposal when available (once)
         # proposal is now a dict after serialization fix
-        if state.get("trade_proposal") and state.get("awaiting_approval") and not self.proposal_sent:
+        #
+        # Gated on current_status too (not just state.awaiting_approval): a
+        # restart-stranded session can be reconciled back to a terminal/
+        # running legacy status while its state dict still carries a stale
+        # awaiting_approval=True + trade_proposal from before the crash. A
+        # reconnecting tab must not be told to approve a proposal that is no
+        # longer actually pending.
+        if (
+            state.get("trade_proposal")
+            and state.get("awaiting_approval")
+            and not self.proposal_sent
+            and current_status == "awaiting_approval"
+        ):
             proposal = state["trade_proposal"]
             action = proposal.get("action", "HOLD")
             if hasattr(action, "value"):
