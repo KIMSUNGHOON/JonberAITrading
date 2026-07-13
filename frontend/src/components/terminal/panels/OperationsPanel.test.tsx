@@ -147,6 +147,24 @@ it('거부 액션 실패 시 오류를 표시하고 컬럼은 계속 렌더한�
   expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument();
 });
 
+it('승인대기 항목의 취소 버튼이 cancelled decision으로 submitApproval을 호출하고 재조회한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    awaiting: [{ session_id: 's5', ticker: '000660', name: 'SK하이닉스',
+                 proposal: { action: 'WATCH', entry_price: 1968000,
+                             stop_loss: 1810560, take_profit: 2125440,
+                             risk_score: 0.7 },
+                 auto_approve_at: null }],
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: '취소' }));
+  await waitFor(() =>
+    expect(submitApproval).toHaveBeenCalledWith(
+      expect.objectContaining({ session_id: 's5', decision: 'cancelled' })));
+  expect(getOperations.mock.calls.length).toBeGreaterThanOrEqual(2); // 액션 후 재조회
+});
+
 it('미체결 취소 버튼이 cancelKRStockOrder를 호출하고 재조회한다', async () => {
   getOperations.mockResolvedValue({
     ...BASE,

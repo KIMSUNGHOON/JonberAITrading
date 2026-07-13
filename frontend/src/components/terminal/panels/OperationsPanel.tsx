@@ -157,7 +157,7 @@ function AwaitingColumn({
   errors: Record<string, string>;
   activeMarket: 'kiwoom' | 'coin';
   submitting: string | null;
-  onDecide: (sessionId: string, decision: 'approved' | 'rejected') => void;
+  onDecide: (sessionId: string, decision: 'approved' | 'rejected' | 'cancelled') => void;
 }) {
   if (!columnVisible(items, 'sessions', errors)) return null;
   return (
@@ -183,6 +183,7 @@ function AwaitingColumn({
                 type="button"
                 disabled={isSubmitting}
                 onClick={() => onDecide(a.session_id, 'approved')}
+                title="제안을 승인합니다 (WATCH는 워치리스트 등록)"
                 className="text-up font-medium disabled:opacity-50"
               >
                 승인
@@ -191,9 +192,19 @@ function AwaitingColumn({
                 type="button"
                 disabled={isSubmitting}
                 onClick={() => onDecide(a.session_id, 'rejected')}
+                title="거부하고 재분석을 요청합니다 — 잠시 후 새 제안이 돌아옵니다"
                 className="text-warn font-medium disabled:opacity-50"
               >
                 거부
+              </button>
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={() => onDecide(a.session_id, 'cancelled')}
+                title="재분석 없이 세션을 종료합니다"
+                className="text-dim hover:text-down font-medium disabled:opacity-50"
+              >
+                취소
               </button>
             </div>
           </div>
@@ -417,13 +428,13 @@ export function OperationsPanel() {
     }
   }, [refetch]);
 
-  const handleDecide = useCallback(async (sessionId: string, decision: 'approved' | 'rejected') => {
+  const handleDecide = useCallback(async (sessionId: string, decision: 'approved' | 'rejected' | 'cancelled') => {
     setSubmittingSession(sessionId);
     try {
       await submitApproval({ session_id: sessionId, decision });
       setActionError(null);
     } catch (e) {
-      const label = decision === 'approved' ? '승인' : '거부';
+      const label = decision === 'approved' ? '승인' : decision === 'rejected' ? '거부' : '취소';
       setActionError(`${label} 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
     } finally {
       setSubmittingSession(null);
