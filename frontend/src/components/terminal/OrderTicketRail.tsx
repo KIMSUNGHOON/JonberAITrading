@@ -130,7 +130,9 @@ export function OrderTicketRail() {
         </div>
       )}
       {active && risk && (
-        <div className="flex-1 flex flex-col min-h-0 gap-2 p-2.5 text-[12px]">
+        // key: a session/proposal switch between two awaiting tickets remounts
+        // the subtree, resetting native <details> open state + scroll position.
+        <div key={sessionId ?? proposal!.id} className="flex-1 flex flex-col min-h-0 gap-2 p-2.5 text-[12px]">
           {isMarketClosed && (
             <div className="flex-none rounded border border-hairline bg-elevated p-2 text-[11px]">
               <div className="text-warn font-medium">현재 장이 마감되어 있습니다</div>
