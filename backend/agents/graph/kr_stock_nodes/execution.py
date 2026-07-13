@@ -257,6 +257,36 @@ async def kr_stock_execution_node(state: dict) -> dict:
         )
         order_response = result.raw  # native OrderResponse — ord_no/return_code used below
 
+        # A broker REJECTION is not an exception — KiwoomExecutionAdapter.place
+        # returns success=False (return_code != 0, ord_no likely empty) WITHOUT
+        # raising. Branch on it BEFORE fill confirmation: a rejected order has
+        # no fill to confirm and must never register a phantom TrackedOrder
+        # (an "" ord_no would be polled against real ka10076 every tick and
+        # expire at market close as '미체결 만료' for an order the broker
+        # refused). Same failure vocabulary as the node's other failure paths.
+        if not result.success:
+            error_msg = order_response.return_msg or "Order rejected by broker"
+            logger.error(
+                "kr_stock_order_rejected",
+                stk_cd=stk_cd,
+                action=action.value,
+                return_code=order_response.return_code,
+                error=error_msg,
+            )
+            reasoning = f"[실행] {action_korean} 주문 거부: {error_msg}"
+            return {
+                "execution_status": "failed",
+                "error": error_msg,
+                "order_response": {
+                    "ord_no": order_response.ord_no,
+                    "return_code": order_response.return_code,
+                    "return_msg": order_response.return_msg,
+                },
+                "current_stage": KRStockAnalysisStage.COMPLETE,
+                "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
+                "messages": [AIMessage(content=reasoning)],
+            }
+
         logger.info(
             "kr_stock_order_placed",
             stk_cd=stk_cd,
@@ -367,6 +397,15 @@ async def kr_stock_execution_node(state: dict) -> dict:
 
                 coordinator = await get_trading_coordinator()
 
+                # Proposal risk_score is float 0-1 (KRStockTradeProposal);
+                # the coordinator layer (TrackedOrder / ManagedPosition) uses
+                # int 1-10 — convert with the file's existing convention
+                # (decision_nodes.py:330, int(proposal.risk_score * 10)).
+                proposal_risk = proposal.get("risk_score")
+                risk_score_int = (
+                    int(float(proposal_risk) * 10) if proposal_risk is not None else None
+                )
+
                 if filled_qty > 0:
                     await register_fill_as_position(
                         coordinator,
@@ -378,6 +417,10 @@ async def kr_stock_execution_node(state: dict) -> dict:
                         take_profit=proposal.get("take_profit"),
                         session_id=state.get("session_id"),
                         source="kr_graph_execution",
+                        # Parity with the poll path (coordinator.py:1560-1561):
+                        # stop_loss_mode from risk params, risk from the proposal.
+                        stop_loss_mode=coordinator.risk_params.stop_loss_mode,
+                        risk_score=risk_score_int,
                     )
 
                 if remaining_qty > 0:
@@ -394,9 +437,15 @@ async def kr_stock_execution_node(state: dict) -> dict:
                             stop_loss=proposal.get("stop_loss"),
                             take_profit=proposal.get("take_profit"),
                             source_session_id=state.get("session_id"),
+                            risk_score=risk_score_int,
                             trade_date=date.today().strftime("%Y%m%d"),
                         )
                     )
+                    # A memory-only TrackedOrder dies with the process — the
+                    # exact incident class this arc closes. Schedule the
+                    # coordinator's blob persistence (R5-P1 mechanism) so the
+                    # tracked remainder survives a restart.
+                    coordinator._schedule_persist()
             except Exception as coord_err:
                 logger.warning(
                     "kr_stock_fill_registration_failed",

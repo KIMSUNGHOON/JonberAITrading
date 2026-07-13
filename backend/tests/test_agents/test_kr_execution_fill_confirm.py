@@ -21,6 +21,7 @@ import pytest
 
 from agents.graph.kr_stock_nodes.execution import kr_stock_execution_node
 from services.kiwoom.models import FilledOrder, OrderResponse
+from services.trading.models import StopLossMode
 from services.trading.pending_order_tracker import TrackedOrder
 
 pytestmark = pytest.mark.asyncio
@@ -34,22 +35,39 @@ class _FakeKiwoomClient:
     """Minimal Kiwoom client: places an order, reports fills from a fixed
     ka10076 snapshot (or raises, to simulate a query failure)."""
 
-    def __init__(self, filled_orders=None, raise_on_query=False, ord_no="ORD1"):
+    def __init__(
+        self,
+        filled_orders=None,
+        raise_on_query=False,
+        ord_no="ORD1",
+        reject_placement=False,
+    ):
         self._filled_orders = filled_orders if filled_orders is not None else []
         self._raise_on_query = raise_on_query
         self._ord_no = ord_no
+        self._reject_placement = reject_placement
         self.buy_calls = []
         self.sell_calls = []
+        self.fill_query_calls = 0
+
+    def _order_response(self):
+        if self._reject_placement:
+            # Real broker-rejection shape: return_code != 0, empty ord_no.
+            # KiwoomExecutionAdapter.place does NOT raise on this — it returns
+            # ExecutionResult(success=False); the node must branch on it.
+            return OrderResponse(ord_no="", return_code=1, return_msg="주문 거부: 증거금 부족")
+        return OrderResponse(ord_no=self._ord_no, return_code=0, return_msg="정상")
 
     async def place_buy_order(self, stk_cd, qty, price=None, order_type=None):
         self.buy_calls.append((stk_cd, qty, price))
-        return OrderResponse(ord_no=self._ord_no, return_code=0, return_msg="정상")
+        return self._order_response()
 
     async def place_sell_order(self, stk_cd, qty, price=None, order_type=None):
         self.sell_calls.append((stk_cd, qty, price))
-        return OrderResponse(ord_no=self._ord_no, return_code=0, return_msg="정상")
+        return self._order_response()
 
     async def get_filled_orders(self, sell_tp="0", stex_tp="0", stk_cd=None, use_cache=True):
+        self.fill_query_calls += 1
         if self._raise_on_query:
             raise RuntimeError("ka10076 query boom")
         return list(self._filled_orders)
@@ -80,6 +98,10 @@ def _state(action="BUY", quantity=10, entry_price=70000, existing_position=None,
             "quantity": quantity,
             "stop_loss": 66500,
             "take_profit": 77000,
+            # KRStockTradeProposal scale: float 0-1. The coordinator layer
+            # (TrackedOrder / ManagedPosition) uses int 1-10; the node converts
+            # via int(x * 10), the same convention as decision_nodes.py:330.
+            "risk_score": 0.6,
         },
         "existing_position": existing_position,
         "reasoning_log": [],
@@ -93,6 +115,9 @@ def _mock_coordinator():
     coordinator = MagicMock()
     coordinator.fill_tracker = MagicMock()
     coordinator.fill_tracker.register = MagicMock()
+    coordinator._schedule_persist = MagicMock()
+    coordinator.risk_params = MagicMock()
+    coordinator.risk_params.stop_loss_mode = StopLossMode.AGENT_AUTO
     return coordinator
 
 
@@ -105,6 +130,33 @@ def _patches(client, coordinator):
         patch("app.dependencies.get_trading_coordinator", AsyncMock(return_value=coordinator)),
         patch("services.trading.position_registration.register_fill_as_position", new_callable=AsyncMock),
     )
+
+
+# ---------------------------------------------------------------------------
+# Broker rejection — adapter returns success=False WITHOUT raising
+# ---------------------------------------------------------------------------
+
+async def test_broker_rejection_fails_without_phantom_tracking(monkeypatch):
+    """A broker-rejected placement (return_code != 0, empty ord_no) must take
+    the node's existing failure path: execution_status "failed", NO fill
+    confirmation poll, NO TrackedOrder (a phantom "" ord_no would be polled
+    against real ka10076 and expire at close as '미체결 만료' for an order the
+    broker refused), NO position, NO registration."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeKiwoomClient(reject_placement=True)
+    coordinator = _mock_coordinator()
+    p1, p2, p3 = _patches(client, coordinator)
+    with p1, p2, p3 as mock_register:
+        result = await kr_stock_execution_node(_state())
+
+    assert result["execution_status"] == "failed"
+    assert "error" in result
+    assert result.get("active_position") is None
+    # Rejection short-circuits BEFORE fill confirmation — no ka10076 calls.
+    assert client.fill_query_calls == 0
+    mock_register.assert_not_awaited()
+    coordinator.fill_tracker.register.assert_not_called()
+    coordinator._schedule_persist.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +178,13 @@ async def test_full_fill_registers_position_and_completes(monkeypatch):
     assert kwargs["ticker"] == "005930"
     assert kwargs["quantity"] == 10
     assert kwargs["session_id"] == "sess-1"
-    # Nothing left unfilled — no remainder tracked.
+    # Parity with coordinator.py:1560-1561 (_poll_tracked_fills): position
+    # registers with the coordinator's stop_loss_mode + the proposal's risk.
+    assert kwargs["stop_loss_mode"] == StopLossMode.AGENT_AUTO
+    assert kwargs["risk_score"] == 6  # int(0.6 * 10)
+    # Nothing left unfilled — no remainder tracked, nothing new to persist.
     coordinator.fill_tracker.register.assert_not_called()
+    coordinator._schedule_persist.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +214,10 @@ async def test_zero_fill_tracks_remainder_no_ghost_position(monkeypatch):
     assert tracked.take_profit == 77000
     assert tracked.source_session_id == "sess-1"
     assert tracked.trade_date == date.today().strftime("%Y%m%d")
+    assert tracked.risk_score == 6  # threaded from the proposal (0.6 -> 6)
+    # A memory-only TrackedOrder dies with the process — registration must
+    # schedule the coordinator's blob persistence (the R5-P1 mechanism).
+    coordinator._schedule_persist.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +240,7 @@ async def test_partial_fill_registers_confirmed_qty_and_tracks_remainder(monkeyp
     tracked = coordinator.fill_tracker.register.call_args.args[0]
     assert tracked.filled_quantity == 4
     assert tracked.total_quantity == 10
+    coordinator._schedule_persist.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
