@@ -21,6 +21,7 @@ the restart load filter) must NOT be adoptable, or an approve would resume a
 proposal the user already vetoed.
 """
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -450,3 +451,136 @@ async def test_unsupported_market_type_fails_closed_404(wired):
     assert exc_info.value.status_code == 404
     assert session_id not in wired["kr_stock_sessions"]
     assert session_id not in wired["coin_sessions"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cancel_during_slow_reject_is_serialized(wired, monkeypatch):
+    """A cancel fired mid-flight during a slow reject must NOT interleave.
+
+    RACE (pre-fix): state["awaiting_approval"] clears at submit_decision START
+    but the SM status mirror only flips at the END. During a long
+    reject-triggered re-analysis the session still lists as awaiting on the
+    operations board, so a second decision (e.g. 취소 from a reloaded tab)
+    used to run concurrently: it took the zombie-cancel branch, returned 200
+    "cancelled" and mirrored CANCELLED — then the ORIGINAL in-flight reject
+    finished and unconditionally mirrored "running", silently overwriting the
+    user's cancel (mirror order: cancelled -> running).
+
+    Serialized semantics (post-fix, asserted here): the cancel WAITS on the
+    per-session lock until the reject completes. The reject's resume leaves
+    awaiting_approval=False with no new proposal -> it mirrors "running";
+    the cancel then observes the settled state, takes the zombie-cancel
+    branch, and mirrors CANCELLED LAST (mirror order: running -> cancelled).
+    The user's cancel is the final word.
+    """
+    session_id = "concurrent-reject-cancel-1"
+    wired["set_sm_session"](_sm_session(session_id))
+
+    resume_started = asyncio.Event()
+    resume_gate = asyncio.Event()
+
+    class _SlowGraph:
+        """Resume blocks on resume_gate so the reject holds the lock mid-flight."""
+
+        def __init__(self):
+            self.aupdate_state = AsyncMock()
+
+        def astream(self, _input, _config):
+            async def gen():
+                resume_started.set()
+                await resume_gate.wait()
+                yield {"finalize": {"awaiting_approval": False}}
+
+            return gen()
+
+    graph = _SlowGraph()
+    wired["set_graph"](graph)
+
+    mirrored_statuses = []
+
+    async def capture_mirror_status(sid, st, error=None):
+        mirrored_statuses.append(st)
+
+    monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+
+    reject_task = asyncio.create_task(
+        approval_module.submit_decision(session_id, "rejected", feedback="retry")
+    )
+    # Deterministic: wait until the reject is INSIDE its resume (holding the
+    # per-session lock, blocked on the gate).
+    await asyncio.wait_for(resume_started.wait(), timeout=5)
+
+    cancel_task = asyncio.create_task(
+        approval_module.submit_decision(session_id, "cancelled")
+    )
+    # Give the cancel ample scheduler turns: with the lock it must be BLOCKED
+    # (pre-fix it completed right here, mid-reject, and returned 200).
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not cancel_task.done(), (
+        "cancel ran concurrently with the in-flight reject (per-session lock missing)"
+    )
+    assert mirrored_statuses == []  # nothing mirrored while the reject is in flight
+
+    resume_gate.set()
+    reject_result = await reject_task
+    cancel_result = await cancel_task
+
+    # Serialized outcome: reject settled first ("running" — re-analysis ran to
+    # end, no new proposal), THEN the cancel landed as the final word.
+    assert reject_result.decision == "rejected"
+    assert reject_result.status == "running"
+    assert cancel_result.decision == "cancelled"
+    assert cancel_result.status == "cancelled"
+    assert cancel_result.execution_status == "cancelled"
+
+    # THE defect assertion: the final SM mirror is the cancel — never a
+    # "running" overwrite landing after a "cancelled".
+    # (SessionStatus is a str-Enum, so members compare equal to raw strings.)
+    assert mirrored_statuses == ["running", SessionStatus.CANCELLED]
+
+    # Session ends terminally cancelled; only the reject resumed the graph.
+    assert wired["kr_stock_sessions"][session_id]["status"] == "cancelled"
+    assert wired["kr_stock_sessions"][session_id]["state"]["approval_status"] == "cancelled"
+    graph.aupdate_state.assert_awaited_once()
+
+    # Lock bookkeeping fully pruned (bounded by in-flight sessions).
+    assert approval_module._decision_locks == {}
+    assert approval_module._decision_lock_refs == {}
+
+
+@pytest.mark.asyncio
+async def test_completion_preserves_cancel_marked_during_resume(wired, monkeypatch):
+    """approval_status flipped to "cancelled" DURING the resume -> preserved.
+
+    Belt-and-braces on top of the lock: the lock serializes decisions within
+    this process, but the state dict is shared by reference (sm row, position
+    manager, another worker) — if approval_status mutates to "cancelled"
+    underneath the resume, the completion branch must NOT overwrite it with
+    running/completed. Here the mutation is delivered in-band via a resume
+    event (state.update(node_output)), same effect as a direct mutation.
+    """
+    session_id = "resume-mutated-cancel-1"
+    wired["set_sm_session"](_sm_session(session_id))
+    graph = _FakeGraph(
+        [{"re_analyze": {"approval_status": "cancelled", "awaiting_approval": False}}]
+    )
+    wired["set_graph"](graph)
+
+    mirrored_statuses = []
+
+    async def capture_mirror_status(sid, st, error=None):
+        mirrored_statuses.append(st)
+
+    monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+
+    result = await approval_module.submit_decision(session_id, "rejected", feedback="x")
+
+    # Pre-fix: new_proposal_awaiting=False -> else-branch unconditionally set
+    # "running" and mirrored it, orphaning the concurrent cancel.
+    assert result.status == "cancelled"
+    assert result.execution_status == "cancelled"
+    assert wired["kr_stock_sessions"][session_id]["status"] == "cancelled"
+    assert mirrored_statuses == ["cancelled"]
+    # And the cancel-preserving path must never rearm the autonomy injector.
+    assert wired["reschedule_calls"] == []

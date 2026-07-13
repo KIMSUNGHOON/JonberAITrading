@@ -4,6 +4,8 @@ HITL Approval API Routes
 Endpoints for human-in-the-loop trade approval workflow.
 """
 
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 import structlog
@@ -45,6 +47,42 @@ router = APIRouter()
 # Approval Endpoints
 # -------------------------------------------
 
+# Per-session decision serialization. submit_decision clears
+# state["awaiting_approval"] at its START but only mirrors the final SM status
+# at its END — during a long resume (e.g. a reject-triggered re-analysis) the
+# session still lists as awaiting on the operations board (which reads the SM
+# status), so a second decision could arrive mid-flight (e.g. a cancel from a
+# reloaded tab; the FE double-submit guard is client-local). Un-serialized,
+# that cancel returned 200 "cancelled" via the zombie-cancel branch, and the
+# ORIGINAL in-flight call then finished and overwrote the SM mirror with
+# "running"/"completed" — silently orphaning the cancel (or executing a trade
+# the user was told was cancelled). The lock makes the second caller wait and
+# observe the true post-resume state. Lock entries are refcount-pruned on
+# release so the dict stays bounded by in-flight sessions, not total sessions.
+_decision_locks: dict[str, asyncio.Lock] = {}
+_decision_lock_refs: dict[str, int] = {}
+
+
+@asynccontextmanager
+async def _session_decision_lock(session_id: str):
+    lock = _decision_locks.setdefault(session_id, asyncio.Lock())
+    _decision_lock_refs[session_id] = _decision_lock_refs.get(session_id, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        # Safe prune: refcount covers holders AND waiters — it only reaches 0
+        # when nobody else holds a reference to this lock, so popping it can
+        # never strand a waiter on a discarded lock (a later caller simply
+        # creates a fresh one). No await between release and this decrement,
+        # so no interleaving window.
+        remaining = _decision_lock_refs[session_id] - 1
+        if remaining:
+            _decision_lock_refs[session_id] = remaining
+        else:
+            del _decision_lock_refs[session_id]
+            _decision_locks.pop(session_id, None)
+
 
 async def submit_decision(
     session_id: str,
@@ -60,7 +98,25 @@ async def submit_decision(
     Extracted from the /decide route (R3) so the autonomy injector can submit
     decisions programmatically with actor='system'. Raises the same
     HTTPExceptions as the route; the route is a thin wrapper (actor='user').
+
+    Decisions for the same session are serialized by a per-session lock (see
+    _decision_locks above). The autonomy injector calls this only from a
+    detached asyncio task after its grace sleep — never from within this call
+    chain — so the lock cannot deadlock.
     """
+    async with _session_decision_lock(session_id):
+        return await _submit_decision_locked(
+            session_id, decision, feedback, modifications, actor
+        )
+
+
+async def _submit_decision_locked(
+    session_id: str,
+    decision: str,
+    feedback: str | None = None,
+    modifications: dict | None = None,
+    actor: str = "user",
+):
     # Search all session types: coin and Korean stock
     coin_sessions = get_coin_sessions()
     kr_stock_sessions = get_kr_stock_sessions()
@@ -306,6 +362,20 @@ async def submit_decision(
             # modified
             session["status"] = "completed"
             execution_status = state.get("execution_status", "completed")
+
+        # Belt-and-braces on top of the per-session lock (which serializes
+        # decisions within this process): if approval_status was flipped to
+        # "cancelled" underneath the resume (direct state mutation from another
+        # worker sharing this state dict), preserve the cancel instead of
+        # overwriting the final status with running/completed.
+        if decision != "cancelled" and state.get("approval_status") == "cancelled":
+            logger.warning(
+                "approval_final_status_preserves_concurrent_cancel",
+                session_id=session_id,
+                decision=decision,
+            )
+            session["status"] = "cancelled"
+            execution_status = "cancelled"
 
         # Mirror the final status to the SessionManager (completed/running/cancelled)
         await mirror_session_status(session_id, session["status"])
