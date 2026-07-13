@@ -3,8 +3,9 @@
 Both autonomy engines (the analysis-pipeline auto-approve injector and the
 ChatCoordinator execution path) must pass check_autonomy. Chain order:
 master gate → market mode → paper-only (hardcoded) → daily-loss breaker →
-max positions (BUY/ADD only) → notional cap (BUY/ADD only). Any provider
-exception denies (fail-closed).
+coordinator-active (BUY/ADD, kiwoom only, F4b I6) → max positions (BUY/ADD
+only, F4b I2 counts F3 pending-fill BUYs too) → notional cap (BUY/ADD only).
+Any provider exception denies (fail-closed).
 """
 
 import pytest
@@ -18,6 +19,7 @@ def _providers(
     paper=True,
     daily_loss_pct=0.0,
     positions=0,
+    coordinator_active=True,
 ):
     async def mode_provider(market):
         return mode
@@ -31,11 +33,15 @@ def _providers(
     async def positions_count_provider(market):
         return positions
 
+    async def coordinator_active_provider(market):
+        return coordinator_active
+
     return dict(
         mode_provider=mode_provider,
         paper_provider=paper_provider,
         daily_loss_provider=daily_loss_provider,
         positions_count_provider=positions_count_provider,
+        coordinator_active_provider=coordinator_active_provider,
     )
 
 
@@ -108,6 +114,133 @@ async def test_max_positions_denies_buy(master_on):
     assert decision.check == "max_positions"
 
 
+class TestCoordinatorActiveGate:
+    """F4b I6: an autonomous BUY/ADD must deny when the trading coordinator
+    isn't active — otherwise the F3 post-fill tail (fill-tracker poll /
+    reconciler / stop-loss registration) never runs and the new exposure
+    goes unwatched. Scoped to kiwoom + BUY/ADD only; HITL never calls
+    check_autonomy at all (see TestCoordinatorCheckNeverBlocksHitl below), so
+    this link can't touch a manual approval regardless of scoping.
+    """
+
+    # NOTE: these call check_autonomy directly (not the _check() helper) so
+    # popping "coordinator_active_provider" actually exercises the REAL
+    # default provider — _check() rebuilds its own full _providers() default
+    # set internally and only ever *updates* it with overrides, so a popped
+    # key would silently keep _check()'s own default instead of falling
+    # through to check_autonomy's real one.
+
+    async def test_denies_when_coordinator_is_none(self, master_on, monkeypatch):
+        import app.dependencies as deps
+
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", None)
+        providers = _providers()
+        providers.pop("coordinator_active_provider")  # exercise the REAL default
+        decision = await check_autonomy(
+            "kiwoom", action="BUY", quantity=10, entry_price=50_000, **providers
+        )
+        assert not decision.allowed
+        assert decision.check == "coordinator_active"
+        assert "미기동" in decision.reason
+
+    async def test_denies_when_coordinator_is_inactive(self, master_on, monkeypatch):
+        import app.dependencies as deps
+
+        class FakeCoordinator:
+            is_active = False
+
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", FakeCoordinator())
+        providers = _providers()
+        providers.pop("coordinator_active_provider")
+        decision = await check_autonomy(
+            "kiwoom", action="BUY", quantity=10, entry_price=50_000, **providers
+        )
+        assert not decision.allowed
+        assert decision.check == "coordinator_active"
+        assert "미기동" in decision.reason
+
+    async def test_allows_when_coordinator_is_active(self, master_on, monkeypatch):
+        import app.dependencies as deps
+
+        class FakeCoordinator:
+            is_active = True
+
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", FakeCoordinator())
+        providers = _providers()
+        providers.pop("coordinator_active_provider")
+        decision = await check_autonomy(
+            "kiwoom", action="BUY", quantity=10, entry_price=50_000, **providers
+        )
+        assert decision == GateDecision(allowed=True, reason="ok", check="all")
+
+    @pytest.mark.parametrize("action", ["SELL", "REDUCE", "HOLD", "WATCH"])
+    async def test_skipped_for_non_increasing_actions(self, master_on, monkeypatch, action):
+        """Scoped like caps 6/7 — SELL/REDUCE/HOLD/WATCH must not deny even
+        with no coordinator at all."""
+        import app.dependencies as deps
+
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", None)
+        providers = _providers()
+        providers.pop("coordinator_active_provider")
+        decision = await check_autonomy(
+            "kiwoom", action=action, quantity=None, entry_price=None, **providers
+        )
+        assert decision.allowed
+
+    async def test_scoped_to_kiwoom_only(self, master_on, monkeypatch):
+        """coin has no equivalent coordinator/fill-tracker — a coin BUY must
+        not be denied by this link even with the real (None) coordinator."""
+        import app.dependencies as deps
+
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", None)
+        providers = _providers()
+        providers.pop("coordinator_active_provider")
+        decision = await check_autonomy(
+            "coin", action="BUY", quantity=1, entry_price=1_000, **providers
+        )
+        assert decision.check != "coordinator_active"
+
+
+class TestCoordinatorCheckNeverBlocksHitl:
+    """F4b I6 scoping guarantee: check_autonomy is the SINGLE policy point
+    for AUTONOMOUS execution only (module docstring). A human's manual
+    decision goes through `approval.submit_decision`
+    (actor='user') — including the injector's own actor='system' call INTO
+    it after its own gate re-check — and that function never calls
+    check_autonomy itself. So the coordinator-active link added inside
+    check_autonomy cannot gate a manual HITL approval: that code path
+    doesn't run through this module at all.
+    """
+
+    def test_submit_decision_never_calls_check_autonomy(self):
+        import inspect
+
+        from app.api.routes import approval
+
+        src = inspect.getsource(approval.submit_decision) + inspect.getsource(
+            approval._submit_decision_locked
+        )
+        assert "check_autonomy" not in src
+
+    async def test_hitl_mode_denied_before_coordinator_check_is_ever_reached(
+        self, master_on, monkeypatch
+    ):
+        """Belt-and-braces: even if check_autonomy were ever invoked for a
+        non-autonomous mode, market_mode (check 2) fails first — the new
+        coordinator link (check 5) is unreachable for it, so it can never be
+        the reason a hitl-mode request is denied."""
+        import app.dependencies as deps
+
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", None)
+        providers = _providers(mode="hitl")
+        providers.pop("coordinator_active_provider")  # exercise the REAL default
+        decision = await check_autonomy(
+            "kiwoom", action="BUY", quantity=10, entry_price=50_000, **providers
+        )
+        assert not decision.allowed
+        assert decision.check == "market_mode"
+
+
 async def test_notional_cap_denies_buy(master_on):
     decision = await _check(action="BUY", quantity=100, entry_price=50_000)  # ₩5M > ₩1M
     assert not decision.allowed
@@ -123,7 +256,7 @@ async def test_buy_with_unknown_notional_is_denied(master_on):
 
 @pytest.mark.parametrize("action", ["SELL", "REDUCE", "HOLD", "WATCH"])
 async def test_non_increasing_actions_skip_position_and_notional_checks(master_on, action):
-    """SELL/REDUCE/HOLD/WATCH don't grow exposure — caps 5/6 don't apply."""
+    """SELL/REDUCE/HOLD/WATCH don't grow exposure — caps 6/7 don't apply."""
     decision = await _check(
         action=action, quantity=None, entry_price=None, **_providers(positions=99)
     )
@@ -297,3 +430,136 @@ class TestDefaultDailyLossProvider:
         )
         assert decision.allowed is False
         assert decision.check == "daily_loss_breaker"
+
+
+class TestDefaultPositionsCountProvider:
+    """F4b I2: the kiwoom positions-count provider must count F3 pending-fill
+    BUY orders too. The account-balance snapshot it's built on is ~30s
+    cached and blind to a BUY that's been placed but not yet (fully)
+    filled — a burst of autonomous BUYs could blow past max_open_positions
+    before the cache catches up. Union in tickers the coordinator's fill
+    tracker is still watching for a BUY fill.
+    """
+
+    def _mock_holdings(self, monkeypatch, tickers):
+        from unittest.mock import AsyncMock
+
+        from services.kiwoom.models import AccountBalance, Holding
+
+        client = AsyncMock()
+        client.get_account_balance.return_value = AccountBalance(
+            holdings=[
+                Holding(
+                    stk_cd=t, stk_nm=t, hldg_qty=10, avg_buy_prc=50_000,
+                    cur_prc=50_000, evlu_amt=500_000, evlu_pfls_amt=0,
+                    evlu_pfls_rt=0.0,
+                )
+                for t in tickers
+            ]
+        )
+
+        async def fake_get_client():
+            return client
+
+        import app.core.kiwoom_singleton as singleton
+
+        monkeypatch.setattr(singleton, "get_shared_kiwoom_client_async", fake_get_client)
+        return client
+
+    def _coordinator_with_tracker(self, *tracked_orders):
+        from services.trading.pending_order_tracker import PendingOrderTracker
+
+        class FakeCoordinator:
+            pass
+
+        coord = FakeCoordinator()
+        coord.fill_tracker = PendingOrderTracker()
+        for order in tracked_orders:
+            coord.fill_tracker.register(order)
+        return coord
+
+    def _tracked_order(self, ticker, side="buy", ord_no=None):
+        from services.trading.pending_order_tracker import TrackedOrder
+
+        return TrackedOrder(
+            ord_no=ord_no or f"ord-{ticker}-{side}",
+            ticker=ticker,
+            side=side,
+            total_quantity=10,
+        )
+
+    @pytest.mark.asyncio
+    async def test_counts_holdings_plus_pending_buy_ticker(self, monkeypatch):
+        # 보유 2 (005930, 035720) ∪ 미체결 BUY 1 distinct ticker (000660) = 3
+        self._mock_holdings(monkeypatch, ["005930", "035720"])
+
+        import app.dependencies as deps
+
+        coord = self._coordinator_with_tracker(self._tracked_order("000660", side="buy"))
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", coord)
+
+        count = await gate_module._default_positions_count_provider("kiwoom")
+        assert count == 3
+
+    @pytest.mark.asyncio
+    async def test_pending_buy_overlapping_a_holding_is_not_double_counted(self, monkeypatch):
+        self._mock_holdings(monkeypatch, ["005930", "035720"])
+
+        import app.dependencies as deps
+
+        coord = self._coordinator_with_tracker(self._tracked_order("005930", side="buy"))
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", coord)
+
+        count = await gate_module._default_positions_count_provider("kiwoom")
+        assert count == 2
+
+    @pytest.mark.asyncio
+    async def test_pending_sell_is_not_counted(self, monkeypatch):
+        self._mock_holdings(monkeypatch, ["005930"])
+
+        import app.dependencies as deps
+
+        coord = self._coordinator_with_tracker(self._tracked_order("035720", side="sell"))
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", coord)
+
+        count = await gate_module._default_positions_count_provider("kiwoom")
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_coordinator_falls_back_to_holdings_only(self, monkeypatch):
+        self._mock_holdings(monkeypatch, ["005930", "035720"])
+
+        import app.dependencies as deps
+
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", None)
+
+        count = await gate_module._default_positions_count_provider("kiwoom")
+        assert count == 2
+
+    async def test_gate_denies_buy_when_pending_fill_pushes_past_cap(
+        self, master_on, monkeypatch
+    ):
+        """Integration: max_open_positions=3 with 2 held + 1 distinct
+        pending-BUY ticker = 3 >= 3 -> denied. Without the F3-aware union
+        this would read as 2 (comfortably under cap) — exactly the
+        cap-exceeded miss I2 exists to catch."""
+        self._mock_holdings(monkeypatch, ["005930", "035720"])
+
+        import app.dependencies as deps
+
+        coord = self._coordinator_with_tracker(self._tracked_order("000660", side="buy"))
+        coord.is_active = True
+        monkeypatch.setattr(deps, "_trading_coordinator_instance", coord)
+
+        from services.trading.models import RiskParameters
+
+        providers = _providers()
+        providers.pop("positions_count_provider")  # exercise the REAL default
+        providers.pop("coordinator_active_provider")  # exercise the REAL default
+        decision = await check_autonomy(
+            "kiwoom", action="BUY", quantity=1, entry_price=50_000,
+            risk_params_provider=lambda: RiskParameters(max_open_positions=3),
+            **providers,
+        )
+        assert not decision.allowed
+        assert decision.check == "max_positions"

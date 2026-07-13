@@ -7,6 +7,7 @@ ChatCoordinator execution path — both autonomy engines share one policy.
 
 Check chain (first failure denies):
     master_gate → market_mode → paper_only → daily_loss_breaker
+    → coordinator_active (BUY/ADD, kiwoom only)
     → max_positions (BUY/ADD only) → notional_cap (BUY/ADD only)
 
 Design rules:
@@ -154,7 +155,26 @@ async def _default_positions_count_provider(market: str) -> int:
 
         client = await get_shared_kiwoom_client_async()
         balance = await client.get_account_balance()
-        return len(balance.holdings or [])
+        tickers = {h.stk_cd for h in (balance.holdings or [])}
+
+        # F3 (I2): the account-balance snapshot is ~30s cached and blind to a
+        # BUY that has been placed but not (fully) filled yet — a burst of
+        # autonomous BUYs can blow past max_open_positions before the next
+        # refresh sees them. Union in tickers the coordinator's fill tracker
+        # is still watching for a BUY fill (audit I2, 2026-07-14). Same
+        # getattr pattern as _default_risk_params/_default_paper_provider;
+        # no coordinator constructed yet → nothing pending to add.
+        import app.dependencies as deps
+
+        coordinator = getattr(deps, "_trading_coordinator_instance", None)
+        if coordinator is not None:
+            tickers |= {
+                t.ticker
+                for t in coordinator.fill_tracker.tracking()
+                if t.side == "buy"
+            }
+
+        return len(tickers)
     raise ValueError(f"unknown market: {market}")
 
 
@@ -165,6 +185,26 @@ def _default_risk_params() -> RiskParameters:
     coordinator = getattr(deps, "_trading_coordinator_instance", None)
     params = getattr(coordinator, "risk_params", None)
     return params if isinstance(params, RiskParameters) else RiskParameters()
+
+
+async def _default_coordinator_active_provider(market: str) -> bool:
+    """Kiwoom only: is the trading coordinator started (`/trading/start`)?
+
+    A BUY/ADD placed through the graph's execution node registers its
+    unfilled remainder with `coordinator.fill_tracker` (F3) so the
+    coordinator's own scheduler loop can poll ka10076 for the post-fill and
+    register the resulting position's stop-loss/take-profit. That poll loop
+    — and RiskMonitor/PositionManager's defensive-exit watch — only run once
+    the coordinator is active. `get_trading_coordinator()` lazily constructs
+    the singleton on first use regardless of activity, so an *existing but
+    inactive* instance is just as dead here as `None` (audit I6, 2026-07-14):
+    the new exposure would sit unwatched with nothing to reconcile or defend
+    it. Same getattr pattern as `_default_risk_params`/`_default_paper_provider`.
+    """
+    import app.dependencies as deps
+
+    coordinator = getattr(deps, "_trading_coordinator_instance", None)
+    return coordinator is not None and bool(coordinator.is_active)
 
 
 # -------------------------------------------
@@ -183,8 +223,19 @@ async def check_autonomy(
     daily_loss_provider: Optional[Provider] = None,
     positions_count_provider: Optional[Provider] = None,
     risk_params_provider: Optional[Callable[[], RiskParameters]] = None,
+    coordinator_active_provider: Optional[Provider] = None,
 ) -> GateDecision:
-    """Decide whether an autonomous execution is allowed. Fail-closed."""
+    """Decide whether an autonomous execution is allowed. Fail-closed.
+
+    NOTE (I6 scoping): this function is the shared policy point for
+    AUTONOMOUS execution only — the injector's pre-check/re-check and every
+    coordinator/PositionManager auto-execution call it; a human's manual
+    decision (`app.api.routes.approval.submit_decision`, actor='user' or the
+    injector's own actor='system' call INTO it) never does. So a check added
+    here — like the coordinator-active link below — can only ever gate an
+    autonomous request; it cannot block HITL, which doesn't pass through
+    this function at all.
+    """
     global _last_breaker_notice_date
 
     mode_provider = mode_provider or _default_mode_provider
@@ -192,6 +243,7 @@ async def check_autonomy(
     daily_loss_provider = daily_loss_provider or _default_daily_loss_provider
     positions_count_provider = positions_count_provider or _default_positions_count_provider
     risk_params_provider = risk_params_provider or _default_risk_params
+    coordinator_active_provider = coordinator_active_provider or _default_coordinator_active_provider
 
     # 1. Master gate (env)
     if not settings.AUTONOMY_ENABLED:
@@ -236,9 +288,25 @@ async def check_autonomy(
             f"daily loss {loss_pct:.2f}% >= limit {params.max_daily_loss_pct:.2f}%",
         )
 
-    # 5 + 6 apply only to exposure-increasing actions.
+    # 5 + 6 + 7 apply only to exposure-increasing actions.
     if action in POSITION_INCREASING_ACTIONS:
-        # 5. Max concurrent positions
+        # 5. Coordinator must be active (kiwoom only — coin has no equivalent
+        # fill-tracker/coordinator; scoped here, not in the provider, in case
+        # a caller ever swaps a coin-specific default in). See
+        # _default_coordinator_active_provider for why an inactive/None
+        # coordinator must deny a BUY/ADD.
+        if market == "kiwoom":
+            try:
+                coordinator_ok = bool(await coordinator_active_provider(market))
+            except Exception as e:
+                return _deny("coordinator_active", str(e))
+            if not coordinator_ok:
+                return _deny(
+                    "coordinator_active",
+                    "사후 체결 추적 불가 — trading 시스템 미기동",
+                )
+
+        # 6. Max concurrent positions
         try:
             count = int(await positions_count_provider(market))
         except Exception as e:
@@ -249,7 +317,7 @@ async def check_autonomy(
                 f"open positions {count} >= limit {params.max_open_positions}",
             )
 
-        # 6. Per-trade notional cap (unknown size = fail-closed)
+        # 7. Per-trade notional cap (unknown size = fail-closed)
         if quantity is None or entry_price is None:
             return _deny("notional_cap", "quantity/entry_price unknown for a BUY/ADD")
         notional = float(quantity) * float(entry_price)
