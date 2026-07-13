@@ -1178,6 +1178,26 @@ class OperationsFill(BaseModel):
     time: str  # HHMMSS
 
 
+# Fields the FE consumer actually reads (OperationsPanel.tsx +
+# kiwoomSessionHandlers.ts rehydrateKiwoomSessions) — everything else,
+# notably `analyses` (the full per-agent LLM output array) and any other
+# internal KRStockTradeProposal bookkeeping, is dropped so a 5s poll doesn't
+# re-serialize the whole analysis payload.
+_PROPOSAL_SLIM_KEYS = (
+    "id", "stk_cd", "stk_nm", "action", "quantity",
+    "entry_price", "stop_loss", "take_profit",
+    "risk_score", "position_size_pct",
+    "rationale", "bull_case", "bear_case", "created_at",
+)
+
+
+def _slim_proposal(proposal: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Strip a raw `trade_proposal` state dict down to the FE-facing fields."""
+    if proposal is None:
+        return None
+    return {k: proposal[k] for k in _PROPOSAL_SLIM_KEYS if k in proposal}
+
+
 class OperationsResponse(BaseModel):
     analyzing: Optional[List[OperationsAnalyzing]] = None
     awaiting: Optional[List[OperationsAwaiting]] = None
@@ -1219,7 +1239,7 @@ async def get_operations(
                 awaiting.append(OperationsAwaiting(
                     session_id=s.session_id, ticker=s.ticker,
                     name=s.display_name,
-                    proposal=s.state.get("trade_proposal"),
+                    proposal=_slim_proposal(s.state.get("trade_proposal")),
                     auto_approve_at=s.state.get("auto_approve_at"),
                 ))
         res["analyzing"], res["awaiting"] = analyzing, awaiting

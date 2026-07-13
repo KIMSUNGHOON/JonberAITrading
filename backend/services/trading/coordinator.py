@@ -1065,8 +1065,15 @@ class ExecutionCoordinator:
         """Get current price for a ticker."""
         if self._kiwoom:
             try:
-                quote = await self._kiwoom.get_quote(ticker)
-                return quote.get("current_price", 0)
+                # KiwoomClient has no `get_quote` method (that was a
+                # never-implemented ghost API — live logs spammed "no
+                # attribute 'get_quote'" every RiskMonitor cycle, always
+                # returning 0 and silently disabling stop-loss/take-profit
+                # checks via the `current_price <= 0` guard). The real quote
+                # API is `get_stock_info` (ka10001), same one
+                # agents/tools/kr_market_data.py uses.
+                info = await self._kiwoom.get_stock_info(ticker)
+                return float(info.cur_prc)
             except Exception as e:
                 logger.error(f"[Coordinator] Failed to get price for {ticker}: {e}")
                 return 0

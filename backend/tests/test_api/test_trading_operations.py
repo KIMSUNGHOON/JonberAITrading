@@ -244,6 +244,43 @@ async def test_operations_holding_survives_agent_chat_coordinator_failure():
     assert "holding" not in res.errors
 
 
+async def test_operations_awaiting_proposal_is_slimmed():
+    """awaiting 제안은 슬림 필드만 응답에 실린다 — `analyses`(LLM 원문 배열 포함,
+    5초 폴링마다 직렬화되어 응답 크기를 지배하던 원인) 및 그 외 잡키는 제외.
+    FE 소비자(kiwoomSessionHandlers.ts rehydrateKiwoomSessions)는 정확히 이
+    슬림 필드 집합만 읽으므로 회귀 없음."""
+    huge_analyses = [{"agent_type": "technical", "raw_llm_output": "x" * 5000}] * 20
+    awaiting = _session("s-await", SessionStatus.AWAITING_APPROVAL, state={
+        "trade_proposal": {
+            "id": "p1", "stk_cd": "005930", "stk_nm": "삼성전자",
+            "action": "BUY", "quantity": 10,
+            "entry_price": 268000, "stop_loss": 246560, "take_profit": 289440,
+            "risk_score": 0.7, "position_size_pct": 5.0,
+            "rationale": "관망", "bull_case": "상승 여력", "bear_case": "하락 위험",
+            "created_at": "2026-07-13T02:00:00+00:00",
+            "analyses": huge_analyses,
+            "some_other_internal_field": "junk",
+        },
+    })
+
+    with patch.object(trading_mod, "get_session_manager",
+                      AsyncMock(return_value=_sm([awaiting]))):
+        res = await trading_mod.get_operations(
+            market="kiwoom", coordinator=_coordinator())
+
+    proposal = res.awaiting[0].proposal
+    assert "analyses" not in proposal
+    assert "some_other_internal_field" not in proposal
+    assert proposal == {
+        "id": "p1", "stk_cd": "005930", "stk_nm": "삼성전자",
+        "action": "BUY", "quantity": 10,
+        "entry_price": 268000, "stop_loss": 246560, "take_profit": 289440,
+        "risk_score": 0.7, "position_size_pct": 5.0,
+        "rationale": "관망", "bull_case": "상승 여력", "bear_case": "하락 위험",
+        "created_at": "2026-07-13T02:00:00+00:00",
+    }
+
+
 async def test_operations_coin_market_returns_sessions_only():
     """coin: 세션만 채우고 KR 전용 섹션은 null + errors 없음(비해당)."""
     coin_sess = AnalysisSession(session_id="c1", market_type=MarketType.COIN,
