@@ -766,10 +766,65 @@ class ExecutionCoordinator:
         return result
 
     async def _execute_order_from_monitor(self, order: OrderRequest):
-        """Execute order from risk monitor (stop-loss/take-profit)."""
+        """Execute order from risk monitor (stop-loss/take-profit).
+
+        This is the choke point for every AGENT_AUTO defensive sell — it MUST
+        pass the shared autonomy gate, the same one PositionManager's
+        `_execute_close_position` (A2) and the queue re-gate (R5-P0) already
+        enforce. Before this fix a stop-loss/take-profit fired straight to the
+        broker with no gate check at all (audit I1, 2026-07-13). A denied sell
+        places nothing and leaves the position tracked/watched — the
+        USER_APPROVAL alert path (RiskMonitor's non-AGENT_AUTO branch) is
+        untouched by this change.
+        """
+        from services.autonomy import check_autonomy
+
+        position = next(
+            (p for p in self._state.positions if p.ticker == order.ticker), None
+        )
+
+        gate = await check_autonomy(
+            "kiwoom",
+            action="SELL",
+            quantity=order.quantity,
+            entry_price=order.price,
+        )
+        if not gate.allowed:
+            logger.warning(
+                f"[Coordinator] AGENT_AUTO defensive sell blocked by gate: "
+                f"{order.ticker} check={gate.check} reason={gate.reason}"
+            )
+            # Notify once per denied episode, not on every RiskMonitor tick —
+            # mirrors the PositionManager A2 latch (close_gate_denied_notified).
+            if position is not None and not position.monitor_gate_denied_notified:
+                position.monitor_gate_denied_notified = True
+                await self._notify_monitor_gate_denied(order, gate.reason)
+            return
+
+        if position is not None and position.monitor_gate_denied_notified:
+            # Gate allowed again: clear the latch so a future denial notifies.
+            position.monitor_gate_denied_notified = False
+
         result = await self._execute_order(order)
         # Track the ACTUAL fill: full → remove, partial → reduce, none → retain.
         self._apply_sell_fill(order.ticker, result.filled_quantity, order=order, result=result)
+
+    async def _notify_monitor_gate_denied(self, order: OrderRequest, gate_reason: str) -> None:
+        """Best-effort Telegram notice when the autonomy gate blocks an
+        AGENT_AUTO defensive sell — the human must know a stop-loss/take-profit
+        did NOT execute and the position is still open."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚫 자율 방어매도 게이트 거부 ({order.ticker}, "
+                    f"{order.reason or 'stop-loss/take-profit'}): {gate_reason}. "
+                    f"포지션은 유지되며 수동 조치가 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(f"[Coordinator] Failed to notify gate denial: {e}")
 
     # -------------------------------------------
     # Position Management

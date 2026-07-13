@@ -28,9 +28,12 @@ from services.trading.coordinator import ExecutionCoordinator
 from services.trading.market_hours import MarketSession
 from services.trading.models import (
     AllocationPlan,
+    ManagedPosition,
+    OrderRequest,
     OrderResult,
     OrderSide,
     QueueStatus,
+    StopLossMode,
     TradingMode,
 )
 
@@ -350,3 +353,111 @@ async def test_defensive_close_proceeds_when_gate_allows(monkeypatch):
 
     assert closed == [position.ticker]
     assert position.ticker not in pm._positions
+
+
+# -------------------------------------------
+# I1 — AGENT_AUTO defensive sell (RiskMonitor stop-loss/take-profit) must
+# pass the autonomy gate before ExecutionCoordinator places the SELL order.
+# -------------------------------------------
+
+
+def _coordinator_with_watched_position():
+    """A coordinator with one AGENT_AUTO position already tracked + watched,
+    mirroring what on_trade_approved/_restore_state produce before a
+    RiskMonitor trigger calls back into _execute_order_from_monitor."""
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    position = ManagedPosition(
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=10,
+        avg_price=72_500,
+        current_price=68_000,
+        stop_loss=68_000,
+        take_profit=79_750,
+        stop_loss_mode=StopLossMode.AGENT_AUTO,
+    )
+    coord._add_position(position)
+    return coord, position
+
+
+def _stop_loss_order(quantity: int = 10, price: float = 68_000) -> OrderRequest:
+    return OrderRequest(
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.SELL,
+        quantity=quantity,
+        price=price,
+        reason="Stop-loss auto-execution",
+    )
+
+
+async def test_monitor_defensive_sell_blocked_when_gate_denies(monkeypatch):
+    """I1: an AGENT_AUTO stop-loss/take-profit sell triggered by RiskMonitor must
+    NOT execute when the autonomy gate denies — order_agent must not be
+    invoked and the position must stay tracked/watched for a human to act."""
+    coord, position = _coordinator_with_watched_position()
+    captured = await _capture_executed_order(coord)
+
+    async def deny_gate(market, **kwargs):
+        return GateDecision(
+            allowed=False, reason="trading_mode:kiwoom is 'hitl'", check="market_mode"
+        )
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
+
+    await coord._execute_order_from_monitor(_stop_loss_order())
+
+    assert captured == [], "gate-denied defensive sell must not place an order"
+    assert any(p.ticker == "005930" for p in coord._state.positions), (
+        "blocked position must stay in _state.positions"
+    )
+
+
+async def test_monitor_defensive_sell_notifies_once_per_denied_episode(monkeypatch):
+    """I1: repeated gate denials for the same ticker must notify once, not on
+    every RiskMonitor tick (mirrors A2's close_gate_denied_notified latch)."""
+    coord, position = _coordinator_with_watched_position()
+    await _capture_executed_order(coord)
+
+    async def deny_gate(market, **kwargs):
+        return GateDecision(
+            allowed=False, reason="daily loss >= limit", check="daily_loss_breaker"
+        )
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
+
+    notices = []
+
+    async def spy_notify(order, gate_reason):
+        notices.append(order.ticker)
+
+    coord._notify_monitor_gate_denied = spy_notify
+
+    order = _stop_loss_order()
+    # Three RiskMonitor ticks deny the same stopped-out position.
+    await coord._execute_order_from_monitor(order)
+    await coord._execute_order_from_monitor(order)
+    await coord._execute_order_from_monitor(order)
+
+    assert notices == ["005930"], "denied defensive sell must notify once, not every tick"
+    assert any(p.ticker == "005930" for p in coord._state.positions)
+
+
+async def test_monitor_defensive_sell_proceeds_when_gate_allows(monkeypatch):
+    """I1 guard: when the gate allows, the defensive sell executes normally and
+    the fill is reconciled as before (full fill removes the position)."""
+    coord, position = _coordinator_with_watched_position()
+    captured = await _capture_executed_order(coord)
+
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+    await coord._execute_order_from_monitor(_stop_loss_order())
+
+    assert len(captured) == 1
+    assert captured[0].ticker == "005930"
+    assert not any(p.ticker == "005930" for p in coord._state.positions), (
+        "fully filled defensive sell must remove the position"
+    )

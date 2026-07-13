@@ -330,6 +330,14 @@ class ManagedPosition(BaseModel):
     analysis_session_id: Optional[str] = None
     risk_score: Optional[int] = None
 
+    # Set once when an AGENT_AUTO defensive sell (RiskMonitor stop-loss /
+    # take-profit) is blocked by the autonomy gate, so the human is notified
+    # ONCE per denied episode instead of on every monitor tick (mirrors
+    # agent_chat.position_manager.MonitoredPosition.close_gate_denied_notified,
+    # A2). Reset when the gate next allows. Defaults False so old persisted
+    # positions restore cleanly.
+    monitor_gate_denied_notified: bool = False
+
     model_config = ConfigDict(use_enum_values=True)
 
 

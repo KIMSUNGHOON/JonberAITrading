@@ -21,7 +21,9 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+import services.autonomy as autonomy_pkg
 import services.storage_service as ss
+from services.autonomy import GateDecision
 from services.kiwoom.models import FilledOrder, OrderResponse
 from services.trading.coordinator import ExecutionCoordinator
 from services.trading.models import (
@@ -232,6 +234,14 @@ def _stub_execute_order(coord, filled_quantity, status="filled"):
     coord._execute_order = _exec
 
 
+async def _allow_gate(market, **kwargs):
+    """I1: _execute_order_from_monitor now gates every AGENT_AUTO defensive sell
+    through check_autonomy before placing the order. These A3 tests exercise
+    the fill-reconciliation logic (full/partial/none), which is orthogonal to
+    the gate itself — force-allow so the underlying order still gets placed."""
+    return GateDecision(allowed=True, reason="ok", check="all")
+
+
 async def test_close_position_retains_position_when_sell_unfilled(temp_storage):
     """A3: a close whose SELL does not fill must KEEP the position (and its stops)
     — dropping it on an unfilled sell orphans the exposure with no defense."""
@@ -268,9 +278,10 @@ async def test_close_position_reduces_when_partially_filled(temp_storage):
     assert "005930" in coord.risk_monitor._watching
 
 
-async def test_monitor_stop_execution_reduces_on_partial_fill(temp_storage):
+async def test_monitor_stop_execution_reduces_on_partial_fill(temp_storage, monkeypatch):
     """A3: a stop-loss/take-profit order that only partially fills must reduce the
     tracked quantity, not remove the whole position on any fill > 0."""
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", _allow_gate)
     coord = _coord_with_position(qty=100)
     _stub_execute_order(coord, filled_quantity=40)
 
@@ -531,10 +542,11 @@ async def test_adjust_stop_loss_updates_managed_position(temp_storage):
     assert coord.risk_monitor._watching["005930"].stop_loss == 70_000
 
 
-async def test_risk_monitor_partial_stop_keeps_reduced_position(temp_storage):
+async def test_risk_monitor_partial_stop_keeps_reduced_position(temp_storage, monkeypatch):
     """Review #5b: a risk-monitor auto-executed stop-loss with a partial fill must
     keep monitoring the reduced remainder — the monitor's own remove_position must
     no longer clobber the coordinator's _apply_sell_fill re-registration."""
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", _allow_gate)
     coord = _coord_with_position(qty=100)
     _stub_execute_order(coord, filled_quantity=40)
     config = coord.risk_monitor._watching["005930"]
@@ -545,10 +557,11 @@ async def test_risk_monitor_partial_stop_keeps_reduced_position(temp_storage):
     assert "005930" in coord.risk_monitor._watching
 
 
-async def test_risk_monitor_full_stop_still_removes_position(temp_storage):
+async def test_risk_monitor_full_stop_still_removes_position(temp_storage, monkeypatch):
     """Review #5b guard: removing the monitor's own unconditional remove must NOT
     break the normal case — a FULL fill still drops the position and stops it
     being watched (via the coordinator's _apply_sell_fill)."""
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", _allow_gate)
     coord = _coord_with_position(qty=100)
     _stub_execute_order(coord, filled_quantity=100)
     config = coord.risk_monitor._watching["005930"]
