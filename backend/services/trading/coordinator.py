@@ -8,6 +8,7 @@ Analysis → Approval → Portfolio → Order → Monitor
 import asyncio
 import json
 import logging
+import uuid
 from datetime import datetime, date
 from typing import Optional, List, Callable, Awaitable
 
@@ -20,6 +21,7 @@ from .models import (
     OrderResult,
     AllocationPlan,
     TradingAlert,
+    AlertType,
     RiskParameters,
     PositionStatus,
     OrderSide,
@@ -38,6 +40,8 @@ from .risk_monitor import RiskMonitor
 from .market_hours import MarketType, get_market_hours_service
 from .strategy import TradingStrategy
 from .strategy_engine import StrategyEngine
+from .pending_order_tracker import PendingOrderTracker, TrackedOrder
+from .position_registration import register_fill_as_position
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +134,13 @@ class ExecutionCoordinator:
         # a coordinator built in a unit test does not write to the shared DB. The
         # explicit _persist_state/_restore_state helpers ignore this flag.
         self._persistence_active = False
+
+        # F3 (audit 2026-07-13): a BUY that didn't (fully) fill at placement
+        # time previously vanished from tracking — the coordinator only
+        # registered a position on the filled portion, so any broker-side
+        # post-fill went unwatched by every defense engine. Tracks the
+        # remainder and reconciles it against ka10076 on the scheduler tick.
+        self.fill_tracker = PendingOrderTracker()
 
     # -------------------------------------------
     # Activity Logging
@@ -282,6 +293,7 @@ class ExecutionCoordinator:
         risk_score: int,
         quantity_override: Optional[int] = None,
         autonomous: bool = False,
+        queue_id: Optional[str] = None,
     ) -> AllocationPlan:
         """
         Handle an approved trade from the analysis system.
@@ -301,6 +313,10 @@ class ExecutionCoordinator:
             take_profit: Take-profit price
             risk_score: Risk score from analysis (1-10)
             quantity_override: Optional manual quantity override
+            queue_id: The originating QueuedTrade.id, when this call comes
+                from `_process_trade_queue_inner` (F3) — threaded onto any
+                fill-tracker registration below so a later post-fill can
+                annotate the queue entry it came from.
 
         Returns:
             AllocationPlan with execution details
@@ -614,6 +630,40 @@ class ExecutionCoordinator:
                 },
             )
 
+        # F3: an unfilled/partial BUY still has (or may soon have) broker-side
+        # exposure that nothing is watching yet — track the remainder so the
+        # scheduler's ka10076 poll can pick up the post-fill later. SELL
+        # unfilled remainders are out of scope (R5-P4).
+        if side == OrderSide.BUY and result.status in ("pending", "partial"):
+            remaining = order.quantity - result.filled_quantity
+            if remaining > 0:
+                self.fill_tracker.register(
+                    TrackedOrder(
+                        ord_no=result.order_id,
+                        ticker=ticker,
+                        stock_name=stock_name or ticker,
+                        side="buy",
+                        total_quantity=order.quantity,
+                        filled_quantity=result.filled_quantity,
+                        filled_amount=result.filled_quantity * result.avg_price,
+                        limit_price=entry_price,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        source_queue_id=queue_id,
+                        source_session_id=session_id,
+                        trade_date=date.today().strftime("%Y%m%d"),
+                    )
+                )
+                self._schedule_persist()
+                self._log_activity(
+                    ActivityType.ORDER_PLACED,
+                    f"미체결 잔량 추적 등록: {stock_name or ticker} {remaining}주 "
+                    f"(ord_no={result.order_id})",
+                    agent="order",
+                    ticker=ticker,
+                    details={"ord_no": result.order_id, "remaining": remaining},
+                )
+
         return allocation
 
     async def _execute_order(self, order: OrderRequest) -> OrderResult:
@@ -788,6 +838,7 @@ class ExecutionCoordinator:
                     ],
                     "daily_trades_count": self._state.daily_trades_count,
                     "daily_count_date": date.today().isoformat(),
+                    "tracked_orders": self.fill_tracker.to_payload(),
                 }
             )
             storage = await get_storage_service()
@@ -826,9 +877,24 @@ class ExecutionCoordinator:
             else:
                 self._state.daily_trades_count = 0
 
+            # Tracked orders (F3): TRACKING orders resume so the scheduler poll
+            # can pick up their post-fill. A TRACKING order whose trade_date
+            # has rolled over (restarted on a later day) is expired instead —
+            # nothing placed on a prior session can still fill. Log-only, no
+            # notification, to avoid a restart notification storm.
+            self.fill_tracker = PendingOrderTracker.from_payload(
+                data.get("tracked_orders", [])
+            )
+            stale = self.fill_tracker.expire_stale(today=date.today().strftime("%Y%m%d"))
+            if stale:
+                logger.info(
+                    f"[Coordinator] Expired {len(stale)} stale tracked orders on restore"
+                )
+
             logger.info(
                 f"[Coordinator] Restored {len(self._state.positions)} positions, "
                 f"{len(self._state.trade_queue)} queued trades, "
+                f"{len(self.fill_tracker.tracking())} tracked orders, "
                 f"daily_count={self._state.daily_trades_count}"
             )
         except Exception as e:
@@ -1338,6 +1404,7 @@ class ExecutionCoordinator:
                     risk_score=trade.risk_score,
                     quantity_override=trade.quantity,
                     autonomous=trade.autonomous,
+                    queue_id=trade.id,
                 )
 
                 trade.allocation = allocation
@@ -1360,19 +1427,153 @@ class ExecutionCoordinator:
         await self._notify_state_change()
 
     async def _check_queue_on_market_open(self) -> None:
-        """One scheduler tick: process the queue on a KRX closed→open transition.
+        """One scheduler tick: process the queue on a KRX closed→open transition,
+        and expire tracked orders on the inverse open→closed transition (F3).
 
         start() already drains the queue if the market is open at start time; this
         covers the case where the system is started (or a trade is queued) while
         the market is closed and the market opens later. Only the EDGE triggers —
         an already-open market is not re-processed every tick. The execution-time
         re-gate (R5-P0) re-checks autonomy safety when each queued trade runs.
+
+        The open→closed edge is the local signal for "nothing placed today can
+        fill any further" — KRX limit orders are day-valid and there is no
+        broker push telling us the session ended, so every still-TRACKING order
+        is expired and notified once, on the edge only (mirrors the open-edge
+        guard so a closed market doesn't re-notify every tick).
         """
         is_open = self._market_hours.get_market_session(MarketType.KRX).is_open
         if is_open and not self._market_was_open and self.get_trade_queue():
             logger.info("[Coordinator] Market opened — processing queued trades")
             await self.process_trade_queue()
+        elif not is_open and self._market_was_open:
+            await self._expire_tracked_orders_on_market_close()
         self._market_was_open = is_open
+
+    async def _expire_tracked_orders_on_market_close(self) -> None:
+        """F3: expire every still-TRACKING order on the open→closed edge and
+        notify once per order via the coordinator's normal alert path."""
+        expired = self.fill_tracker.expire_stale(today=None)
+        if not expired:
+            return
+
+        logger.info(f"[Coordinator] Market closed — expired {len(expired)} tracked orders")
+        self._log_activity(
+            ActivityType.MARKET_CLOSED,
+            f"장 마감 — 미체결 추적 주문 {len(expired)}건 만료 처리",
+            agent="system",
+        )
+        for order in expired:
+            remaining = order.total_quantity - order.filled_quantity
+            await self._on_alert(
+                TradingAlert(
+                    id=str(uuid.uuid4())[:8],
+                    alert_type=AlertType.ORDER_FAILED,
+                    ticker=order.ticker,
+                    title="미체결 주문 만료",
+                    message=(
+                        f"{order.stock_name or order.ticker} 잔량 {remaining}주 — "
+                        f"장 마감으로 추적 종료 (ord_no={order.ord_no})"
+                    ),
+                    data={"ord_no": order.ord_no, "remaining": remaining},
+                )
+            )
+        self._schedule_persist()
+
+    async def _poll_tracked_fills(self) -> None:
+        """One scheduler tick: reconcile TRACKING orders against ka10076 fills.
+
+        Skips the broker call entirely when nothing is TRACKING (flow-control —
+        this runs every 30s alongside the queue-open check). ka10076 returns a
+        cumulative daily snapshot per order, so `apply_fills` diffs it against
+        each order's own accumulated fill and returns only the NEW portion —
+        re-polling an unchanged snapshot is a no-op (idempotent). A query
+        failure is logged and left for the next tick; tracked state does not
+        change on failure.
+        """
+        if not self.fill_tracker.tracking():
+            return
+        if self._kiwoom is None:
+            return
+
+        try:
+            fills = await self._kiwoom.get_filled_orders(use_cache=False)
+        except Exception as e:
+            logger.error(f"[Coordinator] Fill tracker poll failed: {e}")
+            return
+
+        deltas = self.fill_tracker.apply_fills(fills)
+        if not deltas:
+            return
+
+        for delta in deltas:
+            order = delta.order
+            await register_fill_as_position(
+                self,
+                ticker=order.ticker,
+                stock_name=order.stock_name or order.ticker,
+                quantity=delta.new_fill_qty,
+                avg_price=delta.avg_fill_price,
+                stop_loss=order.stop_loss,
+                take_profit=order.take_profit,
+                session_id=order.source_session_id,
+                source="fill_tracker",
+            )
+
+            self._log_activity(
+                ActivityType.POSITION_OPENED,
+                f"사후 체결: {order.stock_name or order.ticker} {delta.new_fill_qty}주 "
+                f"@ ₩{delta.avg_fill_price:,.0f}",
+                agent="order",
+                ticker=order.ticker,
+                details={
+                    "ord_no": order.ord_no,
+                    "new_fill_qty": delta.new_fill_qty,
+                    "avg_fill_price": delta.avg_fill_price,
+                    "stop_loss": order.stop_loss,
+                },
+            )
+
+            stop_note = (
+                f" — 손절 ₩{order.stop_loss:,.0f} 감시 시작" if order.stop_loss else ""
+            )
+            await self._on_alert(
+                TradingAlert(
+                    id=str(uuid.uuid4())[:8],
+                    alert_type=AlertType.ORDER_FILLED,
+                    ticker=order.ticker,
+                    title="사후 체결 감지",
+                    message=(
+                        f"{order.stock_name or order.ticker} {delta.new_fill_qty}주 "
+                        f"@ ₩{delta.avg_fill_price:,.0f} 체결 확인{stop_note}"
+                    ),
+                    data={
+                        "ord_no": order.ord_no,
+                        "new_fill_qty": delta.new_fill_qty,
+                        "avg_fill_price": delta.avg_fill_price,
+                    },
+                )
+            )
+
+            # Post-fill queue annotation: the queue item that originated this
+            # order (if any) gets a note appended — its status vocabulary is
+            # unchanged (design spec §4.1/§7).
+            if order.source_queue_id:
+                queued = next(
+                    (
+                        t
+                        for t in self._state.trade_queue
+                        if t.id == order.source_queue_id
+                    ),
+                    None,
+                )
+                if queued is not None:
+                    queued.reason = (
+                        f"{queued.reason} | 사후체결 {delta.new_fill_qty}주 "
+                        f"@{delta.avg_fill_price:,.0f}"
+                    )
+
+        self._schedule_persist()
 
     async def _queue_scheduler_loop(self) -> None:
         """Periodically check for the market-open transition until stopped."""
@@ -1381,6 +1582,7 @@ class ExecutionCoordinator:
                 await asyncio.sleep(self._queue_scheduler_interval)
                 try:
                     await self._check_queue_on_market_open()
+                    await self._poll_tracked_fills()
                 except Exception as e:
                     logger.error(f"[Coordinator] Queue scheduler error: {e}")
         except asyncio.CancelledError:
