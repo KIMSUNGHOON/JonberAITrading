@@ -5,14 +5,8 @@
  */
 
 import { useState } from 'react';
-import {
-  BarChart3,
-  MessageSquare,
-  TrendingUp,
-  Wallet,
-  X,
-} from 'lucide-react';
-import { useStore, selectStatus, selectAwaitingApproval } from '@/store';
+import { MessageSquare, X } from 'lucide-react';
+import { useStore, selectAwaitingApproval } from '@/store';
 import { ChatPanel } from '@/components/chat/ChatPanel';
 import { Sidebar } from './Sidebar';
 
@@ -22,7 +16,6 @@ export function MobileNav() {
   const [activeView, setActiveView] = useState<MobileView>('none');
   const isMobileMenuOpen = useStore((state) => state.isMobileMenuOpen);
   const setMobileMenuOpen = useStore((state) => state.setMobileMenuOpen);
-  const status = useStore(selectStatus);
   const awaitingApproval = useStore(selectAwaitingApproval);
 
   const toggleView = (view: MobileView) => {
@@ -70,27 +63,11 @@ export function MobileNav() {
       <nav className="md:hidden fixed bottom-0 inset-x-0 h-16 bg-surface-light border-t border-border safe-bottom">
         <div className="h-full flex items-center justify-around">
           <NavButton
-            icon={<TrendingUp className="w-5 h-5" />}
-            label="Analysis"
-            active={status === 'running'}
-            onClick={() => setActiveView('none')}
-          />
-          <NavButton
-            icon={<BarChart3 className="w-5 h-5" />}
-            label="Charts"
-            onClick={() => setActiveView('none')}
-          />
-          <NavButton
             icon={<MessageSquare className="w-5 h-5" />}
             label="Chat"
             active={activeView === 'chat'}
             badge={awaitingApproval}
             onClick={() => toggleView('chat')}
-          />
-          <NavButton
-            icon={<Wallet className="w-5 h-5" />}
-            label="Position"
-            onClick={() => setActiveView('none')}
           />
         </div>
       </nav>
