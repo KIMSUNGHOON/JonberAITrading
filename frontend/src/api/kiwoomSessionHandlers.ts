@@ -14,7 +14,7 @@
  * references), so they are usable outside a React render.
  */
 import { useStore } from '@/store';
-import { wsManager, type WebSocketHandlers } from '@/api/websocket';
+import { wsManager, type WebSocketHandlers, type CompleteMessage } from '@/api/websocket';
 import { getOperations } from '@/api/client';
 import type { KRStockTradeProposal, SessionData, SessionStatus } from '@/types';
 
@@ -55,6 +55,37 @@ function flushReasoningBuffer(sessionId: string): void {
   } else {
     reasoningBuffers.delete(sessionId);
   }
+}
+
+/**
+ * Normalize a completion-frame trade_proposal into KRStockTradeProposal shape.
+ *
+ * The complete frame (backend _serialize_proposal) and the frontend
+ * KRStockTradeProposal use different field names: ticker/display_name vs
+ * stk_cd/stk_nm. Defaults mirror the proposal-frame handler (onProposal) and
+ * the rehydrate builder: missing optional strings → '', missing numbers → 0,
+ * price fields preserve null. Returns null when the frame carries no proposal.
+ */
+function normalizeCompleteProposal(
+  tp: NonNullable<CompleteMessage['data']['trade_proposal']> | undefined,
+): KRStockTradeProposal | null {
+  if (!tp) return null;
+  return {
+    id: tp.id,
+    stk_cd: tp.ticker,
+    stk_nm: tp.display_name || null,
+    action: tp.action.toUpperCase() as KRStockTradeProposal['action'],
+    quantity: tp.quantity ?? 0,
+    entry_price: tp.entry_price ?? null,
+    stop_loss: tp.stop_loss ?? null,
+    take_profit: tp.take_profit ?? null,
+    risk_score: tp.risk_score ?? 0,
+    position_size_pct: 0,
+    rationale: tp.rationale ?? '',
+    bull_case: tp.bull_case ?? '',
+    bear_case: tp.bear_case ?? '',
+    created_at: new Date().toISOString(),
+  };
 }
 
 export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandlers {
@@ -122,17 +153,29 @@ export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandl
         // the completed session's detail page renders empty (analysisResults/
         // reasoningSummary/tradeProposal never land in history) AND a page
         // refresh loses the detail entirely (history is what survives reload,
-        // the live session map does not). tradeProposal comes from the
-        // session's own (already-normalized) live proposal set earlier by
-        // onProposal — the raw data.trade_proposal frame uses different field
-        // names (ticker/display_name vs stk_cd/stk_nm) so it is not reused
-        // directly here.
+        // the live session map does not).
         const session = store().kiwoom.sessions.find((s) => s.sessionId === sessionId);
+        // tradeProposal preference order:
+        //   1. the session's OWN already-normalized live proposal (set by
+        //      onProposal during an interactive/streamed run), else
+        //   2. the completion frame's data.trade_proposal, normalized into
+        //      KRStockTradeProposal shape.
+        // #2 is essential in the autonomous / reconnect cases: when the WS
+        // never observed the awaiting_approval proposal frame (a drop+recover
+        // cycle, or a session that auto-approved during the 60s autonomous
+        // grace while the tab was closed) the store has NO live proposal, so
+        // without this fallback the detail page's trade-proposal card would be
+        // empty even though the backend faithfully carries it on the complete
+        // frame. Field names differ between the two payloads (complete frame:
+        // ticker/display_name; KRStockTradeProposal: stk_cd/stk_nm) so the
+        // frame is mapped, not reused verbatim.
+        //
         // This module only ever handles kiwoom sessions, so the shared
         // SessionData union (CoinTradeProposal | KRStockTradeProposal | null)
         // narrows to KRStockTradeProposal here — same precedent as the
         // KRStockTradeProposal casts in rehydrateKiwoomSessions below.
-        const tradeProposal = (session?.tradeProposal as KRStockTradeProposal | null) ?? null;
+        const liveProposal = (session?.tradeProposal as KRStockTradeProposal | null) ?? null;
+        const tradeProposal = liveProposal ?? normalizeCompleteProposal(data.trade_proposal);
         store().completeKiwoomSession(sessionId, {
           analysisResults: data.analysis_results ?? null,
           reasoningSummary: data.reasoning_summary,

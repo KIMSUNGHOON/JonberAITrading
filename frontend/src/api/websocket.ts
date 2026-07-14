@@ -101,6 +101,7 @@ export interface CompleteMessage {
     trade_proposal?: {
       id: string;
       ticker: string;
+      display_name?: string;  // Stock name (종목명) — backend _serialize_proposal sends it
       action: string;
       quantity: number;
       entry_price: number | null;

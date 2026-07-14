@@ -530,4 +530,36 @@ describe('createKiwoomWebSocketHandlers — onComplete persists to history via c
     expect(setKiwoomSessionError).not.toHaveBeenCalled();
     expect(updateKiwoomSessionStatus).toHaveBeenCalledWith('S1', 'cancelled');
   });
+
+  it('falls back to data.trade_proposal (normalized) when the store has no live proposal — autonomous/reconnect case', () => {
+    // The WS never observed the awaiting_approval proposal frame (drop+recover,
+    // or a session auto-approved during the 60s autonomous grace while the tab
+    // was closed), so the store's session has NO live tradeProposal. The
+    // completion frame still carries data.trade_proposal — it must be
+    // normalized (ticker→stk_cd, display_name→stk_nm) and persisted instead of
+    // passing null (which would render an empty proposal card).
+    mockState.kiwoom.sessions = [{ sessionId: 'S1', tradeProposal: null }];
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onComplete?.({
+      status: 'completed',
+      trade_proposal: {
+        id: 'p9', ticker: '000660', display_name: 'SK하이닉스', action: 'buy',
+        quantity: 5, entry_price: 190000, stop_loss: 175000, take_profit: 210000,
+        risk_score: 0.6, rationale: '자율 매수', bull_case: '상승', bear_case: '하락',
+      },
+    });
+
+    expect(completeKiwoomSession).toHaveBeenCalledTimes(1);
+    expect(completeKiwoomSession).toHaveBeenCalledWith('S1', {
+      analysisResults: null,
+      reasoningSummary: undefined,
+      tradeProposal: expect.objectContaining({
+        id: 'p9', stk_cd: '000660', stk_nm: 'SK하이닉스', action: 'BUY',
+        quantity: 5, entry_price: 190000, stop_loss: 175000, take_profit: 210000,
+        risk_score: 0.6, rationale: '자율 매수', bull_case: '상승', bear_case: '하락',
+      }),
+      completedAt: expect.any(Date),
+    });
+  });
 });
