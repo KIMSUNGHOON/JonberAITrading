@@ -6,22 +6,35 @@
  * exact column matches. Polls every 10s, keyed on activeMarket so switching
  * the market tab re-fetches (the tile never remounts).
  *
- * P1-4 discretionary control surface: inline STOP/TAKE edit + partial close.
- * These are OPERATOR-INITIATED manual actions, not autonomous ones — they go
- * through the same order/positions endpoints the rest of the app uses
- * (createKRStockOrder/createCoinOrder, updatePositionStopLoss/TakeProfit),
- * never a separate execution path. Partial close is implemented as a manual
- * sell order for the entered qty/% rather than the dedicated
- * `/positions/{id}/close` endpoints — those only support closing the FULL
- * position (no qty param exists on them), so a manual sell order is the
- * correct primitive for a partial reduction (see task-7 report for detail).
+ * P1-4 discretionary control surface: inline STOP/TAKE edit + full close.
+ * These are OPERATOR-INITIATED manual actions, not autonomous ones.
+ *
+ * T7 review fixes (see .superpowers/sdd/task-7-fix-findings.md):
+ * - C1: SL/TP save surfaces the backend's real outcome (including an honest
+ *   error when the edit can't take effect anywhere) instead of assuming
+ *   success — the fake-"updated" case was fixed backend-side
+ *   (app/api/routes/trading.py), and the existing axios error interceptor
+ *   already threads `detail` through to `e.message` here.
+ * - M2: on a successful save, the row's local edit override is cleared so
+ *   the field reverts to the freshly-refetched server value instead of
+ *   echoing the typed value forever (which would hide a no-op).
+ * - C2: 청산 is now FULL CLOSE ONLY via the dedicated
+ *   `/positions/{id}/close` endpoints (closeKRStockPosition/
+ *   closeCoinPosition) — these are the only routes that actually reduce
+ *   the stored position (delete it, in this case). The previous
+ *   qty/%-based "partial close" fired a raw sell order that never touched
+ *   the position store, so a refetch kept showing the pre-close quantity
+ *   while a real sell had gone out — a stale-state oversell hazard. Rather
+ *   than add a new partial-reduce backend endpoint (higher-risk surface
+ *   for a safety-adjacent control), partial close is disabled; a two-click
+ *   confirm guards the destructive full close.
  */
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { useStore, selectChartSymbol } from '@/store';
 import {
   getKRStockPositions, getCoinPositions,
   updatePositionStopLoss, updatePositionTakeProfit,
-  createKRStockOrder, createCoinOrder,
+  closeKRStockPosition, closeCoinPosition,
 } from '@/api/client';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting, TH, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
@@ -105,40 +118,19 @@ function usePositions() {
   return { activeMarket, rows, state, err, refetch };
 }
 
-type RowEdit = { stop: string; take: string; close: string };
+// Per-field local edit overrides, keyed by row code. A field is only
+// present here while the operator has an in-progress edit that hasn't been
+// saved yet; a successful save deletes the field's key so `editFor` falls
+// back to the (freshly-refetched) server value again — see M2 in
+// task-7-fix-findings.md. Deliberately per-field (not one blob per row) so
+// clearing STOP on save doesn't clobber an in-progress TAKE edit.
+type RowEdit = { stop?: string; take?: string };
 
-function initEdit(row: Row): RowEdit {
-  return {
-    stop: row.stop != null ? String(row.stop) : '',
-    take: row.take != null ? String(row.take) : '',
-    close: '',
-  };
-}
-
-/**
- * Resolves a partial-close "qty or %" field into a concrete sell quantity.
- * `wholeUnits` (true for KR shares, false for coin volumes) enforces integer
- * quantities where the market requires them. Returns null for anything
- * malformed or exceeding the held quantity — callers must reject, never
- * silently clamp.
- */
-export function resolvePartialQty(raw: string, heldQty: number, wholeUnits: boolean): number | null {
-  const trimmed = raw.trim();
-  if (!trimmed || heldQty <= 0) return null;
-
-  let qty: number;
-  if (trimmed.endsWith('%')) {
-    const pct = Number(trimmed.slice(0, -1));
-    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) return null;
-    qty = (heldQty * pct) / 100;
-    if (wholeUnits) qty = Math.floor(qty);
-  } else {
-    qty = Number(trimmed);
-  }
-
-  if (!Number.isFinite(qty) || qty <= 0 || qty > heldQty) return null;
-  if (wholeUnits && !Number.isInteger(qty)) return null;
-  return qty;
+function editValue(row: Row, edit: RowEdit | undefined, field: 'stop' | 'take'): string {
+  const local = edit?.[field];
+  if (local !== undefined) return local;
+  const serverVal = row[field];
+  return serverVal != null ? String(serverVal) : '';
 }
 
 export function PositionsPanel() {
@@ -149,11 +141,23 @@ export function PositionsPanel() {
   const [edits, setEdits] = useState<Record<string, RowEdit>>({});
   const [rowError, setRowError] = useState<Record<string, string>>({});
   const [busyRow, setBusyRow] = useState<string | null>(null);
+  const [confirmClose, setConfirmClose] = useState<string | null>(null);
 
-  const editFor = (row: Row): RowEdit => edits[row.code] ?? initEdit(row);
+  const setField = (code: string, field: 'stop' | 'take', value: string) => {
+    setEdits((prev) => ({ ...prev, [code]: { ...(prev[code] ?? {}), [field]: value } }));
+  };
 
-  const setField = (row: Row, field: keyof RowEdit, value: string) => {
-    setEdits((prev) => ({ ...prev, [row.code]: { ...(prev[row.code] ?? initEdit(row)), [field]: value } }));
+  // Deletes the field's override entirely (not set to '') so editValue()
+  // falls back to the server value on the next render — that's what
+  // actually reveals a no-op instead of echoing the typed value forever.
+  const clearField = (code: string, field: 'stop' | 'take') => {
+    setEdits((prev) => {
+      const rowEdit = prev[code];
+      if (!rowEdit || !(field in rowEdit)) return prev;
+      const next = { ...rowEdit };
+      delete next[field];
+      return { ...prev, [code]: next };
+    });
   };
 
   const setRowErr = (code: string, msg: string | null) => {
@@ -166,7 +170,7 @@ export function PositionsPanel() {
   };
 
   async function handleSaveStop(row: Row) {
-    const raw = editFor(row).stop.trim();
+    const raw = editValue(row, edits[row.code], 'stop').trim();
     const val = Number(raw);
     if (!raw || !Number.isFinite(val) || val <= 0) {
       setRowErr(row.code, `손절가가 올바르지 않습니다: "${raw}"`);
@@ -176,7 +180,13 @@ export function PositionsPanel() {
     try {
       await updatePositionStopLoss(row.code, val);
       setRowErr(row.code, null);
+      // C1/M2: only treat this as a real change once the backend confirms
+      // it took effect somewhere (risk_monitor OR the coin position store —
+      // see trading.py). refetch() BEFORE clearing the override so the
+      // field flips straight to the true post-save server value with no
+      // flash of a stale one.
       await refetch();
+      clearField(row.code, 'stop');
     } catch (e) {
       setRowErr(row.code, `손절가 저장 실패: ${e instanceof Error ? e.message : '요청 실패'}`);
     } finally {
@@ -185,7 +195,7 @@ export function PositionsPanel() {
   }
 
   async function handleSaveTake(row: Row) {
-    const raw = editFor(row).take.trim();
+    const raw = editValue(row, edits[row.code], 'take').trim();
     const val = Number(raw);
     if (!raw || !Number.isFinite(val) || val <= 0) {
       setRowErr(row.code, `익절가가 올바르지 않습니다: "${raw}"`);
@@ -196,6 +206,7 @@ export function PositionsPanel() {
       await updatePositionTakeProfit(row.code, val);
       setRowErr(row.code, null);
       await refetch();
+      clearField(row.code, 'take');
     } catch (e) {
       setRowErr(row.code, `익절가 저장 실패: ${e instanceof Error ? e.message : '요청 실패'}`);
     } finally {
@@ -203,25 +214,31 @@ export function PositionsPanel() {
     }
   }
 
-  async function handleClose(row: Row) {
-    const raw = editFor(row).close.trim();
-    const qty = resolvePartialQty(raw, row.qty, activeMarket === 'kiwoom');
-    if (qty == null) {
-      setRowErr(row.code, `청산 수량/비율이 올바르지 않습니다: "${raw}"`);
+  // C2: full close ONLY. The dedicated /positions/{id}/close endpoints are
+  // the only routes that actually reduce the stored position (they delete
+  // it on success), so this is the one action guaranteed not to leave a
+  // stale, too-large quantity behind. A raw sell order for a partial
+  // amount does NOT touch the position store — see task-7-fix-findings.md
+  // C2 — so partial close is intentionally not offered here. Two-click
+  // confirm guards the destructive action (mirrors the existing
+  // CoinPositionPanel/KiwoomPositionPanel convention).
+  async function handleFullClose(row: Row) {
+    if (confirmClose !== row.code) {
+      setConfirmClose(row.code);
       return;
     }
+    setConfirmClose(null);
     setBusyRow(row.code);
     try {
       if (activeMarket === 'kiwoom') {
-        await createKRStockOrder({ stk_cd: row.code, side: 'sell', ord_type: 'market', quantity: qty });
+        await closeKRStockPosition(row.code);
       } else {
-        await createCoinOrder({ market: row.code, side: 'ask', ord_type: 'market', volume: qty });
+        await closeCoinPosition(row.code);
       }
       setRowErr(row.code, null);
-      setField(row, 'close', '');
       await refetch();
     } catch (e) {
-      setRowErr(row.code, `청산 주문 실패: ${e instanceof Error ? e.message : '요청 실패'}`);
+      setRowErr(row.code, `청산 실패: ${e instanceof Error ? e.message : '요청 실패'}`);
     } finally {
       setBusyRow(null);
     }
@@ -243,13 +260,16 @@ export function PositionsPanel() {
           <th className={TH}>%</th>
           <th className={TH}>STOP</th>
           <th className={TH}>TAKE</th>
-          <th className={TH}>청산</th>
+          <th className={TH} title="부분청산은 지원되지 않습니다 — 전량 매도만 가능합니다 (두 번 클릭하여 확인)">청산</th>
         </tr>
       </thead>
       <tbody>
         {rows.map((r, i) => {
-          const edit = editFor(r);
+          const rowEdit = edits[r.code];
+          const stopVal = editValue(r, rowEdit, 'stop');
+          const takeVal = editValue(r, rowEdit, 'take');
           const busy = busyRow === r.code;
+          const armed = confirmClose === r.code;
           return (
             <Fragment key={`${r.code}-${i}`}>
               <tr
@@ -271,8 +291,8 @@ export function PositionsPanel() {
                       type="text"
                       inputMode="decimal"
                       aria-label={`손절가 편집 ${r.code}`}
-                      value={edit.stop}
-                      onChange={(e) => setField(r, 'stop', e.target.value)}
+                      value={stopVal}
+                      onChange={(e) => setField(r.code, 'stop', e.target.value)}
                       placeholder={r.stop != null ? undefined : DASH}
                       className="w-16 bg-canvas border border-hairline rounded px-1 py-0.5 text-right text-[11px] tabular-nums text-ink"
                     />
@@ -293,8 +313,8 @@ export function PositionsPanel() {
                       type="text"
                       inputMode="decimal"
                       aria-label={`익절가 편집 ${r.code}`}
-                      value={edit.take}
-                      onChange={(e) => setField(r, 'take', e.target.value)}
+                      value={takeVal}
+                      onChange={(e) => setField(r.code, 'take', e.target.value)}
                       placeholder={r.take != null ? undefined : DASH}
                       className="w-16 bg-canvas border border-hairline rounded px-1 py-0.5 text-right text-[11px] tabular-nums text-ink"
                     />
@@ -310,25 +330,16 @@ export function PositionsPanel() {
                   </div>
                 </td>
                 <td className="text-right px-1.5 py-1" onClick={(e) => e.stopPropagation()}>
-                  <div className="flex items-center gap-1 justify-end">
-                    <input
-                      type="text"
-                      aria-label={`부분청산 수량 ${r.code}`}
-                      value={edit.close}
-                      onChange={(e) => setField(r, 'close', e.target.value)}
-                      placeholder="수량/%"
-                      className="w-14 bg-canvas border border-hairline rounded px-1 py-0.5 text-right text-[11px] tabular-nums text-ink placeholder:text-dim"
-                    />
-                    <button
-                      type="button"
-                      aria-label={`부분청산 실행 ${r.code}`}
-                      disabled={busy}
-                      onClick={() => handleClose(r)}
-                      className="text-warn text-[10px] font-medium disabled:opacity-50"
-                    >
-                      청산
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    aria-label={`전량청산 ${r.code}`}
+                    title="부분청산 미지원 — 전량 매도만 가능합니다"
+                    disabled={busy}
+                    onClick={() => handleFullClose(r)}
+                    className="text-warn text-[10px] font-medium disabled:opacity-50"
+                  >
+                    {armed ? '확인?' : '청산'}
+                  </button>
                 </td>
               </tr>
               {rowError[r.code] && (

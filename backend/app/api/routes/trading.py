@@ -386,14 +386,35 @@ async def update_position_stop_loss(
     stop_loss: float,
     coordinator=Depends(get_trading_coordinator),
 ):
-    """Update stop-loss for a position."""
-    coordinator.risk_monitor.update_stop_loss(ticker, stop_loss)
+    """
+    Update stop-loss for a position.
 
-    return {
-        "status": "updated",
-        "ticker": ticker,
-        "stop_loss": stop_loss,
-    }
+    T7 review C1 fix: this used to unconditionally return
+    {"status": "updated"} even when `ticker` was not tracked by
+    RiskMonitor — which is ALWAYS true for coin positions (they live in a
+    separate storage-backed table, `coin_positions`, and never enter
+    RiskMonitor's `_watching`). Now: try RiskMonitor first (the autonomy
+    surface); if that's a no-op, fall back to persisting directly into the
+    coin position store — the actual source `PositionsPanel` reads for
+    coin rows — so the edit takes real effect; if NEITHER surface knows
+    this ticker, raise an honest 404 instead of a fake success.
+    """
+    if coordinator.risk_monitor.update_stop_loss(ticker, stop_loss):
+        return {"status": "updated", "ticker": ticker, "stop_loss": stop_loss, "source": "risk_monitor"}
+
+    from services.storage_service import get_storage_service
+
+    storage = await get_storage_service()
+    market = ticker.upper()
+    if await storage.get_coin_position(market) and await storage.update_coin_position(
+        market, {"stop_loss": stop_loss}
+    ):
+        return {"status": "updated", "ticker": market, "stop_loss": stop_loss, "source": "coin_position_store"}
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"활성 리스크 관리 대상이 아니며 저장된 포지션도 없습니다: {ticker}",
+    )
 
 
 @router.put("/positions/{ticker}/take-profit")
@@ -402,14 +423,27 @@ async def update_position_take_profit(
     take_profit: float,
     coordinator=Depends(get_trading_coordinator),
 ):
-    """Update take-profit for a position."""
-    coordinator.risk_monitor.update_take_profit(ticker, take_profit)
+    """
+    Update take-profit for a position.
 
-    return {
-        "status": "updated",
-        "ticker": ticker,
-        "take_profit": take_profit,
-    }
+    See `update_position_stop_loss` — same honesty fix (T7 review C1).
+    """
+    if coordinator.risk_monitor.update_take_profit(ticker, take_profit):
+        return {"status": "updated", "ticker": ticker, "take_profit": take_profit, "source": "risk_monitor"}
+
+    from services.storage_service import get_storage_service
+
+    storage = await get_storage_service()
+    market = ticker.upper()
+    if await storage.get_coin_position(market) and await storage.update_coin_position(
+        market, {"take_profit": take_profit}
+    ):
+        return {"status": "updated", "ticker": market, "take_profit": take_profit, "source": "coin_position_store"}
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"활성 리스크 관리 대상이 아니며 저장된 포지션도 없습니다: {ticker}",
+    )
 
 
 # -------------------------------------------

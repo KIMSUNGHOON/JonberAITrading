@@ -179,17 +179,35 @@ class RiskMonitor:
             del self._watching[ticker]
             logger.info(f"[RiskMonitor] Stopped watching {ticker}")
 
-    def update_stop_loss(self, ticker: str, new_stop_loss: float):
-        """Update stop-loss for a position."""
+    def update_stop_loss(self, ticker: str, new_stop_loss: float) -> bool:
+        """
+        Update stop-loss for a position.
+
+        Returns:
+            True if `ticker` is being watched and the update was applied,
+            False otherwise (T7 review C1 — callers, e.g. the SL/TP API
+            route, must be able to tell a real update apart from a no-op
+            instead of assuming success unconditionally).
+        """
         if ticker in self._watching:
             self._watching[ticker].stop_loss = new_stop_loss
             logger.info(f"[RiskMonitor] Updated {ticker} stop-loss to {new_stop_loss}")
+            return True
+        return False
 
-    def update_take_profit(self, ticker: str, new_take_profit: float):
-        """Update take-profit for a position."""
+    def update_take_profit(self, ticker: str, new_take_profit: float) -> bool:
+        """
+        Update take-profit for a position.
+
+        Returns:
+            True if `ticker` is being watched and the update was applied,
+            False otherwise (see `update_stop_loss`).
+        """
         if ticker in self._watching:
             self._watching[ticker].take_profit = new_take_profit
             logger.info(f"[RiskMonitor] Updated {ticker} take-profit to {new_take_profit}")
+            return True
+        return False
 
     async def _monitor_loop(self):
         """Main monitoring loop."""
