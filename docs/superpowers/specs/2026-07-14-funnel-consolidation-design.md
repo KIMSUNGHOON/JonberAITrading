@@ -65,14 +65,14 @@ OrderTicketRail vs Operations '승인대기' — 둘 다 같은 submitApproval. 
 
 ## Phase 2 — 죽은/장식 위젯 정리 (통합과 독립, 즉시)
 - 삭제: `AgentWorkflowGraph/index.tsx`, `startAgentChatDiscussion`(client.ts) 또는 승격버튼에 배선, `setBasketUpdating` 죽은 액션.
-- DebatePanel: (a) 삭제 후 /agent-chat 딥링크 요약카드 대체, 또는 (b) WS 연결+토론개시 액션 추가. 현 고립 폴링 타일 유지 비권장. **결정 필요(사용자).**
+- DebatePanel **살리기(결정됨)**: `useAgentChatWebSocket` 연결(실시간 message/vote/status_change/decision push, 기존 5초 REST 폴링 대체) + 이 타일에 **토론 개시 액션** 추가(코디네이터 기동) + 결과 클릭 시 /agent-chat 세션뷰어 딥링크. 고립 장식 타일 → 실동작 관제 카드로.
 - 레거시 /positions KiwoomPositionPanel/CoinPositionPanel: 대시보드 PositionsPanel 부분집합 → 삭제 후보(KR은 P0-a 선행).
 - /trading WatchListWidget·TradeQueueWidget vs Operations '감시'/'매수대기': 이중 UI → 병합.
 
 ---
 
 ## 회귀 위험 / 검증
-- `TerminalDashboard.tsx` 타일 재편→localStorage 레이아웃 키(`jonber.dashboard.layout.v4`) 마이그레이션 필요(사용자 저장 레이아웃 보존 or 버전 범프).
+- `TerminalDashboard.tsx` 타일 재편→localStorage 레이아웃 키 **버전 범프 v4→v5(결정됨)**: 저장 레이아웃 초기화, 새 퍼널 기본 레이아웃으로 리셋(사용자 커스텀 1회 소실 수용). PanelId/TITLES/DEFAULT_LAYOUT/renderBody 4곳 정합 갱신.
 - OperationsPanel 섹션별 null+errors 정직강등 계약 유지(브로커/코디네이터/세션 3소스 혼합).
 - nav 'Watchlist' 재지정→딥링크/북마크 영향.
 - auto_promote 토글 노출 시 **자율 파이프라인이 실제로 켜짐** — HITL/master gate 상호작용 검증 필수, 사용자가 "승격→자율큐 흐름"을 인지하도록 UI 명시.
