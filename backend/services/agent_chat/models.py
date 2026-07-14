@@ -156,6 +156,14 @@ class MarketContext(BaseModel):
     current_price: float
     price_change_pct: float
 
+    # Data quality marker (CRITICAL safety fix, 2026-07-14): True when the
+    # underlying Kiwoom quote fetch failed and this context was built from
+    # safe defaults instead of a real quote (never a fabricated random-mock
+    # price). Callers (ChatCoordinator) MUST NOT start a discussion/vote on
+    # a stale context — agents would be debating and voting on invented
+    # numbers.
+    is_stale: bool = False
+
     # Technical data
     chart_data: Optional[List[Dict[str, Any]]] = None
     indicators: Optional[Dict[str, Any]] = None

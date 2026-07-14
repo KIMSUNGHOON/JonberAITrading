@@ -361,6 +361,141 @@ class TestGraphNodes:
         from agents.graph.kr_stock_nodes import kr_stock_data_collection_node
         assert callable(kr_stock_data_collection_node)
 
+
+class TestDataCollectionNodeGracefulDegrade:
+    """CRITICAL safety fix (2026-07-14): get_kr_stock_info/get_kr_daily_chart/
+    get_kr_orderbook now return None on a real Kiwoom fetch failure instead of
+    fabricated mock data. The data_collection node must degrade honestly —
+    safe empty defaults + a market_data_stale marker — never crash the graph
+    and never silently masquerade the gap as real data."""
+
+    @pytest.mark.asyncio
+    async def test_none_stock_info_sets_stale_marker_and_does_not_crash(self):
+        from agents.graph.kr_stock_nodes.data_collection import (
+            kr_stock_data_collection_node,
+        )
+
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "reasoning_log": [],
+        }
+
+        with (
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_kr_stock_info",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_kr_orderbook",
+                AsyncMock(return_value={}),
+            ),
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+        ):
+            result = await kr_stock_data_collection_node(state)
+
+        assert result["market_data_stale"] is True
+        assert result["market_data"] == {}
+        assert result["current_stage"] == KRStockAnalysisStage.DATA_COLLECTION
+        assert "error" not in result  # graceful degrade, not a hard graph error
+        # Falls back to the state-supplied stock name instead of blanking it
+        assert result["stk_nm"] == "삼성전자"
+
+    @pytest.mark.asyncio
+    async def test_all_three_none_still_completes_without_crash(self):
+        """chart_df=None and orderbook=None (in addition to stock_info=None)
+        must not raise (e.g. `.empty` on None) — the node must substitute
+        safe empty defaults for all three."""
+        from agents.graph.kr_stock_nodes.data_collection import (
+            kr_stock_data_collection_node,
+        )
+
+        state = {"stk_cd": "005930", "reasoning_log": []}
+
+        with (
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_kr_stock_info",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_kr_daily_chart",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_kr_orderbook",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+        ):
+            result = await kr_stock_data_collection_node(state)
+
+        assert result["market_data_stale"] is True
+        assert result["chart_df"] == []
+        assert result["orderbook"] == {}
+        assert result["current_stage"] == KRStockAnalysisStage.DATA_COLLECTION
+
+    @pytest.mark.asyncio
+    async def test_happy_path_unaffected(self):
+        """Real data flowing through must be completely unchanged by this
+        fix — market_data_stale must be False and real values pass through."""
+        from agents.graph.kr_stock_nodes.data_collection import (
+            kr_stock_data_collection_node,
+        )
+
+        state = {"stk_cd": "005930", "reasoning_log": []}
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": 0.5,
+        }
+        real_chart = pd.DataFrame(
+            {
+                "open": [70000],
+                "high": [71000],
+                "low": [69500],
+                "close": [70800],
+                "volume": [100000],
+            },
+            index=pd.date_range("2026-07-10", periods=1),
+        )
+
+        with (
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_kr_daily_chart",
+                AsyncMock(return_value=real_chart),
+            ),
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_kr_orderbook",
+                AsyncMock(return_value={"bid_ask_ratio": 1.1}),
+            ),
+            patch(
+                "agents.graph.kr_stock_nodes.data_collection.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+        ):
+            result = await kr_stock_data_collection_node(state)
+
+        assert result["market_data_stale"] is False
+        assert result["market_data"] == real_stock_info
+        assert result["stk_nm"] == "삼성전자"
+        assert len(result["chart_df"]) == 1
+        assert result["orderbook"] == {"bid_ask_ratio": 1.1}
+
     @pytest.mark.asyncio
     async def test_technical_analysis_node_exists(self):
         """Technical analysis node function should exist."""

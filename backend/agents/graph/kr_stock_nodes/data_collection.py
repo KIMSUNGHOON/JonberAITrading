@@ -6,6 +6,7 @@ Fetches market data and portfolio context from Kiwoom API.
 
 import time
 
+import pandas as pd
 import structlog
 from langchain_core.messages import AIMessage
 
@@ -39,14 +40,40 @@ async def kr_stock_data_collection_node(state: dict) -> dict:
     )
 
     try:
-        # Fetch stock info
+        # Fetch stock info. get_kr_stock_info/daily_chart/orderbook now
+        # return None on a real fetch failure instead of fabricating random
+        # mock data (CRITICAL safety fix, 2026-07-14) — that fabricated data
+        # used to flow straight into analysis/HITL/votes as if it were real.
+        # A None here must degrade honestly (empty/default values + a stale
+        # marker) rather than crash the graph or pretend the data is good.
         stock_info = await get_kr_stock_info(stk_cd)
+        market_data_stale = stock_info is None
+        if stock_info is None:
+            logger.error(
+                "kr_stock_data_collection_stock_info_unavailable",
+                stk_cd=stk_cd,
+            )
+            stock_info = {}
 
         # Fetch daily chart
         chart_df = await get_kr_daily_chart(stk_cd)
+        if chart_df is None:
+            logger.error(
+                "kr_stock_data_collection_chart_unavailable",
+                stk_cd=stk_cd,
+            )
+            market_data_stale = True
+            chart_df = pd.DataFrame()
 
         # Fetch orderbook
         orderbook = await get_kr_orderbook(stk_cd)
+        if orderbook is None:
+            logger.error(
+                "kr_stock_data_collection_orderbook_unavailable",
+                stk_cd=stk_cd,
+            )
+            market_data_stale = True
+            orderbook = {}
 
         # Fetch portfolio to check for existing position
         existing_position = None
@@ -108,7 +135,10 @@ async def kr_stock_data_collection_node(state: dict) -> dict:
                     "volume": int(row["volume"]),
                 })
 
-        stk_nm = stock_info.get("stk_nm", "")
+        # Fall back to the incoming state's stk_nm (e.g. user-supplied) when
+        # stock_info is degraded/empty, so a fetch failure doesn't blank out
+        # an otherwise-known stock name.
+        stk_nm = stock_info.get("stk_nm") or state.get("stk_nm", "")
         cur_prc = stock_info.get("cur_prc", 0)
         prdy_ctrt = stock_info.get("prdy_ctrt", 0)
 
@@ -121,12 +151,15 @@ async def kr_stock_data_collection_node(state: dict) -> dict:
                 f"수익률={existing_position['profit_loss_pct']:+.2f}%"
             )
 
+        stale_notice = " [경고: 일부 시세 데이터 조회 실패 — 최신값 아님, 보수적 판단 필요]" if market_data_stale else ""
+
         reasoning = (
             f"[데이터 수집] {stk_nm} ({stk_cd}): "
             f"현재가={cur_prc:,}원, "
             f"전일대비={prdy_ctrt:+.2f}%, "
             f"차트 {len(chart_data)}일치"
             f"{position_info}"
+            f"{stale_notice}"
         )
 
         duration_ms = (time.perf_counter() - start_time) * 1000
@@ -136,6 +169,7 @@ async def kr_stock_data_collection_node(state: dict) -> dict:
             stk_cd=stk_cd,
             stk_nm=stk_nm,
             has_position=existing_position is not None,
+            market_data_stale=market_data_stale,
             duration_ms=round(duration_ms, 2),
         )
 
@@ -144,6 +178,7 @@ async def kr_stock_data_collection_node(state: dict) -> dict:
             "market_data": stock_info,
             "chart_df": chart_data,
             "orderbook": orderbook,
+            "market_data_stale": market_data_stale,
             "existing_position": existing_position,
             "portfolio_summary": portfolio_summary,
             "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),

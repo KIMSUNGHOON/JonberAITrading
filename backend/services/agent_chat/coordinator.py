@@ -310,6 +310,18 @@ class ChatCoordinator:
             # Fetch market context
             context = await self._fetch_market_context(ticker, stock_name)
 
+            # A stale context means the real quote fetch failed — never
+            # start agents debating/voting on invented numbers (CRITICAL
+            # safety fix, 2026-07-14). Skip this cycle; _check_watch_list
+            # will retry the ticker on its next pass (no discussion was
+            # started, so it isn't throttled by _was_recently_discussed).
+            if context.is_stale:
+                logger.warning(
+                    "discussion_skipped_stale_market_data",
+                    ticker=ticker,
+                )
+                return
+
             # Create chat room
             room = ChatRoom(
                 ticker=ticker,
@@ -570,6 +582,8 @@ class ChatCoordinator:
         )
 
         try:
+            import pandas as pd
+
             from agents.tools.kr_market_data import (
                 get_kr_stock_info,
                 get_kr_daily_chart,
@@ -577,14 +591,36 @@ class ChatCoordinator:
             )
             from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 
-            # Fetch stock info
+            # Fetch stock info. get_kr_stock_info now returns None on a real
+            # fetch failure instead of a fabricated random-mock price
+            # (CRITICAL safety fix, 2026-07-14) — a None here means we have
+            # no real quote to debate/vote on, so return a stale-marked
+            # context immediately rather than building a discussion context
+            # on invented numbers.
             stock_info = await get_kr_stock_info(ticker)
+            if stock_info is None:
+                logger.error(
+                    "market_context_stock_info_unavailable",
+                    ticker=ticker,
+                )
+                return MarketContext(
+                    ticker=ticker,
+                    stock_name=stock_name,
+                    current_price=0,
+                    price_change_pct=0,
+                    is_stale=True,
+                )
 
             # Fetch chart data
             chart_df = await get_kr_daily_chart(ticker)
+            if chart_df is None:
+                logger.warning(
+                    "market_context_chart_unavailable",
+                    ticker=ticker,
+                )
+                chart_df = pd.DataFrame()
 
             # Calculate indicators
-            import pandas as pd
             if not chart_df.empty:
                 indicators = calculate_kr_technical_indicators(chart_df)
                 chart_data = [
@@ -681,12 +717,14 @@ class ChatCoordinator:
                 ticker=ticker,
                 error=str(e),
             )
-            # Return minimal context
+            # Return minimal context, marked stale so callers refuse to vote
+            # on it (CRITICAL safety fix, 2026-07-14).
             return MarketContext(
                 ticker=ticker,
                 stock_name=stock_name,
                 current_price=0,
                 price_change_pct=0,
+                is_stale=True,
             )
 
     # -------------------------------------------
@@ -731,6 +769,21 @@ class ChatCoordinator:
 
         # Fetch context
         context = await self._fetch_market_context(ticker, stock_name)
+
+        # A stale context means the real quote fetch failed — refuse to
+        # start a discussion that would debate/vote on invented numbers
+        # (CRITICAL safety fix, 2026-07-14). The API route maps ValueError
+        # to 409; PositionManager._trigger_discussion (wait=True caller)
+        # already catches generic Exception and logs, leaving the position
+        # monitored with its last-known stops — a safe degrade either way.
+        if context.is_stale:
+            logger.warning(
+                "manual_discussion_skipped_stale_market_data",
+                ticker=ticker,
+            )
+            raise ValueError(
+                f"시세 데이터 조회 실패로 {ticker} 토론을 시작할 수 없습니다 (stale market data)"
+            )
 
         # Create the room
         room = ChatRoom(

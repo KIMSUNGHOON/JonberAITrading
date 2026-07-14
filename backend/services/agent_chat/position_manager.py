@@ -458,11 +458,23 @@ class PositionManager:
         if not self._positions:
             return
 
-        # Update prices first
-        await self._update_prices()
+        # Update prices first. get_kr_stock_info now returns None on any
+        # fetch failure instead of a fabricated random-mock price (CRITICAL
+        # safety fix, 2026-07-14) — stale_tickers collects positions whose
+        # price could NOT be refreshed this cycle, so the stop-loss/take-
+        # profit check below is skipped for them rather than evaluated
+        # against a random number that could trigger a real defensive sell.
+        stale_tickers = await self._update_prices()
 
         # Check each position
         for ticker, position in list(self._positions.items()):
+            if ticker in stale_tickers:
+                logger.warning(
+                    "position_check_skipped_stale_price",
+                    ticker=ticker,
+                    current_price=position.current_price,
+                )
+                continue
             try:
                 await self._check_position(position)
             except Exception as e:
@@ -472,8 +484,16 @@ class PositionManager:
                     error=str(e),
                 )
 
-    async def _update_prices(self) -> None:
-        """Update current prices for all positions."""
+    async def _update_prices(self) -> set:
+        """Update current prices for all positions.
+
+        Returns the set of tickers whose price could NOT be refreshed this
+        cycle (get_kr_stock_info returned None/incomplete data, i.e. a real
+        fetch failure — never a fabricated mock price since the 2026-07-14
+        CRITICAL fix). Callers must skip stop-loss/take-profit evaluation
+        for those tickers this cycle and keep the last known price.
+        """
+        stale: set = set()
         try:
             from agents.tools.kr_market_data import get_kr_stock_info
 
@@ -483,15 +503,25 @@ class PositionManager:
                     if info and "cur_prc" in info:
                         new_price = info["cur_prc"]
                         self.update_position(ticker, current_price=new_price)
+                    else:
+                        stale.add(ticker)
+                        logger.warning(
+                            "price_update_stale",
+                            ticker=ticker,
+                            reason="fetch_returned_none_or_incomplete",
+                        )
                 except Exception as e:
+                    stale.add(ticker)
                     logger.warning(
                         "price_update_failed",
                         ticker=ticker,
                         error=str(e),
                     )
         except ImportError:
-            # Fallback: prices not updated
-            pass
+            # Fallback: prices not updated for anyone this cycle.
+            stale.update(self._positions.keys())
+
+        return stale
 
     async def _check_position(self, position: MonitoredPosition) -> None:
         """Check a single position for events."""

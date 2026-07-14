@@ -473,6 +473,136 @@ class TestEventDetection:
 
 
 # -------------------------------------------
+# Stale-Price Guard Tests (CRITICAL safety fix, 2026-07-14)
+# -------------------------------------------
+#
+# get_kr_stock_info now returns None on a real Kiwoom fetch failure instead
+# of a fabricated np.random-seeded mock price. Before this fix, a transient
+# Kiwoom hiccup would overwrite a HELD position's current_price with a
+# random number, and _check_position would then evaluate the stop-loss
+# distance against that fabricated price — potentially auto-executing a
+# real sell on invented data. These tests pin the new contract: a None
+# fetch must leave current_price untouched and skip this cycle's
+# stop-loss/take-profit check for that ticker, using the LAZY in-node
+# import convention (patch target is the source module
+# agents.tools.kr_market_data, not position_manager's namespace).
+
+
+class TestUpdatePricesStaleGuard:
+    """Tests for _update_prices / _check_all_positions handling of a None
+    (failed) price fetch."""
+
+    @pytest.mark.asyncio
+    async def test_update_prices_none_leaves_current_price_unchanged(
+        self, position_manager
+    ):
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=72500,
+        )
+
+        with patch(
+            "agents.tools.kr_market_data.get_kr_stock_info",
+            AsyncMock(return_value=None),
+        ):
+            stale = await position_manager._update_prices()
+
+        position = position_manager._positions["005930"]
+        assert position.current_price == 72500  # unchanged, not fabricated
+        assert "005930" in stale
+
+    @pytest.mark.asyncio
+    async def test_update_prices_success_still_updates_price(
+        self, position_manager
+    ):
+        """Happy path: a real fetch must still update current_price exactly
+        as before this fix."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=72500,
+        )
+
+        with patch(
+            "agents.tools.kr_market_data.get_kr_stock_info",
+            AsyncMock(return_value={"stk_cd": "005930", "cur_prc": 73000}),
+        ):
+            stale = await position_manager._update_prices()
+
+        position = position_manager._positions["005930"]
+        assert position.current_price == 73000
+        assert stale == set()
+
+    @pytest.mark.asyncio
+    async def test_check_all_positions_skips_stop_loss_on_stale_price(
+        self, position_manager
+    ):
+        """A position whose current_price is already below its stop_loss
+        (from the last successful fetch) must NOT re-fire STOP_LOSS_HIT
+        this cycle when the price refresh fails — the check itself must be
+        skipped, not merely the price update."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=68000,  # already below stop_loss
+            stop_loss=68875,
+        )
+
+        events = []
+        position_manager.on_event(lambda e: events.append(e))
+
+        with patch(
+            "agents.tools.kr_market_data.get_kr_stock_info",
+            AsyncMock(return_value=None),
+        ):
+            await position_manager._check_all_positions()
+
+        stop_loss_events = [
+            e for e in events if e.event_type == PositionEventType.STOP_LOSS_HIT
+        ]
+        assert stop_loss_events == []
+
+        position = position_manager._positions["005930"]
+        assert position.current_price == 68000  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_check_all_positions_still_checks_fresh_price(
+        self, position_manager
+    ):
+        """Happy path: when the fetch succeeds, the stop-loss check must
+        still run exactly as before."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=72500,
+            stop_loss=68875,
+        )
+
+        events = []
+        position_manager.on_event(lambda e: events.append(e))
+
+        with patch(
+            "agents.tools.kr_market_data.get_kr_stock_info",
+            AsyncMock(return_value={"stk_cd": "005930", "cur_prc": 68000}),
+        ):
+            await position_manager._check_all_positions()
+
+        stop_loss_events = [
+            e for e in events if e.event_type == PositionEventType.STOP_LOSS_HIT
+        ]
+        assert len(stop_loss_events) >= 1
+
+
+# -------------------------------------------
 # Trailing Stop Tests
 # -------------------------------------------
 

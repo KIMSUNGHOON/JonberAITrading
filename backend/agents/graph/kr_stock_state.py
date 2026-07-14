@@ -261,6 +261,13 @@ class KRStockTradingState(TypedDict, total=False):
     chart_df: Optional[list[dict]]  # Daily chart data as list of dicts
     orderbook: Optional[dict]  # Orderbook data
 
+    # Data quality marker (CRITICAL safety fix, 2026-07-14): True when one or
+    # more of market_data/chart_df/orderbook could NOT be fetched this cycle
+    # (get_kr_* returned None) and the graph proceeded with safe empty
+    # defaults instead of crashing or substituting fabricated mock data.
+    # Downstream nodes/consumers should treat a stale run as low-confidence.
+    market_data_stale: bool
+
     # Portfolio context (NEW - fetched during data collection)
     existing_position: Optional[dict]  # User's current position in this stock
     portfolio_summary: Optional[dict]  # Overall portfolio summary

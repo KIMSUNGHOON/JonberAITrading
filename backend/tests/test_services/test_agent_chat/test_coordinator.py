@@ -4,6 +4,7 @@ Tests for ChatCoordinator
 Unit tests for the ChatCoordinator that manages multiple chat rooms.
 """
 
+import pandas as pd
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -254,7 +255,7 @@ class TestManualDiscussion:
     """Tests for manual discussion triggering."""
 
     @pytest.mark.asyncio
-    async def test_start_manual_discussion(self, coordinator):
+    async def test_start_manual_discussion(self, coordinator, mock_market_context):
         """Test starting a manual discussion."""
         with patch('services.agent_chat.coordinator.ChatRoom') as MockRoom:
             mock_session = MagicMock()
@@ -273,7 +274,12 @@ class TestManualDiscussion:
             MockRoom.return_value = mock_room_instance
 
             with patch.object(coordinator, '_fetch_market_context') as mock_context:
-                mock_context.return_value = AsyncMock()
+                # A real (non-stale) MarketContext — a bare AsyncMock() stood
+                # in here before the 2026-07-14 CRITICAL safety fix, and its
+                # auto-mocked `.is_stale` attribute is truthy, which would
+                # now (correctly) make start_manual_discussion refuse to
+                # start a discussion on "stale" data.
+                mock_context.return_value = mock_market_context
 
                 session = await coordinator.start_manual_discussion(
                     ticker="005930",
@@ -294,6 +300,108 @@ class TestManualDiscussion:
                 ticker="005930",
                 stock_name="삼성전자",
             )
+
+
+# -------------------------------------------
+# Stale Market Data Tests (CRITICAL safety fix, 2026-07-14)
+# -------------------------------------------
+#
+# get_kr_stock_info now returns None on a real Kiwoom fetch failure instead
+# of a fabricated np.random-seeded mock price. _fetch_market_context must
+# translate that into an is_stale=True MarketContext, and both discussion
+# entry points must refuse to start agents debating/voting on it.
+
+
+class TestStaleMarketContext:
+    """Tests for _fetch_market_context's handling of a failed quote fetch."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_market_context_none_stock_info_is_stale(self, coordinator):
+        with patch(
+            "agents.tools.kr_market_data.get_kr_stock_info",
+            AsyncMock(return_value=None),
+        ):
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.is_stale is True
+        assert context.current_price == 0
+
+    @pytest.mark.asyncio
+    async def test_fetch_market_context_success_is_not_stale(self, coordinator):
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": 0.5,
+        }
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+        ):
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.is_stale is False
+        assert context.current_price == 72500
+
+
+class TestStaleMarketContextBlocksDiscussion:
+    """Both discussion entry points must refuse to proceed on stale data."""
+
+    @pytest.mark.asyncio
+    async def test_start_manual_discussion_raises_on_stale_context(self, coordinator):
+        stale_context = MarketContext(
+            ticker="005930",
+            stock_name="삼성전자",
+            current_price=0,
+            price_change_pct=0,
+            is_stale=True,
+        )
+        with patch.object(coordinator, "_fetch_market_context") as mock_context:
+            mock_context.return_value = stale_context
+
+            with pytest.raises(ValueError, match="stale"):
+                await coordinator.start_manual_discussion(
+                    ticker="005930",
+                    stock_name="삼성전자",
+                )
+
+        # No room should have been created/left active for this ticker.
+        assert "005930" not in coordinator._active_rooms
+
+    @pytest.mark.asyncio
+    async def test_start_discussion_skips_room_on_stale_context(self, coordinator):
+        """The auto watch-list path (_start_discussion) must skip creating a
+        ChatRoom on stale data — no exception, just a no-op (it will be
+        retried on the next _check_watch_list pass)."""
+        stale_context = MarketContext(
+            ticker="005930",
+            stock_name="삼성전자",
+            current_price=0,
+            price_change_pct=0,
+            is_stale=True,
+        )
+        with (
+            patch.object(coordinator, "_fetch_market_context") as mock_context,
+            patch("services.agent_chat.coordinator.ChatRoom") as MockRoom,
+        ):
+            mock_context.return_value = stale_context
+
+            await coordinator._start_discussion(
+                {"ticker": "005930", "stock_name": "삼성전자"}
+            )
+
+        MockRoom.assert_not_called()
+        assert "005930" not in coordinator._active_rooms
 
 
 # -------------------------------------------

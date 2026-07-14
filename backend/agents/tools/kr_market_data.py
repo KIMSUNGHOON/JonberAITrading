@@ -28,7 +28,7 @@ def _to_python_float(value, default: float = 0.0) -> float:
     return float(value)
 
 
-async def get_kr_stock_info(stk_cd: str) -> dict:
+async def get_kr_stock_info(stk_cd: str) -> Optional[dict]:
     """
     Get Korean stock basic information via Kiwoom API.
 
@@ -36,7 +36,12 @@ async def get_kr_stock_info(stk_cd: str) -> dict:
         stk_cd: Stock code (e.g., "005930" for Samsung Electronics)
 
     Returns:
-        Dictionary with stock info
+        Dictionary with stock info, or None if the fetch failed. A failure
+        MUST NOT be papered over with fabricated (random-mock) data — this
+        return value feeds analysis, HITL approval, agent-chat votes, and
+        held-position stop-loss checks, so callers must treat None as "no
+        real data this cycle" and degrade honestly (skip/hold), never
+        substitute invented numbers (CRITICAL safety fix, 2026-07-14).
     """
     try:
         client = await get_shared_kiwoom_client_async()
@@ -67,10 +72,10 @@ async def get_kr_stock_info(stk_cd: str) -> dict:
 
     except Exception as e:
         logger.error("kr_stock_info_error", stk_cd=stk_cd, error=str(e))
-        return _get_mock_kr_stock_info(stk_cd)
+        return None
 
 
-async def get_kr_current_price(stk_cd: str) -> int:
+async def get_kr_current_price(stk_cd: str) -> Optional[int]:
     """
     Get current price for a Korean stock.
 
@@ -78,19 +83,19 @@ async def get_kr_current_price(stk_cd: str) -> int:
         stk_cd: Stock code
 
     Returns:
-        Current price in KRW
+        Current price in KRW, or None if the fetch failed. Never a
+        fabricated random price (CRITICAL safety fix, 2026-07-14) — callers
+        must not treat None as a real quote.
     """
     try:
         client = await get_shared_kiwoom_client_async()
         return await client.get_current_price(stk_cd)
     except Exception as e:
         logger.error("kr_current_price_error", stk_cd=stk_cd, error=str(e))
-        # Return mock price based on stock code
-        np.random.seed(hash(stk_cd) % 2**32)
-        return int(np.random.uniform(10000, 500000))
+        return None
 
 
-async def get_kr_orderbook(stk_cd: str) -> dict:
+async def get_kr_orderbook(stk_cd: str) -> Optional[dict]:
     """
     Get orderbook data for a Korean stock.
 
@@ -98,7 +103,8 @@ async def get_kr_orderbook(stk_cd: str) -> dict:
         stk_cd: Stock code
 
     Returns:
-        Orderbook dictionary
+        Orderbook dictionary, or None if the fetch failed (never fabricated
+        mock data — CRITICAL safety fix, 2026-07-14).
     """
     try:
         client = await get_shared_kiwoom_client_async()
@@ -127,13 +133,13 @@ async def get_kr_orderbook(stk_cd: str) -> dict:
 
     except Exception as e:
         logger.error("kr_orderbook_error", stk_cd=stk_cd, error=str(e))
-        return _get_mock_kr_orderbook(stk_cd)
+        return None
 
 
 async def get_kr_daily_chart(
     stk_cd: str,
     base_dt: Optional[str] = None,
-) -> pd.DataFrame:
+) -> Optional[pd.DataFrame]:
     """
     Get daily chart data for a Korean stock.
 
@@ -142,7 +148,8 @@ async def get_kr_daily_chart(
         base_dt: Base date (YYYYMMDD), None for today
 
     Returns:
-        DataFrame with OHLCV data
+        DataFrame with OHLCV data, or None if the fetch failed (never a
+        fabricated mock chart — CRITICAL safety fix, 2026-07-14).
     """
     try:
         client = await get_shared_kiwoom_client_async()
@@ -158,7 +165,7 @@ async def get_kr_daily_chart(
 
     except Exception as e:
         logger.error("kr_daily_chart_error", stk_cd=stk_cd, error=str(e))
-        return _generate_mock_kr_chart(stk_cd)
+        return None
 
 
 async def get_kr_account_balance() -> dict:
@@ -395,6 +402,18 @@ def format_kr_market_data_for_llm(
 
 # -------------------------------------------
 # Mock Data Generation (for testing/offline)
+#
+# NOTE (CRITICAL safety fix, 2026-07-14): these generators are no longer
+# reachable from any exception path above — get_kr_stock_info/current_price/
+# orderbook/daily_chart now return None on failure instead of silently
+# fabricating random data (which used to feed analysis, HITL, agent-chat
+# votes, and held-position stop-loss checks with numbers that could trigger
+# a real sell on a transient Kiwoom hiccup). The shared Kiwoom client
+# (get_shared_kiwoom_client_async) always returns a real client whose
+# is_mock flag is baked in at the HTTP layer (KIWOOM_IS_MOCK routes to the
+# mock REST server), so there is no legitimate "no-client" code path in this
+# module that needs these helpers — they are kept only for direct
+# unit-testing / offline exploration and are otherwise dead code.
 # -------------------------------------------
 
 
