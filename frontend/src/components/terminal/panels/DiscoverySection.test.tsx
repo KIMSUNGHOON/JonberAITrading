@@ -10,6 +10,11 @@
  *    useStartAnalysis's start(...).
  *  - Scratchpad (client `basket` store slice): add/list + the same two
  *    actions per row.
+ *  - Scratchpad price polling + row-click chart link (re-homed from the
+ *    deleted standalone WatchlistPanel tile, dashboard-widget-cull
+ *    2026-07-14 §C-1/§C-2): batched getCoinTickers/getKRStockTickers →
+ *    updateBasketItemPrice, including the KR early-return-skip guard for a
+ *    per-code null in the batch response.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
@@ -22,6 +27,8 @@ const getScanProgress = vi.fn();
 const getScanResults = vi.fn();
 const addToWatchList = vi.fn();
 const searchKRStocks = vi.fn();
+const getCoinTickers = vi.fn();
+const getKRStockTickers = vi.fn();
 
 vi.mock('@/api/client', () => ({
   startScan: (...a: unknown[]) => startScan(...a),
@@ -32,6 +39,8 @@ vi.mock('@/api/client', () => ({
   getScanResults: (...a: unknown[]) => getScanResults(...a),
   addToWatchList: (...a: unknown[]) => addToWatchList(...a),
   searchKRStocks: (...a: unknown[]) => searchKRStocks(...a),
+  getCoinTickers: (...a: unknown[]) => getCoinTickers(...a),
+  getKRStockTickers: (...a: unknown[]) => getKRStockTickers(...a),
 }));
 
 const mockStart = vi.fn();
@@ -87,7 +96,12 @@ beforeEach(() => {
   getScanProgress.mockResolvedValue(baseProgress());
   getScanResults.mockResolvedValue({ results: [], count: 0, total: 0, filter: null });
   searchKRStocks.mockResolvedValue({ stocks: [], total: 0 });
-  useStore.setState({ basket: { items: [], maxItems: 10, isUpdating: false } });
+  useStore.setState({
+    basket: { items: [], maxItems: 10, isUpdating: false },
+    upbitApiConfigured: false,
+    kiwoomApiConfigured: false,
+    chartSymbol: null,
+  });
 });
 
 describe('DiscoverySection — scanner controls', () => {
@@ -239,5 +253,253 @@ describe('DiscoverySection — Scratchpad', () => {
     fireEvent.change(screen.getByPlaceholderText(/종목코드/), { target: { value: '000660' } });
     fireEvent.click(screen.getByRole('button', { name: '추가' }));
     await waitFor(() => expect(useStore.getState().basket.items.some((i) => i.ticker === '000660')).toBe(true));
+  });
+});
+
+// -------------------------------------------------------------------------
+// Re-homed from the deleted standalone WatchlistPanel tile
+// (dashboard-widget-cull, 2026-07-14 §C-1/§C-2): the row-click chart link and
+// the 30s batch price polling — including the KR early-return-skip guard a
+// per-code null in the batch response must not blank/crash the panel — were
+// WatchlistPanel's only two features DiscoverySection's Scratchpad lacked.
+// Both are now wired directly into DiscoverySection; these tests replace
+// WatchlistPanel.test.tsx (deleted along with the panel it covered).
+// -------------------------------------------------------------------------
+
+describe('DiscoverySection — Scratchpad row click sets chart symbol (re-homed from WatchlistPanel)', () => {
+  function krItem(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'item-005930',
+      marketType: 'kiwoom' as const,
+      ticker: '005930',
+      displayName: '삼성전자',
+      price: 71000,
+      prevPrice: 0,
+      changeRate: 0,
+      change: 'EVEN' as const,
+      addedAt: new Date(),
+      lastUpdated: null,
+      isLoading: false,
+      error: null,
+      ...overrides,
+    };
+  }
+
+  it('행 클릭이 setChartSymbol(ticker)을 호출한다', async () => {
+    useStore.setState({ basket: { items: [krItem()], maxItems: 10, isUpdating: false } });
+    render(<DiscoverySection />);
+    fireEvent.click(screen.getByText('삼성전자'));
+    await waitFor(() => expect(useStore.getState().chartSymbol).toBe('005930'));
+  });
+
+  it('chartSymbol과 일치하는 활성 행에 하이라이트 클래스가 적용된다', async () => {
+    useStore.setState({
+      basket: { items: [krItem()], maxItems: 10, isUpdating: false },
+      chartSymbol: '005930',
+    });
+    render(<DiscoverySection />);
+    const row = screen.getByText('삼성전자').closest('div[title="차트에 표시"]');
+    expect(row).not.toBeNull();
+    expect(row).toHaveClass('bg-elevated/60');
+    await waitFor(() => expect(getScanProgress).toHaveBeenCalled());
+  });
+
+  it('승격/분석 버튼 클릭은 행 클릭(차트 이동)으로 전파되지 않는다', async () => {
+    useStore.setState({ basket: { items: [krItem()], maxItems: 10, isUpdating: false } });
+    mockStart.mockResolvedValue('session-1');
+    render(<DiscoverySection />);
+    fireEvent.click(screen.getByRole('button', { name: /분석.*005930/ }));
+    await waitFor(() => expect(mockStart).toHaveBeenCalled());
+    expect(useStore.getState().chartSymbol).toBeNull();
+  });
+});
+
+describe('DiscoverySection — Scratchpad price polling (re-homed KR-price-fallback regression from WatchlistPanel.test.tsx)', () => {
+  function krItem(overrides: Record<string, unknown> = {}) {
+    return {
+      id: `item-${overrides.ticker ?? '005930'}`,
+      marketType: 'kiwoom' as const,
+      ticker: '005930',
+      displayName: '삼성전자',
+      price: 0,
+      prevPrice: 0,
+      changeRate: 0,
+      change: 'EVEN' as const,
+      addedAt: new Date(),
+      lastUpdated: null,
+      isLoading: false,
+      error: null,
+      ...overrides,
+    };
+  }
+
+  function coinItem(overrides: Record<string, unknown> = {}) {
+    return {
+      id: `item-${overrides.ticker ?? 'KRW-BTC'}`,
+      marketType: 'coin' as const,
+      ticker: 'KRW-BTC',
+      displayName: '비트코인',
+      price: 0,
+      prevPrice: 0,
+      changeRate: 0,
+      change: 'EVEN' as const,
+      addedAt: new Date(),
+      lastUpdated: null,
+      isLoading: false,
+      error: null,
+      ...overrides,
+    };
+  }
+
+  function krTicker(overrides: Record<string, unknown> = {}) {
+    return {
+      stk_cd: '005930',
+      stk_nm: '삼성전자',
+      cur_prc: 71000,
+      prdy_vrss: 500,
+      prdy_ctrt: 1.23,
+      opng_prc: 70500,
+      high_prc: 71200,
+      low_prc: 70200,
+      trde_qty: 1000,
+      trde_prica: 71000000,
+      per: null,
+      pbr: null,
+      eps: null,
+      bps: null,
+      timestamp: '2026-07-13T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  it('갱신 폴 이후 KR 종목의 가격/등락률이 getKRStockTickers 배치 호출로 갱신된다', async () => {
+    useStore.setState({
+      kiwoomApiConfigured: true,
+      basket: { items: [krItem()], maxItems: 10, isUpdating: false },
+    });
+    getKRStockTickers.mockResolvedValue({
+      tickers: { '005930': krTicker() },
+      total: 1,
+    });
+
+    render(<DiscoverySection />);
+
+    await waitFor(() => expect(getKRStockTickers).toHaveBeenCalledWith(['005930']));
+    await waitFor(() => expect(screen.getByText('₩71,000')).toBeInTheDocument());
+    expect(screen.getByText('+1.23%')).toBeInTheDocument();
+  });
+
+  it('여러 KR 종목이 있어도 배치 호출은 한 번만 발생한다 (N건이 아니라 1건)', async () => {
+    useStore.setState({
+      kiwoomApiConfigured: true,
+      basket: {
+        items: [
+          krItem({ id: 'item-005930', ticker: '005930', displayName: '삼성전자' }),
+          krItem({ id: 'item-000660', ticker: '000660', displayName: 'SK하이닉스' }),
+        ],
+        maxItems: 10,
+        isUpdating: false,
+      },
+    });
+    getKRStockTickers.mockResolvedValue({
+      tickers: {
+        '005930': krTicker(),
+        '000660': krTicker({ stk_cd: '000660', stk_nm: 'SK하이닉스', cur_prc: 150000, prdy_ctrt: -0.5 }),
+      },
+      total: 2,
+    });
+
+    render(<DiscoverySection />);
+
+    await waitFor(() => expect(screen.getByText('₩71,000')).toBeInTheDocument());
+    expect(screen.getByText('₩150,000')).toBeInTheDocument();
+    // Exactly ONE batch call for both symbols — not one call per symbol.
+    expect(getKRStockTickers).toHaveBeenCalledTimes(1);
+    expect(getKRStockTickers).toHaveBeenCalledWith(['005930', '000660']);
+  });
+
+  it('kiwoomApiConfigured가 false면 KR 폴을 시도하지 않는다', async () => {
+    useStore.setState({
+      kiwoomApiConfigured: false,
+      basket: { items: [krItem()], maxItems: 10, isUpdating: false },
+    });
+
+    render(<DiscoverySection />);
+
+    await waitFor(() => expect(getScanProgress).toHaveBeenCalled());
+    expect(getKRStockTickers).not.toHaveBeenCalled();
+  });
+
+  it('일부 KR 종목이 배치 응답에서 null이어도 패널이 죽지 않고 나머지는 갱신된다', async () => {
+    useStore.setState({
+      kiwoomApiConfigured: true,
+      basket: {
+        items: [
+          krItem({ id: 'item-005930', ticker: '005930', displayName: '삼성전자' }),
+          krItem({ id: 'item-000660', ticker: '000660', displayName: 'SK하이닉스' }),
+        ],
+        maxItems: 10,
+        isUpdating: false,
+      },
+    });
+    getKRStockTickers.mockResolvedValue({
+      tickers: {
+        '005930': krTicker(),
+        '000660': null, // honest per-code degrade — never fabricated
+      },
+      total: 1,
+    });
+
+    render(<DiscoverySection />);
+
+    await waitFor(() => expect(screen.getByText('₩71,000')).toBeInTheDocument());
+    // Null ticker keeps its last-known (missing) price — honest DASH, no crash.
+    expect(screen.getByText('SK하이닉스')).toBeInTheDocument();
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+  });
+
+  it('배치 호출 자체가 실패해도 패널이 죽지 않는다', async () => {
+    useStore.setState({
+      kiwoomApiConfigured: true,
+      basket: { items: [krItem()], maxItems: 10, isUpdating: false },
+    });
+    getKRStockTickers.mockRejectedValue(new Error('kiwoom rate limit'));
+
+    render(<DiscoverySection />);
+
+    await waitFor(() => expect(getKRStockTickers).toHaveBeenCalled());
+    // Still renders the row with its last-known (initial) price, no crash.
+    expect(screen.getByText('삼성전자')).toBeInTheDocument();
+  });
+
+  it('coin 종목은 기존처럼 getCoinTickers로 갱신된다', async () => {
+    useStore.setState({
+      upbitApiConfigured: true,
+      basket: { items: [coinItem()], maxItems: 10, isUpdating: false },
+    });
+    getCoinTickers.mockResolvedValue({
+      tickers: [
+        {
+          market: 'KRW-BTC',
+          trade_price: 50_000_000,
+          change: 'RISE',
+          change_rate: 0.012,
+          change_price: 600_000,
+          high_price: 50_500_000,
+          low_price: 49_000_000,
+          trade_volume: 10,
+          acc_trade_price_24h: 1_000_000_000,
+          timestamp: '2026-07-13T00:00:00Z',
+        },
+      ],
+      total: 1,
+    });
+
+    render(<DiscoverySection />);
+
+    await waitFor(() => expect(getCoinTickers).toHaveBeenCalledWith(['KRW-BTC']));
+    await waitFor(() => expect(screen.getByText('₩50,000,000')).toBeInTheDocument());
+    expect(screen.getByText('+1.20%')).toBeInTheDocument();
+    expect(getKRStockTickers).not.toHaveBeenCalled();
   });
 });

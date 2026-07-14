@@ -26,14 +26,16 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useShallow } from 'zustand/shallow';
-import { useStore, selectBasketItems, type BasketItem, type MarketType } from '@/store';
+import { useStore, selectBasketItems, selectChartSymbol, type BasketItem, type MarketType } from '@/store';
 import {
   startScan, pauseScan, resumeScan, stopScan,
   getScanProgress, getScanResults, addToWatchList, searchKRStocks,
+  getCoinTickers, getKRStockTickers,
 } from '@/api/client';
 import { useStartAnalysis } from '@/hooks/useStartAnalysis';
+import { changeColor } from '@/utils/pnl';
 import type { ScanProgressResponse, ScanResultItem, KRStockInfo } from '@/types';
-import { Awaiting, DASH, fmtPrice } from './shared';
+import { Awaiting, DASH, fmtPct, fmtPrice } from './shared';
 
 const POLL_MS = 5_000;
 const TOP_N = 10;
@@ -170,14 +172,103 @@ function useScratchpadAdd() {
 }
 
 // -------------------------------------------
+// Scratchpad price polling — re-homed from the former standalone Watchlist
+// tile (merged in, P2 dashboard-cull). Batched (ONE request per market per
+// poll, not one-per-symbol), 30s cadence, gated on the relevant API being
+// configured. Unlike the old tile, the Scratchpad shows items from BOTH
+// markets at once (no activeMarket filter) — so both effects run
+// independently, each keyed on its own ticker subset, rather than one effect
+// gated on a single activeMarket.
+// -------------------------------------------
+
+function useScratchpadPricePolling(basketItems: BasketItem[]) {
+  const upbitApiConfigured = useStore((s) => s.upbitApiConfigured);
+  const kiwoomApiConfigured = useStore((s) => s.kiwoomApiConfigured);
+  const updateBasketItemPrice = useStore((s) => s.updateBasketItemPrice);
+
+  const coinTickers = basketItems.filter((i) => i.marketType === 'coin').map((i) => i.ticker);
+  const krTickers = basketItems.filter((i) => i.marketType === 'kiwoom').map((i) => i.ticker);
+
+  // Coin prices (batched, gated on Upbit config).
+  useEffect(() => {
+    if (!upbitApiConfigured || coinTickers.length === 0) return;
+
+    let alive = true;
+    async function run() {
+      try {
+        const res = await getCoinTickers(coinTickers);
+        if (!alive) return;
+        res.tickers.forEach((t) => {
+          updateBasketItemPrice(
+            t.market,
+            t.trade_price,
+            t.change_rate * 100,
+            t.change as 'RISE' | 'FALL' | 'EVEN',
+          );
+        });
+      } catch {
+        /* keep last known prices; do not fabricate */
+      }
+    }
+    run();
+    const id = setInterval(run, 30_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+    // ticker identity changes each render; key on the joined ticker set instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [upbitApiConfigured, coinTickers.join(','), updateBasketItemPrice]);
+
+  // KR prices in ONE batch call (P1-7) instead of one request per symbol. A
+  // code that fails to fetch maps to `null` in the response — that item MUST
+  // keep its last known price rather than being blanked (the KR
+  // early-return-skip guard WatchlistPanel.test.tsx regression-tested; kept
+  // here verbatim across the merge).
+  useEffect(() => {
+    if (!kiwoomApiConfigured || krTickers.length === 0) return;
+
+    let alive = true;
+    async function run() {
+      try {
+        const res = await getKRStockTickers(krTickers);
+        if (!alive) return;
+        Object.values(res.tickers).forEach((t) => {
+          if (!t) return; // keep last known price; do not fabricate
+          updateBasketItemPrice(
+            t.stk_cd,
+            t.cur_prc,
+            t.prdy_ctrt,
+            t.prdy_ctrt > 0 ? 'RISE' : t.prdy_ctrt < 0 ? 'FALL' : 'EVEN',
+          );
+        });
+      } catch {
+        /* keep last known prices; do not fabricate */
+      }
+    }
+    run();
+    const id = setInterval(run, 30_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+    // ticker identity changes each render; key on the joined ticker set instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kiwoomApiConfigured, krTickers.join(','), updateBasketItemPrice]);
+}
+
+// -------------------------------------------
 // Main
 // -------------------------------------------
 
 export function DiscoverySection() {
   const { progress, results, refetch } = useScanState();
   const basketItems = useStore(useShallow(selectBasketItems));
+  const chartSymbol = useStore(selectChartSymbol);
+  const setChartSymbol = useStore((s) => s.setChartSymbol);
   const startAnalysis = useStartAnalysis();
   const scratchpad = useScratchpadAdd();
+  useScratchpadPricePolling(basketItems);
 
   const [autoPromote, setAutoPromote] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -436,15 +527,28 @@ export function DiscoverySection() {
             <Awaiting label="스크래치패드 비어있음 — 종목을 추가하세요" />
           ) : (
             basketItems.map((item) => (
-              <div key={item.id} className="flex items-center justify-between gap-2 px-2.5 py-1.5 border-b border-hairline/40">
+              <div
+                key={item.id}
+                onClick={() => setChartSymbol(item.ticker)}
+                title="차트에 표시"
+                className={`flex items-center justify-between gap-2 px-2.5 py-1.5 border-b border-hairline/40 cursor-pointer hover:bg-elevated/40 ${
+                  chartSymbol === item.ticker ? 'bg-elevated/60' : ''
+                }`}
+              >
                 <div className="flex-1 min-w-0">
                   <span className="font-semibold">{item.displayName}</span>
                   <span className="text-dim text-[10px] ml-1">{item.ticker}</span>
                 </div>
+                <div className="flex items-center gap-2 flex-none text-[10px] tabular-nums">
+                  <span>{fmtPrice(item.price, item.marketType)}</span>
+                  <span className={changeColor(item.change)}>
+                    {item.price > 0 ? fmtPct(item.changeRate) : DASH}
+                  </span>
+                </div>
                 <div className="flex gap-2 flex-none">
                   <button
                     type="button"
-                    onClick={() => handlePromoteItem(item)}
+                    onClick={(e) => { e.stopPropagation(); handlePromoteItem(item); }}
                     disabled={item.marketType !== 'kiwoom'}
                     aria-label={`승격 ${item.ticker}`}
                     title={item.marketType !== 'kiwoom' ? '서버 워치리스트는 KR 전용입니다' : '서버 워치리스트에 등록'}
@@ -454,7 +558,7 @@ export function DiscoverySection() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => handleAnalyzeItem(item)}
+                    onClick={(e) => { e.stopPropagation(); handleAnalyzeItem(item); }}
                     aria-label={`분석 ${item.ticker}`}
                     title="분석 시작"
                     className="text-up font-medium"

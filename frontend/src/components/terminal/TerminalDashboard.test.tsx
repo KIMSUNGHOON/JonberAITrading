@@ -1,10 +1,12 @@
 /**
- * TerminalDashboard registration (P2 funnel-consolidation Task 5) — pins
- * that the new 'funnel' PanelId is wired at all 4 required sites (PanelId /
+ * TerminalDashboard registration (P2 funnel-consolidation Task 5; layout
+ * pruned 8→6 leaves by the dashboard-widget-cull pass, 2026-07-14) — pins
+ * that the 'funnel' PanelId is wired at all 4 required sites (PanelId /
  * TITLES / DEFAULT_LAYOUT / renderBody — a missed site is a crash or a
- * blank tile) and that the mosaic layout storage key was bumped v4→v5 so
- * any previously-saved layout (which doesn't know about 'funnel') is reset
- * to the new default rather than silently hiding the funnel panel forever.
+ * blank tile) and that the mosaic layout storage key was bumped v5→v6 so
+ * any previously-saved layout (which may reference the now-removed
+ * 'scanner'/'watchlist'/'operations' leaves) is reset to the new default
+ * rather than rendering a blank/undefined tile.
  *
  * These exercise the exported pure data (TITLES/DEFAULT_LAYOUT/renderBody)
  * directly rather than mounting the full <TerminalDashboard/> tree, so the
@@ -23,13 +25,15 @@ import { FunnelPanel } from './panels/FunnelPanel';
 function leavesOf(node: MosaicNode<PanelId>): PanelId[] {
   if (typeof node === 'string') return [node];
   if (!('children' in node)) return []; // tabs nodes unused by DEFAULT_LAYOUT
-  const [a, b] = node.children;
-  return [...leavesOf(a), ...leavesOf(b)];
+  // Split nodes are n-ary (react-mosaic's MosaicSplitNode.children is an
+  // array, not a fixed pair) — DEFAULT_LAYOUT nests 3- and 4-child splits,
+  // so this must walk every child, not just the first two.
+  return node.children.flatMap(leavesOf);
 }
 
-describe('TerminalDashboard — mosaic layout v5 + funnel registration', () => {
-  it('bumps the layout storage key to v5 (resets any v4-saved layout that predates the funnel panel)', () => {
-    expect(STORAGE_KEY).toBe('jonber.dashboard.layout.v5');
+describe('TerminalDashboard — mosaic layout v6 + funnel registration', () => {
+  it('bumps the layout storage key to v6 (resets any v5-saved layout that references the removed scanner/watchlist/operations leaves)', () => {
+    expect(STORAGE_KEY).toBe('jonber.dashboard.layout.v6');
   });
 
   it('registers "funnel" in the DEFAULT_LAYOUT tree', () => {
@@ -51,5 +55,15 @@ describe('TerminalDashboard — mosaic layout v5 + funnel registration', () => {
       expect(TITLES[id]).toBeTruthy();
       expect(renderBody(id)).toBeDefined();
     }
+  });
+
+  it('is trimmed to exactly 6 leaves — scanner/watchlist/operations are gone', () => {
+    const leaves = leavesOf(DEFAULT_LAYOUT);
+    expect(leaves.sort()).toEqual(
+      ['chart', 'debate', 'funnel', 'performance', 'portfolio', 'positions'].sort()
+    );
+    expect(leaves).not.toContain('scanner');
+    expect(leaves).not.toContain('watchlist');
+    expect(leaves).not.toContain('operations');
   });
 });
