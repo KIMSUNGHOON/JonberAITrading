@@ -217,6 +217,24 @@ class RiskParameters(BaseModel):
         description="% change to trigger sudden move alert"
     )
 
+    # Sudden-move pause is PER-TICKER and auto-recovering (M1, C2 audit
+    # 2026-07-13) — it does NOT use the global pause()/resume() kill-switch,
+    # so one stock's dead-candle can no longer freeze stop-loss defense for
+    # the whole book. See RiskMonitor._handle_sudden_move / _check_position.
+    sudden_move_cooldown_ticks: int = Field(
+        default=5,
+        ge=1, le=100,
+        description="Monitor ticks a ticker's stop-loss/take-profit stays "
+                     "paused after a sudden move, before auto-recovering"
+    )
+    sudden_move_stabilization_pct: float = Field(
+        default=3.0,
+        ge=0.1, le=30.0,
+        description="If a ticker's tick-to-tick price move falls at/under "
+                     "this %% while cooling down, it auto-recovers early "
+                     "(before sudden_move_cooldown_ticks elapses)"
+    )
+
     # Trading limits
     max_daily_trades: int = Field(
         default=10,

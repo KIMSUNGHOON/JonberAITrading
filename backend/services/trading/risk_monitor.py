@@ -213,19 +213,48 @@ class RiskMonitor:
         # Calculate price change
         change_pct = ((current_price - config.entry_price) / config.entry_price) * 100
 
-        # Check for sudden moves
+        # Tick-to-tick move, used both to DETECT a new sudden move and to
+        # judge whether an in-progress per-ticker cooldown has stabilized.
+        tick_change_pct = 0.0
         if config.last_price > 0:
-            sudden_change = abs(
+            tick_change_pct = abs(
                 (current_price - config.last_price) / config.last_price * 100
             )
-            if sudden_change >= self.risk_params.sudden_move_threshold_pct:
+            if tick_change_pct >= self.risk_params.sudden_move_threshold_pct:
+                # M1 (C2 audit 2026-07-13): pause THIS ticker only — does
+                # NOT touch _trading_mode or any other watched ticker. The
+                # old code called the GLOBAL pause() here, which froze
+                # stop-loss/take-profit checks for the entire book over one
+                # ticker's dead-candle.
                 await self._handle_sudden_move(ticker, config, current_price, change_pct)
                 config.last_price = current_price
                 return
 
+        # This ticker is cooling down from its OWN prior sudden move.
+        # Auto-recovers after N monitor ticks OR once price stabilizes
+        # (volatility at/under sudden_move_stabilization_pct) — no human
+        # RESUME required.
+        if config.sudden_move_cooldown_ticks > 0:
+            config.sudden_move_cooldown_ticks -= 1
+            stabilized = tick_change_pct <= self.risk_params.sudden_move_stabilization_pct
+            if config.sudden_move_cooldown_ticks > 0 and not stabilized:
+                config.last_price = current_price
+                return
+            config.sudden_move_cooldown_ticks = 0
+            logger.info(
+                f"[RiskMonitor] {ticker} sudden-move cooldown cleared "
+                f"({'price stabilized' if stabilized else 'tick-count elapsed'}); "
+                "stop-loss/take-profit resumed automatically"
+            )
+            # Fall through: re-evaluate stop-loss/take-profit with the
+            # current price in this same tick.
+
         config.last_price = current_price
 
-        # Skip trigger checks if paused
+        # Manual/global kill-switch (ExecutionCoordinator.pause()/resume(),
+        # the alert "RESUME" action) — unrelated to the per-ticker
+        # sudden-move cooldown above. Still intentionally gates ALL tickers
+        # when an operator explicitly pauses the whole book.
         if self._trading_mode == TradingMode.PAUSED:
             return
 
@@ -244,7 +273,17 @@ class RiskMonitor:
         current_price: float,
         change_pct: float,
     ):
-        """Handle sudden price movement."""
+        """Handle sudden price movement.
+
+        Pauses stop-loss/take-profit checks for THIS ticker only, via
+        `config.sudden_move_cooldown_ticks` (M1, C2 audit 2026-07-13). This
+        deliberately does NOT call the global `pause()` — that API is kept
+        as a separate manual/operator kill-switch (ExecutionCoordinator.
+        pause()/resume(), the alert "RESUME" action), which still legitimately
+        gates every ticker when invoked explicitly. The per-ticker cooldown
+        set here auto-clears in `_check_position` after N monitor ticks or
+        once price stabilizes — no human action required.
+        """
         direction = "up" if change_pct > 0 else "down"
         alert_type = AlertType.SUDDEN_MOVE_UP if change_pct > 0 else AlertType.SUDDEN_MOVE_DOWN
 
@@ -253,10 +292,12 @@ class RiskMonitor:
             f"{change_pct:+.1f}% ({current_price})"
         )
 
-        # Pause trading
-        await self.pause(f"Sudden {direction} move in {ticker}: {change_pct:+.1f}%")
+        # Per-ticker pause + auto-recovery — NOT the global pause().
+        config.sudden_move_cooldown_ticks = self.risk_params.sudden_move_cooldown_ticks
 
-        # Create alert
+        # Create alert. "RESUME" is intentionally omitted: recovery is now
+        # automatic and per-ticker, and the global resume() would not clear
+        # this ticker's cooldown anyway.
         alert = TradingAlert(
             id=str(uuid.uuid4())[:8],
             alert_type=alert_type,
@@ -271,7 +312,7 @@ class RiskMonitor:
                 "direction": direction,
             },
             action_required=True,
-            options=["RESUME", "CLOSE_POSITION", "ADJUST_STOP_LOSS"],
+            options=["CLOSE_POSITION", "ADJUST_STOP_LOSS"],
         )
 
         await self._add_alert(alert)
@@ -515,3 +556,14 @@ class WatchConfig:
         self.take_profit = take_profit
         self.stop_loss_mode = stop_loss_mode
         self.last_price = last_price
+
+        # M1 (C2 audit 2026-07-13): remaining monitor ticks this ticker's
+        # OWN stop-loss/take-profit checks stay paused after a sudden move.
+        # 0 = not paused. Set by RiskMonitor._handle_sudden_move, decremented
+        # and auto-cleared by RiskMonitor._check_position — per-ticker only,
+        # independent of the global _trading_mode.
+        self.sudden_move_cooldown_ticks: int = 0
+
+    @property
+    def is_sudden_move_paused(self) -> bool:
+        return self.sudden_move_cooldown_ticks > 0
