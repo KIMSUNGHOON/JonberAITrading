@@ -29,15 +29,14 @@ vi.mock('@/hooks/useStartAnalysis', () => ({
 }));
 const navigate = vi.fn();
 vi.mock('react-router-dom', () => ({ useNavigate: () => navigate }));
-let mockState: Record<string, unknown>;
-vi.mock('@/store', async () => {
-  const actual = await vi.importActual<object>('@/store');
-  return {
-    ...actual,
-    useStore: (sel: (s: unknown) => unknown) => sel(mockState),
-  };
-});
 
+// T7 review HIGH #1/#2 fix: the REAL store is used (not a bare-vi.fn()
+// mock of setActiveKiwoomSession/setAwaitingApproval) so the reachability
+// tests below actually exercise setActiveKiwoomSession's cache-miss no-op /
+// coin's single-slot limitation instead of masking them behind a mock that
+// always "succeeds". See store/index.ts injectAwaitingKiwoomSession /
+// focusAwaitingCoinSession.
+import { useStore } from '@/store';
 import { OperationsPanel } from './OperationsPanel';
 
 const BASE = {
@@ -48,11 +47,24 @@ const BASE = {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockState = {
+  // Full, isolated reset of both market slices — a real singleton store
+  // persists mutations across tests within this file otherwise, and the
+  // reachability tests below depend on starting from a clean sessions[]/
+  // activeSessionId every time.
+  useStore.setState({
     activeMarket: 'kiwoom',
-    setActiveKiwoomSession: vi.fn(),
-    setAwaitingApproval: vi.fn(),
-  };
+    kiwoom: {
+      sessions: [], activeSessionId: null, maxConcurrentSessions: 3,
+      stk_cd: '', stk_nm: null, status: 'idle', currentStage: null,
+      reasoningLog: [], analyses: [], tradeProposal: null, awaitingApproval: false,
+      activePosition: null, error: null, history: [],
+    },
+    coin: {
+      activeSessionId: null, market: '', koreanName: null, status: 'idle',
+      currentStage: null, reasoningLog: [], analyses: [], tradeProposal: null,
+      awaitingApproval: false, activePosition: null, error: null, history: [],
+    },
+  });
 });
 
 it('전 컬럼 헤더와 카운트를 렌더한다', async () => {
@@ -79,11 +91,17 @@ it('전 컬럼 헤더와 카운트를 렌더한다', async () => {
 // 승인/거부/취소 buttons — the SAME submitApproval endpoint was previously
 // reachable from here AND from the global OrderTicketRail simultaneously.
 // This column is now a read-only summary: clicking a row focuses that
-// session (setActiveKiwoomSession + setAwaitingApproval, which re-syncs the
-// rail's legacy proposal mirror from the session's own per-session state)
-// and navigates to its workflow view, where the rail is docked. See
+// session and navigates to its workflow view, where the rail is docked. See
 // OrderTicketRail.test.tsx for the retained approve/reject/cancel coverage.
-it('승인대기 항목에는 승인/거부/취소 버튼이 없다 — 클릭하면 세션을 포커스하고 주문 레일로 이동한다', async () => {
+//
+// T7 review HIGH #1: this session was NEVER added to kiwoom.sessions[] — it
+// reached AWAITING_APPROVAL purely server-side (autonomous trigger / another
+// tab / watch-monitor reanalysis) and the poll is the ONLY place this tab
+// has seen it. The pre-fix handler (setActiveKiwoomSession) would silently
+// no-op here since the session isn't cached — asserting on the REAL store
+// (not a bare mock) is what makes that regression visible.
+it('승인대기 항목에는 승인/거부/취소 버튼이 없다 — 클릭하면 로컬 캐시에 없어도 세션을 레일에 포커스하고 주문 레일로 이동한다 (캐시 miss No-op 봉합)', async () => {
+  expect(useStore.getState().kiwoom.sessions).toHaveLength(0); // precondition: NOT cached
   getOperations.mockResolvedValue({
     ...BASE,
     awaiting: [{ session_id: 's2', ticker: '000660', name: 'SK하이닉스',
@@ -99,8 +117,12 @@ it('승인대기 항목에는 승인/거부/취소 버튼이 없다 — 클릭�
   expect(screen.queryByRole('button', { name: '취소' })).not.toBeInTheDocument();
 
   fireEvent.click(screen.getByText('SK하이닉스'));
-  expect(mockState.setActiveKiwoomSession).toHaveBeenCalledWith('s2');
-  expect(mockState.setAwaitingApproval).toHaveBeenCalledWith(true);
+
+  const state = useStore.getState();
+  expect(state.kiwoom.activeSessionId).toBe('s2'); // NOT a no-op
+  expect(state.kiwoom.sessions.find((s) => s.sessionId === 's2')).toBeTruthy(); // injected
+  expect(state.kiwoom.awaitingApproval).toBe(true);
+  expect(state.kiwoom.tradeProposal).toMatchObject({ action: 'WATCH', entry_price: 1968000, stk_cd: '000660', stk_nm: 'SK하이닉스' });
   expect(navigate).toHaveBeenCalledWith('/workflow/s2');
   // The approval decision itself is NEVER submitted from this surface.
   expect(submitApproval).not.toHaveBeenCalled();
@@ -157,7 +179,12 @@ it('미체결 조회 실패 시 헤더는 조회 실패, 살아있는 큐 항목
   expect(screen.getByRole('button', { name: '대기 취소' })).toBeInTheDocument();
 });
 
-it('세션이 두 개 이상 승인대기 중이어도 각 행이 각자의 세션으로 포커스한다 (전부 도달 가능)', async () => {
+// T7 review HIGH #1 (continued): with TWO concurrent kiwoom awaiting
+// sessions, neither cached locally, each row click must target ITS OWN
+// session on the rail (both individually reachable), and switching between
+// them must actually retarget the rail (not stick to whichever was
+// clicked first).
+it('세션이 두 개 이상 승인대기 중이어도 각 행이 각자의 세션으로 포커스한다 (전부 도달 가능, 캐시 miss여도)', async () => {
   getOperations.mockResolvedValue({
     ...BASE,
     awaiting: [
@@ -169,12 +196,20 @@ it('세션이 두 개 이상 승인대기 중이어도 각 행이 각자의 세�
   });
   render(<OperationsPanel />);
   await waitFor(() => expect(screen.getByText(/승인대기 · 2/)).toBeInTheDocument());
+
   fireEvent.click(screen.getByText('삼성전자'));
-  expect(mockState.setActiveKiwoomSession).toHaveBeenCalledWith('s5');
+  expect(useStore.getState().kiwoom.activeSessionId).toBe('s5');
+  expect(useStore.getState().kiwoom.tradeProposal).toMatchObject({ action: 'BUY', entry_price: 70000 });
   expect(navigate).toHaveBeenCalledWith('/workflow/s5');
+
   fireEvent.click(screen.getByText('SK하이닉스'));
-  expect(mockState.setActiveKiwoomSession).toHaveBeenCalledWith('s4');
+  expect(useStore.getState().kiwoom.activeSessionId).toBe('s4');
+  expect(useStore.getState().kiwoom.tradeProposal).toMatchObject({ action: 'WATCH', entry_price: 1968000 });
   expect(navigate).toHaveBeenCalledWith('/workflow/s4');
+
+  // Both sessions ended up injected — neither click was a no-op.
+  const sessionIds = useStore.getState().kiwoom.sessions.map((s) => s.sessionId);
+  expect(sessionIds).toEqual(expect.arrayContaining(['s4', 's5']));
 });
 
 it('actionable=false인 승인대기 항목은 버튼 없이 상태 불일치만 안내하고, 클릭 시에도 여전히 레일로 포커스한다 (좀비 부활 방지 정보는 유지, 액션은 이중화하지 않음)', async () => {
@@ -191,7 +226,24 @@ it('actionable=false인 승인대기 항목은 버튼 없이 상태 불일치만
   expect(screen.queryByRole('button', { name: '거부' })).not.toBeInTheDocument();
   expect(screen.queryByRole('button', { name: '취소' })).not.toBeInTheDocument();
   fireEvent.click(screen.getByText('삼성전자'));
-  expect(mockState.setActiveKiwoomSession).toHaveBeenCalledWith('s6');
+  expect(useStore.getState().kiwoom.activeSessionId).toBe('s6');
+  expect(submitApproval).not.toHaveBeenCalled();
+});
+
+// T7 review HIGH #1/#2 fix, requirement #4: when the row genuinely lacks
+// proposal detail (a real state-inconsistency case, not a cache issue), the
+// click must surface an HONEST error rather than silently pretending the
+// rail now shows something.
+it('proposal이 없는 승인대기 행은 클릭 시 무음 no-op 대신 오류 배너를 표시한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    awaiting: [{ session_id: 's7', ticker: '005930', name: '삼성전자',
+                 proposal: null, auto_approve_at: null }],
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
+  fireEvent.click(screen.getByText('삼성전자'));
+  await screen.findByText(/제안 데이터가 없어 주문 레일에 표시할 수 없습니다/);
   expect(submitApproval).not.toHaveBeenCalled();
 });
 
@@ -297,4 +349,47 @@ it('큐가 비어있으면 Process 버튼을 렌더하지 않는다', async () =
   render(<OperationsPanel />);
   await waitFor(() => expect(screen.getByText(/매수대기 · 1/)).toBeInTheDocument());
   expect(screen.queryByRole('button', { name: 'Process' })).not.toBeInTheDocument();
+});
+
+// -------------------------------------------
+// T7 review HIGH #2: coin has no sessions[] array — a single active-session
+// slot. Two concurrent AWAITING_APPROVAL coin sessions both render a row,
+// but the slot can only ever reflect one. Before this fix, clicking the
+// row that ISN'T the currently-focused one was a pure no-op (no store
+// action existed to retarget the slot from a row the FE never started/
+// streamed itself) — the second session's approval had no path. This pins
+// that BOTH are individually reachable (one at a time, per the spec).
+// -------------------------------------------
+
+it('coin: 두 개의 동시 승인대기 세션이 있어도 각 행 클릭이 그 세션을 레일에 포커스한다 (두 번째 세션도 도달 가능)', async () => {
+  useStore.setState({ activeMarket: 'coin' });
+  getOperations.mockResolvedValue({
+    ...BASE,
+    awaiting: [
+      { session_id: 'c1', ticker: 'KRW-BTC', name: '비트코인',
+        proposal: { action: 'BUY', entry_price: 100_000_000, stop_loss: 95_000_000, take_profit: 110_000_000, risk_score: 4 },
+        auto_approve_at: null },
+      { session_id: 'c2', ticker: 'KRW-ETH', name: '이더리움',
+        proposal: { action: 'BUY', entry_price: 4_000_000, stop_loss: 3_800_000, take_profit: 4_400_000, risk_score: 3 },
+        auto_approve_at: null },
+    ],
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/승인대기 · 2/)).toBeInTheDocument());
+
+  fireEvent.click(screen.getByText('비트코인'));
+  expect(useStore.getState().coin.activeSessionId).toBe('c1');
+  expect(useStore.getState().coin.tradeProposal).toMatchObject({ market: 'KRW-BTC', korean_name: '비트코인', entry_price: 100_000_000 });
+  expect(useStore.getState().coin.awaitingApproval).toBe(true);
+  expect(navigate).toHaveBeenCalledWith('/workflow/c1');
+
+  fireEvent.click(screen.getByText('이더리움'));
+  expect(useStore.getState().coin.activeSessionId).toBe('c2');
+  expect(useStore.getState().coin.tradeProposal).toMatchObject({ market: 'KRW-ETH', korean_name: '이더리움', entry_price: 4_000_000 });
+  expect(useStore.getState().coin.awaitingApproval).toBe(true);
+  expect(navigate).toHaveBeenCalledWith('/workflow/c2');
+
+  // Switching back to the first must retarget again (proves it's not stuck).
+  fireEvent.click(screen.getByText('비트코인'));
+  expect(useStore.getState().coin.activeSessionId).toBe('c1');
 });

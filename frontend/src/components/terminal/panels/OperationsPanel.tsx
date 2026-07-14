@@ -32,7 +32,7 @@ import {
 } from '@/api/client';
 import { useTradeNotifications } from '@/hooks/useTradeNotifications';
 import { useStartAnalysis } from '@/hooks/useStartAnalysis';
-import type { OperationsResponse } from '@/types';
+import type { OperationsResponse, OperationsAwaiting } from '@/types';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
 
@@ -187,19 +187,27 @@ function AwaitingCountdown({ autoApproveAt }: { autoApproveAt: string }) {
 // Resolution: OrderTicketRail is the ONE authoritative approval surface
 // (it's global/always-docked, unlike this column which only appears inside
 // whichever panel is currently tiled in). This column is now a read-only
-// summary — clicking a row calls `onFocus`, which makes that session the
-// active one (mirroring its own per-session tradeProposal/awaitingApproval
-// into the legacy fields OrderTicketRail reads — see setActiveKiwoomSession)
-// and navigates to its workflow view, where the rail shows the full ticket
-// with APPROVE/REJECT/Cancel Analysis. No action (approve/reject/cancel) is
-// lost — all three remain reachable, just from a single place.
+// summary — clicking a row calls `onFocus` with the row's OWN data, which
+// targets that session on the rail and navigates to its workflow view. No
+// action (approve/reject/cancel) is lost — all three remain reachable, just
+// from a single place.
+//
+// T7 review HIGH #1/#2 fix: `onFocus` takes the FULL row (not just
+// session_id). This column's rows come from the server /operations poll —
+// a session can land here without ever touching this tab's local FE cache
+// (kiwoom.sessions[], only populated by rehydrateKiwoomSessions at mount +
+// this tab's own WS handlers; coin has no per-session cache at all, just one
+// active slot). Passing only the id let the old handler silently no-op on a
+// cache miss (kiwoom) or clobber-vs-ignore a second concurrent session
+// (coin) — see handleFocusAwaiting below, which now seeds the store
+// straight from this row so the click is NEVER a no-op.
 export function AwaitingColumn({
   items, errors, activeMarket, onFocus,
 }: {
   items: OperationsResponse['awaiting'];
   errors: Record<string, string>;
   activeMarket: 'kiwoom' | 'coin';
-  onFocus: (sessionId: string) => void;
+  onFocus: (row: OperationsAwaiting) => void;
 }) {
   if (!columnVisible(items, 'sessions', errors)) return null;
   return (
@@ -218,8 +226,8 @@ export function AwaitingColumn({
             key={a.session_id}
             role="button"
             tabIndex={0}
-            onClick={() => onFocus(a.session_id)}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onFocus(a.session_id); } }}
+            onClick={() => onFocus(a)}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onFocus(a); } }}
             title="주문 레일에서 승인/거부/취소를 처리합니다"
             className={`${CARD} cursor-pointer hover:bg-elevated/40`}
           >
@@ -511,8 +519,8 @@ export function TodayFillsColumn({
 
 export function useOperationsActions(refetch: () => void, navigate: (path: string) => void) {
   const activeMarket = useStore((s) => s.activeMarket);
-  const setActiveKiwoomSession = useStore((s) => s.setActiveKiwoomSession);
-  const setAwaitingApproval = useStore((s) => s.setAwaitingApproval);
+  const injectAwaitingKiwoomSession = useStore((s) => s.injectAwaitingKiwoomSession);
+  const focusAwaitingCoinSession = useStore((s) => s.focusAwaitingCoinSession);
   const startAnalysis = useStartAnalysis();
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -529,21 +537,38 @@ export function useOperationsActions(refetch: () => void, navigate: (path: strin
 
   // Task 7: routes an awaiting session into the ONE authoritative approval
   // surface (OrderTicketRail) instead of submitting approve/reject/cancel
-  // directly from this read-only summary column. For kiwoom, making the
-  // session the ACTIVE one re-syncs the rail's legacy tradeProposal/
-  // awaitingApproval mirror from that session's own per-session fields (see
-  // setActiveKiwoomSession in store/index.ts) — those fields are already kept
-  // current per-session by the live WS handlers regardless of which session
-  // is active, so switching + navigating is enough to surface the full
-  // ticket. Coin has no sessions[] array to switch (a single tracked
-  // session) — navigating there is sufficient.
-  const handleFocusAwaiting = useCallback((sessionId: string) => {
-    if (activeMarket === 'kiwoom') {
-      setActiveKiwoomSession(sessionId);
-      setAwaitingApproval(true);
+  // directly from this read-only summary column.
+  //
+  // T7 review HIGH #1/#2 fix: this used to only switch the ACTIVE session id
+  // and trust that session's own local cache to already carry the right
+  // tradeProposal/awaitingApproval — which silently no-ops for kiwoom on a
+  // cache miss (setActiveKiwoomSession returns unchanged state when the
+  // session isn't in kiwoom.sessions[], stranding the approval with NO
+  // error) and can't even represent a second concurrent coin session at all
+  // (coin has no sessions[] array, just one slot). Both fixed the same way:
+  // seed the store straight from the ROW's own data (id/ticker/name/
+  // proposal/auto_approve_at — everything the poll already gave us) via
+  // injectAwaitingKiwoomSession/focusAwaitingCoinSession, so the click NEVER
+  // depends on local cache state. If the row itself lacks a proposal (a
+  // genuine state-inconsistency case — see `actionable`), focusing can't
+  // produce a renderable ticket; surface that honestly instead of pretending
+  // it worked.
+  const handleFocusAwaiting = useCallback((row: OperationsAwaiting) => {
+    if (!row.proposal) {
+      setActionError('제안 데이터가 없어 주문 레일에 표시할 수 없습니다 (취소는 워크플로 화면에서 가능)');
+    } else {
+      const seed = {
+        sessionId: row.session_id, ticker: row.ticker, name: row.name,
+        proposal: row.proposal, autoApproveAt: row.auto_approve_at,
+      };
+      if (activeMarket === 'kiwoom') {
+        injectAwaitingKiwoomSession(seed);
+      } else {
+        focusAwaitingCoinSession(seed);
+      }
     }
-    navigate(`/workflow/${sessionId}`);
-  }, [activeMarket, setActiveKiwoomSession, setAwaitingApproval, navigate]);
+    navigate(`/workflow/${row.session_id}`);
+  }, [activeMarket, injectAwaitingKiwoomSession, focusAwaitingCoinSession, navigate, setActionError]);
 
   const handleConvertWatch = useCallback(async (watchId: string) => {
     try {

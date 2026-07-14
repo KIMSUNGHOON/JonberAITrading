@@ -87,7 +87,24 @@ beforeEach(() => {
   getScanResults.mockResolvedValue({ results: [], count: 0, total: 0, filter: null });
   searchKRStocks.mockResolvedValue({ stocks: [], total: 0 });
   getOperations.mockResolvedValue({ ...OPERATIONS_BASE });
-  useStore.setState({ basket: { items: [], maxItems: 10, isUpdating: false }, activeMarket: 'kiwoom' });
+  useStore.setState({
+    basket: { items: [], maxItems: 10, isUpdating: false },
+    activeMarket: 'kiwoom',
+    // T7 review HIGH #1/#2: reset both market slices so each test starts
+    // from a clean sessions[]/activeSessionId — a real singleton store
+    // otherwise carries a prior test's injected/focused session forward.
+    kiwoom: {
+      sessions: [], activeSessionId: null, maxConcurrentSessions: 3,
+      stk_cd: '', stk_nm: null, status: 'idle', currentStage: null,
+      reasoningLog: [], analyses: [], tradeProposal: null, awaitingApproval: false,
+      activePosition: null, error: null, history: [],
+    },
+    coin: {
+      activeSessionId: null, market: '', koreanName: null, status: 'idle',
+      currentStage: null, reasoningLog: [], analyses: [], tradeProposal: null,
+      awaitingApproval: false, activePosition: null, error: null, history: [],
+    },
+  });
 });
 
 describe('FunnelPanel — assembly', () => {
@@ -235,7 +252,16 @@ describe('FunnelPanel — PIPELINE section (honest-degrade preserved)', () => {
   // OperationsPanel and the global OrderTicketRail). Clicking a row here
   // only focuses the session + navigates to its workflow view, where the
   // rail is docked and handles the actual decision.
-  it('승인대기 항목에는 승인/거부/취소 버튼이 없다 — 클릭하면 주문 레일로 이동한다 (PIPELINE 재사용, 이중화 제거 확인)', async () => {
+  //
+  // T7 review HIGH #1 fix: this session is deliberately NOT in
+  // kiwoom.sessions[] (FunnelPanel never called startKiwoomSession/
+  // addKiwoomSession for it — it reached AWAITING_APPROVAL purely via the
+  // /operations poll, e.g. an autonomous trigger this tab never streamed).
+  // The pre-fix handler would have silently no-op'd here; asserting on the
+  // REAL store (imported above, not a bare-fn mock) is what makes that
+  // regression visible.
+  it('승인대기 항목에는 승인/거부/취소 버튼이 없다 — 클릭하면 캐시에 없는 세션도 레일에 포커스하고 이동한다 (PIPELINE 재사용, 캐시 miss 봉합 확인)', async () => {
+    expect(useStore.getState().kiwoom.sessions.find((s) => s.sessionId === 's2')).toBeUndefined();
     getOperations.mockResolvedValue({
       ...OPERATIONS_BASE,
       awaiting: [{ session_id: 's2', ticker: '000660', name: 'SK하이닉스',
@@ -252,6 +278,12 @@ describe('FunnelPanel — PIPELINE section (honest-degrade preserved)', () => {
     fireEvent.click(screen.getByText('SK하이닉스'));
     expect(navigate).toHaveBeenCalledWith('/workflow/s2');
     expect(submitApproval).not.toHaveBeenCalled();
+
+    const state = useStore.getState();
+    expect(state.kiwoom.activeSessionId).toBe('s2'); // NOT a silent no-op
+    expect(state.kiwoom.sessions.find((s) => s.sessionId === 's2')).toBeTruthy();
+    expect(state.kiwoom.awaitingApproval).toBe(true);
+    expect(state.kiwoom.tradeProposal).toMatchObject({ action: 'WATCH', entry_price: 1968000 });
   });
 
   // Task 8b: backported from the removed /trading TradeQueueWidget —

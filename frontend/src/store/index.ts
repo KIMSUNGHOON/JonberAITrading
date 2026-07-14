@@ -50,6 +50,59 @@ function generateUUID(): string {
 }
 
 // -------------------------------------------
+// Awaiting-row → TradeProposal reconstruction (approval-reachability fix,
+// T7 review HIGH #1/#2)
+// -------------------------------------------
+// The /operations poll (OperationsPanel's AwaitingColumn — see
+// backend/app/api/routes/trading.py _slim_proposal/_PROPOSAL_SLIM_KEYS)
+// sends a slimmed proposal Record per session that carries every field the
+// OrderTicketRail actually renders (action/qty/entry/stop/take/risk/
+// rationale/bull/bear/id/created_at) but omits the proposal's OWN symbol
+// fields for BOTH markets (kiwoom stk_cd/stk_nm, coin market/korean_name —
+// neither pair is in the backend's slim allowlist). The row's OWN top-level
+// ticker/name (populated from the SESSION, not the proposal) fill that gap,
+// so a clicked row can always be turned into a rail-renderable proposal
+// without a round-trip — even for a session never cached locally.
+function buildProposalFromAwaitingRow(
+  row: { sessionId: string; ticker: string; name: string | null; proposal: Record<string, unknown> | null },
+  marketType: 'kiwoom' | 'coin',
+): KRStockTradeProposal | CoinTradeProposal | null {
+  const p = row.proposal;
+  if (!p) return null;
+  const base = {
+    id: typeof p.id === 'string' ? p.id : row.sessionId,
+    action: (typeof p.action === 'string' ? p.action : 'HOLD') as KRStockTradeProposal['action'],
+    quantity: typeof p.quantity === 'number' ? p.quantity : 0,
+    entry_price: typeof p.entry_price === 'number' ? p.entry_price : null,
+    stop_loss: typeof p.stop_loss === 'number' ? p.stop_loss : null,
+    take_profit: typeof p.take_profit === 'number' ? p.take_profit : null,
+    risk_score: typeof p.risk_score === 'number' ? p.risk_score : 0,
+    position_size_pct: typeof p.position_size_pct === 'number' ? p.position_size_pct : 0,
+    rationale: typeof p.rationale === 'string' ? p.rationale : '',
+    bull_case: typeof p.bull_case === 'string' ? p.bull_case : '',
+    bear_case: typeof p.bear_case === 'string' ? p.bear_case : '',
+    created_at: typeof p.created_at === 'string' ? p.created_at : new Date().toISOString(),
+  };
+  if (marketType === 'kiwoom') {
+    return { ...base, stk_cd: row.ticker, stk_nm: row.name };
+  }
+  return { ...base, market: row.ticker, korean_name: row.name };
+}
+
+/** Shape a click on an AwaitingColumn row carries — the SAME shape as the
+ * server /operations `awaiting[]` entry (camelCased), never the local
+ * sessions[] cache. Both `injectAwaitingKiwoomSession` and
+ * `focusAwaitingCoinSession` take this so neither market ever needs the
+ * clicked session to already be cached locally. */
+export interface AwaitingRowSeed {
+  sessionId: string;
+  ticker: string;
+  name: string | null;
+  proposal: Record<string, unknown> | null;
+  autoApproveAt: string | null;
+}
+
+// -------------------------------------------
 // Store Types
 // -------------------------------------------
 
@@ -266,6 +319,17 @@ interface CoinActions {
   resetCoin: () => void;
   // History management
   removeCoinHistoryItem: (sessionId: string) => void;
+
+  /**
+   * Approval-reachability fix (T7 review HIGH #2): coin has no sessions[]
+   * array — a single active-session slot. Two concurrent AWAITING_APPROVAL
+   * coin sessions both render a row in AwaitingColumn, but only one can ever
+   * be reflected here at once. This retargets the single slot to the
+   * CLICKED row's own data (id/ticker/name/proposal) rather than trusting
+   * whatever the slot already held, so clicking either row reaches it — one
+   * at a time, but neither is ever permanently unreachable.
+   */
+  focusAwaitingCoinSession: (row: AwaitingRowSeed) => void;
 }
 
 interface KiwoomActions {
@@ -286,6 +350,20 @@ interface KiwoomActions {
   addKiwoomSession: (session: SessionData) => boolean;
   removeKiwoomSession: (sessionId: string) => void;
   setActiveKiwoomSession: (sessionId: string | null) => void;
+
+  /**
+   * Approval-reachability fix (T7 review HIGH #1): the AwaitingColumn's rows
+   * come from the server /operations poll, NOT from this local sessions[]
+   * cache (which is populated only by rehydrateKiwoomSessions at mount + the
+   * live WS handlers for sessions THIS tab started/streamed). A session that
+   * reached AWAITING_APPROVAL without this tab's involvement (autonomous
+   * auto-trigger, another tab, watch-monitor reanalysis, a long-lived tab)
+   * has a row here but no local session — setActiveKiwoomSession silently
+   * no-ops on that cache miss, stranding the approval. This upserts a
+   * session from the row's OWN data (never trusts local cache presence) and
+   * makes it active, so the click always resolves to a rail target.
+   */
+  injectAwaitingKiwoomSession: (row: AwaitingRowSeed) => void;
 
   // Multi-session state updates (sessionId-specific)
   updateKiwoomSessionStatus: (sessionId: string, status: SessionStatus) => void;
@@ -591,6 +669,32 @@ export const useStore = create<Store>()(
           // When both status and proposal messages arrive close together, only proposal setter opens dialog
           return {
             coin: { ...state.coin, awaitingApproval: awaiting },
+          };
+        }),
+
+      // T7 review HIGH #2 — see interface doc comment. Reusing the same
+      // session (already the active one) only patches the fields the row
+      // carries; switching to a DIFFERENT session resets the rest of the
+      // slot (reasoningLog/analyses/activePosition) exactly like
+      // startCoinSession already does, since this single-slot state was
+      // never designed to hold two sessions' data at once — that's the very
+      // limitation this fix works around by re-targeting the slot per click
+      // instead of leaving the second session's row un-clickable.
+      focusAwaitingCoinSession: (row) =>
+        set((state) => {
+          const proposal = buildProposalFromAwaitingRow(row, 'coin') as CoinTradeProposal | null;
+          const sameSession = state.coin.activeSessionId === row.sessionId;
+          const base = sameSession ? state.coin : { ...initialCoinState, history: state.coin.history };
+          return {
+            coin: {
+              ...base,
+              activeSessionId: row.sessionId,
+              market: row.ticker,
+              koreanName: row.name,
+              status: 'awaiting_approval',
+              tradeProposal: proposal ?? base.tradeProposal,
+              awaitingApproval: true,
+            },
           };
         }),
 
@@ -1019,6 +1123,71 @@ export const useStore = create<Store>()(
                 activePosition: session.activePosition,
                 error: session.error,
               } : {}),
+            },
+          };
+        }),
+
+      // T7 review HIGH #1 — see interface doc comment. Upserts rather than
+      // requiring the session to pre-exist (unlike setActiveKiwoomSession
+      // above, which this deliberately does NOT reuse for that reason: its
+      // cache-miss no-op is exactly the bug). An existing session's OWN
+      // tradeProposal is preferred over the row's slimmed reconstruction
+      // when both exist (the live WS-fed copy may carry more than the
+      // slim allowlist) — the row only fills in when the local copy is
+      // absent (proposal null) or the session itself doesn't exist yet.
+      injectAwaitingKiwoomSession: (row) =>
+        set((state) => {
+          const idx = state.kiwoom.sessions.findIndex(s => s.sessionId === row.sessionId);
+          const proposal = buildProposalFromAwaitingRow(row, 'kiwoom') as KRStockTradeProposal | null;
+          const now = new Date();
+          let session: SessionData;
+          let newSessions: SessionData[];
+          if (idx === -1) {
+            session = {
+              sessionId: row.sessionId,
+              ticker: row.ticker,
+              displayName: row.name || row.ticker,
+              marketType: 'kiwoom',
+              status: 'awaiting_approval',
+              currentStage: null,
+              reasoningLog: [],
+              analyses: [],
+              tradeProposal: proposal,
+              awaitingApproval: true,
+              autoApproveAt: row.autoApproveAt,
+              activePosition: null,
+              error: null,
+              createdAt: now,
+              updatedAt: now,
+            };
+            newSessions = [...state.kiwoom.sessions, session];
+          } else {
+            const existing = state.kiwoom.sessions[idx];
+            session = {
+              ...existing,
+              status: 'awaiting_approval',
+              tradeProposal: (existing.tradeProposal as KRStockTradeProposal | null) ?? proposal,
+              awaitingApproval: true,
+              autoApproveAt: row.autoApproveAt,
+              updatedAt: now,
+            };
+            newSessions = state.kiwoom.sessions.map((s, i) => (i === idx ? session : s));
+          }
+          return {
+            kiwoom: {
+              ...state.kiwoom,
+              sessions: newSessions,
+              activeSessionId: row.sessionId,
+              stk_cd: session.ticker,
+              stk_nm: session.displayName,
+              status: session.status,
+              currentStage: session.currentStage,
+              reasoningLog: session.reasoningLog,
+              analyses: session.analyses,
+              tradeProposal: session.tradeProposal as KRStockTradeProposal | null,
+              awaitingApproval: session.awaitingApproval,
+              activePosition: session.activePosition,
+              error: session.error,
             },
           };
         }),
