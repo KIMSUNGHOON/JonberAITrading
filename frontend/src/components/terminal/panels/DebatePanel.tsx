@@ -1,6 +1,6 @@
 /**
  * Agent-debate tile — 4 analyst votes + consensus for the current discussion,
- * now a LIVE control card (P2 T6) rather than a decorative REST-poll tile:
+ * a LIVE-updating card (P2 T6) rather than a decorative REST-poll tile:
  *
  * - Live updates: once an ACTIVE session is resolved, `useAgentChatWebSocket`
  *   streams vote/status_change/decision frames straight into local state
@@ -11,13 +11,18 @@
  *   STOPS once the WS reports connected (mirroring ChatSessionViewer), so a
  *   stale REST snapshot can never race a fresher WS-pushed vote/decision and
  *   clobber it via the panel's replace-all `setDetail`.
- * - Start affordance: when the coordinator is dormant (its default per
- *   project notes) there is no session to show votes for. Instead of a dead
- *   '—' tile, a "토론 시작" button calls the coordinator launch path
- *   (`startAgentChat`) so the tile can go from decorative to actionable.
- * - Deep link: the session header is a real link to the /agent-chat session
- *   viewer (full message history, decision detail) — this tile only ever
- *   shows the compact vote/consensus summary.
+ * - Coordinator on/off is NOT controlled here (R5-P2-UX B1): the coordinator
+ *   start/stop switch used to be triggerable from three different screens
+ *   with three different labels — this tile, /agent-chat's Status Card, and
+ *   /trading's "결정 계층" card — all hitting the same `startAgentChat` /
+ *   `stopAgentChat`. That let a user flip the switch here without realizing
+ *   /agent-chat and /trading show (and control) the exact same coordinator.
+ *   `/agent-chat`'s Status Card is now the single authoritative control; this
+ *   tile only ever shows a read-only running/stopped chip (+ last-check
+ *   freshness when running) and a deep link to go control it.
+ * - Deep link: the session header links to the /agent-chat session viewer
+ *   (full message history, decision detail) — with the session id attached
+ *   so it opens the session actually being viewed here, not the bare list.
  *
  * Honesty is preserved throughout: no session → no fabricated votes, and a
  * cold coordinator status shows "확인 중" rather than guessing. The 75% gate
@@ -30,7 +35,6 @@ import {
   getAgentChatSessions,
   getAgentChatSessionDetail,
   getAgentChatStatus,
-  startAgentChat,
 } from '@/api/client';
 import { useAgentChatWebSocket } from '@/hooks/useAgentChatWebSocket';
 import type {
@@ -74,6 +78,14 @@ function voteDot(v: AgentChatVoteType | undefined): string {
   return 'bg-dim';
 }
 
+/** HH:mm:ss for the last coordinator watch-list tick; DASH when unknown. */
+function formatLastCheck(iso: string | null | undefined): string {
+  if (!iso) return DASH;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return DASH;
+  return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
 const POLL_MS = 5_000;
 
 /** Statuses for which the coordinator is still actively working the session
@@ -90,9 +102,8 @@ function useDebateSession() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [detail, setDetail] = useState<AgentChatSessionDetail | null>(null);
   const [coordinatorRunning, setCoordinatorRunning] = useState<boolean | null>(null);
+  const [lastCheckAt, setLastCheckAt] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
-  const [starting, setStarting] = useState(false);
-  const [startError, setStartError] = useState<string | null>(null);
   const aliveRef = useRef(true);
 
   const resolveSessionId = useCallback(async (): Promise<string | null> => {
@@ -110,6 +121,7 @@ function useDebateSession() {
     ]);
     if (!aliveRef.current) return;
     setCoordinatorRunning(status ? status.is_running : null);
+    setLastCheckAt(status?.last_check_at ?? null);
     setSessionId(sid);
     if (!sid) {
       setDetail(null);
@@ -174,28 +186,22 @@ function useDebateSession() {
     return () => clearInterval(id);
   }, [isConnected, refreshAll]);
 
-  const startDiscussion = useCallback(async () => {
-    setStarting(true);
-    setStartError(null);
-    try {
-      await startAgentChat();
-      await refreshAll();
-    } catch (e) {
-      setStartError(e instanceof Error ? e.message : '토론 시작 실패');
-    } finally {
-      setStarting(false);
-    }
-  }, [refreshAll]);
-
-  return { ready, detail, coordinatorRunning, isConnected, starting, startError, startDiscussion };
+  return { ready, detail, coordinatorRunning, lastCheckAt, isConnected };
 }
 
 export function DebatePanel() {
   const navigate = useNavigate();
-  const { ready, detail, coordinatorRunning, isConnected, starting, startError, startDiscussion } =
-    useDebateSession();
+  const { ready, detail, coordinatorRunning, lastCheckAt, isConnected } = useDebateSession();
 
-  const openViewer = useCallback(() => navigate('/agent-chat'), [navigate]);
+  // Deep-links into /agent-chat — the SSOT for coordinator control. Passing
+  // a session id opens that session directly instead of dropping the user on
+  // the bare list (the "세션 보기" fix from the B1 audit finding).
+  const openViewer = useCallback(
+    (sessionId?: string | null) => {
+      navigate(sessionId ? `/agent-chat?session=${sessionId}` : '/agent-chat');
+    },
+    [navigate],
+  );
 
   if (!ready) {
     return <Awaiting label="토론 상태 확인 중…" />;
@@ -208,23 +214,26 @@ export function DebatePanel() {
         <span className="text-[11px] text-dim">
           {running ? '코디네이터 실행 중 · 활성 토론 대기' : '코디네이터 미기동 · 활성 토론 없음'}
         </span>
-        {!running && (
-          <button
-            type="button"
-            onClick={startDiscussion}
-            disabled={starting}
-            className="text-[11px] font-semibold text-accent hover:underline disabled:opacity-50"
-          >
-            {starting ? '시작 중…' : '토론 시작'}
-          </button>
-        )}
-        {startError && <span className="text-[10px] text-down">{startError}</span>}
+        {/* Read-only status chip — coordinator on/off is controlled from
+            /agent-chat only (SSOT), never from this tile. */}
+        <span className="inline-flex items-center gap-1.5 text-[10px]">
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${running ? 'bg-up' : 'bg-dim'}`}
+            aria-hidden
+          />
+          <span className={running ? 'text-up' : 'text-dim'}>
+            {running ? 'RUNNING' : 'STOPPED'}
+          </span>
+          {running && (
+            <span className="text-dim">· 마지막 점검 {formatLastCheck(lastCheckAt)}</span>
+          )}
+        </span>
         <button
           type="button"
-          onClick={openViewer}
-          className="text-[10px] text-dim hover:text-accent"
+          onClick={() => openViewer()}
+          className="text-[11px] font-semibold text-accent hover:underline"
         >
-          에이전트 토론 뷰어 열기 →
+          /agent-chat에서 제어 →
         </button>
       </div>
     );
@@ -255,7 +264,7 @@ export function DebatePanel() {
           )}
           <button
             type="button"
-            onClick={openViewer}
+            onClick={() => openViewer(detail.id)}
             className="text-dim hover:text-accent font-semibold"
             title="에이전트 토론 세션 뷰어 열기"
           >

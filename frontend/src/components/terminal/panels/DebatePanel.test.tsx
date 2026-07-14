@@ -1,9 +1,17 @@
 /**
  * DebatePanel was a REST-poll-only decorative tile (no WS, no start action,
  * no deep link — always '—' when the coordinator was dormant, its default).
- * P2 T6 revives it: live votes/consensus via the already-built
- * useAgentChatWebSocket hook, a "토론 시작" action that calls the coordinator
- * launch path, and a deep link into the /agent-chat session viewer.
+ * P2 T6 revived it: live votes/consensus via the already-built
+ * useAgentChatWebSocket hook, a deep link into the /agent-chat session
+ * viewer, and (at the time) a "토론 시작" action calling the coordinator
+ * launch path directly.
+ *
+ * R5-P2-UX B1 demotes that start action: the SAME coordinator on/off was
+ * also controllable from /agent-chat's Status Card and /trading's "결정
+ * 계층" card — three switches, one coordinator, no way to tell they were the
+ * same. /agent-chat is now the single authoritative control; this tile only
+ * shows a read-only running/stopped chip (+ last-check freshness) and a
+ * deep link to go control it there. It never calls `startAgentChat` itself.
  */
 import { it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
@@ -20,6 +28,9 @@ vi.mock('@/api/client', () => ({
   getAgentChatSessions: (...a: unknown[]) => getAgentChatSessions(...a),
   getAgentChatSessionDetail: (...a: unknown[]) => getAgentChatSessionDetail(...a),
   getAgentChatStatus: (...a: unknown[]) => getAgentChatStatus(...a),
+  // NOT imported by DebatePanel anymore — kept here only so a future
+  // regression (re-adding a direct start call) has something to assert
+  // against; the demotion tests below assert this mock is NEVER called.
   startAgentChat: (...a: unknown[]) => startAgentChat(...a),
 }));
 
@@ -131,7 +142,7 @@ it('활성 세션의 실시간 votes/consensus를 렌더하고, WS vote/decision
   expect(screen.getByText('BUY', { selector: 'span.text-ink' })).toBeInTheDocument();
 });
 
-it('활성/최근 세션이 없고 코디네이터가 미기동이면 정직한 빈 상태 + 토론 시작 유도를 보여준다 (죽은 —타일 금지)', async () => {
+it('활성/최근 세션이 없고 코디네이터가 미기동이면 정직한 빈 상태 + 상태칩·딥링크를 보여준다 (죽은 —타일 금지)', async () => {
   getAgentChatActiveDiscussions.mockResolvedValue({ discussions: [], count: 0 });
   getAgentChatSessions.mockResolvedValue({ sessions: [], count: 0 });
   getAgentChatStatus.mockResolvedValue({
@@ -142,11 +153,14 @@ it('활성/최근 세션이 없고 코디네이터가 미기동이면 정직한 
   render(<DebatePanel />);
 
   await waitFor(() => expect(screen.getByText(/코디네이터 미기동/)).toBeInTheDocument());
-  expect(screen.getByRole('button', { name: '토론 시작' })).toBeInTheDocument();
+  expect(screen.getByText('STOPPED')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '/agent-chat에서 제어 →' })).toBeInTheDocument();
+  // No coordinator start control on this tile anymore (B1 demotion).
+  expect(screen.queryByRole('button', { name: '토론 시작' })).not.toBeInTheDocument();
   expect(getAgentChatSessionDetail).not.toHaveBeenCalled();
 });
 
-it('"토론 시작" 클릭 시 코디네이터 기동 경로(startAgentChat)를 호출한다', async () => {
+it('"/agent-chat에서 제어" 클릭은 딥링크만 하고 startAgentChat을 호출하지 않는다 (SSOT=/agent-chat)', async () => {
   getAgentChatActiveDiscussions.mockResolvedValue({ discussions: [], count: 0 });
   getAgentChatSessions.mockResolvedValue({ sessions: [], count: 0 });
   getAgentChatStatus.mockResolvedValue({
@@ -156,12 +170,13 @@ it('"토론 시작" 클릭 시 코디네이터 기동 경로(startAgentChat)를 
 
   render(<DebatePanel />);
 
-  const startButton = await screen.findByRole('button', { name: '토론 시작' });
-  fireEvent.click(startButton);
-  await waitFor(() => expect(startAgentChat).toHaveBeenCalled());
+  const controlLink = await screen.findByRole('button', { name: '/agent-chat에서 제어 →' });
+  fireEvent.click(controlLink);
+  expect(navigate).toHaveBeenCalledWith('/agent-chat');
+  expect(startAgentChat).not.toHaveBeenCalled();
 });
 
-it('코디네이터가 실행 중이고 활성 토론이 없으면 시작 버튼 없이 대기 상태만 보여준다', async () => {
+it('코디네이터가 실행 중이면 RUNNING 상태칩 + 마지막 점검 시각을 보여주고 활성 토론이 없으면 대기 상태만 보여준다', async () => {
   getAgentChatActiveDiscussions.mockResolvedValue({ discussions: [], count: 0 });
   getAgentChatSessions.mockResolvedValue({ sessions: [], count: 0 });
   getAgentChatStatus.mockResolvedValue({
@@ -172,10 +187,12 @@ it('코디네이터가 실행 중이고 활성 토론이 없으면 시작 버튼
   render(<DebatePanel />);
 
   await waitFor(() => expect(screen.getByText(/코디네이터 실행 중/)).toBeInTheDocument());
+  expect(screen.getByText('RUNNING')).toBeInTheDocument();
+  expect(screen.getByText(/마지막 점검/)).toBeInTheDocument();
   expect(screen.queryByRole('button', { name: '토론 시작' })).not.toBeInTheDocument();
 });
 
-it('"세션 보기" 클릭 시 /agent-chat 세션 뷰어로 딥링크한다', async () => {
+it('"세션 보기" 클릭 시 현재 세션 ID를 실어 /agent-chat 세션 뷰어로 딥링크한다', async () => {
   getAgentChatActiveDiscussions.mockResolvedValue({
     discussions: [{ ticker: '005930', stock_name: '삼성전자', session_id: 's1', status: 'voting', started_at: null }],
     count: 1,
@@ -191,7 +208,9 @@ it('"세션 보기" 클릭 시 /agent-chat 세션 뷰어로 딥링크한다', as
 
   const viewButton = await screen.findByRole('button', { name: '세션 보기 →' });
   fireEvent.click(viewButton);
-  expect(navigate).toHaveBeenCalledWith('/agent-chat');
+  // BASE_DETAIL.id === 's1' — the deep link must carry the session actually
+  // being viewed, not drop the user on the bare /agent-chat list.
+  expect(navigate).toHaveBeenCalledWith('/agent-chat?session=s1');
 });
 
 // --- T6 review fixes: REST/WS never run concurrently, and a decided session

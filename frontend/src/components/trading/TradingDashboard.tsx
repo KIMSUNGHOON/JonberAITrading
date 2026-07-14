@@ -12,6 +12,13 @@
  *
  * 전략 위젯은 실제 배선(R5-P3) 전까지 UI에서 내렸다 — 통제감 착각 제거.
  *
+ * R5-P2-UX B1: "결정 계층" 카드는 더 이상 Start/Stop을 직접 호출하지 않는다.
+ * 이 코디네이터 on/off는 /agent-chat Status Card, /trading(여기), 대시보드
+ * DebatePanel 세 곳에서 각각 다른 라벨로 켤 수 있었다 — 사용자가 "같은
+ * 스위치"라는 걸 알 수 없는 3중 컨트롤이었다. SSOT는 /agent-chat으로 고정하고,
+ * 여기서는 읽기전용 상태칩 + 딥링크만 제공한다("실행 계층"은 별개 스위치라
+ * 그대로 유지).
+ *
  * P2 funnel-consolidation Task 8b: the "3행: 운용 데이터" row (WatchListWidget/
  * TradeQueueWidget) has been removed — every action those two widgets
  * offered (convert-to-queue, remove-from-watch, re-analyze, cancel-queued,
@@ -23,6 +30,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Bot,
   CircleDollarSign,
@@ -36,9 +44,7 @@ import {
 import {
   getAgentChatStatus,
   getTradingStatus,
-  startAgentChat,
   startTrading,
-  stopAgentChat,
   stopTrading,
   pauseTrading,
   resumeTrading,
@@ -47,6 +53,15 @@ import {
 import { useStore } from '@/store';
 import { TradingModeSection } from '@/components/settings/TradingModeSection';
 import type { AgentChatCoordinatorStatus } from '@/types';
+
+/** HH:mm for the last coordinator watch-list tick; DASH when unknown. */
+const DASH = '—';
+function formatLastCheck(iso: string | null | undefined): string {
+  if (!iso) return DASH;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return DASH;
+  return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
 
 interface ExecutionStatus {
   mode: string;
@@ -113,6 +128,7 @@ function ActionButton({
 }
 
 export default function TradingDashboard() {
+  const navigate = useNavigate();
   const masterEnabled = useStore((s) => s.autonomyMasterEnabled);
   const tradingModes = useStore((s) => s.tradingModes);
 
@@ -201,10 +217,10 @@ export default function TradingDashboard() {
             {/* 트레이딩 모드 (공용 섹션 재사용) */}
             <TradingModeSection onError={setError} />
 
-            {/* 결정 계층 */}
+            {/* 결정 계층 — 읽기전용 상태칩 + 딥링크 (B1: on/off SSOT=/agent-chat) */}
             <div className="bg-card border border-hairline rounded p-4">
               <CardHeader icon={<Bot size={15} />} title="결정 계층 · Agent Coordinator" />
-              <div className="flex items-center gap-2 text-sm text-muted mb-3">
+              <div className="flex items-center gap-2 text-sm text-muted mb-1">
                 <StatusDot on={!!brainStatus?.is_running} />
                 {brainStatus == null
                   ? '상태 확인 중…'
@@ -212,28 +228,22 @@ export default function TradingDashboard() {
                     ? `가동 중 — 토론 ${brainStatus.active_discussions}건 · ${brainStatus.check_interval_minutes}분 주기`
                     : '정지 — 워치리스트 감시 없음'}
               </div>
-              <div className="flex gap-2">
-                {brainStatus?.is_running ? (
-                  <ActionButton
-                    label="Stop"
-                    icon={<Square size={12} />}
-                    tone="danger"
-                    disabled={busy !== null}
-                    onClick={() => act('brain', () => stopAgentChat())}
-                  />
-                ) : (
-                  <ActionButton
-                    label="Start"
-                    icon={<Play size={12} />}
-                    tone="accent"
-                    disabled={busy !== null}
-                    onClick={() => act('brain', () => startAgentChat())}
-                  />
-                )}
-              </div>
+              {brainStatus?.is_running && (
+                <div className="text-[11px] text-dim mb-2">
+                  마지막 점검 {formatLastCheck(brainStatus.last_check_at)}
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => navigate('/agent-chat')}
+                className="mt-2 text-xs font-medium text-accent hover:underline"
+              >
+                /agent-chat에서 제어 →
+              </button>
               <p className="mt-3 text-[11px] text-dim leading-relaxed">
                 워치리스트 감시 → 에이전트 토론 → 합의(75%) → 결정. 손절/익절 감시
-                (Position Monitor)도 함께 기동됩니다.
+                (Position Monitor)도 함께 기동됩니다. 시작/정지는 /agent-chat에서
+                제어합니다.
               </p>
             </div>
 
