@@ -17,6 +17,18 @@ The manual `pause()`/`resume()` API is kept as-is: it is a separate,
 operator-driven kill-switch (ExecutionCoordinator.pause()/resume(), the
 alert "RESUME" action) that still gates ALL tickers globally when invoked
 explicitly — it is simply no longer what the sudden-move path uses.
+
+T3 (MEDIUM finding B, review 2026-07-13) extends this: a ticker whose
+tick-to-tick move keeps qualifying as "sudden" on EVERY tick re-enters
+`_handle_sudden_move` every time and re-arms `sudden_move_cooldown_ticks`
+before it can ever count down — under a perpetual move that ticker's
+stop-loss/take-profit defense would never resume, and there is no manual
+override (RESUME was removed). `WatchConfig.sudden_move_ticks_in_cooldown`
+now counts consecutive re-arm ticks (NOT reset by re-arming) and forces
+recovery once it exceeds an absolute cap
+(`RiskMonitor.ABSOLUTE_COOLDOWN_CAP_MULTIPLIER` x `sudden_move_cooldown_ticks`)
+— a circuit breaker for the circuit breaker: guaranteed recovery even if
+the move never stabilizes.
 """
 
 import pytest
@@ -212,3 +224,72 @@ async def test_manual_global_pause_still_gates_all_tickers():
 
     await monitor._check_position("AAAA", config)
     assert executed == ["AAAA"]  # fires once resumed
+
+
+@pytest.mark.asyncio
+async def test_sudden_move_perpetual_re_arm_force_recovers_after_absolute_cap():
+    """T3 (MEDIUM finding B): a ticker that re-qualifies as "sudden" on
+    EVERY tick would re-arm `sudden_move_cooldown_ticks` forever and never
+    reach the normal N-tick recovery path (it always returns early from the
+    sudden-move branch, never falling into the decrement branch). The
+    absolute cap on consecutive re-arms forces recovery regardless —
+    stop-loss/take-profit resumes (take-profit fires here, proving the
+    check actually ran) even though the move never stabilized."""
+    monitor = _monitor(
+        sudden_move_cooldown_ticks=3,
+        sudden_move_stabilization_pct=1.0,
+        take_profit_mode=StopLossMode.AGENT_AUTO,
+    )
+    executed = []
+
+    async def executor(order):
+        executed.append(order.ticker)
+
+    monitor._execute_order = executor
+
+    position = ManagedPosition(
+        ticker="AAAA",
+        stock_name="AAAA",
+        quantity=10,
+        avg_price=70_000,
+        current_price=70_000,
+        take_profit=75_000,
+        stop_loss_mode=StopLossMode.AGENT_AUTO,
+    )
+    monitor.add_position(position)
+    config = monitor._watching["AAAA"]
+
+    # Every tick is a +15% move from the previous tick — always >= the 10%
+    # sudden-move threshold, so this ticker NEVER falls into the ordinary
+    # decrement/recovery branch on its own.
+    price = 70_000.0
+    prices = []
+    for _ in range(12):
+        price *= 1.15
+        prices.append(price)
+    idx = {"i": 0}
+
+    async def fetcher(_ticker):
+        p = prices[idx["i"]]
+        idx["i"] += 1
+        return p
+
+    monitor._get_price = fetcher
+
+    absolute_cap = (
+        monitor.risk_params.sudden_move_cooldown_ticks
+        * monitor.ABSOLUTE_COOLDOWN_CAP_MULTIPLIER
+    )
+
+    for _ in range(absolute_cap):
+        await monitor._check_position("AAAA", config)
+        assert executed == [], "still gated — re-arming every tick, under the cap"
+    assert config.sudden_move_ticks_in_cooldown == absolute_cap
+    assert config.sudden_move_cooldown_ticks == monitor.risk_params.sudden_move_cooldown_ticks
+
+    # One more consecutive "sudden" tick exceeds the absolute cap -> forced
+    # recovery THIS tick; take-profit (long since crossed) fires immediately.
+    await monitor._check_position("AAAA", config)
+    assert config.sudden_move_ticks_in_cooldown == 0
+    assert config.sudden_move_cooldown_ticks == 0
+    assert executed == ["AAAA"]

@@ -37,12 +37,22 @@ class RiskMonitor:
     - Auto-execute based on mode settings
     """
 
+    # T3 (MEDIUM finding B, review 2026-07-13): absolute cap on consecutive
+    # sudden-move re-arms, expressed as a multiple of
+    # `risk_params.sudden_move_cooldown_ticks`. A ticker whose tick-to-tick
+    # move keeps qualifying as "sudden" would otherwise re-arm the cooldown
+    # forever and never reach the ordinary N-tick recovery path — this is
+    # the circuit breaker for that circuit breaker, guaranteeing recovery
+    # even if the move never stabilizes.
+    ABSOLUTE_COOLDOWN_CAP_MULTIPLIER = 3
+
     def __init__(
         self,
         risk_params: Optional[RiskParameters] = None,
         price_fetcher: Optional[Callable[[str], Awaitable[float]]] = None,
         alert_sender: Optional[Callable[[TradingAlert], Awaitable[None]]] = None,
         order_executor: Optional[Callable[[OrderRequest], Awaitable[None]]] = None,
+        price_sink: Optional[Callable[[str, float], None]] = None,
     ):
         """
         Initialize Risk Monitor.
@@ -52,11 +62,21 @@ class RiskMonitor:
             price_fetcher: Async function to get current price
             alert_sender: Async function to send alerts
             order_executor: Async function to execute orders
+            price_sink: Optional callback(ticker, price) invoked every tick
+                right after a fresh price is fetched (T1, MEDIUM finding A).
+                Decoupled from the monitor's own stop-loss/take-profit logic
+                so a live 1s price feed can be mirrored back into an
+                external tracker (ExecutionCoordinator's ManagedPosition)
+                without this monitor knowing anything about it. The sink
+                owns its own "stale price" contract — this monitor calls it
+                unconditionally with whatever `price_fetcher` returned,
+                including a fail-safe 0.
         """
         self.risk_params = risk_params or RiskParameters()
         self._get_price = price_fetcher
         self._send_alert = alert_sender
         self._execute_order = order_executor
+        self._price_sink = price_sink
 
         # Monitoring state
         self._watching: Dict[str, WatchConfig] = {}
@@ -207,6 +227,21 @@ class RiskMonitor:
             # Simulation: use last known price
             current_price = config.last_price
 
+        # T1 (MEDIUM finding A, review 2026-07-13): this 1s poll already
+        # fetches a fresh price for every watched ticker — previously that
+        # price was written only to `config.last_price` below and
+        # discarded, so an external tracker (ExecutionCoordinator's
+        # ManagedPosition.current_price, and unrealized P&L/exposure
+        # derived from it) went stale between trade decisions. Feed it back
+        # unconditionally via the decoupled price_sink so both stay fresh
+        # at the same cadence; the sink owns the "no 0/None overwrite"
+        # contract, not this monitor.
+        if self._price_sink:
+            try:
+                self._price_sink(ticker, current_price)
+            except Exception as e:
+                logger.warning(f"[RiskMonitor] price_sink failed for {ticker}: {e}")
+
         if current_price <= 0:
             return
 
@@ -226,9 +261,41 @@ class RiskMonitor:
                 # old code called the GLOBAL pause() here, which froze
                 # stop-loss/take-profit checks for the entire book over one
                 # ticker's dead-candle.
-                await self._handle_sudden_move(ticker, config, current_price, change_pct)
-                config.last_price = current_price
-                return
+                #
+                # T3 (MEDIUM finding B, review 2026-07-13): a ticker whose
+                # tick-to-tick move keeps qualifying as "sudden" on EVERY
+                # tick re-enters this branch every time and re-arms the
+                # cooldown below before it can ever count down — its
+                # stop-loss/take-profit defense would never resume under a
+                # perpetual move. `sudden_move_ticks_in_cooldown` counts
+                # consecutive ticks spent here (across re-arms — NOT reset
+                # by them) and is a circuit breaker for the circuit
+                # breaker: once it exceeds the absolute cap, defense is
+                # force-resumed regardless of the ongoing move.
+                config.sudden_move_ticks_in_cooldown += 1
+                absolute_cap = (
+                    self.risk_params.sudden_move_cooldown_ticks
+                    * self.ABSOLUTE_COOLDOWN_CAP_MULTIPLIER
+                )
+                if config.sudden_move_ticks_in_cooldown > absolute_cap:
+                    logger.warning(
+                        f"[RiskMonitor] {ticker} force-recovered from "
+                        f"sudden-move cooldown after "
+                        f"{config.sudden_move_ticks_in_cooldown} consecutive "
+                        f"ticks (absolute cap {absolute_cap}) — "
+                        "stop-loss/take-profit resumed despite continued "
+                        "volatility"
+                    )
+                    config.sudden_move_cooldown_ticks = 0
+                    config.sudden_move_ticks_in_cooldown = 0
+                    config.last_price = current_price
+                    # Fall through to stop-loss/take-profit evaluation
+                    # below instead of returning — guaranteed recovery,
+                    # not another skip.
+                else:
+                    await self._handle_sudden_move(ticker, config, current_price, change_pct)
+                    config.last_price = current_price
+                    return
 
         # This ticker is cooling down from its OWN prior sudden move.
         # Auto-recovers after N monitor ticks OR once price stabilizes
@@ -241,6 +308,7 @@ class RiskMonitor:
                 config.last_price = current_price
                 return
             config.sudden_move_cooldown_ticks = 0
+            config.sudden_move_ticks_in_cooldown = 0
             logger.info(
                 f"[RiskMonitor] {ticker} sudden-move cooldown cleared "
                 f"({'price stabilized' if stabilized else 'tick-count elapsed'}); "
@@ -563,6 +631,16 @@ class WatchConfig:
         # and auto-cleared by RiskMonitor._check_position — per-ticker only,
         # independent of the global _trading_mode.
         self.sudden_move_cooldown_ticks: int = 0
+
+        # T3 (MEDIUM finding B, review 2026-07-13): consecutive ticks spent
+        # in the sudden-move branch since the cooldown FIRST armed, counting
+        # across re-arms (a perpetual mover never resets this by re-arming
+        # `sudden_move_cooldown_ticks` above). Reset to 0 whenever the
+        # ticker actually recovers — via the ordinary tick-count/
+        # stabilization path in `_check_position`, or via the absolute-cap
+        # force-recovery itself. Guarantees this ticker's defense resumes
+        # even under a move that never qualifies as "stabilized".
+        self.sudden_move_ticks_in_cooldown: int = 0
 
     @property
     def is_sudden_move_paused(self) -> bool:

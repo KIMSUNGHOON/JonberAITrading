@@ -105,6 +105,7 @@ class ExecutionCoordinator:
             price_fetcher=self._get_current_price,
             alert_sender=self._on_alert,
             order_executor=self._execute_order_from_monitor,
+            price_sink=self._on_price_update,
         )
 
         # State
@@ -1190,6 +1191,35 @@ class ExecutionCoordinator:
 
         # Simulation mode - return mock price
         return 50000  # 5만원
+
+    def _on_price_update(self, ticker: str, price: float) -> None:
+        """Price-sink for RiskMonitor's 1s poll (T1, MEDIUM finding A, review
+        2026-07-13).
+
+        RiskMonitor already fetches a fresh price for every watched ticker
+        once a second, via the very same `_get_current_price` injected above
+        as `price_fetcher` — but until this fix that fresh price was written
+        only to the monitor's own `WatchConfig.last_price` and discarded, so
+        `ManagedPosition.current_price` (and unrealized_pnl/exposure derived
+        from it) was only ever refreshed by `_reprice_positions`, itself only
+        called from `_refresh_account_info` at trade-decision time. Displayed
+        P&L/exposure went stale between decisions even though live price data
+        was already flowing. This callback closes that loop at the same 1s
+        cadence, independent of trade decisions.
+
+        Same T2 stale-price contract as `_reprice_positions`: a falsy price
+        (0/None — `_get_current_price`'s fail-safe signal for "no fresh
+        quote") must never overwrite a live position's last-known price.
+        """
+        if not price:
+            return
+        position = next(
+            (p for p in self._state.positions if p.ticker == ticker), None
+        )
+        if position is None:
+            return
+        position.current_price = price
+        position.last_updated = datetime.now()
 
     # -------------------------------------------
     # Alerts & Callbacks
