@@ -33,12 +33,33 @@ describe('nav map', () => {
       expect(watchlistItem).toBeDefined();
       expect(watchlistItem?.view).not.toBe('basket');
       expect(viewToPath(watchlistItem!.view)).not.toBe('/watchlist');
-      // Today the server watch-list lives on /trading (WatchListWidget).
-      expect(viewToPath('watchlist')).toBe('/trading');
+      // Today the server watch-list lives on /trading (WatchListWidget),
+      // disambiguated from the 'trading' (Auto-trade) entry by a query param.
+      expect(viewToPath('watchlist')).toBe('/trading?tab=watchlist');
     });
 
     it('no nav entry is labeled "Basket" anymore', () => {
       expect(NAV_ITEMS.some((n) => n.label === 'Basket')).toBe(false);
+    });
+  });
+
+  // P2-T5: 'trading' and 'watchlist' both route to /trading — before this fix
+  // pathToView('/trading') always resolved to 'trading', so the Watchlist nav
+  // icon could never highlight even when its own link was the one clicked.
+  describe('nav-highlight fix for the shared /trading path (P2-T5)', () => {
+    it('resolves plain /trading to the "trading" (Auto-trade) view', () => {
+      expect(pathToView('/trading')).toBe('trading');
+      expect(pathToView('/trading', '')).toBe('trading');
+    });
+
+    it('resolves /trading?tab=watchlist to the "watchlist" view', () => {
+      expect(pathToView('/trading', '?tab=watchlist')).toBe('watchlist');
+    });
+
+    it('round-trips: viewToPath("watchlist") resolves back to "watchlist" via pathToView', () => {
+      const path = viewToPath('watchlist');
+      const [pathname, search] = path.split('?');
+      expect(pathToView(pathname, search ? `?${search}` : '')).toBe('watchlist');
     });
   });
 });

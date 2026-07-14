@@ -23,7 +23,13 @@ import { Awaiting, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
 type FetchState = 'loading' | 'ready' | 'error';
 const POLL_MS = 5_000;
 
-function useOperations() {
+/**
+ * Shared data source — exported so FunnelPanel's WATCHLIST + PIPELINE
+ * sections poll the SAME underlying `/operations` response instead of
+ * running a second independent poll (keeps the two sections in sync and
+ * halves the request volume). See FunnelPanel.tsx for the consumer.
+ */
+export function useOperations() {
   const activeMarket = useStore((s) => s.activeMarket);
   const [data, setData] = useState<OperationsResponse | null>(null);
   const [state, setState] = useState<FetchState>('loading');
@@ -93,7 +99,10 @@ const CARD = 'px-2.5 py-1.5 border-b border-hairline/40 text-[11px]';
 // 분석중
 // -------------------------------------------
 
-function AnalyzingColumn({
+// Column components below are exported: FunnelPanel's PIPELINE section
+// reuses them verbatim (minus WatchingColumn, which becomes its own
+// WATCHLIST section) instead of reimplementing the honest-degrade contract.
+export function AnalyzingColumn({
   items, errors, navigate, onCancel,
 }: {
   items: OperationsResponse['analyzing'];
@@ -150,7 +159,7 @@ function AwaitingCountdown({ autoApproveAt }: { autoApproveAt: string }) {
   );
 }
 
-function AwaitingColumn({
+export function AwaitingColumn({
   items, errors, activeMarket, submitting, onDecide,
 }: {
   items: OperationsResponse['awaiting'];
@@ -220,7 +229,15 @@ function AwaitingColumn({
 // 감시
 // -------------------------------------------
 
-function WatchingColumn({
+// 감시(WATCHLIST) status label — server enum values are lowercase
+// (active/triggered/removed/converted); get_watch_list() only ever returns
+// ACTIVE rows today, but the label map is honest about the full enum
+// rather than assuming a single value.
+const WATCH_STATUS_LABEL: Record<string, string> = {
+  active: 'ACTIVE', triggered: 'TRIGGERED', removed: 'REMOVED', converted: 'CONVERTED',
+};
+
+export function WatchingColumn({
   items, errors, onConvert, onRemove,
 }: {
   items: OperationsResponse['watching'];
@@ -239,17 +256,37 @@ function WatchingColumn({
         const name = (w.stock_name as string | null) ?? ticker;
         const currentPrice = w.current_price as number | null;
         const targetEntry = w.target_entry_price as number | null;
+        const confidence = typeof w.confidence === 'number' ? w.confidence : null;
+        const status = typeof w.status === 'string' ? w.status : null;
         return (
           <div key={id ?? i} className={CARD}>
-            <div className="font-semibold">{name}</div>
+            <div className="font-semibold flex items-center gap-1.5">
+              {name}
+              <span className="text-dim text-[10px] font-normal">{ticker}</span>
+            </div>
             <div className="text-muted">
               현재 {fmtPrice(currentPrice, 'kiwoom')} · 목표진입 {fmtPrice(targetEntry, 'kiwoom')}
             </div>
+            <div className="text-dim text-[10px]">
+              신뢰도 {confidence != null ? `${(confidence * 100).toFixed(0)}%` : DASH}
+              {' · '}
+              {status ? (WATCH_STATUS_LABEL[status] ?? status.toUpperCase()) : DASH}
+            </div>
             <div className="flex gap-2 mt-1">
-              <button type="button" onClick={() => onConvert(id)} className="text-accent font-medium">
+              <button
+                type="button"
+                onClick={() => onConvert(id)}
+                aria-label={`큐 전환 ${ticker}`}
+                className="text-accent font-medium"
+              >
                 큐 전환
               </button>
-              <button type="button" onClick={() => onRemove(id)} className="text-dim hover:text-down font-medium">
+              <button
+                type="button"
+                onClick={() => onRemove(id)}
+                aria-label={`제거 ${ticker}`}
+                className="text-dim hover:text-down font-medium"
+              >
                 제거
               </button>
             </div>
@@ -264,7 +301,7 @@ function WatchingColumn({
 // 매수대기
 // -------------------------------------------
 
-function PendingBuyColumn({
+export function PendingBuyColumn({
   pendingBuy, errors, activeMarket, onDismiss, onCancelOrder,
 }: {
   pendingBuy: OperationsResponse['pending_buy'];
@@ -338,7 +375,7 @@ function PendingBuyColumn({
 // 보유
 // -------------------------------------------
 
-function HoldingColumn({
+export function HoldingColumn({
   items, errors, activeMarket, navigate,
 }: {
   items: OperationsResponse['holding'];
@@ -381,7 +418,7 @@ function formatFillTime(hhmmss: string): string {
   return `${hhmmss.slice(0, 2)}:${hhmmss.slice(2, 4)}`;
 }
 
-function TodayFillsColumn({
+export function TodayFillsColumn({
   items, errors, activeMarket, navigate,
 }: {
   items: OperationsResponse['today_fills'];
@@ -410,12 +447,14 @@ function TodayFillsColumn({
 }
 
 // -------------------------------------------
-// Main
+// Shared action handlers — exported so FunnelPanel's WATCHLIST + PIPELINE
+// sections dispatch the exact same mutations (submitApproval/
+// convertWatchToQueue/removeFromWatchList/dismissTrade/cancelKRStockOrder/
+// cancelKRStockSession) against the ONE `refetch` from `useOperations()`,
+// instead of re-deriving the wiring.
 // -------------------------------------------
 
-export function OperationsPanel() {
-  const { activeMarket, data, state, err, refetch } = useOperations();
-  const navigate = useNavigate();
+export function useOperationsActions(refetch: () => void) {
   const [submittingSession, setSubmittingSession] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -487,6 +526,26 @@ export function OperationsPanel() {
       refetch();
     }
   }, [refetch]);
+
+  return {
+    submittingSession, actionError, setActionError,
+    handleCancelAnalysis, handleDecide, handleConvertWatch, handleRemoveWatch,
+    handleDismissQueue, handleCancelOrder,
+  };
+}
+
+// -------------------------------------------
+// Main
+// -------------------------------------------
+
+export function OperationsPanel() {
+  const { activeMarket, data, state, err, refetch } = useOperations();
+  const navigate = useNavigate();
+  const {
+    submittingSession, actionError, setActionError,
+    handleCancelAnalysis, handleDecide, handleConvertWatch, handleRemoveWatch,
+    handleDismissQueue, handleCancelOrder,
+  } = useOperationsActions(refetch);
 
   if (state === 'loading') return <Awaiting label="운용 현황 로드 중…" />;
   if (state === 'error') return <Awaiting label={`운용 현황 오류 · ${err}`} />;

@@ -1209,6 +1209,13 @@ export interface ScanResultsResponse {
 export interface StartScanRequest {
   notify_progress?: boolean;
   custom_stocks?: [string, string][];
+  // P1-5 (backend, default False): when true, scan results feed straight
+  // into the server watch-list and from there the autonomous watch-monitor
+  // /queue pipeline. Surfaced as an explicit opt-in toggle in
+  // DiscoverySection (P2 funnel Phase 1, P1-b) — declared here so that
+  // wiring no longer needs a variable-typed workaround to slip past the
+  // excess-property check.
+  auto_promote_enabled?: boolean;
 }
 
 // -------------------------------------------
