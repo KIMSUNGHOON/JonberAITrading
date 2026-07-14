@@ -55,6 +55,28 @@ class KRStockTickerResponse(BaseModel):
     timestamp: datetime = Field(description="Data timestamp")
 
 
+class KRStockTickerBatchRequest(BaseModel):
+    """Batch ticker request for multiple Korean stock codes (P1-7)."""
+
+    codes: list[str] = Field(description="Stock codes (6-digit each), max 50 per request")
+
+
+class KRStockTickerBatchResponse(BaseModel):
+    """
+    Batch ticker snapshots keyed by stock code (P1-7).
+
+    A code that could not be fetched (unknown code, transient API/rate-limit
+    error) maps to `None` rather than being fabricated — callers must treat
+    a null entry as "keep the last known price", same contract as the
+    per-symbol endpoint's failure mode.
+    """
+
+    tickers: dict[str, Optional[KRStockTickerResponse]] = Field(
+        description="Stock code -> ticker snapshot, or null on per-code failure"
+    )
+    total: int = Field(description="Count of codes successfully fetched (non-null)")
+
+
 class KRStockCandleData(BaseModel):
     """Single candle (OHLCV) data for Korean stock."""
 

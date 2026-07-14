@@ -20,6 +20,7 @@ from .orders import router as orders_router
 from .positions import router as positions_router
 from .trades import router as trades_router
 from .kr_settings import router as settings_router
+from .tickers import router as tickers_router
 
 # Re-export for backwards compatibility
 from .constants import (
@@ -46,6 +47,7 @@ router.include_router(orders_router)
 router.include_router(positions_router)
 router.include_router(trades_router)
 router.include_router(settings_router)
+router.include_router(tickers_router)
 
 __all__ = [
     "router",

@@ -6,14 +6,15 @@
  * NO backing field and render an honest em-dash (—) rather than fabricated data.
  * For coin, prices are refreshed via getCoinTickers (batched, 30s) written back
  * into the store — the same path BasketWidget uses — so the two stay in sync.
- * For KR (kiwoom), there is no batch ticker endpoint yet (P1), so each item is
- * refreshed individually via getKRStockTicker (30s poll, per-item try/catch —
- * one failing ticker keeps its last known price rather than blanking the tile).
+ * For KR (kiwoom), prices are refreshed via getKRStockTickers (batched, P1-7 —
+ * ONE request per poll instead of one-per-symbol) on the same 30s cadence. A
+ * code that fails to fetch maps to `null` in the response — that item just
+ * keeps its last known price rather than blanking the tile.
  */
 import { useEffect } from 'react';
 import { useShallow } from 'zustand/shallow';
 import { useStore, selectBasketItems, selectChartSymbol } from '@/store';
-import { getCoinTickers, getKRStockTicker } from '@/api/client';
+import { getCoinTickers, getKRStockTickers } from '@/api/client';
 import { changeColor } from '@/utils/pnl';
 import { Awaiting, TH, DASH, fmtPct, fmtPrice, marketLabelOf } from './shared';
 
@@ -61,10 +62,10 @@ export function WatchlistPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeMarket, upbitApiConfigured, items.map((i) => i.ticker).join(','), updateBasketItemPrice]);
 
-  // Refresh KR prices individually (single-fetch per ticker; a batch REST
-  // endpoint is P1 — out of scope here). 30s poll keeps Kiwoom rate-limit
-  // load conservative. Promise.allSettled: one failing ticker must not blank
-  // the others — it just keeps its last known price.
+  // Refresh KR prices in ONE batch call (P1-7) instead of one request per
+  // symbol. 30s poll keeps Kiwoom rate-limit load conservative. A code that
+  // failed to fetch maps to null in the response — that item keeps its last
+  // known price rather than being blanked.
   useEffect(() => {
     if (activeMarket !== 'kiwoom' || !kiwoomApiConfigured) return;
     const krTickers = items.map((i) => i.ticker);
@@ -72,18 +73,21 @@ export function WatchlistPanel() {
 
     let alive = true;
     async function run() {
-      const results = await Promise.allSettled(krTickers.map((stk_cd) => getKRStockTicker(stk_cd)));
-      if (!alive) return;
-      results.forEach((r) => {
-        if (r.status !== 'fulfilled') return; // keep last known price; do not fabricate
-        const t = r.value;
-        updateBasketItemPrice(
-          t.stk_cd,
-          t.cur_prc,
-          t.prdy_ctrt,
-          t.prdy_ctrt > 0 ? 'RISE' : t.prdy_ctrt < 0 ? 'FALL' : 'EVEN',
-        );
-      });
+      try {
+        const res = await getKRStockTickers(krTickers);
+        if (!alive) return;
+        Object.values(res.tickers).forEach((t) => {
+          if (!t) return; // keep last known price; do not fabricate
+          updateBasketItemPrice(
+            t.stk_cd,
+            t.cur_prc,
+            t.prdy_ctrt,
+            t.prdy_ctrt > 0 ? 'RISE' : t.prdy_ctrt < 0 ? 'FALL' : 'EVEN',
+          );
+        });
+      } catch {
+        /* keep last known prices; do not fabricate */
+      }
     }
     run();
     const id = setInterval(run, 30_000);

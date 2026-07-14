@@ -603,6 +603,26 @@ class ApiClient {
   }
 
   /**
+   * Get current ticker snapshots for multiple Korean stock codes in a single
+   * request (P1-7). Replaces per-symbol getKRStockTicker fan-out — one call
+   * per poll instead of N, still queued behind the shared Kiwoom throttle.
+   * A code that failed to fetch (unknown code, transient API error) maps to
+   * `null` — callers must keep the last known price, never fabricate.
+   */
+  async getKRStockTickers(codes: string[]): Promise<{
+    tickers: Record<string, KRStockTickerResponse | null>;
+    total: number;
+  }> {
+    return kiwoomRequestQueue.enqueue(async () => {
+      const response = await this.client.post<{
+        tickers: Record<string, KRStockTickerResponse | null>;
+        total: number;
+      }>('/kr_stocks/tickers', { codes });
+      return response.data;
+    });
+  }
+
+  /**
    * Get candle (OHLCV) data for a Korean stock.
    * Uses request queue to prevent rate limit errors.
    */
@@ -1905,6 +1925,8 @@ export const searchKRStocks = (query: string, limit?: number) =>
   apiClient.searchKRStocks(query, limit);
 
 export const getKRStockTicker = (stk_cd: string) => apiClient.getKRStockTicker(stk_cd);
+
+export const getKRStockTickers = (codes: string[]) => apiClient.getKRStockTickers(codes);
 
 export const getKRStockCandles = (stk_cd: string, period?: string, count?: number) =>
   apiClient.getKRStockCandles(stk_cd, period, count);
