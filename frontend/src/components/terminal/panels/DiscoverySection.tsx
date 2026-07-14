@@ -23,10 +23,22 @@
  * The server watch-list (ExecutionCoordinator) is KR-only, so the
  * [승격▲] action is disabled for coin Scratchpad rows (scan results are
  * always KR — the background scanner covers only KOSPI/KOSDAQ).
+ *
+ * Nav-rationalize (2026-07-14, docs/superpowers/audits/2026-07-14-dashboard-
+ * widget-cull.md, user-approved "ABSORB"): the standalone Scratchpad page
+ * (BasketPage/BasketWidget, /watchlist route) is gone — its power-staging
+ * features (comma-separated bulk-add, autocomplete ↑/↓/Esc keyboard nav,
+ * per-item remove + clear-all, bulk "analyze all" respecting the concurrent-
+ * slot limit, the API-not-configured warning banner) are folded into this
+ * Scratchpad section, on top of what it already had (30s live price
+ * polling, row-click chart link, promote▲/analyze▶ per row).
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { useShallow } from 'zustand/shallow';
-import { useStore, selectBasketItems, selectChartSymbol, type BasketItem, type MarketType } from '@/store';
+import {
+  useStore, selectBasketItems, selectChartSymbol, selectKiwoomAvailableSlots,
+  type BasketItem, type MarketType,
+} from '@/store';
 import {
   startScan, pauseScan, resumeScan, stopScan,
   getScanProgress, getScanResults, addToWatchList, searchKRStocks,
@@ -95,17 +107,36 @@ function useScanState() {
 }
 
 // -------------------------------------------
-// Scratchpad manual add — compact re-use of BasketWidget's KR-search +
-// manual-ticker logic against the same store actions/endpoint, without
-// pulling in BasketWidget's full autocomplete/keyboard-nav UI.
+// Scratchpad manual add — full parity with the former standalone
+// BasketWidget (folded in, nav-rationalize 2026-07-14): comma-separated
+// bulk-add and an autocomplete dropdown with ↑/↓/Esc keyboard nav, against
+// the same store actions/endpoint.
 // -------------------------------------------
 
-function useScratchpadAdd() {
+function useScratchpadAdd(basketItems: BasketItem[]) {
   const addToBasket = useStore((s) => s.addToBasket);
-  const [market, setMarket] = useState<MarketType>('kiwoom');
-  const [query, setQuery] = useState('');
+  const [market, setMarketRaw] = useState<MarketType>('kiwoom');
+  const [query, setQueryRaw] = useState('');
   const [suggestions, setSuggestions] = useState<KRStockInfo[]>([]);
+  const [selectedIndex, setSelectedIndex] = useState(-1);
+  const [dismissed, setDismissed] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
+
+  // Typing re-opens a dismissed (Esc'd) dropdown and resets keyboard selection.
+  const setQuery = useCallback((v: string) => {
+    setQueryRaw(v);
+    setDismissed(false);
+    setSelectedIndex(-1);
+  }, []);
+
+  const setMarket = useCallback((m: MarketType) => {
+    setMarketRaw(m);
+    setQueryRaw('');
+    setSuggestions([]);
+    setSelectedIndex(-1);
+    setDismissed(false);
+    setAddError(null);
+  }, []);
 
   useEffect(() => {
     if (market !== 'kiwoom' || !query.trim()) {
@@ -116,7 +147,7 @@ function useScratchpadAdd() {
     const id = setTimeout(async () => {
       try {
         const res = await searchKRStocks(query.trim(), 6);
-        if (alive) setSuggestions(res.stocks);
+        if (alive) { setSuggestions(res.stocks); setSelectedIndex(-1); }
       } catch {
         if (alive) setSuggestions([]);
       }
@@ -125,6 +156,10 @@ function useScratchpadAdd() {
   }, [query, market]);
 
   const addSuggestion = useCallback((stock: KRStockInfo) => {
+    if (basketItems.some((i) => i.ticker === stock.stk_cd)) {
+      setAddError(`${stock.stk_nm} (${stock.stk_cd})은 이미 스크래치패드에 있습니다`);
+      return;
+    }
     addToBasket({
       marketType: 'kiwoom',
       ticker: stock.stk_cd,
@@ -134,41 +169,90 @@ function useScratchpadAdd() {
       changeRate: stock.prdy_ctrt || 0,
       change: stock.prdy_ctrt > 0 ? 'RISE' : stock.prdy_ctrt < 0 ? 'FALL' : 'EVEN',
     });
-    setQuery('');
+    setQueryRaw('');
     setSuggestions([]);
+    setSelectedIndex(-1);
     setAddError(null);
-  }, [addToBasket]);
+  }, [addToBasket, basketItems]);
 
+  // Bulk add: comma-separated tickers/codes (BasketWidget parity). A single
+  // non-comma kiwoom query with a live suggestion still prefers the
+  // keyboard-selected (or first) autocomplete match over raw-code parsing.
   const addManual = useCallback(() => {
     const raw = query.trim();
     if (!raw) return;
-    if (suggestions.length > 0 && market === 'kiwoom') {
-      addSuggestion(suggestions[0]);
-      return;
-    }
-    if (market === 'kiwoom') {
-      const code = raw.toUpperCase();
-      if (!/^\d{6}$/.test(code)) {
-        setAddError('6자리 종목코드를 입력하세요 (예: 005930)');
+
+    if (!raw.includes(',') && market === 'kiwoom' && suggestions.length > 0) {
+      const pick = selectedIndex >= 0 ? suggestions[selectedIndex] : suggestions[0];
+      if (pick) {
+        addSuggestion(pick);
         return;
       }
-      addToBasket({
-        marketType: 'kiwoom', ticker: code, displayName: code,
-        price: 0, prevPrice: 0, changeRate: 0, change: 'EVEN',
-      });
-    } else {
-      const upper = raw.toUpperCase();
-      const ticker = upper.startsWith('KRW-') ? upper : `KRW-${upper}`;
-      addToBasket({
-        marketType: 'coin', ticker, displayName: upper.replace('KRW-', ''),
-        price: 0, prevPrice: 0, changeRate: 0, change: 'EVEN',
-      });
     }
-    setQuery('');
-    setAddError(null);
-  }, [query, market, suggestions, addToBasket, addSuggestion]);
 
-  return { market, setMarket, query, setQuery, suggestions, addSuggestion, addManual, addError };
+    const tokens = raw.split(',').map((t) => t.trim().toUpperCase()).filter(Boolean);
+    const invalid: string[] = [];
+    let added = 0;
+
+    for (const token of tokens) {
+      if (basketItems.length + added >= 10) break;
+
+      if (market === 'kiwoom') {
+        if (!/^\d{6}$/.test(token)) {
+          invalid.push(token);
+          continue;
+        }
+        if (basketItems.some((i) => i.ticker === token)) continue;
+        addToBasket({
+          marketType: 'kiwoom', ticker: token, displayName: token,
+          price: 0, prevPrice: 0, changeRate: 0, change: 'EVEN',
+        });
+        added++;
+      } else {
+        const ticker = token.startsWith('KRW-') ? token : `KRW-${token}`;
+        if (basketItems.some((i) => i.ticker === ticker)) continue;
+        addToBasket({
+          marketType: 'coin', ticker, displayName: token.replace('KRW-', ''),
+          price: 0, prevPrice: 0, changeRate: 0, change: 'EVEN',
+        });
+        added++;
+      }
+    }
+
+    setAddError(invalid.length > 0 ? `잘못된 종목코드: ${invalid.join(', ')} (6자리 숫자 필요)` : null);
+    if (added > 0 || invalid.length === tokens.length) {
+      setQueryRaw('');
+      setSuggestions([]);
+      setSelectedIndex(-1);
+    }
+  }, [query, market, suggestions, selectedIndex, basketItems, addToBasket, addSuggestion]);
+
+  // ↑/↓ cycles the autocomplete dropdown; Esc dismisses it (until the next
+  // keystroke); Enter commits (autocomplete pick, or bulk/manual add).
+  const onKeyDown = useCallback((e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      addManual();
+    } else if (e.key === 'ArrowDown') {
+      if (dismissed || suggestions.length === 0) return;
+      e.preventDefault();
+      setSelectedIndex((prev) => (prev < suggestions.length - 1 ? prev + 1 : prev));
+    } else if (e.key === 'ArrowUp') {
+      if (dismissed || suggestions.length === 0) return;
+      e.preventDefault();
+      setSelectedIndex((prev) => (prev > 0 ? prev - 1 : -1));
+    } else if (e.key === 'Escape') {
+      setDismissed(true);
+      setSelectedIndex(-1);
+    }
+  }, [addManual, dismissed, suggestions.length]);
+
+  return {
+    market, setMarket,
+    query, setQuery,
+    suggestions: dismissed ? [] : suggestions,
+    selectedIndex, addSuggestion, addManual, addError, onKeyDown,
+  };
 }
 
 // -------------------------------------------
@@ -266,13 +350,24 @@ export function DiscoverySection() {
   const basketItems = useStore(useShallow(selectBasketItems));
   const chartSymbol = useStore(selectChartSymbol);
   const setChartSymbol = useStore((s) => s.setChartSymbol);
+  const removeFromBasket = useStore((s) => s.removeFromBasket);
+  const clearBasket = useStore((s) => s.clearBasket);
+  const setShowSettingsModal = useStore((s) => s.setShowSettingsModal);
+  const upbitApiConfigured = useStore((s) => s.upbitApiConfigured);
+  const kiwoomApiConfigured = useStore((s) => s.kiwoomApiConfigured);
   const startAnalysis = useStartAnalysis();
-  const scratchpad = useScratchpadAdd();
+  const scratchpad = useScratchpadAdd(basketItems);
   useScratchpadPricePolling(basketItems);
 
   const [autoPromote, setAutoPromote] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [bulkAnalyzing, setBulkAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const hasCoinItems = basketItems.some((i) => i.marketType === 'coin');
+  const hasKiwoomItems = basketItems.some((i) => i.marketType === 'kiwoom');
+  const showCoinApiWarning = hasCoinItems && !upbitApiConfigured;
+  const showKiwoomApiWarning = hasKiwoomItems && !kiwoomApiConfigured;
 
   const status = progress?.status ?? 'idle';
   const pct = Math.min(100, Math.max(0, progress?.progress_pct ?? 0));
@@ -348,6 +443,44 @@ export function DiscoverySection() {
       setError(`분석 시작 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
     });
   }, [startAnalysis]);
+
+  // Bulk "analyze all" (BasketWidget.handleBulkAnalyze parity, folded in
+  // nav-rationalize 2026-07-14): starts analysis for as many Scratchpad
+  // items as the concurrent Kiwoom session slot limit allows (max 3 at
+  // once), staggered 500ms apart to avoid session-creation races.
+  // Successfully-started items are removed from the Scratchpad; failures
+  // stay behind with an inline error.
+  const handleBulkAnalyze = useCallback(async () => {
+    if (basketItems.length === 0 || bulkAnalyzing) return;
+    setBulkAnalyzing(true);
+    setError(null);
+
+    const availableSlots = selectKiwoomAvailableSlots(useStore.getState());
+    const maxItems = Math.min(basketItems.length, availableSlots, 3);
+    const itemsToAnalyze = basketItems.slice(0, maxItems);
+
+    if (maxItems === 0) {
+      setError('분석 슬롯이 모두 사용 중입니다');
+      setBulkAnalyzing(false);
+      return;
+    }
+
+    const startedItems: BasketItem[] = [];
+    for (let i = 0; i < itemsToAnalyze.length; i++) {
+      const item = itemsToAnalyze[i];
+      try {
+        const sessionId = await startAnalysis(item.marketType, item.ticker, item.displayName);
+        if (sessionId) startedItems.push(item);
+        if (i < itemsToAnalyze.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      } catch (e) {
+        setError(`전체분석 실패 (${item.ticker}): ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
+      }
+    }
+    startedItems.forEach((item) => removeFromBasket(item.id));
+    setBulkAnalyzing(false);
+  }, [basketItems, bulkAnalyzing, startAnalysis, removeFromBasket]);
 
   const topResults = [...results].sort((a, b) => b.confidence - a.confidence).slice(0, TOP_N);
 
@@ -474,6 +607,29 @@ export function DiscoverySection() {
           <span className="text-[10px] text-muted font-semibold tracking-wide">
             Scratchpad · {basketItems.length}/10
           </span>
+          {basketItems.length > 0 && (
+            <div className="flex items-center gap-2 flex-none">
+              <button
+                type="button"
+                onClick={handleBulkAnalyze}
+                disabled={bulkAnalyzing}
+                aria-label="전체 분석"
+                title="전체 분석 (동시 슬롯 한도 적용, 최대 3개)"
+                className="text-up font-medium disabled:opacity-50"
+              >
+                {bulkAnalyzing ? '분석 중…' : '전체분석▶▶'}
+              </button>
+              <button
+                type="button"
+                onClick={clearBasket}
+                aria-label="전체 삭제"
+                title="스크래치패드 비우기"
+                className="text-down font-medium"
+              >
+                전체삭제🗑
+              </button>
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-1.5 px-2.5 py-1.5 flex-none relative">
           <select
@@ -488,13 +644,8 @@ export function DiscoverySection() {
             type="text"
             value={scratchpad.query}
             onChange={(e) => scratchpad.setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                scratchpad.addManual();
-              }
-            }}
-            placeholder="종목코드/티커 (예: 005930, BTC)"
+            onKeyDown={scratchpad.onKeyDown}
+            placeholder="종목코드/티커, 콤마로 여러 개 (예: 005930,000660)"
             className="flex-1 min-w-0 px-2 py-1 bg-card border border-hairline rounded text-[10px]"
           />
           <button
@@ -506,12 +657,14 @@ export function DiscoverySection() {
           </button>
           {scratchpad.suggestions.length > 0 && (
             <div className="absolute z-10 top-full left-8 right-16 mt-1 bg-elevated border border-hairline rounded shadow-lg max-h-32 overflow-y-auto">
-              {scratchpad.suggestions.map((s) => (
+              {scratchpad.suggestions.map((s, idx) => (
                 <button
                   key={s.stk_cd}
                   type="button"
                   onClick={() => scratchpad.addSuggestion(s)}
-                  className="w-full text-left px-2 py-1 text-[10px] hover:bg-canvas"
+                  className={`w-full text-left px-2 py-1 text-[10px] hover:bg-canvas ${
+                    idx === scratchpad.selectedIndex ? 'bg-canvas' : ''
+                  }`}
                 >
                   {s.stk_nm} <span className="text-dim">{s.stk_cd}</span>
                 </button>
@@ -521,6 +674,20 @@ export function DiscoverySection() {
         </div>
         {scratchpad.addError && (
           <div className="px-2.5 pb-1 text-down text-[10px] flex-none">{scratchpad.addError}</div>
+        )}
+        {(showCoinApiWarning || showKiwoomApiWarning) && (
+          <div className="flex-none flex items-center justify-between gap-2 px-2.5 py-1 border-b border-hairline bg-warn/10 text-warn text-[10px]">
+            <span>
+              {showCoinApiWarning && showKiwoomApiWarning
+                ? 'Upbit·Kiwoom API 미등록 — 실시간 시세 없음'
+                : showCoinApiWarning
+                ? 'Upbit API 미등록 — 실시간 시세 없음'
+                : 'Kiwoom API 미등록 — 실시간 시세 없음'}
+            </span>
+            <button type="button" onClick={() => setShowSettingsModal(true)} className="underline flex-none">
+              설정으로 이동
+            </button>
+          </div>
         )}
         <div className="flex-1 min-h-0 overflow-y-auto">
           {basketItems.length === 0 ? (
@@ -564,6 +731,15 @@ export function DiscoverySection() {
                     className="text-up font-medium"
                   >
                     분석▶
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); removeFromBasket(item.id); }}
+                    aria-label={`제거 ${item.ticker}`}
+                    title="스크래치패드에서 제거"
+                    className="text-dim hover:text-down font-medium"
+                  >
+                    ✕
                   </button>
                 </div>
               </div>

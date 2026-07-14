@@ -1,8 +1,10 @@
 /**
  * Sidebar Component
  *
- * Navigation for page views.
- * - Dashboard, Analysis, Charts, Positions, Scratchpad, Trades
+ * Mobile hamburger-menu navigation. Renders from NAV_ITEMS (frontend/src/nav.ts)
+ * — the same single source of truth the desktop TerminalShell rail and the
+ * ⌘K command palette use — so this menu can never drift out of sync with
+ * the rest of the app's nav surface again (nav-rationalize, 2026-07-14).
  */
 
 import { useMemo } from 'react';
@@ -11,7 +13,6 @@ import {
   Wallet,
   BookOpen,
   HelpCircle,
-  ShoppingBasket,
   LayoutDashboard,
   Activity,
   Receipt,
@@ -21,8 +22,23 @@ import {
 } from 'lucide-react';
 import { useStore } from '@/store';
 import { useGoTo, useActiveView } from '@/hooks/useNav';
+import { NAV_ITEMS, type ViewKey } from '@/nav';
 import { MarketTabs } from '@/components/layout/MarketTabs';
 import { useTranslations } from '@/utils/translations';
+
+// Icon lookup for NAV_ITEMS — mirrors TerminalShell's NAV_ICONS (icons are
+// kept local to each nav consumer per nav.ts's "icons stay in
+// TerminalShell/Sidebar" convention; only the ViewKeys present in NAV_ITEMS
+// need an entry here).
+const NAV_ICONS: Partial<Record<ViewKey, React.ReactNode>> = {
+  dashboard: <LayoutDashboard className="w-5 h-5" />,
+  analysis: <Activity className="w-5 h-5" />,
+  positions: <Wallet className="w-5 h-5" />,
+  'agent-chat': <MessageSquare className="w-5 h-5" />,
+  scanner: <Scan className="w-5 h-5" />,
+  trading: <Bot className="w-5 h-5" />,
+  trades: <Receipt className="w-5 h-5" />,
+};
 
 interface NavItemProps {
   icon: React.ReactNode;
@@ -75,8 +91,6 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
   const language = useStore((state) => state.language);
   const t = useTranslations(language);
 
-  // Get counts for badges - use primitive selectors to avoid infinite loops
-  const basketItemsCount = useStore((state) => state.basket.items.length);
   const activeMarket = useStore((state) => state.activeMarket);
   const coinPosition = useStore((state) => state.coin.activePosition);
   const kiwoomPosition = useStore((state) => state.kiwoom.activePosition);
@@ -101,6 +115,14 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
     return count;
   }, [coinStatus, kiwoomSessions]);
 
+  // Only 'analysis' (running session count) and 'positions' (active
+  // position present) carry a badge.
+  const badgeFor = (view: ViewKey): string | undefined => {
+    if (view === 'analysis') return runningCount > 0 ? String(runningCount) : undefined;
+    if (view === 'positions') return activePosition ? '1' : undefined;
+    return undefined;
+  };
+
   return (
     <div className={`h-full flex flex-col overflow-hidden ${collapsed ? 'p-2' : 'p-3'}`}>
       {/* Market Tabs - Hidden when collapsed */}
@@ -110,67 +132,19 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
         </div>
       )}
 
-      {/* Navigation */}
+      {/* Navigation — single source: NAV_ITEMS (frontend/src/nav.ts) */}
       <nav className="space-y-1">
-        <NavItem
-          icon={<LayoutDashboard className="w-5 h-5" />}
-          label={t('nav_dashboard')}
-          active={activeView === 'dashboard'}
-          onClick={() => goTo('dashboard')}
-          collapsed={collapsed}
-        />
-        <NavItem
-          icon={<Activity className="w-5 h-5" />}
-          label={t('nav_analysis')}
-          active={activeView === 'analysis'}
-          badge={runningCount > 0 ? String(runningCount) : undefined}
-          onClick={() => goTo('analysis')}
-          collapsed={collapsed}
-        />
-        <NavItem
-          icon={<Wallet className="w-5 h-5" />}
-          label={t('nav_positions')}
-          active={activeView === 'positions'}
-          badge={activePosition ? '1' : undefined}
-          onClick={() => goTo('positions')}
-          collapsed={collapsed}
-        />
-        <NavItem
-          icon={<ShoppingBasket className="w-5 h-5" />}
-          label={t('nav_basket')}
-          active={activeView === 'basket'}
-          badge={basketItemsCount > 0 ? String(basketItemsCount) : undefined}
-          onClick={() => goTo('basket')}
-          collapsed={collapsed}
-        />
-        <NavItem
-          icon={<Receipt className="w-5 h-5" />}
-          label={t('nav_trades')}
-          active={activeView === 'trades'}
-          onClick={() => goTo('trades')}
-          collapsed={collapsed}
-        />
-        <NavItem
-          icon={<Bot className="w-5 h-5" />}
-          label={t('nav_auto_trading')}
-          active={activeView === 'trading'}
-          onClick={() => goTo('trading')}
-          collapsed={collapsed}
-        />
-        <NavItem
-          icon={<Scan className="w-5 h-5" />}
-          label={t('nav_scanner')}
-          active={activeView === 'scanner'}
-          onClick={() => goTo('scanner')}
-          collapsed={collapsed}
-        />
-        <NavItem
-          icon={<MessageSquare className="w-5 h-5" />}
-          label={t('nav_agent_chat')}
-          active={activeView === 'agent-chat'}
-          onClick={() => goTo('agent-chat')}
-          collapsed={collapsed}
-        />
+        {NAV_ITEMS.map((n) => (
+          <NavItem
+            key={n.view}
+            icon={NAV_ICONS[n.view]}
+            label={n.label}
+            active={activeView === n.view}
+            badge={badgeFor(n.view)}
+            onClick={() => goTo(n.view)}
+            collapsed={collapsed}
+          />
+        ))}
       </nav>
 
       {/* Spacer to push secondary nav down */}

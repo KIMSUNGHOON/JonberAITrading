@@ -10,6 +10,6 @@ export function useGoTo() {
 
 /** The current top-level view, derived from the URL (nav active-state). */
 export function useActiveView(): ViewKey {
-  const { pathname, search } = useLocation();
-  return pathToView(pathname, search);
+  const { pathname } = useLocation();
+  return pathToView(pathname);
 }

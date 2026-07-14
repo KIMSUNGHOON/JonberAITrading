@@ -503,3 +503,222 @@ describe('DiscoverySection — Scratchpad price polling (re-homed KR-price-fallb
     expect(getKRStockTickers).not.toHaveBeenCalled();
   });
 });
+
+// -------------------------------------------------------------------------
+// Power-staging features folded in from the deleted standalone BasketWidget
+// (nav-rationalize, 2026-07-14, user-approved "ABSORB"): comma-separated
+// bulk-add, autocomplete ↑/↓/Esc keyboard nav, per-item remove + clear-all,
+// bulk "analyze all" respecting the concurrent-slot limit, and the
+// API-not-configured warning banner. BasketWidget.test.tsx (deleted along
+// with the widget) covered these; these tests replace it.
+// -------------------------------------------------------------------------
+
+describe('DiscoverySection — Scratchpad power features folded in from BasketWidget', () => {
+  function krItem(overrides: Record<string, unknown> = {}) {
+    return {
+      id: `item-${overrides.ticker ?? '005930'}`,
+      marketType: 'kiwoom' as const,
+      ticker: '005930',
+      displayName: '삼성전자',
+      price: 71000,
+      prevPrice: 0,
+      changeRate: 0,
+      change: 'EVEN' as const,
+      addedAt: new Date(),
+      lastUpdated: null,
+      isLoading: false,
+      error: null,
+      ...overrides,
+    };
+  }
+
+  describe('comma-separated bulk-add', () => {
+    it('콤마로 구분된 여러 종목코드를 한 번에 추가한다', async () => {
+      render(<DiscoverySection />);
+      fireEvent.change(screen.getByPlaceholderText(/종목코드/), { target: { value: '005930,000660' } });
+      fireEvent.click(screen.getByRole('button', { name: '추가' }));
+      await waitFor(() => {
+        const tickers = useStore.getState().basket.items.map((i) => i.ticker);
+        expect(tickers).toEqual(expect.arrayContaining(['005930', '000660']));
+      });
+    });
+
+    it('유효하지 않은 코드가 섞여 있으면 유효한 것만 추가하고 나머지는 에러로 안내한다', async () => {
+      render(<DiscoverySection />);
+      fireEvent.change(screen.getByPlaceholderText(/종목코드/), { target: { value: '005930,BAD' } });
+      fireEvent.click(screen.getByRole('button', { name: '추가' }));
+      await waitFor(() => {
+        expect(useStore.getState().basket.items.some((i) => i.ticker === '005930')).toBe(true);
+      });
+      expect(screen.getByText(/잘못된 종목코드.*BAD/)).toBeInTheDocument();
+    });
+
+    it('coin 마켓에서 콤마로 구분된 여러 티커를 KRW- 접두로 추가한다', async () => {
+      render(<DiscoverySection />);
+      fireEvent.change(screen.getByRole('combobox'), { target: { value: 'coin' } });
+      fireEvent.change(screen.getByPlaceholderText(/종목코드/), { target: { value: 'BTC,ETH' } });
+      fireEvent.click(screen.getByRole('button', { name: '추가' }));
+      await waitFor(() => {
+        const tickers = useStore.getState().basket.items.map((i) => i.ticker);
+        expect(tickers).toEqual(expect.arrayContaining(['KRW-BTC', 'KRW-ETH']));
+      });
+    });
+  });
+
+  describe('autocomplete keyboard nav (↑/↓/Esc)', () => {
+    it('↓ 키로 두 번째 자동완성 항목을 선택하고 Enter로 추가한다', async () => {
+      searchKRStocks.mockResolvedValue({
+        stocks: [
+          { stk_cd: '005930', stk_nm: '삼성전자', cur_prc: 71000, prdy_ctrt: 1.2, prdy_vrss: 0, trde_qty: 0, trde_prica: 0 },
+          { stk_cd: '000660', stk_nm: 'SK하이닉스', cur_prc: 150000, prdy_ctrt: -0.5, prdy_vrss: 0, trde_qty: 0, trde_prica: 0 },
+        ],
+        total: 2,
+      });
+      render(<DiscoverySection />);
+      const input = screen.getByPlaceholderText(/종목코드/);
+      fireEvent.change(input, { target: { value: '반도체' } });
+      await waitFor(() => expect(searchKRStocks).toHaveBeenCalled());
+      await waitFor(() => expect(screen.getByText('SK하이닉스')).toBeInTheDocument());
+
+      fireEvent.keyDown(input, { key: 'ArrowDown' }); // -> index 0 (삼성전자)
+      fireEvent.keyDown(input, { key: 'ArrowDown' }); // -> index 1 (SK하이닉스)
+      fireEvent.keyDown(input, { key: 'Enter' });
+
+      await waitFor(() => {
+        expect(useStore.getState().basket.items.some((i) => i.ticker === '000660')).toBe(true);
+      });
+      expect(useStore.getState().basket.items.some((i) => i.ticker === '005930')).toBe(false);
+    });
+
+    it('Esc가 자동완성 드롭다운을 닫는다', async () => {
+      searchKRStocks.mockResolvedValue({
+        stocks: [{ stk_cd: '005930', stk_nm: '삼성전자', cur_prc: 71000, prdy_ctrt: 1.2, prdy_vrss: 0, trde_qty: 0, trde_prica: 0 }],
+        total: 1,
+      });
+      render(<DiscoverySection />);
+      const input = screen.getByPlaceholderText(/종목코드/);
+      fireEvent.change(input, { target: { value: '삼성' } });
+      await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
+
+      fireEvent.keyDown(input, { key: 'Escape' });
+      expect(screen.queryByText('삼성전자')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('per-item remove + clear-all', () => {
+    it('개별 항목의 ✕ 버튼이 removeFromBasket을 호출한다', async () => {
+      useStore.setState({ basket: { items: [krItem()], maxItems: 10, isUpdating: false } });
+      render(<DiscoverySection />);
+      fireEvent.click(screen.getByRole('button', { name: /제거.*005930/ }));
+      await waitFor(() => expect(useStore.getState().basket.items).toHaveLength(0));
+    });
+
+    it('제거 버튼 클릭은 행 클릭(차트 이동)으로 전파되지 않는다', async () => {
+      useStore.setState({ basket: { items: [krItem()], maxItems: 10, isUpdating: false } });
+      render(<DiscoverySection />);
+      fireEvent.click(screen.getByRole('button', { name: /제거.*005930/ }));
+      expect(useStore.getState().chartSymbol).toBeNull();
+    });
+
+    it('전체삭제 버튼이 스크래치패드를 비운다', async () => {
+      useStore.setState({
+        basket: {
+          items: [krItem(), krItem({ id: 'item-000660', ticker: '000660', displayName: 'SK하이닉스' })],
+          maxItems: 10,
+          isUpdating: false,
+        },
+      });
+      render(<DiscoverySection />);
+      fireEvent.click(screen.getByRole('button', { name: '전체 삭제' }));
+      await waitFor(() => expect(useStore.getState().basket.items).toHaveLength(0));
+    });
+
+    it('스크래치패드가 비어있으면 전체분석/전체삭제 버튼을 보여주지 않는다', () => {
+      render(<DiscoverySection />);
+      expect(screen.queryByRole('button', { name: '전체 삭제' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '전체 분석' })).not.toBeInTheDocument();
+    });
+  });
+
+  describe('bulk "analyze all" respects the concurrent-slot limit', () => {
+    it('가용 슬롯만큼만 분석을 시작하고 시작된 항목만 스크래치패드에서 제거한다', async () => {
+      useStore.setState({
+        basket: {
+          items: [
+            krItem({ id: 'item-005930', ticker: '005930', displayName: '삼성전자' }),
+            krItem({ id: 'item-000660', ticker: '000660', displayName: 'SK하이닉스' }),
+          ],
+          maxItems: 10,
+          isUpdating: false,
+        },
+        kiwoom: {
+          sessions: [],
+          activeSessionId: null,
+          maxConcurrentSessions: 1,
+          stk_cd: '',
+          stk_nm: null,
+          status: 'idle',
+          currentStage: null,
+          reasoningLog: [],
+          analyses: [],
+          tradeProposal: null,
+          awaitingApproval: false,
+          activePosition: null,
+          error: null,
+          history: [],
+        },
+      });
+      mockStart.mockResolvedValue('session-limited');
+
+      render(<DiscoverySection />);
+      fireEvent.click(screen.getByRole('button', { name: '전체 분석' }));
+
+      await waitFor(() => expect(mockStart).toHaveBeenCalledTimes(1));
+      expect(mockStart).toHaveBeenCalledWith('kiwoom', '005930', '삼성전자');
+
+      await waitFor(() => {
+        const tickers = useStore.getState().basket.items.map((i) => i.ticker);
+        expect(tickers).toEqual(['000660']);
+      });
+    });
+  });
+
+  describe('API-not-configured warning banner', () => {
+    it('coin 항목이 있고 Upbit API 미등록이면 경고 배너를 보여주고, 클릭 시 설정 모달을 연다', () => {
+      useStore.setState({
+        upbitApiConfigured: false,
+        kiwoomApiConfigured: true,
+        basket: {
+          items: [krItem({ id: 'item-coin', marketType: 'coin', ticker: 'KRW-BTC', displayName: '비트코인' })],
+          maxItems: 10,
+          isUpdating: false,
+        },
+      });
+      render(<DiscoverySection />);
+      expect(screen.getByText(/Upbit API 미등록/)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText('설정으로 이동'));
+      expect(useStore.getState().showSettingsModal).toBe(true);
+    });
+
+    it('KR 항목이 있고 Kiwoom API 미등록이면 경고 배너를 보여준다', () => {
+      useStore.setState({
+        upbitApiConfigured: true,
+        kiwoomApiConfigured: false,
+        basket: { items: [krItem()], maxItems: 10, isUpdating: false },
+      });
+      render(<DiscoverySection />);
+      expect(screen.getByText(/Kiwoom API 미등록/)).toBeInTheDocument();
+    });
+
+    it('필요한 API가 모두 등록되어 있으면 경고 배너를 보여주지 않는다', () => {
+      useStore.setState({
+        upbitApiConfigured: true,
+        kiwoomApiConfigured: true,
+        basket: { items: [krItem()], maxItems: 10, isUpdating: false },
+      });
+      render(<DiscoverySection />);
+      expect(screen.queryByText(/API 미등록/)).not.toBeInTheDocument();
+    });
+  });
+});
