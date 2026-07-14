@@ -113,6 +113,25 @@ class StorageService:
                     )
                 """)
 
+                # Coin realized P&L table (P2-4 Task P0: coin had no
+                # realized-P&L record at all — paper_performance is KR-only.
+                # Minimal shape: one row per close/reduce, mirroring
+                # coin_trades' style rather than trying to reuse it (a trade
+                # row is a single execution; a realized row is a matched
+                # entry/exit pair with the resulting P&L).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS coin_realized_pnl (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT,
+                        market TEXT NOT NULL,
+                        entry_price REAL NOT NULL,
+                        exit_price REAL NOT NULL,
+                        quantity REAL NOT NULL,
+                        realized_amount REAL NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # KR stock trades table (P1-1: the /trades tab had no backing
                 # storage — nothing recorded a fill anywhere, and the route
                 # masked the missing methods as an empty list via
@@ -208,6 +227,12 @@ class StorageService:
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_coin_positions_session ON coin_positions(session_id)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_realized_pnl_market ON coin_realized_pnl(market)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_coin_realized_pnl_created ON coin_realized_pnl(created_at DESC)"
                 )
 
                 await conn.commit()
@@ -691,7 +716,19 @@ class StorageService:
 
     async def save_coin_position(self, position: dict[str, Any]) -> bool:
         """
-        Save or update a coin position.
+        Save or update a coin position, weighted-averaging repeat buys.
+
+        `position["quantity"]`/`["avg_entry_price"]` are treated as the
+        INCREMENTAL buy being added, not the total position — every caller
+        (paper + live BUY execution) passes this trade's own qty/price. If a
+        position already exists for the market, the stored quantity/avg
+        entry price are combined with the incoming values via a
+        quantity-weighted average; otherwise this is just the first buy.
+
+        (P2-4 Task P0 fix: this used to be `INSERT OR REPLACE`, so a second
+        BUY of the same market overwrote avg_entry_price/quantity with only
+        the last buy's values instead of averaging — repeated buys silently
+        discarded all prior cost basis.)
 
         Args:
             position: Position data with keys:
@@ -703,8 +740,35 @@ class StorageService:
         """
         await self.initialize()
 
+        market = position["market"].upper()
+
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT quantity, avg_entry_price FROM coin_positions WHERE market = ?",
+                    (market,),
+                )
+                existing = await cursor.fetchone()
+
+                incoming_quantity = float(position["quantity"])
+                incoming_price = float(position["avg_entry_price"])
+
+                final_quantity = incoming_quantity
+                final_avg_entry_price = incoming_price
+
+                if existing and float(existing["quantity"]) > 0:
+                    old_quantity = float(existing["quantity"])
+                    old_avg_entry_price = float(existing["avg_entry_price"])
+                    combined_quantity = old_quantity + incoming_quantity
+
+                    if combined_quantity > 0:
+                        final_avg_entry_price = (
+                            old_quantity * old_avg_entry_price
+                            + incoming_quantity * incoming_price
+                        ) / combined_quantity
+                    final_quantity = combined_quantity
+
                 await conn.execute(
                     """
                     INSERT OR REPLACE INTO coin_positions
@@ -715,20 +779,25 @@ class StorageService:
                             ?)
                     """,
                     (
-                        position["market"],
+                        market,
                         position["currency"],
-                        position["quantity"],
-                        position["avg_entry_price"],
+                        final_quantity,
+                        final_avg_entry_price,
                         position.get("stop_loss"),
                         position.get("take_profit"),
                         position.get("session_id"),
-                        position["market"],
+                        market,
                         datetime.now(),
                         datetime.now(),
                     ),
                 )
                 await conn.commit()
-                logger.debug("coin_position_saved", market=position["market"])
+                logger.debug(
+                    "coin_position_saved",
+                    market=market,
+                    quantity=final_quantity,
+                    avg_entry_price=final_avg_entry_price,
+                )
                 return True
         except Exception as e:
             logger.error(
@@ -832,6 +901,98 @@ class StorageService:
         except Exception as e:
             logger.error("coin_position_delete_failed", market=market, error=str(e))
             return False
+
+    async def save_coin_realized_pnl(self, record: dict[str, Any]) -> bool:
+        """
+        Persist a minimal realized-P&L record for a coin close/reduce.
+
+        (P2-4 Task P0: coin had no realized-P&L aggregation at all — every
+        SELL's outcome simply vanished. Kept intentionally minimal — entry/
+        exit/qty/realized only, no fees yet (that's a later fill-realism
+        task). Full performance-panel integration is out of scope here.)
+
+        Args:
+            record: dict with keys id, market, entry_price, exit_price,
+                quantity, realized_amount, and optionally session_id/created_at.
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO coin_realized_pnl
+                    (id, session_id, market, entry_price, exit_price,
+                     quantity, realized_amount, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"],
+                        record.get("session_id"),
+                        record["market"].upper(),
+                        record["entry_price"],
+                        record["exit_price"],
+                        record["quantity"],
+                        record["realized_amount"],
+                        record.get("created_at", datetime.now()),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "coin_realized_pnl_saved",
+                    market=record["market"],
+                    realized_amount=record["realized_amount"],
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "coin_realized_pnl_save_failed",
+                market=record.get("market"),
+                error=str(e),
+            )
+            return False
+
+    async def get_coin_realized_pnl(
+        self,
+        market: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Get realized coin P&L records, newest first, optionally filtered by market."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                if market:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM coin_realized_pnl
+                        WHERE market = ?
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (market.upper(), limit, offset),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM coin_realized_pnl
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (limit, offset),
+                    )
+
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("coin_realized_pnl_get_failed", error=str(e))
+            return []
 
     # -------------------------------------------
     # KR Stock Trading Operations (P1-1)

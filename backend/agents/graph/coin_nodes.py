@@ -699,6 +699,58 @@ async def coin_execution_node(state: dict) -> dict:
         return await _execute_paper_order(state, proposal, market, action, entry_price, quantity)
 
 
+async def _close_or_reduce_coin_position(
+    storage,
+    *,
+    market: str,
+    sell_quantity: float,
+    exit_price: float,
+    session_id: str | None,
+) -> None:
+    """Reduce or close a coin position on SELL, persisting a matching
+    realized-P&L record for whatever quantity was actually sold.
+
+    (P2-4 Task P0 fix: autonomous SELL previously never touched the ledger
+    at all in either `_execute_paper_order` or `_execute_live_order` — the
+    position-save call was gated inside `if side == "bid":` (buy only), so
+    a sold coin position stayed "held" forever at the old avg price, with
+    unrealized P&L accumulating on a phantom holding. Coin also had no
+    realized-P&L aggregation whatsoever before this.)
+    """
+    existing_position = await storage.get_coin_position(market)
+    if not existing_position:
+        logger.warning(
+            "coin_sell_no_open_position",
+            market=market,
+            sell_quantity=sell_quantity,
+        )
+        return
+
+    position_quantity = float(existing_position["quantity"])
+    position_entry_price = float(existing_position["avg_entry_price"])
+    matched_quantity = min(sell_quantity, position_quantity)
+
+    if matched_quantity <= 0:
+        return
+
+    remaining_quantity = position_quantity - matched_quantity
+    if remaining_quantity <= 1e-9:
+        await storage.delete_coin_position(market)
+    else:
+        await storage.update_coin_position(market, {"quantity": remaining_quantity})
+
+    realized_amount = (exit_price - position_entry_price) * matched_quantity
+    await storage.save_coin_realized_pnl({
+        "id": f"realized-{uuid.uuid4()}",
+        "session_id": session_id,
+        "market": market,
+        "entry_price": position_entry_price,
+        "exit_price": exit_price,
+        "quantity": matched_quantity,
+        "realized_amount": realized_amount,
+    })
+
+
 async def _execute_paper_order(
     state: dict,
     proposal: dict,
@@ -737,7 +789,11 @@ async def _execute_paper_order(
         "order_uuid": trade_id,
     })
 
-    # Save or update position for BUY orders
+    # Save or update position for BUY orders; reduce/close it for SELL
+    # orders. (P2-4 Task P0 fix: this used to be gated to `side == "bid"`
+    # only, so an autonomous SELL never touched the ledger — a sold
+    # position stayed "held" forever at the old avg price, with unrealized
+    # P&L accumulating on a phantom holding.)
     if side == "bid":
         await storage.save_coin_position({
             "market": market,
@@ -748,6 +804,14 @@ async def _execute_paper_order(
             "take_profit": proposal.get("take_profit"),
             "session_id": session_id,
         })
+    else:
+        await _close_or_reduce_coin_position(
+            storage,
+            market=market,
+            sell_quantity=float(quantity),
+            exit_price=float(entry_price),
+            session_id=session_id,
+        )
 
     position = CoinPosition(
         market=market,
@@ -859,7 +923,10 @@ async def _execute_live_order(
                 "order_uuid": order.uuid,
             })
 
-            # Save or update position for BUY orders (if order executed)
+            # Save or update position for BUY orders (if order executed);
+            # reduce/close it for SELL orders using the actually-executed
+            # quantity (P2-4 Task P0 fix — see `_close_or_reduce_coin_position`;
+            # this branch previously did nothing for SELL at all).
             if side == "bid" and order.state in ("done", "wait"):
                 await storage.save_coin_position({
                     "market": market,
@@ -870,6 +937,14 @@ async def _execute_live_order(
                     "take_profit": proposal.get("take_profit"),
                     "session_id": session_id,
                 })
+            elif side == "ask" and order.state in ("done", "wait") and executed_volume > 0:
+                await _close_or_reduce_coin_position(
+                    storage,
+                    market=market,
+                    sell_quantity=executed_volume,
+                    exit_price=exec_price,
+                    session_id=session_id,
+                )
 
             # Create position record for state
             position = CoinPosition(
