@@ -31,21 +31,29 @@ async def get_positions():
     """
     Get all open positions with real-time P&L.
 
+    Source: broker account balance holdings (kt00004, `get_account_balance()`)
+    — the SAME source Operations '보유' reads (app/api/routes/trading.py,
+    mapping mirrored from kr_stocks/orders.py:63-76), so the two surfaces can
+    never diverge on quantity/avg/current price/P&L for the same holding.
+
+    Previously this endpoint called `storage.get_kr_stock_positions()`, a
+    method that has never existed on StorageService — there is no KR
+    position writer anywhere in the backend. Every call raised
+    AttributeError, which was caught and silently turned into an empty list,
+    so KR positions were ALWAYS empty regardless of actual broker holdings.
+
+    On broker fetch failure this degrades honestly to an empty portfolio
+    (logged, not raised) rather than fabricating positions or non-zero
+    totals.
+
     Returns:
         List of positions with portfolio summary
     """
-    from services.storage_service import get_storage_service
-
-    storage = await get_storage_service()
-
-    # Try to get positions from storage first
     try:
-        positions_data = await storage.get_kr_stock_positions()
-    except AttributeError:
-        # If method doesn't exist yet, return empty
-        positions_data = []
-
-    if not positions_data:
+        client = await get_shared_kiwoom_client_async()
+        balance = await client.get_account_balance()
+    except Exception as e:
+        logger.error("failed_to_fetch_kr_positions", error=str(e))
         return KRStockPositionListResponse(
             positions=[],
             total_value_krw=0,
@@ -53,56 +61,39 @@ async def get_positions():
             total_pnl_pct=0,
         )
 
-    # Get current prices
-    client = await get_shared_kiwoom_client_async()
-    price_map = {}
-
-    try:
-        for p in positions_data:
-            try:
-                info = await client.get_stock_info(p["stk_cd"])
-                if info:
-                    price_map[p["stk_cd"]] = info.cur_prc
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning("failed_to_fetch_prices_for_positions", error=str(e))
-
     positions = []
     total_value = 0
     total_pnl = 0
     total_cost = 0
 
-    for p in positions_data:
-        stk_cd = p["stk_cd"]
-        quantity = p["quantity"]
-        avg_entry = p["avg_entry_price"]
-        current_price = price_map.get(stk_cd, avg_entry)
+    for h in balance.holdings:
+        quantity = h.hldg_qty
+        avg_entry = h.avg_buy_prc
 
-        position_value = quantity * current_price
-        position_cost = quantity * avg_entry
-        unrealized_pnl = position_value - position_cost
-        unrealized_pnl_pct = (
-            (unrealized_pnl / position_cost * 100) if position_cost > 0 else 0
-        )
-
-        total_value += position_value
-        total_cost += position_cost
-        total_pnl += unrealized_pnl
+        total_value += h.evlu_amt
+        total_pnl += h.evlu_pfls_amt
+        total_cost += quantity * avg_entry
 
         positions.append(
             KRStockPosition(
-                stk_cd=stk_cd,
-                stk_nm=p["stk_nm"],
+                stk_cd=h.stk_cd,
+                stk_nm=h.stk_nm,
                 quantity=quantity,
                 avg_entry_price=avg_entry,
-                current_price=current_price,
-                unrealized_pnl=unrealized_pnl,
-                unrealized_pnl_pct=unrealized_pnl_pct,
-                stop_loss=p.get("stop_loss"),
-                take_profit=p.get("take_profit"),
-                session_id=p.get("session_id"),
-                created_at=p["created_at"],
+                current_price=h.cur_prc,
+                # Broker-computed P&L (kt00004) — same fields Operations
+                # '보유' reads directly off the Holding model
+                # (trading.py:1391-1398). Pass-through, not independently
+                # recomputed, so the two surfaces can never disagree.
+                unrealized_pnl=h.evlu_pfls_amt,
+                unrealized_pnl_pct=h.evlu_pfls_rt,
+                # SL/TP for KR positions stays coordinator-managed (Operations
+                # '보유' enrichment + PUT .../stop-loss|take-profit, P1-T7) —
+                # out of scope here; this list endpoint doesn't own it.
+                stop_loss=None,
+                take_profit=None,
+                session_id=None,
+                created_at=datetime.now(timezone.utc),
             )
         )
 
