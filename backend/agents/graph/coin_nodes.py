@@ -116,11 +116,54 @@ async def coin_data_collection_node(state: dict) -> dict:
         orderbook_dict = orderbook.model_dump() if orderbook else None
         trades_list = [t.model_dump() for t in trades] if trades else []
 
+        # P4 Task 2: fetch the existing position for this market (if any) so
+        # the strategic-decision node can tell a genuine re-eval of a held
+        # market apart from a fresh-entry analysis — mirrors what the KR
+        # graph's data_collection node does against the broker balance
+        # (kr_stock_nodes/data_collection.py), using the coin equivalent
+        # source of truth (storage.get_coin_position, the same one
+        # `coin/positions.py` GET /positions/{market} reads).
+        # get_coin_position() already catches its own storage errors and
+        # returns None, so a fetch failure here degrades honestly to "no
+        # position" rather than crashing the graph.
+        existing_position = None
+        try:
+            from services.storage_service import get_storage_service
+
+            storage = await get_storage_service()
+            position = await storage.get_coin_position(market)
+            if position and float(position.get("quantity", 0)) > 0:
+                existing_position = {
+                    "market": position.get("market", market),
+                    "quantity": position["quantity"],
+                    "avg_entry_price": position["avg_entry_price"],
+                    "stop_loss": position.get("stop_loss"),
+                    "take_profit": position.get("take_profit"),
+                }
+                logger.info(
+                    "coin_existing_position_found",
+                    market=market,
+                    quantity=existing_position["quantity"],
+                    avg_entry_price=existing_position["avg_entry_price"],
+                )
+        except Exception as e:
+            logger.warning(
+                "coin_existing_position_fetch_failed", market=market, error=str(e)
+            )
+
+        position_info = ""
+        if existing_position:
+            position_info = (
+                f" [Position: qty={existing_position['quantity']}, "
+                f"avg_entry={existing_position['avg_entry_price']:,.0f} KRW]"
+            )
+
         reasoning = (
             f"[Data Collection] {market}: "
             f"Price={analysis_data.current_price:,.0f} KRW, "
             f"24h={analysis_data.change_rate_24h:+.2f}%, "
             f"Volume={analysis_data.volume_24h:,.0f}"
+            f"{position_info}"
         )
 
         duration_ms = (time.perf_counter() - start_time) * 1000
@@ -129,6 +172,7 @@ async def coin_data_collection_node(state: dict) -> dict:
             node="coin_data_collection",
             market=market,
             price=analysis_data.current_price,
+            has_position=existing_position is not None,
             duration_ms=round(duration_ms, 2),
         )
 
@@ -137,6 +181,7 @@ async def coin_data_collection_node(state: dict) -> dict:
             "candles": candles,
             "orderbook": orderbook_dict,
             "trades": trades_list,
+            "existing_position": existing_position,
             "reasoning_log": add_coin_reasoning_log(state, reasoning),
             "messages": [AIMessage(content=reasoning)],
             "current_stage": CoinAnalysisStage.DATA_COLLECTION,
@@ -452,11 +497,31 @@ async def coin_strategic_decision_node(state: dict) -> dict:
     # Calculate consensus
     consensus_signal, avg_confidence = calculate_coin_consensus_signal(analyses)
 
+    # P4 Task 2: existing position context. Coin's TradeAction is
+    # intentionally position-agnostic (BUY/SELL/HOLD only — see
+    # `decision_policy.POSITION_AGNOSTIC_ACTIONS`; unlike KR's 7-action
+    # ADD/REDUCE/WATCH/AVOID split, expanding coin's action space is a
+    # separate, larger change out of scope here). This does NOT change which
+    # action gets chosen, but it does make the decision genuinely aware of a
+    # held market: the LLM sees the position in its context, and (below) the
+    # proposal's SELL quantity is sized off the REAL held quantity instead of
+    # always defaulting to 0 for a market this node didn't know was held.
+    existing_position = state.get("existing_position")
+    has_position = existing_position is not None
+    position_context = (
+        f"\n## Existing Position\n"
+        f"- Quantity: {existing_position['quantity']}\n"
+        f"- Avg entry price: {existing_position['avg_entry_price']:,.0f} KRW\n"
+        if existing_position
+        else "\n## Existing Position\n- No position held.\n"
+    )
+
     messages = [
         SystemMessage(content=COIN_STRATEGIC_DECISION_PROMPT),
         HumanMessage(
             content=f"Make trading decision for {market}:\n\n"
-            f"Consensus Signal: {consensus_signal.value} (Avg Confidence: {avg_confidence:.0%})\n\n"
+            f"Consensus Signal: {consensus_signal.value} (Avg Confidence: {avg_confidence:.0%})\n"
+            f"{position_context}\n"
             f"{analyses_context}"
         ),
     ]
@@ -534,6 +599,13 @@ async def coin_strategic_decision_node(state: dict) -> dict:
                 error=str(e),
             )
             # quantity remains 0, user can modify in approval dialog
+    elif action in (TradeAction.SELL, "SELL") and existing_position:
+        # P4 Task 2: a SELL for a market this node now knows is held sells
+        # the REAL held quantity (mirrors the KR decision node's `existing_position
+        # ["quantity"]` full-sell sizing) — previously this branch didn't
+        # exist at all, so every coin SELL proposal quantity stayed 0.0
+        # (a "blind" sell that would execute as a quantity-0 no-op).
+        quantity = float(existing_position["quantity"])
 
     # Create trade proposal
     proposal = CoinTradeProposal(
@@ -553,7 +625,11 @@ async def coin_strategic_decision_node(state: dict) -> dict:
         analyses=analyses,
     )
 
-    reasoning = f"[Strategic Decision] Proposal: {action.value} {market} {quantity:.4f} @ {current_price:,.0f} KRW"
+    position_note = f" (existing qty: {existing_position['quantity']})" if has_position else ""
+    reasoning = (
+        f"[Strategic Decision] Proposal: {action.value} {market} {quantity:.4f} "
+        f"@ {current_price:,.0f} KRW{position_note}"
+    )
 
     duration_ms = (time.perf_counter() - start_time) * 1000
     logger.info(
@@ -561,6 +637,7 @@ async def coin_strategic_decision_node(state: dict) -> dict:
         node="coin_strategic_decision",
         market=market,
         action=action.value,
+        has_position=has_position,
         duration_ms=round(duration_ms, 2),
     )
 

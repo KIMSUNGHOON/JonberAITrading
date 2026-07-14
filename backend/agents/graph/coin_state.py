@@ -242,6 +242,11 @@ class CoinTradingState(TypedDict, total=False):
     orderbook: Optional[dict]  # Orderbook data
     trades: Optional[list[dict]]  # Recent trades
 
+    # Portfolio context (P4 Task 2): the user's current open position for
+    # this market, if any — see `agents.graph.coin_nodes.coin_data_collection_node`
+    # for how it's populated (storage.get_coin_position, best-effort).
+    existing_position: Optional[dict]
+
     # Analysis results (stored as dicts for serialization)
     technical_analysis: Optional[dict]
     market_analysis: Optional[dict]  # Replaces fundamental for crypto
@@ -308,6 +313,9 @@ def create_coin_initial_state(
         "candles": None,
         "orderbook": None,
         "trades": None,
+
+        # Portfolio context (P4 Task 2)
+        "existing_position": None,
 
         # Analysis results
         "technical_analysis": None,

@@ -129,6 +129,17 @@ class CoinAnalysisResponse(BaseModel):
             "instead of starting a new analysis (P4 dedup)."
         ),
     )
+    position_exists: bool = Field(
+        default=False,
+        description=(
+            "True when this market is already held (storage.get_coin_position, "
+            "the same source /positions reads) at the time this analysis "
+            "started — lets the FE label this run '이미 보유 중 · 관리 분석' "
+            "instead of a fresh-entry analysis (P4). Best-effort: a storage "
+            "lookup failure degrades this to False rather than failing the "
+            "analysis-start request."
+        ),
+    )
 
 
 class CoinAnalysisSummary(BaseModel):
@@ -169,6 +180,13 @@ class CoinAnalysisStatusResponse(BaseModel):
     status: Literal["running", "awaiting_approval", "completed", "cancelled", "error"]
     current_stage: Optional[str] = None
     awaiting_approval: bool = False
+    position_exists: bool = Field(
+        default=False,
+        description=(
+            "True when this market was already held at analysis-start time "
+            "(P4). See CoinAnalysisResponse.position_exists."
+        ),
+    )
     trade_proposal: Optional[CoinTradeProposalResponse] = None
     analyses: list[CoinAnalysisSummary] = Field(default_factory=list)
     reasoning_log: list[str] = Field(default_factory=list)

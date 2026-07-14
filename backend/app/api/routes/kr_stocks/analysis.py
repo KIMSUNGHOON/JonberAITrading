@@ -80,6 +80,13 @@ async def start_kr_stock_analysis(
             status=existing.get("status", "running"),
             message="이미 진행중인 분석 세션이 있습니다 — 기존 세션을 재사용합니다.",
             duplicate=True,
+            # P4 Task 2: best-effort, no extra broker call — reuse whatever
+            # this in-flight session already recorded (either the fresh-start
+            # check below, if it ran for this same session, or the graph's
+            # own data_collection node once it completes). A dedup hit is
+            # meant to return immediately without paying for a second
+            # network round-trip (see test_kr_start_dedup_does_not_call_kiwoom_client).
+            position_exists=bool((existing.get("state") or {}).get("position_exists", False)),
         )
 
     session_id = str(uuid.uuid4())
@@ -100,6 +107,20 @@ async def start_kr_stock_analysis(
     except Exception as e:
         logger.warning("failed_to_get_stock_name", stk_cd=stk_cd, error=str(e))
 
+    # P4 Task 2: surface whether stk_cd is already held, from the SAME
+    # broker-balance source /positions and Operations '보유' read (kt00004,
+    # get_account_balance()) — so this flag can never disagree with what
+    # those surfaces show as held. Best-effort: any failure (client
+    # unavailable, API error) degrades to False rather than failing the
+    # analysis-start request — a position-awareness hint must never block
+    # starting the analysis itself.
+    position_exists = False
+    try:
+        balance = await client.get_account_balance()
+        position_exists = any(h.stk_cd == stk_cd for h in balance.holdings)
+    except Exception as e:
+        logger.warning("kr_position_exists_check_failed", stk_cd=stk_cd, error=str(e))
+
     # Create session record (legacy dict = read path for REST/WS)
     initial_state = {
         "stk_cd": stk_cd,
@@ -107,6 +128,7 @@ async def start_kr_stock_analysis(
         "query": request.query,
         "reasoning_log": [],
         "current_stage": "data_collection",
+        "position_exists": position_exists,
     }
     kr_stock_sessions[session_id] = {
         "session_id": session_id,
@@ -152,6 +174,7 @@ async def start_kr_stock_analysis(
         stk_nm=stk_nm,
         status="started",
         message="한국주식 분석이 시작되었습니다. WebSocket으로 실시간 업데이트를 받을 수 있습니다.",
+        position_exists=position_exists,
     )
 
 
@@ -347,6 +370,7 @@ async def get_kr_stock_analysis_status(session_id: str):
         status=session["status"],
         current_stage=state.get("current_stage"),
         awaiting_approval=state.get("awaiting_approval", False),
+        position_exists=state.get("position_exists", False),
         trade_proposal=trade_proposal,
         analyses=analyses,
         reasoning_log=state.get("reasoning_log", [])[-20:],

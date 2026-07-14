@@ -79,6 +79,11 @@ async def start_coin_analysis(
             status=existing.get("status", "running"),
             message="이미 진행중인 분석 세션이 있습니다 — 기존 세션을 재사용합니다.",
             duplicate=True,
+            # P4 Task 2: best-effort, no extra storage lookup — reuse
+            # whatever this in-flight session already recorded, mirroring
+            # the KR dedup path's reasoning (a dedup hit returns immediately,
+            # without paying for a second lookup).
+            position_exists=bool((existing.get("state") or {}).get("position_exists", False)),
         )
 
     session_id = str(uuid.uuid4())
@@ -97,6 +102,21 @@ async def start_coin_analysis(
         if market_info:
             korean_name = market_info.korean_name
 
+    # P4 Task 2: surface whether this market is already held, from the SAME
+    # storage-backed source /positions reads (storage.get_coin_position) —
+    # so this flag can never disagree with what that surface shows as held.
+    # Best-effort: get_coin_position already degrades to None internally on
+    # a storage error, so this can never fail the analysis-start request.
+    position_exists = False
+    try:
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
+        position = await storage.get_coin_position(market)
+        position_exists = bool(position) and float(position.get("quantity", 0)) > 0
+    except Exception as e:
+        logger.warning("coin_position_exists_check_failed", market=market, error=str(e))
+
     # Create session record (legacy dict = read path for REST/WS)
     initial_state = {
         "market": market,
@@ -104,6 +124,7 @@ async def start_coin_analysis(
         "query": request.query,
         "reasoning_log": [],
         "current_stage": "data_collection",
+        "position_exists": position_exists,
     }
     coin_sessions[session_id] = {
         "session_id": session_id,
@@ -147,6 +168,7 @@ async def start_coin_analysis(
         market=market,
         status="started",
         message="Coin analysis started. Connect to WebSocket for live updates.",
+        position_exists=position_exists,
     )
 
 
@@ -339,6 +361,7 @@ async def get_coin_analysis_status(session_id: str):
         status=session["status"],
         current_stage=state.get("current_stage"),
         awaiting_approval=state.get("awaiting_approval", False),
+        position_exists=state.get("position_exists", False),
         trade_proposal=trade_proposal,
         analyses=analyses,
         reasoning_log=state.get("reasoning_log", [])[-20:],

@@ -158,6 +158,17 @@ class KRStockAnalysisResponse(BaseModel):
             "instead of starting a new analysis (P4 dedup)."
         ),
     )
+    position_exists: bool = Field(
+        default=False,
+        description=(
+            "True when stk_cd is already held in the broker account balance "
+            "(kt00004, the same source /positions and Operations '보유' read) "
+            "at the time this analysis started — lets the FE label this run "
+            "'이미 보유 중 · 관리 분석' instead of a fresh-entry analysis (P4). "
+            "Best-effort: a broker-fetch failure degrades this to False rather "
+            "than failing the analysis-start request."
+        ),
+    )
 
 
 class KRStockAnalysisSummary(BaseModel):
@@ -204,6 +215,13 @@ class KRStockAnalysisStatusResponse(BaseModel):
     )
     current_stage: Optional[str] = Field(default=None, description="Current analysis stage")
     awaiting_approval: bool = Field(default=False, description="Whether awaiting HITL approval")
+    position_exists: bool = Field(
+        default=False,
+        description=(
+            "True when stk_cd was already held in the broker account balance "
+            "at analysis-start time (P4). See KRStockAnalysisResponse.position_exists."
+        ),
+    )
     trade_proposal: Optional[KRStockTradeProposalResponse] = Field(
         default=None, description="Trade proposal if available"
     )
