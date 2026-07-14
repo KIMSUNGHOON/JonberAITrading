@@ -2,8 +2,13 @@
  * 마켓별 트레이딩 모드(HITL | AUTONOMOUS) 토글 섹션 (R3).
  *
  * SettingsModal(General 탭)과 자율 운용 관제(/trading)가 공유한다 — R5-P2에서
- * SettingsModal 내부 함수를 추출. 응답이 진실의 원천(낙관적 업데이트 없음),
- * 마스터 게이트(AUTONOMY_ENABLED, env)가 꺼져 있으면 토글 비활성.
+ * SettingsModal 내부 함수를 추출. 응답이 진실의 원천(낙관적 업데이트 없음).
+ *
+ * 마스터 게이트(AUTONOMY_ENABLED, env)는 per-market 모드 "의도" 설정과는 무관하다
+ * — 백엔드(PUT /settings/trading-mode)는 마스터 게이트 상태와 무관하게 의도를
+ * 저장한다. 마스터 게이트가 꺼져 있어도 토글은 항상 활성 상태이며, autonomous로
+ * 설정했지만 마스터가 꺼져 있으면 발동하지 않는다는 안내만 표시한다(실제 실행
+ * 게이팅은 TradingDashboard의 `fullyArmed`가 계속 담당).
  */
 
 import { useEffect, useState } from 'react';
@@ -48,7 +53,13 @@ export function TradingModeSection({ onError }: { onError: (message: string) => 
     }
   };
 
-  const disabled = !tradingModes || !masterEnabled || saving !== null;
+  // Setting the per-market mode INTENT never requires the master gate — the
+  // backend (`PUT /settings/trading-mode`) accepts and persists it regardless
+  // of AUTONOMY_ENABLED. Only actual autonomous EXECUTION requires the master
+  // gate (see TradingDashboard's `fullyArmed`, which correctly still checks
+  // it). Disabling the toggle here was a pure UX dead-end.
+  const disabled = !tradingModes || saving !== null;
+  const anyAutonomous = !!tradingModes && (tradingModes.kiwoom === 'autonomous' || tradingModes.coin === 'autonomous');
 
   return (
     <div className="bg-card border border-hairline rounded p-4 font-mono">
@@ -86,6 +97,11 @@ export function TradingModeSection({ onError }: { onError: (message: string) => 
       </div>
       {loadFailed ? (
         <p className="mt-3 text-[11px] text-dim">모드 조회 실패 — 토글이 비활성화되었습니다</p>
+      ) : !masterEnabled && anyAutonomous ? (
+        <p className="mt-3 text-[11px] text-accent">
+          자율 모드 설정됨 · 발동하려면 .env에 AUTONOMY_ENABLED=true 설정 후 백엔드 재시작 필요
+          (인앱 전환 불가)
+        </p>
       ) : tradingModes && !masterEnabled ? (
         <p className="mt-3 text-[11px] text-dim">
           AUTONOMY_ENABLED=false — .env에서 마스터 게이트를 켜야 적용됩니다
