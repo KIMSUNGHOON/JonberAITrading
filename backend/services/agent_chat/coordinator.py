@@ -239,6 +239,15 @@ class ChatCoordinator:
             trading_coord = await get_trading_coordinator()
             watch_items = trading_coord.get_watch_list()
 
+            # trading_coord.get_watch_list() already filters to ACTIVE-only,
+            # so no further status filter is needed here. A redundant
+            # `w.status.value == "active"` check used to live in this
+            # comprehension — it crashed with AttributeError once watch_list
+            # persistence (P2 SSOT prep, 2026-07-14) started restoring entries
+            # whose `status` field is a plain str (pydantic's
+            # `use_enum_values=True` on WatchedStock converts it on
+            # `model_validate`), silently emptying the whole list on every
+            # tick after a restart.
             return [
                 {
                     "ticker": w.ticker,
@@ -251,7 +260,6 @@ class ChatCoordinator:
                     "take_profit": w.take_profit,
                 }
                 for w in watch_items
-                if w.status.value == "active"
             ]
         except Exception as e:
             logger.warning("get_watch_list_failed", error=str(e))
@@ -512,6 +520,16 @@ class ChatCoordinator:
                     # fresh gate check at execution time.
                     autonomous=True,
                 )
+
+                # P2 SSOT prep (2026-07-14): this decision only ever comes
+                # from a watch-list opportunity (_handle_decision's only
+                # caller is the watch-list auto path — manual discussions
+                # never execute). on_trade_approved does NOT go through
+                # convert_watch_to_queue, so without this the watch entry
+                # would stay ACTIVE and could be re-discussed/duplicate-
+                # triggered on the next 5-min check. No-op if the ticker
+                # isn't (or is no longer) an active watch entry.
+                trading_coord.mark_watch_converted(ticker)
 
                 logger.info(
                     "trade_executed",

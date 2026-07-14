@@ -519,3 +519,76 @@ class TestCoordinatorSingleton:
         coord2 = await get_chat_coordinator()
 
         assert coord1 is coord2
+
+
+# -------------------------------------------
+# P2 SSOT prep (2026-07-14): autonomous execution must flip the watch entry
+# -------------------------------------------
+#
+# _execute_trade never went through ExecutionCoordinator.convert_watch_to_queue
+# (it calls on_trade_approved directly), so a watch-list item that got
+# autonomously executed stayed ACTIVE forever — the 5-min watch-list check
+# could re-detect the same "opportunity" and trigger a duplicate discussion/
+# execution on the same ticker.
+
+
+class TestAutonomousExecutionMarksWatchConverted:
+    """_execute_trade must mark the originating watch entry CONVERTED."""
+
+    @pytest.mark.asyncio
+    async def test_execute_trade_marks_watch_converted(self, coordinator):
+        """A successful autonomous execution flips the watch entry to
+        CONVERTED so it is never re-discussed/re-triggered."""
+        import app.dependencies as deps_module
+
+        fake_trading_coord = MagicMock()
+        fake_trading_coord.on_trade_approved = AsyncMock(return_value=None)
+        fake_trading_coord.mark_watch_converted = MagicMock(return_value=True)
+
+        async def fake_get_trading_coordinator():
+            return fake_trading_coord
+
+        with patch.object(
+            deps_module, "get_trading_coordinator", fake_get_trading_coordinator
+        ):
+            decision = TradeDecision(
+                action=DecisionAction.BUY,
+                confidence=0.9,
+                consensus_level=0.9,
+                rationale="워치리스트 목표가 도달",
+                quantity=10,
+                entry_price=72_500,
+            )
+
+            await coordinator._execute_trade("005930", decision)
+
+        fake_trading_coord.on_trade_approved.assert_awaited_once()
+        fake_trading_coord.mark_watch_converted.assert_called_once_with("005930")
+
+    @pytest.mark.asyncio
+    async def test_execute_trade_skips_mark_when_action_unmapped(self, coordinator):
+        """No action_map entry (HOLD/WATCH/NO_ACTION) means no order was placed
+        — the watch entry must NOT be marked converted for a no-op decision."""
+        import app.dependencies as deps_module
+
+        fake_trading_coord = MagicMock()
+        fake_trading_coord.on_trade_approved = AsyncMock(return_value=None)
+        fake_trading_coord.mark_watch_converted = MagicMock(return_value=True)
+
+        async def fake_get_trading_coordinator():
+            return fake_trading_coord
+
+        with patch.object(
+            deps_module, "get_trading_coordinator", fake_get_trading_coordinator
+        ):
+            decision = TradeDecision(
+                action=DecisionAction.HOLD,
+                confidence=0.9,
+                consensus_level=0.9,
+                rationale="관망",
+            )
+
+            await coordinator._execute_trade("005930", decision)
+
+        fake_trading_coord.on_trade_approved.assert_not_awaited()
+        fake_trading_coord.mark_watch_converted.assert_not_called()

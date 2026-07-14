@@ -1012,6 +1012,14 @@ class ExecutionCoordinator:
                     "trade_queue": [
                         t.model_dump(mode="json") for t in self._state.trade_queue
                     ],
+                    # P2 SSOT prep (2026-07-14): the watch list lived only in
+                    # memory alongside positions/queue, so a restart silently
+                    # dropped every watched stock — the funnel's single source
+                    # of truth must survive a restart the same way positions
+                    # and the trade queue already do.
+                    "watch_list": [
+                        w.model_dump(mode="json") for w in self._state.watch_list
+                    ],
                     "daily_trades_count": self._state.daily_trades_count,
                     "daily_count_date": date.today().isoformat(),
                     "tracked_orders": self.fill_tracker.to_payload(),
@@ -1045,6 +1053,14 @@ class ExecutionCoordinator:
             # Queued trades.
             self._state.trade_queue = [
                 QueuedTrade.model_validate(t) for t in data.get("trade_queue", [])
+            ]
+
+            # Watch list (P2 SSOT prep) — restored in whatever status it was
+            # persisted in (ACTIVE/CONVERTED/REMOVED), so a CONVERTED entry
+            # stays CONVERTED across a restart instead of reverting to
+            # ACTIVE and becoming re-discussable.
+            self._state.watch_list = [
+                WatchedStock.model_validate(w) for w in data.get("watch_list", [])
             ]
 
             # Daily count — reset on a new calendar day.
@@ -1089,6 +1105,7 @@ class ExecutionCoordinator:
             logger.info(
                 f"[Coordinator] Restored {len(self._state.positions)} positions, "
                 f"{len(self._state.trade_queue)} queued trades, "
+                f"{len(self._state.watch_list)} watched stocks, "
                 f"{len(self.fill_tracker.tracking())} tracked orders, "
                 f"daily_count={self._state.daily_trades_count}"
             )
@@ -1164,6 +1181,13 @@ class ExecutionCoordinator:
         out unrealized_pnl and exposure math, which is worse than a stale
         (but real) last-known price, so a falsy result SKIPS that position
         and leaves current_price untouched (T2 stale-price contract).
+
+        Watch-list entries (P2 SSOT prep, 2026-07-14) get the same treatment:
+        `WatchedStock.current_price` was only ever set at registration time,
+        so the 5-min opportunity check (`ChatCoordinator._detect_opportunity`'s
+        target-price proximity test) judged against a price that could be
+        hours or days stale. Only ACTIVE entries are repriced — a
+        CONVERTED/REMOVED entry's price is historical, not live.
         """
         for position in self._state.positions:
             price = await self._get_current_price(position.ticker)
@@ -1171,6 +1195,15 @@ class ExecutionCoordinator:
                 continue
             position.current_price = price
             position.last_updated = datetime.now()
+
+        for watched in self._state.watch_list:
+            if watched.status != WatchStatus.ACTIVE:
+                continue
+            price = await self._get_current_price(watched.ticker)
+            if not price:
+                continue
+            watched.current_price = price
+            watched.last_checked = datetime.now()
 
     async def _get_current_price(self, ticker: str) -> float:
         """Get current price for a ticker."""
@@ -1936,6 +1969,7 @@ class ExecutionCoordinator:
             existing.last_checked = datetime.now()
 
             logger.info(f"[Coordinator] Watch list updated: {ticker}")
+            self._schedule_persist()
             return existing
 
         # Create new watch list entry
@@ -1971,6 +2005,7 @@ class ExecutionCoordinator:
         )
 
         logger.info(f"[Coordinator] Added to watch list: {watched.id}")
+        self._schedule_persist()
         return watched
 
     def get_watch_list(self) -> List[WatchedStock]:
@@ -1992,6 +2027,7 @@ class ExecutionCoordinator:
                 )
 
                 logger.info(f"[Coordinator] Removed from watch list: {watch_id}")
+                self._schedule_persist()
                 return True
         return False
 
@@ -2060,6 +2096,40 @@ class ExecutionCoordinator:
              if w.ticker == ticker and w.status == WatchStatus.ACTIVE),
             None
         )
+
+    def mark_watch_converted(self, ticker: str) -> bool:
+        """Mark the active watch-list entry for `ticker` as CONVERTED.
+
+        Used by the autonomous agent-chat path (`ChatCoordinator._execute_trade`)
+        when it executes a decision that originated from a watch-list
+        opportunity WITHOUT going through `convert_watch_to_queue` — that path
+        calls `on_trade_approved` directly, so without this call the watch
+        entry stayed ACTIVE forever. The 5-min watch-list check
+        (`ChatCoordinator._check_watch_list`) could then re-detect the same
+        "opportunity" and start a duplicate discussion/execution on the same
+        ticker (P2 funnel-consolidation audit finding, 2026-07-14).
+
+        Returns False (no-op) when there is no active watch entry for the
+        ticker — a decision can legitimately originate outside the watch list.
+        """
+        watched = self.get_watched_stock(ticker)
+        if watched is None:
+            return False
+
+        watched.status = WatchStatus.CONVERTED
+        watched.triggered_at = datetime.now()
+
+        self._log_activity(
+            ActivityType.WATCH_CONVERTED,
+            f"Watch list auto-converted by autonomous execution: {watched.ticker}",
+            agent="system",
+            ticker=ticker,
+            details={"watch_id": watched.id},
+        )
+
+        logger.info(f"[Coordinator] Watch list auto-converted: {watched.id}")
+        self._schedule_persist()
+        return True
 
     # -------------------------------------------
     # Strategy Management
