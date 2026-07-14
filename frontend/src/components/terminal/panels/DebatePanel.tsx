@@ -2,12 +2,15 @@
  * Agent-debate tile — 4 analyst votes + consensus for the current discussion,
  * now a LIVE control card (P2 T6) rather than a decorative REST-poll tile:
  *
- * - Live updates: once a session is resolved, `useAgentChatWebSocket` streams
- *   vote/status_change/decision frames straight into local state (the same
- *   hook ChatSessionViewer already uses). The 5s REST poll below still runs
- *   as a fallback/resync (also the ONLY way to discover a session id, since
- *   the WS is per-session) — so the tile degrades gracefully if the socket
- *   never connects.
+ * - Live updates: once an ACTIVE session is resolved, `useAgentChatWebSocket`
+ *   streams vote/status_change/decision frames straight into local state
+ *   (the same hook + the same active-session gating ChatSessionViewer already
+ *   uses — a decided/historical session gets no WS and no "LIVE" badge). The
+ *   5s REST poll is the ONLY way to discover a session id, and it keeps
+ *   running as a true fallback/resync while the WS is disconnected — but it
+ *   STOPS once the WS reports connected (mirroring ChatSessionViewer), so a
+ *   stale REST snapshot can never race a fresher WS-pushed vote/decision and
+ *   clobber it via the panel's replace-all `setDetail`.
  * - Start affordance: when the coordinator is dormant (its default per
  *   project notes) there is no session to show votes for. Instead of a dead
  *   '—' tile, a "토론 시작" button calls the coordinator launch path
@@ -73,6 +76,16 @@ function voteDot(v: AgentChatVoteType | undefined): string {
 
 const POLL_MS = 5_000;
 
+/** Statuses for which the coordinator is still actively working the session
+ *  (mirrors ChatSessionViewer's `isActiveSession`). A decided/cancelled/error
+ *  session is historical — it gets no WS connection and no "LIVE" badge. */
+const ACTIVE_STATUSES: AgentChatSessionStatus[] = [
+  'initializing',
+  'analyzing',
+  'discussing',
+  'voting',
+];
+
 function useDebateSession() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [detail, setDetail] = useState<AgentChatSessionDetail | null>(null);
@@ -111,16 +124,16 @@ function useDebateSession() {
   useEffect(() => {
     aliveRef.current = true;
     refreshAll();
-    const id = setInterval(refreshAll, POLL_MS);
     return () => {
       aliveRef.current = false;
-      clearInterval(id);
     };
   }, [refreshAll]);
 
   // Live WS wiring (P2 T6) — reuses the already-built agent-chat hook so this
   // tile's votes/consensus update as frames arrive, without waiting for the
-  // next 5s REST poll. Only connects once a session id is resolved.
+  // next 5s REST poll. Only connects once a session id is resolved AND the
+  // session is still active (mirrors ChatSessionViewer): a decided/idle
+  // session is historical, so it gets no persistent WS and no "LIVE" badge.
   const onVote = useCallback((vote: AgentChatVote) => {
     setDetail((prev) => {
       if (!prev) return prev;
@@ -142,13 +155,24 @@ function useDebateSession() {
     );
   }, []);
 
+  const isActiveSession = detail !== null && ACTIVE_STATUSES.includes(detail.status);
+
   const { isConnected } = useAgentChatWebSocket({
-    sessionId,
+    sessionId: isActiveSession ? sessionId : null,
     autoConnect: true,
     onVote,
     onStatusChange,
     onDecision,
   });
+
+  // Fallback REST poll — mirrors ChatSessionViewer: runs only while the WS is
+  // NOT connected, so REST snapshots never race the socket and clobber
+  // fresher WS-pushed vote/decision state with a stale `setDetail` replace.
+  useEffect(() => {
+    if (isConnected) return;
+    const id = setInterval(refreshAll, POLL_MS);
+    return () => clearInterval(id);
+  }, [isConnected, refreshAll]);
 
   const startDiscussion = useCallback(async () => {
     setStarting(true);

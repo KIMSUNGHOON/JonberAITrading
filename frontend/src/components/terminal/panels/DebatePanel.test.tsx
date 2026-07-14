@@ -5,8 +5,10 @@
  * useAgentChatWebSocket hook, a "토론 시작" action that calls the coordinator
  * launch path, and a deep link into the /agent-chat session viewer.
  */
-import { it, expect, vi, beforeEach } from 'vitest';
+import { it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
+
+const POLL_MS = 5_000;
 
 const getAgentChatActiveDiscussions = vi.fn();
 const getAgentChatSessions = vi.fn();
@@ -28,13 +30,30 @@ vi.mock('react-router-dom', () => ({ useNavigate: () => navigate }));
 // render, so tests can invoke onVote/onStatusChange/onDecision directly to
 // simulate a WS push (mirrors OrderTicketRail/NotificationBell's convention
 // of driving mocked hooks by capturing their call args).
-const useAgentChatWebSocketMock = vi.fn((_opts?: unknown) => ({
-  isConnected: true,
-  connectionState: 'connected' as const,
-  connect: vi.fn(),
-  disconnect: vi.fn(),
-  lastError: null,
-}));
+//
+// Default behavior approximates the real hook: "connected" only when the
+// panel actually asked to connect (a non-null sessionId — i.e. the panel
+// decided the session is active). Individual tests override via
+// `mockImplementation` when they need to force a specific isConnected value
+// irrespective of sessionId (e.g. to exercise the REST-poll gating race).
+type WsMockReturn = {
+  isConnected: boolean;
+  connectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
+  connect: () => void;
+  disconnect: () => void;
+  lastError: string | null;
+};
+function defaultWsMockImpl(opts?: unknown): WsMockReturn {
+  const sessionId = (opts as { sessionId?: string | null } | undefined)?.sessionId ?? null;
+  return {
+    isConnected: Boolean(sessionId),
+    connectionState: sessionId ? 'connected' : 'disconnected',
+    connect: vi.fn(),
+    disconnect: vi.fn(),
+    lastError: null,
+  };
+}
+const useAgentChatWebSocketMock = vi.fn(defaultWsMockImpl);
 vi.mock('@/hooks/useAgentChatWebSocket', () => ({
   useAgentChatWebSocket: (opts?: unknown) => useAgentChatWebSocketMock(opts),
 }));
@@ -65,13 +84,13 @@ const BASE_DETAIL = {
 beforeEach(() => {
   vi.clearAllMocks();
   startAgentChat.mockResolvedValue({ status: 'started', message: 'ok', check_interval: 300 });
-  useAgentChatWebSocketMock.mockReturnValue({
-    isConnected: true,
-    connectionState: 'connected' as const,
-    connect: vi.fn(),
-    disconnect: vi.fn(),
-    lastError: null,
-  });
+  useAgentChatWebSocketMock.mockImplementation(defaultWsMockImpl);
+});
+
+afterEach(() => {
+  // Safety net: any test that opts into fake timers restores real ones
+  // itself, but this guards against a leak into later tests if one throws.
+  vi.useRealTimers();
 });
 
 it('활성 세션의 실시간 votes/consensus를 렌더하고, WS vote/decision 프레임 수신 시 갱신한다', async () => {
@@ -173,4 +192,122 @@ it('"세션 보기" 클릭 시 /agent-chat 세션 뷰어로 딥링크한다', as
   const viewButton = await screen.findByRole('button', { name: '세션 보기 →' });
   fireEvent.click(viewButton);
   expect(navigate).toHaveBeenCalledWith('/agent-chat');
+});
+
+// --- T6 review fixes: REST/WS never run concurrently, and a decided session
+// never claims LIVE (mirrors ChatSessionViewer's isActiveSession gating). ---
+//
+// NOTE: `waitFor`'s own internal retry loop is itself a (faked) setInterval,
+// so it must not be used to await state settling while fake timers are
+// active — it would just hang until the real testTimeout kills the test.
+// `flushMicrotasks` instead drains the pending promise chain directly via
+// `advanceTimersByTimeAsync(0)` (which — per vitest/sinon — still lets
+// already-resolved promises drain even with nothing scheduled to tick).
+async function flushMicrotasks() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0);
+  });
+}
+
+it('WS가 연결된 활성 세션에서는 5s+ 경과해도 REST 폴이 재실행되지 않는다 (플리커 봉합)', async () => {
+  vi.useFakeTimers();
+  try {
+    getAgentChatActiveDiscussions.mockResolvedValue({
+      discussions: [{ ticker: '005930', stock_name: '삼성전자', session_id: 's1', status: 'voting', started_at: null }],
+      count: 1,
+    });
+    getAgentChatSessions.mockResolvedValue({ sessions: [], count: 0 });
+    getAgentChatSessionDetail.mockResolvedValue(BASE_DETAIL);
+    getAgentChatStatus.mockResolvedValue({
+      is_running: true, active_discussions: 1, total_sessions: 3,
+      check_interval_minutes: 5, max_concurrent_discussions: 3, last_check_at: null,
+    });
+
+    render(<DebatePanel />);
+    await flushMicrotasks();
+
+    // Initial REST fetch resolves and the (active) session's WS connects
+    // (default mock: isConnected === Boolean(sessionId)).
+    expect(screen.getByText('LIVE')).toBeInTheDocument();
+    expect(getAgentChatSessionDetail).toHaveBeenCalledTimes(1);
+
+    // Advance well past several poll intervals — REST must NOT refire while
+    // the WS reports connected, so a stale snapshot can never race a fresher
+    // WS-pushed vote/decision via the panel's replace-all setDetail.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_MS * 3);
+    });
+    expect(getAgentChatSessionDetail).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('WS가 연결되지 않은 활성 세션에서는 REST 폴백 폴링이 계속된다', async () => {
+  vi.useFakeTimers();
+  try {
+    // Force isConnected: false regardless of sessionId — simulates an
+    // active session whose socket is still connecting/never connects.
+    useAgentChatWebSocketMock.mockImplementation(() => ({
+      isConnected: false,
+      connectionState: 'connecting' as const,
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      lastError: null,
+    }));
+
+    getAgentChatActiveDiscussions.mockResolvedValue({
+      discussions: [{ ticker: '005930', stock_name: '삼성전자', session_id: 's1', status: 'voting', started_at: null }],
+      count: 1,
+    });
+    getAgentChatSessions.mockResolvedValue({ sessions: [], count: 0 });
+    getAgentChatSessionDetail.mockResolvedValue(BASE_DETAIL);
+    getAgentChatStatus.mockResolvedValue({
+      is_running: true, active_discussions: 1, total_sessions: 3,
+      check_interval_minutes: 5, max_concurrent_discussions: 3, last_check_at: null,
+    });
+
+    render(<DebatePanel />);
+    await flushMicrotasks();
+
+    expect(getAgentChatSessionDetail).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText('LIVE')).not.toBeInTheDocument();
+
+    // One poll interval elapses while still disconnected — REST fallback
+    // must fire again (never becomes a dead tile if the socket never opens).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_MS);
+    });
+    expect(getAgentChatSessionDetail).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('decided(비활성) 세션에서는 WS를 열지 않고(sessionId=null) LIVE 배지를 보여주지 않는다', async () => {
+  getAgentChatActiveDiscussions.mockResolvedValue({ discussions: [], count: 0 });
+  getAgentChatSessions.mockResolvedValue({
+    sessions: [
+      {
+        id: 's-old', ticker: '005930', stock_name: '삼성전자', status: 'decided' as const,
+        started_at: null, ended_at: '2026-07-14T00:00:00Z', total_messages: 12, total_rounds: 3,
+        consensus_level: 0.9, decision_action: 'BUY' as const, decision_confidence: 0.88,
+      },
+    ],
+    count: 1,
+  });
+  getAgentChatSessionDetail.mockResolvedValue({ ...BASE_DETAIL, id: 's-old', status: 'decided' as const });
+  getAgentChatStatus.mockResolvedValue({
+    is_running: false, active_discussions: 0, total_sessions: 5,
+    check_interval_minutes: 5, max_concurrent_discussions: 3, last_check_at: null,
+  });
+
+  render(<DebatePanel />);
+
+  await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
+  // The panel resolved a session id (the most-recent, no-status-check
+  // fallback) but must not treat it as live: no WS connection request...
+  expect(lastWsOpts().sessionId).toBeNull();
+  // ...and no misleading "LIVE" badge for a historical/decided session.
+  expect(screen.queryByText('LIVE')).not.toBeInTheDocument();
 });
