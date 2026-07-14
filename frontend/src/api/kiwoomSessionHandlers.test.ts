@@ -24,7 +24,11 @@ vi.mock('@/store', () => ({
   }),
 }));
 
-import { createKiwoomWebSocketHandlers, ensureKiwoomSessionStreaming } from './kiwoomSessionHandlers';
+import {
+  createKiwoomWebSocketHandlers,
+  ensureKiwoomSessionStreaming,
+  rehydrateCoinSessions,
+} from './kiwoomSessionHandlers';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -252,6 +256,154 @@ describe('rehydrateKiwoomSessions', () => {
     await rehydrateKiwoomSessions();
 
     expect(removeKiwoomSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('rehydrateCoinSessions', () => {
+  // Coin's store slice tracks at most ONE session (flat activeSessionId/
+  // status/tradeProposal fields, not a `sessions[]` array like Kiwoom) — so
+  // these tests exercise the single-session add + purge-absent pattern.
+  const baseCoinActions = () => ({
+    startCoinSession: vi.fn(),
+    setCoinStatus: vi.fn(),
+    setCoinStage: vi.fn(),
+    setCoinProposal: vi.fn(),
+    setCoinAwaitingApproval: vi.fn(),
+    resetCoin: vi.fn(),
+  });
+
+  it('서버가 나열하는 awaiting 코인 세션을 재수화하고 제안을 복원한다', async () => {
+    const actions = baseCoinActions();
+    mockState = {
+      coin: { activeSessionId: null, status: 'idle' },
+      ...actions,
+    };
+    getOperations.mockResolvedValue({
+      analyzing: [],
+      awaiting: [{
+        session_id: 'coin-aw-1', ticker: 'KRW-BTC', name: '비트코인',
+        proposal: { id: 'p1', action: 'BUY', quantity: 0.01, entry_price: 90000000,
+                    stop_loss: 85000000, take_profit: 100000000, risk_score: 0.5,
+                    rationale: '상승 모멘텀' },
+        auto_approve_at: null,
+      }],
+      watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: {},
+    });
+
+    await rehydrateCoinSessions();
+
+    expect(actions.startCoinSession).toHaveBeenCalledWith('coin-aw-1', 'KRW-BTC', '비트코인');
+    expect(actions.setCoinStatus).toHaveBeenCalledWith('awaiting_approval');
+    expect(actions.setCoinAwaitingApproval).toHaveBeenCalledWith(true);
+    expect(actions.setCoinProposal).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'p1', market: 'KRW-BTC', action: 'BUY', quantity: 0.01 }),
+    );
+    expect(actions.resetCoin).not.toHaveBeenCalled();
+  });
+
+  it('서버가 나열하는 running 코인 세션을 재수화한다(제안 없음)', async () => {
+    const actions = baseCoinActions();
+    mockState = {
+      coin: { activeSessionId: null, status: 'idle' },
+      ...actions,
+    };
+    getOperations.mockResolvedValue({
+      analyzing: [{ session_id: 'coin-run-1', ticker: 'KRW-ETH', name: '이더리움',
+                    status: 'running', current_stage: 'sentiment_analysis', started_at: null }],
+      awaiting: [], watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: {},
+    });
+
+    await rehydrateCoinSessions();
+
+    expect(actions.startCoinSession).toHaveBeenCalledWith('coin-run-1', 'KRW-ETH', '이더리움');
+    expect(actions.setCoinStatus).toHaveBeenCalledWith('running');
+    expect(actions.setCoinStage).toHaveBeenCalledWith('sentiment_analysis');
+    expect(actions.setCoinProposal).not.toHaveBeenCalled();
+  });
+
+  it('스토어가 이미 서버가 아는 세션을 추적 중이면 다시 추가하지 않는다', async () => {
+    const actions = baseCoinActions();
+    mockState = {
+      coin: { activeSessionId: 'coin-run-1', status: 'running' },
+      ...actions,
+    };
+    getOperations.mockResolvedValue({
+      analyzing: [{ session_id: 'coin-run-1', ticker: 'KRW-ETH', name: '이더리움',
+                    status: 'running', current_stage: 'risk_assessment', started_at: null }],
+      awaiting: [], watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: {},
+    });
+
+    await rehydrateCoinSessions();
+
+    expect(actions.startCoinSession).not.toHaveBeenCalled();
+    expect(actions.resetCoin).not.toHaveBeenCalled();
+  });
+
+  it('서버가 더 이상 나열하지 않는 비터미널 코인 세션은 resetCoin으로 정리한다', async () => {
+    const actions = baseCoinActions();
+    mockState = {
+      coin: { activeSessionId: 'coin-zombie-1', status: 'awaiting_approval' },
+      ...actions,
+    };
+    getOperations.mockResolvedValue({
+      analyzing: [], awaiting: [], watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: {},
+    });
+
+    await rehydrateCoinSessions();
+
+    expect(actions.resetCoin).toHaveBeenCalledTimes(1);
+  });
+
+  it('세션 섹션이 실패(errors.sessions)하면 퍼지를 건너뛴다', async () => {
+    const actions = baseCoinActions();
+    mockState = {
+      coin: { activeSessionId: 'coin-live-1', status: 'running' },
+      ...actions,
+    };
+    getOperations.mockResolvedValue({
+      analyzing: null, awaiting: null, watching: [],
+      pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: { sessions: 'boom' },
+    });
+
+    await rehydrateCoinSessions();
+
+    expect(actions.resetCoin).not.toHaveBeenCalled();
+    // Degraded snapshot carries no sessions to add either.
+    expect(actions.startCoinSession).not.toHaveBeenCalled();
+  });
+
+  it('터미널 상태(completed) 코인 세션은 서버 목록에 없어도 정리하지 않는다(히스토리 보존)', async () => {
+    const actions = baseCoinActions();
+    mockState = {
+      coin: { activeSessionId: 'coin-done-1', status: 'completed' },
+      ...actions,
+    };
+    getOperations.mockResolvedValue({
+      analyzing: [], awaiting: [], watching: [], pending_buy: { queue: [], open_orders: [] },
+      holding: [], today_fills: [], errors: {},
+    });
+
+    await rehydrateCoinSessions();
+
+    expect(actions.resetCoin).not.toHaveBeenCalled();
+    expect(actions.startCoinSession).not.toHaveBeenCalled();
+  });
+
+  it('getOperations 실패 시 조용히 종료한다', async () => {
+    const actions = baseCoinActions();
+    mockState = {
+      coin: { activeSessionId: null, status: 'idle' },
+      ...actions,
+    };
+    getOperations.mockRejectedValue(new Error('network down'));
+
+    await expect(rehydrateCoinSessions()).resolves.toBeUndefined();
+    expect(actions.startCoinSession).not.toHaveBeenCalled();
   });
 });
 

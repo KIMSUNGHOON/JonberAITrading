@@ -16,7 +16,7 @@ import { ChatPopup } from '@/components/chat/ChatPopup';
 import { Toast } from '@/components/ui/Toast';
 import { TradeNotificationToast } from '@/components/ui/TradeNotificationToast';
 import { getUpbitApiStatus, getKiwoomApiStatus, getTradingMode } from '@/api/client';
-import { rehydrateKiwoomSessions } from '@/api/kiwoomSessionHandlers';
+import { rehydrateKiwoomSessions, rehydrateCoinSessions } from '@/api/kiwoomSessionHandlers';
 import { SessionBridge } from '@/routes/SessionBridge';
 import { BasketPage } from '@/pages/BasketPage';
 import { PositionsPage } from '@/pages/PositionsPage';
@@ -87,6 +87,11 @@ function App() {
       // failure (the operations board surfaces its own error state).
       try {
         await rehydrateKiwoomSessions();
+      } catch {
+        // silent
+      }
+      try {
+        await rehydrateCoinSessions();
       } catch {
         // silent
       }

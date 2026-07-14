@@ -774,3 +774,92 @@ async def test_ws_streams_kr_analysis_via_push_end_to_end(sm, kr_sessions, monke
     # Inter-frame ordering: every reasoning frame precedes the complete frame.
     types = [f["type"] for f in ws.sent]
     assert max(i for i, t in enumerate(types) if t == "reasoning") < types.index("complete")
+
+
+# -------------------------------------------
+# P1-6: status endpoint falls back to the SessionManager when the legacy
+# in-process dict misses (e.g. a restart wiped it), so a session's detail
+# stays fetchable using the SQLite-persisted state_json.
+# -------------------------------------------
+
+
+async def test_status_endpoint_falls_back_to_sm_when_legacy_dict_misses(sm, kr_sessions):
+    """`kr_stock_sessions` is a plain in-process dict — a restart wipes it.
+    A session that was running/awaiting_approval at shutdown is reloaded into
+    the SessionManager (see SessionManager._load_active_sessions) and may
+    since have completed via the resume/approval flow. The status endpoint
+    must still serve its analyses/trade_proposal from the sm-persisted state
+    instead of 404ing."""
+    from app.api.routes.kr_stocks.analysis import get_kr_stock_analysis_status
+
+    session_id = "kr-restart-detail-1"
+    await sm.create_session(
+        session_id=session_id,
+        market_type=MarketType.KIWOOM,
+        ticker="005930",
+        display_name="삼성전자",
+        stk_cd="005930",
+        stk_nm="삼성전자",
+        state={
+            "reasoning_log": ["[t] 완료"],
+            "current_stage": "done",
+            "awaiting_approval": False,
+            "technical_analysis": {
+                "agent_type": "technical",
+                "signal": "buy",
+                "confidence": 0.8,
+                "summary": "상승 추세",
+                "key_factors": ["golden cross"],
+            },
+            "trade_proposal": {
+                "id": "p1",
+                "stk_cd": "005930",
+                "stk_nm": "삼성전자",
+                "action": "BUY",
+                "quantity": 10,
+                "created_at": "2026-07-13T10:00:00+00:00",
+            },
+        },
+    )
+    await sm.update_status(session_id, SessionStatus.COMPLETED)
+
+    # Legacy dict never had this session_id in this (post-restart) process.
+    assert session_id not in kr_sessions
+
+    response = await get_kr_stock_analysis_status(session_id)
+
+    assert response.status == "completed"
+    assert response.stk_cd == "005930"
+    assert response.stk_nm == "삼성전자"
+    assert len(response.analyses) == 1
+    assert response.analyses[0].signal == "buy"
+    assert response.analyses[0].summary == "상승 추세"
+    assert response.trade_proposal is not None
+    assert response.trade_proposal.action == "BUY"
+    assert response.trade_proposal.quantity == 10
+
+
+async def test_status_endpoint_prefers_legacy_dict_over_sm(sm, kr_sessions):
+    """Normal (non-restart) case is unchanged: when the legacy dict has the
+    session, it wins — no sm lookup needed."""
+    from app.api.routes.kr_stocks.analysis import get_kr_stock_analysis_status
+
+    session_id = "kr-legacy-wins-1"
+    record = _seed_session(kr_sessions, session_id)
+    record["status"] = "completed"
+
+    response = await get_kr_stock_analysis_status(session_id)
+
+    assert response.status == "completed"
+    assert response.analyses == []
+
+
+async def test_status_endpoint_404s_when_legacy_and_sm_both_miss(sm, kr_sessions):
+    from fastapi import HTTPException
+
+    from app.api.routes.kr_stocks.analysis import get_kr_stock_analysis_status
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_kr_stock_analysis_status("kr-nonexistent-session")
+
+    assert exc_info.value.status_code == 404

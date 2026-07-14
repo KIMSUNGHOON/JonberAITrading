@@ -256,7 +256,22 @@ async def get_kr_stock_analysis_status(session_id: str):
     Returns:
         Full status including market data and trade proposal
     """
-    session = get_kr_stock_session(session_id)
+    session = kr_stock_sessions.get(session_id)
+    if session is None:
+        # Legacy dict miss: `kr_stock_sessions` is a plain in-process dict —
+        # every restart wipes it. Sessions that were running/awaiting_approval
+        # at shutdown are reloaded into the SessionManager at startup (see
+        # SessionManager._load_active_sessions) and may since have completed
+        # via the resume/approval flow; fall back to its persisted copy so
+        # this session's analyses/trade_proposal are still servable instead
+        # of a bare 404.
+        session_manager = await get_session_manager()
+        session = await session_manager.get_session_dict(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Korean stock session {session_id} not found",
+        )
     state = session["state"]
 
     # Build trade proposal response
