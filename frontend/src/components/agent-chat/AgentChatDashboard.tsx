@@ -3,9 +3,19 @@
  *
  * Main dashboard for Agent Group Chat system.
  * Controls coordinator start/stop and shows active discussions.
+ *
+ * R5-P2-UX B2: this page used to full-page-swap to `ChatSessionViewer` the
+ * moment a session was selected (the app's only screen that does that — see
+ * the page-ux audit §B). It's now master-detail: the session list stays
+ * visible (narrowed) whenever the detail pane shows a viewer, so selecting a
+ * session never wipes the page. Selection is also driven by the URL
+ * (`?session=<id>`) rather than local-only state, so DebatePanel's
+ * "세션 보기 →" deep link (B1) actually opens the session it links to, and
+ * the address bar always reflects what's on screen.
  */
 
 import { useState, useEffect, useCallback } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   MessageSquare,
   Play,
@@ -29,9 +39,30 @@ import type {
   AgentChatActiveDiscussion,
   AgentChatSessionSummary,
 } from '@/types';
+import { computeLoopLiveness } from '@/hooks/useLoopLiveness';
 import { ChatSessionList } from './ChatSessionList';
 import { ChatSessionViewer } from './ChatSessionViewer';
 import { PositionMonitor } from './PositionMonitor';
+
+const DASH = '—';
+
+/** "HH:MM:SS" for the coordinator's last watch-list tick; DASH when unknown
+ *  — an absent/never-ticked heartbeat must read as honestly missing, not as
+ *  a fabricated "just checked". */
+function formatLastCheckTime(iso: string | null | undefined): string {
+  if (!iso) return DASH;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return DASH;
+  return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+/** "mm:ss" countdown, floored at 0 — never a negative or fractional display. */
+function formatCountdownMMSS(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const mm = Math.floor(totalSeconds / 60);
+  const ss = totalSeconds % 60;
+  return `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+}
 
 interface CoordinatorConfig {
   check_interval_minutes: number;
@@ -45,12 +76,62 @@ export function AgentChatDashboard() {
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [showConfig, setShowConfig] = useState(false);
   const [config, setConfig] = useState<CoordinatorConfig>({
     check_interval_minutes: 5,
     max_concurrent_discussions: 3,
   });
+
+  // Selection lives in the URL (`?session=<id>`), not local-only state: this
+  // is what makes DebatePanel's session-id deep link (B1) actually land on
+  // the right session, and it's the single source of truth for "what's
+  // selected" — no separate state to fall out of sync.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selectedSessionId = searchParams.get('session');
+  const selectSession = useCallback(
+    (sessionId: string | null) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (sessionId) {
+            next.set('session', sessionId);
+          } else {
+            next.delete('session');
+          }
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  // Tick every 1s while the coordinator is running with a known last-check
+  // timestamp, so the "다음 점검까지" countdown re-renders (same pattern as
+  // OrderTicketRail's auto-approve countdown: derive remaining time from
+  // Date.now() vs. an ISO timestamp on each tick).
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    if (!status?.is_running || !status?.last_check_at) return;
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [status?.is_running, status?.last_check_at]);
+
+  // Loop-liveness (reuses the same pure classifier the shell's
+  // LoopLivenessChip uses — see hooks/useLoopLiveness): `is_running` alone
+  // can't tell a healthy 5-minute loop apart from one whose job crashed but
+  // left the flag set. A "stale" reading here must show as a warning, not a
+  // confident (and wrong) countdown.
+  const liveness = computeLoopLiveness(status, nowTick);
+  const lastCheckLabel = formatLastCheckTime(status?.last_check_at);
+  const nextCheckLabel = (() => {
+    if (!status?.is_running) return null;
+    if (!status.last_check_at) return '첫 점검 대기 중';
+    const intervalMs = (status.check_interval_minutes || config.check_interval_minutes) * 60_000;
+    const nextAt = new Date(status.last_check_at).getTime() + intervalMs;
+    const remaining = nextAt - nowTick;
+    return remaining > 0 ? formatCountdownMMSS(remaining) : '점검 중…';
+  })();
 
   const fetchData = useCallback(async () => {
     try {
@@ -117,16 +198,6 @@ export function AgentChatDashboard() {
     );
   }
 
-  // If a session is selected, show the viewer
-  if (selectedSessionId) {
-    return (
-      <ChatSessionViewer
-        sessionId={selectedSessionId}
-        onClose={() => setSelectedSessionId(null)}
-      />
-    );
-  }
-
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -182,7 +253,7 @@ export function AgentChatDashboard() {
                 ) : (
                   <Square className="w-4 h-4" />
                 )}
-                Stop
+                자동 모니터링 중지
               </button>
             ) : (
               <button
@@ -195,10 +266,28 @@ export function AgentChatDashboard() {
                 ) : (
                   <Play className="w-4 h-4" />
                 )}
-                Start
+                자동 모니터링 시작 ({config.check_interval_minutes}분 주기)
               </button>
             )}
           </div>
+        </div>
+
+        {/* Loop liveness (P1-3 last_check_at, rendered here for the first
+            time — previously only the shell's LoopLivenessChip consumed it).
+            A stale/absent heartbeat must read as honest, not as a confident
+            "just checked" or a fake countdown. */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-6 text-xs text-muted">
+          <span>
+            마지막 점검 <span className="text-ink tabular-nums">{lastCheckLabel}</span>
+          </span>
+          {status?.is_running && liveness === 'stale' && (
+            <span className="text-warn">루프 응답 지연 — 예정된 점검을 놓쳤을 수 있습니다</span>
+          )}
+          {status?.is_running && liveness !== 'stale' && nextCheckLabel && (
+            <span>
+              다음 점검까지 <span className="text-ink tabular-nums">{nextCheckLabel}</span>
+            </span>
+          )}
         </div>
 
         {/* Config Panel */}
@@ -265,8 +354,10 @@ export function AgentChatDashboard() {
         </div>
       </div>
 
-      {/* Active Discussions */}
-      {activeDiscussions.length > 0 && (
+      {/* Active Discussions — hidden while the detail pane is open (the
+          session list to the left already shows this session's card; the
+          detail pane is where attention belongs). */}
+      {!selectedSessionId && activeDiscussions.length > 0 && (
         <div className="bg-card rounded border border-hairline p-6">
           <h3 className="text-lg font-medium text-ink mb-4 flex items-center gap-2">
             <div className="w-2 h-2 bg-accent rounded-full animate-pulse" />
@@ -277,7 +368,7 @@ export function AgentChatDashboard() {
               <div
                 key={discussion.session_id}
                 className="flex items-center justify-between p-4 bg-elevated rounded-lg cursor-pointer hover:bg-hairline"
-                onClick={() => setSelectedSessionId(discussion.session_id)}
+                onClick={() => selectSession(discussion.session_id)}
               >
                 <div>
                   <div className="text-ink font-medium">
@@ -298,19 +389,29 @@ export function AgentChatDashboard() {
         </div>
       )}
 
-      {/* Main Grid - Sessions and Position Monitor */}
+      {/* Master-detail (R5-P2-UX B2): the session list ("master") never gets
+          replaced — it just narrows to make room for the detail pane once a
+          session is selected. Browsing (no selection): list 2/3 + Position
+          Monitor 1/3, same as before. Viewing a session: list 1/3 (still
+          visible + clickable — switching sessions doesn't require going
+          "back" first) + ChatSessionViewer 2/3. */}
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-        {/* Recent Sessions (2/3 width) */}
-        <div className="xl:col-span-2">
+        <div className={selectedSessionId ? 'xl:col-span-1' : 'xl:col-span-2'}>
           <ChatSessionList
             sessions={recentSessions}
-            onSelectSession={setSelectedSessionId}
+            onSelectSession={selectSession}
           />
         </div>
 
-        {/* Position Monitor (1/3 width) */}
-        <div>
-          <PositionMonitor />
+        <div className={selectedSessionId ? 'xl:col-span-2' : ''}>
+          {selectedSessionId ? (
+            <ChatSessionViewer
+              sessionId={selectedSessionId}
+              onClose={() => selectSession(null)}
+            />
+          ) : (
+            <PositionMonitor />
+          )}
         </div>
       </div>
     </div>

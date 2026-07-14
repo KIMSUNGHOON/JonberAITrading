@@ -399,7 +399,7 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
           className="flex items-center gap-2 text-muted hover:text-ink mb-4"
         >
           <ArrowLeft className="w-5 h-5" />
-          Back
+          목록
         </button>
         <div className="flex items-center gap-3 text-down">
           <AlertCircle className="w-5 h-5" />
@@ -413,12 +413,31 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
 
   return (
     <div className="space-y-3">
-      {/* Header */}
+      {/* Breadcrumb (R5-P2-UX B2): 종목/상태/← 목록 in one line. Selecting a
+          session no longer full-page-swaps (AgentChatDashboard is now
+          master-detail — the session list stays visible alongside this
+          pane), but this still gives a persistent "where am I" anchor at the
+          top of the detail pane itself. */}
       <div className="flex items-center gap-3 border-b border-hairline pb-2">
         <button onClick={onClose} className="flex items-center gap-1.5 text-xs text-muted hover:text-ink">
           <ArrowLeft className="w-4 h-4" />
-          Back
+          목록
         </button>
+        <span className="text-dim text-xs">/</span>
+        <span className="text-xs font-medium text-ink truncate">
+          {session.stock_name} ({session.ticker})
+        </span>
+        <span
+          className={`text-[10px] font-mono uppercase ${
+            session.status === 'decided'
+              ? 'text-up'
+              : session.status === 'error'
+              ? 'text-down'
+              : 'text-accent'
+          }`}
+        >
+          {session.status}
+        </span>
         <div className="ml-auto flex items-center gap-3">
           {isActiveSession && (
             <span className="text-[11px] font-mono">
