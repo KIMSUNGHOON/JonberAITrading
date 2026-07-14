@@ -6,7 +6,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '@/store';
 import { useGoTo } from '@/hooks/useNav';
 import { useStartAnalysis } from '@/hooks/useStartAnalysis';
-import { startScan, startAgentChatDiscussion } from '@/api/client';
+import { startScan, startAgentChatDiscussion, createKRStockOrder, createCoinOrder } from '@/api/client';
 import { buildCommands, filterCommands, type CommandCtx } from './commands';
 
 // Section order in the results list — matches the group labels used in
@@ -51,6 +51,35 @@ export function CommandPalette({ open, onClose }: Props) {
         startDebate: (t) => {
           startAgentChatDiscussion({ ticker: t, stock_name: t }).catch(fail(`토론 시작 실패 (${t})`));
         },
+        // P1-4 discretionary control surface: manual :buy/:sell. Resolves the
+        // market from activeMarket at call time (same convention as
+        // startAnalysis) and calls the SAME order-create endpoint the rest of
+        // the app uses — no separate/bypassing execution path. Upbit has no
+        // qty-based market-buy (its market-buy semantics take a KRW amount,
+        // not a coin volume) so a coin :buy with no price is rejected instead
+        // of silently reinterpreting qty as a KRW amount.
+        placeOrder: (side, sym, qty, px) => {
+          const m = useStore.getState().activeMarket;
+          const promise = m === 'coin'
+            ? side === 'buy' && px == null
+              ? Promise.reject(new Error('코인 시장가 매수는 미지원 — 가격을 지정하세요: :buy SYM QTY PX'))
+              : createCoinOrder({
+                  market: sym,
+                  side: side === 'buy' ? 'bid' : 'ask',
+                  ord_type: px != null ? 'limit' : 'market',
+                  price: px,
+                  volume: qty,
+                })
+            : createKRStockOrder({
+                stk_cd: sym,
+                side,
+                ord_type: px != null ? 'limit' : 'market',
+                price: px,
+                quantity: qty,
+              });
+          promise.catch(fail(`:${side} ${sym} 주문 실패`));
+        },
+        reportError: (msg) => setError(msg),
       };
     },
     [goTo, setActiveMarket, setChartSymbol, setShowSettingsModal, setError, start]
