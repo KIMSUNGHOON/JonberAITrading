@@ -187,6 +187,25 @@ async def _submit_decision_locked(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="실행 중일 수 있어 취소 불가 — 체결 확인 필요",
                 )
+            # I4 (F4b T4 extension): a session already TERMINAL (completed or
+            # error) has already run to its real outcome — regardless of
+            # which decision got it there (approved AND modified both leave
+            # session["status"] == "completed"; a re-analysis that blew up
+            # leaves "error"). A late cancel arriving after that (e.g. from a
+            # reloaded tab, or racing the I3 lock) must not flip a settled
+            # outcome back to CANCELLED — that would misreport an executed
+            # trade as never-happened, or erase a genuine failure record.
+            # Checked after the narrower approved-branch above (which has its
+            # own, more specific "확인 필요" message for the maybe-mid-flight
+            # shape); this one is a plain "already done" refusal. cancelled
+            # itself is intentionally NOT included here — re-cancelling an
+            # already-cancelled session is a harmless idempotent no-op,
+            # handled by the zombie-tolerance branch below.
+            if session.get("status") in ("completed", "error"):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="이미 처리됨 — 취소 불가",
+                )
             # Cancel-zombie tolerance: the operations board lists a session as
             # actionable off the session_manager row (sm.status ==
             # AWAITING_APPROVAL — checked above, in _adopt_session_from_manager,

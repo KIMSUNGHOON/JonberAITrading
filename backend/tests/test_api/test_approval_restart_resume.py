@@ -676,3 +676,140 @@ async def test_completion_preserves_cancel_marked_during_resume(wired, monkeypat
     assert mirrored_statuses == ["cancelled"]
     # And the cancel-preserving path must never rearm the autonomy injector.
     assert wired["reschedule_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_completed_session_is_rejected_409(wired, monkeypatch):
+    """(I4) awaiting_approval=False + status='completed' + cancel -> 409.
+
+    DEFECT this guards: the F4a T4 guard only checked approval_status ==
+    'approved', but a session can reach status='completed' via decision=
+    'modified' too (see the `else` branch in submit_decision — modified also
+    sets session["status"] = "completed"). A late cancel targeting that
+    session fell straight into the zombie-cancel tolerance branch (only
+    approval_status is inspected there) and flipped a real, already-executed
+    outcome back to CANCELLED. The terminal-status check must catch this
+    shape even though approval_status != 'approved'.
+    """
+    from fastapi import HTTPException
+
+    session_id = "completed-zombie-cancel-1"
+    wired["kr_stock_sessions"][session_id] = {
+        "session_id": session_id,
+        "status": "completed",
+        "state": {
+            "awaiting_approval": False,
+            "approval_status": "modified",
+            "trade_proposal": {"id": "prop-1", "action": "BUY", "quantity": 1, "entry_price": 70000},
+            "reasoning_log": [],
+        },
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+    }
+    graph = _FakeGraph([])
+    wired["set_graph"](graph)
+
+    mirrored_statuses = []
+
+    async def capture_mirror_status(sid, st, error=None):
+        mirrored_statuses.append(st)
+
+    monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "cancelled")
+
+    assert exc_info.value.status_code == 409
+    assert "이미 처리됨" in exc_info.value.detail
+
+    state = wired["kr_stock_sessions"][session_id]["state"]
+    assert state["approval_status"] == "modified"  # not overwritten to cancelled
+    assert wired["kr_stock_sessions"][session_id]["status"] == "completed"  # unchanged
+    assert mirrored_statuses == []  # no status mirror performed
+    graph.aupdate_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_error_session_is_rejected_409(wired, monkeypatch):
+    """(I4) awaiting_approval=False + status='error' + cancel -> 409, stays error.
+
+    DEFECT this guards: a re-analysis (reject -> resume) that blew up leaves
+    session["status"] = "error" with approval_status still whatever the prior
+    decision was (e.g. 'rejected', never 'approved'). A late cancel used to
+    sail through the zombie-cancel branch and overwrite ERROR with CANCELLED,
+    erasing the failure record.
+    """
+    from fastapi import HTTPException
+
+    session_id = "error-zombie-cancel-1"
+    wired["kr_stock_sessions"][session_id] = {
+        "session_id": session_id,
+        "status": "error",
+        "state": {
+            "awaiting_approval": False,
+            "approval_status": "rejected",
+            "trade_proposal": {"id": "prop-1", "action": "BUY", "quantity": 1, "entry_price": 70000},
+            "reasoning_log": [],
+        },
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+        "error": "graph exploded",
+    }
+    graph = _FakeGraph([])
+    wired["set_graph"](graph)
+
+    mirrored_statuses = []
+
+    async def capture_mirror_status(sid, st, error=None):
+        mirrored_statuses.append(st)
+
+    monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "cancelled")
+
+    assert exc_info.value.status_code == 409
+    assert "이미 처리됨" in exc_info.value.detail
+
+    state = wired["kr_stock_sessions"][session_id]["state"]
+    assert state["approval_status"] == "rejected"  # not overwritten to cancelled
+    assert wired["kr_stock_sessions"][session_id]["status"] == "error"  # unchanged, not cancelled
+    assert mirrored_statuses == []  # no status mirror performed
+    graph.aupdate_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_genuinely_awaiting_still_200s(wired, monkeypatch):
+    """Regression pin: a normal cancel of a session truly awaiting approval
+    (awaiting_approval=True, not the stale-flag zombie shape) must still
+    succeed and go through the full resume machinery unchanged by I3/I4 —
+    those only touch the `not awaiting_approval` zombie-cancel branch.
+    """
+    session_id = "genuine-awaiting-cancel-1"
+    wired["kr_stock_sessions"][session_id] = {
+        "session_id": session_id,
+        "status": "awaiting_approval",
+        "state": {
+            "awaiting_approval": True,
+            "approval_status": None,
+            "trade_proposal": {"id": "prop-1", "action": "BUY", "quantity": 1, "entry_price": 70000},
+            "reasoning_log": [],
+        },
+        "stk_cd": "005930",
+        "stk_nm": "삼성전자",
+    }
+    graph = _FakeGraph([{"finalize": {"awaiting_approval": False}}])
+    wired["set_graph"](graph)
+
+    result = await approval_module.submit_decision(session_id, "cancelled")
+
+    assert result.session_id == session_id
+    assert result.decision == "cancelled"
+    assert result.status == "cancelled"
+    assert result.execution_status == "cancelled"
+
+    graph.aupdate_state.assert_awaited_once()
+    resume_config, resume_update = graph.aupdate_state.await_args.args
+    assert resume_config == {"configurable": {"thread_id": session_id}}
+    assert resume_update["approval_status"] == "cancelled"
+    assert wired["kr_stock_sessions"][session_id]["status"] == "cancelled"

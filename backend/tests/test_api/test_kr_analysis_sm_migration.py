@@ -357,6 +357,105 @@ async def test_cancel_mirror_success_reports_mirror_failed_false(sm, kr_sessions
 
 
 # -------------------------------------------
+# (I3) Cancel route participates in the per-session decision lock
+# -------------------------------------------
+
+
+async def test_cancel_route_serializes_against_concurrent_decision_lock_holder(sm, kr_sessions):
+    """(I3) cancel must wait if another decision (e.g. an in-flight reject
+    resume through /decide) currently holds the per-session decision lock for
+    this session_id — otherwise the cancel races the resume directly against
+    the legacy dict + sm mirror, and whichever writes last silently wins even
+    if it is the stale one.
+    """
+    import app.api.routes.approval as approval_module
+
+    session_id = "kr-cancel-lock-1"
+    record = _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    lock_acquired = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def hold_lock():
+        async with approval_module._session_decision_lock(session_id):
+            lock_acquired.set()
+            await release_lock.wait()
+
+    holder = asyncio.create_task(hold_lock())
+    await asyncio.wait_for(lock_acquired.wait(), timeout=5)
+
+    cancel_task = asyncio.create_task(cancel_kr_stock_analysis(session_id))
+    # Give the cancel ample scheduler turns: with the lock in place it must be
+    # BLOCKED (pre-fix it ran immediately, concurrently with the lock holder).
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not cancel_task.done(), (
+        "cancel ran while the decision lock was held elsewhere — routes not serialized"
+    )
+
+    release_lock.set()
+    await holder
+    result = await cancel_task
+
+    assert record["status"] == "cancelled"
+    assert result["mirror_failed"] is False
+
+    # Lock bookkeeping fully pruned afterwards.
+    assert approval_module._decision_locks == {}
+    assert approval_module._decision_lock_refs == {}
+
+
+# -------------------------------------------
+# (I4) Cancel route refuses an already-settled session with 409
+# -------------------------------------------
+
+
+async def test_cancel_route_refuses_completed_session_409(sm, kr_sessions):
+    from fastapi import HTTPException
+
+    session_id = "kr-cancel-done-1"
+    record = _seed_session(kr_sessions, session_id)
+    record["status"] = "completed"
+    await _seed_sm_session(sm, session_id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cancel_kr_stock_analysis(session_id)
+
+    assert exc_info.value.status_code == 409
+    assert record["status"] == "completed"  # not flipped to cancelled
+
+
+async def test_cancel_route_refuses_error_session_409(sm, kr_sessions):
+    from fastapi import HTTPException
+
+    session_id = "kr-cancel-err-1"
+    record = _seed_session(kr_sessions, session_id)
+    record["status"] = "error"
+    await _seed_sm_session(sm, session_id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cancel_kr_stock_analysis(session_id)
+
+    assert exc_info.value.status_code == 409
+    assert record["status"] == "error"  # not flipped to cancelled
+
+
+async def test_cancel_route_still_200s_for_awaiting_session(sm, kr_sessions):
+    """Normal case unchanged: an actively-running (not yet settled) session
+    cancels cleanly with 200."""
+    session_id = "kr-cancel-normal-1"
+    record = _seed_session(kr_sessions, session_id)
+    await _seed_sm_session(sm, session_id)
+    assert record["status"] == "running"  # _seed_session default
+
+    response = await cancel_kr_stock_analysis(session_id)
+
+    assert response["mirror_failed"] is False
+    assert record["status"] == "cancelled"
+
+
+# -------------------------------------------
 # Producer robustness: sm mirror failures must not affect the analysis
 # -------------------------------------------
 

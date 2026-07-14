@@ -8,6 +8,7 @@ status transition fires a pub/sub notification for the session WebSocket.
 Headless: stubbed graph astream + a real SessionManager on a test SQLite db.
 """
 
+import asyncio
 import os
 
 import pytest
@@ -201,6 +202,85 @@ async def test_cancel_route_mirrors_cancelled_status(sm, coin_sessions_fixture):
 
     assert coin_sessions_fixture[session_id]["status"] == "cancelled"
     assert (await sm.get_session(session_id)).status == SessionStatus.CANCELLED
+
+
+# -------------------------------------------
+# (I3) Cancel route participates in the per-session decision lock
+# -------------------------------------------
+
+
+async def test_cancel_route_serializes_against_concurrent_decision_lock_holder(
+    sm, coin_sessions_fixture
+):
+    """(I3) cancel must wait if another decision (e.g. an in-flight reject
+    resume through /decide) currently holds the per-session decision lock for
+    this session_id. Same defect/fix as the kr_stocks analog."""
+    import app.api.routes.approval as approval_module
+
+    session_id = "coin-cancel-lock-1"
+    record = _seed_session(coin_sessions_fixture, session_id)
+    await _seed_sm_session(sm, session_id)
+
+    lock_acquired = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def hold_lock():
+        async with approval_module._session_decision_lock(session_id):
+            lock_acquired.set()
+            await release_lock.wait()
+
+    holder = asyncio.create_task(hold_lock())
+    await asyncio.wait_for(lock_acquired.wait(), timeout=5)
+
+    cancel_task = asyncio.create_task(cancel_coin_analysis(session_id))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not cancel_task.done(), (
+        "cancel ran while the decision lock was held elsewhere — routes not serialized"
+    )
+
+    release_lock.set()
+    await holder
+    await cancel_task
+
+    assert record["status"] == "cancelled"
+    assert approval_module._decision_locks == {}
+    assert approval_module._decision_lock_refs == {}
+
+
+# -------------------------------------------
+# (I4) Cancel route refuses an already-settled session with 409
+# -------------------------------------------
+
+
+async def test_cancel_route_refuses_completed_session_409(sm, coin_sessions_fixture):
+    from fastapi import HTTPException
+
+    session_id = "coin-cancel-done-1"
+    record = _seed_session(coin_sessions_fixture, session_id)
+    record["status"] = "completed"
+    await _seed_sm_session(sm, session_id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cancel_coin_analysis(session_id)
+
+    assert exc_info.value.status_code == 409
+    assert record["status"] == "completed"
+
+
+async def test_cancel_route_refuses_error_session_409(sm, coin_sessions_fixture):
+    from fastapi import HTTPException
+
+    session_id = "coin-cancel-err-1"
+    record = _seed_session(coin_sessions_fixture, session_id)
+    record["status"] = "error"
+    await _seed_sm_session(sm, session_id)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await cancel_coin_analysis(session_id)
+
+    assert exc_info.value.status_code == 409
+    assert record["status"] == "error"
 
 
 async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, coin_sessions_fixture, monkeypatch):

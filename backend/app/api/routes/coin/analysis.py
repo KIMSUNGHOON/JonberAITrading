@@ -335,21 +335,37 @@ async def cancel_coin_analysis(session_id: str):
     Returns:
         Confirmation message
     """
-    session = get_coin_session(session_id)
+    # I3: local import — approval.py is imported at coin-package init time
+    # (__init__.py -> .analysis, this module), and approval.py itself imports
+    # get_coin_sessions from this package at module level. A module-level
+    # import of approval here would close a real import cycle (approval ->
+    # coin -> analysis -> approval, partially-initialized). Deferred import
+    # breaks the cycle; by request time approval.py is always fully loaded.
+    from app.api.routes.approval import _session_decision_lock
 
-    if session["status"] in ["completed", "cancelled"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Session already {session['status']}",
-        )
+    # Route this cancel through the SAME per-session lock /decide uses, so it
+    # serializes against a concurrent reject/approve on the same session_id
+    # (see the kr_stocks analog for the full defect writeup).
+    async with _session_decision_lock(session_id):
+        session = get_coin_session(session_id)
 
-    session["status"] = "cancelled"
-    session["state"]["reasoning_log"].append("[System] Analysis cancelled by user")
+        # I4: refuse a cancel of an already-settled session. completed/error
+        # both mean the session already ran to its real outcome; "cancelled"
+        # is folded into the same 409 (pre-existing behavior, previously a
+        # 400) since a repeat-cancel has nothing left to do.
+        if session["status"] in ("completed", "error", "cancelled"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Session already {session['status']} — cancel refused",
+            )
 
-    # Mirror to sm — the notify wakes the WebSocket, which re-reads the fresh
-    # legacy snapshot (cancelled status + the appended log entry).
-    await mirror_session_status(session_id, SessionStatus.CANCELLED)
+        session["status"] = "cancelled"
+        session["state"]["reasoning_log"].append("[System] Analysis cancelled by user")
 
-    logger.info("coin_analysis_cancelled", session_id=session_id)
+        # Mirror to sm — the notify wakes the WebSocket, which re-reads the fresh
+        # legacy snapshot (cancelled status + the appended log entry).
+        await mirror_session_status(session_id, SessionStatus.CANCELLED)
 
-    return {"message": f"Session {session_id} cancelled"}
+        logger.info("coin_analysis_cancelled", session_id=session_id)
+
+        return {"message": f"Session {session_id} cancelled"}
