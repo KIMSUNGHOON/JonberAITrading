@@ -12,11 +12,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from app.api.routes.kr_stocks import orders as orders_mod
 from app.api.routes.kr_stocks import positions as positions_mod
 from app.api.schemas.kr_stocks import KRStockOrderRequest
-from services.kiwoom.models import OrderResponse, OrderType as KiwoomOrderType
+from services.kiwoom.models import Holding, OrderResponse, OrderType as KiwoomOrderType
 
 
 def _resp(ord_no="L1", rc=0):
     return OrderResponse(ord_no=ord_no, return_code=rc, return_msg="정상")
+
+
+def _holding(**overrides):
+    fields = dict(
+        stk_cd="005930", stk_nm="삼성전자", hldg_qty=10,
+        avg_buy_prc=70000, cur_prc=71000, evlu_amt=710000,
+        evlu_pfls_amt=10000, evlu_pfls_rt=1.43,
+    )
+    fields.update(overrides)
+    return Holding(**fields)
 
 
 @patch("app.api.routes.kr_stocks.orders.check_kiwoom_api_keys")
@@ -63,21 +73,20 @@ async def test_create_order_mock_mode_never_touches_client(mock_client_get, _chk
     assert resp.order_id.startswith("mock-")
 
 
-@patch("services.storage_service.get_storage_service")
 @patch("app.api.routes.kr_stocks.positions.check_kiwoom_api_keys")
 @patch("app.api.routes.kr_stocks.positions.get_shared_kiwoom_client_async")
-async def test_close_position_live_dispatches_market_sell(mock_client_get, _chk, mock_storage_get):
+async def test_close_position_live_dispatches_market_sell(mock_client_get, _chk):
+    # Position source is broker balance (kt00004), not storage — there is no
+    # KR position writer in the backend. close_position always routes
+    # through KiwoomExecutionAdapter/client.place_sell_order; mock-vs-live is
+    # handled inside the client itself (KIWOOM_IS_MOCK base URL).
     client = MagicMock()
     client.place_sell_order = AsyncMock(return_value=_resp("C1"))
+    balance = MagicMock()
+    balance.holdings = [_holding(stk_cd="005930", hldg_qty=10)]
+    client.get_account_balance = AsyncMock(return_value=balance)
     mock_client_get.return_value = client
-    storage = MagicMock()
-    storage.get_kr_stock_position = AsyncMock(
-        return_value={"quantity": 10, "stk_nm": "삼성전자", "avg_entry_price": 70000}
-    )
-    storage.delete_kr_stock_position = AsyncMock()
-    mock_storage_get.return_value = storage
-    with patch.object(positions_mod.settings, "KIWOOM_IS_MOCK", False):
-        resp = await positions_mod.close_position("005930")
+    resp = await positions_mod.close_position("005930")
     client.place_sell_order.assert_awaited_once()
     kwargs = client.place_sell_order.await_args.kwargs
     assert kwargs["order_type"] == KiwoomOrderType.MARKET

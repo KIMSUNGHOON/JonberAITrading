@@ -18,8 +18,11 @@ test_kr_trades.py.
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from fastapi import HTTPException
+
 from app.api.routes.kr_stocks import positions as positions_mod
-from services.kiwoom.models import Holding
+from services.kiwoom.models import Holding, OrderResponse
 
 
 def _kiwoom(holdings=None):
@@ -138,3 +141,126 @@ async def test_get_positions_client_construction_failure_degrades_honestly():
 
     assert res.positions == []
     assert res.total_value_krw == 0
+
+
+# -------------------------------------------
+# P2 T1b: GET /positions/{stk_cd} (single) + POST /positions/{stk_cd}/close
+#
+# Before this fix both handlers called `storage.get_kr_stock_position()` /
+# `storage.delete_kr_stock_position()`, methods that have never existed on
+# StorageService (same root cause as the list handler above) — every
+# lookup 404'd even for a ticker the list endpoint showed as held, and
+# close_position's "delete a storage row" semantics were architecturally
+# wrong for a KR position (broker balance, not a stored row). Both now
+# source from the same `get_account_balance().holdings` the list handler
+# uses, and close_position places a real full-quantity market SELL via
+# KiwoomExecutionAdapter instead of fabricating a response.
+# -------------------------------------------
+
+
+async def test_get_position_returns_held_ticker_from_broker_balance():
+    holding = _holding()
+    client = _kiwoom([holding])
+
+    with patch.object(positions_mod, "get_shared_kiwoom_client_async",
+                       AsyncMock(return_value=client)):
+        res = await positions_mod.get_position("005930")
+
+    assert res.stk_cd == "005930"
+    assert res.stk_nm == "삼성전자"
+    assert res.quantity == holding.hldg_qty == 10
+    assert res.avg_entry_price == holding.avg_buy_prc == 260000
+    assert res.current_price == holding.cur_prc == 266000
+    assert res.unrealized_pnl == holding.evlu_pfls_amt == 60000
+    assert res.unrealized_pnl_pct == holding.evlu_pfls_rt == 2.31
+
+
+async def test_get_position_unheld_ticker_returns_honest_404():
+    client = _kiwoom([_holding(stk_cd="005930")])
+
+    with patch.object(positions_mod, "get_shared_kiwoom_client_async",
+                       AsyncMock(return_value=client)):
+        with pytest.raises(HTTPException) as exc_info:
+            await positions_mod.get_position("000660")
+
+    assert exc_info.value.status_code == 404
+
+
+async def test_get_position_broker_failure_degrades_honestly():
+    """Broker fetch failure -> honest 503, never a fabricated position."""
+    client = MagicMock()
+    client.get_account_balance = AsyncMock(side_effect=RuntimeError("kiwoom down"))
+
+    with patch.object(positions_mod, "get_shared_kiwoom_client_async",
+                       AsyncMock(return_value=client)):
+        with pytest.raises(HTTPException) as exc_info:
+            await positions_mod.get_position("005930")
+
+    assert exc_info.value.status_code == 503
+
+
+@patch("app.api.routes.kr_stocks.positions.check_kiwoom_api_keys")
+async def test_close_position_places_full_qty_market_sell(_chk):
+    holding = _holding(stk_cd="005930", hldg_qty=10)
+    client = _kiwoom([holding])
+    client.place_sell_order = AsyncMock(
+        return_value=OrderResponse(ord_no="C1", return_code=0, return_msg="정상")
+    )
+    client.place_buy_order = AsyncMock()
+
+    with patch.object(positions_mod, "get_shared_kiwoom_client_async",
+                       AsyncMock(return_value=client)):
+        res = await positions_mod.close_position("005930")
+
+    client.place_sell_order.assert_awaited_once()
+    kwargs = client.place_sell_order.await_args.kwargs
+    assert kwargs["stk_cd"] == "005930"
+    assert kwargs["qty"] == 10
+    client.place_buy_order.assert_not_awaited()
+    assert res.order_id == "C1"
+    assert res.side == "sell"
+    assert res.quantity == 10
+    assert res.status == "pending"
+
+
+@patch("app.api.routes.kr_stocks.positions.check_kiwoom_api_keys")
+async def test_close_position_unheld_ticker_returns_honest_404(_chk):
+    client = _kiwoom([_holding(stk_cd="005930")])
+
+    with patch.object(positions_mod, "get_shared_kiwoom_client_async",
+                       AsyncMock(return_value=client)):
+        with pytest.raises(HTTPException) as exc_info:
+            await positions_mod.close_position("000660")
+
+    assert exc_info.value.status_code == 404
+
+
+@patch("app.api.routes.kr_stocks.positions.check_kiwoom_api_keys")
+async def test_close_position_broker_rejection_is_not_reported_as_success(_chk):
+    """A rejected sell order (return_code != 0) must never surface as a
+    fabricated completed/pending success."""
+    holding = _holding(stk_cd="005930", hldg_qty=10)
+    client = _kiwoom([holding])
+    client.place_sell_order = AsyncMock(
+        return_value=OrderResponse(ord_no="", return_code=1, return_msg="주문거부")
+    )
+
+    with patch.object(positions_mod, "get_shared_kiwoom_client_async",
+                       AsyncMock(return_value=client)):
+        res = await positions_mod.close_position("005930")
+
+    assert res.status not in ("pending", "completed")
+
+
+@patch("app.api.routes.kr_stocks.positions.check_kiwoom_api_keys")
+async def test_close_position_broker_balance_failure_degrades_honestly(_chk):
+    """Failure to even look up the holding -> honest 503, no fake order."""
+    client = MagicMock()
+    client.get_account_balance = AsyncMock(side_effect=RuntimeError("kiwoom down"))
+
+    with patch.object(positions_mod, "get_shared_kiwoom_client_async",
+                       AsyncMock(return_value=client)):
+        with pytest.raises(HTTPException) as exc_info:
+            await positions_mod.close_position("005930")
+
+    assert exc_info.value.status_code == 503
