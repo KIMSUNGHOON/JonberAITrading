@@ -2,12 +2,32 @@
  * Positions tile — live broker holdings for the active market.
  *
  * Data comes from REST (per-market), NOT the store: the store's activePosition
- * is a single analysis-derived object with no stop/take. Kiwoom + coin have
- * exact column matches. Polls every 10s, keyed on activeMarket so switching
- * the market tab re-fetches (the tile never remounts).
+ * is a single analysis-derived object with no stop/take. Polls every 10s,
+ * keyed on activeMarket so switching the market tab re-fetches (the tile
+ * never remounts).
  *
  * P1-4 discretionary control surface: inline STOP/TAKE edit + full close.
  * These are OPERATOR-INITIATED manual actions, not autonomous ones.
+ *
+ * Cleanup Task B (dashboard-widget-cull audit §C-5, 2026-07-14): KR rows are
+ * sourced from `getOperations('kiwoom')` -> `GET /trading/operations`, NOT
+ * `getKRStockPositions()` -> `GET /kr_stocks/positions`. The latter
+ * hardcodes `stop_loss=None, take_profit=None`
+ * (backend/app/api/routes/kr_stocks/positions.py) — so a saved inline
+ * STOP/TAKE edit (which writes to coordinator.risk_monitor._watching via
+ * PUT /trading/positions/{ticker}/stop-loss) would read back as blank on
+ * the very next refetch, looking like the save silently reverted. See
+ * KiwoomPositionPanel.tsx (fixed first, commit 04597ff / 대안2 A2) for the
+ * same rationale — `/operations` enriches SL/TP from the trading
+ * coordinator/risk_monitor before returning it (trading.py `get_operations`),
+ * so the field now reflects what was actually saved. Coin rows are
+ * unaffected (getCoinPositions() is storage-based and never had this bug).
+ *
+ * `/operations` holding===null for market='kiwoom' only happens alongside an
+ * `errors.holding` entry (broker fetch failed) — the "non-applicable"
+ * null-with-no-error case is coin-only (get_operations' `market != "kiwoom"`
+ * early return), so a null holding here is always treated as a real failure
+ * (honest-degrade, mirroring KiwoomPositionPanel.tsx).
  *
  * T7 review fixes (see .superpowers/sdd/task-7-fix-findings.md):
  * - C1: SL/TP save surfaces the backend's real outcome (including an honest
@@ -32,7 +52,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { useStore, selectChartSymbol } from '@/store';
 import {
-  getKRStockPositions, getCoinPositions,
+  getOperations, getCoinPositions,
   updatePositionStopLoss, updatePositionTakeProfit,
   closeKRStockPosition, closeCoinPosition,
 } from '@/api/client';
@@ -65,17 +85,25 @@ function usePositions() {
     setErr(null);
     try {
       if (activeMarket === 'kiwoom') {
-        const res = await getKRStockPositions();
+        const res = await getOperations('kiwoom');
         if (!aliveRef.current) return;
+        if (res.holding === null) {
+          // Honest degrade: for market='kiwoom' a null holding always means
+          // the broker fetch failed (see file-header note above) — never
+          // silently show zero positions.
+          setErr(res.errors.holding ?? '로드 실패');
+          setState('error');
+          return;
+        }
         setRows(
-          res.positions.map((p) => ({
-            sym: p.stk_nm || p.stk_cd,
-            code: p.stk_cd,
+          res.holding.map((p) => ({
+            sym: p.name || p.ticker,
+            code: p.ticker,
             qty: p.quantity,
-            entry: p.avg_entry_price,
+            entry: p.avg_price,
             cur: p.current_price,
-            pnl: p.unrealized_pnl,
-            pnlPct: p.unrealized_pnl_pct,
+            pnl: p.pnl,
+            pnlPct: p.pnl_pct,
             stop: p.stop_loss,
             take: p.take_profit,
           })),
