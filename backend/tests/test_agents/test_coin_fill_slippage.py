@@ -21,6 +21,7 @@ provably distinct from the proposal's stale `entry_price`.
 """
 
 import pytest
+import structlog.testing
 
 import agents.graph.coin_nodes as coin_nodes_module
 import services.storage_service as ss
@@ -78,6 +79,44 @@ def _fake_upbit_client_class(live_price):
 
         async def get_ticker(self, markets):
             return [_FakeTicker(trade_price=live_price)]
+
+    return _FakeUpbitClient
+
+
+def _fake_upbit_client_raising(exc):
+    """Stub for the network-failure branch: `get_ticker` raises."""
+
+    class _FakeUpbitClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def get_ticker(self, markets):
+            raise exc
+
+    return _FakeUpbitClient
+
+
+def _fake_upbit_client_empty():
+    """Stub for the network-degrade branch: `get_ticker` returns `[]`."""
+
+    class _FakeUpbitClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def get_ticker(self, markets):
+            return []
 
     return _FakeUpbitClient
 
@@ -226,3 +265,85 @@ async def test_zero_slippage_fills_exactly_at_refetched_live_price(temp_storage,
 
     position = await temp_storage.get_coin_position("KRW-BTC")
     assert position["avg_entry_price"] == pytest.approx(live_price)
+
+
+# -------------------------------------------
+# P2 review LOW finding (P2-4 P4a): the network-failure degrade branch in
+# `_fetch_live_coin_price` — `get_ticker` raises, or returns `[]` — had ZERO
+# coverage. Per the review, the degraded path is STALE PRICE + slippage
+# still applied (not a full reversion to a raw, un-slipped fill), and the
+# failure must not crash the trade.
+# -------------------------------------------
+
+
+async def test_get_ticker_raises_degrades_to_stale_price_with_slippage_and_logs_warning(
+    temp_storage, monkeypatch
+):
+    stale_entry_price = 100_000_000
+    monkeypatch.setattr(
+        coin_nodes_module,
+        "UpbitClient",
+        _fake_upbit_client_raising(ConnectionError("upbit unreachable")),
+    )
+
+    with structlog.testing.capture_logs() as logs:
+        result = await coin_execution_node(
+            _state("BUY", entry_price=stale_entry_price, quantity=0.1)
+        )
+
+    # No exception propagated out of the node — the trade still completed.
+    assert result["execution_status"] == "completed"
+
+    # Degrades to the stale proposal price, with slippage still applied ON
+    # TOP of it (not a bare, un-slipped stale fill).
+    position = await temp_storage.get_coin_position("KRW-BTC")
+    assert position is not None
+    expected_fill = stale_entry_price * 1.01  # +100 bps adverse for BUY
+    assert position["avg_entry_price"] == pytest.approx(expected_fill)
+
+    # The failure is logged, not swallowed silently.
+    warnings = [e for e in logs if e.get("event") == "coin_paper_live_price_refetch_failed"]
+    assert len(warnings) == 1
+    assert warnings[0]["market"] == "KRW-BTC"
+
+
+async def test_get_ticker_empty_response_degrades_to_stale_price_with_slippage(
+    temp_storage, monkeypatch
+):
+    stale_entry_price = 100_000_000
+    monkeypatch.setattr(coin_nodes_module, "UpbitClient", _fake_upbit_client_empty())
+
+    result = await coin_execution_node(_state("BUY", entry_price=stale_entry_price, quantity=0.1))
+
+    # No exception propagated out of the node — the trade still completed.
+    assert result["execution_status"] == "completed"
+
+    position = await temp_storage.get_coin_position("KRW-BTC")
+    assert position is not None
+    expected_fill = stale_entry_price * 1.01  # +100 bps adverse for BUY
+    assert position["avg_entry_price"] == pytest.approx(expected_fill)
+
+
+async def test_get_ticker_raises_on_sell_degrades_to_stale_price_with_slippage(
+    temp_storage, monkeypatch
+):
+    """Same degrade path, exercised on the SELL/exit-leg side (adverse
+    slippage direction is inverted vs. BUY)."""
+    entry_price = 100_000_000
+    monkeypatch.setattr(coin_nodes_module, "UpbitClient", _fake_upbit_client_class(entry_price))
+    await coin_execution_node(_state("BUY", entry_price=entry_price, quantity=0.1))
+
+    stale_exit_price = 120_000_000
+    monkeypatch.setattr(
+        coin_nodes_module,
+        "UpbitClient",
+        _fake_upbit_client_raising(TimeoutError("upbit timed out")),
+    )
+
+    result = await coin_execution_node(_state("SELL", entry_price=stale_exit_price, quantity=0.1))
+    assert result["execution_status"] == "completed"
+
+    records = await temp_storage.get_coin_realized_pnl(market="KRW-BTC")
+    assert len(records) == 1
+    expected_fill = stale_exit_price * 0.99  # -100 bps adverse for SELL
+    assert records[0]["exit_price"] == pytest.approx(expected_fill)
