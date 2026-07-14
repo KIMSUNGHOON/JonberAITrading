@@ -1143,7 +1143,33 @@ class ExecutionCoordinator:
                 total_stock_value=5_000_000,
             )
 
+        # DI2: reprice every open position from the live quote feed.
+        # `ManagedPosition.current_price` was only ever set once, at open
+        # (avg_price), so `unrealized_pnl = (current_price - avg_price) * qty`
+        # was permanently 0 and portfolio_agent's exposure math (which also
+        # reads current_price) drifted from the live total_equity refreshed
+        # just above. Do this every time account info is refreshed so both
+        # stay consistent.
+        await self._reprice_positions()
+
         self._state.last_updated = datetime.now()
+
+    async def _reprice_positions(self) -> None:
+        """Update each open position's `current_price` from the live quote feed.
+
+        `_get_current_price` fails safe to 0/None on any broker error (see
+        test_current_price_feed.py) — that is a "no fresh quote" signal, not
+        a real price. Writing a fabricated 0 into a live position would zero
+        out unrealized_pnl and exposure math, which is worse than a stale
+        (but real) last-known price, so a falsy result SKIPS that position
+        and leaves current_price untouched (T2 stale-price contract).
+        """
+        for position in self._state.positions:
+            price = await self._get_current_price(position.ticker)
+            if not price:
+                continue
+            position.current_price = price
+            position.last_updated = datetime.now()
 
     async def _get_current_price(self, ticker: str) -> float:
         """Get current price for a ticker."""
