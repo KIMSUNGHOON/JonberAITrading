@@ -168,8 +168,11 @@ async def close_position(stk_cd: str):
     so deleting a storage row here was architecturally wrong (and dead code:
     `storage.get_kr_stock_position` / `delete_kr_stock_position` don't exist,
     always AttributeError'd). Closing = looking up the held quantity from the
-    same broker balance the list/single-GET handlers use, then placing a
-    full-quantity market SELL through the single execution path
+    same broker balance the list/single-GET handlers use (but with
+    `use_cache=False` — a full close must sell against CURRENT holdings, not
+    a <=30s-stale cached snapshot that would understate a concurrent ADD and
+    leave a partial position silently open), then placing a full-quantity
+    market SELL through the single execution path
     (`KiwoomExecutionAdapter`, the exact primitive `orders.py` create_order's
     live branch uses) — never a locally fabricated success response.
     Mock-vs-live is handled inside the Kiwoom client itself (KIWOOM_IS_MOCK
@@ -187,7 +190,12 @@ async def close_position(stk_cd: str):
     client = await get_shared_kiwoom_client_async()
 
     try:
-        balance = await client.get_account_balance()
+        # use_cache=False: this is the full-close quantity, so it must
+        # reflect CURRENT holdings, not a <=30s-stale cached snapshot
+        # (client.py:700-716) — a concurrent ADD in the last 30s would
+        # otherwise yield a smaller stale qty, and "close full position"
+        # would silently leave a partial position open.
+        balance = await client.get_account_balance(use_cache=False)
     except Exception as e:
         logger.error(
             "failed_to_fetch_kr_position_for_close", stk_cd=stk_cd, error=str(e)

@@ -224,6 +224,30 @@ async def test_close_position_places_full_qty_market_sell(_chk):
 
 
 @patch("app.api.routes.kr_stocks.positions.check_kiwoom_api_keys")
+async def test_close_position_uses_fresh_balance_not_cache(_chk):
+    """close_position must fetch account balance with use_cache=False —
+    the default 30s cache (client.py:700-716) can understate a position
+    that grew via a concurrent ADD in the last 30s, so a "close full
+    position" order would only sell the stale (smaller) quantity and
+    silently leave a partial position open."""
+    holding = _holding(stk_cd="005930", hldg_qty=25)
+    client = _kiwoom([holding])
+    client.place_sell_order = AsyncMock(
+        return_value=OrderResponse(ord_no="C2", return_code=0, return_msg="정상")
+    )
+    client.place_buy_order = AsyncMock()
+
+    with patch.object(positions_mod, "get_shared_kiwoom_client_async",
+                       AsyncMock(return_value=client)):
+        res = await positions_mod.close_position("005930")
+
+    client.get_account_balance.assert_awaited_once_with(use_cache=False)
+    kwargs = client.place_sell_order.await_args.kwargs
+    assert kwargs["qty"] == 25  # sells against the FRESH holding qty
+    assert res.quantity == 25
+
+
+@patch("app.api.routes.kr_stocks.positions.check_kiwoom_api_keys")
 async def test_close_position_unheld_ticker_returns_honest_404(_chk):
     client = _kiwoom([_holding(stk_cd="005930")])
 
