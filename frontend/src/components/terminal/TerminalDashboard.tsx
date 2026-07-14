@@ -14,13 +14,14 @@ import { OperationsPanel } from './panels/OperationsPanel';
 import { WatchlistPanel } from './panels/WatchlistPanel';
 import { PositionsPanel } from './panels/PositionsPanel';
 import { PortfolioPanel } from './panels/PortfolioPanel';
+import { PerformancePanel } from './panels/PerformancePanel';
 import { ScannerPanel } from './panels/ScannerPanel';
 import { DebatePanel } from './panels/DebatePanel';
 import { ChartTile } from './panels/ChartTile';
 
 type PanelId =
   | 'operations' | 'watchlist' | 'chart' | 'portfolio'
-  | 'positions' | 'scanner' | 'debate';
+  | 'positions' | 'scanner' | 'debate' | 'performance';
 
 const TITLES: Record<PanelId, string> = {
   operations: 'Operations · 운용 파이프라인',
@@ -30,12 +31,12 @@ const TITLES: Record<PanelId, string> = {
   positions: 'Positions',
   scanner: 'Scanner · KOSPI+KOSDAQ',
   debate: 'Agent debate',
+  performance: 'Performance · 실현손익/수익률',
 };
 
-// 레이아웃 v3 — REASONING 타일 제거(perf: 스트리밍 델타가 uncapped 로그를 강제
-// 스크롤과 함께 매 delta마다 전체 재렌더 — 배치 플러시로도 tile 자체는 불필요해
-// 제거; v2 저장 레이아웃은 삭제된 'reasoning' id를 참조하므로 키를 새로 부여)
-const STORAGE_KEY = 'jonber.dashboard.layout.v3';
+// 레이아웃 v4 — PERFORMANCE 타일 추가(TUX4: 실현손익·누적수익률·승률·일별곡선;
+// v3 저장 레이아웃은 새 'performance' id를 모르므로 키를 새로 부여)
+const STORAGE_KEY = 'jonber.dashboard.layout.v4';
 
 const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
   type: 'split',
@@ -47,7 +48,10 @@ const DEFAULT_LAYOUT: MosaicNode<PanelId> = {
       type: 'split', direction: 'row', splitPercentages: [40, 30, 30],
       children: [
         { type: 'split', direction: 'column', splitPercentages: [64, 36], children: ['watchlist', 'chart'] },
-        { type: 'split', direction: 'column', splitPercentages: [16, 62, 22], children: ['portfolio', 'positions', 'scanner'] },
+        {
+          type: 'split', direction: 'column', splitPercentages: [16, 46, 16, 22],
+          children: ['portfolio', 'performance', 'positions', 'scanner'],
+        },
         'debate',
       ],
     },
@@ -63,6 +67,7 @@ function renderBody(id: PanelId) {
     case 'positions': return <PositionsPanel />;
     case 'scanner': return <ScannerPanel />;
     case 'debate': return <DebatePanel />;
+    case 'performance': return <PerformancePanel />;
   }
 }
 

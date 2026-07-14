@@ -5,6 +5,7 @@ Provides endpoints for auto-trading system control and monitoring.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -39,10 +40,21 @@ from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 # 지연 조회(트레이딩 코디네이터에 스탑이 없을 때만 호출)이며 실패해도 홀딩 섹션은
 # 살아남는다(app/api/routes/agent_chat.py:753 GET /positions와 동일한 방어 패턴).
 from services.agent_chat.coordinator import get_chat_coordinator
+from services.trading.paper_performance import (
+    compute_cumulative_return_pct,
+    compute_daily_win_loss,
+    daily_pnl_series,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/trading", tags=["trading"])
+
+KST = timezone(timedelta(hours=9))
+
+# Paper-Proof C1 운용 개시 시점 기준 자산 (2026-07-13, roadmap 기록) — 사용자가
+# --base/쿼리파라미터로 덮어쓰지 않으면 이 값을 분모로 누적 수익률을 계산한다.
+DEFAULT_BASE_ASSET_KRW = 500_000_000
 
 
 # -------------------------------------------
@@ -1370,3 +1382,114 @@ async def get_operations(
 
     res["pending_buy"] = OperationsPendingBuy(queue=queue_items, open_orders=open_orders)
     return OperationsResponse(**res)
+
+
+# ─── Performance visualization (TUX4 — "수익률 담보" 딜리버러블) ───
+#
+# services/trading/paper_performance.py의 순수 집계 함수를 브로커 호출 결과에
+# 적용한다. 실현손익(ka10074) 섹션과 자산(kt00004) 섹션은 서로 다른 API
+# 호출이라 독립적으로 실패할 수 있다 — 하나가 죽어도 다른 하나는 정상 반환
+# (/operations와 동일한 섹션별 정직 강등: null + errors, 0/가짜 값 위장 금지).
+
+
+class PerformanceDailyPoint(BaseModel):
+    dt: str = Field(..., description="일자 (YYYYMMDD)")
+    pnl: int = Field(..., description="당일 매도손익 (부호 보존)")
+    cumulative_pnl: int = Field(..., description="기간 내 누적 손익 (부호 보존)")
+
+
+class PerformancePnlSummary(BaseModel):
+    strt_dt: str
+    end_dt: str
+    realized_pnl_total: int
+    commission: int
+    tax: int
+    net_pnl: int
+    trade_days: int
+    win_days: int
+    loss_days: int
+    flat_days: int
+    win_rate_pct: Optional[float] = Field(
+        None, description="일 단위 승률 % = 승/(승+패); 승부 없으면 None"
+    )
+    daily: List[PerformanceDailyPoint] = Field(default_factory=list)
+
+
+class PerformanceAssetSummary(BaseModel):
+    current_asset: int = Field(..., description="현재 계좌 평가액 (주식+예수금)")
+    base_asset: Optional[int] = Field(None, description="누적 수익률 분모 (기준 자산)")
+    cumulative_return_pct: Optional[float] = Field(
+        None, description="누적 수익률 % (기준 자산 대비); 기준 없으면 None"
+    )
+
+
+class PerformanceResponse(BaseModel):
+    pnl: Optional[PerformancePnlSummary] = None
+    asset: Optional[PerformanceAssetSummary] = None
+    errors: Dict[str, str] = {}
+
+
+@router.get("/performance", response_model=PerformanceResponse)
+async def get_performance(
+    base: Optional[int] = DEFAULT_BASE_ASSET_KRW,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    """모의투자 성과 스냅샷 — 실현손익·승률·일별 시리즈 + 누적 수익률.
+
+    `pnl`(ka10074 기간 실현손익)과 `asset`(kt00004 현재 평가액) 섹션은
+    독립적으로 조회·강등된다: 하나가 실패해도 다른 하나는 정상 값을 반환하고
+    실패한 섹션만 null + errors 사유가 채워진다 (위장 금지).
+
+    Args:
+        base: 누적 수익률 분모 (기본: Paper-Proof C1 운용 개시 기준 자산).
+              0 이하 또는 미지정이면 cumulative_return_pct는 None.
+        start/end: 조회 기간 YYYYMMDD (기본: 최근 30일).
+    """
+    errors: Dict[str, str] = {}
+    end_dt = end or datetime.now(KST).strftime("%Y%m%d")
+    strt_dt = start or (datetime.now(KST) - timedelta(days=30)).strftime("%Y%m%d")
+
+    try:
+        client = await get_shared_kiwoom_client_async()
+    except Exception as e:  # noqa: BLE001 — 클라이언트 자체를 못 얻으면 양쪽 다 실패
+        client = None
+        errors["pnl"] = str(e)
+        errors["asset"] = str(e)
+
+    pnl_summary: Optional[PerformancePnlSummary] = None
+    if client is not None:
+        try:
+            pnl = await client.get_realized_pnl(strt_dt=strt_dt, end_dt=end_dt)
+            win_days, loss_days, flat_days, win_rate_pct = compute_daily_win_loss(pnl.daily)
+            pnl_summary = PerformancePnlSummary(
+                strt_dt=pnl.strt_dt,
+                end_dt=pnl.end_dt,
+                realized_pnl_total=pnl.realized_pnl,
+                commission=pnl.commission,
+                tax=pnl.tax,
+                net_pnl=pnl.realized_pnl - pnl.commission - pnl.tax,
+                trade_days=len(pnl.daily),
+                win_days=win_days,
+                loss_days=loss_days,
+                flat_days=flat_days,
+                win_rate_pct=win_rate_pct,
+                daily=[PerformanceDailyPoint(**p) for p in daily_pnl_series(pnl.daily)],
+            )
+        except Exception as e:  # noqa: BLE001 — 섹션 독립 강등
+            errors["pnl"] = str(e)
+
+    asset_summary: Optional[PerformanceAssetSummary] = None
+    if client is not None:
+        try:
+            balance = await client.get_account_balance()
+            current_asset = balance.total_value
+            asset_summary = PerformanceAssetSummary(
+                current_asset=current_asset,
+                base_asset=base,
+                cumulative_return_pct=compute_cumulative_return_pct(current_asset, base),
+            )
+        except Exception as e:  # noqa: BLE001 — 섹션 독립 강등
+            errors["asset"] = str(e)
+
+    return PerformanceResponse(pnl=pnl_summary, asset=asset_summary, errors=errors)

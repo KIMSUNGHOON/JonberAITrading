@@ -1500,3 +1500,40 @@ export interface OperationsResponse {
   today_fills: OperationsFill[] | null;
   errors: Record<string, string>;
 }
+
+// -------------------------------------------
+// Performance (TUX4 — 성과 가시화)
+// -------------------------------------------
+
+export interface PerformanceDailyPoint {
+  dt: string; // YYYYMMDD
+  pnl: number; // signed daily realized P&L
+  cumulative_pnl: number; // signed running total over the queried period
+}
+
+export interface PerformancePnlSummary {
+  strt_dt: string;
+  end_dt: string;
+  realized_pnl_total: number;
+  commission: number;
+  tax: number;
+  net_pnl: number;
+  trade_days: number;
+  win_days: number;
+  loss_days: number;
+  flat_days: number;
+  win_rate_pct: number | null;
+  daily: PerformanceDailyPoint[];
+}
+
+export interface PerformanceAssetSummary {
+  current_asset: number;
+  base_asset: number | null;
+  cumulative_return_pct: number | null;
+}
+
+export interface PerformanceResponse {
+  pnl: PerformancePnlSummary | null;
+  asset: PerformanceAssetSummary | null;
+  errors: Record<string, string>;
+}

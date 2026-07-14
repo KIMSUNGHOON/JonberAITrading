@@ -57,6 +57,8 @@ import type {
   ConvertWatchToQueueResponse,
   // Operations Types
   OperationsResponse,
+  // Performance Types
+  PerformanceResponse,
   // Scanner Types
   ScanProgressResponse,
   ScanResultsResponse,
@@ -1446,6 +1448,19 @@ class ApiClient {
   }
 
   /**
+   * Get paper-trading performance snapshot (realized P&L, cumulative return,
+   * win rate, daily series). `base`/`start`/`end` are optional overrides —
+   * the backend defaults base to the C1 operating baseline and the window to
+   * the last 30 days.
+   */
+  async getPerformance(params?: { base?: number; start?: string; end?: string }): Promise<PerformanceResponse> {
+    const response = await this.client.get<PerformanceResponse>('/trading/performance', {
+      params,
+    });
+    return response.data;
+  }
+
+  /**
    * Add a stock to watch list.
    */
   async addToWatchList(request: AddToWatchListRequest): Promise<AddToWatchListResponse> {
@@ -2060,6 +2075,10 @@ export const convertWatchToQueue = (request: ConvertWatchToQueueRequest) =>
 // Operations API
 export const getOperations = (market: 'kiwoom' | 'coin' = 'kiwoom') =>
   apiClient.getOperations(market);
+
+// Performance API
+export const getPerformance = (params?: { base?: number; start?: string; end?: string }) =>
+  apiClient.getPerformance(params);
 
 // Background Scanner API
 export const startScan = (request?: StartScanRequest) =>

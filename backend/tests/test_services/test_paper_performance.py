@@ -8,7 +8,12 @@ ka10074(get_realized_pnl)의 기간 실현손익 + 계좌 스냅샷으로 운용
 import pytest
 
 from services.kiwoom.models import DailyRealizedPnlRow, RealizedPnl
-from services.trading.paper_performance import build_performance_report
+from services.trading.paper_performance import (
+    build_performance_report,
+    compute_cumulative_return_pct,
+    compute_daily_win_loss,
+    daily_pnl_series,
+)
 
 
 def _pnl(daily, **totals):
@@ -89,3 +94,60 @@ class TestBuildPerformanceReport:
         assert "20260701" in text and "20260712" in text
         assert "50,000" in text
         assert "%" in text
+
+
+class TestComputeDailyWinLoss:
+    """/api/trading/performance의 pnl 섹션이 자산 스냅샷 없이도 독립적으로
+    쓰는 순수 헬퍼 — build_performance_report와 동일 로직을 공유한다."""
+
+    def test_counts_win_loss_flat(self):
+        daily = [
+            _row("20260706", sell_pnl=50_000),
+            _row("20260707", sell_pnl=-30_000),
+            _row("20260708", sell_pnl=0),
+            _row("20260709", sell_pnl=120_000),
+        ]
+        win, loss, flat, win_rate = compute_daily_win_loss(daily)
+        assert (win, loss, flat) == (2, 1, 1)
+        assert win_rate == pytest.approx(2 / 3 * 100)
+
+    def test_no_decided_days_returns_none_rate(self):
+        win, loss, flat, win_rate = compute_daily_win_loss([_row("20260706", sell_pnl=0)])
+        assert (win, loss, flat) == (0, 0, 1)
+        assert win_rate is None
+
+    def test_empty_daily_returns_zeros_and_none(self):
+        assert compute_daily_win_loss([]) == (0, 0, 0, None)
+
+
+class TestComputeCumulativeReturnPct:
+    def test_positive_return(self):
+        assert compute_cumulative_return_pct(510_000_000, 500_000_000) == pytest.approx(2.0)
+
+    def test_negative_return_sign_preserved(self):
+        assert compute_cumulative_return_pct(490_000_000, 500_000_000) == pytest.approx(-2.0)
+
+    def test_no_base_asset_is_none(self):
+        assert compute_cumulative_return_pct(500_000_000, None) is None
+
+    def test_zero_or_negative_base_asset_is_none(self):
+        assert compute_cumulative_return_pct(500_000_000, 0) is None
+        assert compute_cumulative_return_pct(500_000_000, -1) is None
+
+
+class TestDailyPnlSeries:
+    def test_running_cumulative_sum_preserves_sign(self):
+        daily = [
+            _row("20260706", sell_pnl=50_000),
+            _row("20260707", sell_pnl=-30_000),
+            _row("20260708", sell_pnl=120_000),
+        ]
+        points = daily_pnl_series(daily)
+        assert points == [
+            {"dt": "20260706", "pnl": 50_000, "cumulative_pnl": 50_000},
+            {"dt": "20260707", "pnl": -30_000, "cumulative_pnl": 20_000},
+            {"dt": "20260708", "pnl": 120_000, "cumulative_pnl": 140_000},
+        ]
+
+    def test_empty_daily_returns_empty_list(self):
+        assert daily_pnl_series([]) == []

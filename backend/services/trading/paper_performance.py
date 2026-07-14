@@ -8,11 +8,58 @@ ka10074 기간 실현손익(RealizedPnl)과 계좌 스냅샷으로 관찰 운용
 운용 중 필요해지면 ka10072/73으로 확장).
 """
 
-from typing import Optional
+from typing import Optional, TypedDict
 
 from pydantic import BaseModel, Field
 
-from services.kiwoom.models import RealizedPnl
+from services.kiwoom.models import DailyRealizedPnlRow, RealizedPnl
+
+
+class DailyPnlPoint(TypedDict):
+    """일별 손익 시계열 포인트 (차트 소비용, dt 오름차순 가정)."""
+
+    dt: str
+    pnl: int
+    cumulative_pnl: int
+
+
+def compute_daily_win_loss(
+    daily: list[DailyRealizedPnlRow],
+) -> tuple[int, int, int, Optional[float]]:
+    """일별 실현손익 승/패/보합 집계 + 일 단위 승률(%).
+
+    Returns (win_days, loss_days, flat_days, win_rate_pct). 승부(승+패)가
+    없으면 win_rate_pct는 None (0%가 아니라 미정).
+    """
+    win_days = sum(1 for d in daily if d.sell_pnl > 0)
+    loss_days = sum(1 for d in daily if d.sell_pnl < 0)
+    flat_days = sum(1 for d in daily if d.sell_pnl == 0)
+    decided = win_days + loss_days
+    win_rate_pct = (win_days / decided * 100.0) if decided else None
+    return win_days, loss_days, flat_days, win_rate_pct
+
+
+def compute_cumulative_return_pct(
+    current_asset: int, base_asset: Optional[int]
+) -> Optional[float]:
+    """기준 자산 대비 누적 수익률 %; 기준이 없거나 0/음수면 None."""
+    if base_asset is not None and base_asset > 0:
+        return (current_asset - base_asset) / base_asset * 100.0
+    return None
+
+
+def daily_pnl_series(daily: list[DailyRealizedPnlRow]) -> list[DailyPnlPoint]:
+    """일별 손익 + 누적 손익 시계열 (차트/API 소비용).
+
+    ka10074 dt_rlzt_pl은 일자 오름차순으로 온다고 가정 — 누적합은 그 순서를
+    그대로 따른다.
+    """
+    cumulative = 0
+    points: list[DailyPnlPoint] = []
+    for d in daily:
+        cumulative += d.sell_pnl
+        points.append({"dt": d.dt, "pnl": d.sell_pnl, "cumulative_pnl": cumulative})
+    return points
 
 
 class PerformanceReport(BaseModel):
@@ -77,14 +124,8 @@ def build_performance_report(
     base_asset: Optional[int],
 ) -> PerformanceReport:
     """RealizedPnl + 자산 스냅샷 → PerformanceReport (순수 함수)."""
-    win_days = sum(1 for d in pnl.daily if d.sell_pnl > 0)
-    loss_days = sum(1 for d in pnl.daily if d.sell_pnl < 0)
-    flat_days = sum(1 for d in pnl.daily if d.sell_pnl == 0)
-    decided = win_days + loss_days
-
-    cumulative_return_pct: Optional[float] = None
-    if base_asset is not None and base_asset > 0:
-        cumulative_return_pct = (current_asset - base_asset) / base_asset * 100.0
+    win_days, loss_days, flat_days, win_rate_pct = compute_daily_win_loss(pnl.daily)
+    cumulative_return_pct = compute_cumulative_return_pct(current_asset, base_asset)
 
     return PerformanceReport(
         strt_dt=pnl.strt_dt,
@@ -97,7 +138,7 @@ def build_performance_report(
         win_days=win_days,
         loss_days=loss_days,
         flat_days=flat_days,
-        win_rate_pct=(win_days / decided * 100.0) if decided else None,
+        win_rate_pct=win_rate_pct,
         current_asset=current_asset,
         base_asset=base_asset,
         cumulative_return_pct=cumulative_return_pct,
