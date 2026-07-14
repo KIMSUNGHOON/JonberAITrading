@@ -45,7 +45,12 @@ class TestBuildPerformanceReport:
                                           base_asset=500_000_000)
 
         assert report.realized_pnl_total == 140_000
-        assert report.net_pnl == 140_000 - 400 - 800
+        # P2-4 Task P3: ka10074's realized_pnl is ALREADY net of
+        # commission/tax (see build_performance_report's docstring for the
+        # official-docs evidence) — net_pnl must equal realized_pnl_total,
+        # NOT realized_pnl_total - commission - tax (that would be a
+        # double deduction).
+        assert report.net_pnl == 140_000
         assert report.trade_days == 4
         assert report.win_days == 2
         assert report.loss_days == 1
@@ -72,7 +77,8 @@ class TestBuildPerformanceReport:
         report = build_performance_report(pnl, current_asset=499_820_122,
                                           base_asset=500_000_000)
         assert report.realized_pnl_total == -163_958
-        assert report.net_pnl == -163_958 - 3_500 - 12_420
+        # Already net of commission/tax — see P2-4 P3 note above.
+        assert report.net_pnl == -163_958
         assert report.cumulative_return_pct < 0
 
     def test_empty_period_is_all_zero(self):
@@ -94,6 +100,83 @@ class TestBuildPerformanceReport:
         assert "20260701" in text and "20260712" in text
         assert "50,000" in text
         assert "%" in text
+
+
+class TestNetGrossSemantics:
+    """P2-4 Task P3 / audit §D 검증#5: ka10074 rlzt_pl(및 dt_rlzt_pl의
+    tdy_sel_pl)이 gross(비용 미차감)인지 net(이미 차감됨)인지 검증.
+
+    자기목 픽스처 금지(Paper-Proof Phase A 사고의 근본원인) — 숫자를
+    "정답에 맞춰" 지어내지 않는다. 대신 이 리포에 커밋된 **공식 Kiwoom
+    REST API 문서의 실제 예제 응답**을 그대로 쓴다:
+    `Kiwoom-REST-API/kiwoom_docs/계좌.md` 일자별종목별실현손익요청_기간
+    (ka10073, 216-272행) — ka10074와 동일한 "실현손익" 필드 계열
+    (tdy_sel_pl/tdy_trde_cmsn/tdy_trde_tax)을 공유하는 브로커 예제:
+
+        buy_uv=97602.96 (매입단가), cntr_pric=158200 (체결가),
+        cntr_qty=1 (체결량), tdy_sel_pl=59813.04 (당일매도손익),
+        tdy_trde_cmsn=500 (당일매매수수료), tdy_trde_tax=284 (당일매매세금)
+
+    검산: gross = (cntr_pric - buy_uv) * cntr_qty = 60,597.04
+          gross - (trde_cmsn + trde_tax) = 60,597.04 - 784 = 59,813.04
+          == tdy_sel_pl (정확히 일치 — 반올림 오차조차 없음)
+
+    이 산술이 "브로커가 이미 수수료·세금을 뺀 값을 실현손익으로 보고한다"는
+    유일하게 성립하는 해석이다(반대로 gross라면 59,813.04 + 784 =
+    60,597.04가 tdy_sel_pl이어야 하는데 그렇지 않다). 아래 테스트는 이
+    검증된 숫자를 RealizedPnl에 그대로 태워 build_performance_report를
+    통과시켜, 코드가 이중차감하지 않음을 고정한다.
+    """
+
+    def test_net_pnl_matches_verified_kiwoom_doc_example_no_double_deduction(self):
+        # 위 ka10073 공식 예제의 실제 숫자를 그대로 사용 (지어낸 값 아님) —
+        # 정수 원 단위로 반올림한다 (RealizedPnl/DailyRealizedPnlRow 필드는
+        # int이고, 실제 client._parse_change도 int()로 파싱한다; 예제 문서의
+        # 소수점은 매입단가 평균원가 계산상의 예시적 표기일 뿐, 반올림해도
+        # 검증하려는 gross/net 관계는 그대로 성립한다 — 아래 두 번째 테스트가
+        # 원본 소수 산술로 그 근거 자체를 별도로 고정한다).
+        tdy_sel_pl = round(59_813.04)
+        tdy_trde_cmsn = 500
+        tdy_trde_tax = 284
+
+        pnl = RealizedPnl(
+            strt_dt="20241128", end_dt="20241128",
+            total_buy_amount=0, total_sell_amount=158_200,
+            realized_pnl=tdy_sel_pl,
+            commission=tdy_trde_cmsn, tax=tdy_trde_tax,
+            daily=[
+                DailyRealizedPnlRow(
+                    dt="20241128", buy_amount=0, sell_amount=158_200,
+                    sell_pnl=tdy_sel_pl,
+                    commission=tdy_trde_cmsn, tax=tdy_trde_tax,
+                )
+            ],
+        )
+        report = build_performance_report(
+            pnl, current_asset=500_059_813, base_asset=500_000_000
+        )
+
+        # net_pnl == realized_pnl_total (already net) — NOT
+        # realized_pnl_total - commission - tax, which would double-deduct
+        # a cost the broker already subtracted.
+        assert report.net_pnl == pytest.approx(tdy_sel_pl)
+        assert report.net_pnl != pytest.approx(tdy_sel_pl - tdy_trde_cmsn - tdy_trde_tax)
+
+    def test_gross_reconstruction_confirms_broker_already_netted_cost(self):
+        """이 테스트는 build_performance_report를 검증하는 게 아니라, 위
+        docstring의 산술 근거 자체를 코드로 고정한다 (숫자가 바뀌면 이
+        테스트가 먼저 깨져 "근거가 stale해졌다"를 알려준다)."""
+        buy_uv = 97_602.96
+        cntr_pric = 158_200
+        cntr_qty = 1
+        tdy_sel_pl = 59_813.04
+        tdy_trde_cmsn = 500
+        tdy_trde_tax = 284
+
+        gross = (cntr_pric - buy_uv) * cntr_qty
+        net = gross - (tdy_trde_cmsn + tdy_trde_tax)
+
+        assert net == pytest.approx(tdy_sel_pl, abs=0.01)
 
 
 class TestComputeDailyWinLoss:

@@ -1011,7 +1011,7 @@ async def _execute_live_order(
                 "volume": float(quantity),
                 "executed_volume": executed_volume,
                 "fee": float(order.paid_fee) if order.paid_fee else 0,
-                "total_krw": exec_price * executed_volume if executed_volume else exec_price * quantity,
+                "total_krw": exec_price * executed_volume,
                 "state": order.state,
                 "order_uuid": order.uuid,
             })
@@ -1020,11 +1020,24 @@ async def _execute_live_order(
             # reduce/close it for SELL orders using the actually-executed
             # quantity (P2-4 Task P0 fix — see `_close_or_reduce_coin_position`;
             # this branch previously did nothing for SELL at all).
-            if side == "bid" and order.state in ("done", "wait"):
+            #
+            # P2-4 Task P3 fix: the BUY branch used to fall back to the
+            # REQUESTED `quantity` whenever `executed_volume` was falsy
+            # (`executed_volume if executed_volume else float(quantity)`).
+            # Since a `"wait"` (still open/unfilled) order reports
+            # `executed_volume == 0`, that fallback recorded a 0%-filled
+            # order as if it had fully filled the requested amount —
+            # inflating/creating a position that was never actually
+            # bought. Now gated strictly on `executed_volume > 0` and
+            # using the ACTUAL executed volume verbatim, mirroring the
+            # honest-fill discipline the SELL branch already had (below,
+            # since P0). A truly 0-filled order creates no position at
+            # all; a partial fill records the real filled quantity.
+            if side == "bid" and order.state in ("done", "wait") and executed_volume > 0:
                 await storage.save_coin_position({
                     "market": market,
                     "currency": currency,
-                    "quantity": executed_volume if executed_volume else float(quantity),
+                    "quantity": executed_volume,
                     "avg_entry_price": exec_price,
                     "stop_loss": proposal.get("stop_loss"),
                     "take_profit": proposal.get("take_profit"),

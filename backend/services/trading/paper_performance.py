@@ -86,9 +86,18 @@ class PerformanceReport(BaseModel):
     strt_dt: str = Field(..., description="기간 시작 (YYYYMMDD)")
     end_dt: str = Field(..., description="기간 종료 (YYYYMMDD)")
     realized_pnl_total: int = Field(..., description="기간 실현손익 (부호 보존)")
-    commission: int = Field(..., description="기간 매매수수료")
-    tax: int = Field(..., description="기간 매매세금")
-    net_pnl: int = Field(..., description="비용 차감 순손익")
+    commission: int = Field(..., description="기간 매매수수료 (참고용 비용 내역 — 이미 realized_pnl_total에 반영됨, 아래 참조)")
+    tax: int = Field(..., description="기간 매매세금 (참고용 비용 내역 — 이미 realized_pnl_total에 반영됨, 아래 참조)")
+    net_pnl: int = Field(
+        ...,
+        description=(
+            "순손익. P2-4 §D 검증#5 (2026-07-14): ka10074 rlzt_pl(및 "
+            "dt_rlzt_pl의 tdy_sel_pl)은 이미 수수료·세금이 차감된 NET "
+            "값이다 — realized_pnl_total을 그대로 쓴다. commission/tax를 "
+            "다시 빼면 이중차감(과소평가)이 된다. 근거는 build_performance_report "
+            "docstring 참조."
+        ),
+    )
     trade_days: int = Field(..., description="매매 발생 일수")
     win_days: int = Field(..., description="수익 일수")
     loss_days: int = Field(..., description="손실 일수")
@@ -141,7 +150,31 @@ def build_performance_report(
     current_asset: int,
     base_asset: Optional[int],
 ) -> PerformanceReport:
-    """RealizedPnl + 자산 스냅샷 → PerformanceReport (순수 함수)."""
+    """RealizedPnl + 자산 스냅샷 → PerformanceReport (순수 함수).
+
+    P2-4 Task P3 (2026-07-14) — net/gross 검증 결과, ka10074 rlzt_pl은
+    이미 수수료·세금이 차감된 NET 값이다. `net_pnl`을
+    `realized_pnl - commission - tax`로 계산하던 이전 코드는 이미
+    net인 값을 다시 한번 차감하는 **이중차감(과소평가)** 버그였다 —
+    coin의 낙관(과대평가) 버그들과 반대 방향이지만 "수익률 신뢰"에는
+    똑같이 치명적이다.
+
+    근거 (자기목 픽스처 아님 — 공식 Kiwoom REST API 문서의 실제 예제
+    응답): `Kiwoom-REST-API/kiwoom_docs/계좌.md`의
+    일자별종목별실현손익요청_기간 (ka10073, ka10074와 같은
+    "실현손익" 필드 계열 — tdy_sel_pl/tdy_trde_cmsn/tdy_trde_tax를
+    공유) 응답 예제(해당 파일 216-272행):
+        buy_uv=97602.96, cntr_pric=158200, cntr_qty=1,
+        tdy_sel_pl=59813.04, tdy_trde_cmsn=500, tdy_trde_tax=284
+    검산: gross = (cntr_pric - buy_uv) * cntr_qty = 60597.04
+          gross - (trde_cmsn + trde_tax) = 60597.04 - 784 = 59813.04
+          == tdy_sel_pl (정확히 일치, 반올림 오차 없음)
+    즉 브로커가 이미 수수료·세금을 뺀 값을 "실현손익"으로 보고한다.
+    ka10074의 dt_rlzt_pl.tdy_sel_pl은 ka10073과 동일한 필드명·의미이므로
+    (같은 브로커의 같은 "실현손익" TR 계열), 상위 합계 rlzt_pl도 동일
+    관례를 따른다고 보는 것이 합리적이다. 회귀 테스트:
+    test_paper_performance.py::TestNetGrossSemantics 참조.
+    """
     win_days, loss_days, flat_days, win_rate_pct = compute_daily_win_loss(pnl.daily)
     cumulative_return_pct = compute_cumulative_return_pct(current_asset, base_asset)
 
@@ -151,7 +184,9 @@ def build_performance_report(
         realized_pnl_total=pnl.realized_pnl,
         commission=pnl.commission,
         tax=pnl.tax,
-        net_pnl=pnl.realized_pnl - pnl.commission - pnl.tax,
+        # realized_pnl (ka10074 rlzt_pl)은 이미 NET이므로 그대로 사용.
+        # commission/tax를 여기서 다시 빼면 이중차감이 된다 (위 docstring 근거).
+        net_pnl=pnl.realized_pnl,
         trade_days=len(pnl.daily),
         win_days=win_days,
         loss_days=loss_days,
