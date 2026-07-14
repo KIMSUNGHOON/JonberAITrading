@@ -4,17 +4,28 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 const getOperations = vi.fn();
 const submitApproval = vi.fn().mockResolvedValue({});
 const cancelKRStockOrder = vi.fn().mockResolvedValue({});
+const cancelQueuedTrade = vi.fn().mockResolvedValue({});
+const processTradeQueue = vi.fn().mockResolvedValue({});
 vi.mock('@/api/client', () => ({
   getOperations: (...a: unknown[]) => getOperations(...a),
   submitApproval: (...a: unknown[]) => submitApproval(...a),
   cancelKRStockSession: vi.fn(),
   convertWatchToQueue: vi.fn(),
   removeFromWatchList: vi.fn(),
-  dismissTrade: vi.fn(),
   cancelKRStockOrder: (...a: unknown[]) => cancelKRStockOrder(...a),
+  cancelQueuedTrade: (...a: unknown[]) => cancelQueuedTrade(...a),
+  processTradeQueue: (...a: unknown[]) => processTradeQueue(...a),
 }));
 vi.mock('@/hooks/useTradeNotifications', () => ({
   useTradeNotifications: () => ({ isConnected: true, notifications: [] }),
+}));
+// Task 8b: WatchingColumn's re-analyze backport uses the SAME shared
+// "start an analysis" hook DiscoverySection uses (wraps startKRStockAnalysis
+// + session bookkeeping/WS wiring) rather than reimplementing it — mocked
+// the same way DiscoverySection.test.tsx / FunnelPanel.test.tsx do.
+const mockStartAnalysis = vi.fn();
+vi.mock('@/hooks/useStartAnalysis', () => ({
+  useStartAnalysis: () => mockStartAnalysis,
 }));
 const navigate = vi.fn();
 vi.mock('react-router-dom', () => ({ useNavigate: () => navigate }));
@@ -200,4 +211,90 @@ it('미체결 취소 버튼이 cancelKRStockOrder를 호출하고 재조회한�
   fireEvent.click(screen.getByRole('button', { name: '주문 취소' }));
   await waitFor(() => expect(cancelKRStockOrder).toHaveBeenCalledWith('o9'));
   expect(getOperations.mock.calls.length).toBeGreaterThanOrEqual(2); // 액션 후 재조회
+});
+
+// -------------------------------------------
+// Task 8b (P2 funnel-consolidation, final): actions backported from the
+// removed /trading WatchListWidget/TradeQueueWidget.
+// -------------------------------------------
+
+it('감시 항목의 재분석 버튼이 useStartAnalysis의 start를 kiwoom/티커로 호출하고 새 세션의 워크플로우로 이동한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    watching: [{
+      id: 'watch-1', ticker: '005930', stock_name: '삼성전자',
+      current_price: 71000, target_entry_price: 70000, confidence: 0.75, status: 'active',
+    }],
+  });
+  mockStartAnalysis.mockResolvedValue('session-42');
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: '재분석 005930' }));
+  await waitFor(() => expect(mockStartAnalysis).toHaveBeenCalledWith('kiwoom', '005930', '삼성전자'));
+  await waitFor(() => expect(navigate).toHaveBeenCalledWith('/workflow/session-42'));
+});
+
+it('재분석 실패 시 액션 오류 배너를 표시하고 이동하지 않는다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    watching: [{
+      id: 'watch-1', ticker: '005930', stock_name: '삼성전자',
+      current_price: 71000, target_entry_price: 70000, confidence: 0.75, status: 'active',
+    }],
+  });
+  mockStartAnalysis.mockRejectedValue(new Error('세션 한도 초과'));
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: '재분석 005930' }));
+  await screen.findByText(/재분석 실패: 세션 한도 초과/);
+  expect(navigate).not.toHaveBeenCalledWith(expect.stringContaining('/workflow/'));
+});
+
+it('매수대기 큐 항목의 대기 취소 버튼이 cancelQueuedTrade를 호출한다 (dismissTrade 아님 — 대기 상태 취소만 처리)', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    pending_buy: {
+      queue: [{ id: 'q1', session_id: 's3', ticker: '005930',
+                stock_name: '삼성전자', action: 'BUY', entry_price: 260000,
+                quantity: 10, status: 'pending' }],
+      open_orders: [],
+    },
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/매수대기 · 1/)).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: '대기 취소' }));
+  await waitFor(() => expect(cancelQueuedTrade).toHaveBeenCalledWith('q1'));
+  expect(getOperations.mock.calls.length).toBeGreaterThanOrEqual(2); // 액션 후 재조회
+});
+
+it('큐에 대기 항목이 있으면 Process 버튼이 나타나고 클릭 시 processTradeQueue를 호출한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    pending_buy: {
+      queue: [{ id: 'q2', session_id: 's4', ticker: '005930',
+                stock_name: '삼성전자', action: 'BUY', entry_price: 260000,
+                quantity: 10, status: 'pending' }],
+      open_orders: [],
+    },
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/매수대기 · 1/)).toBeInTheDocument());
+  fireEvent.click(screen.getByRole('button', { name: 'Process' }));
+  await waitFor(() => expect(processTradeQueue).toHaveBeenCalled());
+});
+
+it('큐가 비어있으면 Process 버튼을 렌더하지 않는다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    pending_buy: {
+      queue: [],
+      open_orders: [{ order_id: 'o10', stk_cd: '005930', stk_nm: '삼성전자',
+                      side: 'buy', price: 260000, quantity: 48,
+                      remaining_quantity: 48, executed_quantity: 0,
+                      created_at: null }],
+    },
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText(/매수대기 · 1/)).toBeInTheDocument());
+  expect(screen.queryByRole('button', { name: 'Process' })).not.toBeInTheDocument();
 });

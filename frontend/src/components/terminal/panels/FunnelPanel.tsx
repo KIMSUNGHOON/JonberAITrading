@@ -31,6 +31,13 @@
  * see OperationsPanel.tsx's module doc and AwaitingColumn's doc comment. The
  * global OrderTicketRail is the one surface that calls submitApproval;
  * clicking a row here just focuses that session and navigates there.
+ *
+ * Task 8b (P2 funnel-consolidation, final): WATCHLIST's WatchingColumn now
+ * also carries re-analyze, and PIPELINE's PendingBuyColumn now also carries
+ * cancel-queued-trade + a manual "Process" queue-trigger — both backported
+ * from the standalone /trading widgets (WatchListWidget / TradeQueueWidget),
+ * which have been removed from the /trading route now that this funnel
+ * covers every action they provided.
  */
 import { useNavigate } from 'react-router-dom';
 import { DiscoverySection } from './DiscoverySection';
@@ -49,7 +56,7 @@ export function FunnelPanel() {
   const {
     actionError, setActionError,
     handleCancelAnalysis, handleFocusAwaiting, handleConvertWatch, handleRemoveWatch,
-    handleDismissQueue, handleCancelOrder,
+    handleReanalyzeWatch, handleCancelQueued, handleCancelOrder, handleProcessQueue,
   } = useOperationsActions(refetch, navigate);
 
   const market = activeMarket === 'coin' ? 'coin' : 'kiwoom';
@@ -95,6 +102,7 @@ export function FunnelPanel() {
               errors={data.errors}
               onConvert={handleConvertWatch}
               onRemove={handleRemoveWatch}
+              onReanalyze={handleReanalyzeWatch}
             />
           </div>
         )}
@@ -123,8 +131,9 @@ export function FunnelPanel() {
               pendingBuy={data.pending_buy}
               errors={data.errors}
               activeMarket={market}
-              onDismiss={handleDismissQueue}
+              onCancelQueued={handleCancelQueued}
               onCancelOrder={handleCancelOrder}
+              onProcessQueue={handleProcessQueue}
             />
             <HoldingColumn
               items={data.holding}

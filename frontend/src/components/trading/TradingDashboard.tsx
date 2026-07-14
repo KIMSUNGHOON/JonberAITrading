@@ -11,6 +11,15 @@
  *   3. 실행 계층 (Execution Coordinator) — 큐 → 게이트 재확인 → 브로커 주문
  *
  * 전략 위젯은 실제 배선(R5-P3) 전까지 UI에서 내렸다 — 통제감 착각 제거.
+ *
+ * P2 funnel-consolidation Task 8b: the "3행: 운용 데이터" row (WatchListWidget/
+ * TradeQueueWidget) has been removed — every action those two widgets
+ * offered (convert-to-queue, remove-from-watch, re-analyze, cancel-queued,
+ * manual queue-process) now lives in the dashboard funnel's WATCHLIST/
+ * PIPELINE sections (see OperationsPanel.tsx's WatchingColumn/
+ * PendingBuyColumn + FunnelPanel.tsx), which poll the SAME `/operations`
+ * source instead of running two more independent polls. This screen is now
+ * purely the three control switches + safety gate summary.
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -37,8 +46,6 @@ import {
 } from '@/api/client';
 import { useStore } from '@/store';
 import { TradingModeSection } from '@/components/settings/TradingModeSection';
-import TradeQueueWidget from './TradeQueueWidget';
-import WatchListWidget from './WatchListWidget';
 import type { AgentChatCoordinatorStatus } from '@/types';
 
 interface ExecutionStatus {
@@ -324,12 +331,6 @@ export default function TradingDashboard() {
               고정되어 있습니다. 자율 승인 전 60초 유예 동안 홈 ORDER 레일에서
               거부할 수 있습니다.
             </p>
-          </div>
-
-          {/* 3행: 운용 데이터 */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 items-start">
-            <WatchListWidget />
-            <TradeQueueWidget />
           </div>
         </div>
       </div>

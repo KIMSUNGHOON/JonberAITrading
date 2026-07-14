@@ -31,8 +31,10 @@ const submitApproval = vi.fn().mockResolvedValue({});
 const cancelKRStockSession = vi.fn().mockResolvedValue({});
 const convertWatchToQueue = vi.fn().mockResolvedValue({});
 const removeFromWatchList = vi.fn().mockResolvedValue({});
-const dismissTrade = vi.fn().mockResolvedValue({});
 const cancelKRStockOrder = vi.fn().mockResolvedValue({});
+// Task 8b: backported from the removed /trading TradeQueueWidget.
+const cancelQueuedTrade = vi.fn().mockResolvedValue({});
+const processTradeQueue = vi.fn().mockResolvedValue({});
 
 vi.mock('@/api/client', () => ({
   startScan: (...a: unknown[]) => startScan(...a),
@@ -48,8 +50,9 @@ vi.mock('@/api/client', () => ({
   cancelKRStockSession: (...a: unknown[]) => cancelKRStockSession(...a),
   convertWatchToQueue: (...a: unknown[]) => convertWatchToQueue(...a),
   removeFromWatchList: (...a: unknown[]) => removeFromWatchList(...a),
-  dismissTrade: (...a: unknown[]) => dismissTrade(...a),
   cancelKRStockOrder: (...a: unknown[]) => cancelKRStockOrder(...a),
+  cancelQueuedTrade: (...a: unknown[]) => cancelQueuedTrade(...a),
+  processTradeQueue: (...a: unknown[]) => processTradeQueue(...a),
 }));
 
 const mockStart = vi.fn();
@@ -142,6 +145,25 @@ describe('FunnelPanel — WATCHLIST section (server SSOT)', () => {
     expect(screen.getByText(/82%/)).toBeInTheDocument();
     expect(screen.getByText(/ACTIVE/)).toBeInTheDocument();
   });
+
+  // Task 8b: backported from the removed /trading WatchListWidget — verifies
+  // the action is reachable from FunnelPanel too (shared WatchingColumn),
+  // not just OperationsPanel.
+  it('[재분석] calls useStartAnalysis\'s start with kiwoom/ticker/name and navigates to the new session', async () => {
+    getOperations.mockResolvedValue({
+      ...OPERATIONS_BASE,
+      watching: [{
+        id: 'watch-4', ticker: '005930', stock_name: '삼성전자',
+        current_price: 71000, target_entry_price: 70000, confidence: 0.75, status: 'active',
+      }],
+    });
+    mockStart.mockResolvedValue('session-99');
+    render(<FunnelPanel />);
+    await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /재분석.*005930/ }));
+    await waitFor(() => expect(mockStart).toHaveBeenCalledWith('kiwoom', '005930', '삼성전자'));
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/workflow/session-99'));
+  });
 });
 
 describe('FunnelPanel — actionError banner (panel-level, T5 review MEDIUM fix)', () => {
@@ -230,5 +252,40 @@ describe('FunnelPanel — PIPELINE section (honest-degrade preserved)', () => {
     fireEvent.click(screen.getByText('SK하이닉스'));
     expect(navigate).toHaveBeenCalledWith('/workflow/s2');
     expect(submitApproval).not.toHaveBeenCalled();
+  });
+
+  // Task 8b: backported from the removed /trading TradeQueueWidget —
+  // verifies both actions are reachable from FunnelPanel too (shared
+  // PendingBuyColumn), not just OperationsPanel.
+  it('[대기 취소] calls cancelQueuedTrade with the queue id of the pending trade', async () => {
+    getOperations.mockResolvedValue({
+      ...OPERATIONS_BASE,
+      pending_buy: {
+        queue: [{ id: 'q1', session_id: 's3', ticker: '005930',
+                  stock_name: '삼성전자', action: 'BUY', entry_price: 260000,
+                  quantity: 10, status: 'pending' }],
+        open_orders: [],
+      },
+    });
+    render(<FunnelPanel />);
+    await waitFor(() => expect(screen.getByText(/매수대기 · 1/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: '대기 취소' }));
+    await waitFor(() => expect(cancelQueuedTrade).toHaveBeenCalledWith('q1'));
+  });
+
+  it('[Process] appears when the queue has a pending trade and calls processTradeQueue', async () => {
+    getOperations.mockResolvedValue({
+      ...OPERATIONS_BASE,
+      pending_buy: {
+        queue: [{ id: 'q2', session_id: 's4', ticker: '005930',
+                  stock_name: '삼성전자', action: 'BUY', entry_price: 260000,
+                  quantity: 10, status: 'pending' }],
+        open_orders: [],
+      },
+    });
+    render(<FunnelPanel />);
+    await waitFor(() => expect(screen.getByText(/매수대기 · 1/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Process' }));
+    await waitFor(() => expect(processTradeQueue).toHaveBeenCalled());
   });
 });

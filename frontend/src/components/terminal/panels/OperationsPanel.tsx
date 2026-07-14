@@ -14,15 +14,24 @@
  * OrderTicketRail (frontend/src/components/terminal/OrderTicketRail.tsx),
  * which is now the ONE surface that calls submitApproval. Previously the
  * same pending approval was actionable from both places at once.
+ *
+ * Task 8b (P2 funnel-consolidation, final): WatchingColumn and
+ * PendingBuyColumn now carry the re-analyze / cancel-queued-trade / manual
+ * queue-process actions that used to live ONLY on the standalone /trading
+ * widgets (WatchListWidget / TradeQueueWidget). Those two widgets have been
+ * removed from the /trading route — this board (and FunnelPanel, which
+ * reuses these same columns) is now the single place both actions are
+ * reachable from.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStore } from '@/store';
 import {
   getOperations, cancelKRStockSession, convertWatchToQueue,
-  removeFromWatchList, dismissTrade, cancelKRStockOrder,
+  removeFromWatchList, cancelKRStockOrder, cancelQueuedTrade, processTradeQueue,
 } from '@/api/client';
 import { useTradeNotifications } from '@/hooks/useTradeNotifications';
+import { useStartAnalysis } from '@/hooks/useStartAnalysis';
 import type { OperationsResponse } from '@/types';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
@@ -243,12 +252,14 @@ const WATCH_STATUS_LABEL: Record<string, string> = {
 };
 
 export function WatchingColumn({
-  items, errors, onConvert, onRemove,
+  items, errors, onConvert, onRemove, onReanalyze,
 }: {
   items: OperationsResponse['watching'];
   errors: Record<string, string>;
   onConvert: (watchId: string) => void;
   onRemove: (watchId: string) => void;
+  /** Task 8b: backported from the /trading WatchListWidget's re-analyze button. */
+  onReanalyze: (ticker: string, name: string) => void;
 }) {
   if (!columnVisible(items, 'watching', errors)) return null;
   return (
@@ -288,6 +299,14 @@ export function WatchingColumn({
               </button>
               <button
                 type="button"
+                onClick={() => onReanalyze(ticker, name)}
+                aria-label={`재분석 ${ticker}`}
+                className="text-accent font-medium"
+              >
+                재분석
+              </button>
+              <button
+                type="button"
                 onClick={() => onRemove(id)}
                 aria-label={`제거 ${ticker}`}
                 className="text-dim hover:text-down font-medium"
@@ -307,13 +326,24 @@ export function WatchingColumn({
 // -------------------------------------------
 
 export function PendingBuyColumn({
-  pendingBuy, errors, activeMarket, onDismiss, onCancelOrder,
+  pendingBuy, errors, activeMarket, onCancelQueued, onCancelOrder, onProcessQueue,
 }: {
   pendingBuy: OperationsResponse['pending_buy'];
   errors: Record<string, string>;
   activeMarket: 'kiwoom' | 'coin';
-  onDismiss: (queueId: string) => void;
+  /**
+   * Task 8b: backported from the /trading TradeQueueWidget — cancels a
+   * PENDING queued trade (DELETE /trading/queue/{id}). Distinct from
+   * `onCancelOrder` below, which cancels an already-placed broker order.
+   */
+  onCancelQueued: (queueId: string) => void;
   onCancelOrder: (orderId: string) => void;
+  /**
+   * Task 8b: backported from the /trading TradeQueueWidget's manual
+   * "Process" button (POST /trading/queue/process) — forces queue
+   * processing instead of waiting for the next scheduled market-open tick.
+   */
+  onProcessQueue: () => void;
 }) {
   const { queue, open_orders: openOrders } = pendingBuy;
   const queueVisible = columnVisible(queue, 'queue', errors);
@@ -329,10 +359,20 @@ export function PendingBuyColumn({
   return (
     <div className={COLUMN_WRAP}>
       <div
-        className="text-[10px] text-muted font-semibold tracking-wide px-2.5 py-1.5 border-b border-hairline sticky top-0 bg-card flex-none"
+        className="flex items-center justify-between gap-2 text-[10px] text-muted font-semibold tracking-wide px-2.5 py-1.5 border-b border-hairline sticky top-0 bg-card flex-none"
         title={anyFailed ? failReason : undefined}
       >
-        {anyFailed ? <span className="text-down">매수대기 · 조회 실패</span> : `매수대기 · ${count}`}
+        <span>{anyFailed ? <span className="text-down">매수대기 · 조회 실패</span> : `매수대기 · ${count}`}</span>
+        {!queueFailed && (queue?.length ?? 0) > 0 && (
+          <button
+            type="button"
+            onClick={onProcessQueue}
+            title="큐를 즉시 처리합니다 (다음 장 개시를 기다리지 않음)"
+            className="text-accent font-medium normal-case tracking-normal"
+          >
+            Process
+          </button>
+        )}
       </div>
       {(queue ?? []).map((raw, i) => {
         const q = raw as Record<string, unknown>;
@@ -351,7 +391,7 @@ export function PendingBuyColumn({
             <div className="text-muted">
               {action ?? DASH} {fmtInt(quantity)}주 @{fmtPrice(entry, activeMarket)}
             </div>
-            <button type="button" onClick={() => onDismiss(id)} className="text-dim hover:text-down font-medium mt-1">
+            <button type="button" onClick={() => onCancelQueued(id)} className="text-dim hover:text-down font-medium mt-1">
               대기 취소
             </button>
           </div>
@@ -454,18 +494,26 @@ export function TodayFillsColumn({
 // -------------------------------------------
 // Shared action handlers — exported so FunnelPanel's WATCHLIST + PIPELINE
 // sections dispatch the exact same mutations (convertWatchToQueue/
-// removeFromWatchList/dismissTrade/cancelKRStockOrder/cancelKRStockSession)
-// against the ONE `refetch` from `useOperations()`, instead of re-deriving
-// the wiring. `submitApproval` is deliberately NOT called from here (Task 7,
-// P2 funnel-consolidation) — approve/reject/cancel of an awaiting proposal is
+// removeFromWatchList/cancelQueuedTrade/processTradeQueue/cancelKRStockOrder/
+// cancelKRStockSession/startKRStockAnalysis-via-useStartAnalysis) against the
+// ONE `refetch` from `useOperations()`, instead of re-deriving the wiring.
+// `submitApproval` is deliberately NOT called from here (Task 7, P2
+// funnel-consolidation) — approve/reject/cancel of an awaiting proposal is
 // handled EXCLUSIVELY by the global OrderTicketRail now; `handleFocusAwaiting`
 // below only navigates the user there instead of duplicating the decision.
+//
+// Task 8b: `handleReanalyzeWatch`/`handleCancelQueued`/`handleProcessQueue`
+// are backported from the now-removed /trading WatchListWidget/
+// TradeQueueWidget — same client fns those widgets called
+// (startKRStockAnalysis via useStartAnalysis, cancelQueuedTrade,
+// processTradeQueue), just dispatched from the shared columns instead.
 // -------------------------------------------
 
 export function useOperationsActions(refetch: () => void, navigate: (path: string) => void) {
   const activeMarket = useStore((s) => s.activeMarket);
   const setActiveKiwoomSession = useStore((s) => s.setActiveKiwoomSession);
   const setAwaitingApproval = useStore((s) => s.setAwaitingApproval);
+  const startAnalysis = useStartAnalysis();
   const [actionError, setActionError] = useState<string | null>(null);
 
   const handleCancelAnalysis = useCallback(async (sessionId: string) => {
@@ -519,9 +567,32 @@ export function useOperationsActions(refetch: () => void, navigate: (path: strin
     }
   }, [refetch]);
 
-  const handleDismissQueue = useCallback(async (queueId: string) => {
+  // Task 8b: backported from WatchListWidget.handleReanalyze — starts a
+  // fresh analysis session for an already-watched ticker and navigates
+  // there, via the SAME shared `useStartAnalysis` hook DiscoverySection uses
+  // (wraps startKRStockAnalysis + multi-session bookkeeping/WS wiring)
+  // rather than reimplementing the widget's older, WS-less store call.
+  const handleReanalyzeWatch = useCallback(async (ticker: string, name: string) => {
     try {
-      await dismissTrade(queueId);
+      const sessionId = await startAnalysis('kiwoom', ticker, name);
+      setActionError(null);
+      if (sessionId) navigate(`/workflow/${sessionId}`);
+    } catch (e) {
+      setActionError(`재분석 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
+    }
+  }, [startAnalysis, navigate]);
+
+  // Task 8b: backported from TradeQueueWidget.handleCancel — cancels a
+  // PENDING queued trade. NOTE: this replaces a prior wiring of this same
+  // "대기 취소" button to `dismissTrade` (DELETE /queue/{id}/dismiss), which
+  // only succeeds for trades NOT pending/processing — but the queue items
+  // rendered here (`data.pending_buy.queue`) are, by construction
+  // (coordinator.get_trade_queue() default), ALWAYS pending/processing. That
+  // wiring could never succeed; `cancelQueuedTrade` (DELETE /queue/{id}) is
+  // the endpoint that actually works for an active queued trade.
+  const handleCancelQueued = useCallback(async (queueId: string) => {
+    try {
+      await cancelQueuedTrade(queueId);
       setActionError(null);
     } catch (e) {
       setActionError(`대기 취소 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
@@ -541,10 +612,24 @@ export function useOperationsActions(refetch: () => void, navigate: (path: strin
     }
   }, [refetch]);
 
+  // Task 8b: backported from TradeQueueWidget.handleProcess — manually
+  // triggers queue processing instead of waiting for the scheduled
+  // market-open tick.
+  const handleProcessQueue = useCallback(async () => {
+    try {
+      await processTradeQueue();
+      setActionError(null);
+    } catch (e) {
+      setActionError(`대기열 처리 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
+    } finally {
+      refetch();
+    }
+  }, [refetch]);
+
   return {
     actionError, setActionError,
     handleCancelAnalysis, handleFocusAwaiting, handleConvertWatch, handleRemoveWatch,
-    handleDismissQueue, handleCancelOrder,
+    handleReanalyzeWatch, handleCancelQueued, handleCancelOrder, handleProcessQueue,
   };
 }
 
@@ -558,7 +643,7 @@ export function OperationsPanel() {
   const {
     actionError, setActionError,
     handleCancelAnalysis, handleFocusAwaiting, handleConvertWatch, handleRemoveWatch,
-    handleDismissQueue, handleCancelOrder,
+    handleReanalyzeWatch, handleCancelQueued, handleCancelOrder, handleProcessQueue,
   } = useOperationsActions(refetch, navigate);
 
   if (state === 'loading') return <Awaiting label="운용 현황 로드 중…" />;
@@ -600,13 +685,15 @@ export function OperationsPanel() {
           errors={data.errors}
           onConvert={handleConvertWatch}
           onRemove={handleRemoveWatch}
+          onReanalyze={handleReanalyzeWatch}
         />
         <PendingBuyColumn
           pendingBuy={data.pending_buy}
           errors={data.errors}
           activeMarket={market}
-          onDismiss={handleDismissQueue}
+          onCancelQueued={handleCancelQueued}
           onCancelOrder={handleCancelOrder}
+          onProcessQueue={handleProcessQueue}
         />
         <HoldingColumn
           items={data.holding}

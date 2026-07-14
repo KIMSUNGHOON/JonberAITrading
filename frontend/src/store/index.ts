@@ -213,8 +213,10 @@ interface UIState {
 // Basket (user-facing label: "Scratchpad", P2-T3) Types
 //
 // "Watchlist" is reserved for the SERVER watch-list (WATCH decisions /
-// scanner promotions — see OperationsPanel's "감시" column + /trading's
-// WatchListWidget). This client-side research-staging slice keeps its
+// scanner promotions — see OperationsPanel's "감시" column, reused by
+// FunnelPanel's WATCHLIST section; the standalone /trading WatchListWidget
+// was removed in P2 funnel-consolidation Task 8b once its actions were
+// backported there). This client-side research-staging slice keeps its
 // internal `basket` identifiers (type/action names, persist key) as-is to
 // minimize blast radius; only user-facing labels changed.
 // -------------------------------------------

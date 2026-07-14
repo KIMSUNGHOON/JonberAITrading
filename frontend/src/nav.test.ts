@@ -33,9 +33,11 @@ describe('nav map', () => {
       expect(watchlistItem).toBeDefined();
       expect(watchlistItem?.view).not.toBe('basket');
       expect(viewToPath(watchlistItem!.view)).not.toBe('/watchlist');
-      // Today the server watch-list lives on /trading (WatchListWidget),
-      // disambiguated from the 'trading' (Auto-trade) entry by a query param.
-      expect(viewToPath('watchlist')).toBe('/trading?tab=watchlist');
+      // P2 funnel-consolidation Task 8b: the server watch-list now lives in
+      // the dashboard funnel's WATCHLIST section (the /trading WatchListWidget
+      // was removed once its actions were backported there), disambiguated
+      // from a plain dashboard visit by a query param.
+      expect(viewToPath('watchlist')).toBe('/?tab=watchlist');
     });
 
     it('no nav entry is labeled "Basket" anymore', () => {
@@ -43,23 +45,30 @@ describe('nav map', () => {
     });
   });
 
-  // P2-T5: 'trading' and 'watchlist' both route to /trading — before this fix
-  // pathToView('/trading') always resolved to 'trading', so the Watchlist nav
-  // icon could never highlight even when its own link was the one clicked.
-  describe('nav-highlight fix for the shared /trading path (P2-T5)', () => {
-    it('resolves plain /trading to the "trading" (Auto-trade) view', () => {
-      expect(pathToView('/trading')).toBe('trading');
-      expect(pathToView('/trading', '')).toBe('trading');
+  // P2-T5 (originally for /trading; re-pointed at '/' by Task 8b once the
+  // /trading WatchListWidget was removed): 'dashboard' and 'watchlist' both
+  // route to '/' — without the query-param disambiguation, pathToView('/')
+  // would always resolve to 'dashboard', so the Watchlist nav icon could
+  // never highlight even when its own link was the one clicked.
+  describe('nav-highlight fix for the shared / path (P2-T5, P2-T8b)', () => {
+    it('resolves plain / to the "dashboard" view', () => {
+      expect(pathToView('/')).toBe('dashboard');
+      expect(pathToView('/', '')).toBe('dashboard');
     });
 
-    it('resolves /trading?tab=watchlist to the "watchlist" view', () => {
-      expect(pathToView('/trading', '?tab=watchlist')).toBe('watchlist');
+    it('resolves /?tab=watchlist to the "watchlist" view', () => {
+      expect(pathToView('/', '?tab=watchlist')).toBe('watchlist');
     });
 
     it('round-trips: viewToPath("watchlist") resolves back to "watchlist" via pathToView', () => {
       const path = viewToPath('watchlist');
       const [pathname, search] = path.split('?');
       expect(pathToView(pathname, search ? `?${search}` : '')).toBe('watchlist');
+    });
+
+    it('resolves plain /trading to the "trading" (Auto-trade) view (no longer shares a path with watchlist)', () => {
+      expect(pathToView('/trading')).toBe('trading');
+      expect(pathToView('/trading', '?tab=watchlist')).toBe('trading');
     });
   });
 });
