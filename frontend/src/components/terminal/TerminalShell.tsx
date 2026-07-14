@@ -17,6 +17,7 @@ import { CommandPalette } from './CommandPalette';
 import { OrderTicketRail } from './OrderTicketRail';
 import { NotificationBell } from './NotificationBell';
 import { LoopLivenessChip } from './LoopLivenessChip';
+import { ScannerLivenessChip } from './ScannerLivenessChip';
 
 // Icon lookup for the nav rail — preserves the exact icon choices from the
 // pre-router NAV array. Keyed by ViewKey; only the views present in
@@ -147,6 +148,7 @@ export function TerminalShell() {
           </span>
         )}
         <LoopLivenessChip />
+        <ScannerLivenessChip />
         <span className="text-accent">P&amp;L GRN-UP</span>
         <span>WS 1/1</span>
         <span className="ml-auto text-dim">⌘K command · j/k rows · :help</span>
