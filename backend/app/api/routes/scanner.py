@@ -32,6 +32,13 @@ class StartScanRequest(BaseModel):
     use_llm: bool = False  # Use LLM for analysis (slower but more accurate)
     auto_gpu_scaling: bool = True  # Automatically adjust concurrency based on GPU memory
 
+    # Watch-list auto-promotion (P1-5). OFF by default — must be explicitly
+    # enabled so a scan never silently starts feeding the autonomous watch
+    # monitor/queue-conversion pipeline. See BackgroundScanner.start_scan.
+    auto_promote_enabled: bool = False
+    promote_confidence_threshold: float = 0.7
+    promote_max_count: int = 10
+
 
 class ScanProgressResponse(BaseModel):
     """Scan progress response"""
@@ -129,6 +136,11 @@ async def start_scan(request: Optional[StartScanRequest] = None):
         # Extract parameters with defaults
         use_llm = request.use_llm if request else False
         auto_gpu_scaling = request.auto_gpu_scaling if request else True
+        auto_promote_enabled = request.auto_promote_enabled if request else False
+        promote_confidence_threshold = (
+            request.promote_confidence_threshold if request else 0.7
+        )
+        promote_max_count = request.promote_max_count if request else 10
 
         # Start scan
         await scanner.start_scan(
@@ -136,6 +148,9 @@ async def start_scan(request: Optional[StartScanRequest] = None):
             notify_progress=request.notify_progress if request else True,
             use_llm=use_llm,
             auto_gpu_scaling=auto_gpu_scaling,
+            auto_promote_enabled=auto_promote_enabled,
+            promote_confidence_threshold=promote_confidence_threshold,
+            promote_max_count=promote_max_count,
         )
 
         mode = "LLM 배치 분석" if use_llm else "기술적 지표 분석"
@@ -145,6 +160,9 @@ async def start_scan(request: Optional[StartScanRequest] = None):
             "total_stocks": scanner.get_progress().total_stocks,
             "mode": "llm" if use_llm else "quick",
             "auto_gpu_scaling": auto_gpu_scaling,
+            "auto_promote_enabled": auto_promote_enabled,
+            "promote_confidence_threshold": promote_confidence_threshold,
+            "promote_max_count": promote_max_count,
         }
 
     except HTTPException:

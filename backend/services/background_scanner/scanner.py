@@ -104,6 +104,15 @@ class BackgroundScanner:
     MAX_CONCURRENT_SCANS = 8  # Optimized for RTX 3090 24GB
     DEFAULT_CONCURRENT_SCANS = 3
 
+    # Watch-list auto-promotion defaults. Auto-promote is OFF by default —
+    # the scan pipeline previously dead-ended (results reached nowhere), but
+    # turning promotion on unconditionally would silently start feeding the
+    # autonomous watch monitor/queue-conversion path, so it stays an explicit
+    # opt-in (mirrors the AUTONOMY_ENABLED fail-closed default elsewhere).
+    DEFAULT_AUTO_PROMOTE_ENABLED = False
+    DEFAULT_PROMOTE_CONFIDENCE_THRESHOLD = 0.7
+    DEFAULT_PROMOTE_MAX_COUNT = 10
+
     def __init__(self):
         self._progress = ScanProgress()
         self._current_concurrency = self.DEFAULT_CONCURRENT_SCANS
@@ -116,6 +125,11 @@ class BackgroundScanner:
         self._db_initialized = False
         self._use_llm = False  # Whether to use LLM for analysis
         self._gpu_monitor = None
+
+        # Watch-list auto-promotion config (see start_scan args).
+        self._auto_promote_enabled = self.DEFAULT_AUTO_PROMOTE_ENABLED
+        self._promote_confidence_threshold = self.DEFAULT_PROMOTE_CONFIDENCE_THRESHOLD
+        self._promote_max_count = self.DEFAULT_PROMOTE_MAX_COUNT
 
     async def _init_db(self):
         """Initialize SQLite database for storing scan results."""
@@ -271,6 +285,9 @@ class BackgroundScanner:
         notify_progress: bool = True,
         use_llm: bool = False,
         auto_gpu_scaling: bool = True,
+        auto_promote_enabled: bool = DEFAULT_AUTO_PROMOTE_ENABLED,
+        promote_confidence_threshold: float = DEFAULT_PROMOTE_CONFIDENCE_THRESHOLD,
+        promote_max_count: int = DEFAULT_PROMOTE_MAX_COUNT,
     ):
         """
         Start background scanning of all stocks.
@@ -280,6 +297,12 @@ class BackgroundScanner:
             notify_progress: Whether to send Telegram notifications
             use_llm: Use LLM for analysis (slower but more accurate)
             auto_gpu_scaling: Automatically adjust concurrency based on GPU memory
+            auto_promote_enabled: Auto-promote high-conviction BUY/WATCH results
+                into the server watch-list on scan completion. OFF by default —
+                must be explicitly enabled (see _promote_results_to_watch_list).
+            promote_confidence_threshold: Minimum confidence (0.0-1.0) a
+                BUY/WATCH result must clear to be promoted.
+            promote_max_count: Maximum number of results promoted per scan.
         """
         if self._running:
             logger.warning("scanner_already_running")
@@ -290,6 +313,11 @@ class BackgroundScanner:
 
         # Store LLM preference
         self._use_llm = use_llm
+
+        # Store watch-list auto-promotion preferences
+        self._auto_promote_enabled = auto_promote_enabled
+        self._promote_confidence_threshold = promote_confidence_threshold
+        self._promote_max_count = promote_max_count
 
         # Initialize GPU monitor if using LLM with auto scaling
         if use_llm and auto_gpu_scaling:
@@ -501,9 +529,100 @@ class BackgroundScanner:
             session_id=session_id,
         )
 
+        # Auto-promote high-conviction results into the server watch-list so
+        # the discovery pipeline doesn't dead-end (opt-in; see docstring).
+        await self._promote_results_to_watch_list(session_id)
+
         # Send completion notification
         if notify_progress:
             await self._send_scan_summary()
+
+    async def _promote_results_to_watch_list(self, session_id: str) -> int:
+        """Promote high-conviction scan results into the server watch-list.
+
+        ROOT: scan results previously flowed nowhere — a completed scan sat in
+        `self._results`/SQLite with no consumer, so agent-chat's 5-minute
+        watch monitor and queue-conversion never picked up discovered names.
+        This closes that dead-end by pushing the top BUY/WATCH results (by
+        confidence) into `ExecutionCoordinator.add_to_watch_list`, the same
+        sink the WATCH-decision graph node and the `/trading/watch-list/add`
+        route use.
+
+        Gated by `_auto_promote_enabled` (default False, set via
+        `start_scan`) — auto-promotion must be explicitly turned on so a scan
+        never silently starts feeding the autonomous pipeline.
+
+        Only BUY/WATCH actions clearing `_promote_confidence_threshold` are
+        candidates; AVOID/SELL/HOLD are never promoted. Candidates already
+        present in the watch list (by ticker) are skipped so they don't
+        consume a promotion slot or get duplicated; the remaining candidates
+        are ranked by confidence and capped at `_promote_max_count`.
+
+        Returns the number of results promoted (0 if disabled/none qualify).
+        """
+        if not self._auto_promote_enabled:
+            return 0
+
+        candidates = [
+            r for r in self._results
+            if r.action in ("BUY", "WATCH")
+            and r.confidence >= self._promote_confidence_threshold
+        ]
+        if not candidates:
+            return 0
+
+        # Highest-confidence first so max_count keeps the strongest names
+        # when there are more qualifying candidates than promotion slots.
+        candidates.sort(key=lambda r: r.confidence, reverse=True)
+
+        try:
+            from app.dependencies import get_trading_coordinator
+
+            coordinator = await get_trading_coordinator()
+        except Exception as e:
+            logger.warning("watch_list_promotion_coordinator_unavailable", error=str(e))
+            return 0
+
+        existing_tickers = {w.ticker for w in coordinator.get_watch_list()}
+
+        promoted = 0
+        for result in candidates:
+            if promoted >= self._promote_max_count:
+                break
+            if result.stk_cd in existing_tickers:
+                continue  # already watched — dedup, don't double-add
+
+            try:
+                coordinator.add_to_watch_list(
+                    session_id=session_id,
+                    ticker=result.stk_cd,
+                    stock_name=result.stk_nm,
+                    signal=result.signal,
+                    confidence=result.confidence,
+                    current_price=result.current_price,
+                    analysis_summary=result.summary,
+                    key_factors=result.key_factors,
+                )
+            except Exception as e:
+                logger.warning(
+                    "watch_list_promotion_failed",
+                    stk_cd=result.stk_cd,
+                    error=str(e),
+                )
+                continue
+
+            existing_tickers.add(result.stk_cd)
+            promoted += 1
+
+        logger.info(
+            "scan_results_promoted_to_watch_list",
+            promoted=promoted,
+            candidates=len(candidates),
+            session_id=session_id,
+            threshold=self._promote_confidence_threshold,
+            max_count=self._promote_max_count,
+        )
+        return promoted
 
     async def _scan_all_stocks_quick(
         self,
