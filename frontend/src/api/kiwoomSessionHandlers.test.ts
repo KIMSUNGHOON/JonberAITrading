@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { DetailedAnalysisResults } from '@/types';
 
 // wsManager is the shared per-session WebSocket manager; spy on has()/connect().
 // vi.hoisted so the (hoisted) vi.mock factory can reference it without a TDZ.
@@ -325,6 +326,7 @@ describe('createKiwoomWebSocketHandlers — reasoning delta batching', () => {
   let setKiwoomSessionAutoApproveAt: ReturnType<typeof vi.fn>;
   let setKiwoomSessionProposal: ReturnType<typeof vi.fn>;
   let setKiwoomSessionError: ReturnType<typeof vi.fn>;
+  let completeKiwoomSession: ReturnType<typeof vi.fn>;
   const callOrder: string[] = [];
 
   beforeEach(() => {
@@ -337,6 +339,7 @@ describe('createKiwoomWebSocketHandlers — reasoning delta batching', () => {
     setKiwoomSessionAutoApproveAt = vi.fn();
     setKiwoomSessionProposal = vi.fn(() => callOrder.push('proposal'));
     setKiwoomSessionError = vi.fn();
+    completeKiwoomSession = vi.fn();
     mockState = {
       kiwoom: { sessions: [] },
       addKiwoomSessionReasoningBatch,
@@ -346,6 +349,7 @@ describe('createKiwoomWebSocketHandlers — reasoning delta batching', () => {
       setKiwoomSessionAutoApproveAt,
       setKiwoomSessionProposal,
       setKiwoomSessionError,
+      completeKiwoomSession,
     };
   });
 
@@ -450,5 +454,80 @@ describe('createKiwoomWebSocketHandlers — reasoning delta batching', () => {
     vi.advanceTimersByTime(300); // S1's own timer still fires independently
     expect(addKiwoomSessionReasoningBatch).toHaveBeenCalledTimes(2);
     expect(addKiwoomSessionReasoningBatch).toHaveBeenLastCalledWith('S1', ['[Technical] s1 line']);
+  });
+});
+
+describe('createKiwoomWebSocketHandlers — onComplete persists to history via completeKiwoomSession', () => {
+  // Regression: onComplete previously discarded the backend's completion
+  // payload entirely (only forwarded data.error/status). completeKiwoomSession
+  // (store/index.ts) is what writes analysisResults/reasoningSummary/
+  // tradeProposal into kiwoom.history — without this wiring the detail page
+  // renders empty AND a page refresh loses the detail (history is what
+  // survives reload). This had zero production callers before this fix.
+  let completeKiwoomSession: ReturnType<typeof vi.fn>;
+  let setKiwoomSessionError: ReturnType<typeof vi.fn>;
+  let updateKiwoomSessionStatus: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    completeKiwoomSession = vi.fn();
+    setKiwoomSessionError = vi.fn();
+    updateKiwoomSessionStatus = vi.fn();
+    mockState = {
+      kiwoom: {
+        // The session's own (already-normalized, via onProposal) live
+        // proposal — this is what should be threaded through, NOT a
+        // re-parse of the raw data.trade_proposal frame (different field
+        // names: ticker/display_name vs stk_cd/stk_nm).
+        sessions: [
+          { sessionId: 'S1', tradeProposal: { id: 'p1', stk_cd: '005930', action: 'BUY' } },
+        ],
+      },
+      completeKiwoomSession,
+      setKiwoomSessionError,
+      updateKiwoomSessionStatus,
+      updateKiwoomSessionStage: vi.fn(),
+      setKiwoomSessionAwaitingApproval: vi.fn(),
+      setKiwoomSessionAutoApproveAt: vi.fn(),
+      setKiwoomSessionProposal: vi.fn(),
+    };
+  });
+
+  it('a completed frame persists analysisResults + reasoningSummary + the session\'s live proposal', () => {
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onComplete?.({
+      status: 'completed',
+      analysis_results: { technical: { recommendation: 'BUY' } } as unknown as DetailedAnalysisResults,
+      reasoning_summary: 'final call: buy',
+    });
+
+    expect(completeKiwoomSession).toHaveBeenCalledTimes(1);
+    expect(completeKiwoomSession).toHaveBeenCalledWith('S1', {
+      analysisResults: { technical: { recommendation: 'BUY' } },
+      reasoningSummary: 'final call: buy',
+      tradeProposal: { id: 'p1', stk_cd: '005930', action: 'BUY' },
+      completedAt: expect.any(Date),
+    });
+    expect(updateKiwoomSessionStatus).toHaveBeenCalledWith('S1', 'completed');
+  });
+
+  it('an error frame calls setKiwoomSessionError and updateKiwoomSessionStatus but NOT completeKiwoomSession', () => {
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onComplete?.({ status: 'error', error: 'kiwoom API timeout' });
+
+    expect(setKiwoomSessionError).toHaveBeenCalledWith('S1', 'kiwoom API timeout');
+    expect(completeKiwoomSession).not.toHaveBeenCalled();
+    expect(updateKiwoomSessionStatus).toHaveBeenCalledWith('S1', 'error');
+  });
+
+  it('a cancelled frame updates status but does NOT call completeKiwoomSession or setKiwoomSessionError', () => {
+    const handlers = createKiwoomWebSocketHandlers('S1');
+
+    handlers.onComplete?.({ status: 'cancelled' });
+
+    expect(completeKiwoomSession).not.toHaveBeenCalled();
+    expect(setKiwoomSessionError).not.toHaveBeenCalled();
+    expect(updateKiwoomSessionStatus).toHaveBeenCalledWith('S1', 'cancelled');
   });
 });

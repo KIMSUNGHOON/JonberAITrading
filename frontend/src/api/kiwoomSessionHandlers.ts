@@ -116,6 +116,30 @@ export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandl
       if (data.error) {
         store().setKiwoomSessionError(sessionId, data.error);
       }
+      if (data.status === 'completed') {
+        // Persist the completion payload into kiwoom.history (Phase 9 store
+        // action, previously dead — zero production callers). Without this,
+        // the completed session's detail page renders empty (analysisResults/
+        // reasoningSummary/tradeProposal never land in history) AND a page
+        // refresh loses the detail entirely (history is what survives reload,
+        // the live session map does not). tradeProposal comes from the
+        // session's own (already-normalized) live proposal set earlier by
+        // onProposal — the raw data.trade_proposal frame uses different field
+        // names (ticker/display_name vs stk_cd/stk_nm) so it is not reused
+        // directly here.
+        const session = store().kiwoom.sessions.find((s) => s.sessionId === sessionId);
+        // This module only ever handles kiwoom sessions, so the shared
+        // SessionData union (CoinTradeProposal | KRStockTradeProposal | null)
+        // narrows to KRStockTradeProposal here — same precedent as the
+        // KRStockTradeProposal casts in rehydrateKiwoomSessions below.
+        const tradeProposal = (session?.tradeProposal as KRStockTradeProposal | null) ?? null;
+        store().completeKiwoomSession(sessionId, {
+          analysisResults: data.analysis_results ?? null,
+          reasoningSummary: data.reasoning_summary,
+          tradeProposal,
+          completedAt: new Date(),
+        });
+      }
       store().updateKiwoomSessionStatus(sessionId, data.status as SessionStatus);
     },
     onError: () => {
