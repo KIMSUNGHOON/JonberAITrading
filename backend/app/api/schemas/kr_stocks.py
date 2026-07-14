@@ -150,6 +150,14 @@ class KRStockAnalysisResponse(BaseModel):
     stk_nm: Optional[str] = Field(default=None, description="Stock name")
     status: str = Field(description="Current status")
     message: str = Field(description="Status message")
+    duplicate: bool = Field(
+        default=False,
+        description=(
+            "True when this response reuses an already in-progress "
+            "(running/awaiting_approval) session for the same stk_cd "
+            "instead of starting a new analysis (P4 dedup)."
+        ),
+    )
 
 
 class KRStockAnalysisSummary(BaseModel):

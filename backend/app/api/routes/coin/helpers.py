@@ -46,6 +46,45 @@ def get_coin_session(session_id: str) -> dict:
     return session
 
 
+# Statuses that make a session count as "in flight" for ticker-level dedup
+# (P4): a session still running or parked at a human/autonomy decision. Once
+# a session settles (completed/error/cancelled) it no longer blocks a fresh
+# analysis of the same market.
+_ACTIVE_STATUSES = ("running", "awaiting_approval")
+
+
+async def find_active_coin_session(market: str) -> Optional[dict]:
+    """Return the first RUNNING/AWAITING_APPROVAL session for `market`, if any.
+
+    Same pattern as `kr_stocks.helpers.find_active_kr_session`: checks the
+    legacy in-process `coin_sessions` dict first (authoritative read path
+    within this process), then falls back to the SessionManager to also
+    catch a session that survived a restart (legacy dict wiped, but
+    reconciled into SessionManager as still AWAITING_APPROVAL).
+
+    Used to prevent `/analysis/start` from spawning a second concurrent
+    analysis for a market that already has one in progress (P4 dedup) —
+    ported from the `ticker in self._active_rooms` guard pattern in
+    `services/agent_chat/coordinator.py`.
+    """
+    for session in coin_sessions.values():
+        if session.get("market") == market and session.get("status") in _ACTIVE_STATUSES:
+            return session
+
+    from services.session_manager import MarketType, SessionStatus, get_session_manager
+
+    manager = await get_session_manager()
+    for sm_status in (SessionStatus.RUNNING, SessionStatus.AWAITING_APPROVAL):
+        sessions = await manager.get_all_sessions(
+            market_type=MarketType.COIN, status=sm_status
+        )
+        for sm_session in sessions.values():
+            if (sm_session.market or sm_session.ticker) == market:
+                return sm_session.to_legacy_dict()
+
+    return None
+
+
 def check_api_keys() -> None:
     """Check if Upbit API keys are configured (runtime or environment)."""
     if not get_upbit_access_key() or not get_upbit_secret_key():

@@ -35,7 +35,7 @@ from services.session_manager import (
     mirror_session_status,
 )
 from .constants import coin_sessions, get_cached_markets
-from .helpers import get_coin_session
+from .helpers import find_active_coin_session, get_coin_session
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -58,8 +58,30 @@ async def start_coin_analysis(
     Returns:
         Session ID and initial status
     """
-    session_id = str(uuid.uuid4())
     market = request.market.upper()
+
+    # P4 dedup: refuse to spawn a second concurrent analysis for a market
+    # that already has one in progress (RUNNING/AWAITING_APPROVAL) — reuse
+    # the existing session instead of minting a new one. Completed/error/
+    # cancelled sessions never block; only a truly in-flight run does, so
+    # re-analysis after a prior run finished is always allowed.
+    existing = await find_active_coin_session(market)
+    if existing is not None:
+        logger.info(
+            "coin_analysis_dedup_hit",
+            existing_session_id=existing["session_id"],
+            market=market,
+            existing_status=existing.get("status"),
+        )
+        return CoinAnalysisResponse(
+            session_id=existing["session_id"],
+            market=existing.get("market") or market,
+            status=existing.get("status", "running"),
+            message="이미 진행중인 분석 세션이 있습니다 — 기존 세션을 재사용합니다.",
+            duplicate=True,
+        )
+
+    session_id = str(uuid.uuid4())
 
     logger.info(
         "coin_analysis_started",

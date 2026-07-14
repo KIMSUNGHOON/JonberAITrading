@@ -121,6 +121,14 @@ class CoinAnalysisResponse(BaseModel):
     market: str = Field(description="Market code")
     status: str = Field(description="Current status")
     message: str = Field(description="Status message")
+    duplicate: bool = Field(
+        default=False,
+        description=(
+            "True when this response reuses an already in-progress "
+            "(running/awaiting_approval) session for the same market "
+            "instead of starting a new analysis (P4 dedup)."
+        ),
+    )
 
 
 class CoinAnalysisSummary(BaseModel):

@@ -35,7 +35,7 @@ from services.session_manager import (
     mirror_session_status,
 )
 from .constants import kr_stock_sessions
-from .helpers import get_kr_stock_session
+from .helpers import find_active_kr_session, get_kr_stock_session
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -58,8 +58,31 @@ async def start_kr_stock_analysis(
     Returns:
         Session ID and initial status
     """
-    session_id = str(uuid.uuid4())
     stk_cd = request.stk_cd
+
+    # P4 dedup: refuse to spawn a second concurrent analysis for a stk_cd
+    # that already has one in progress (RUNNING/AWAITING_APPROVAL) — reuse
+    # the existing session instead of minting a new one. Completed/error/
+    # cancelled sessions never block; only a truly in-flight run does, so
+    # re-analysis after a prior run finished is always allowed.
+    existing = await find_active_kr_session(stk_cd)
+    if existing is not None:
+        logger.info(
+            "kr_stock_analysis_dedup_hit",
+            existing_session_id=existing["session_id"],
+            stk_cd=stk_cd,
+            existing_status=existing.get("status"),
+        )
+        return KRStockAnalysisResponse(
+            session_id=existing["session_id"],
+            stk_cd=existing.get("stk_cd") or stk_cd,
+            stk_nm=existing.get("stk_nm"),
+            status=existing.get("status", "running"),
+            message="이미 진행중인 분석 세션이 있습니다 — 기존 세션을 재사용합니다.",
+            duplicate=True,
+        )
+
+    session_id = str(uuid.uuid4())
 
     logger.info(
         "kr_stock_analysis_started",
