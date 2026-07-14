@@ -20,6 +20,7 @@ following the conventions in test_kr_analysis_sm_migration.py /
 test_coin_analysis_sm_migration.py.
 """
 
+import asyncio
 import os
 
 import pytest
@@ -269,6 +270,125 @@ async def test_kr_start_ticker_isolation_different_stk_cd_not_blocked(
     assert response.duplicate is False
     assert response.session_id != existing_id
     assert len(bg.tasks) == 1
+
+
+# -------------------------------------------
+# KR: P4-T1-review TOCTOU fix — the check-then-record window itself
+# -------------------------------------------
+#
+# The tests above all seed the "existing session" synchronously before
+# calling start_kr_stock_analysis, so they never exercise the actual race:
+# find_active_kr_session (~line 68) returning None for BOTH of two
+# near-simultaneous same-stk_cd requests because neither had recorded a
+# session yet, with the awaited kiwoom name lookup (get_shared_kiwoom_client_
+# async + client.get_stock_info) sitting in the gap. These tests drive that
+# window directly with a controllable asyncio.Event.
+
+
+async def test_kr_start_concurrent_same_ticker_only_one_session_created(
+    sm, kr_sessions, monkeypatch
+):
+    """Two near-simultaneous starts for the SAME stk_cd, with NO prior
+    session: task A is parked mid-lookup (blocked inside `get_stock_info` on
+    `gate`) — by the time it parks there, the fix must already have written
+    A's placeholder into `kr_stock_sessions` (synchronously, before the
+    kiwoom awaits). Task B's start, arriving while A is still parked, must
+    then see that placeholder via `find_active_kr_session` and dedup onto it
+    instead of minting a second session + a second graph run."""
+    gate = asyncio.Event()
+
+    class _BlockingClient:
+        async def get_stock_info(self, stk_cd):
+            await gate.wait()
+            return _FakeStockInfo()
+
+        async def get_account_balance(self):
+            return None  # unused here; exercised by test_analysis_position_exists.py
+
+    async def _fake_client():
+        return _BlockingClient()
+
+    monkeypatch.setattr(
+        "app.api.routes.kr_stocks.analysis.get_shared_kiwoom_client_async", _fake_client
+    )
+
+    bg_a = BackgroundTasks()
+    task_a = asyncio.create_task(
+        start_kr_stock_analysis(KRStockAnalysisRequest(stk_cd="005930"), bg_a)
+    )
+
+    # Let task A run up to (and park inside) the gated get_stock_info call —
+    # by construction of the fix this is AFTER the synchronous placeholder
+    # write and BEFORE the kiwoom name lookup resolves.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if kr_sessions:
+            break
+    assert len(kr_sessions) == 1, "A's placeholder must already be recorded"
+    existing_id = next(iter(kr_sessions))
+    assert kr_sessions[existing_id]["status"] == "running"
+
+    # Task B "arrives" while A is still parked — same stk_cd, no gating on
+    # its own client lookup needed since it must dedup before reaching it.
+    bg_b = BackgroundTasks()
+    response_b = await start_kr_stock_analysis(
+        KRStockAnalysisRequest(stk_cd="005930"), bg_b
+    )
+
+    assert response_b.duplicate is True
+    assert response_b.session_id == existing_id
+    assert bg_b.tasks == []  # no second graph run queued for B
+    assert len(kr_sessions) == 1  # still exactly one session record
+
+    # Release A and let it finish.
+    gate.set()
+    response_a = await task_a
+
+    assert response_a.duplicate is False
+    assert response_a.session_id == existing_id
+    assert len(bg_a.tasks) == 1  # exactly one graph run total, from A
+    assert len(kr_sessions) == 1  # B never created a second entry
+    assert kr_sessions[existing_id]["stk_nm"] == "삼성전자"  # finalized after the lookup
+
+
+async def test_kr_start_cleans_up_placeholder_on_kiwoom_client_failure(
+    sm, kr_sessions, monkeypatch
+):
+    """If resolving the kiwoom client itself blows up (distinct from the
+    already-guarded, best-effort inner get_stock_info/get_account_balance
+    calls), the just-reserved placeholder must be removed. Otherwise a
+    stranded "running" session would permanently dedup-block all future
+    analysis of this ticker."""
+
+    async def _boom_client():
+        raise RuntimeError("kiwoom client unavailable")
+
+    monkeypatch.setattr(
+        "app.api.routes.kr_stocks.analysis.get_shared_kiwoom_client_async", _boom_client
+    )
+
+    with pytest.raises(RuntimeError):
+        await start_kr_stock_analysis(
+            KRStockAnalysisRequest(stk_cd="005930"), BackgroundTasks()
+        )
+
+    assert len(kr_sessions) == 0  # no stranded placeholder left behind
+
+    # A subsequent analysis for the SAME ticker must not be blocked by
+    # anything left over from the failed attempt.
+    async def _fake_client():
+        return _FakeKiwoomClient()
+
+    monkeypatch.setattr(
+        "app.api.routes.kr_stocks.analysis.get_shared_kiwoom_client_async", _fake_client
+    )
+
+    bg = BackgroundTasks()
+    response = await start_kr_stock_analysis(KRStockAnalysisRequest(stk_cd="005930"), bg)
+
+    assert response.duplicate is False
+    assert len(bg.tasks) == 1
+    assert len(kr_sessions) == 1
 
 
 # -------------------------------------------

@@ -97,31 +97,69 @@ async def start_kr_stock_analysis(
         stk_cd=stk_cd,
     )
 
-    # Get stock name
-    stk_nm = None
-    client = await get_shared_kiwoom_client_async()
-    try:
-        info = await client.get_stock_info(stk_cd)
-        if info:
-            stk_nm = info.stk_nm
-    except Exception as e:
-        logger.warning("failed_to_get_stock_name", stk_cd=stk_cd, error=str(e))
+    # P4-T1 TOCTOU fix: reserve the session synchronously, right here — no
+    # `await` between this write and the `find_active_kr_session` check
+    # above — BEFORE the kiwoom name/position lookups below. Those lookups
+    # are awaited network round-trips; without this reservation, two
+    # near-simultaneous starts for the SAME stk_cd could both pass the dedup
+    # check above before either recorded a session (two graph runs for one
+    # ticker). `find_active_kr_session` matches on stk_cd + status in
+    # {"running", "awaiting_approval"}, which this placeholder already
+    # satisfies, so a concurrent request now dedups onto it immediately.
+    # stk_nm/position_exists are filled in below once the lookups return.
+    kr_stock_sessions[session_id] = {
+        "session_id": session_id,
+        "stk_cd": stk_cd,
+        "stk_nm": None,
+        "status": "running",
+        "state": {
+            "stk_cd": stk_cd,
+            "stk_nm": None,
+            "query": request.query,
+            "reasoning_log": [],
+            "current_stage": "data_collection",
+            "position_exists": False,
+        },
+        "created_at": datetime.now(timezone.utc),
+        "error": None,
+    }
 
-    # P4 Task 2: surface whether stk_cd is already held, from the SAME
-    # broker-balance source /positions and Operations '보유' read (kt00004,
-    # get_account_balance()) — so this flag can never disagree with what
-    # those surfaces show as held. Best-effort: any failure (client
-    # unavailable, API error) degrades to False rather than failing the
-    # analysis-start request — a position-awareness hint must never block
-    # starting the analysis itself.
+    # Get stock name + position (awaited network calls). Wrapped so that an
+    # unexpected failure resolving the kiwoom client itself — as opposed to
+    # the inner best-effort lookups below, which already degrade to
+    # None/False on failure without raising — cleans up the placeholder just
+    # reserved above instead of leaving a stranded "running" session that
+    # would permanently block future analysis of this ticker.
+    stk_nm = None
     position_exists = False
     try:
-        balance = await client.get_account_balance()
-        position_exists = any(h.stk_cd == stk_cd for h in balance.holdings)
-    except Exception as e:
-        logger.warning("kr_position_exists_check_failed", stk_cd=stk_cd, error=str(e))
+        client = await get_shared_kiwoom_client_async()
 
-    # Create session record (legacy dict = read path for REST/WS)
+        try:
+            info = await client.get_stock_info(stk_cd)
+            if info:
+                stk_nm = info.stk_nm
+        except Exception as e:
+            logger.warning("failed_to_get_stock_name", stk_cd=stk_cd, error=str(e))
+
+        # P4 Task 2: surface whether stk_cd is already held, from the SAME
+        # broker-balance source /positions and Operations '보유' read (kt00004,
+        # get_account_balance()) — so this flag can never disagree with what
+        # those surfaces show as held. Best-effort: any failure (client
+        # unavailable, API error) degrades to False rather than failing the
+        # analysis-start request — a position-awareness hint must never block
+        # starting the analysis itself.
+        try:
+            balance = await client.get_account_balance()
+            position_exists = any(h.stk_cd == stk_cd for h in balance.holdings)
+        except Exception as e:
+            logger.warning("kr_position_exists_check_failed", stk_cd=stk_cd, error=str(e))
+    except Exception:
+        kr_stock_sessions.pop(session_id, None)
+        raise
+
+    # Finalize session record (legacy dict = read path for REST/WS) now that
+    # the lookups above have resolved.
     initial_state = {
         "stk_cd": stk_cd,
         "stk_nm": stk_nm,
@@ -130,15 +168,12 @@ async def start_kr_stock_analysis(
         "current_stage": "data_collection",
         "position_exists": position_exists,
     }
-    kr_stock_sessions[session_id] = {
-        "session_id": session_id,
-        "stk_cd": stk_cd,
-        "stk_nm": stk_nm,
-        "status": "running",
-        "state": initial_state,
-        "created_at": datetime.now(timezone.utc),
-        "error": None,
-    }
+    kr_stock_sessions[session_id].update(
+        {
+            "stk_nm": stk_nm,
+            "state": initial_state,
+        }
+    )
 
     # Also register in the SessionManager so its pub/sub can push updates to
     # the session WebSocket. The sm keeps an independent state copy — the
