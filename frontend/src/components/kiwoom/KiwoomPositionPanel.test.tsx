@@ -12,9 +12,18 @@
  * 2,125,440); (2) market is pinned to 'kiwoom' regardless of any global
  * active-market state; (3) missing SL/TP still degrades to a dash (no
  * fabrication); (4) the 청산 button still calls the full-close path
- * (closeKRStockPosition) untouched; (5) totals derive from the same
+ * (closeKRStockPosition) untouched; (5) 총 손익 derives from the same
  * holdings (single source of truth); (6) a broker fetch failure degrades
  * honestly instead of faking an empty/zero portfolio.
+ *
+ * UX-A2 follow-up (2026-07-13): the panel used to ALSO render an aggregate
+ * "총 평가금액" (Σ qty × current_price over these holdings) — but the LEFT
+ * 계좌 요약 card (KiwoomAccountBalance) shows the account's broker-reported
+ * `total_eval_amount` for the SAME concept, computed via a different path,
+ * so the two visibly diverged (~0.9% on mock data). That line is now
+ * removed here so the stock-evaluation total renders exactly once on the
+ * page (in the left card). 총 손익 (holdings-level P&L) is kept — it's a
+ * different concept from the left card's account-level total_profit_loss.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
@@ -95,12 +104,21 @@ describe('KiwoomPositionPanel', () => {
     expect(getOperations.mock.calls.length).toBeGreaterThanOrEqual(2); // 청산 후 재조회
   });
 
-  it('총 평가금액/총 손익 헤더를 동일 holdings로부터 계산해 표시한다 (별도 소스 없음 — 드리프트 불가)', async () => {
+  it('총 손익 헤더를 동일 holdings로부터 계산해 표시한다 (별도 소스 없음 — 드리프트 불가)', async () => {
     getOperations.mockResolvedValue(withHolding());
     render(<KiwoomPositionPanel />);
-    await waitFor(() => expect(screen.getByText('총 평가금액')).toBeInTheDocument());
-    // 10주 * 1,968,000원 = 19,680,000원 -> "1968만원"
-    expect(screen.getByText(/1968만원/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('총 손익')).toBeInTheDocument());
+    // pnl 680,000원 -> "+68만원" — scoped to the summary row since the
+    // single-holding fixture makes this text-identical to the per-row 평가손익.
+    const summaryRow = screen.getByText('총 손익').closest('div');
+    expect(summaryRow?.textContent).toMatch(/\+68만원/);
+  });
+
+  it('총 평가금액(집계)은 더 이상 렌더링하지 않는다 — 좌측 계좌 요약 카드와의 발산 봉합 (대안2 후속)', async () => {
+    getOperations.mockResolvedValue(withHolding());
+    render(<KiwoomPositionPanel />);
+    await waitFor(() => expect(screen.getByText('SK하이닉스')).toBeInTheDocument());
+    expect(screen.queryByText('총 평가금액')).not.toBeInTheDocument();
   });
 
   it('holding 조회 실패(null+errors.holding)는 정직하게 오류로 표시한다 (0 위장 금지)', async () => {

@@ -26,8 +26,23 @@
  * the page (gated by `kiwoomApiConfigured`, not `activeMarket`).
  *
  * There's no separate "totals" field on `OperationsResponse` (unlike the old
- * `KRStockPositionListResponse`), so 총 평가금액/총 손익 are derived from the
- * same holdings array below — they can never drift from the per-row figures.
+ * `KRStockPositionListResponse`), so 총 손익 is derived from the same
+ * holdings array below — it can never drift from the per-row figures.
+ *
+ * UX-A2 follow-up (2026-07-13): this panel used to also show an aggregate
+ * "총 평가금액" (Σ quantity × current_price over these holdings). The LEFT
+ * "계좌 요약" card (KiwoomAccountBalance) already shows the account's
+ * broker-reported `total_eval_amount` for the exact same concept (주식
+ * 평가). Because the two are computed via different paths — broker-side
+ * total vs. a client-side sum over `/operations` holdings — they can
+ * diverge (observed ~0.9% on mock data), which reintroduces the
+ * "why don't these two numbers match?" confusion 대안2 set out to fix.
+ * KiwoomAccountBalance is the designated single source for the
+ * stock-evaluation total, so it's removed here. 총 손익 stays: it's a
+ * different concept (holdings-level unrealized P&L from current positions)
+ * from the left card's account-level total_profit_loss, and the two can
+ * legitimately disagree (e.g. realized P&L / fees baked into the account
+ * figure) without being "the same number told twice".
  */
 
 import { useState, useEffect } from 'react';
@@ -122,7 +137,6 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
     );
   }
 
-  const totalValue = positions.reduce((sum, p) => sum + p.quantity * p.current_price, 0);
   const totalPnl = positions.reduce((sum, p) => sum + p.pnl, 0);
   const totalCost = positions.reduce((sum, p) => sum + p.quantity * p.avg_price, 0);
   const totalPnlPct = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
@@ -158,14 +172,13 @@ export function KiwoomPositionPanel({ onPositionClose }: KiwoomPositionPanelProp
         </div>
       )}
 
-      {/* Portfolio Summary */}
+      {/* Portfolio Summary — 총 평가금액 removed (UX-A2 follow-up): the LEFT
+          계좌 요약 card (KiwoomAccountBalance) is the single source for the
+          stock-evaluation total; showing it here too diverged from that
+          card because the two were computed via different paths. */}
       {positions.length > 0 && (
         <div className="p-3 bg-elevated rounded-lg">
           <div className="flex items-center justify-between">
-            <span className="text-muted">총 평가금액</span>
-            <span className="font-semibold tabular-nums">{formatKRW(totalValue)}원</span>
-          </div>
-          <div className="flex items-center justify-between mt-1">
             <span className="text-muted">총 손익</span>
             <div className={`flex items-center gap-1 font-semibold tabular-nums ${pnlColor(totalPnl)}`}>
               {totalPnl >= 0 ? <TrendingUp size={14} /> : <TrendingDown size={14} />}
