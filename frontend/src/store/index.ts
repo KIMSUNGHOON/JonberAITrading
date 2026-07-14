@@ -247,7 +247,6 @@ interface BasketActions {
   updateBasketItemPrice: (ticker: string, price: number, changeRate: number, change: 'RISE' | 'FALL' | 'EVEN') => void;
   setBasketItemLoading: (ticker: string, loading: boolean) => void;
   setBasketItemError: (ticker: string, error: string | null) => void;
-  setBasketUpdating: (updating: boolean) => void;
 }
 
 interface CoinActions {
@@ -1490,14 +1489,6 @@ export const useStore = create<Store>()(
                 ? { ...item, error, isLoading: false }
                 : item
             ),
-          },
-        })),
-
-      setBasketUpdating: (updating) =>
-        set((state) => ({
-          basket: {
-            ...state.basket,
-            isUpdating: updating,
           },
         })),
 
