@@ -2,14 +2,31 @@
  * Portfolio KV tile — 총자산 / 평가손익 / 보유 / 가용 for the active market.
  *
  * No store slice backs account balances; data comes from REST per market:
- *   kiwoom → getKRStockAccount
- *   coin   → getCoinAccounts (+ getCoinPositions for P&L, which accounts lack)
+ *   kiwoom → getKRStockAccount (총자산/가용/보유) + getOperations('kiwoom') (평가손익)
+ *   coin   → getCoinAccounts (총자산/가용/보유) + getCoinPositions (평가손익)
  * Polls every 30s (Kiwoom is throttled through the 800ms request queue, so keep
  * the cadence gentle). The 4-cell grid keeps the exact honest empty-state.
+ *
+ * P2-4 M1: the KR 평가손익 figure is summed from `getOperations('kiwoom')`
+ * holdings — the SAME per-holding `pnl` the Positions tile (PositionsPanel)
+ * and the funnel's HoldingColumn already render, which P1 (commit 6e6bf3f)
+ * wired net of round-trip KR cost (commission both legs + sell tax; see
+ * `services/trading/fill_costs.py::effective_pnl`). Previously this tile
+ * read `getKRStockAccount().total_profit_loss`, the broker's raw GROSS
+ * evlu_pfls_amt — always off from the holdings panels by exactly the
+ * round-trip cost. Sourcing both from the one `/operations` response is what
+ * makes the dashboard's numbers reconcile (this codebase has fixed the same
+ * "why don't these two numbers match" class of bug twice before: ddfebb6,
+ * b283814). A failed/degraded ops fetch renders DASH here rather than
+ * silently falling back to the gross figure, which would reintroduce the
+ * divergence. Coin already sourced 평가손익 from `getCoinPositions()`
+ * (`total_pnl`), which itself sums each position's `unrealized_pnl` — net of
+ * projected coin fee since P1 (`calculate_position_pnl`) — so no coin-side
+ * change was needed.
  */
 import { useEffect, useState, type ReactNode } from 'react';
 import { useStore } from '@/store';
-import { getKRStockAccount, getCoinAccounts, getCoinPositions } from '@/api/client';
+import { getKRStockAccount, getCoinAccounts, getCoinPositions, getOperations } from '@/api/client';
 import { pnlColor } from '@/utils/pnl';
 import { DASH, fmtPct, fmtMoneyCompact } from './shared';
 
@@ -33,12 +50,28 @@ function usePortfolioSummary() {
     async function run() {
       try {
         if (activeMarket === 'kiwoom') {
-          const acct = await getKRStockAccount();
+          // ops fetch is best-effort (.catch(() => null)): a network failure
+          // here must degrade 평가손익 to DASH, never fall back to
+          // acct.total_profit_loss (gross) — that fallback is exactly the
+          // divergence this fix closes. See file header for the full
+          // rationale.
+          const [acct, ops] = await Promise.all([
+            getKRStockAccount(),
+            getOperations('kiwoom').catch(() => null),
+          ]);
           if (!alive) return;
+          const opsHoldings = ops?.holding ?? null;
+          let pnl: number | null = null;
+          let pnlPct: number | null = null;
+          if (opsHoldings) {
+            pnl = opsHoldings.reduce((sum, h) => sum + h.pnl, 0);
+            const costBasis = opsHoldings.reduce((sum, h) => sum + h.avg_price * h.quantity, 0);
+            pnlPct = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+          }
           setSummary({
             totalAssets: acct.cash.deposit + acct.total_eval_amount,
-            pnl: acct.total_profit_loss,
-            pnlPct: acct.total_profit_loss_rate,
+            pnl,
+            pnlPct,
             holdings: acct.holdings.length,
             available: acct.cash.orderable_amount,
           });
