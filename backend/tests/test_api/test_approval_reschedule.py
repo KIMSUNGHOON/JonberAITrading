@@ -191,7 +191,66 @@ async def test_system_approve_proceeds_when_id_matches(wired):
     assert sessions["s5"]["state"]["approval_status"] == "approved"
 
 
+def _coin_session(session_id: str) -> dict:
+    """A coin session where the user's cancel already landed (route sets
+    session["status"] = "cancelled") but — pre-fix — left
+    state["awaiting_approval"] True and approval_status None behind, exactly
+    the shape the buggy coin cancel route used to produce (see coin/analysis.py
+    cancel route + F4b IMPORTANT-1)."""
+    return {
+        "market": "KRW-BTC",
+        "korean_name": "비트코인",
+        "status": "cancelled",
+        "state": {
+            "awaiting_approval": True,
+            "approval_status": None,
+            "trade_proposal": {"id": "P1", "action": "BUY", "quantity": 1,
+                               "entry_price": 50_000_000},
+            "reasoning_log": [],
+        },
+    }
+
+
+# --- Task 2 (F4b, IMPORTANT-1): inside-lock guard on session["status"] ------
+#
+# The proposal-id pin only catches a REPLACED proposal (reject -> re-analysis).
+# A cancel never replaces the proposal, so on the coin market (whose cancel
+# route did not clear awaiting_approval/approval_status) a stale system
+# auto-approve raced straight through the pin check and the
+# `not state.get("awaiting_approval")` check into the live approve path —
+# executing the trade and overwriting the cancelled status. The inside-lock
+# guard must also stand down whenever session["status"] is no longer
+# "awaiting_approval", regardless of which market or which route caused the
+# mutation.
+
 @pytest.mark.asyncio
+async def test_coin_system_approve_stands_down_when_status_not_awaiting(wired, monkeypatch):
+    """Coin analog of the stale-approve stand-down: cancel already flipped
+    session["status"] away from "awaiting_approval" while awaiting_approval/
+    approval_status remained in their pre-cancel shape (the coin route bug
+    this arc fixes) — the pin still matches (cancel didn't touch the
+    proposal), so only the session-status guard can catch this. No resume,
+    no state mutation beyond what cancel already did, no order."""
+    _sessions, reschedule_calls, _set_graph = wired
+    coin_sessions = {"c1": _coin_session("c1")}
+    monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: coin_sessions)
+    monkeypatch.setattr(approval_module, "get_kr_stock_sessions", lambda: {})
+
+    graph = _FakeGraph([])
+    monkeypatch.setattr(approval_module, "get_coin_trading_graph", lambda: graph)
+
+    result = await approval_module.submit_decision(
+        "c1", "approved", actor="system", expected_proposal_id="P1"
+    )
+
+    assert result == {"status": "stood_down", "reason": "not_awaiting"}
+    graph.aupdate_state.assert_not_awaited()
+    assert coin_sessions["c1"]["status"] == "cancelled"
+    assert coin_sessions["c1"]["state"]["approval_status"] is None
+    assert coin_sessions["c1"]["state"]["awaiting_approval"] is True
+    assert reschedule_calls == []
+
+
 async def test_user_decision_ignores_expected_id(wired):
     """actor='user' must never be stood down by the pin check -- it is scoped
     to actor=='system' only. Defense-in-depth: even a mismatched

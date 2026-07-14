@@ -205,6 +205,46 @@ async def test_cancel_route_mirrors_cancelled_status(sm, coin_sessions_fixture):
 
 
 # -------------------------------------------
+# F4b IMPORTANT-1: cancel must clear awaiting_approval/approval_status on
+# BOTH the legacy dict AND the sm mirror — same zombie-resurrection /
+# stale-auto-approve guard as the kr_stocks analog
+# (test_kr_analysis_sm_migration.py::test_cancel_clears_awaiting_flag_on_legacy_and_sm).
+# Pre-fix, this route only set session["status"] = "cancelled" and left
+# state["awaiting_approval"] True / approval_status None behind — a stale
+# system auto-approve racing in through the injector's grace-window timer
+# would then find the proposal-id pin unchanged (a cancel never replaces
+# the proposal) and awaiting_approval still True, sail through
+# submit_decision's stale-flag checks, place the order, and overwrite this
+# cancelled status with "completed".
+# -------------------------------------------
+
+
+async def test_cancel_clears_awaiting_flag_on_legacy_and_sm(sm, coin_sessions_fixture):
+    session_id = "coin-cancel-clear-1"
+    record = _seed_session(coin_sessions_fixture, session_id)
+    record["status"] = "awaiting_approval"
+    record["state"]["awaiting_approval"] = True
+    record["state"]["trade_proposal"] = {"id": "p1", "action": "HOLD"}
+    await _seed_sm_session(sm, session_id)
+    await sm.update_state(session_id, {"awaiting_approval": True})
+    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+
+    await cancel_coin_analysis(session_id)
+
+    # Legacy dict cleared (pinned)
+    assert record["state"]["awaiting_approval"] is False
+    assert record["state"]["approval_status"] == "cancelled"
+
+    # sm mirror cleared too — without this, a restart resurrects the session
+    # as AWAITING_APPROVAL with awaiting_approval still True (zombie), and a
+    # live stale auto-approve would sail through the pin check unopposed.
+    session = await sm.get_session(session_id)
+    assert session.state.get("awaiting_approval") is False
+    assert session.state.get("approval_status") == "cancelled"
+    assert session.status == SessionStatus.CANCELLED
+
+
+# -------------------------------------------
 # (I3) Cancel route participates in the per-session decision lock
 # -------------------------------------------
 

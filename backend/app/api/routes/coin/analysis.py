@@ -360,11 +360,30 @@ async def cancel_coin_analysis(session_id: str):
             )
 
         session["status"] = "cancelled"
+        # F4b IMPORTANT-1: mirror the kr_stocks cancel route's state-clearing.
+        # Without this, awaiting_approval stays True and approval_status stays
+        # None/absent after this cancel — a stale system auto-approve racing
+        # in through the injector's grace-window timer (see
+        # _autonomy_injector._auto_approve_after_grace) checks the proposal-id
+        # pin (unaffected by a cancel, which never replaces the proposal) but
+        # NOT session["status"], so it falls straight through
+        # submit_decision's stale-flag checks into the live approve path:
+        # order placed, this cancelled status silently overwritten with
+        # "completed". Clearing both flags here makes the session look
+        # correctly "not awaiting" the same way kr_stocks does, and
+        # approval._submit_decision_locked's inside-lock guard (belt-and-
+        # braces) now also stands down on session["status"] alone.
+        session["state"]["awaiting_approval"] = False
+        session["state"]["approval_status"] = "cancelled"
         session["state"]["reasoning_log"].append("[System] Analysis cancelled by user")
 
         # Mirror to sm — the notify wakes the WebSocket, which re-reads the fresh
         # legacy snapshot (cancelled status + the appended log entry).
         await mirror_session_status(session_id, SessionStatus.CANCELLED)
+        await mirror_session_state(
+            session_id,
+            {"awaiting_approval": False, "approval_status": "cancelled"},
+        )
 
         logger.info("coin_analysis_cancelled", session_id=session_id)
 

@@ -166,8 +166,29 @@ async def _submit_decision_locked(
                 session_id=session_id,
                 scheduled_for=expected_proposal_id,
                 current=current_proposal_id,
+                reason="proposal_changed",
             )
             return {"status": "stood_down", "reason": "proposal_changed"}
+
+        # F4b IMPORTANT-1 (belt-and-braces): the pin above only catches a
+        # REPLACED proposal (reject -> re-analysis). A route that mutates
+        # session["status"] without replacing the proposal or clearing
+        # state["awaiting_approval"] (the coin cancel route's bug, fixed
+        # alongside this — see coin/analysis.py cancel route) would sail
+        # through the pin check unchanged and fall into the live approve path
+        # below, executing an order and overwriting the cancelled status.
+        # Checking session["status"] here closes the whole class for BOTH
+        # markets against ANY status-only mutation, present or future, not
+        # just the one bug this audit found.
+        if session.get("status") != "awaiting_approval":
+            logger.info(
+                "auto_approve_stood_down_inside_lock",
+                session_id=session_id,
+                scheduled_for=expected_proposal_id,
+                session_status=session.get("status"),
+                reason="not_awaiting",
+            )
+            return {"status": "stood_down", "reason": "not_awaiting"}
 
     if not state.get("awaiting_approval"):
         if decision == "cancelled":
