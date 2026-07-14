@@ -204,6 +204,37 @@ _승인 대기 중..._
 """
         return await self._send_message(message.strip())
 
+    async def send_trade_pending(
+        self,
+        ticker: str,
+        stock_name: str,
+        action: str,
+        quantity: int,
+        ord_no: Optional[str] = None,
+    ) -> bool:
+        """Send order-placed-but-unfilled notification.
+
+        Distinct from send_trade_executed (F4b I5): the broker accepted the
+        order (execution_status=='placed_pending_fill') but a fill has not
+        been confirmed yet -- never word this as an execution.
+        """
+        if not self._config.TELEGRAM_NOTIFY_TRADE_ALERTS:
+            return False
+
+        message = f"""
+🟡 *거래 접수 — 체결 대기*
+
+*종목:* {stock_name} ({ticker})
+*행동:* {action}
+*수량:* {quantity:,}주
+*주문번호:* {ord_no or "확인 불가"}
+
+_체결이 아직 확인되지 않았습니다._
+
+⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+"""
+        return await self._send_message(message.strip())
+
     async def send_trade_rejected(
         self,
         ticker: str,

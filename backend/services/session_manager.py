@@ -411,6 +411,16 @@ class SessionManager:
             # A restart always invalidates any pending auto-approve deadline
             # (the injector task that would fire it is gone).
             changed_common = st.pop("auto_approve_at", None) is not None
+            # I7: the FE operations board renders a live countdown off
+            # auto_approve_at; silently popping it (above) would leave a
+            # session that LOOKS like it's still awaiting a decision with no
+            # explanation for why the countdown vanished. Do NOT re-arm it --
+            # just annotate so the reasoning log honestly explains the
+            # restart cleared it and a human must decide now.
+            if changed_common:
+                st.setdefault("reasoning_log", []).append(
+                    "재시작으로 자율 승인 타이머 해제 — 수동 승인 필요"
+                )
 
             if s.status == SessionStatus.RUNNING and awaiting and prop:
                 action = str(prop.get("action") or "").upper()

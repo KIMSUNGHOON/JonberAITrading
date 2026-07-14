@@ -45,6 +45,47 @@ async def test_r1_hold_running_awaiting_flips_to_awaiting(tmp_path, monkeypatch)
     assert mgr._sessions["r1"].status == SessionStatus.AWAITING_APPROVAL
     assert mgr._sessions["r1"].state.get("auto_approve_at") is None
     assert mgr._sessions["r1"].state.get("approval_status") in (None, "")
+    # I7: the cleared countdown must be explained in the reasoning log, not
+    # just silently vanish -- the FE countdown would otherwise disappear
+    # with no indication a human now has to decide.
+    assert any(
+        "재시작으로 자율 승인 타이머 해제" in line
+        for line in mgr._sessions["r1"].state.get("reasoning_log", [])
+    )
+
+
+async def test_i7_kept_session_still_clears_and_annotates_auto_approve_at(tmp_path, monkeypatch):
+    """A session that falls through to the default 'kept' branch (no status
+    change otherwise) must still have its stale auto_approve_at cleared AND
+    annotated -- the common-path handling (I7) runs regardless of which
+    branch a session ends up in below it."""
+    s = _sess("r5b", SessionStatus.AWAITING_APPROVAL, {
+        "awaiting_approval": True,
+        "trade_proposal": {"action": "WATCH", "created_at": NOW.isoformat()},
+        "auto_approve_at": "2026-07-14T09:01:00+00:00",
+        "reasoning_log": ["[09:00:00] 기존 로그"],
+    })
+    mgr = await _mgr_with([s], tmp_path, monkeypatch)
+    rep = await mgr.reconcile_stranded_sessions(now=NOW)
+    assert "r5b" in rep.kept
+    assert mgr._sessions["r5b"].status == SessionStatus.AWAITING_APPROVAL
+    assert mgr._sessions["r5b"].state.get("auto_approve_at") is None
+    log = mgr._sessions["r5b"].state.get("reasoning_log", [])
+    assert log[0] == "[09:00:00] 기존 로그"  # prior entries preserved, not clobbered
+    assert any("재시작으로 자율 승인 타이머 해제" in line for line in log)
+
+
+async def test_i7_no_auto_approve_at_leaves_reasoning_log_untouched(tmp_path, monkeypatch):
+    """No stale deadline present -> nothing popped -> no annotation added
+    (the line must be conditioned on an actual pop, not unconditional)."""
+    s = _sess("r5c", SessionStatus.AWAITING_APPROVAL, {
+        "awaiting_approval": True,
+        "trade_proposal": {"action": "WATCH", "created_at": NOW.isoformat()},
+    })
+    mgr = await _mgr_with([s], tmp_path, monkeypatch)
+    rep = await mgr.reconcile_stranded_sessions(now=NOW)
+    assert "r5c" in rep.kept
+    assert mgr._sessions["r5c"].state.get("reasoning_log", []) == []
 
 
 async def test_r1_buy_over_6h_errors(tmp_path, monkeypatch):

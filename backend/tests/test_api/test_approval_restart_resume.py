@@ -36,6 +36,7 @@ def _sm_session(
     market_type: MarketType = MarketType.KIWOOM,
     status: SessionStatus = SessionStatus.AWAITING_APPROVAL,
     awaiting_approval: bool = True,
+    auto_approve_at: str | None = None,
 ) -> AnalysisSession:
     if market_type == MarketType.KIWOOM:
         kwargs = {"ticker": "005930", "display_name": "삼성전자",
@@ -45,21 +46,24 @@ def _sm_session(
                   "market": "KRW-BTC", "korean_name": "비트코인"}
     else:
         kwargs = {"ticker": "AAPL", "display_name": "Apple Inc"}
+    state = {
+        "awaiting_approval": awaiting_approval,
+        "approval_status": None,
+        "trade_proposal": {
+            "id": "prop-restart-1",
+            "action": "BUY",
+            "quantity": 1,
+            "entry_price": 70000,
+        },
+        "reasoning_log": [],
+    }
+    if auto_approve_at is not None:
+        state["auto_approve_at"] = auto_approve_at
     return AnalysisSession(
         session_id=session_id,
         market_type=market_type,
         status=status,
-        state={
-            "awaiting_approval": awaiting_approval,
-            "approval_status": None,
-            "trade_proposal": {
-                "id": "prop-restart-1",
-                "action": "BUY",
-                "quantity": 1,
-                "entry_price": 70000,
-            },
-            "reasoning_log": [],
-        },
+        state=state,
         **kwargs,
     )
 
@@ -185,6 +189,60 @@ async def test_approve_after_restart_falls_back_to_session_manager(wired):
     # Re-adopted into the legacy dict so subsequent lookups hit it directly.
     assert session_id in wired["kr_stock_sessions"]
     assert session_id not in wired["coin_sessions"]
+
+
+@pytest.mark.asyncio
+async def test_adopt_clears_stale_auto_approve_at_and_annotates(wired):
+    """(I7) Adoption is a SEPARATE restore route from
+    reconcile_stranded_sessions (which only clears auto_approve_at for
+    sessions loaded at process startup). A session adopted here can still
+    carry a stale countdown deadline from before the restart -- the
+    in-process injector task that would have fired it is gone, so it must
+    never be trusted or re-armed. _adopt_session_from_manager must clear it
+    (defense-in-depth) and explain why in the reasoning log, same as the
+    reconcile path.
+    """
+    session_id = "restart-approve-stale-timer-1"
+    wired["set_sm_session"](
+        _sm_session(session_id, auto_approve_at="2026-07-14T09:01:00+00:00")
+    )
+    graph = _FakeGraph(
+        [{"execution": {"execution_status": "completed", "awaiting_approval": False}}]
+    )
+    wired["set_graph"](graph)
+
+    result = await approval_module.submit_decision(session_id, "approved")
+
+    assert result.status == "completed"
+    state = wired["kr_stock_sessions"][session_id]["state"]
+    # Cleared, never re-armed.
+    assert state.get("auto_approve_at") is None
+    # Explained, not silently vanished.
+    assert any(
+        "재시작으로 자율 승인 타이머 해제" in line
+        for line in state.get("reasoning_log", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_adopt_without_auto_approve_at_leaves_reasoning_log_untouched(wired):
+    """No stale deadline present on the sm row -> nothing popped -> no
+    annotation added (the line must be conditioned on an actual pop)."""
+    session_id = "restart-approve-no-timer-1"
+    wired["set_sm_session"](_sm_session(session_id))  # no auto_approve_at
+    graph = _FakeGraph(
+        [{"execution": {"execution_status": "completed", "awaiting_approval": False}}]
+    )
+    wired["set_graph"](graph)
+
+    await approval_module.submit_decision(session_id, "approved")
+
+    state = wired["kr_stock_sessions"][session_id]["state"]
+    assert "auto_approve_at" not in state
+    assert not any(
+        "재시작으로 자율 승인 타이머 해제" in line
+        for line in state.get("reasoning_log", [])
+    )
 
 
 @pytest.mark.asyncio

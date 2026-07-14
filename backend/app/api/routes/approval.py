@@ -482,14 +482,37 @@ async def _submit_decision_locked(
                         session_id=session_id,
                     )
                 elif action in ("BUY", "SELL"):
-                    # Check if trade was queued or executed immediately
-                    if allocation_rationale and "queued" in allocation_rationale.lower():
+                    # I5: honest wording keyed off the graph's real
+                    # execution_status (set above at the top of this
+                    # decision=='approved' branch) instead of the previous
+                    # "queued" substring check on allocation_rationale, which
+                    # never actually matched anything allocation_rationale
+                    # produces (it always reads "... executed via trading
+                    # graph (<status>)") -- so BUY/SELL always fell through to
+                    # broadcast_trade_executed/send_trade_executed even when
+                    # the order only placed and never confirmed a fill, or
+                    # outright failed. Never claim a fill that didn't happen.
+                    if execution_status == "placed_pending_fill":
+                        order_response = state.get("order_response") or {}
+                        ord_no = order_response.get("ord_no")
                         await broadcast_trade_queued(
                             ticker=ticker,
                             stock_name=stock_name,
                             action=action,
                             quantity=proposal.get("quantity", 0),
                             price=proposal.get("entry_price", 0),
+                            expected_execution=(
+                                f"접수, 체결 대기 (주문번호: {ord_no})"
+                                if ord_no
+                                else "접수, 체결 대기"
+                            ),
+                            session_id=session_id,
+                        )
+                    elif execution_status == "failed":
+                        await broadcast_trade_rejected(
+                            ticker=ticker,
+                            stock_name=stock_name,
+                            reason=state.get("error") or "주문 실행 실패",
                             session_id=session_id,
                         )
                     else:
@@ -530,16 +553,34 @@ async def _submit_decision_locked(
                             target_price=int(proposal.get("entry_price", 0)) if proposal.get("entry_price") else None,
                             risk_score=int(risk.get("risk_score", 5)),
                         )
-                    # BUY/SELL actions send trade executed notification
+                    # BUY/SELL actions: honest wording keyed off execution_status
+                    # (see the matching WS branch above for why -- same
+                    # "queued" dead-check replaced).
                     elif action in ("BUY", "SELL"):
-                        await telegram.send_trade_executed(
-                            ticker=ticker,
-                            stock_name=stock_name,
-                            action=action,
-                            quantity=proposal.get("quantity", 0),
-                            price=proposal.get("entry_price", 0),
-                            total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
-                        )
+                        if execution_status == "placed_pending_fill":
+                            order_response = state.get("order_response") or {}
+                            await telegram.send_trade_pending(
+                                ticker=ticker,
+                                stock_name=stock_name,
+                                action=action,
+                                quantity=proposal.get("quantity", 0),
+                                ord_no=order_response.get("ord_no"),
+                            )
+                        elif execution_status == "failed":
+                            await telegram.send_trade_rejected(
+                                ticker=ticker,
+                                stock_name=stock_name,
+                                reason=state.get("error") or "주문 실행 실패",
+                            )
+                        else:
+                            await telegram.send_trade_executed(
+                                ticker=ticker,
+                                stock_name=stock_name,
+                                action=action,
+                                quantity=proposal.get("quantity", 0),
+                                price=proposal.get("entry_price", 0),
+                                total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
+                            )
                 elif decision == "rejected":
                     await telegram.send_trade_rejected(
                         ticker=ticker,
@@ -567,8 +608,14 @@ async def _submit_decision_locked(
     if decision == "approved":
         if allocation_rationale and "watch list" in allocation_rationale.lower():
             message = f"{allocation_rationale}"
-        elif allocation_rationale and "queued" in allocation_rationale.lower():
-            message = f"Trade approved. {allocation_rationale}"
+        # I5: honest wording off the real execution_status -- replaces a
+        # "queued" substring check that never matched (allocation_rationale
+        # never contains that word), which meant this always fell through to
+        # "executed successfully" regardless of whether the order filled.
+        elif execution_status == "placed_pending_fill":
+            message = "Trade approved and order placed — fill pending confirmation."
+        elif execution_status == "failed":
+            message = "Trade approved but execution failed."
         else:
             message = "Trade approved and executed successfully."
     elif decision == "rejected":
@@ -796,6 +843,19 @@ async def _adopt_session_from_manager(
         return None
 
     legacy_session = sm_session.to_legacy_dict()
+
+    # I7: this adoption route is a SEPARATE restart-restore path from
+    # reconcile_stranded_sessions (which only clears auto_approve_at for
+    # sessions loaded at startup). A session adopted here can still be
+    # carrying a stale deadline from before the restart -- the in-process
+    # injector task that would have fired it is gone, so it can never
+    # legitimately elapse. Clear it defense-in-depth (never re-arm) and
+    # explain why, same wording as the reconcile path.
+    adopted_state = legacy_session["state"]
+    if adopted_state.pop("auto_approve_at", None) is not None:
+        adopted_state.setdefault("reasoning_log", []).append(
+            "재시작으로 자율 승인 타이머 해제 — 수동 승인 필요"
+        )
 
     # State-level awaiting check BEFORE registering: return unregistered so
     # the caller's own awaiting check raises 400 without leaving a zombie
