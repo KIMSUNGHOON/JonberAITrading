@@ -37,7 +37,11 @@ const BASE = {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockState = { activeMarket: 'kiwoom' };
+  mockState = {
+    activeMarket: 'kiwoom',
+    setActiveKiwoomSession: vi.fn(),
+    setAwaitingApproval: vi.fn(),
+  };
 });
 
 it('전 컬럼 헤더와 카운트를 렌더한다', async () => {
@@ -60,7 +64,15 @@ it('전 컬럼 헤더와 카운트를 렌더한다', async () => {
   expect(screen.getByText(/미체결 48주/)).toBeInTheDocument();
 });
 
-it('승인대기 항목의 승인 버튼이 submitApproval을 호출한다', async () => {
+// Task 7 (P2 funnel-consolidation): 승인대기 no longer carries its own
+// 승인/거부/취소 buttons — the SAME submitApproval endpoint was previously
+// reachable from here AND from the global OrderTicketRail simultaneously.
+// This column is now a read-only summary: clicking a row focuses that
+// session (setActiveKiwoomSession + setAwaitingApproval, which re-syncs the
+// rail's legacy proposal mirror from the session's own per-session state)
+// and navigates to its workflow view, where the rail is docked. See
+// OrderTicketRail.test.tsx for the retained approve/reject/cancel coverage.
+it('승인대기 항목에는 승인/거부/취소 버튼이 없다 — 클릭하면 세션을 포커스하고 주문 레일로 이동한다', async () => {
   getOperations.mockResolvedValue({
     ...BASE,
     awaiting: [{ session_id: 's2', ticker: '000660', name: 'SK하이닉스',
@@ -71,10 +83,16 @@ it('승인대기 항목의 승인 버튼이 submitApproval을 호출한다', asy
   });
   render(<OperationsPanel />);
   await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
-  fireEvent.click(screen.getByRole('button', { name: '승인' }));
-  await waitFor(() =>
-    expect(submitApproval).toHaveBeenCalledWith(
-      expect.objectContaining({ session_id: 's2', decision: 'approved' })));
+  expect(screen.queryByRole('button', { name: '승인' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '거부' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '취소' })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByText('SK하이닉스'));
+  expect(mockState.setActiveKiwoomSession).toHaveBeenCalledWith('s2');
+  expect(mockState.setAwaitingApproval).toHaveBeenCalledWith(true);
+  expect(navigate).toHaveBeenCalledWith('/workflow/s2');
+  // The approval decision itself is NEVER submitted from this surface.
+  expect(submitApproval).not.toHaveBeenCalled();
 });
 
 it('섹션 오류는 조회 실패로 정직 표기한다 (0 위장 금지)', async () => {
@@ -128,44 +146,27 @@ it('미체결 조회 실패 시 헤더는 조회 실패, 살아있는 큐 항목
   expect(screen.getByRole('button', { name: '대기 취소' })).toBeInTheDocument();
 });
 
-it('거부 액션 실패 시 오류를 표시하고 컬럼은 계속 렌더한다', async () => {
-  submitApproval.mockRejectedValueOnce(new Error('network down'));
+it('세션이 두 개 이상 승인대기 중이어도 각 행이 각자의 세션으로 포커스한다 (전부 도달 가능)', async () => {
   getOperations.mockResolvedValue({
     ...BASE,
-    awaiting: [{ session_id: 's4', ticker: '000660', name: 'SK하이닉스',
-                 proposal: { action: 'WATCH', entry_price: 1968000,
-                             stop_loss: 1810560, take_profit: 2125440,
-                             risk_score: 0.7 },
-                 auto_approve_at: null }],
+    awaiting: [
+      { session_id: 's4', ticker: '000660', name: 'SK하이닉스',
+        proposal: { action: 'WATCH', entry_price: 1968000 }, auto_approve_at: null },
+      { session_id: 's5', ticker: '005930', name: '삼성전자',
+        proposal: { action: 'BUY', entry_price: 70000 }, auto_approve_at: null },
+    ],
   });
   render(<OperationsPanel />);
-  await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
-  fireEvent.click(screen.getByRole('button', { name: '거부' }));
-  await waitFor(() => expect(screen.getByText(/거부 실패/)).toBeInTheDocument());
-  expect(screen.getByText(/network down/)).toBeInTheDocument();
-  // 보드는 계속 렌더한다 — 오류가 컬럼을 가리지 않는다
-  expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByText(/승인대기 · 2/)).toBeInTheDocument());
+  fireEvent.click(screen.getByText('삼성전자'));
+  expect(mockState.setActiveKiwoomSession).toHaveBeenCalledWith('s5');
+  expect(navigate).toHaveBeenCalledWith('/workflow/s5');
+  fireEvent.click(screen.getByText('SK하이닉스'));
+  expect(mockState.setActiveKiwoomSession).toHaveBeenCalledWith('s4');
+  expect(navigate).toHaveBeenCalledWith('/workflow/s4');
 });
 
-it('승인대기 항목의 취소 버튼이 cancelled decision으로 submitApproval을 호출하고 재조회한다', async () => {
-  getOperations.mockResolvedValue({
-    ...BASE,
-    awaiting: [{ session_id: 's5', ticker: '000660', name: 'SK하이닉스',
-                 proposal: { action: 'WATCH', entry_price: 1968000,
-                             stop_loss: 1810560, take_profit: 2125440,
-                             risk_score: 0.7 },
-                 auto_approve_at: null }],
-  });
-  render(<OperationsPanel />);
-  await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
-  fireEvent.click(screen.getByRole('button', { name: '취소' }));
-  await waitFor(() =>
-    expect(submitApproval).toHaveBeenCalledWith(
-      expect.objectContaining({ session_id: 's5', decision: 'cancelled' })));
-  expect(getOperations.mock.calls.length).toBeGreaterThanOrEqual(2); // 액션 후 재조회
-});
-
-it('actionable=false인 승인대기 항목은 승인/거부가 비활성화되고 취소만 가능하다 (좀비 부활 방지)', async () => {
+it('actionable=false인 승인대기 항목은 버튼 없이 상태 불일치만 안내하고, 클릭 시에도 여전히 레일로 포커스한다 (좀비 부활 방지 정보는 유지, 액션은 이중화하지 않음)', async () => {
   getOperations.mockResolvedValue({
     ...BASE,
     awaiting: [{ session_id: 's6', ticker: '005930', name: '삼성전자',
@@ -174,9 +175,13 @@ it('actionable=false인 승인대기 항목은 승인/거부가 비활성화되�
   });
   render(<OperationsPanel />);
   await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
-  expect(screen.getByRole('button', { name: '승인' })).toBeDisabled();
-  expect(screen.getByRole('button', { name: '거부' })).toBeDisabled();
-  expect(screen.getByRole('button', { name: '취소' })).not.toBeDisabled();
+  expect(screen.getByText(/세션 상태 불일치/)).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '승인' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '거부' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '취소' })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByText('삼성전자'));
+  expect(mockState.setActiveKiwoomSession).toHaveBeenCalledWith('s6');
+  expect(submitApproval).not.toHaveBeenCalled();
 });
 
 it('미체결 취소 버튼이 cancelKRStockOrder를 호출하고 재조회한다', async () => {

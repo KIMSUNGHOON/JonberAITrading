@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { OrderTicketRail } from './OrderTicketRail';
 
 // Controlled store: `useStore` runs the real selector against `mockState`, so
@@ -129,6 +129,33 @@ describe('OrderTicketRail — decisions', () => {
     fireEvent.keyDown(window, { key: 'Enter', metaKey: true }); // ⌘⏎ focuses Approve
     expect(submitApproval).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: /approve/i })).toHaveFocus();
+  });
+
+  // Task 7 (P2 funnel-consolidation): reject/cancel coverage that used to
+  // live on OperationsPanel's now-defunct 승인대기 buttons (they called this
+  // SAME submitApproval endpoint) — pinned here instead, since the rail is
+  // now the ONE surface that submits an approval decision.
+  it('Reject calls submitApproval with {session_id, rejected}', async () => {
+    render(<OrderTicketRail />);
+    fireEvent.click(screen.getByRole('button', { name: /reject|re-analyze/i }));
+    expect(submitApproval).toHaveBeenCalledWith(
+      expect.objectContaining({ session_id: 'sess-1', decision: 'rejected' }),
+    );
+  });
+
+  it('Cancel Analysis calls submitApproval with {session_id, cancelled}', async () => {
+    render(<OrderTicketRail />);
+    fireEvent.click(screen.getByRole('button', { name: /cancel analysis/i }));
+    expect(submitApproval).toHaveBeenCalledWith(
+      expect.objectContaining({ session_id: 'sess-1', decision: 'cancelled' }),
+    );
+  });
+
+  it('a rejected submitApproval surfaces the error via setError (no silent failure)', async () => {
+    submitApproval.mockRejectedValueOnce(new Error('network down'));
+    render(<OrderTicketRail />);
+    fireEvent.click(screen.getByRole('button', { name: /approve/i }));
+    await waitFor(() => expect(mockState.setError).toHaveBeenCalledWith('network down'));
   });
 });
 

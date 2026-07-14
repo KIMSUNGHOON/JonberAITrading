@@ -156,7 +156,14 @@ describe('FunnelPanel — PIPELINE section (honest-degrade preserved)', () => {
     expect(screen.queryByText(/매수대기 · 0/)).not.toBeInTheDocument();
   });
 
-  it('승인 버튼이 submitApproval을 호출한다 (PIPELINE 재사용 확인)', async () => {
+  // Task 7 (P2 funnel-consolidation): PIPELINE's 승인대기 column no longer
+  // has its own 승인/거부/취소 buttons — with FunnelPanel now ALSO reusing
+  // AwaitingColumn (Task 5), that would have been a THIRD place the same
+  // submitApproval endpoint was directly reachable from (alongside
+  // OperationsPanel and the global OrderTicketRail). Clicking a row here
+  // only focuses the session + navigates to its workflow view, where the
+  // rail is docked and handles the actual decision.
+  it('승인대기 항목에는 승인/거부/취소 버튼이 없다 — 클릭하면 주문 레일로 이동한다 (PIPELINE 재사용, 이중화 제거 확인)', async () => {
     getOperations.mockResolvedValue({
       ...OPERATIONS_BASE,
       awaiting: [{ session_id: 's2', ticker: '000660', name: 'SK하이닉스',
@@ -166,9 +173,12 @@ describe('FunnelPanel — PIPELINE section (honest-degrade preserved)', () => {
     });
     render(<FunnelPanel />);
     await waitFor(() => expect(screen.getByText(/승인대기 · 1/)).toBeInTheDocument());
-    fireEvent.click(screen.getByRole('button', { name: '승인' }));
-    await waitFor(() =>
-      expect(submitApproval).toHaveBeenCalledWith(
-        expect.objectContaining({ session_id: 's2', decision: 'approved' })));
+    expect(screen.queryByRole('button', { name: '승인' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '거부' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '취소' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('SK하이닉스'));
+    expect(navigate).toHaveBeenCalledWith('/workflow/s2');
+    expect(submitApproval).not.toHaveBeenCalled();
   });
 });

@@ -25,6 +25,12 @@
  * WATCHLIST and PIPELINE share the ONE `useOperations()` poll below (not two
  * independent polls) so a queue conversion in WATCHLIST is reflected in
  * PIPELINE's 매수대기 column on the very next shared refetch.
+ *
+ * Task 7 (P2 funnel-consolidation): PIPELINE's 승인대기 column (AwaitingColumn)
+ * is a read-only summary, not a THIRD place to approve/reject a proposal —
+ * see OperationsPanel.tsx's module doc and AwaitingColumn's doc comment. The
+ * global OrderTicketRail is the one surface that calls submitApproval;
+ * clicking a row here just focuses that session and navigates there.
  */
 import { useNavigate } from 'react-router-dom';
 import { DiscoverySection } from './DiscoverySection';
@@ -41,10 +47,10 @@ export function FunnelPanel() {
   const navigate = useNavigate();
   const { activeMarket, data, state, err, refetch } = useOperations();
   const {
-    submittingSession, actionError, setActionError,
-    handleCancelAnalysis, handleDecide, handleConvertWatch, handleRemoveWatch,
+    actionError, setActionError,
+    handleCancelAnalysis, handleFocusAwaiting, handleConvertWatch, handleRemoveWatch,
     handleDismissQueue, handleCancelOrder,
-  } = useOperationsActions(refetch);
+  } = useOperationsActions(refetch, navigate);
 
   const market = activeMarket === 'coin' ? 'coin' : 'kiwoom';
 
@@ -105,8 +111,7 @@ export function FunnelPanel() {
               items={data.awaiting}
               errors={data.errors}
               activeMarket={market}
-              submitting={submittingSession}
-              onDecide={handleDecide}
+              onFocus={handleFocusAwaiting}
             />
             <PendingBuyColumn
               pendingBuy={data.pending_buy}

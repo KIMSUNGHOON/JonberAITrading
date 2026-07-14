@@ -7,12 +7,19 @@
  * columns) is hidden outright. Polls every 5s and refetches immediately on
  * any trade-notification push so the board tracks live state without a
  * manual refresh.
+ *
+ * Task 7 (P2 funnel-consolidation): the 승인대기 column (AwaitingColumn,
+ * below) no longer carries its own approve/reject/cancel buttons — it is a
+ * read-only summary that focuses the session and deep-links into the global
+ * OrderTicketRail (frontend/src/components/terminal/OrderTicketRail.tsx),
+ * which is now the ONE surface that calls submitApproval. Previously the
+ * same pending approval was actionable from both places at once.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStore } from '@/store';
 import {
-  getOperations, submitApproval, cancelKRStockSession, convertWatchToQueue,
+  getOperations, cancelKRStockSession, convertWatchToQueue,
   removeFromWatchList, dismissTrade, cancelKRStockOrder,
 } from '@/api/client';
 import { useTradeNotifications } from '@/hooks/useTradeNotifications';
@@ -159,14 +166,31 @@ function AwaitingCountdown({ autoApproveAt }: { autoApproveAt: string }) {
   );
 }
 
+// Task 7 (P2 funnel-consolidation): this column used to carry its own
+// 승인/거부/취소 buttons calling submitApproval directly — the SAME endpoint
+// the global OrderTicketRail (frontend/src/components/terminal/
+// OrderTicketRail.tsx) already calls for the active session's ticket. With
+// both surfaces live at once (and now THREE places once FunnelPanel's
+// PIPELINE section reused this column too — Task 5), the same pending
+// approval was actionable from multiple places simultaneously: confusing,
+// and safety-adjacent since these buttons approve real paper trades.
+//
+// Resolution: OrderTicketRail is the ONE authoritative approval surface
+// (it's global/always-docked, unlike this column which only appears inside
+// whichever panel is currently tiled in). This column is now a read-only
+// summary — clicking a row calls `onFocus`, which makes that session the
+// active one (mirroring its own per-session tradeProposal/awaitingApproval
+// into the legacy fields OrderTicketRail reads — see setActiveKiwoomSession)
+// and navigates to its workflow view, where the rail shows the full ticket
+// with APPROVE/REJECT/Cancel Analysis. No action (approve/reject/cancel) is
+// lost — all three remain reachable, just from a single place.
 export function AwaitingColumn({
-  items, errors, activeMarket, submitting, onDecide,
+  items, errors, activeMarket, onFocus,
 }: {
   items: OperationsResponse['awaiting'];
   errors: Record<string, string>;
   activeMarket: 'kiwoom' | 'coin';
-  submitting: string | null;
-  onDecide: (sessionId: string, decision: 'approved' | 'rejected' | 'cancelled') => void;
+  onFocus: (sessionId: string) => void;
 }) {
   if (!columnVisible(items, 'sessions', errors)) return null;
   return (
@@ -179,45 +203,26 @@ export function AwaitingColumn({
         const stop = typeof proposal.stop_loss === 'number' ? proposal.stop_loss : null;
         const take = typeof proposal.take_profit === 'number' ? proposal.take_profit : null;
         const risk = typeof proposal.risk_score === 'number' ? proposal.risk_score : null;
-        const isSubmitting = submitting === a.session_id;
         const notActionable = a.actionable === false;
-        const disabledTitle = '세션 상태 불일치 — 취소만 가능';
         return (
-          <div key={a.session_id} className={CARD}>
+          <div
+            key={a.session_id}
+            role="button"
+            tabIndex={0}
+            onClick={() => onFocus(a.session_id)}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onFocus(a.session_id); } }}
+            title="주문 레일에서 승인/거부/취소를 처리합니다"
+            className={`${CARD} cursor-pointer hover:bg-elevated/40`}
+          >
             <div className="font-semibold">{a.name || a.ticker}</div>
             <div className="text-muted">
               {action} · 진입 {fmtPrice(entry, activeMarket)} · 손절 {fmtPrice(stop, activeMarket)} · 익절 {fmtPrice(take, activeMarket)} · 리스크 {risk != null ? `${risk}/10` : DASH}
             </div>
             {a.auto_approve_at && <AwaitingCountdown autoApproveAt={a.auto_approve_at} />}
-            <div className="flex gap-2 mt-1">
-              <button
-                type="button"
-                disabled={isSubmitting || notActionable}
-                onClick={() => onDecide(a.session_id, 'approved')}
-                title={notActionable ? disabledTitle : '제안을 승인합니다 (WATCH는 워치리스트 등록)'}
-                className={`text-up font-medium disabled:opacity-50 ${notActionable ? 'cursor-not-allowed' : ''}`}
-              >
-                승인
-              </button>
-              <button
-                type="button"
-                disabled={isSubmitting || notActionable}
-                onClick={() => onDecide(a.session_id, 'rejected')}
-                title={notActionable ? disabledTitle : '거부하고 재분석을 요청합니다 — 잠시 후 새 제안이 돌아옵니다'}
-                className={`text-warn font-medium disabled:opacity-50 ${notActionable ? 'cursor-not-allowed' : ''}`}
-              >
-                거부
-              </button>
-              <button
-                type="button"
-                disabled={isSubmitting}
-                onClick={() => onDecide(a.session_id, 'cancelled')}
-                title="재분석 없이 세션을 종료합니다"
-                className="text-dim hover:text-down font-medium disabled:opacity-50"
-              >
-                취소
-              </button>
-            </div>
+            {notActionable && (
+              <div className="text-[10px] text-warn mt-0.5">세션 상태 불일치 · 취소만 가능</div>
+            )}
+            <div className="text-accent text-[10px] font-medium mt-1">주문 레일에서 처리 →</div>
           </div>
         );
       })}
@@ -448,14 +453,19 @@ export function TodayFillsColumn({
 
 // -------------------------------------------
 // Shared action handlers — exported so FunnelPanel's WATCHLIST + PIPELINE
-// sections dispatch the exact same mutations (submitApproval/
-// convertWatchToQueue/removeFromWatchList/dismissTrade/cancelKRStockOrder/
-// cancelKRStockSession) against the ONE `refetch` from `useOperations()`,
-// instead of re-deriving the wiring.
+// sections dispatch the exact same mutations (convertWatchToQueue/
+// removeFromWatchList/dismissTrade/cancelKRStockOrder/cancelKRStockSession)
+// against the ONE `refetch` from `useOperations()`, instead of re-deriving
+// the wiring. `submitApproval` is deliberately NOT called from here (Task 7,
+// P2 funnel-consolidation) — approve/reject/cancel of an awaiting proposal is
+// handled EXCLUSIVELY by the global OrderTicketRail now; `handleFocusAwaiting`
+// below only navigates the user there instead of duplicating the decision.
 // -------------------------------------------
 
-export function useOperationsActions(refetch: () => void) {
-  const [submittingSession, setSubmittingSession] = useState<string | null>(null);
+export function useOperationsActions(refetch: () => void, navigate: (path: string) => void) {
+  const activeMarket = useStore((s) => s.activeMarket);
+  const setActiveKiwoomSession = useStore((s) => s.setActiveKiwoomSession);
+  const setAwaitingApproval = useStore((s) => s.setAwaitingApproval);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const handleCancelAnalysis = useCallback(async (sessionId: string) => {
@@ -469,19 +479,23 @@ export function useOperationsActions(refetch: () => void) {
     }
   }, [refetch]);
 
-  const handleDecide = useCallback(async (sessionId: string, decision: 'approved' | 'rejected' | 'cancelled') => {
-    setSubmittingSession(sessionId);
-    try {
-      await submitApproval({ session_id: sessionId, decision });
-      setActionError(null);
-    } catch (e) {
-      const label = decision === 'approved' ? '승인' : decision === 'rejected' ? '거부' : '취소';
-      setActionError(`${label} 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
-    } finally {
-      setSubmittingSession(null);
-      refetch();
+  // Task 7: routes an awaiting session into the ONE authoritative approval
+  // surface (OrderTicketRail) instead of submitting approve/reject/cancel
+  // directly from this read-only summary column. For kiwoom, making the
+  // session the ACTIVE one re-syncs the rail's legacy tradeProposal/
+  // awaitingApproval mirror from that session's own per-session fields (see
+  // setActiveKiwoomSession in store/index.ts) — those fields are already kept
+  // current per-session by the live WS handlers regardless of which session
+  // is active, so switching + navigating is enough to surface the full
+  // ticket. Coin has no sessions[] array to switch (a single tracked
+  // session) — navigating there is sufficient.
+  const handleFocusAwaiting = useCallback((sessionId: string) => {
+    if (activeMarket === 'kiwoom') {
+      setActiveKiwoomSession(sessionId);
+      setAwaitingApproval(true);
     }
-  }, [refetch]);
+    navigate(`/workflow/${sessionId}`);
+  }, [activeMarket, setActiveKiwoomSession, setAwaitingApproval, navigate]);
 
   const handleConvertWatch = useCallback(async (watchId: string) => {
     try {
@@ -528,8 +542,8 @@ export function useOperationsActions(refetch: () => void) {
   }, [refetch]);
 
   return {
-    submittingSession, actionError, setActionError,
-    handleCancelAnalysis, handleDecide, handleConvertWatch, handleRemoveWatch,
+    actionError, setActionError,
+    handleCancelAnalysis, handleFocusAwaiting, handleConvertWatch, handleRemoveWatch,
     handleDismissQueue, handleCancelOrder,
   };
 }
@@ -542,10 +556,10 @@ export function OperationsPanel() {
   const { activeMarket, data, state, err, refetch } = useOperations();
   const navigate = useNavigate();
   const {
-    submittingSession, actionError, setActionError,
-    handleCancelAnalysis, handleDecide, handleConvertWatch, handleRemoveWatch,
+    actionError, setActionError,
+    handleCancelAnalysis, handleFocusAwaiting, handleConvertWatch, handleRemoveWatch,
     handleDismissQueue, handleCancelOrder,
-  } = useOperationsActions(refetch);
+  } = useOperationsActions(refetch, navigate);
 
   if (state === 'loading') return <Awaiting label="운용 현황 로드 중…" />;
   if (state === 'error') return <Awaiting label={`운용 현황 오류 · ${err}`} />;
@@ -579,8 +593,7 @@ export function OperationsPanel() {
           items={data.awaiting}
           errors={data.errors}
           activeMarket={market}
-          submitting={submittingSession}
-          onDecide={handleDecide}
+          onFocus={handleFocusAwaiting}
         />
         <WatchingColumn
           items={data.watching}
