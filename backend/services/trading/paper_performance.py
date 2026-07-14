@@ -16,11 +16,24 @@ from services.kiwoom.models import DailyRealizedPnlRow, RealizedPnl
 
 
 class DailyPnlPoint(TypedDict):
-    """일별 손익 시계열 포인트 (차트 소비용, dt 오름차순 가정)."""
+    """일별 손익 시계열 포인트 (차트 소비용, dt 오름차순으로 정렬됨)."""
 
     dt: str
     pnl: int
     cumulative_pnl: int
+
+
+def _dt_sort_key(dt: str, index: int) -> tuple[int, object]:
+    """daily_pnl_series 정렬 키.
+
+    dt가 YYYYMMDD 8자리 숫자면 (0, dt) — 문자열 비교가 곧 날짜 오름차순이다
+    (자리수 고정 zero-padded). 파싱 불가한 dt는 (1, index)로 원래 순서를
+    유지한 채 뒤로 보낸다 (크래시 방지, 정렬 불능이라 값을 신뢰할 수 없음을
+    표시). 첫 원소가 다르면 둘째 원소(str vs int)는 비교되지 않는다.
+    """
+    if isinstance(dt, str) and len(dt) == 8 and dt.isdigit():
+        return (0, dt)
+    return (1, index)
 
 
 def compute_daily_win_loss(
@@ -51,12 +64,17 @@ def compute_cumulative_return_pct(
 def daily_pnl_series(daily: list[DailyRealizedPnlRow]) -> list[DailyPnlPoint]:
     """일별 손익 + 누적 손익 시계열 (차트/API 소비용).
 
-    ka10074 dt_rlzt_pl은 일자 오름차순으로 온다고 가정 — 누적합은 그 순서를
-    그대로 따른다.
+    ka10074 dt_rlzt_pl의 브로커 응답 순서와 무관하게 dt 오름차순으로 정렬한
+    뒤 누적합을 계산한다 (Kiwoom이 내림차순/뒤섞인 순서로 줘도 누적 P&L이
+    역방향으로 도는 것을 방지). dt를 8자리 숫자로 파싱할 수 없는 행은 정렬
+    불능으로 보고 원래 순서를 유지한 채 뒤로 보낸다 (크래시하지 않음).
     """
+    ordered = sorted(
+        enumerate(daily), key=lambda pair: _dt_sort_key(pair[1].dt, pair[0])
+    )
     cumulative = 0
     points: list[DailyPnlPoint] = []
-    for d in daily:
+    for _, d in ordered:
         cumulative += d.sell_pnl
         points.append({"dt": d.dt, "pnl": d.sell_pnl, "cumulative_pnl": cumulative})
     return points

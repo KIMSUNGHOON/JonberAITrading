@@ -151,3 +151,43 @@ class TestDailyPnlSeries:
 
     def test_empty_daily_returns_empty_list(self):
         assert daily_pnl_series([]) == []
+
+    def test_descending_input_is_sorted_ascending_before_cumsum(self):
+        """Kiwoom(ka10074)이 내림차순으로 줘도 누적합은 정방향이어야 한다."""
+        daily = [
+            _row("20260708", sell_pnl=120_000),
+            _row("20260707", sell_pnl=-30_000),
+            _row("20260706", sell_pnl=50_000),
+        ]
+        points = daily_pnl_series(daily)
+        assert points == [
+            {"dt": "20260706", "pnl": 50_000, "cumulative_pnl": 50_000},
+            {"dt": "20260707", "pnl": -30_000, "cumulative_pnl": 20_000},
+            {"dt": "20260708", "pnl": 120_000, "cumulative_pnl": 140_000},
+        ]
+
+    def test_shuffled_input_is_sorted_ascending_before_cumsum(self):
+        daily = [
+            _row("20260707", sell_pnl=-30_000),
+            _row("20260706", sell_pnl=50_000),
+            _row("20260709", sell_pnl=10_000),
+            _row("20260708", sell_pnl=120_000),
+        ]
+        points = daily_pnl_series(daily)
+        assert [p["dt"] for p in points] == [
+            "20260706", "20260707", "20260708", "20260709",
+        ]
+        assert [p["cumulative_pnl"] for p in points] == [
+            50_000, 20_000, 140_000, 150_000,
+        ]
+
+    def test_malformed_dt_does_not_crash_and_sorts_last(self):
+        """dt가 8자리 숫자가 아닌 행은 정렬 불가 — 크래시 없이 뒤로 보낸다."""
+        daily = [
+            _row("20260708", sell_pnl=10_000),
+            _row("", sell_pnl=5_000),
+            _row("20260706", sell_pnl=50_000),
+        ]
+        points = daily_pnl_series(daily)
+        assert [p["dt"] for p in points] == ["20260706", "20260708", ""]
+        assert [p["cumulative_pnl"] for p in points] == [50_000, 60_000, 65_000]
