@@ -21,7 +21,7 @@
  * having to satisfy ChatSessionViewer's/PositionMonitor's own network calls.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { act, render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 
 import type {
@@ -34,12 +34,14 @@ const startAgentChat = vi.fn();
 const stopAgentChat = vi.fn();
 const getAgentChatActiveDiscussions = vi.fn();
 const getAgentChatSessions = vi.fn();
+const startAgentChatDiscussion = vi.fn();
 vi.mock('@/api/client', () => ({
   getAgentChatStatus: (...a: unknown[]) => getAgentChatStatus(...a),
   startAgentChat: (...a: unknown[]) => startAgentChat(...a),
   stopAgentChat: (...a: unknown[]) => stopAgentChat(...a),
   getAgentChatActiveDiscussions: (...a: unknown[]) => getAgentChatActiveDiscussions(...a),
   getAgentChatSessions: (...a: unknown[]) => getAgentChatSessions(...a),
+  startAgentChatDiscussion: (...a: unknown[]) => startAgentChatDiscussion(...a),
 }));
 
 // Stubs — the point of this suite is AgentChatDashboard's own layout/status
@@ -228,8 +230,13 @@ describe('루프 생존 가시화 (last_check_at)', () => {
       renderDashboard();
       await flushMicrotasks();
 
-      expect(screen.getByText(/다음 점검까지/)).toBeInTheDocument();
-      expect(screen.getByText(/마지막 점검/)).toBeInTheDocument();
+      // B3 added a second "다음 점검까지 …" phrase (Active Discussions'
+      // honest empty-state) — scope to the Status Card's heartbeat row so
+      // this stays a pin on that row specifically, not "exactly one match
+      // anywhere on the page".
+      const heartbeat = screen.getByTestId('coordinator-heartbeat');
+      expect(within(heartbeat).getByText(/다음 점검까지/)).toBeInTheDocument();
+      expect(within(heartbeat).getByText(/마지막 점검/)).toBeInTheDocument();
       // 5min interval - 30s elapsed = 270s = 04:30 remaining.
       expect(screen.getByText('04:30')).toBeInTheDocument();
     } finally {
@@ -266,7 +273,12 @@ describe('루프 생존 가시화 (last_check_at)', () => {
       renderDashboard();
       await flushMicrotasks();
 
-      expect(screen.getByText(/루프 응답 지연/)).toBeInTheDocument();
+      // B3's Active Discussions empty-state uses its own distinct stale
+      // wording ("점검 루프 응답 없음") specifically so it doesn't collide
+      // with this row's "루프 응답 지연" — scope here to pin that
+      // specifically instead of "exactly one match anywhere on the page".
+      const heartbeat = screen.getByTestId('coordinator-heartbeat');
+      expect(within(heartbeat).getByText(/루프 응답 지연/)).toBeInTheDocument();
       // No confident countdown while the loop reads as dead.
       expect(screen.queryByText(/다음 점검까지/)).not.toBeInTheDocument();
     } finally {
@@ -282,5 +294,104 @@ describe('루프 생존 가시화 (last_check_at)', () => {
     await screen.findByText('마지막 점검');
     expect(screen.queryByText(/다음 점검까지/)).not.toBeInTheDocument();
     expect(screen.queryByText(/루프 응답 지연/)).not.toBeInTheDocument();
+  });
+});
+
+// B3 — this page previously had no way to say "debate this ticker now": the
+// only caller of startAgentChatDiscussion was ⌘K's CommandPalette. These
+// pin the in-page manual debate input/button, reusing the exact same
+// client call CommandPalette uses.
+describe('페이지 내 수동 토론 시작 (B3)', () => {
+  it('종목코드 입력 후 제출하면 startAgentChatDiscussion을 호출하고 새 세션을 연다', async () => {
+    startAgentChatDiscussion.mockResolvedValue({
+      session_id: 'new-1',
+      ticker: '005930',
+      stock_name: '005930',
+      status: 'initializing',
+      started_at: new Date().toISOString(),
+      message: 'ok',
+    });
+    renderDashboard();
+    await screen.findByTestId('chat-session-list');
+
+    const input = screen.getByPlaceholderText('종목코드 (예: 005930)');
+    fireEvent.change(input, { target: { value: '005930' } });
+    fireEvent.click(screen.getByRole('button', { name: '토론 시작' }));
+
+    await waitFor(() =>
+      expect(startAgentChatDiscussion).toHaveBeenCalledWith({ ticker: '005930', stock_name: '005930' }),
+    );
+    // "surface the new/active discussion" — the resulting session opens.
+    await waitFor(() => expect(screen.getByTestId('chat-session-viewer')).toBeInTheDocument());
+    expect(screen.getByText('viewing:new-1')).toBeInTheDocument();
+  });
+
+  it('토론 시작 실패 시 정직한 에러를 보여준다(무음 실패 없음)', async () => {
+    startAgentChatDiscussion.mockRejectedValue(new Error('중복 토론 진행 중'));
+    renderDashboard();
+    await screen.findByTestId('chat-session-list');
+
+    const input = screen.getByPlaceholderText('종목코드 (예: 005930)');
+    fireEvent.change(input, { target: { value: '005930' } });
+    fireEvent.click(screen.getByRole('button', { name: '토론 시작' }));
+
+    await waitFor(() => expect(startAgentChatDiscussion).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByText('중복 토론 진행 중')).toBeInTheDocument());
+    // Failure must not silently look like success.
+    expect(screen.queryByTestId('chat-session-viewer')).not.toBeInTheDocument();
+  });
+
+  it('빈 종목코드로는 제출 버튼이 비활성화된다', async () => {
+    renderDashboard();
+    await screen.findByTestId('chat-session-list');
+
+    expect(screen.getByRole('button', { name: '토론 시작' })).toBeDisabled();
+  });
+});
+
+// B3 — Active Discussions used to vanish entirely at 0, with no
+// explanation of why or when the next check runs
+// (`AgentChatDashboard.tsx:269` pre-B3). It must now stay and say why.
+describe('Active Discussions 빈 상태 정직화 (B3)', () => {
+  it('가동 중이고 활성 토론이 없으면 사라지지 않고 다음 점검 카운트다운을 보여준다', async () => {
+    vi.useFakeTimers();
+    try {
+      const fixedNow = new Date('2026-07-14T09:05:00+09:00');
+      vi.setSystemTime(fixedNow);
+      const lastCheck = new Date(fixedNow.getTime() - 30_000).toISOString(); // 30s ago
+
+      getAgentChatStatus.mockResolvedValue(
+        baseStatus({ is_running: true, last_check_at: lastCheck, check_interval_minutes: 5 }),
+      );
+      getAgentChatActiveDiscussions.mockResolvedValue({ discussions: [], count: 0 });
+
+      renderDashboard();
+      await flushMicrotasks();
+
+      const section = screen.getByTestId('active-discussions');
+      // 5min interval - 30s elapsed = 270s = 04:30 remaining.
+      expect(within(section).getByText('다음 점검까지 04:30 · 조건 충족 종목 없음')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('코디네이터가 꺼져 있으면 실동작과 일치하는 문구("자동 모니터링이 꺼져 있습니다")를 보여준다', async () => {
+    getAgentChatStatus.mockResolvedValue(baseStatus({ is_running: false }));
+    getAgentChatActiveDiscussions.mockResolvedValue({ discussions: [], count: 0 });
+
+    renderDashboard();
+    await screen.findByTestId('active-discussions');
+
+    const section = screen.getByTestId('active-discussions');
+    expect(within(section).getByText(/자동 모니터링이 꺼져 있습니다/)).toBeInTheDocument();
+  });
+
+  it('세션 상세를 보고 있을 때는 여전히 숨겨진다(리스트가 그 카드를 이미 보여줌)', async () => {
+    getAgentChatActiveDiscussions.mockResolvedValue({ discussions: [], count: 0 });
+    renderDashboard('/agent-chat?session=s1');
+
+    await screen.findByTestId('chat-session-viewer');
+    expect(screen.queryByTestId('active-discussions')).not.toBeInTheDocument();
   });
 });

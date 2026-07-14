@@ -33,6 +33,7 @@ import {
   stopAgentChat,
   getAgentChatActiveDiscussions,
   getAgentChatSessions,
+  startAgentChatDiscussion,
 } from '@/api/client';
 import type {
   AgentChatCoordinatorStatus,
@@ -81,6 +82,13 @@ export function AgentChatDashboard() {
     check_interval_minutes: 5,
     max_concurrent_discussions: 3,
   });
+
+  // B3: in-page manual debate — this page previously had no way to say "debate
+  // this ticker now"; the only caller of startAgentChatDiscussion was ⌘K
+  // (CommandPalette.tsx). Reuses the exact same client call/request shape.
+  const [debateTicker, setDebateTicker] = useState('');
+  const [debateLoading, setDebateLoading] = useState(false);
+  const [debateError, setDebateError] = useState<string | null>(null);
 
   // Selection lives in the URL (`?session=<id>`), not local-only state: this
   // is what makes DebatePanel's session-id deep link (B1) actually land on
@@ -131,6 +139,16 @@ export function AgentChatDashboard() {
     const nextAt = new Date(status.last_check_at).getTime() + intervalMs;
     const remaining = nextAt - nowTick;
     return remaining > 0 ? formatCountdownMMSS(remaining) : '점검 중…';
+  })();
+
+  // B3 — Active Discussions used to vanish entirely at 0 (no explanation of
+  // why / when the next check runs). This is the honest replacement text
+  // for that state, reusing the same last_check/interval math as the
+  // countdown above (not a separate, possibly-inconsistent computation).
+  const activeDiscussionsEmptyText = (() => {
+    if (!status?.is_running) return '자동 모니터링이 꺼져 있습니다 · 조건 충족 종목 없음';
+    if (liveness === 'stale') return '점검 루프 응답 없음 — 다음 점검 시각 불명 · 조건 충족 종목 없음';
+    return `다음 점검까지 ${nextCheckLabel} · 조건 충족 종목 없음`;
   })();
 
   const fetchData = useCallback(async () => {
@@ -189,6 +207,37 @@ export function AgentChatDashboard() {
       setActionLoading(false);
     }
   };
+
+  // B3 — "debate this ticker right now", distinct from `handleStart` above
+  // (which only arms the 5-minute watch-list scheduler). Also used as the
+  // fallback action for PositionMonitor's "Discussion Required" event badge
+  // when no existing/active session matches that ticker — so the badge is
+  // never a dead end, it always leads somewhere real.
+  const handleStartDebate = useCallback(
+    async (ticker: string, stockName?: string) => {
+      const trimmed = ticker.trim();
+      if (!trimmed) {
+        setDebateError('종목코드를 입력하세요');
+        return;
+      }
+      try {
+        setDebateLoading(true);
+        setDebateError(null);
+        const result = await startAgentChatDiscussion({
+          ticker: trimmed,
+          stock_name: stockName?.trim() || trimmed,
+        });
+        setDebateTicker('');
+        await fetchData();
+        selectSession(result.session_id);
+      } catch (err) {
+        setDebateError(err instanceof Error ? err.message : '토론 시작 실패');
+      } finally {
+        setDebateLoading(false);
+      }
+    },
+    [fetchData, selectSession],
+  );
 
   if (loading) {
     return (
@@ -276,7 +325,10 @@ export function AgentChatDashboard() {
             time — previously only the shell's LoopLivenessChip consumed it).
             A stale/absent heartbeat must read as honest, not as a confident
             "just checked" or a fake countdown. */}
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-6 text-xs text-muted">
+        <div
+          className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-6 text-xs text-muted"
+          data-testid="coordinator-heartbeat"
+        >
           <span>
             마지막 점검 <span className="text-ink tabular-nums">{lastCheckLabel}</span>
           </span>
@@ -354,38 +406,93 @@ export function AgentChatDashboard() {
         </div>
       </div>
 
+      {/* Manual debate (B3) — this page previously had no way to say "debate
+          this ticker now"; that only existed in ⌘K (CommandPalette.tsx).
+          Kept visible in both browsing and detail views since "start a
+          debate for some other ticker" is a valid action regardless of
+          what's currently on screen. */}
+      <div className="bg-card rounded border border-hairline p-6">
+        <h3 className="text-lg font-medium text-ink mb-3 flex items-center gap-2">
+          <MessageSquare className="w-5 h-5 text-accent" />
+          지금 토론 시작
+        </h3>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            handleStartDebate(debateTicker);
+          }}
+          className="flex items-center gap-3"
+        >
+          <input
+            type="text"
+            value={debateTicker}
+            onChange={(e) => setDebateTicker(e.target.value)}
+            placeholder="종목코드 (예: 005930)"
+            aria-label="토론할 종목코드"
+            disabled={debateLoading}
+            className="flex-1 px-3 py-2 bg-elevated border border-hairline rounded-lg text-ink text-sm placeholder:text-dim disabled:opacity-50"
+          />
+          <button
+            type="submit"
+            disabled={debateLoading || !debateTicker.trim()}
+            className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent/90 disabled:opacity-50 text-canvas rounded-lg whitespace-nowrap"
+          >
+            {debateLoading ? (
+              <RefreshCw className="w-4 h-4 animate-spin" />
+            ) : (
+              <MessageSquare className="w-4 h-4" />
+            )}
+            토론 시작
+          </button>
+        </form>
+        {debateError && <p className="text-sm text-down mt-2">{debateError}</p>}
+        <p className="text-xs text-muted mt-2">
+          특정 종목을 지금 바로 4-애널리스트 토론에 부칩니다 — 5분 주기 자동 모니터링과는 별개입니다.
+        </p>
+      </div>
+
       {/* Active Discussions — hidden while the detail pane is open (the
           session list to the left already shows this session's card; the
-          detail pane is where attention belongs). */}
-      {!selectedSessionId && activeDiscussions.length > 0 && (
-        <div className="bg-card rounded border border-hairline p-6">
+          detail pane is where attention belongs). At 0 this used to vanish
+          with no explanation; now it stays and says why (next-check
+          countdown / loop state) instead of just disappearing. */}
+      {!selectedSessionId && (
+        <div className="bg-card rounded border border-hairline p-6" data-testid="active-discussions">
           <h3 className="text-lg font-medium text-ink mb-4 flex items-center gap-2">
-            <div className="w-2 h-2 bg-accent rounded-full animate-pulse" />
+            <div
+              className={`w-2 h-2 rounded-full ${
+                activeDiscussions.length > 0 ? 'bg-accent animate-pulse' : 'bg-muted'
+              }`}
+            />
             Active Discussions
           </h3>
-          <div className="space-y-3">
-            {activeDiscussions.map((discussion) => (
-              <div
-                key={discussion.session_id}
-                className="flex items-center justify-between p-4 bg-elevated rounded-lg cursor-pointer hover:bg-hairline"
-                onClick={() => selectSession(discussion.session_id)}
-              >
-                <div>
-                  <div className="text-ink font-medium">
-                    {discussion.stock_name} ({discussion.ticker})
+          {activeDiscussions.length > 0 ? (
+            <div className="space-y-3">
+              {activeDiscussions.map((discussion) => (
+                <div
+                  key={discussion.session_id}
+                  className="flex items-center justify-between p-4 bg-elevated rounded-lg cursor-pointer hover:bg-hairline"
+                  onClick={() => selectSession(discussion.session_id)}
+                >
+                  <div>
+                    <div className="text-ink font-medium">
+                      {discussion.stock_name} ({discussion.ticker})
+                    </div>
+                    <div className="text-sm text-muted">
+                      Status: {discussion.status}
+                    </div>
                   </div>
-                  <div className="text-sm text-muted">
-                    Status: {discussion.status}
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-1 text-xs bg-accent/20 text-accent rounded">
+                      In Progress
+                    </span>
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <span className="px-2 py-1 text-xs bg-accent/20 text-accent rounded">
-                    In Progress
-                  </span>
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-muted">{activeDiscussionsEmptyText}</p>
+          )}
         </div>
       )}
 
@@ -400,6 +507,7 @@ export function AgentChatDashboard() {
           <ChatSessionList
             sessions={recentSessions}
             onSelectSession={selectSession}
+            selectedSessionId={selectedSessionId}
           />
         </div>
 
@@ -410,7 +518,12 @@ export function AgentChatDashboard() {
               onClose={() => selectSession(null)}
             />
           ) : (
-            <PositionMonitor />
+            <PositionMonitor
+              activeDiscussions={activeDiscussions}
+              sessions={recentSessions}
+              onOpenSession={selectSession}
+              onStartDebate={handleStartDebate}
+            />
           )}
         </div>
       </div>

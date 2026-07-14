@@ -21,6 +21,10 @@ import { pnlColor } from '@/utils/pnl';
 interface ChatSessionListProps {
   sessions: AgentChatSessionSummary[];
   onSelectSession: (sessionId: string) => void;
+  /** B3 (cosmetic, optional): highlights the row for the session currently
+   *  open in the detail pane, so the list ("master") visibly reflects what's
+   *  selected instead of leaving that only implicit. */
+  selectedSessionId?: string | null;
 }
 
 // Session-lifecycle STATUS map (not directional) -> direct tokens: muted
@@ -129,7 +133,7 @@ function formatConsensus(level: number | null): string {
   return `${(level * 100).toFixed(0)}%`;
 }
 
-export function ChatSessionList({ sessions, onSelectSession }: ChatSessionListProps) {
+export function ChatSessionList({ sessions, onSelectSession, selectedSessionId = null }: ChatSessionListProps) {
   if (sessions.length === 0) {
     return (
       <div className="bg-card rounded border border-hairline p-6">
@@ -155,10 +159,14 @@ export function ChatSessionList({ sessions, onSelectSession }: ChatSessionListPr
             ? decisionConfig[session.decision_action]
             : null;
 
+          const isSelected = session.id === selectedSessionId;
+
           return (
             <div
               key={session.id}
-              className="flex items-center justify-between p-4 bg-elevated rounded-lg cursor-pointer hover:bg-hairline transition-colors"
+              className={`flex items-center justify-between p-4 rounded-lg cursor-pointer transition-colors ${
+                isSelected ? 'bg-hairline ring-1 ring-accent' : 'bg-elevated hover:bg-hairline'
+              }`}
               onClick={() => onSelectSession(session.id)}
             >
               <div className="flex-1 min-w-0">

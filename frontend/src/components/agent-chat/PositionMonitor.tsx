@@ -30,6 +30,8 @@ import type {
   AgentChatMonitoredPosition,
   AgentChatPositionEvent,
   AgentChatPositionEventType,
+  AgentChatActiveDiscussion,
+  AgentChatSessionSummary,
 } from '@/types';
 
 const eventTypeConfig: Record<
@@ -205,7 +207,18 @@ function PositionCard({ position }: { position: AgentChatMonitoredPosition }) {
   );
 }
 
-function EventItem({ event }: { event: AgentChatPositionEvent }) {
+function EventItem({
+  event,
+  onDiscussionRequired,
+}: {
+  event: AgentChatPositionEvent;
+  /** B3: "Discussion Required" used to be static text with no onClick — a
+   *  dead end that gave the operator no next action. Clicking it now hands
+   *  the event back up so the parent can either open the matching session
+   *  or start a new debate for this ticker (see PositionMonitor's
+   *  `handleDiscussionRequired`). */
+  onDiscussionRequired?: (event: AgentChatPositionEvent) => void;
+}) {
   const config = eventTypeConfig[event.event_type] || eventTypeConfig.significant_gain;
 
   return (
@@ -222,9 +235,13 @@ function EventItem({ event }: { event: AgentChatPositionEvent }) {
         <div className="flex items-center gap-4 mt-2 text-xs text-dim">
           <span>{formatTime(event.timestamp)}</span>
           {event.requires_discussion && (
-            <span className="px-1.5 py-0.5 bg-accent/20 text-accent rounded">
-              Discussion Required
-            </span>
+            <button
+              type="button"
+              onClick={() => onDiscussionRequired?.(event)}
+              className="px-1.5 py-0.5 bg-accent/20 text-accent rounded hover:bg-accent/30"
+            >
+              Discussion Required →
+            </button>
           )}
           {event.auto_execute && (
             <span className="px-1.5 py-0.5 bg-warn/20 text-warn rounded">
@@ -240,15 +257,57 @@ function EventItem({ event }: { event: AgentChatPositionEvent }) {
 interface PositionMonitorProps {
   /** Compact mode for dashboard sidebar */
   compact?: boolean;
+  /** B3: active + recent sessions, used to resolve a "Discussion Required"
+   *  event's ticker to an already-running/recent session so the badge can
+   *  open it directly instead of being a dead end. Passed down by
+   *  AgentChatDashboard (the same data it already fetches for its own
+   *  Active Discussions / session list — no duplicate fetch here). */
+  activeDiscussions?: AgentChatActiveDiscussion[];
+  sessions?: AgentChatSessionSummary[];
+  /** Opens a session in the master-detail view (AgentChatDashboard's
+   *  `selectSession`). */
+  onOpenSession?: (sessionId: string) => void;
+  /** Starts a new debate for a ticker (AgentChatDashboard's
+   *  `handleStartDebate`) — the fallback when no session matches. */
+  onStartDebate?: (ticker: string, stockName?: string) => void;
 }
 
-export function PositionMonitor({ compact = false }: PositionMonitorProps) {
+export function PositionMonitor({
+  compact = false,
+  activeDiscussions = [],
+  sessions = [],
+  onOpenSession,
+  onStartDebate,
+}: PositionMonitorProps) {
   const [summary, setSummary] = useState<AgentChatPositionSummary | null>(null);
   const [events, setEvents] = useState<AgentChatPositionEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showPositions, setShowPositions] = useState(!compact);
   const [showEvents, setShowEvents] = useState(!compact);
+
+  // B3: resolve "Discussion Required" to a real next action — open the
+  // matching session if one exists (checking the currently-active
+  // discussions first since those are the freshest signal, then recent
+  // session history), otherwise start a brand-new debate for that ticker so
+  // the badge is never a dead end.
+  const handleDiscussionRequired = useCallback(
+    (event: AgentChatPositionEvent) => {
+      const activeMatch = activeDiscussions.find((d) => d.ticker === event.ticker);
+      if (activeMatch) {
+        onOpenSession?.(activeMatch.session_id);
+        return;
+      }
+      const sessionMatch = sessions.find((s) => s.ticker === event.ticker);
+      if (sessionMatch) {
+        onOpenSession?.(sessionMatch.id);
+        return;
+      }
+      const stockName = (event.data?.stock_name as string | undefined) ?? event.ticker;
+      onStartDebate?.(event.ticker, stockName);
+    },
+    [activeDiscussions, sessions, onOpenSession, onStartDebate],
+  );
 
   const fetchData = useCallback(async () => {
     try {
@@ -313,8 +372,12 @@ export function PositionMonitor({ compact = false }: PositionMonitorProps) {
         </div>
         <div className="text-center py-8 text-dim">
           <Activity className="w-10 h-10 mx-auto mb-3 opacity-50" />
-          <p>No positions being monitored</p>
-          <p className="text-sm mt-1">Add positions to start monitoring</p>
+          <p>모니터링 중인 포지션이 없습니다</p>
+          {/* B3: this used to say "Add positions to start monitoring" — but
+              there is no "Add positions" UI anywhere in the app. Positions
+              are actually populated by coordinator.start() ->
+              sync_from_account(), so the text says that instead. */}
+          <p className="text-sm mt-1">코디네이터 시작 시 계좌에서 자동 동기화됩니다</p>
         </div>
       </div>
     );
@@ -417,7 +480,11 @@ export function PositionMonitor({ compact = false }: PositionMonitorProps) {
           {showEvents && (
             <div className="space-y-2 mt-2 max-h-[400px] overflow-y-auto">
               {events.map((event) => (
-                <EventItem key={event.id} event={event} />
+                <EventItem
+                  key={event.id}
+                  event={event}
+                  onDiscussionRequired={handleDiscussionRequired}
+                />
               ))}
             </div>
           )}
