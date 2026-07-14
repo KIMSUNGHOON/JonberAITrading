@@ -22,7 +22,7 @@ import pytest
 
 import services.storage_service as ss
 from agents.graph.coin_nodes import coin_execution_node
-from app.config import settings
+from app.config import settings, paper_fill_settings
 
 pytestmark = pytest.mark.asyncio
 
@@ -43,6 +43,19 @@ def _force_paper_mode(monkeypatch):
     `_execute_paper_order` deterministically, regardless of the running
     environment's mode. Live-path coverage is separate, below."""
     monkeypatch.setattr(settings, "UPBIT_TRADING_MODE", "paper")
+
+
+@pytest.fixture(autouse=True)
+def _zero_coin_fee(monkeypatch):
+    """P2-4 Task P1 added a non-zero conservative default coin_fee_bps,
+    which would otherwise perturb every exact-value assertion in this file
+    (all written before fees existed, at P0). This file's job is to pin
+    the P0 ledger-structure bugs (SELL persistence, weighted averaging,
+    realized-P&L existence) in isolation from the fee dimension — fee
+    behavior itself is covered separately in test_coin_fill_fees.py.
+    Zeroing the rate here keeps every assertion below byte-for-byte
+    identical to P0, proving Task P1 did not disturb P0's ledger math."""
+    monkeypatch.setattr(paper_fill_settings, "coin_fee_bps", 0.0)
 
 
 def _state(action, market="KRW-BTC", entry_price=100_000_000, quantity=0.1, **overrides):

@@ -126,7 +126,24 @@ def calculate_position_pnl(
     current_price: float,
 ) -> tuple[float, float, float]:
     """
-    Calculate position P&L metrics.
+    Calculate position P&L metrics, net of coin trading fees.
+
+    P2-4 Task P1: coin paper trading has no broker ledger — the app's own
+    storage IS the ledger (see
+    `agents/graph/coin_nodes.py::_execute_paper_order`), which bakes the
+    ENTRY-leg fee into `avg_entry_price` at buy time. This function nets
+    out the remaining PROJECTED EXIT-leg fee (what would be paid if this
+    position were sold right now, at `current_price`) via
+    `settings.coin_fee_bps`, so the displayed unrealized P&L is a
+    realistic "if I closed now" number rather than a gross, no-cost
+    price-diff. (Previously every coin fee was hardcoded to 0 — this
+    helper did a pure price-diff with no cost awareness at all.)
+
+    For live positions (avg_entry_price NOT fee-baked, since
+    `_execute_live_order` is out of scope for this task and stores the raw
+    execution price) this still nets out the projected exit fee, which is
+    a legitimate — if partial, missing the entry leg — improvement, not a
+    regression.
 
     Args:
         quantity: Position quantity
@@ -136,9 +153,12 @@ def calculate_position_pnl(
     Returns:
         Tuple of (position_value, unrealized_pnl, unrealized_pnl_pct)
     """
+    from app.config import paper_fill_settings
+
     position_value = quantity * current_price
     position_cost = quantity * avg_entry_price
-    unrealized_pnl = position_value - position_cost
+    projected_exit_fee = position_value * (paper_fill_settings.coin_fee_bps / 10_000)
+    unrealized_pnl = position_value - position_cost - projected_exit_fee
     unrealized_pnl_pct = (unrealized_pnl / position_cost * 100) if position_cost > 0 else 0
 
     return position_value, unrealized_pnl, unrealized_pnl_pct

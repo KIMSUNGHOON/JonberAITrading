@@ -166,3 +166,80 @@ def get_settings() -> Settings:
 
 # Convenience alias for direct import
 settings = get_settings()
+
+
+# -------------------------------------------
+# Paper Fill Settings (P2-4 fill-realism, Task P1)
+# -------------------------------------------
+
+
+class PaperFillSettings(BaseSettings):
+    """Conservative (real-or-higher) round-trip cost assumptions for paper
+    trading P&L.
+
+    Background: `docs/superpowers/audits/2026-07-14-paper-fill-realism-audit.md`
+    (§C priority 1) found that paper "profit" was structurally overstated
+    because round-trip commission/tax/fees were never modeled anywhere.
+
+    DESIGN PRINCIPLE — do not violate elsewhere in the codebase:
+    - KR headline returns come from the mock BROKER ledger (kt00004 account
+      equity / ka10074 realized P&L), which ALREADY deducts its own
+      commission+tax. These KR rates must therefore NEVER be added to the
+      KR ledger calculation (`ManagedPosition.unrealized_pnl`,
+      `fill_confirm`, coordinator avg_price, `paper_performance`) — that
+      would double-count and desync the app from the broker's own numbers.
+      They exist ONLY for the KR display-layer cost helper
+      (`services/trading/fill_costs.py`), which shows a realistic
+      "what would I actually keep if I exited now" number without touching
+      the ledger.
+    - coin paper trading has NO broker ledger — the app's own SQLite
+      storage IS the ledger (see
+      `agents/graph/coin_nodes.py::_execute_paper_order`) — so
+      `coin_fee_bps` IS simulated directly into the coin cost
+      basis/realized P&L there (and into the displayed unrealized P&L in
+      `app/api/routes/coin/helpers.py::calculate_position_pnl`).
+
+    Rates deliberately err high rather than trying to be exact (real rates
+    vary by year/broker/rebate tier and are not this app's concern) — the
+    whole point of this settings group is that paper P&L should never be
+    MORE optimistic than reality. Env-overridable with the `PAPER_FILL_`
+    prefix, e.g. `PAPER_FILL_COIN_FEE_BPS=10`.
+    """
+
+    model_config = SettingsConfigDict(
+        env_file="../.env",
+        env_file_encoding="utf-8",
+        env_prefix="PAPER_FILL_",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # KR commission, charged PER SIDE (both entry and exit legs of a round
+    # trip). Real KR discount-brokerage commission is usually ~0.015%;
+    # kept small but non-zero and slightly above that.
+    kr_commission_bps: float = Field(default=2.0, ge=0)
+
+    # KR securities transaction tax, SELL SIDE ONLY. Real KRX rates have
+    # been ~0.18-0.23% depending on market/year (KOSDAQ/KOSPI, rural
+    # special tax portion) — use the higher end so this never understates
+    # the real exit cost.
+    kr_sell_tax_bps: float = Field(default=23.0, ge=0)
+
+    # Upbit KRW-market fee is ~0.05% per side. coin paper trading has no
+    # broker ledger, so this is simulated directly (see class docstring).
+    coin_fee_bps: float = Field(default=5.0, ge=0)
+
+    # Reserved for P2-4 Task P2 (adverse execution-price slippage
+    # simulation) — the field exists now so config stays stable across
+    # P1/P2; unused by Task P1.
+    slippage_bps: float = Field(default=10.0, ge=0)
+
+
+@lru_cache
+def get_paper_fill_settings() -> PaperFillSettings:
+    """Get cached PaperFillSettings instance (mirrors get_settings())."""
+    return PaperFillSettings()
+
+
+# Convenience alias for direct import (mirrors `settings` above).
+paper_fill_settings = get_paper_fill_settings()

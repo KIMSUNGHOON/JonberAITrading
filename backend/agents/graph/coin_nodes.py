@@ -40,7 +40,7 @@ from agents.prompts import (
     COIN_STRATEGIC_DECISION_PROMPT,
     COIN_TECHNICAL_ANALYST_PROMPT,
 )
-from app.config import settings
+from app.config import settings, paper_fill_settings
 from app.api.routes.settings import get_upbit_access_key, get_upbit_secret_key
 from services.upbit import UpbitClient
 from services.execution import (
@@ -706,6 +706,7 @@ async def _close_or_reduce_coin_position(
     sell_quantity: float,
     exit_price: float,
     session_id: str | None,
+    fee_bps: float = 0.0,
 ) -> None:
     """Reduce or close a coin position on SELL, persisting a matching
     realized-P&L record for whatever quantity was actually sold.
@@ -716,6 +717,22 @@ async def _close_or_reduce_coin_position(
     a sold coin position stayed "held" forever at the old avg price, with
     unrealized P&L accumulating on a phantom holding. Coin also had no
     realized-P&L aggregation whatsoever before this.)
+
+    P2-4 Task P1: `fee_bps` is the exit-leg coin fee rate (basis points),
+    subtracted from `realized_amount` for the ACTUALLY MATCHED quantity
+    (never the raw requested `sell_quantity`, which may exceed the open
+    position). Defaults to 0.0 — the live caller (`_execute_live_order`)
+    deliberately never passes this (live uses real Upbit fills, no
+    simulation; scope is paper-only). The paper caller
+    (`_execute_paper_order`) passes `paper_fill_settings.coin_fee_bps`.
+
+    Round-trip fee accounting note: `position_entry_price` (read from
+    storage) is ALREADY fee-inclusive for paper positions —
+    `_execute_paper_order`'s BUY branch bakes the entry-leg fee into the
+    stored `avg_entry_price` per unit. So `(exit_price -
+    position_entry_price) * matched_quantity` already nets out the entry
+    fee; subtracting the exit fee here on top gives the full round-trip
+    (entry_fee + exit_fee) exactly once each, with no double-counting.
     """
     existing_position = await storage.get_coin_position(market)
     if not existing_position:
@@ -739,7 +756,8 @@ async def _close_or_reduce_coin_position(
     else:
         await storage.update_coin_position(market, {"quantity": remaining_quantity})
 
-    realized_amount = (exit_price - position_entry_price) * matched_quantity
+    exit_fee = exit_price * matched_quantity * (fee_bps / 10_000)
+    realized_amount = (exit_price - position_entry_price) * matched_quantity - exit_fee
     await storage.save_coin_realized_pnl({
         "id": f"realized-{uuid.uuid4()}",
         "session_id": session_id,
@@ -772,6 +790,17 @@ async def _execute_paper_order(
     trade_id = f"paper-{uuid.uuid4()}"
     session_id = state.get("session_id")
 
+    # P2-4 Task P1: coin paper has no broker ledger (the app IS the
+    # ledger, unlike KR where the mock broker already deducts its own
+    # commission+tax) — so the round-trip fee is simulated directly here.
+    # `fee` is this single leg's fee (entry fee on a BUY, exit fee on a
+    # SELL); the round-trip total is accounted for across both legs (see
+    # `_close_or_reduce_coin_position`'s docstring for how the entry leg,
+    # baked into avg_entry_price below, and the exit leg, subtracted at
+    # sell time, combine without double-counting).
+    fee_rate = paper_fill_settings.coin_fee_bps / 10_000
+    fee = float(entry_price) * float(quantity) * fee_rate
+
     # Save trade to storage
     storage = await get_storage_service()
     await storage.save_coin_trade({
@@ -783,8 +812,12 @@ async def _execute_paper_order(
         "price": float(entry_price),
         "volume": float(quantity),
         "executed_volume": float(quantity),
-        "fee": 0,
-        "total_krw": float(entry_price * quantity),
+        "fee": fee,
+        # BUY: total cash OUT includes the fee paid. SELL: total cash IN is
+        # net of the fee taken. (Previously hardcoded fee=0 / notional-only
+        # total_krw for every paper trade.)
+        "total_krw": float(entry_price * quantity) + fee if side == "bid"
+                     else float(entry_price * quantity) - fee,
         "state": "done",
         "order_uuid": trade_id,
     })
@@ -795,11 +828,21 @@ async def _execute_paper_order(
     # position stayed "held" forever at the old avg price, with unrealized
     # P&L accumulating on a phantom holding.)
     if side == "bid":
+        # P2-4 Task P1: bake the entry fee into the per-unit cost basis so
+        # avg_entry_price reflects what was actually paid. This also
+        # correctly deflates the raw price-diff unrealized P&L display
+        # (calculate_position_pnl) by the entry fee without that helper
+        # needing separate bookkeeping, and weighted-averages correctly
+        # across repeat buys (P0's save_coin_position averaging already
+        # handles this once fed a fee-inclusive incoming price).
+        fee_inclusive_entry_price = float(entry_price) + (
+            fee / float(quantity) if quantity else 0.0
+        )
         await storage.save_coin_position({
             "market": market,
             "currency": currency,
             "quantity": float(quantity),
-            "avg_entry_price": float(entry_price),
+            "avg_entry_price": fee_inclusive_entry_price,
             "stop_loss": proposal.get("stop_loss"),
             "take_profit": proposal.get("take_profit"),
             "session_id": session_id,
@@ -811,6 +854,7 @@ async def _execute_paper_order(
             sell_quantity=float(quantity),
             exit_price=float(entry_price),
             session_id=session_id,
+            fee_bps=paper_fill_settings.coin_fee_bps,
         )
 
     position = CoinPosition(

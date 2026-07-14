@@ -45,6 +45,10 @@ from services.trading.paper_performance import (
     compute_daily_win_loss,
     daily_pnl_series,
 )
+# P2-4 Task P1: display-layer cost helper for the live holdings tile below
+# (get_operations) — net-of-cost projection only, never fed back into the
+# broker ledger (see services/trading/fill_costs.py docstring).
+from services.trading.fill_costs import effective_pnl, effective_pnl_pct
 
 logger = logging.getLogger(__name__)
 
@@ -1385,14 +1389,32 @@ async def get_operations(
             # 실제 필드는 hldg_qty/avg_buy_prc/cur_prc/evlu_pfls_amt/evlu_pfls_rt
             # (quantity/avg_buy_price 등은 API 스키마 KRStockHolding의 이름;
             # kr_stocks/orders.py:68-73의 매핑과 동일 소스·동일 변환).
+            #
+            # P2-4 Task P1: pnl/pnl_pct here are DISPLAY values only — this
+            # is the live real-time position tile's actual data source (see
+            # frontend/src/components/terminal/panels/PositionsPanel.tsx
+            # header note: KR rows read `getOperations('kiwoom')`, not
+            # kr_stocks/positions.py). The broker's raw evlu_pfls_amt/
+            # evlu_pfls_rt (price-diff only) never account for the
+            # round-trip cost of actually exiting, so they're run through
+            # `effective_pnl`/`effective_pnl_pct` (services/trading/
+            # fill_costs.py) net of KR commission (both legs) + sell tax.
+            # This does NOT touch the broker ledger itself (kt00004
+            # current_asset / ka10074 realized P&L stay untouched, and so
+            # does ManagedPosition.unrealized_pnl) — it only changes what
+            # gets displayed here.
             holdings_out = []
             for h in balance.holdings:
                 stop_loss, take_profit = await _stops_for(h.stk_cd)
+                avg_price = float(h.avg_buy_prc)
+                current_price = float(h.cur_prc)
+                quantity = float(h.hldg_qty)
                 holdings_out.append(OperationsHolding(
                     ticker=h.stk_cd, name=h.stk_nm, quantity=h.hldg_qty,
-                    avg_price=float(h.avg_buy_prc),
-                    current_price=float(h.cur_prc),
-                    pnl=float(h.evlu_pfls_amt), pnl_pct=float(h.evlu_pfls_rt),
+                    avg_price=avg_price,
+                    current_price=current_price,
+                    pnl=effective_pnl(avg_price, current_price, quantity, "BUY"),
+                    pnl_pct=effective_pnl_pct(avg_price, current_price, quantity, "BUY"),
                     stop_loss=stop_loss,
                     take_profit=take_profit,
                 ))

@@ -1,9 +1,12 @@
 """GET /api/trading/operations aggregate endpoint tests."""
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from app.api.routes import trading as trading_mod
 from services.session_manager import AnalysisSession, MarketType, SessionStatus
 from services.trading.models import ManagedPosition, QueuedTrade, WatchedStock
+from services.trading.fill_costs import effective_pnl, effective_pnl_pct
 from services.kiwoom.models import FilledOrder, Holding, PendingOrder
 
 
@@ -104,7 +107,19 @@ async def test_operations_aggregates_all_sections():
     h = res.holding[0]
     assert h.quantity == 10 and h.stop_loss == 246560.0 and h.take_profit == 289440.0
     assert h.avg_price == 260000.0 and h.current_price == 266000.0
-    assert h.pnl == 60000.0 and h.pnl_pct == 2.31
+    # P2-4 Task P1: pnl/pnl_pct are now net of round-trip KR cost (this is
+    # the live position tile's real data source — see
+    # PositionsPanel.tsx header note), NOT the broker's raw evlu_pfls_amt/
+    # evlu_pfls_rt (60000.0 / 2.31) pass-through anymore. Compare against
+    # the same helper the route uses rather than hardcoding the
+    # commission/tax math here.
+    expected_pnl = effective_pnl(260000.0, 266000.0, 10, "BUY")
+    expected_pnl_pct = effective_pnl_pct(260000.0, 266000.0, 10, "BUY")
+    assert h.pnl == pytest.approx(expected_pnl)
+    assert h.pnl_pct == pytest.approx(expected_pnl_pct)
+    # Sanity: net must be strictly less than the broker's raw gross figure
+    # (60000.0) — cost-aware display must never show MORE than raw.
+    assert h.pnl < 60000.0
     assert res.today_fills[0].side == "buy"  # buy_sell_tp "1" == 매수
     assert res.errors == {}
 
