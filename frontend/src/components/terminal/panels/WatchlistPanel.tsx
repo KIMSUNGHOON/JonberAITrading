@@ -6,11 +6,14 @@
  * NO backing field and render an honest em-dash (—) rather than fabricated data.
  * For coin, prices are refreshed via getCoinTickers (batched, 30s) written back
  * into the store — the same path BasketWidget uses — so the two stay in sync.
+ * For KR (kiwoom), there is no batch ticker endpoint yet (P1), so each item is
+ * refreshed individually via getKRStockTicker (30s poll, per-item try/catch —
+ * one failing ticker keeps its last known price rather than blanking the tile).
  */
 import { useEffect } from 'react';
 import { useShallow } from 'zustand/shallow';
 import { useStore, selectBasketItems, selectChartSymbol } from '@/store';
-import { getCoinTickers } from '@/api/client';
+import { getCoinTickers, getKRStockTicker } from '@/api/client';
 import { changeColor } from '@/utils/pnl';
 import { Awaiting, TH, DASH, fmtPct, fmtPrice, marketLabelOf } from './shared';
 
@@ -18,6 +21,7 @@ export function WatchlistPanel() {
   const activeMarket = useStore((s) => s.activeMarket);
   const allItems = useStore(useShallow(selectBasketItems));
   const upbitApiConfigured = useStore((s) => s.upbitApiConfigured);
+  const kiwoomApiConfigured = useStore((s) => s.kiwoomApiConfigured);
   const updateBasketItemPrice = useStore((s) => s.updateBasketItemPrice);
   const setChartSymbol = useStore((s) => s.setChartSymbol);
   const chartSymbol = useStore(selectChartSymbol);
@@ -56,6 +60,40 @@ export function WatchlistPanel() {
     // items identity changes each render; key on the ticker set + gates instead.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeMarket, upbitApiConfigured, items.map((i) => i.ticker).join(','), updateBasketItemPrice]);
+
+  // Refresh KR prices individually (single-fetch per ticker; a batch REST
+  // endpoint is P1 — out of scope here). 30s poll keeps Kiwoom rate-limit
+  // load conservative. Promise.allSettled: one failing ticker must not blank
+  // the others — it just keeps its last known price.
+  useEffect(() => {
+    if (activeMarket !== 'kiwoom' || !kiwoomApiConfigured) return;
+    const krTickers = items.map((i) => i.ticker);
+    if (krTickers.length === 0) return;
+
+    let alive = true;
+    async function run() {
+      const results = await Promise.allSettled(krTickers.map((stk_cd) => getKRStockTicker(stk_cd)));
+      if (!alive) return;
+      results.forEach((r) => {
+        if (r.status !== 'fulfilled') return; // keep last known price; do not fabricate
+        const t = r.value;
+        updateBasketItemPrice(
+          t.stk_cd,
+          t.cur_prc,
+          t.prdy_ctrt,
+          t.prdy_ctrt > 0 ? 'RISE' : t.prdy_ctrt < 0 ? 'FALL' : 'EVEN',
+        );
+      });
+    }
+    run();
+    const id = setInterval(run, 30_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+    // items identity changes each render; key on the ticker set + gates instead.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeMarket, kiwoomApiConfigured, items.map((i) => i.ticker).join(','), updateBasketItemPrice]);
 
   if (items.length === 0) {
     return <Awaiting label={`관심종목 없음 · ${marketLabelOf(activeMarket)} 종목을 바스켓에 추가`} />;
