@@ -149,6 +149,40 @@ class TestCoordinatorStatusEndpoint:
             assert data["active_discussions"] == 1
             assert data["total_sessions"] == 2
 
+    @pytest.mark.asyncio
+    async def test_get_coordinator_status_last_check_at_none_before_first_tick(self, mock_coordinator):
+        """P1-3: no tick has fired yet (fresh MagicMock has no real _last_tick) -> None."""
+        with patch('app.api.routes.agent_chat.get_chat_coordinator') as mock_get:
+            mock_get.return_value = mock_coordinator
+
+            from app.main import app
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get("/api/agent-chat/status")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert "last_check_at" in data
+            assert data["last_check_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_coordinator_status_reports_last_check_at_after_tick(self, mock_coordinator):
+        """P1-3: loop-liveness heartbeat — a real tick timestamp serializes as ISO."""
+        mock_coordinator._running = True
+        mock_coordinator._last_tick = datetime(2026, 7, 14, 9, 0, 0)
+
+        with patch('app.api.routes.agent_chat.get_chat_coordinator') as mock_get:
+            mock_get.return_value = mock_coordinator
+
+            from app.main import app
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get("/api/agent-chat/status")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["last_check_at"] == "2026-07-14T09:00:00"
+
 
 # -------------------------------------------
 # Coordinator Control Tests

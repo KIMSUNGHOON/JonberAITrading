@@ -7,7 +7,7 @@ import { useEffect, useState } from 'react';
 import { Outlet } from 'react-router-dom';
 import {
   LayoutDashboard, Activity, Wallet, ShoppingBasket, Receipt,
-  Bot, Scan, MessageSquare, Settings, Bell,
+  Bot, Scan, MessageSquare, Settings,
 } from 'lucide-react';
 import { useStore } from '@/store';
 import { useGoTo, useActiveView } from '@/hooks/useNav';
@@ -15,6 +15,8 @@ import { useCommandPalette } from '@/hooks/useCommandPalette';
 import { NAV_ITEMS, type ViewKey } from '@/nav';
 import { CommandPalette } from './CommandPalette';
 import { OrderTicketRail } from './OrderTicketRail';
+import { NotificationBell } from './NotificationBell';
+import { LoopLivenessChip } from './LoopLivenessChip';
 
 // Icon lookup for the nav rail — preserves the exact icon choices from the
 // pre-router NAV array. Keyed by ViewKey; only the views present in
@@ -91,7 +93,7 @@ export function TerminalShell() {
             </button>
           ))}
         </div>
-        <button className="text-muted hover:text-ink p-1" title="Notifications"><Bell size={15} /></button>
+        <NotificationBell />
         <button onClick={() => setShowSettingsModal(true)} className="text-muted hover:text-ink p-1" title="Settings"><Settings size={15} /></button>
       </div>
 
@@ -144,6 +146,7 @@ export function TerminalShell() {
             {activeTradingMode === 'autonomous' ? 'AUTO' : 'HITL'}
           </span>
         )}
+        <LoopLivenessChip />
         <span className="text-accent">P&amp;L GRN-UP</span>
         <span>WS 1/1</span>
         <span className="ml-auto text-dim">⌘K command · j/k rows · :help</span>

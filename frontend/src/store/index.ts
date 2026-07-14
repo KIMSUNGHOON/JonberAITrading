@@ -29,6 +29,12 @@ import type {
   TradingMode,
   TradingModeResponse,
 } from '@/types';
+import type { TradeNotificationType, TradeNotification } from '@/hooks/useTradeNotifications';
+
+// P1-3: how many trade notifications survive a page refresh (bounded, most
+// recent first). The live WS stream (useTradeNotifications) can carry far
+// more, but only this many are persisted to localStorage.
+const MAX_PERSISTED_NOTIFICATIONS = 30;
 
 // UUID 생성 함수 (crypto.randomUUID 폴백)
 function generateUUID(): string {
@@ -82,6 +88,21 @@ interface KiwoomHistoryItem extends HistoryItem {
 // Combined ticker history (for backward compatibility)
 type TickerHistoryItem = CoinHistoryItem | KiwoomHistoryItem;
 
+// -------------------------------------------
+// Notification Center (P1-3)
+// -------------------------------------------
+// Persisted mirror of the live /ws/trade-notifications stream — captured
+// regardless of whether the bell dropdown is open, so a trade fired during
+// unattended operation still shows up as unread after the fact (and
+// survives a page refresh).
+export interface StoredNotification {
+  id: string;
+  type: TradeNotificationType;
+  data: TradeNotification['data'];
+  receivedAt: string;  // ISO string — set at capture time
+  read: boolean;
+}
+
 // Base analysis state (shared structure)
 interface BaseAnalysisState {
   activeSessionId: string | null;
@@ -128,6 +149,11 @@ interface ChatState {
   isTyping: boolean;
 }
 
+// P1-3: persisted notification-center slice (see StoredNotification above).
+interface NotificationState {
+  notifications: StoredNotification[];
+}
+
 type MarketType = 'coin' | 'kiwoom';
 type Language = 'en' | 'ko';
 
@@ -147,6 +173,11 @@ interface UIState {
   chatPopupOpen: boolean;
   chatPopupSize: ChatPopupSize;
   chatPopupPosition: { x: number; y: number };
+
+  // Notification center dropdown (P1-3). Ephemeral — NOT persisted, mirrors
+  // chatPopupOpen's pattern. A new notification captured while this is true
+  // is marked read immediately (the user is looking at it).
+  notificationPanelOpen: boolean;
 
   // Upbit API status
   upbitApiConfigured: boolean;
@@ -282,6 +313,15 @@ interface ChatActions {
   clearChat: () => void;
 }
 
+// P1-3 notification center actions.
+interface NotificationActions {
+  // Captures a live WS notification into the bounded, persisted store.
+  // Marked read immediately if the panel is currently open.
+  addNotification: (notification: { type: TradeNotificationType; data: TradeNotification['data'] }) => void;
+  markNotificationsRead: () => void;
+  clearAllNotifications: () => void;
+}
+
 interface UIActions {
   setActiveMarket: (market: MarketType) => void;
   setShowChartPanel: (show: boolean) => void;
@@ -294,6 +334,8 @@ interface UIActions {
   toggleChatPopup: () => void;
   setChatPopupSize: (size: ChatPopupSize) => void;
   setChatPopupPosition: (position: { x: number; y: number }) => void;
+  // Notification panel (P1-3)
+  setNotificationPanelOpen: (open: boolean) => void;
   setUpbitApiConfigured: (configured: boolean) => void;
   setKiwoomApiConfigured: (configured: boolean) => void;
   setChartTimeframe: (timeframe: TimeFrame) => void;
@@ -325,7 +367,8 @@ type Store = {
   coin: CoinState;
   kiwoom: KiwoomState;
   basket: BasketState;
-} & ChatState & UIState & CoinActions & KiwoomActions & ChatActions & UIActions & BasketActions & LegacyActions;
+} & ChatState & NotificationState & UIState & CoinActions & KiwoomActions & ChatActions &
+  NotificationActions & UIActions & BasketActions & LegacyActions;
 
 // -------------------------------------------
 // Initial States
@@ -377,6 +420,10 @@ const initialChatState: ChatState = {
   isTyping: false,
 };
 
+const initialNotificationState: NotificationState = {
+  notifications: [],
+};
+
 // Note: hasVisited is now persisted via zustand persist middleware
 // No need for manual localStorage reading
 
@@ -390,6 +437,7 @@ const initialUIState: UIState = {
   chatPopupOpen: false,
   chatPopupSize: 'medium',
   chatPopupPosition: { x: -1, y: -1 }, // -1 = use default position (bottom-right)
+  notificationPanelOpen: false,
   upbitApiConfigured: false,
   kiwoomApiConfigured: false,
   chartConfig: {
@@ -421,6 +469,7 @@ interface PersistedState {
   chartConfig: ChartConfig;
   sidebarCollapsed: boolean;
   language: Language;
+  notifications: StoredNotification[];
 }
 
 export const useStore = create<Store>()(
@@ -432,6 +481,7 @@ export const useStore = create<Store>()(
       kiwoom: initialKiwoomState,
       basket: initialBasketState,
       ...initialChatState,
+      ...initialNotificationState,
       ...initialUIState,
 
       // -------------------------------------------
@@ -1260,6 +1310,31 @@ export const useStore = create<Store>()(
       clearChat: () => set({ messages: [] }),
 
       // -------------------------------------------
+      // Notification Center Actions (P1-3)
+      // -------------------------------------------
+      addNotification: (notification) =>
+        set((state) => {
+          const item: StoredNotification = {
+            id: generateUUID(),
+            type: notification.type,
+            data: notification.data,
+            receivedAt: new Date().toISOString(),
+            // Already visible to the user if the panel is open right now.
+            read: state.notificationPanelOpen,
+          };
+          return {
+            notifications: [item, ...state.notifications].slice(0, MAX_PERSISTED_NOTIFICATIONS),
+          };
+        }),
+
+      markNotificationsRead: () =>
+        set((state) => ({
+          notifications: state.notifications.map((n) => (n.read ? n : { ...n, read: true })),
+        })),
+
+      clearAllNotifications: () => set({ notifications: [] }),
+
+      // -------------------------------------------
       // UI Actions
       // -------------------------------------------
       setActiveMarket: (market) => set(() => ({
@@ -1287,6 +1362,8 @@ export const useStore = create<Store>()(
       setChatPopupSize: (size) => set({ chatPopupSize: size }),
 
       setChatPopupPosition: (position) => set({ chatPopupPosition: position }),
+
+      setNotificationPanelOpen: (open) => set({ notificationPanelOpen: open }),
 
       setUpbitApiConfigured: (configured) => set({ upbitApiConfigured: configured }),
 
@@ -1528,6 +1605,7 @@ export const useStore = create<Store>()(
           chartConfig: state.chartConfig,
           sidebarCollapsed: state.sidebarCollapsed,
           language: state.language,
+          notifications: state.notifications,
         }),
         // Merge persisted state with initial state
         merge: (persistedState, currentState) => {
@@ -1571,6 +1649,12 @@ export const useStore = create<Store>()(
             chartConfig: persisted.chartConfig ?? currentState.chartConfig,
             sidebarCollapsed: persisted.sidebarCollapsed ?? currentState.sidebarCollapsed,
             language: persisted.language ?? currentState.language,
+            // Bounded defensively even on rehydrate — a payload written by a
+            // future version (or hand-edited localStorage) shouldn't grow the
+            // in-memory list past the cap.
+            notifications: Array.isArray(persisted.notifications)
+              ? persisted.notifications.slice(0, MAX_PERSISTED_NOTIFICATIONS)
+              : currentState.notifications,
           };
         },
       }
@@ -1629,6 +1713,11 @@ export const selectChat = (state: Store) => ({
   messages: state.messages,
   isTyping: state.isTyping,
 });
+
+// Notification center (P1-3)
+export const selectNotifications = (state: Store) => state.notifications;
+export const selectUnreadNotificationCount = (state: Store) =>
+  state.notifications.reduce((count, n) => (n.read ? count : count + 1), 0);
 
 export const selectChartConfig = (state: Store) => state.chartConfig;
 export const selectChartSymbol = (state: Store) => state.chartSymbol;

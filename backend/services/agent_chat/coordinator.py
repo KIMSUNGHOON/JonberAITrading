@@ -90,6 +90,11 @@ class ChatCoordinator:
         # Scheduler for periodic checks
         self._scheduler: Optional[AsyncIOScheduler] = None
         self._running = False
+        # Loop-liveness heartbeat: set at the top of every executed tick, so a
+        # scheduler whose job silently stopped firing (thread died, exception
+        # loop, etc.) can be told apart from one that's genuinely idle —
+        # `_running=True` alone can't distinguish "still ticking" from "dead".
+        self._last_tick: Optional[datetime] = None
 
         # Callbacks
         self._on_decision_callbacks: List[Callable] = []
@@ -188,6 +193,7 @@ class ChatCoordinator:
         if not self._running:
             return
 
+        self._last_tick = datetime.now()
         logger.debug("checking_watch_list")
 
         try:

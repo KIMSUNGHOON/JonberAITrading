@@ -1237,6 +1237,10 @@ export interface AgentChatCoordinatorStatus {
   total_sessions: number;
   check_interval_minutes: number;
   max_concurrent_discussions: number;
+  // P1-3: ISO timestamp of the last executed watch-list tick; null until the
+  // first tick fires. Used for loop-liveness (a dead scheduler still
+  // reporting is_running=true should not display as active).
+  last_check_at?: string | null;
 }
 
 export interface AgentChatStartCoordinatorRequest {

@@ -93,6 +93,11 @@ class CoordinatorStatusResponse(BaseModel):
     total_sessions: int
     check_interval_minutes: int
     max_concurrent_discussions: int
+    # Additive (P1-3 loop-liveness): timestamp of the last executed watch-list
+    # tick. is_running alone can't tell a healthy loop from a dead scheduler
+    # that never reset its running flag — the FE compares this against
+    # check_interval_minutes to detect staleness. None until the first tick.
+    last_check_at: Optional[str] = None
 
 
 class StartCoordinatorRequest(BaseModel):
@@ -229,12 +234,19 @@ async def get_coordinator_status():
     """
     coordinator = await get_chat_coordinator()
 
+    # Defensive isinstance check: test doubles (MagicMock) auto-vivify any
+    # attribute access, so `getattr(..., None)` isn't enough to detect "never
+    # ticked" — only a real datetime should ever be serialized.
+    last_tick = getattr(coordinator, "_last_tick", None)
+    last_check_at = last_tick.isoformat() if isinstance(last_tick, datetime) else None
+
     return CoordinatorStatusResponse(
         is_running=coordinator._running,
         active_discussions=len(coordinator._active_rooms),
         total_sessions=len(coordinator._session_history),
         check_interval_minutes=coordinator.check_interval,
         max_concurrent_discussions=coordinator.max_concurrent,
+        last_check_at=last_check_at,
     )
 
 
