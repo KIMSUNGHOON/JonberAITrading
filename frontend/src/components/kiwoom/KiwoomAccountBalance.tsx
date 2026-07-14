@@ -158,7 +158,7 @@ export function KiwoomAccountBalance() {
             <Wallet size={20} />
           </div>
           <div>
-            <h3 className="font-semibold">계좌 정보</h3>
+            <h3 className="font-semibold">계좌 요약</h3>
             <p className="text-xs text-dim">키움증권</p>
           </div>
         </div>
@@ -211,29 +211,6 @@ export function KiwoomAccountBalance() {
           </div>
         </div>
       </div>
-
-      {/* Holdings Summary */}
-      {account.holdings.length > 0 && (
-        <div className="space-y-2">
-          <div className="text-sm font-medium text-muted">보유 종목</div>
-          <div className="max-h-40 overflow-y-auto space-y-1">
-            {account.holdings.map((holding) => (
-              <div
-                key={holding.stk_cd}
-                className="flex items-center justify-between p-2 bg-elevated rounded-lg text-sm"
-              >
-                <div>
-                  <span className="font-medium">{holding.stk_nm}</span>
-                  <span className="text-xs text-dim ml-2 tabular-nums">{holding.quantity}주</span>
-                </div>
-                <div className={`tabular-nums ${pnlColor(holding.profit_loss)}`}>
-                  {holding.profit_loss >= 0 ? '+' : ''}{holding.profit_loss_rate.toFixed(2)}%
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }

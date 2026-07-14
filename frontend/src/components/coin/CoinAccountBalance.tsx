@@ -90,7 +90,7 @@ export function CoinAccountBalance({ onRefresh }: CoinAccountBalanceProps) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Wallet size={18} className="text-accent" />
-          <h3 className="font-semibold">Account Balance</h3>
+          <h3 className="font-semibold">계좌 잔고 (원장)</h3>
         </div>
         <button
           onClick={handleRefresh}
