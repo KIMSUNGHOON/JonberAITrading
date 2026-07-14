@@ -20,6 +20,7 @@ from .models import (
     RiskParameters,
     OrderRequest,
     OrderSide,
+    OrderType,
 )
 
 logger = logging.getLogger(__name__)
@@ -503,6 +504,15 @@ class RiskMonitor:
             side=OrderSide.SELL,
             quantity=config.quantity,
             price=current_price,
+            # P2-4 Task P2: defensive exits must submit as MARKET, not the
+            # OrderRequest default of LIMIT (models.py). A LIMIT order sent
+            # at the trigger price records a fill at that (favorable) price
+            # if the mock/live broker fills it there — understating real
+            # gap/crash risk. MARKET makes the broker report the true
+            # adverse fill via ka10076, so the KR ledger stays broker-truth
+            # (no app-side synthetic slippage added here — this is an
+            # order-construction fix, correct in live too, not a sim).
+            order_type=OrderType.MARKET,
             reason="Stop-loss auto-execution",
         )
 
@@ -554,6 +564,9 @@ class RiskMonitor:
             side=OrderSide.SELL,
             quantity=config.quantity,
             price=current_price,
+            # P2-4 Task P2: see _execute_stop_loss — MARKET so the broker
+            # reports the true fill instead of the (favorable) trigger price.
+            order_type=OrderType.MARKET,
             reason="Take-profit auto-execution",
         )
 

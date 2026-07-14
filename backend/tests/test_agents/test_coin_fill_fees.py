@@ -44,6 +44,24 @@ def _known_fee_rate(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_live_refetch_or_slippage(monkeypatch):
+    """P2-4 Task P2 added a live-price re-fetch + adverse slippage to
+    `_execute_paper_order`, which would otherwise perturb every exact-value
+    fee assertion in this file (all written before either existed, at P1).
+    Isolate this file to the fee dimension by short-circuiting the re-fetch
+    to return exactly the `entry_price` each call already passes as its
+    fallback, and zeroing slippage. Price-refetch/slippage behavior itself
+    is covered separately in test_coin_fill_slippage.py."""
+    import agents.graph.coin_nodes as coin_nodes_module
+
+    async def _identity_fetch(market, fallback):
+        return fallback
+
+    monkeypatch.setattr(coin_nodes_module, "_fetch_live_coin_price", _identity_fetch)
+    monkeypatch.setattr(paper_fill_settings, "slippage_bps", 0.0)
+
+
 def _state(action, market="KRW-BTC", entry_price=100_000_000, quantity=0.1, **overrides):
     state = {
         "approval_status": "approved",

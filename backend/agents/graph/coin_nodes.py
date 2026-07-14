@@ -769,6 +769,37 @@ async def _close_or_reduce_coin_position(
     })
 
 
+async def _fetch_live_coin_price(market: str, fallback: float) -> float:
+    """Re-fetch the CURRENT market price at execution time (P2-4 Task P2).
+
+    Background: `_execute_paper_order` previously reused `entry_price` — a
+    snapshot the trade proposal captured at ANALYSIS time — as the fill
+    price, even though HITL approval can take minutes/hours. That silently
+    erased however much the market moved during the approval delay: a
+    counterfactual "filled at the analysis-time price" (audit §A/§C
+    priority 2). Paper trading has no broker to report a real fill, so the
+    simulation must at least fill against a freshly-fetched price rather
+    than a stale one.
+
+    Falls back to `fallback` (the stale proposal price) on any fetch
+    error/empty response — a flaky market-data call must not crash trade
+    execution; it degrades to the old (still-optimistic) behavior for that
+    one trade only.
+    """
+    try:
+        async with UpbitClient() as client:
+            tickers = await client.get_ticker([market])
+        if tickers:
+            return float(tickers[0].trade_price)
+    except Exception as e:
+        logger.warning(
+            "coin_paper_live_price_refetch_failed",
+            market=market,
+            error=str(e),
+        )
+    return float(fallback)
+
+
 async def _execute_paper_order(
     state: dict,
     proposal: dict,
@@ -786,6 +817,22 @@ async def _execute_paper_order(
     # Determine side based on action
     side = "bid" if action in ("BUY", TradeAction.BUY) else "ask"
 
+    # P2-4 Task P2: RE-FETCH the current price at execution time instead of
+    # reusing `entry_price` (the proposal's analysis-time snapshot) as the
+    # fill — see `_fetch_live_coin_price` docstring. Then apply ADVERSE
+    # slippage by side: a BUY always fills AT OR ABOVE the live price, a
+    # SELL always fills AT OR BELOW it — so paper P&L is never MORE
+    # optimistic than a live fill would realistically be. `fill_price` is
+    # this order's actual simulated execution price for everything below
+    # (fee basis, stored trade/position price, realized/unrealized P&L) —
+    # `entry_price` itself is now used only as the refetch's fallback.
+    live_price = await _fetch_live_coin_price(market, fallback=float(entry_price))
+    slippage_rate = paper_fill_settings.slippage_bps / 10_000
+    fill_price = (
+        live_price * (1 + slippage_rate) if side == "bid"
+        else live_price * (1 - slippage_rate)
+    )
+
     # Generate trade ID
     trade_id = f"paper-{uuid.uuid4()}"
     session_id = state.get("session_id")
@@ -797,9 +844,11 @@ async def _execute_paper_order(
     # SELL); the round-trip total is accounted for across both legs (see
     # `_close_or_reduce_coin_position`'s docstring for how the entry leg,
     # baked into avg_entry_price below, and the exit leg, subtracted at
-    # sell time, combine without double-counting).
+    # sell time, combine without double-counting). P2-4 Task P2: the fee
+    # is now charged on `fill_price` (the slipped price), not the stale
+    # `entry_price` — slippage and fee stack on the same simulated fill.
     fee_rate = paper_fill_settings.coin_fee_bps / 10_000
-    fee = float(entry_price) * float(quantity) * fee_rate
+    fee = float(fill_price) * float(quantity) * fee_rate
 
     # Save trade to storage
     storage = await get_storage_service()
@@ -809,15 +858,15 @@ async def _execute_paper_order(
         "market": market,
         "side": side,
         "order_type": "paper",
-        "price": float(entry_price),
+        "price": float(fill_price),
         "volume": float(quantity),
         "executed_volume": float(quantity),
         "fee": fee,
         # BUY: total cash OUT includes the fee paid. SELL: total cash IN is
         # net of the fee taken. (Previously hardcoded fee=0 / notional-only
         # total_krw for every paper trade.)
-        "total_krw": float(entry_price * quantity) + fee if side == "bid"
-                     else float(entry_price * quantity) - fee,
+        "total_krw": float(fill_price * quantity) + fee if side == "bid"
+                     else float(fill_price * quantity) - fee,
         "state": "done",
         "order_uuid": trade_id,
     })
@@ -835,7 +884,7 @@ async def _execute_paper_order(
         # needing separate bookkeeping, and weighted-averages correctly
         # across repeat buys (P0's save_coin_position averaging already
         # handles this once fed a fee-inclusive incoming price).
-        fee_inclusive_entry_price = float(entry_price) + (
+        fee_inclusive_entry_price = float(fill_price) + (
             fee / float(quantity) if quantity else 0.0
         )
         await storage.save_coin_position({
@@ -852,7 +901,7 @@ async def _execute_paper_order(
             storage,
             market=market,
             sell_quantity=float(quantity),
-            exit_price=float(entry_price),
+            exit_price=float(fill_price),
             session_id=session_id,
             fee_bps=paper_fill_settings.coin_fee_bps,
         )
@@ -860,20 +909,20 @@ async def _execute_paper_order(
     position = CoinPosition(
         market=market,
         quantity=quantity,
-        entry_price=float(entry_price),
-        current_price=float(entry_price),
+        entry_price=float(fill_price),
+        current_price=float(fill_price),
         stop_loss=proposal.get("stop_loss"),
         take_profit=proposal.get("take_profit"),
     )
 
-    reasoning = f"[Execution] (Paper) Trade simulated: {action} {market} @ {entry_price:,.0f} KRW, qty: {quantity}"
+    reasoning = f"[Execution] (Paper) Trade simulated: {action} {market} @ {fill_price:,.0f} KRW, qty: {quantity}"
 
     logger.info(
         "paper_trade_executed",
         market=market,
         action=action,
         quantity=quantity,
-        entry_price=entry_price,
+        entry_price=fill_price,
         trade_id=trade_id,
     )
 
