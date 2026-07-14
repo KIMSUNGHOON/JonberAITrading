@@ -216,6 +216,38 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         decision_source=decision_source,
     )
 
+    # T2 MAJOR hard-gate: when market data could not be fetched this cycle
+    # (market_data_stale set by the data-collection node — get_kr_* returned
+    # None instead of fabricating random-mock data, CRITICAL fix 2026-07-14),
+    # the analyses/consensus above ran on empty/neutral defaults with a
+    # fabricated-absent price ("현재가: 0원"). An actionable proposal from that
+    # context could be auto-approved by the 60s autonomy injector and — for a
+    # real held position — execute a real SELL/REDUCE (which uses the position's
+    # REAL quantity) on absent data. Force any actionable trade to HOLD
+    # (no-trade) with floored confidence, as an override AFTER the LLM/consensus
+    # produced its action, so stale data can NEVER yield an auto-executable
+    # proposal. HOLD/WATCH/AVOID are already no-trade and pass through unchanged.
+    if state.get("market_data_stale") and action in (
+        TradeAction.BUY,
+        TradeAction.ADD,
+        TradeAction.SELL,
+        TradeAction.REDUCE,
+    ):
+        logger.warning(
+            "kr_stock_decision_hard_gated_stale",
+            stk_cd=stk_cd,
+            original_action=action.value,
+        )
+        stale_note = (
+            f"[시세 데이터 불가로 결정 보류] 시세 조회 실패(stale)로 원래 제안 "
+            f"{action.value}을(를) HOLD로 강제 전환했습니다. 신뢰할 수 있는 "
+            f"현재가 없이는 매매를 실행하지 않습니다."
+        )
+        action = TradeAction.HOLD
+        decision_source = "stale_hard_gate"
+        avg_confidence = min(avg_confidence, 0.1)
+        response = f"{stale_note}\n\n{response}"
+
     # Get risk parameters
     risk = state.get("risk_assessment", {})
     risk_signals = risk.get("signals", {})

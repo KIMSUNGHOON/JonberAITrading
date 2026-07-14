@@ -545,6 +545,126 @@ class TestDataCollectionNodeGracefulDegrade:
         assert callable(kr_stock_re_analyze_node)
 
 
+class TestStrategicDecisionStaleHardGate:
+    """T2 MAJOR (2026-07-14): the T2 CRITICAL fix made get_kr_* return None on a
+    real fetch failure, and the data-collection node sets market_data_stale.
+    But the strategic-decision node's LLM/consensus still runs on the empty
+    neutral defaults (price "0원") and could emit an actionable proposal that
+    the 60s autonomy injector auto-approves — critically, a real SELL/REDUCE of
+    a HELD position uses the position's REAL quantity, so a defensive sell could
+    execute on fabricated-absent data. The node must hard-gate any actionable
+    trade (BUY/ADD/SELL/REDUCE) to HOLD when stale, as an override AFTER the
+    action is produced. HOLD/WATCH/AVOID (no-trade) pass through unchanged."""
+
+    @staticmethod
+    def _quiet_telegram(monkeypatch):
+        """Neutralize the lazy `services.telegram.get_telegram_notifier` used by
+        the node's proposal-notification branches (the not-stale SELL path
+        fires one) so tests don't touch the real notifier."""
+        async def fake_notifier():
+            return MagicMock(is_ready=False)
+
+        monkeypatch.setattr(
+            "services.telegram.get_telegram_notifier", fake_notifier
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_forces_sell_to_hold(self, monkeypatch):
+        """(a) stale + LLM/consensus would SELL a held position → final action
+        HOLD, quantity 0, confidence floored, rationale notes 시세 불가."""
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+
+        async def fake_decide_action(llm, messages, **kwargs):
+            return kr.TradeAction.SELL, "LLM says dump the whole position", "llm", None, None
+
+        monkeypatch.setattr(kr, "get_llm_provider", lambda: MagicMock())
+        monkeypatch.setattr(kr, "decide_action", fake_decide_action)
+        self._quiet_telegram(monkeypatch)
+
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            # stock_info succeeded (stale old price present) but chart/orderbook
+            # failed → data-collection still marks the run stale.
+            "market_data": {"cur_prc": 70000},
+            "market_data_stale": True,
+            "existing_position": {
+                "quantity": 100,
+                "avg_buy_price": 68000,
+                "current_price": 70000,
+                "profit_loss": 200000,
+                "profit_loss_pct": 2.94,
+            },
+        }
+        result = await kr.kr_stock_strategic_decision_node(state)
+
+        assert result["trade_proposal"]["action"] == "HOLD"
+        assert result["trade_proposal"]["quantity"] == 0  # no real SELL qty
+        assert result["synthesis"]["average_confidence"] <= 0.1
+        assert "시세" in result["synthesis"]["decision_rationale"]
+
+    @pytest.mark.asyncio
+    async def test_not_stale_sell_unchanged(self, monkeypatch):
+        """(b) regression: NOT stale + would-SELL → action stays SELL with the
+        real held quantity (the gate must not touch healthy runs)."""
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+
+        async def fake_decide_action(llm, messages, **kwargs):
+            return kr.TradeAction.SELL, "LLM says sell", "llm", None, None
+
+        monkeypatch.setattr(kr, "get_llm_provider", lambda: MagicMock())
+        monkeypatch.setattr(kr, "decide_action", fake_decide_action)
+        self._quiet_telegram(monkeypatch)
+
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "market_data": {"cur_prc": 70000},
+            # no market_data_stale key → healthy run
+            "existing_position": {
+                "quantity": 100,
+                "avg_buy_price": 68000,
+                "current_price": 70000,
+                "profit_loss": 200000,
+                "profit_loss_pct": 2.94,
+            },
+        }
+        result = await kr.kr_stock_strategic_decision_node(state)
+
+        assert result["trade_proposal"]["action"] == "SELL"
+        assert result["trade_proposal"]["quantity"] == 100  # full real qty
+
+    @pytest.mark.asyncio
+    async def test_stale_forces_buy_to_hold(self, monkeypatch):
+        """(c) stale + would-BUY → HOLD. The BUY sizing path calls
+        get_shared_kiwoom_client_async; wire it to blow up so that if the gate
+        regressed (BUY survived with a stale price > 0), the test fails loudly
+        instead of silently sizing on stale data."""
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+
+        async def fake_decide_action(llm, messages, **kwargs):
+            return kr.TradeAction.BUY, "LLM says buy the dip", "llm", None, None
+
+        async def boom():
+            raise AssertionError("BUY sizing path reached under stale data")
+
+        monkeypatch.setattr(kr, "get_llm_provider", lambda: MagicMock())
+        monkeypatch.setattr(kr, "decide_action", fake_decide_action)
+        monkeypatch.setattr(kr, "get_shared_kiwoom_client_async", boom)
+        self._quiet_telegram(monkeypatch)
+
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "market_data": {"cur_prc": 70000},  # stale old price present
+            "market_data_stale": True,
+        }
+        result = await kr.kr_stock_strategic_decision_node(state)
+
+        assert result["trade_proposal"]["action"] == "HOLD"
+        assert result["trade_proposal"]["quantity"] == 0
+
+
 class TestGraphCreation:
     """Tests for graph creation functions."""
 
