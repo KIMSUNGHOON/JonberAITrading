@@ -1524,7 +1524,19 @@ async def get_performance(
                 realized_pnl_total=pnl.realized_pnl,
                 commission=pnl.commission,
                 tax=pnl.tax,
-                net_pnl=pnl.realized_pnl - pnl.commission - pnl.tax,
+                # P2-4 P3b (2026-07-14, follow-up to P3/2b5c897): ka10074
+                # rlzt_pl은 이미 수수료·세금이 차감된 NET 값이다 — 공식
+                # Kiwoom REST API 문서(Kiwoom-REST-API/kiwoom_docs/계좌.md
+                # ka10073 예제, 216-272행)의 실제 응답으로 검산됨:
+                #   gross = (cntr_pric-buy_uv)*cntr_qty = 60597.04
+                #   gross - (trde_cmsn+trde_tax) = 60597.04-784 = 59813.04
+                #   == tdy_sel_pl (정확히 일치)
+                # 즉 commission/tax는 참고용 비용 내역일 뿐, realized_pnl에서
+                # 다시 빼면 이중차감(과소평가)이 된다. `pnl.realized_pnl -
+                # pnl.commission - pnl.tax`로 되돌리지 말 것 — see
+                # services/trading/paper_performance.py::build_performance_report
+                # (P3, 2b5c897) and test_paper_performance.py::TestNetGrossSemantics.
+                net_pnl=pnl.realized_pnl,
                 trade_days=len(pnl.daily),
                 win_days=win_days,
                 loss_days=loss_days,
