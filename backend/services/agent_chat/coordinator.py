@@ -21,6 +21,7 @@ from services.agent_chat.models import (
 )
 from services.agent_chat.chat_room import ChatRoom
 from services.autonomy import check_autonomy
+from services.trading.models import ActivityType
 
 # -------------------------------------------
 # Room-created hooks
@@ -43,6 +44,57 @@ def _fire_room_created(room: "ChatRoom") -> None:
             hook(room)
         except Exception as e:
             logger.warning("room_created_hook_failed", error=str(e))
+
+
+# -------------------------------------------
+# Trade-outcome discriminator (P2 review gap, 2026-07-14)
+# -------------------------------------------
+
+
+def _trade_actually_resulted(trading_coord, ticker: str, allocation) -> bool:
+    """Whether `allocation` (on_trade_approved's return value) represents a
+    trade that genuinely executed or was queued — i.e. a real position or
+    queue entry resulted — as opposed to TRADE_REJECTED (daily trade limit
+    reached, or portfolio sizing to <=0 shares) or ORDER_FAILED (an order
+    was placed but the broker filled 0 shares).
+
+    AllocationPlan carries no explicit success/failure field: a queued
+    trade always reports quantity=0 (but IS real — see the "Trade queued"
+    rationale check below), while a genuinely-filled order and an
+    ORDER_FAILED one share the identical quantity>0 shape (the field holds
+    the requested/allocated size, not the broker's actual fill). For that
+    last case we fall back to the activity log on_trade_approved writes
+    synchronously before it returns, and look for the most recent entry for
+    this ticker.
+    """
+    if allocation is None:
+        return False
+
+    rationale = getattr(allocation, "rationale", None) or ""
+    if rationale.startswith("Trade queued"):
+        return True
+
+    quantity = getattr(allocation, "quantity", 0) or 0
+    if quantity <= 0:
+        return False
+
+    try:
+        recent = trading_coord.get_activity_log(limit=10)
+    except Exception:
+        return True
+
+    for entry in reversed(list(recent or [])):
+        if getattr(entry, "ticker", None) != ticker:
+            continue
+        activity_type = getattr(entry, "activity_type", None)
+        return activity_type not in (ActivityType.ORDER_FAILED, "order_failed")
+
+    # No matching log entry found (e.g. a coordinator stub in tests that
+    # doesn't model the log) — the quantity>0 result is the best signal we
+    # have, so treat it as resulted.
+    return True
+
+
 from services.agent_chat.position_manager import (
     PositionManager,
     get_position_manager,
@@ -506,7 +558,7 @@ class ChatCoordinator:
 
             if action:
                 # Execute via trading coordinator
-                await trading_coord.on_trade_approved(
+                allocation = await trading_coord.on_trade_approved(
                     session_id=f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                     ticker=ticker,
                     stock_name=None,  # Will be looked up
@@ -529,7 +581,24 @@ class ChatCoordinator:
                 # would stay ACTIVE and could be re-discussed/duplicate-
                 # triggered on the next 5-min check. No-op if the ticker
                 # isn't (or is no longer) an active watch entry.
-                trading_coord.mark_watch_converted(ticker)
+                #
+                # T2 review gap (2026-07-14): on_trade_approved has non-
+                # exception outcomes where NO trade actually resulted — the
+                # daily trade limit was hit, portfolio sizing came out to
+                # <=0 shares, or the order was placed but the broker filled
+                # 0 shares. Converting the watch entry in any of those cases
+                # retires a real signal that was never acted on (the daily
+                # limit resets tomorrow, sizing may succeed later, a broker
+                # blip shouldn't kill a signal). Only flip it when the trade
+                # genuinely executed or was queued.
+                if _trade_actually_resulted(trading_coord, ticker, allocation):
+                    trading_coord.mark_watch_converted(ticker)
+                else:
+                    logger.info(
+                        "watch_not_converted_no_trade_resulted",
+                        ticker=ticker,
+                        rationale=getattr(allocation, "rationale", None),
+                    )
 
                 logger.info(
                     "trade_executed",

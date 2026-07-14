@@ -2101,13 +2101,22 @@ class ExecutionCoordinator:
         """Mark the active watch-list entry for `ticker` as CONVERTED.
 
         Used by the autonomous agent-chat path (`ChatCoordinator._execute_trade`)
-        when it executes a decision that originated from a watch-list
-        opportunity WITHOUT going through `convert_watch_to_queue` — that path
-        calls `on_trade_approved` directly, so without this call the watch
-        entry stayed ACTIVE forever. The 5-min watch-list check
+        WITHOUT going through `convert_watch_to_queue` — that path calls
+        `on_trade_approved` directly, so without this call the watch entry
+        stayed ACTIVE forever. The 5-min watch-list check
         (`ChatCoordinator._check_watch_list`) could then re-detect the same
         "opportunity" and start a duplicate discussion/execution on the same
         ticker (P2 funnel-consolidation audit finding, 2026-07-14).
+
+        Callers MUST gate this on `on_trade_approved`'s actual outcome, not
+        merely on having attempted a decision: `on_trade_approved` has non-
+        exception outcomes where no trade actually results (daily trade
+        limit reached, portfolio sizing to <=0 shares, or an order placed
+        but the broker filled 0 shares) — call this only when a trade
+        genuinely executed or was queued (a real position/queue entry
+        resulted), otherwise the watch entry must stay ACTIVE so the
+        opportunity can be re-evaluated later (T2 review gap, 2026-07-14;
+        see `services.agent_chat.coordinator._trade_actually_resulted`).
 
         Returns False (no-op) when there is no active watch entry for the
         ticker — a decision can legitimately originate outside the watch list.

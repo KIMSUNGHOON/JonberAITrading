@@ -7,6 +7,7 @@ Unit tests for the ChatCoordinator that manages multiple chat rooms.
 import pandas as pd
 import pytest
 import pytest_asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta
 
@@ -21,6 +22,7 @@ from services.agent_chat.coordinator import (
     ChatCoordinator,
     get_chat_coordinator,
 )
+from services.trading.models import ActivityType, AllocationPlan, OrderSide
 
 
 # -------------------------------------------
@@ -532,18 +534,47 @@ class TestCoordinatorSingleton:
 # execution on the same ticker.
 
 
-class TestAutonomousExecutionMarksWatchConverted:
-    """_execute_trade must mark the originating watch entry CONVERTED."""
+def _allocation(
+    quantity: int,
+    rationale: str,
+    ticker: str = "005930",
+    entry_price: float = 72_500,
+) -> AllocationPlan:
+    """Build a real AllocationPlan shaped like on_trade_approved's actual
+    return value for the given scenario (see services/trading/coordinator.py
+    on_trade_approved: TRADE_QUEUED/TRADE_REJECTED/order-result branches all
+    return this exact model)."""
+    return AllocationPlan(
+        ticker=ticker,
+        side=OrderSide.BUY,
+        quantity=quantity,
+        entry_price=entry_price,
+        estimated_amount=quantity * entry_price,
+        position_pct=1.0,
+        rationale=rationale,
+    )
 
-    @pytest.mark.asyncio
-    async def test_execute_trade_marks_watch_converted(self, coordinator):
-        """A successful autonomous execution flips the watch entry to
-        CONVERTED so it is never re-discussed/re-triggered."""
+
+class TestAutonomousExecutionMarksWatchConverted:
+    """_execute_trade must mark the originating watch entry CONVERTED --
+    but ONLY when on_trade_approved's return shows a trade genuinely
+    executed or was queued (T2 review gap, 2026-07-14: on_trade_approved has
+    non-exception TRADE_REJECTED/ORDER_FAILED outcomes where no trade
+    resulted at all, and converting the watch entry on those retires a real
+    signal that was never acted on)."""
+
+    async def _run(self, coordinator, allocation, activity_log=None):
+        """Run _execute_trade with `trading_coord.on_trade_approved`
+        returning `allocation`, and return the fake coordinator so the
+        caller can assert on mark_watch_converted."""
         import app.dependencies as deps_module
 
         fake_trading_coord = MagicMock()
-        fake_trading_coord.on_trade_approved = AsyncMock(return_value=None)
+        fake_trading_coord.on_trade_approved = AsyncMock(return_value=allocation)
         fake_trading_coord.mark_watch_converted = MagicMock(return_value=True)
+        fake_trading_coord.get_activity_log = MagicMock(
+            return_value=activity_log if activity_log is not None else []
+        )
 
         async def fake_get_trading_coordinator():
             return fake_trading_coord
@@ -562,8 +593,79 @@ class TestAutonomousExecutionMarksWatchConverted:
 
             await coordinator._execute_trade("005930", decision)
 
+        return fake_trading_coord
+
+    @pytest.mark.asyncio
+    async def test_execute_trade_marks_watch_converted_on_filled_order(
+        self, coordinator
+    ):
+        """A genuinely filled order (quantity>0, ORDER_EXECUTED logged)
+        flips the watch entry to CONVERTED so it is never re-discussed."""
+        allocation = _allocation(10, "정상 매수: 10주 매수 (risk-based sizing)")
+        activity_log = [
+            SimpleNamespace(ticker="005930", activity_type=ActivityType.ORDER_EXECUTED),
+        ]
+
+        fake_trading_coord = await self._run(coordinator, allocation, activity_log)
+
         fake_trading_coord.on_trade_approved.assert_awaited_once()
         fake_trading_coord.mark_watch_converted.assert_called_once_with("005930")
+
+    @pytest.mark.asyncio
+    async def test_execute_trade_marks_watch_converted_when_queued(self, coordinator):
+        """A trade that gets queued (market closed / system paused-stopped)
+        is a real, actionable outcome even though quantity=0 -- it must
+        still flip the watch entry to CONVERTED."""
+        allocation = _allocation(
+            0, "Trade queued: Market closed (Queue ID: queue_20260714120000)"
+        )
+
+        fake_trading_coord = await self._run(coordinator, allocation)
+
+        fake_trading_coord.mark_watch_converted.assert_called_once_with("005930")
+
+    @pytest.mark.asyncio
+    async def test_execute_trade_skips_mark_when_daily_limit_rejected(
+        self, coordinator
+    ):
+        """TRADE_REJECTED via the daily trade limit (quantity=0, non-queued
+        rationale) must NOT convert -- the limit resets tomorrow and the
+        watch item should stay eligible for re-evaluation."""
+        allocation = _allocation(0, "Daily trade limit reached (10/10)")
+
+        fake_trading_coord = await self._run(coordinator, allocation)
+
+        fake_trading_coord.on_trade_approved.assert_awaited_once()
+        fake_trading_coord.mark_watch_converted.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_trade_skips_mark_when_allocation_sized_to_zero(
+        self, coordinator
+    ):
+        """TRADE_REJECTED via portfolio sizing to <=0 shares must NOT
+        convert -- sizing may succeed later (e.g. after cash frees up)."""
+        allocation = _allocation(0, "Allocation rejected: insufficient buying power")
+
+        fake_trading_coord = await self._run(coordinator, allocation)
+
+        fake_trading_coord.mark_watch_converted.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_trade_skips_mark_when_order_failed(self, coordinator):
+        """ORDER_FAILED: the order was placed (quantity>0, same
+        AllocationPlan shape as a genuine fill) but the broker filled 0
+        shares. A broker blip shouldn't retire the signal -- must NOT
+        convert. Distinguishing this from a real fill requires the activity
+        log on_trade_approved wrote synchronously before returning."""
+        allocation = _allocation(10, "정상 매수: 10주 매수 (risk-based sizing)")
+        activity_log = [
+            SimpleNamespace(ticker="005930", activity_type=ActivityType.ORDER_FAILED),
+        ]
+
+        fake_trading_coord = await self._run(coordinator, allocation, activity_log)
+
+        fake_trading_coord.on_trade_approved.assert_awaited_once()
+        fake_trading_coord.mark_watch_converted.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_execute_trade_skips_mark_when_action_unmapped(self, coordinator):
