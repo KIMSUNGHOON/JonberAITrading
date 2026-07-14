@@ -469,8 +469,8 @@ export function DiscoverySection() {
     for (let i = 0; i < itemsToAnalyze.length; i++) {
       const item = itemsToAnalyze[i];
       try {
-        const sessionId = await startAnalysis(item.marketType, item.ticker, item.displayName);
-        if (sessionId) startedItems.push(item);
+        const result = await startAnalysis(item.marketType, item.ticker, item.displayName);
+        if (result.sessionId) startedItems.push(item);
         if (i < itemsToAnalyze.length - 1) {
           await new Promise((resolve) => setTimeout(resolve, 500));
         }

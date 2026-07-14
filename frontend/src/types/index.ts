@@ -369,6 +369,15 @@ export interface CoinAnalysisResponse {
   market: string;
   status: string;
   message: string;
+  // P4: additive dedup + position-awareness flags (backend
+  // services/analysis dedup — commits 52eadd0/f0c18bf). `duplicate` means
+  // this response reuses an already in-progress session for `market`
+  // instead of starting a new one; `position_exists` means `market` is
+  // already held (position-aware ADD/REDUCE/HOLD analysis, not a fresh
+  // BUY entry). Optional so callers/tests built against the pre-P4
+  // response shape keep compiling.
+  duplicate?: boolean;
+  position_exists?: boolean;
 }
 
 export interface CoinTradeProposal {
@@ -595,6 +604,11 @@ export interface KRStockAnalysisResponse {
   stk_nm: string | null;
   status: string;
   message: string;
+  // P4: additive dedup + position-awareness flags — see
+  // CoinAnalysisResponse.duplicate/position_exists doc comment above (same
+  // contract, KR side).
+  duplicate?: boolean;
+  position_exists?: boolean;
 }
 
 export interface KRStockTradeProposal {

@@ -24,9 +24,9 @@ import {
   ChevronLeft,
   ChevronRight,
 } from 'lucide-react';
-import { apiClient, startKRStockAnalysis } from '@/api/client';
-import { useStore } from '@/store';
+import { apiClient } from '@/api/client';
 import { useGoTo } from '@/hooks/useNav';
+import { useStartAnalysis } from '@/hooks/useStartAnalysis';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting, TH } from '@/components/terminal/panels/shared';
 
@@ -114,8 +114,7 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
   // const language = useStore((state) => state.language);
   // const t = useTranslations(language);  // TODO: Add translations for scanner page
   const goTo = useGoTo();
-  const setActiveMarket = useStore((state) => state.setActiveMarket);
-  const startKiwoomSession = useStore((state) => state.startKiwoomSession);
+  const startAnalysis = useStartAnalysis();
 
   // State
   const [results, setResults] = useState<ScanResult[]>([]);
@@ -186,19 +185,23 @@ export function ScannerResultsPage({ onBack }: ScannerResultsPageProps) {
     }
   };
 
+  // P4 T3: routes through the shared useStartAnalysis hook (same as
+  // DiscoverySection/OperationsPanel) instead of calling startKRStockAnalysis
+  // + the legacy single-session store action directly — this is what wires
+  // in the dedup/held-position behavior (a `duplicate` hit focuses the
+  // already-running session instead of spawning a second one; a held
+  // position surfaces the "이미 보유 중" toast) without reimplementing it here.
   const handleAnalyze = useCallback(async (stk_cd: string, stk_nm: string) => {
     try {
       setAnalyzing(stk_cd);
-      setActiveMarket('kiwoom');
-      const response = await startKRStockAnalysis({ stk_cd });
-      startKiwoomSession(response.session_id, stk_cd, stk_nm);
-      goTo('workflow', response.session_id);
+      const result = await startAnalysis('kiwoom', stk_cd, stk_nm);
+      goTo('workflow', result.sessionId);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start analysis');
     } finally {
       setAnalyzing(null);
     }
-  }, [setActiveMarket, startKiwoomSession, goTo]);
+  }, [startAnalysis, goTo]);
 
   const filteredResults = results.filter((item) => {
     if (!searchQuery) return true;

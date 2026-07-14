@@ -260,6 +260,14 @@ interface UIState {
   // NOT persisted.
   tradingModes: { kiwoom: TradingMode; coin: TradingMode } | null;
   autonomyMasterEnabled: boolean;
+
+  // P4 T3: brief, app-wide informational toast (e.g. "이미 보유 중 · 포지션
+  // 관리 분석" when useStartAnalysis's start() sees position_exists=true).
+  // Deliberately a SEPARATE slot from the per-session `error` field/
+  // selectError/setError: setError routes through setKiwoomError/
+  // setCoinError, which ALSO flip that session's status to 'error' — wrong
+  // for a benign advisory note. Ephemeral, NOT persisted.
+  infoNotice: string | null;
 }
 
 // -------------------------------------------
@@ -432,6 +440,8 @@ interface UIActions {
   setLanguage: (language: Language) => void;
   // R3 trading modes — sync setter fed by callers (fetch stays in components/hooks)
   setTradingModes: (resp: TradingModeResponse) => void;
+  // P4 T3 — see UIState.infoNotice doc comment.
+  setInfoNotice: (message: string | null) => void;
 }
 
 // Legacy actions for backward compatibility
@@ -539,6 +549,7 @@ const initialUIState: UIState = {
   // R3 trading modes — unknown until fetched
   tradingModes: null,
   autonomyMasterEnabled: false,
+  infoNotice: null,
 };
 
 // -------------------------------------------
@@ -1550,6 +1561,8 @@ export const useStore = create<Store>()(
       setSelectedSessionId: (sessionId) => set({ selectedSessionId: sessionId }),
 
       setLanguage: (language) => set({ language }),
+
+      setInfoNotice: (message) => set({ infoNotice: message }),
 
       setTradingModes: (resp) =>
         set({

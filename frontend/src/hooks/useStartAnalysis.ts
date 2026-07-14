@@ -6,6 +6,20 @@
  * the exact same flow (API call + session bookkeeping + Kiwoom multi-session
  * WebSocket wiring) without duplicating it.
  *
+ * P4 T3 (re-analysis dedup + held-position awareness): the backend's
+ * /analysis/start now returns two additive flags (KR + coin, T1 52eadd0 + T2
+ * f0c18bf):
+ *   - `duplicate`: true when an active (running/awaiting_approval) session
+ *     for the ticker already existed — the response IS that pre-existing
+ *     session, no new graph run was started. `start()` must NOT add a
+ *     second store session in this case; it focuses the existing one
+ *     instead (injecting minimal bookkeeping first if the local store never
+ *     saw it — e.g. started from another tab).
+ *   - `position_exists`: true when the ticker is already held, meaning the
+ *     analysis is position-aware (ADD/REDUCE/HOLD), not a fresh BUY entry.
+ *     `start()` surfaces this via the app-wide `infoNotice` toast so the
+ *     user isn't left assuming a plain new-entry analysis just started.
+ *
  * NOTE on error handling: `start()` does NOT catch/swallow errors — it lets
  * them propagate so callers can attach their own UX (e.g. BasketWidget shows
  * a per-item error message via `setBasketItemError`). Callers that just want
@@ -17,11 +31,35 @@ import { startKRStockAnalysis, startCoinAnalysis } from '@/api/client';
 import { wsManager } from '@/api/websocket';
 import { createKiwoomWebSocketHandlers } from '@/api/kiwoomSessionHandlers';
 
+/**
+ * Result of `start()`. `sessionId` always identifies the session now showing
+ * — either freshly created, or (P4 dedup) the pre-existing in-progress
+ * session for the same ticker that `start()` focused instead of duplicating.
+ * Callers that only need to navigate/reference the session can keep treating
+ * this like a plain id (`result.sessionId`); `duplicate`/`positionExists` let
+ * a caller react to the P4 outcome without re-deriving it from the raw API
+ * response.
+ */
+export interface StartAnalysisResult {
+  sessionId: string;
+  /** True when this reused an already-running/awaiting-approval session for
+   * the ticker instead of starting a new graph run (P4 T1 dedup). */
+  duplicate: boolean;
+  /** True when the ticker is already held — the analysis is position-aware
+   * (ADD/REDUCE/HOLD), not a fresh BUY entry (P4 T2). */
+  positionExists: boolean;
+}
+
+function heldPositionNotice(label: string): string {
+  return `${label} — 이미 보유 중 · 포지션 관리 분석 (ADD/REDUCE/HOLD)`;
+}
+
 export function useStartAnalysis() {
   const setActiveMarket = useStore((state) => state.setActiveMarket);
 
   // Legacy session actions (single-session mode for coin)
   const startCoinSession = useStore((state) => state.startCoinSession);
+  const setCoinAwaitingApproval = useStore((state) => state.setCoinAwaitingApproval);
 
   // Multi-session actions for Kiwoom. The per-session WS handler factory lives
   // in api/kiwoomSessionHandlers (shared with SessionBridge) so every path that
@@ -29,17 +67,22 @@ export function useStartAnalysis() {
   const addKiwoomSession = useStore((state) => state.addKiwoomSession);
   const setActiveKiwoomSession = useStore((state) => state.setActiveKiwoomSession);
 
+  // P4 T3: brief, app-wide informational toast — see store's `infoNotice`
+  // doc comment for why this is deliberately NOT the `error`/setError slot.
+  const setInfoNotice = useStore((state) => state.setInfoNotice);
+
   /**
    * Start an analysis for a ticker on the given market. Switches the active
    * market, calls the matching start-analysis API, wires up session state
-   * (and, for Kiwoom, the multi-session WebSocket), and returns the new
-   * sessionId. Throws on failure — callers own their own error handling.
+   * (and, for Kiwoom, the multi-session WebSocket), and returns the
+   * resulting session's id plus the P4 dedup/held-position outcome. Throws
+   * on failure — callers own their own error handling.
    */
   const start = async (
     marketType: MarketType,
     ticker: string,
     displayName?: string
-  ): Promise<string | null> => {
+  ): Promise<StartAnalysisResult> => {
     console.log(`[useStartAnalysis] start(${marketType}, ${ticker})`);
 
     // Switch to the correct market
@@ -48,12 +91,55 @@ export function useStartAnalysis() {
     if (marketType === 'kiwoom') {
       const response = await startKRStockAnalysis({ stk_cd: ticker });
       const sessionId = response.session_id;
+      const label = displayName || response.stk_nm || ticker;
+      const positionExists = response.position_exists ?? false;
 
-      // Create session data for multi-session store
+      if (response.duplicate) {
+        // P4 T1 dedup hit: the backend returned an ALREADY in-progress
+        // session for this stk_cd instead of starting a new graph run.
+        // addKiwoomSession is a no-op (returns false) when the session id
+        // already exists locally, so it's only worth calling — and only
+        // worth opening a WS connection for — when the local store never
+        // saw this session at all (e.g. it was started from another tab).
+        // Either way, focus it: the user must land on the real running
+        // analysis, not a duplicate or a stale previously-active session.
+        const alreadyCached = useStore
+          .getState()
+          .kiwoom.sessions.some((s) => s.sessionId === sessionId);
+        if (!alreadyCached) {
+          const isAwaiting = response.status === 'awaiting_approval';
+          const sessionData: SessionData = {
+            sessionId,
+            ticker,
+            displayName: label,
+            marketType: 'kiwoom',
+            status: isAwaiting ? 'awaiting_approval' : 'running',
+            currentStage: null,
+            reasoningLog: [],
+            analyses: [],
+            tradeProposal: null,
+            awaitingApproval: isAwaiting,
+            autoApproveAt: null,
+            activePosition: null,
+            error: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+          addKiwoomSession(sessionData);
+          if (!wsManager.has(sessionId)) {
+            wsManager.connect(sessionId, createKiwoomWebSocketHandlers(sessionId));
+          }
+        }
+        setActiveKiwoomSession(sessionId);
+        if (positionExists) setInfoNotice(heldPositionNotice(label));
+        return { sessionId, duplicate: true, positionExists };
+      }
+
+      // Fresh session — unchanged behavior.
       const sessionData: SessionData = {
         sessionId,
         ticker,
-        displayName: displayName || response.stk_nm || ticker,
+        displayName: label,
         marketType: 'kiwoom',
         status: 'running',
         currentStage: null,
@@ -81,13 +167,38 @@ export function useStartAnalysis() {
       // Set as active session
       setActiveKiwoomSession(sessionId);
 
-      return sessionId;
+      if (positionExists) setInfoNotice(heldPositionNotice(label));
+
+      return { sessionId, duplicate: false, positionExists };
     } else {
       // For coin, use legacy single-session mode for now
       const response = await startCoinAnalysis({ market: ticker });
       const sessionId = response.session_id;
+      const label = displayName || ticker;
+      const positionExists = response.position_exists ?? false;
+
+      if (response.duplicate) {
+        // P4 T1 dedup hit. Coin only tracks ONE active session at a time
+        // (no sessions[] array like Kiwoom's) — if that slot already IS
+        // this session, it's already focused and must be left untouched
+        // (no reset, no wiped reasoningLog/tradeProposal). Otherwise
+        // re-target the slot at it via the same `startCoinSession` the
+        // fresh-start branch below uses (it already handles "not yet in
+        // history" bookkeeping), mirroring whatever status the backend
+        // reports instead of assuming 'running'.
+        if (useStore.getState().coin.activeSessionId !== sessionId) {
+          startCoinSession(sessionId, ticker, displayName);
+          if (response.status === 'awaiting_approval') {
+            setCoinAwaitingApproval(true);
+          }
+        }
+        if (positionExists) setInfoNotice(heldPositionNotice(label));
+        return { sessionId, duplicate: true, positionExists };
+      }
+
       startCoinSession(sessionId, ticker, displayName);
-      return sessionId;
+      if (positionExists) setInfoNotice(heldPositionNotice(label));
+      return { sessionId, duplicate: false, positionExists };
     }
   };
 

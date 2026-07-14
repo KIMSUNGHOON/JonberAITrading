@@ -35,6 +35,11 @@ function App() {
   const setTradingModes = useStore((state) => state.setTradingModes);
   const error = useStore(selectError);
   const setError = useStore((state) => state.setError);
+  // P4 T3: brief informational note (e.g. "이미 보유 중" on a held-position
+  // re-analysis) — deliberately separate from `error`/setError above, which
+  // also flips the active session's status to 'error'.
+  const infoNotice = useStore((state) => state.infoNotice);
+  const setInfoNotice = useStore((state) => state.setInfoNotice);
 
   // Chat Popup state - select individual values to avoid re-renders
   const chatPopupOpen = useStore((state) => state.chatPopupOpen);
@@ -123,6 +128,16 @@ function App() {
           type="error"
           duration={0}
           onClose={() => setError(null)}
+        />
+      )}
+
+      {/* Info Toast - brief, auto-dismissing (P4 T3 held-position notice) */}
+      {infoNotice && (
+        <Toast
+          message={infoNotice}
+          type="info"
+          duration={4500}
+          onClose={() => setInfoNotice(null)}
         />
       )}
 

@@ -668,7 +668,7 @@ describe('DiscoverySection — Scratchpad power features folded in from BasketWi
           history: [],
         },
       });
-      mockStart.mockResolvedValue('session-limited');
+      mockStart.mockResolvedValue({ sessionId: 'session-limited', duplicate: false, positionExists: false });
 
       render(<DiscoverySection />);
       fireEvent.click(screen.getByRole('button', { name: '전체 분석' }));

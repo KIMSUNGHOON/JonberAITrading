@@ -278,7 +278,7 @@ it('감시 항목의 재분석 버튼이 useStartAnalysis의 start를 kiwoom/티
       current_price: 71000, target_entry_price: 70000, confidence: 0.75, status: 'active',
     }],
   });
-  mockStartAnalysis.mockResolvedValue('session-42');
+  mockStartAnalysis.mockResolvedValue({ sessionId: 'session-42', duplicate: false, positionExists: false });
   render(<OperationsPanel />);
   await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
   fireEvent.click(screen.getByRole('button', { name: '재분석 005930' }));

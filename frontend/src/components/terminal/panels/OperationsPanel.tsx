@@ -599,9 +599,12 @@ export function useOperationsActions(refetch: () => void, navigate: (path: strin
   // rather than reimplementing the widget's older, WS-less store call.
   const handleReanalyzeWatch = useCallback(async (ticker: string, name: string) => {
     try {
-      const sessionId = await startAnalysis('kiwoom', ticker, name);
+      // P4 T3: startAnalysis now returns {sessionId, duplicate, positionExists}
+      // — a `duplicate` hit still navigates here (to the pre-existing session
+      // useStartAnalysis just focused), it just doesn't spawn a second one.
+      const result = await startAnalysis('kiwoom', ticker, name);
       setActionError(null);
-      if (sessionId) navigate(`/workflow/${sessionId}`);
+      if (result.sessionId) navigate(`/workflow/${result.sessionId}`);
     } catch (e) {
       setActionError(`재분석 실패: ${e instanceof Error ? e.message : '액션 실패'}`);
     }

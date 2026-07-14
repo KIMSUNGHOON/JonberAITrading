@@ -174,7 +174,7 @@ describe('FunnelPanel — WATCHLIST section (server SSOT)', () => {
         current_price: 71000, target_entry_price: 70000, confidence: 0.75, status: 'active',
       }],
     });
-    mockStart.mockResolvedValue('session-99');
+    mockStart.mockResolvedValue({ sessionId: 'session-99', duplicate: false, positionExists: false });
     render(<FunnelPanel />);
     await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
     fireEvent.click(screen.getByRole('button', { name: /재분석.*005930/ }));
