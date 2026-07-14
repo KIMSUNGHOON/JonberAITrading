@@ -56,6 +56,25 @@ export function FunnelPanel() {
 
   return (
     <div className="flex flex-col h-full min-h-0 text-[11px]">
+      {/* actionError is panel-wide (not WATCHLIST-only): it's set by handlers
+          from BOTH the WATCHLIST section (큐 전환/제거) AND the PIPELINE
+          section (분석 취소/대기 취소/주문 취소), so it renders once here at
+          the panel level — matching OperationsPanel's original single-banner
+          placement — rather than being mislabeled under one section's
+          header. */}
+      {actionError && (
+        <div className="flex-none flex items-center justify-between gap-2 px-2.5 py-1 border-b border-hairline bg-down/5 text-down">
+          <span>{actionError}</span>
+          <button
+            type="button"
+            aria-label="오류 닫기"
+            onClick={() => setActionError(null)}
+            className="text-dim hover:text-down flex-none"
+          >
+            ✕
+          </button>
+        </div>
+      )}
       {/* DISCOVERY */}
       <div className="flex-none flex flex-col min-h-0 border-b border-hairline" style={{ height: '42%' }}>
         <div className={SECTION_LABEL}>DISCOVERY · 발견</div>
@@ -67,19 +86,6 @@ export function FunnelPanel() {
       {/* WATCHLIST — server SSOT (ExecutionCoordinator), same data+actions as PIPELINE below */}
       <div className="flex-none flex flex-col min-h-0 border-b border-hairline" style={{ height: '24%' }}>
         <div className={SECTION_LABEL}>WATCHLIST · 감시</div>
-        {actionError && (
-          <div className="flex-none flex items-center justify-between gap-2 px-2.5 py-1 border-b border-hairline bg-down/5 text-down">
-            <span>{actionError}</span>
-            <button
-              type="button"
-              aria-label="오류 닫기"
-              onClick={() => setActionError(null)}
-              className="text-dim hover:text-down flex-none"
-            >
-              ✕
-            </button>
-          </div>
-        )}
         {state === 'loading' && <Awaiting label="감시 리스트 로드 중…" />}
         {state === 'error' && <Awaiting label={`감시 리스트 오류 · ${err}`} />}
         {state === 'ready' && data && (

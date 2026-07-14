@@ -6,6 +6,11 @@
  *  - PIPELINE inherits OperationsPanel's per-section honest-degrade
  *    contract: one failed column shows "조회 실패" while an unrelated
  *    column that succeeded keeps rendering (no fabricated masking).
+ *  - actionError (T5 review MEDIUM fix): the shared `useOperationsActions`
+ *    banner is rendered ONCE at the panel level (not nested under the
+ *    WATCHLIST header), since it's set by PIPELINE-only handlers
+ *    (분석 취소/대기 취소/주문 취소) just as much as WATCHLIST's
+ *    (큐 전환/제거) — see "actionError banner" describe block below.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
@@ -136,6 +141,51 @@ describe('FunnelPanel — WATCHLIST section (server SSOT)', () => {
     await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
     expect(screen.getByText(/82%/)).toBeInTheDocument();
     expect(screen.getByText(/ACTIVE/)).toBeInTheDocument();
+  });
+});
+
+describe('FunnelPanel — actionError banner (panel-level, T5 review MEDIUM fix)', () => {
+  it('a PIPELINE cancel-action failure (분석 취소) surfaces the error banner at the panel level, not nested under the WATCHLIST header', async () => {
+    getOperations.mockResolvedValue({
+      ...OPERATIONS_BASE,
+      analyzing: [{ session_id: 's1', ticker: '005930', name: '삼성전자',
+                    status: 'running', current_stage: 'technical_analysis', started_at: null }],
+    });
+    cancelKRStockSession.mockRejectedValueOnce(new Error('네트워크 오류'));
+    render(<FunnelPanel />);
+    await waitFor(() => expect(screen.getByText(/분석중 · 1/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: '분석 취소' }));
+    const errorBanner = await screen.findByText(/분석 취소 실패: 네트워크 오류/);
+
+    // Must precede (not be nested under) the WATCHLIST section header —
+    // i.e. render at the panel level, not mislabeled as a WATCHLIST error.
+    const watchlistHeader = screen.getByText(/WATCHLIST/);
+    const bannerFollowsWatchlist = Boolean(
+      watchlistHeader.compareDocumentPosition(errorBanner) & Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(bannerFollowsWatchlist).toBe(false);
+    // It's the panel's first rendered element (above even DISCOVERY).
+    expect(errorBanner.closest('[class*="border-hairline"]')?.previousElementSibling).toBeNull();
+  });
+
+  it('a WATCHLIST action failure (감시 제거) still shows the panel-level error banner', async () => {
+    getOperations.mockResolvedValue({
+      ...OPERATIONS_BASE,
+      watching: [{
+        id: 'watch-9', ticker: '005930', stock_name: '삼성전자',
+        current_price: 71000, target_entry_price: 70000, confidence: 0.75, status: 'active',
+      }],
+    });
+    removeFromWatchList.mockRejectedValueOnce(new Error('서버 오류'));
+    render(<FunnelPanel />);
+    await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: /제거.*005930/ }));
+    const errorBanner = await screen.findByText(/감시 제거 실패: 서버 오류/);
+    // Dismissable, same as before.
+    fireEvent.click(screen.getByRole('button', { name: '오류 닫기' }));
+    await waitFor(() => expect(errorBanner).not.toBeInTheDocument());
   });
 });
 
