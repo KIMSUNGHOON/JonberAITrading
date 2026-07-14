@@ -210,7 +210,13 @@ interface UIState {
 }
 
 // -------------------------------------------
-// Basket (Watchlist) Types
+// Basket (user-facing label: "Scratchpad", P2-T3) Types
+//
+// "Watchlist" is reserved for the SERVER watch-list (WATCH decisions /
+// scanner promotions — see OperationsPanel's "감시" column + /trading's
+// WatchListWidget). This client-side research-staging slice keeps its
+// internal `basket` identifiers (type/action names, persist key) as-is to
+// minimize blast radius; only user-facing labels changed.
 // -------------------------------------------
 
 export interface BasketItem {

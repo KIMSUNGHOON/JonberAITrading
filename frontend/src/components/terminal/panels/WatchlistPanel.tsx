@@ -100,7 +100,7 @@ export function WatchlistPanel() {
   }, [activeMarket, kiwoomApiConfigured, items.map((i) => i.ticker).join(','), updateBasketItemPrice]);
 
   if (items.length === 0) {
-    return <Awaiting label={`관심종목 없음 · ${marketLabelOf(activeMarket)} 종목을 바스켓에 추가`} />;
+    return <Awaiting label={`스크래치패드 비어있음 · ${marketLabelOf(activeMarket)} 종목을 스크래치패드에 추가`} />;
   }
 
   return (

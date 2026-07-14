@@ -2,7 +2,7 @@
  * Sidebar Component
  *
  * Navigation for page views.
- * - Dashboard, Analysis, Charts, Positions, My Basket, Trades
+ * - Dashboard, Analysis, Charts, Positions, Scratchpad, Trades
  */
 
 import { useMemo } from 'react';

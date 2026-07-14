@@ -426,7 +426,7 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
         <div className="text-center py-4">
           <BarChart3 className="w-8 h-8 mx-auto mb-2 text-gray-600" />
           <p className="text-sm text-gray-500">분석 중인 종목이 없습니다</p>
-          <p className="text-xs text-gray-600 mt-1">My Basket에서 종목을 선택하여 분석을 시작하세요</p>
+          <p className="text-xs text-gray-600 mt-1">Scratchpad에서 종목을 선택하여 분석을 시작하세요</p>
         </div>
       ) : (
         <>

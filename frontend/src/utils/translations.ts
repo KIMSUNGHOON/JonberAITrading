@@ -242,7 +242,7 @@ const translations: Record<Language, Record<TranslationKey, string>> = {
     nav_analysis: '분석',
     nav_charts: '차트',
     nav_positions: '포지션',
-    nav_basket: '관심종목',
+    nav_basket: '스크래치패드',
     nav_trades: '거래내역',
     nav_auto_trading: '자동매매',
     nav_scanner: '스캐너 결과',
@@ -402,9 +402,9 @@ const translations: Record<Language, Record<TranslationKey, string>> = {
     market_coin: '암호화폐',
     market_all: '전체',
 
-    // Basket
-    basket_title: '관심종목',
-    basket_empty: '관심종목이 비어있습니다',
+    // Basket (label: Scratchpad, P2-T3 — '관심종목' now belongs to the server watch-list)
+    basket_title: '스크래치패드',
+    basket_empty: '스크래치패드가 비어있습니다',
     basket_empty_desc: '종목을 추가하여 분석을 시작하세요',
     basket_analyze_all: '전체 분석',
     basket_clear_all: '전체 삭제',
@@ -436,7 +436,7 @@ const translations: Record<Language, Record<TranslationKey, string>> = {
     nav_analysis: 'Analysis',
     nav_charts: 'Charts',
     nav_positions: 'Positions',
-    nav_basket: 'My Basket',
+    nav_basket: 'Scratchpad',
     nav_trades: 'Trades',
     nav_auto_trading: 'Auto-Trading',
     nav_scanner: 'Scanner Results',
@@ -596,9 +596,9 @@ const translations: Record<Language, Record<TranslationKey, string>> = {
     market_coin: 'Crypto',
     market_all: 'All',
 
-    // Basket
-    basket_title: 'My Basket',
-    basket_empty: 'Basket is empty',
+    // Basket (label: Scratchpad, P2-T3 — "Watchlist" now belongs to the server watch-list)
+    basket_title: 'Scratchpad',
+    basket_empty: 'Scratchpad is empty',
     basket_empty_desc: 'Add stocks to start analysis',
     basket_analyze_all: 'Analyze All',
     basket_clear_all: 'Clear All',

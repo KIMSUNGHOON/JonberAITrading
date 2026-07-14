@@ -1,7 +1,10 @@
 /**
- * BasketPage Component
+ * BasketPage Component — user-facing label is "Scratchpad" (P2-T3).
  *
- * Full-page view of the basket/watchlist with expanded functionality.
+ * Full-page view of the client-side research-staging list (store.basket)
+ * with expanded functionality. Not the server watch-list — see nav.ts for
+ * the naming split. Internal identifiers (component/file name, `basket`
+ * store slice) are kept as-is to minimize blast radius.
  * - Full search capability
  * - Expanded item list
  * - Bulk actions
@@ -39,8 +42,8 @@ export function BasketPage({ onBack }: BasketPageProps) {
           <ArrowLeft className="w-5 h-5 text-muted" />
         </button>
         <div>
-          <h1 className="text-xl font-semibold">My Basket</h1>
-          <p className="text-sm text-dim">Search and manage your watchlist</p>
+          <h1 className="text-xl font-semibold">Scratchpad</h1>
+          <p className="text-sm text-dim">Search stocks and stage them here before starting analysis</p>
         </div>
       </div>
 

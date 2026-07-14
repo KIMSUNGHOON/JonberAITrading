@@ -1,7 +1,10 @@
 /**
- * BasketWidget Component
+ * BasketWidget Component — user-facing label is "Scratchpad" (P2-T3).
  *
- * Watchlist-style widget for tracking multiple stocks/coins.
+ * Widget for staging multiple stocks/coins before analysis. Not the server
+ * watch-list — see nav.ts for the naming split. Internal identifiers
+ * (component/file name, `basket` store slice) are kept as-is to minimize
+ * blast radius.
  * - Add/remove items to basket
  * - Real-time price updates (when API configured)
  * - API configuration status handling
@@ -356,7 +359,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
     // Add to basket directly
     const exists = basketItems.some((item) => item.ticker === stock.stk_cd);
     if (exists) {
-      setInputError(`${stock.stk_nm} (${stock.stk_cd})은 이미 바스켓에 있습니다`);
+      setInputError(`${stock.stk_nm} (${stock.stk_cd})은 이미 스크래치패드에 있습니다`);
       return;
     }
 
@@ -607,7 +610,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
       <div className={`flex items-center justify-between ${expanded ? 'mb-4' : 'mb-3'}`}>
         <div className="flex items-center gap-2">
           <ShoppingBasket className={`${expanded ? 'w-6 h-6' : 'w-5 h-5'} text-accent`} />
-          <h3 className={`font-semibold ${expanded ? 'text-base' : 'text-sm'}`}>My Basket</h3>
+          <h3 className={`font-semibold ${expanded ? 'text-base' : 'text-sm'}`}>Scratchpad</h3>
           <span className="px-1.5 py-0.5 text-xs bg-accent text-canvas rounded-full tabular-nums">
             {basketItems.length}/10
           </span>
@@ -658,7 +661,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
                 ? 'text-dim cursor-not-allowed'
                 : 'text-accent hover:bg-accent/20'
             }`}
-            title={isBasketFull ? '바스켓이 가득 찼습니다' : '종목 추가'}
+            title={isBasketFull ? '스크래치패드가 가득 찼습니다' : '종목 추가'}
           >
             <Plus className="w-4 h-4" />
           </button>
@@ -833,7 +836,7 @@ export function BasketWidget({ expanded = false }: BasketWidgetProps) {
         {basketItems.length === 0 ? (
           <div className="text-center py-6 text-dim">
             <ShoppingBasket className="w-8 h-8 mx-auto mb-2 opacity-30" />
-            <p className="text-xs">바스켓이 비어있습니다</p>
+            <p className="text-xs">스크래치패드가 비어있습니다</p>
             <p className="text-xs mt-1">종목을 추가해보세요</p>
           </div>
         ) : (

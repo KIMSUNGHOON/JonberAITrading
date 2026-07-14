@@ -25,7 +25,7 @@ type PanelId =
 
 const TITLES: Record<PanelId, string> = {
   operations: 'Operations · 운용 파이프라인',
-  watchlist: 'Basket',            // ← 서버 워치리스트와 구분 (스펙 §7)
+  watchlist: 'Scratchpad',        // ← 서버 워치리스트(Watchlist)와 구분 (스펙 §7, P2-T3)
   chart: 'Chart',
   portfolio: 'Portfolio',
   positions: 'Positions',

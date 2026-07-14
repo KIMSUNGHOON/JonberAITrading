@@ -1,6 +1,6 @@
 /**
  * Chart tile — embeds the real TradingChart, fed by an explicitly-picked symbol
- * (watchlist/position row click → store.chartSymbol) or, failing that, the
+ * (scratchpad/position row click → store.chartSymbol) or, failing that, the
  * active analysis session's ticker. So the chart works WITHOUT a running session
  * (candles need only ticker+timeframe).
  *
@@ -26,7 +26,7 @@ export function ChartTile() {
 
   if (!symbol || !hasRealCandles(symbol)) {
     return (
-      <Awaiting label="차트 대기 · 관심종목 행 클릭 또는 :analyze <종목>" />
+      <Awaiting label="차트 대기 · 스크래치패드 행 클릭 또는 :analyze <종목>" />
     );
   }
 
