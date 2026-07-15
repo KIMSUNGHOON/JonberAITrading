@@ -206,6 +206,29 @@ class StorageService:
                     )
                 """)
 
+                # Regime snapshot table (Phase2 Task 2): the only durable
+                # market-wide artifact is the background scanner's
+                # scan_sessions breadth distribution (buy/sell/hold counts
+                # across the day's KOSPI/KOSDAQ sweep) — index/flow fetchers
+                # are a later phase. One row per compute_regime_snapshot
+                # call (services/trading/regime.py); id is NOT the
+                # trade_date so re-running the same day intentionally
+                # appends rather than overwrites, mirroring
+                # agent_calibration's accretion style above.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS regime_snapshot (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT,
+                        breadth_buy INTEGER,
+                        breadth_sell INTEGER,
+                        breadth_hold INTEGER,
+                        breadth_ratio REAL,
+                        regime_label TEXT,
+                        source TEXT DEFAULT 'scanner',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # App settings table (generic key-value; e.g. trading_mode:kiwoom)
                 # — runtime settings that must survive restarts (R3).
                 await conn.execute("""
@@ -398,6 +421,11 @@ class StorageService:
                 # Agent calibration ledger index (Phase2 Task 1)
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_ac_agent_type ON agent_calibration(agent_type)"
+                )
+
+                # Regime snapshot index (Phase2 Task 2)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_regime_snapshot_trade_date ON regime_snapshot(trade_date)"
                 )
 
                 await conn.commit()
@@ -1889,6 +1917,85 @@ class StorageService:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error("agent_calibration_get_failed", error=str(e))
+            return []
+
+    # -------------------------------------------
+    # Regime Snapshot (Phase2 Task 2)
+    # -------------------------------------------
+
+    async def save_regime_snapshot(self, record: dict[str, Any]) -> bool:
+        """
+        Persist one daily market-regime snapshot row.
+
+        (Phase2 Task 2: computed by services/trading/regime.py::
+        compute_regime_snapshot from the background scanner's
+        scan_sessions breadth distribution — the only durable market-wide
+        artifact in this codebase. Mirrors save_coin_realized_pnl's shape.)
+
+        Args:
+            record: dict with keys id, trade_date, breadth_buy,
+                breadth_sell, breadth_hold, breadth_ratio, regime_label,
+                and optionally source (defaults to 'scanner').
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO regime_snapshot
+                    (id, trade_date, breadth_buy, breadth_sell, breadth_hold,
+                     breadth_ratio, regime_label, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"],
+                        record.get("trade_date"),
+                        record.get("breadth_buy"),
+                        record.get("breadth_sell"),
+                        record.get("breadth_hold"),
+                        record.get("breadth_ratio"),
+                        record.get("regime_label"),
+                        record.get("source", "scanner"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "regime_snapshot_saved",
+                    trade_date=record.get("trade_date"),
+                    regime_label=record.get("regime_label"),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "regime_snapshot_save_failed",
+                trade_date=record.get("trade_date"),
+                error=str(e),
+            )
+            return False
+
+    async def get_regime_snapshots(self, limit: int = 60) -> list[dict[str, Any]]:
+        """Get regime snapshots, newest first by created_at."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM regime_snapshot
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("regime_snapshots_get_failed", error=str(e))
             return []
 
     # -------------------------------------------

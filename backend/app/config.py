@@ -116,6 +116,13 @@ class Settings(BaseSettings):
     # KIWOOM_PER_API_MIN_INTERVAL's single-field pattern above).
     EOD_FLAT_THRESHOLD_KRW: float = Field(default=10000.0, ge=0)
 
+    # Breadth ratio magnitude above which the background scanner's
+    # buy/sell/hold distribution for a day is labeled a directional regime
+    # ("risk_on"/"risk_off") rather than "neutral" (services/trading/
+    # regime.py::compute_regime_snapshot). Config-driven per the same
+    # pattern as EOD_FLAT_THRESHOLD_KRW above.
+    EOD_REGIME_BREADTH_THRESHOLD: float = Field(default=0.15, ge=0)
+
     # -------------------------------------------
     # Naver API Configuration (News Search)
     # https://developers.naver.com/apps
