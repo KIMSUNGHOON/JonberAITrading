@@ -124,6 +124,23 @@ class Settings(BaseSettings):
     EOD_REGIME_BREADTH_THRESHOLD: float = Field(default=0.15, ge=0)
 
     # -------------------------------------------
+    # Phase3: EOD strategy consensus (strategy_orchestrator.py). ENABLED
+    # gates the market-close LLM panel (3 structured calls via the
+    # STRATEGIC_DECISION chain); the produced strategy stays dormant until
+    # Phase4 wires tactical consumption, so this is analysis-only — but the
+    # flag exists to kill the LLM spend without a code change. The timeout
+    # bounds how long the close-edge scheduler tick may stall (market is
+    # already closed at that point; the next open is the following day).
+    STRATEGY_CONSENSUS_ENABLED: bool = True
+    STRATEGY_CONSENSUS_TIMEOUT_SECONDS: float = Field(default=420.0, gt=0)
+    # Consensus gates (strategy_consensus.aggregate_stance): fewer than
+    # MIN_VALID_VOTES valid panelist votes -- or a dominant-stance share
+    # below THRESHOLD -- keeps the current strategy (the single-vote=100%
+    # agent-chat defect, corrected by construction).
+    STRATEGY_MIN_VALID_VOTES: int = Field(default=2, ge=1)
+    STRATEGY_CONSENSUS_THRESHOLD: float = Field(default=0.5, ge=0, le=1.0)
+
+    # -------------------------------------------
     # Naver API Configuration (News Search)
     # https://developers.naver.com/apps
     # -------------------------------------------

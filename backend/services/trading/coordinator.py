@@ -47,6 +47,7 @@ from .trade_log import record_trade_fill, record_kr_realized_pnl
 from .cadence import compute_watch_ttl
 from .eod_snapshot import write_daily_snapshot
 from .eod_orchestrator import run_eod_review
+from .strategy_orchestrator import run_strategy_consensus
 from services.storage_service import get_storage_service
 
 logger = logging.getLogger(__name__)
@@ -2039,6 +2040,7 @@ class ExecutionCoordinator:
             await self._expire_tracked_orders_on_market_close()
             await write_daily_snapshot(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # T5c: 마감 1회
             await run_eod_review(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase2 T4: EOD 리뷰(레짐/캘리브레이션/리포트+FK 백필)
+            await run_strategy_consensus(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase3: EOD 전략 합의(리뷰 소비→TradingStrategy 갱신+버전 영속; 타임아웃/실패는 내부 소유)
         self._market_was_open = is_open
 
     async def _expire_tracked_orders_on_market_close(self) -> None:
