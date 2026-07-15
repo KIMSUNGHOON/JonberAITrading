@@ -82,7 +82,6 @@ class ActivityType(str, Enum):
     MARKET_CLOSED = "market_closed"
     ACCOUNT_REFRESHED = "account_refreshed"
     STRATEGY_CHANGED = "strategy_changed"
-    STRATEGY_EVALUATED = "strategy_evaluated"
     # Watch list activities
     WATCH_ADDED = "watch_added"
     WATCH_REMOVED = "watch_removed"
@@ -569,7 +568,6 @@ class TradingState(BaseModel):
         "portfolio": AgentState(name="Portfolio Agent"),
         "order": AgentState(name="Order Agent"),
         "risk": AgentState(name="Risk Monitor"),
-        "strategy": AgentState(name="Strategy Engine"),
     })
 
     # Timestamps

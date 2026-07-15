@@ -1,14 +1,14 @@
 """
 Trading Strategy Module
 
-Provides strategy configuration, presets, and the strategy engine
-for making trading decisions based on analysis results.
+Provides strategy configuration and presets for making trading
+decisions based on analysis results.
 """
 
 import json
 import logging
 from enum import Enum
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -126,28 +126,6 @@ class TradingStrategy(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     is_active: bool = Field(default=True)
-
-
-class EntryDecision(BaseModel):
-    """Decision for entering a position"""
-    action: str  # BUY, SELL, HOLD, SKIP
-    confidence: int = Field(ge=0, le=100)
-    entry_price: Optional[float] = None
-    position_size_pct: Optional[float] = None
-    stop_loss_price: Optional[float] = None
-    take_profit_price: Optional[float] = None
-    rationale: str = ""
-    key_factors: List[str] = Field(default_factory=list)
-    strategy_alignment: int = Field(default=0, ge=0, le=100)  # How well it fits the strategy
-
-
-class ExitDecision(BaseModel):
-    """Decision for exiting a position"""
-    action: str  # HOLD, STOP_LOSS, TAKE_PROFIT, STRATEGIC_EXIT, EMERGENCY_EXIT
-    urgency: str = "normal"  # normal, high, critical
-    reason: str = ""
-    recommended_price: Optional[float] = None
-    partial_exit_pct: Optional[float] = None  # For partial exits
 
 
 # -------------------------------------------

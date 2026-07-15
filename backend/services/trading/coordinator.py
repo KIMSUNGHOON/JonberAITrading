@@ -39,7 +39,6 @@ from .order_agent import OrderAgent, KiwoomRateLimiter
 from .risk_monitor import RiskMonitor
 from .market_hours import MarketType, get_market_hours_service
 from .strategy import TradingStrategy
-from .strategy_engine import StrategyEngine
 from .pending_order_tracker import PendingOrderTracker, TrackedOrder
 from .position_registration import register_fill_as_position
 from .reconciler import reconcile
@@ -126,7 +125,6 @@ class ExecutionCoordinator:
 
         # Strategy
         self._strategy: Optional[TradingStrategy] = None
-        self._strategy_engine: Optional[StrategyEngine] = None
 
         # Open-queue scheduler (R5-P1): auto-process the queue on the KRX
         # closed→open transition while the system is already running.
@@ -2495,9 +2493,6 @@ class ExecutionCoordinator:
         self._strategy = strategy
 
         if strategy:
-            # Create strategy engine with LLM provider (if available)
-            self._strategy_engine = StrategyEngine(strategy, llm_provider=None)
-
             self._log_activity(
                 ActivityType.STRATEGY_CHANGED,
                 f"Strategy set: {strategy.name} ({strategy.risk_tolerance.value})",
@@ -2512,8 +2507,6 @@ class ExecutionCoordinator:
 
             logger.info(f"[Coordinator] Strategy set: {strategy.name}")
         else:
-            self._strategy_engine = None
-
             self._log_activity(
                 ActivityType.STRATEGY_CHANGED,
                 "Strategy cleared",
@@ -2521,122 +2514,3 @@ class ExecutionCoordinator:
             )
 
             logger.info("[Coordinator] Strategy cleared")
-
-    def get_strategy_engine(self) -> Optional[StrategyEngine]:
-        """Get the strategy engine instance."""
-        return self._strategy_engine
-
-    async def evaluate_with_strategy(
-        self,
-        ticker: str,
-        stock_name: str,
-        analysis_results: dict,
-        current_price: float,
-    ) -> dict:
-        """
-        Evaluate a trade using the current strategy.
-
-        Args:
-            ticker: Stock ticker
-            stock_name: Stock name
-            analysis_results: Analysis results from agents
-            current_price: Current stock price
-
-        Returns:
-            Entry decision dict with action, confidence, etc.
-        """
-        if not self._strategy_engine:
-            return {
-                "action": "SKIP",
-                "confidence": 0,
-                "rationale": "No strategy configured",
-            }
-
-        # Prepare account info
-        account_info = {
-            "total_equity": self._state.account.total_equity,
-            "available_cash": self._state.account.available_cash,
-            "total_stock_value": self._state.account.total_stock_value,
-            "positions": [p.model_dump() for p in self._state.positions],
-        }
-
-        # Update strategy agent status - working
-        self._update_agent_status(
-            "strategy",
-            AgentStatus.WORKING,
-            task=f"Evaluating entry for {stock_name or ticker}",
-            processing_stock=ticker,
-            processing_stock_name=stock_name,
-            analysis_summary={
-                "technical": analysis_results.get("technical", {}).get("signal", "N/A"),
-                "fundamental": analysis_results.get("fundamental", {}).get("signal", "N/A"),
-                "sentiment": analysis_results.get("sentiment", {}).get("signal", "N/A"),
-                "risk": analysis_results.get("risk", {}).get("level", "N/A"),
-            } if analysis_results else None,
-        )
-
-        try:
-            decision = await self._strategy_engine.evaluate_entry(
-                ticker=ticker,
-                stock_name=stock_name,
-                analysis_results=analysis_results,
-                current_price=current_price,
-                account_info=account_info,
-            )
-
-            self._log_activity(
-                ActivityType.STRATEGY_EVALUATED,
-                f"Strategy evaluation: {decision.action} (confidence: {decision.confidence}%)",
-                agent="strategy",
-                ticker=ticker,
-                details={
-                    "action": decision.action,
-                    "confidence": decision.confidence,
-                    "rationale": decision.rationale,
-                    "key_factors": decision.key_factors,
-                },
-            )
-
-            # Update strategy agent status - completed
-            self._update_agent_status(
-                "strategy",
-                AgentStatus.IDLE,
-                action=f"Decided: {decision.action} ({decision.confidence}%)",
-                processing_stock=ticker,
-                processing_stock_name=stock_name,
-                trade_details={
-                    "action": decision.action,
-                    "confidence": decision.confidence,
-                    "entry_price": decision.entry_price,
-                    "stop_loss": decision.stop_loss,
-                    "take_profit": decision.take_profit,
-                },
-                last_result={
-                    "success": True,
-                    "message": decision.rationale,
-                },
-            )
-            self._complete_agent_task("strategy", success=True)
-
-            return decision.model_dump()
-
-        except Exception as e:
-            logger.error(f"[Coordinator] Strategy evaluation failed: {e}")
-            # Update strategy agent status - error
-            self._update_agent_status(
-                "strategy",
-                AgentStatus.ERROR,
-                error=str(e),
-                processing_stock=ticker,
-                processing_stock_name=stock_name,
-                last_result={
-                    "success": False,
-                    "message": f"Strategy evaluation error: {e}",
-                },
-            )
-            self._complete_agent_task("strategy", success=False)
-            return {
-                "action": "SKIP",
-                "confidence": 0,
-                "rationale": f"Strategy evaluation error: {e}",
-            }

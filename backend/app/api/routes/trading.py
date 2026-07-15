@@ -18,7 +18,6 @@ from services.trading import (
     TradingAlert,
     RiskParameters,
     StopLossMode,
-    AllocationPlan,
     # Strategy
     RiskTolerance,
     TradingStyle,
@@ -1257,7 +1256,6 @@ async def get_agent_states(
     - Portfolio Agent: Position sizing and allocation
     - Order Agent: Order execution
     - Risk Monitor: Stop-loss/take-profit monitoring
-    - Strategy Engine: Strategy evaluation
     """
     return {
         "agents": coordinator.get_agent_states(),
