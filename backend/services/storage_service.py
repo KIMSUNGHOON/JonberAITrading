@@ -239,6 +239,24 @@ class StorageService:
                     )
                 """)
 
+                # EOD review report table (Phase2 Task 3): the durable,
+                # structured end-of-day review assembled from the Phase1/
+                # Phase2 ledgers (daily_perf_snapshot/kr_realized_pnl/
+                # agent_calibration/regime_snapshot) — see
+                # services/trading/eod_review.py::build_eod_review. Stored as
+                # one opaque report_json blob rather than normalized columns
+                # since its shape is a nested aggregate, not a flat record.
+                # trade_date is the PK so re-running the same day's review
+                # (e.g. after a late fill correction) updates the existing
+                # row via INSERT OR REPLACE rather than accreting duplicates.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS eod_review (
+                        trade_date TEXT PRIMARY KEY,
+                        report_json TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # Agent-chat decisions ledger (Phase1 C1: decisions/votes were
                 # in-memory-only and evaporated on restart). One row per
                 # decision reached by the agent-chat debate for a ticker;
@@ -1996,6 +2014,74 @@ class StorageService:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error("regime_snapshots_get_failed", error=str(e))
+            return []
+
+    # -------------------------------------------
+    # EOD Review Report (Phase2 Task 3)
+    # -------------------------------------------
+
+    async def save_eod_review(self, record: dict[str, Any]) -> bool:
+        """
+        Persist one end-of-day review report row.
+
+        (Phase2 Task 3: the assembled report from
+        services/trading/eod_review.py::build_eod_review. Uses
+        INSERT OR REPLACE against the trade_date PRIMARY KEY so re-running
+        the same day's review — e.g. after a late fill correction — updates
+        the existing row rather than accreting a duplicate.)
+
+        Args:
+            record: dict with keys trade_date, report_json (a JSON string).
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO eod_review (trade_date, report_json)
+                    VALUES (?, ?)
+                    """,
+                    (
+                        record["trade_date"],
+                        record.get("report_json"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "eod_review_saved", trade_date=record.get("trade_date")
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "eod_review_save_failed",
+                trade_date=record.get("trade_date"),
+                error=str(e),
+            )
+            return False
+
+    async def get_eod_reviews(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Get EOD review reports, newest first by trade_date."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM eod_review
+                    ORDER BY trade_date DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("eod_reviews_get_failed", error=str(e))
             return []
 
     # -------------------------------------------
