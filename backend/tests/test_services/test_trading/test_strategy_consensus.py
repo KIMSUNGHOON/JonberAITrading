@@ -159,6 +159,20 @@ def test_non_numeric_adjustment_is_ignored():
     assert out.exit_conditions.stop_loss_pct == pytest.approx(0.06)
 
 
+def test_hostile_adjustments_shape_is_non_vote_not_run_killer():
+    """One malformed panelist (adjustments as a list — plausible LLM output,
+    since the schema only validates top-level required keys) must not raise
+    / abort the whole consensus; it's simply excluded from that knob's
+    electorate, and a valid co-panelist's suggestion still applies."""
+    current = TradingStrategy()  # stop_loss_pct=0.07
+    votes = [
+        _vote(adjustments=[{"stop_loss_pct": 0.05}], panelist="a"),  # hostile shape
+        _vote(adjustments={"stop_loss_pct": 0.06}, panelist="b"),
+    ]
+    out = apply_consensus(current, votes, "defensive", 0.8, "2026-07-15", "rev-1")
+    assert out.exit_conditions.stop_loss_pct == pytest.approx(0.06)
+
+
 def test_bool_adjustment_is_rejected():
     """bool은 int 서브클래스지만 노브 값이 아니다 — True가 1.0으로 새면 안 됨."""
     current = TradingStrategy()  # stop_loss_pct=0.07

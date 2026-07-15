@@ -119,6 +119,14 @@ async def run_strategy_consensus(
             )
             return _result(False, "timeout")
 
+        # Re-read: a manual POST/PUT/DELETE /strategy landing mid-panel-await
+        # would otherwise leave `current` stale, making the revision write +
+        # pointer move below describe a strategy no longer in effect (restore
+        # would then revert/resurrect it). This shrinks that race window from
+        # the panel's up-to-STRATEGY_CONSENSUS_TIMEOUT_SECONDS (≤420s) await
+        # down to microseconds.
+        current = coordinator.get_strategy()
+
         stance_result = aggregate_stance(
             votes,
             min_valid=settings.STRATEGY_MIN_VALID_VOTES,

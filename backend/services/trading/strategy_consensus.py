@@ -139,7 +139,10 @@ def _aggregate_knob(votes: list[dict], knob: str) -> Optional[float]:
     are rejected (bool is an int subclass)."""
     suggestions = []
     for vote in votes:
-        raw = (vote.get("adjustments") or {}).get(knob)
+        adjustments = vote.get("adjustments")
+        if not isinstance(adjustments, dict):
+            continue
+        raw = adjustments.get(knob)
         if isinstance(raw, (int, float)) and not isinstance(raw, bool):
             suggestions.append(float(raw))
     if not suggestions:

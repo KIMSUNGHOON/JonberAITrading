@@ -882,16 +882,23 @@ async def apply_preset(
     """
     try:
         preset_enum = StrategyPreset(preset_name)
-        strategy = get_strategy_preset(preset_enum)
+        # deep copy REQUIRED before persistence: get_strategy_preset returns
+        # the shared module-level STRATEGY_PRESETS instance for non-CUSTOM
+        # presets, and _persist_manual_strategy mutates strategy.id — without
+        # the copy that would corrupt the global preset object.
+        strategy = get_strategy_preset(preset_enum).model_copy(deep=True)
 
         coordinator.set_strategy(strategy)
 
         logger.info(f"[Strategy API] Applied preset: {preset_name}")
 
+        persisted = await _persist_manual_strategy(strategy)
+
         return {
             "status": "applied",
             "preset": preset_name,
             "strategy": strategy.model_dump(),
+            "persisted": persisted,
         }
 
     except ValueError:

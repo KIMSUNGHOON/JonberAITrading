@@ -191,6 +191,59 @@ async def test_panel_timeout_is_failure_harmless(tmp_path, monkeypatch):
     assert coordinator.set_calls == []
 
 
+async def test_persist_failed_leaves_pointer_and_strategy_untouched(tmp_path, monkeypatch):
+    """Pointer-invariant regression watchpoint: if the revision write fails,
+    neither the active pointer nor the coordinator's applied strategy may
+    move — a moved pointer with no matching row would break restore."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    await _seed_review(storage)
+    coordinator = _StubCoordinator(strategy=TradingStrategy())
+    monkeypatch.setattr(
+        strategy_orchestrator, "run_strategy_panel", AsyncMock(return_value=_votes())
+    )
+    monkeypatch.setattr(storage, "save_strategy_revision", AsyncMock(return_value=False))
+
+    result = await run_strategy_consensus(coordinator, storage, _TRADE_DATE)
+
+    assert result["ok"] is False
+    assert result["reason"] == "persist_failed"
+    assert await storage.get_app_setting(ACTIVE_STRATEGY_REVISION_KEY) is None
+    assert coordinator.set_calls == []
+
+
+async def test_current_strategy_reread_after_panel_await(tmp_path, monkeypatch):
+    """Fix2 pin: `current` must be re-read after the (up to
+    STRATEGY_CONSENSUS_TIMEOUT_SECONDS) panel await, not the stale pre-panel
+    snapshot — otherwise a manual strategy swap landing mid-await would be
+    clobbered by the revision write below."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    await _seed_review(storage)
+    pre_panel = TradingStrategy(name="사전 전략")
+    replacement = TradingStrategy(name="교체된 전략")
+    coordinator = _StubCoordinator(strategy=pre_panel)
+
+    # 3-way split -> no_change, isolating the re-read from knob-application
+    # logic: the recorded strategy is just whatever `current` resolves to.
+    votes = [
+        {"panelist": "a", "stance": "defensive", "confidence": 0.8, "reasoning": "r"},
+        {"panelist": "b", "stance": "neutral", "confidence": 0.8, "reasoning": "r"},
+        {"panelist": "c", "stance": "aggressive", "confidence": 0.8, "reasoning": "r"},
+    ]
+
+    async def _panel_swaps_strategy(context):
+        coordinator.set_strategy(replacement)
+        return votes
+
+    monkeypatch.setattr(strategy_orchestrator, "run_strategy_panel", _panel_swaps_strategy)
+
+    result = await run_strategy_consensus(coordinator, storage, _TRADE_DATE)
+
+    assert result["ok"] is True and result["stance"] == "no_change"
+    rows = await storage.get_strategy_revisions()
+    assert json.loads(rows[0]["strategy_json"])["name"] == replacement.name
+    assert json.loads(rows[0]["strategy_json"])["name"] != pre_panel.name
+
+
 async def test_any_exception_never_raises(tmp_path, monkeypatch):
     storage = StorageService(db_path=str(tmp_path / "storage.db"))
     await _seed_review(storage)

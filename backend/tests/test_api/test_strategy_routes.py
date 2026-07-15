@@ -119,6 +119,36 @@ def test_put_strategy_persists_manual_revision(client: TestClient, stub_coordina
     assert len(rows) == 1 and rows[0]["source"] == "manual"
 
 
+def test_apply_preset_persists_manual_revision_without_mutating_shared_preset(
+    client: TestClient, stub_coordinator, tmp_storage
+):
+    """apply-preset must mirror the POST /strategy persistence wiring (revision
+    + pointer move) — AND must deep-copy the preset before persisting, since
+    get_strategy_preset returns the shared module-level STRATEGY_PRESETS
+    instance for non-CUSTOM presets and persistence mutates strategy.id."""
+    import asyncio
+
+    from services.trading.strategy import STRATEGY_PRESETS, StrategyPreset
+
+    original_id = STRATEGY_PRESETS[StrategyPreset.GROWTH_MOMENTUM].id
+    with patch("app.api.routes.trading.get_storage_service",
+               new=AsyncMock(return_value=tmp_storage)):
+        response = client.post("/api/trading/strategy/apply-preset/growth_momentum")
+    assert response.status_code == 200
+    assert response.json().get("persisted") is True
+    rows = asyncio.get_event_loop().run_until_complete(
+        tmp_storage.get_strategy_revisions()
+    )
+    assert len(rows) == 1 and rows[0]["source"] == "manual"
+    pointer = asyncio.get_event_loop().run_until_complete(
+        tmp_storage.get_app_setting(ACTIVE_STRATEGY_REVISION_KEY)
+    )
+    assert pointer == rows[0]["id"]
+    # shared preset object must be untouched by the persistence id-mutation
+    assert STRATEGY_PRESETS[StrategyPreset.GROWTH_MOMENTUM].id == original_id
+    assert STRATEGY_PRESETS[StrategyPreset.GROWTH_MOMENTUM].id != rows[0]["id"]
+
+
 def test_delete_strategy_clears_pointer(client: TestClient, stub_coordinator, tmp_storage):
     import asyncio
 
