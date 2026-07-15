@@ -41,6 +41,33 @@ from .helpers import (
 logger = structlog.get_logger()
 
 
+async def _get_active_strategy():
+    """활성 TradingStrategy 조회 (best-effort — 실패/없음=None, 그래프 노드를
+    절대 막지 않는다). lazy import는 agent_chat coordinator와 동일 패턴."""
+    try:
+        from app.dependencies import get_trading_coordinator
+
+        return (await get_trading_coordinator()).get_strategy()
+    except Exception:
+        return None
+
+
+def _strategy_stop_params(strategy, risk_score: float) -> tuple[float, float, float]:
+    """전략 exit/sizing 노브 + risk_score 감산 → (stop_pct 분율, take_pct 분율,
+    max_position_pct 퍼센트). 고리스크(>=0.5)는 손절 타이트(×1.15 캡 0.50),
+    익절 보수(×0.8 플로어 0.01), 포지션 축소(×0.6 — 기존 5.0→3.0 비율 준용)."""
+    base_stop = strategy.exit_conditions.stop_loss_pct
+    base_take = strategy.exit_conditions.take_profit_pct
+    base_position = strategy.position_sizing.max_position_pct * 100.0
+    if risk_score < 0.5:
+        return base_stop, base_take, base_position
+    return (
+        min(0.50, base_stop * 1.15),
+        max(0.01, base_take * 0.8),
+        base_position * 0.6,
+    )
+
+
 async def kr_stock_risk_assessment_node(state: dict) -> dict:
     """
     Korean stock risk assessment.
@@ -73,9 +100,17 @@ async def kr_stock_risk_assessment_node(state: dict) -> dict:
     # Calculate risk score
     risk_score = _calculate_kr_stock_risk_score(analyses, market_data)
 
-    # Korean stock stop-loss calculation (typically 5-8%)
-    stop_loss_pct = 0.05 if risk_score < 0.5 else 0.08
-    take_profit_pct = 0.10 if risk_score < 0.5 else 0.08
+    # Korean stock stop-loss calculation — 활성 전략이 있으면 전략 노브,
+    # 없으면 기존 하드코딩(5-8%) 유지 (Phase4).
+    strategy = await _get_active_strategy()
+    if strategy is not None:
+        stop_loss_pct, take_profit_pct, max_position_pct = _strategy_stop_params(
+            strategy, risk_score
+        )
+    else:
+        stop_loss_pct = 0.05 if risk_score < 0.5 else 0.08
+        take_profit_pct = 0.10 if risk_score < 0.5 else 0.08
+        max_position_pct = 5.0 if risk_score < 0.5 else 3.0
 
     result = KRStockAnalysisResult(
         agent_type="risk",
@@ -88,7 +123,7 @@ async def kr_stock_risk_assessment_node(state: dict) -> dict:
         key_factors=_extract_key_factors(response),
         signals={
             "risk_score": risk_score,
-            "max_position_pct": 5.0 if risk_score < 0.5 else 3.0,
+            "max_position_pct": max_position_pct,
             "suggested_stop_loss": int(current_price * (1 - stop_loss_pct)),
             "suggested_take_profit": int(current_price * (1 + take_profit_pct)),
         },
@@ -140,6 +175,7 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
     stk_cd = _get_stk_cd_safely(state, "strategic_decision")
     stk_nm = state.get("stk_nm", stk_cd)
     llm = get_llm_provider()
+    strategy = await _get_active_strategy()
 
     logger.info("node_started", node="kr_stock_strategic_decision", stk_cd=stk_cd)
 
@@ -300,8 +336,16 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         action=action,
         quantity=quantity,
         entry_price=current_price,
-        stop_loss=risk_signals.get("suggested_stop_loss", int(current_price * 0.95)),
-        take_profit=risk_signals.get("suggested_take_profit", int(current_price * 1.10)),
+        stop_loss=risk_signals.get(
+            "suggested_stop_loss",
+            int(current_price * (1 - strategy.exit_conditions.stop_loss_pct))
+            if strategy else int(current_price * 0.95),
+        ),
+        take_profit=risk_signals.get(
+            "suggested_take_profit",
+            int(current_price * (1 + strategy.exit_conditions.take_profit_pct))
+            if strategy else int(current_price * 1.10),
+        ),
         risk_score=float(risk_signals.get("risk_score", 0.5)),
         position_size_pct=position_size_pct,
         rationale=response,

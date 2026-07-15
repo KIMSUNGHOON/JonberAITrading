@@ -349,10 +349,24 @@ class ChatCoordinator:
         target_price = stock.get("target_entry_price")
         confidence = stock.get("confidence", 0)
 
-        # Check if price is near target (within 3%)
+        # Phase4: 활성 전략의 기회감지 임계 소비 (best-effort — 조회 실패/전략
+        # 없음 = 기존 하드코딩 0.03/0.75로 진행, 거동 불변).
+        proximity_pct = 0.03
+        min_confidence = 0.75
+        try:
+            from app.dependencies import get_trading_coordinator
+
+            strategy = (await get_trading_coordinator()).get_strategy()
+            if strategy is not None:
+                proximity_pct = strategy.entry_conditions.entry_proximity_pct
+                min_confidence = strategy.entry_conditions.opportunity_min_confidence
+        except Exception:
+            pass  # best-effort — 기본 임계로 진행
+
+        # Check if price is near target (within proximity_pct)
         if target_price and current_price:
             price_diff = abs(current_price - target_price) / target_price
-            if price_diff <= 0.03:
+            if price_diff <= proximity_pct:
                 logger.info(
                     "opportunity_detected_target_reached",
                     ticker=ticker,
@@ -362,7 +376,7 @@ class ChatCoordinator:
                 return True
 
         # Check for high confidence
-        if confidence >= 0.75:
+        if confidence >= min_confidence:
             logger.info(
                 "opportunity_detected_high_confidence",
                 ticker=ticker,

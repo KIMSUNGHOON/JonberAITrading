@@ -66,6 +66,12 @@ class EntryConditions(BaseModel):
     avoid_high_volatility: bool = Field(default=True)
     prefer_dividend: bool = Field(default=False)
 
+    # Phase4: 기회감지 임계 (agent_chat coordinator._detect_opportunity 소비).
+    # KNOB_BOUNDS 밖 = EOD LLM 합의가 조정 불가, 수동 전략 편집 전용.
+    # 기본값은 기존 하드코딩(0.03 / 0.75)과 동일 — 전략 없음=거동 불변.
+    entry_proximity_pct: float = Field(default=0.03, ge=0.005, le=0.10)
+    opportunity_min_confidence: float = Field(default=0.75, ge=0.5, le=0.95)
+
 
 class ExitConditions(BaseModel):
     """Conditions for exiting a position"""
