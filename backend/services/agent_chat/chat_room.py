@@ -53,6 +53,7 @@ class ChatRoom:
         context: MarketContext,
         max_discussion_rounds: int = 2,
         consensus_threshold: float = 0.75,
+        agent_weights: Optional[Dict[str, float]] = None,
     ):
         """
         Initialize chat room.
@@ -63,6 +64,8 @@ class ChatRoom:
             context: Market data context
             max_discussion_rounds: Maximum discussion rounds before voting
             consensus_threshold: Required consensus level (0.0-1.0)
+            agent_weights: Phase4 캘리브레이션 틸트 가중(키=AgentType.value).
+                None=레거시 DEFAULT_AGENT_WEIGHTS와 완전 동일 거동(옵트인).
         """
         self.ticker = ticker
         self.stock_name = stock_name
@@ -75,6 +78,7 @@ class ChatRoom:
             context=context,
             max_discussion_rounds=max_discussion_rounds,
             consensus_threshold=consensus_threshold,
+            agent_weights=agent_weights,
         )
 
         # Initialize agents

@@ -331,7 +331,7 @@ class ModeratorAgent(BaseDiscussionAgent):
             action = DecisionAction.HOLD if context.has_position else DecisionAction.NO_ACTION
 
         # Get weighted confidence
-        confidence = calculate_weighted_confidence(session.votes)
+        confidence = calculate_weighted_confidence(session.votes, session.agent_weights)
 
         # Get risk parameters from risk agent's vote
         risk_vote = next(

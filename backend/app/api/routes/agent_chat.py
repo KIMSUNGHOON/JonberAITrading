@@ -111,7 +111,9 @@ class StartCoordinatorRequest(BaseModel):
 # -------------------------------------------
 
 
-# Per-agent consensus weights (mirror of services.agent_chat.models.calculate_consensus)
+# Phase4: models.py DEFAULT_AGENT_WEIGHTS의 미러 — 세션 실가중
+# (session.agent_weights, 캘리브레이션 틸트)이 있으면 그것이 우선이고, 이
+# dict는 세션에 접근할 수 없는 호출부의 폴백으로만 쓰인다.
 _AGENT_WEIGHTS = {
     "technical": 0.25,
     "fundamental": 0.25,
@@ -170,22 +172,28 @@ def _session_to_detail(session: ChatSession) -> dict:
             }
             for m in session.all_messages
         ],
-        "votes": [_vote_to_dict(v) for v in session.votes],
+        "votes": [_vote_to_dict(v, session.agent_weights) for v in session.votes],
         "consensus_level": session.consensus_level,
         "decision": _decision_to_dict(session.decision) if session.decision else None,
     }
 
 
-def _vote_to_dict(vote) -> dict:
-    """Convert a vote to the dict shape the FE expects (REST detail + WS frame)."""
+def _vote_to_dict(vote, weights: Optional[dict] = None) -> dict:
+    """Convert a vote to the dict shape the FE expects (REST detail + WS frame).
+
+    Phase4: `weights` is the session's real (possibly calibration-tilted)
+    agent_weights when the caller has access to the session; a session-real
+    weight always wins over the static `_AGENT_WEIGHTS` mirror fallback.
+    """
+    weight = (weights or {}).get(vote.agent_type.value)
+    if weight is None:
+        weight = _AGENT_WEIGHTS.get(vote.agent_type.value, 0.25)
     return {
         "agent_type": vote.agent_type.value,
         "vote": vote.vote.value,
         "confidence": vote.confidence,
-        "weight": _AGENT_WEIGHTS.get(vote.agent_type.value, 0.25),
-        "weighted_score": round(
-            _AGENT_WEIGHTS.get(vote.agent_type.value, 0.25) * vote.confidence, 4
-        ),
+        "weight": weight,
+        "weighted_score": round(weight * vote.confidence, 4),
         "reasoning": vote.reasoning,
     }
 
@@ -558,7 +566,7 @@ def _wire_room_to_websocket(room) -> None:
             await manager.send_message(session_id, {
                 "type": "vote",
                 "session_id": session_id,
-                "vote": _vote_to_dict(room.session.votes[-1]),
+                "vote": _vote_to_dict(room.session.votes[-1], room.session.agent_weights),
             })
 
     async def _forward_status(status, session) -> None:
@@ -636,31 +644,32 @@ async def get_agent_info():
     Returns agent types and their roles.
     """
     from services.agent_chat import AgentType
+    from services.agent_chat.models import DEFAULT_AGENT_WEIGHTS
 
     agents = [
         {
             "type": AgentType.TECHNICAL.value,
             "name": "기술적 분석가",
             "description": "차트 패턴, 기술적 지표 분석",
-            "weight": 0.25,
+            "weight": DEFAULT_AGENT_WEIGHTS[AgentType.TECHNICAL],
         },
         {
             "type": AgentType.FUNDAMENTAL.value,
             "name": "펀더멘털 분석가",
             "description": "재무제표, 밸류에이션 분석",
-            "weight": 0.25,
+            "weight": DEFAULT_AGENT_WEIGHTS[AgentType.FUNDAMENTAL],
         },
         {
             "type": AgentType.SENTIMENT.value,
             "name": "시장 심리 분석가",
             "description": "뉴스, 시장 심리 분석",
-            "weight": 0.20,
+            "weight": DEFAULT_AGENT_WEIGHTS[AgentType.SENTIMENT],
         },
         {
             "type": AgentType.RISK.value,
             "name": "리스크 관리자",
             "description": "리스크 평가, 포지션 사이징",
-            "weight": 0.30,
+            "weight": DEFAULT_AGENT_WEIGHTS[AgentType.RISK],
         },
         {
             "type": AgentType.MODERATOR.value,

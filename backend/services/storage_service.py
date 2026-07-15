@@ -357,6 +357,17 @@ class StorageService:
                     )
                 """)
 
+                # agent_chat_decisions.agent_weights (Phase4 T4): persists the
+                # consensus weights (default or calibration-tilted) actually
+                # used to reach this decision, as a JSON TEXT blob — without
+                # this, post-hoc calibration analysis over historical
+                # decisions can't tell which weighting produced them.
+                await self._ensure_columns(
+                    conn,
+                    "agent_chat_decisions",
+                    {"agent_weights": "TEXT"},
+                )
+
                 # Trade <-> decision provenance (Phase1 C2): kr_stock_trades
                 # and coin_trades predate decision_id/strategy_id/
                 # entry_or_exit -- there is no migration mechanism in this
@@ -1639,7 +1650,8 @@ class StorageService:
                 dissenting_opinions (list), entry_price, stop_loss,
                 take_profit, position_pct, news_sentiment, news_count,
                 behavioral_signals (dict), market_sentiment (dict/None),
-                flow (dict/None).
+                flow (dict/None), agent_weights (dict/None — Phase4:
+                consensus weights actually used, JSON-serialized).
             votes: list of dicts with keys decision_id, agent_type, vote,
                 confidence, reasoning, key_factors (list),
                 suggested_position_pct, suggested_stop_loss_pct,
@@ -1659,8 +1671,8 @@ class StorageService:
                      confidence, consensus_level, rationale, dissenting_opinions,
                      entry_price, stop_loss, take_profit, position_pct,
                      news_sentiment, news_count, behavioral_signals,
-                     market_sentiment, flow)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     market_sentiment, flow, agent_weights)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         decision["id"],
@@ -1689,6 +1701,9 @@ class StorageService:
                         else None,
                         json.dumps(decision["flow"])
                         if decision.get("flow") is not None
+                        else None,
+                        json.dumps(decision["agent_weights"])
+                        if decision.get("agent_weights") is not None
                         else None,
                     ),
                 )

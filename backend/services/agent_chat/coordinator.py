@@ -115,6 +115,11 @@ class ChatCoordinator:
     - Track session history
     """
 
+    # Phase4: 캘리브레이션 동적 가중 상수
+    _MIN_CALIBRATION_SAMPLES = 5
+    _WEIGHT_TILT_MIN = 0.5   # base 대비 하한 배수 (RISK 0.30→최소 0.15, 소거 불가)
+    _WEIGHT_TILT_MAX = 1.5
+
     def __init__(
         self,
         check_interval_minutes: int = 1,
@@ -399,6 +404,7 @@ class ChatCoordinator:
                 ticker=ticker,
                 stock_name=stock_name,
                 context=context,
+                agent_weights=await self._compute_agent_weights(),
             )
 
             # Register callbacks
@@ -705,6 +711,40 @@ class ChatCoordinator:
             logger.warning("strategy_context_build_failed", error=str(e))
             return None, None
 
+    async def _compute_agent_weights(self) -> Optional[dict]:
+        """agent_calibration 최신 스냅샷 → 가중 틸트. 표본 부족/데이터 없음/
+        실패 = None (기존 고정 가중과 완전 동일 거동 — 옵트인)."""
+        try:
+            from services.storage_service import get_storage_service
+            from services.trading.strategy_panel import _latest_per_key
+
+            storage = await get_storage_service()
+            rows = _latest_per_key(await storage.get_agent_calibration(), "agent_type")
+            from services.agent_chat.models import DEFAULT_AGENT_WEIGHTS
+
+            weights: dict = {}
+            tilted = False
+            for agent_type, base in DEFAULT_AGENT_WEIGHTS.items():
+                row = next(
+                    (r for r in rows if r.get("agent_type") == agent_type.value), None
+                )
+                weight = base
+                if (
+                    row
+                    and row.get("accuracy") is not None
+                    and (row.get("decisions_scored") or 0) >= self._MIN_CALIBRATION_SAMPLES
+                ):
+                    weight = base * (0.5 + float(row["accuracy"]))
+                    weight = max(base * self._WEIGHT_TILT_MIN,
+                                 min(base * self._WEIGHT_TILT_MAX, weight))
+                    if weight != base:
+                        tilted = True
+                weights[agent_type.value] = round(weight, 4)
+            return weights if tilted else None
+        except Exception as e:
+            logger.warning("agent_weights_compute_failed", error=str(e))
+            return None
+
     async def _fetch_market_context(
         self,
         ticker: str,
@@ -932,6 +972,7 @@ class ChatCoordinator:
             ticker=ticker,
             stock_name=stock_name,
             context=context,
+            agent_weights=await self._compute_agent_weights(),
         )
         _fire_room_created(room)
 

@@ -72,6 +72,29 @@ class DecisionAction(str, Enum):
     NO_ACTION = "NO_ACTION"
 
 
+# Phase4: 합의 가중의 유일한 소스 — 이전엔 calculate_consensus/
+# get_majority_direction/calculate_weighted_confidence 3곳 + routes FE 미러
+# 1곳에 같은 dict가 4벌 하드코딩돼 있었다. ChatSession.agent_weights(캘리브
+# 레이션 틸트, 키=AgentType.value)가 있으면 그것이 우선. moderator는 투표하지
+# 않으므로 절대 키를 넣지 않는다.
+DEFAULT_AGENT_WEIGHTS: Dict[AgentType, float] = {
+    AgentType.TECHNICAL: 0.25,
+    AgentType.FUNDAMENTAL: 0.25,
+    AgentType.SENTIMENT: 0.20,
+    AgentType.RISK: 0.30,
+}
+
+
+def resolve_agent_weight(
+    agent_type: AgentType, weights: Optional[Dict[str, float]] = None
+) -> float:
+    """세션 가중(있으면) → 기본 가중 → 0.25 폴백."""
+    if weights:
+        base = DEFAULT_AGENT_WEIGHTS.get(agent_type, 0.25)
+        return weights.get(agent_type.value, base)
+    return DEFAULT_AGENT_WEIGHTS.get(agent_type, 0.25)
+
+
 # -------------------------------------------
 # Core Models
 # -------------------------------------------
@@ -248,6 +271,10 @@ class ChatSession(BaseModel):
     max_discussion_rounds: int = 3
     consensus_threshold: float = 0.75  # 75% agreement required
 
+    # Phase4: 캘리브레이션 틸트 가중(키=AgentType.value). None=레거시
+    # DEFAULT_AGENT_WEIGHTS와 완전 동일 거동(옵트인).
+    agent_weights: Optional[Dict[str, float]] = Field(default=None)
+
     model_config = ConfigDict(
         json_encoders={datetime: lambda v: v.isoformat()}
     )
@@ -295,32 +322,35 @@ class ChatSession(BaseModel):
         if not self.votes:
             return 0.0
 
-        # Agent weights
-        weights = {
-            AgentType.TECHNICAL: 0.25,
-            AgentType.FUNDAMENTAL: 0.25,
-            AgentType.SENTIMENT: 0.20,
-            AgentType.RISK: 0.30,
-        }
-
         # Count weighted votes by direction
         bullish_weight = 0.0
         bearish_weight = 0.0
         neutral_weight = 0.0
+        scoring_votes = 0
 
         for vote in self.votes:
             if vote.agent_type == AgentType.MODERATOR:
                 continue  # Moderator doesn't vote
 
-            weight = weights.get(vote.agent_type, 0.25)
+            weight = resolve_agent_weight(vote.agent_type, self.agent_weights)
             weighted_confidence = weight * vote.confidence
 
             if vote.vote in (VoteType.STRONG_BUY, VoteType.BUY):
                 bullish_weight += weighted_confidence
+                scoring_votes += 1
             elif vote.vote in (VoteType.STRONG_SELL, VoteType.SELL):
                 bearish_weight += weighted_confidence
+                scoring_votes += 1
             elif vote.vote == VoteType.HOLD:
                 neutral_weight += weighted_confidence
+                scoring_votes += 1
+
+        # Phase4: 단독투표 가드 — 유효(방향) 투표가 2 미만이면 합의는 성립하지
+        # 않는다 (기존엔 3표가 예외로 드롭돼도 남은 1표가 max/total=1.0으로
+        # 75% 게이트를 통과하던 감사 C 결함의 봉합).
+        if scoring_votes < 2:
+            self.consensus_level = 0.0
+            return 0.0
 
         total_weight = bullish_weight + bearish_weight + neutral_weight
         if total_weight == 0:
@@ -338,13 +368,6 @@ class ChatSession(BaseModel):
             return VoteType.HOLD
 
         # Weighted vote counting
-        weights = {
-            AgentType.TECHNICAL: 0.25,
-            AgentType.FUNDAMENTAL: 0.25,
-            AgentType.SENTIMENT: 0.20,
-            AgentType.RISK: 0.30,
-        }
-
         direction_weights = {
             "bullish": 0.0,
             "bearish": 0.0,
@@ -355,7 +378,7 @@ class ChatSession(BaseModel):
             if vote.agent_type == AgentType.MODERATOR:
                 continue
 
-            weight = weights.get(vote.agent_type, 0.25) * vote.confidence
+            weight = resolve_agent_weight(vote.agent_type, self.agent_weights) * vote.confidence
 
             if vote.vote in (VoteType.STRONG_BUY, VoteType.BUY):
                 direction_weights["bullish"] += weight
@@ -414,17 +437,12 @@ def vote_to_action(vote: VoteType, has_position: bool) -> DecisionAction:
             return DecisionAction.WATCH
 
 
-def calculate_weighted_confidence(votes: List[AgentVote]) -> float:
+def calculate_weighted_confidence(
+    votes: List[AgentVote], weights: Optional[Dict[str, float]] = None
+) -> float:
     """Calculate weighted average confidence from votes."""
     if not votes:
         return 0.0
-
-    weights = {
-        AgentType.TECHNICAL: 0.25,
-        AgentType.FUNDAMENTAL: 0.25,
-        AgentType.SENTIMENT: 0.20,
-        AgentType.RISK: 0.30,
-    }
 
     total_weight = 0.0
     weighted_sum = 0.0
@@ -433,7 +451,7 @@ def calculate_weighted_confidence(votes: List[AgentVote]) -> float:
         if vote.agent_type == AgentType.MODERATOR:
             continue
 
-        weight = weights.get(vote.agent_type, 0.25)
+        weight = resolve_agent_weight(vote.agent_type, weights)
         total_weight += weight
         weighted_sum += weight * vote.confidence
 

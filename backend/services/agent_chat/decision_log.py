@@ -132,6 +132,11 @@ def serialize_session(
         "regime_snapshot_id": None,
         "outcome_realized_pnl": None,
         "outcome_label": None,
+        # Phase4: provenance — the consensus weights actually used to reach
+        # this decision (None = legacy DEFAULT_AGENT_WEIGHTS, no calibration
+        # tilt was active). save_agent_chat_decision JSON-serializes this the
+        # same way it does dissenting_opinions/behavioral_signals/etc.
+        "agent_weights": session.agent_weights,
     }
 
     votes: list[dict[str, Any]] = [
