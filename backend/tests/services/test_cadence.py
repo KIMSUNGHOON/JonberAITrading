@@ -12,7 +12,7 @@ so cost stays bounded while responsiveness scales down as N grows:
 
 import pytest
 
-from services.trading.cadence import compute_held_ttl
+from services.trading.cadence import compute_held_ttl, compute_watch_ttl
 
 
 @pytest.mark.parametrize(
@@ -33,3 +33,23 @@ def test_compute_held_ttl_examples(n, expected):
 @pytest.mark.parametrize("n", [0, 1, 2, 5, 16, 100])
 def test_compute_held_ttl_returns_float(n):
     assert isinstance(compute_held_ttl(n), float)
+
+
+@pytest.mark.parametrize(
+    "w,expected",
+    [
+        (0, 10.0),  # clamped at the 10s floor
+        (3, 10.0),  # ceil(3/0.3) = ceil(10.0) = 10
+        (4, 14.0),  # ceil(4/0.3) = ceil(13.33) = 14
+        (6, 20.0),  # ceil(6/0.3) = ceil(20.0) = 20
+        (18, 60.0),  # ceil(18/0.3) = ceil(60.0) = 60
+        (100, 60.0),  # clamped at the 60s ceiling
+    ],
+)
+def test_compute_watch_ttl_examples(w, expected):
+    assert compute_watch_ttl(w) == expected
+
+
+@pytest.mark.parametrize("w", [0, 3, 4, 6, 18, 100])
+def test_compute_watch_ttl_returns_float(w):
+    assert isinstance(compute_watch_ttl(w), float)

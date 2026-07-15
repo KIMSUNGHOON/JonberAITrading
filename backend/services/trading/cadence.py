@@ -29,3 +29,25 @@ def compute_held_ttl(n: int) -> float:
     """
     ttl = math.ceil(n / 0.8)
     return float(min(max(ttl, 2), 20))
+
+
+def compute_watch_ttl(w: int) -> float:
+    """TTL (seconds) for watch-list price cache lookups, given `w` ACTIVE
+    watch-list entries.
+
+    Root cause (monitoring-cadence-tuning arc, MAIN BODY): `WatchedStock.
+    current_price` for ACTIVE watch entries was only ever refreshed at
+    coordinator `start()` and on each trade approval (via
+    `_refresh_account_info` -> `_reprice_positions`) — there was no periodic
+    loop, so entry-candidate prices went stale for an entire session. A
+    periodic `_watch_refresh_loop` (see `ExecutionCoordinator`) fixes that,
+    but its sleep/TTL must scale with `w` for the same reason `compute_held_ttl`
+    scales with held-position count: request cost is `w / ttl` req/s against
+    Kiwoom's ~1.43 req/s ceiling, so a fixed interval either starves
+    responsiveness (few watched stocks) or blows the request budget (many).
+    `clamp(ceil(w / 0.3), 10, 60)` seconds — roughly one request slot per
+    watched stock at a 0.3 req/s-per-entry rate, floored at 10s and capped at
+    60s.
+    """
+    ttl = math.ceil(w / 0.3)
+    return float(min(max(ttl, 10), 60))

@@ -44,6 +44,7 @@ from .pending_order_tracker import PendingOrderTracker, TrackedOrder
 from .position_registration import register_fill_as_position
 from .reconciler import reconcile
 from .trade_log import record_trade_fill
+from .cadence import compute_watch_ttl
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,14 @@ class ExecutionCoordinator:
         self._market_was_open = False
         self._queue_scheduler_task: Optional[asyncio.Task] = None
         self._queue_scheduler_interval = 30.0
+
+        # Watch-list price refresh loop (monitoring-cadence-tuning arc, MAIN
+        # BODY): WatchedStock.current_price for ACTIVE entries was only ever
+        # refreshed at start() and on each trade approval (via
+        # _refresh_account_info -> _reprice_positions), never periodically —
+        # entry-candidate prices went stale for the whole session. Same
+        # lifecycle shape as _queue_scheduler_task above.
+        self._watch_refresh_task: Optional[asyncio.Task] = None
         # Re-entrancy guard: process_trade_queue is now reachable from start(),
         # the scheduler, and manual API calls — concurrent runs would double-
         # execute PENDING/PROCESSING trades (review #6).
@@ -231,6 +240,13 @@ class ExecutionCoordinator:
                 self._queue_scheduler_loop()
             )
 
+        # Start the periodic watch-list price refresh loop (same idempotent
+        # guard shape as the queue scheduler above).
+        if self._watch_refresh_task is None or self._watch_refresh_task.done():
+            self._watch_refresh_task = asyncio.create_task(
+                self._watch_refresh_loop()
+            )
+
     async def stop(self):
         """Stop the auto-trading system."""
         logger.info("[Coordinator] Stopping auto-trading system")
@@ -242,6 +258,11 @@ class ExecutionCoordinator:
         if self._queue_scheduler_task is not None:
             self._queue_scheduler_task.cancel()
             self._queue_scheduler_task = None
+
+        # Stop the watch-list price refresh loop.
+        if self._watch_refresh_task is not None:
+            self._watch_refresh_task.cancel()
+            self._watch_refresh_task = None
 
         # Persist restart-critical state on graceful shutdown, then deactivate.
         if self._persistence_active:
@@ -1204,6 +1225,64 @@ class ExecutionCoordinator:
                 continue
             watched.current_price = price
             watched.last_checked = datetime.now()
+
+    async def _refresh_watch_prices(self) -> None:
+        """Periodic, WATCH-only price sweep (monitoring-cadence-tuning arc,
+        MAIN BODY).
+
+        `_reprice_positions` above only refreshes watch-list entries when
+        `_refresh_account_info` runs — at coordinator `start()` and on each
+        trade approval. There was no periodic loop, so a WATCH entry's
+        `current_price` (compared against `target_entry_price` by
+        `ChatCoordinator._check_watch_list`) could go stale for an entire
+        session between trades. `_watch_refresh_loop` drives this on a
+        cadence derived from `compute_watch_ttl(W)` (W = ACTIVE watch count)
+        so the refresh rate scales with load instead of a fixed interval
+        that either starves responsiveness or blows the shared Kiwoom quote
+        budget.
+
+        Only ACTIVE entries are refreshed — CONVERTED/REMOVED prices are
+        historical. Same T2 stale-price contract as `_reprice_positions`: a
+        falsy quote (0/None, `_get_current_price`'s fail-safe "no fresh
+        data" signal) must never overwrite the last-known price. A single
+        ticker's fetch raising must not abort the sweep for the rest.
+        """
+        active = [w for w in self._state.watch_list if w.status == WatchStatus.ACTIVE]
+        ttl = compute_watch_ttl(len(active))
+        for watched in active:
+            try:
+                price = await self._get_current_price(watched.ticker, ttl=ttl)
+            except Exception as e:
+                logger.error(
+                    f"[Coordinator] Watch refresh failed for {watched.ticker}: {e}"
+                )
+                continue
+            if not price:
+                continue
+            watched.current_price = price
+            watched.last_checked = datetime.now()
+
+    async def _watch_refresh_loop(self) -> None:
+        """Background loop driving `_refresh_watch_prices` on a cadence that
+        scales with the current ACTIVE watch count (monitoring-cadence-
+        tuning arc, MAIN BODY). Same lifecycle shape as
+        `_queue_scheduler_loop` — created in `start()`, cancelled in
+        `stop()`.
+        """
+        try:
+            while True:
+                try:
+                    await self._refresh_watch_prices()
+                except Exception as e:
+                    logger.error(f"[Coordinator] Watch refresh loop error: {e}")
+                active_count = sum(
+                    1
+                    for w in self._state.watch_list
+                    if w.status == WatchStatus.ACTIVE
+                )
+                await asyncio.sleep(compute_watch_ttl(active_count))
+        except asyncio.CancelledError:
+            pass
 
     async def _get_current_price(
         self, ticker: str, ttl: Optional[float] = None
