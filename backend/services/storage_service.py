@@ -257,6 +257,34 @@ class StorageService:
                     )
                 """)
 
+                # Strategy revision ledger (Phase3: the adaptive
+                # TradingStrategy produced by the EOD strategy-consensus
+                # panel — and manual /trading/strategy edits — versioned
+                # durably; coordinator._strategy alone is in-memory and
+                # evaporates on restart). Accrete-style (id PK, one row per
+                # consensus run / manual set) like regime_snapshot; the
+                # "currently applied" revision is the app_settings
+                # 'strategy:active_revision_id' pointer, so restore never
+                # guesses. strategy_json is the FULL TradingStrategy dump —
+                # the strategy in effect AFTER this run (unchanged runs
+                # store the same content with changed=0).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS strategy_revisions (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT,
+                        source TEXT,
+                        stance TEXT,
+                        consensus_level REAL,
+                        changed INTEGER DEFAULT 0,
+                        strategy_json TEXT NOT NULL,
+                        parent_revision_id TEXT,
+                        rationale TEXT,
+                        votes_json TEXT,
+                        regime_snapshot_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # Agent-chat decisions ledger (Phase1 C1: decisions/votes were
                 # in-memory-only and evaporated on restart). One row per
                 # decision reached by the agent-chat debate for a ticker;
@@ -444,6 +472,12 @@ class StorageService:
                 # Regime snapshot index (Phase2 Task 2)
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_regime_snapshot_trade_date ON regime_snapshot(trade_date)"
+                )
+
+                # Strategy revision index (Phase3)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_strategy_revisions_trade_date"
+                    " ON strategy_revisions(trade_date)"
                 )
 
                 await conn.commit()
@@ -2083,6 +2117,100 @@ class StorageService:
         except Exception as e:
             logger.error("eod_reviews_get_failed", error=str(e))
             return []
+
+    # -------------------------------------------
+    # Strategy Revisions (Phase3 Task 1)
+    # -------------------------------------------
+
+    async def save_strategy_revision(self, record: dict[str, Any]) -> bool:
+        """Persist one strategy revision row (Phase3 — EOD consensus run or
+        manual /trading/strategy edit). Accrete-style; the active revision is
+        the app_settings 'strategy:active_revision_id' pointer, not a flag
+        here. Failure-harmless: returns False, never raises (market-close
+        edge caller).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO strategy_revisions
+                    (id, trade_date, source, stance, consensus_level, changed,
+                     strategy_json, parent_revision_id, rationale, votes_json,
+                     regime_snapshot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"],
+                        record.get("trade_date"),
+                        record.get("source"),
+                        record.get("stance"),
+                        record.get("consensus_level"),
+                        1 if record.get("changed") else 0,
+                        record["strategy_json"],
+                        record.get("parent_revision_id"),
+                        record.get("rationale"),
+                        record.get("votes_json"),
+                        record.get("regime_snapshot_id"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "strategy_revision_saved",
+                    revision_id=record.get("id"),
+                    trade_date=record.get("trade_date"),
+                    stance=record.get("stance"),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "strategy_revision_save_failed",
+                revision_id=record.get("id"),
+                error=str(e),
+            )
+            return False
+
+    async def get_strategy_revisions(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Strategy revisions, newest first (created_at DESC, rowid DESC
+        tie-break so same-second inserts stay insertion-ordered)."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM strategy_revisions
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("strategy_revisions_get_failed", error=str(e))
+            return []
+
+    async def get_strategy_revision(self, revision_id: str) -> Optional[dict[str, Any]]:
+        """Single strategy revision by id, or None."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM strategy_revisions WHERE id = ?",
+                    (revision_id,),
+                )
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(
+                "strategy_revision_get_failed", revision_id=revision_id, error=str(e)
+            )
+            return None
 
     # -------------------------------------------
     # Regime FK Backfill (Phase2 Task 4)
