@@ -20,6 +20,7 @@ from services.agent_chat.models import (
     TradeDecision,
 )
 from services.agent_chat.chat_room import ChatRoom
+from services.agent_chat.decision_log import persist_session
 from services.autonomy import check_autonomy
 from services.trading.models import ActivityType
 
@@ -426,6 +427,7 @@ class ChatCoordinator:
 
             # Store in history
             self._session_history.append(session)
+            await persist_session(session)
             if len(self._session_history) > 100:  # Keep last 100
                 self._session_history = self._session_history[-100:]
 
@@ -900,6 +902,7 @@ class ChatCoordinator:
             try:
                 session = await room.start()
                 self._session_history.append(session)
+                await persist_session(session)
                 self._last_discussion[ticker] = datetime.now()
                 return session
             finally:
@@ -921,6 +924,7 @@ class ChatCoordinator:
             session = await room.start()
 
             self._session_history.append(session)
+            await persist_session(session)
             self._last_discussion[ticker] = datetime.now()
 
         except Exception as e:
@@ -933,6 +937,7 @@ class ChatCoordinator:
             # (CANCELLED) session queryable instead of letting the id dangle
             # as a permanent 404.
             self._session_history.append(room.session)
+            await persist_session(room.session)
         finally:
             self._active_rooms.pop(ticker, None)
 
