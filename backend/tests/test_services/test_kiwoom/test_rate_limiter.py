@@ -293,3 +293,111 @@ class TestRateLimiterIntegration:
         assert all(results)
         assert limiter._query_count == 2
         assert limiter._order_count == 2
+
+
+class TestPerApiRateGate:
+    """Per-API-ID min-interval gate (Kiwoom error 1700 is PER-API-ID, not
+    global — see rate_limiter.py module docstring / root-cause spec).
+
+    These tests pass an explicit `per_api_min_interval` to
+    `KiwoomRateLimiter(...)` so behavior is deterministic regardless of the
+    `KIWOOM_PER_API_MIN_INTERVAL` env/config default.
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_api_id_spacing_enforced(self):
+        """Two acquire() calls for the SAME api_id must be spaced at least
+        per_api_min_interval apart, even though the global bucket's own
+        ~0.7s min_interval alone would allow the second one sooner."""
+        limiter = KiwoomRateLimiter(
+            query_limit=5, order_limit=5, per_api_min_interval=1.0
+        )
+
+        await limiter.acquire(RequestType.QUERY, api_id="ka10001")
+        t1 = time.monotonic()
+        await limiter.acquire(RequestType.QUERY, api_id="ka10001")
+        t2 = time.monotonic()
+
+        spacing = t2 - t1
+        assert spacing >= 0.95, (
+            f"expected >= ~1.0s spacing between same-api_id grants, got {spacing:.3f}s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_different_api_id_not_cross_blocked(self):
+        """A different api_id must NOT be gated by another api_id's
+        per-api interval — only the shared global bucket (~0.7s) applies
+        between them."""
+        limiter = KiwoomRateLimiter(
+            query_limit=5, order_limit=5, per_api_min_interval=1.0
+        )
+
+        await limiter.acquire(RequestType.QUERY, api_id="ka10001")
+        t1 = time.monotonic()
+        await limiter.acquire(RequestType.QUERY, api_id="ka10074")
+        t2 = time.monotonic()
+
+        elapsed = t2 - t1
+        assert elapsed < 0.95, (
+            f"ka10074 acquire should not be gated by ka10001's 1.0s per-api "
+            f"interval, took {elapsed:.3f}s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_api_id_none_behaves_like_before(self):
+        """api_id=None must skip the per-api gate entirely — only the
+        global bucket applies, preserving current behavior for callers
+        that don't pass api_id."""
+        limiter = KiwoomRateLimiter(
+            query_limit=5, order_limit=5, per_api_min_interval=5.0
+        )
+
+        t0 = time.monotonic()
+        await limiter.acquire(RequestType.QUERY)
+        await limiter.acquire(RequestType.QUERY)
+        elapsed = time.monotonic() - t0
+
+        # If api_id=None were (incorrectly) gated, this would take >= 5.0s.
+        assert elapsed < 2.0, (
+            f"api_id=None acquire should only be gated by the global bucket, "
+            f"took {elapsed:.3f}s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_api_id_grants_are_serialized(self):
+        """3 concurrent acquire() calls for the SAME api_id must produce
+        grant times each >= per_api_min_interval apart — concurrent callers
+        must not slip through together."""
+        limiter = KiwoomRateLimiter(
+            query_limit=5, order_limit=5, per_api_min_interval=1.0
+        )
+
+        grant_times: list[float] = []
+
+        async def make_request():
+            await limiter.acquire(RequestType.QUERY, api_id="ka10001")
+            grant_times.append(time.monotonic())
+
+        await asyncio.gather(*(make_request() for _ in range(3)))
+
+        grant_times.sort()
+        spacings = [
+            grant_times[i + 1] - grant_times[i] for i in range(len(grant_times) - 1)
+        ]
+
+        assert len(spacings) == 2
+        assert all(spacing >= 0.95 for spacing in spacings), (
+            f"expected each grant spaced >= ~1.0s apart, got spacings={spacings}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_per_api_min_interval_from_settings(self):
+        """When per_api_min_interval is not passed explicitly, it must be
+        sourced from configurable settings (KIWOOM_PER_API_MIN_INTERVAL),
+        not a bare magic number."""
+        from app.config import get_settings
+
+        limiter = KiwoomRateLimiter()
+
+        assert limiter._per_api_min_interval == get_settings().KIWOOM_PER_API_MIN_INTERVAL
+        assert limiter._per_api_min_interval == 1.0

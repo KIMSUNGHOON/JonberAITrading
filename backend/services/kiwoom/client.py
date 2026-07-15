@@ -256,7 +256,7 @@ class KiwoomClient:
         # Rate Limiting (이용약관 제11조)
         if self._rate_limiter:
             request_type = get_request_type(api_id)
-            acquired = await self._rate_limiter.acquire(request_type)
+            acquired = await self._rate_limiter.acquire(request_type, api_id=api_id)
             if not acquired:
                 raise KiwoomRateLimitError()
 

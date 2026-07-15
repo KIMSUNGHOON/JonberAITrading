@@ -89,6 +89,18 @@ class Settings(BaseSettings):
     KIWOOM_ACCOUNT_NO: str | None = None
     KIWOOM_IS_MOCK: bool = True  # True: 모의투자, False: 실거래
 
+    # Per-API-ID minimum interval (seconds) between two requests to the SAME
+    # Kiwoom api_id (e.g. ka10001). Kiwoom error 1700 ("허용된 API 요청 개수를
+    # 초과") is a PER-API-ID limit — distinct from 1701 (total) and 1702
+    # (group), which the existing global QUERY/ORDER buckets already guard.
+    # A single hot API (e.g. ka10001, called by RiskMonitor + watch-refresh +
+    # agent-chat) can monopolize the shared global budget and still exceed
+    # ITS OWN server-side limit even though other APIs sit idle — the global
+    # bucket alone cannot protect an individual API. This gate is layered on
+    # top of (not a replacement for) the global buckets. See
+    # `services/kiwoom/rate_limiter.py::KiwoomRateLimiter`.
+    KIWOOM_PER_API_MIN_INTERVAL: float = Field(default=1.0, ge=0)
+
     # Autonomy master gate (R3). False = trading_mode toggles are inert and
     # every autonomous execution path is denied at the shared gate.
     AUTONOMY_ENABLED: bool = False

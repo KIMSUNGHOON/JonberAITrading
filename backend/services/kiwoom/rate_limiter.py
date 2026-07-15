@@ -134,6 +134,7 @@ class KiwoomRateLimiter:
         self,
         query_limit: int = DEFAULT_QUERY_LIMIT,
         order_limit: int = DEFAULT_ORDER_LIMIT,
+        per_api_min_interval: Optional[float] = None,
     ):
         """
         Rate Limiter 초기화
@@ -141,6 +142,10 @@ class KiwoomRateLimiter:
         Args:
             query_limit: 조회 초당 요청 수 (기본: 5)
             order_limit: 주문 초당 요청 수 (기본: 5)
+            per_api_min_interval: 동일 api_id에 대한 최소 요청 간격 (초).
+                None이면 설정값(KIWOOM_PER_API_MIN_INTERVAL, 기본 1.0초)을 사용.
+                에러 1700(API ID별 제한) 방지용 — 전역 버킷(1701/1702 보호)과는
+                별개로 각 api_id마다 추가로 적용된다.
         """
         self._query_bucket = TokenBucket(
             max_tokens=query_limit,
@@ -151,6 +156,21 @@ class KiwoomRateLimiter:
             refill_rate=float(order_limit),
         )
 
+        if per_api_min_interval is None:
+            # Local import to avoid a hard import-time dependency from the
+            # services layer on app.config (mirrors services/trading/fill_costs.py).
+            from app.config import get_settings
+
+            per_api_min_interval = get_settings().KIWOOM_PER_API_MIN_INTERVAL
+        self._per_api_min_interval = per_api_min_interval
+
+        # api_id -> monotonic timestamp of its last granted request.
+        self._per_api_last_grant: dict[str, float] = {}
+        # api_id -> asyncio.Lock serializing check+wait+grant for that api_id.
+        # Created lazily per api_id (dict get/set here is synchronous, so no
+        # additional guard lock is needed under asyncio's cooperative model).
+        self._per_api_locks: dict[str, asyncio.Lock] = {}
+
         # 통계
         self._query_count = 0
         self._order_count = 0
@@ -160,12 +180,58 @@ class KiwoomRateLimiter:
             "kiwoom_rate_limiter_initialized",
             query_limit=query_limit,
             order_limit=order_limit,
+            per_api_min_interval=self._per_api_min_interval,
         )
+
+    def _get_api_lock(self, api_id: str) -> asyncio.Lock:
+        """Get (or lazily create) the per-api_id lock."""
+        lock = self._per_api_locks.get(api_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._per_api_locks[api_id] = lock
+        return lock
+
+    async def _acquire_per_api_then_global(
+        self,
+        api_id: str,
+        bucket: TokenBucket,
+        timeout: Optional[float],
+        start_time: float,
+    ) -> bool:
+        """Enforce the per-api_id min-interval FIRST (so we never spend a
+        scarce global token only to then block on the per-api gate), THEN
+        acquire the global bucket, THEN record the grant time — all under
+        this api_id's lock so concurrent callers for the SAME api_id are
+        serialized rather than slipping through together."""
+        api_lock = self._get_api_lock(api_id)
+        async with api_lock:
+            last_grant = self._per_api_last_grant.get(api_id)
+            if last_grant is not None:
+                now = time.monotonic()
+                wait_time = self._per_api_min_interval - (now - last_grant)
+                if wait_time > 0:
+                    if timeout is not None:
+                        elapsed = now - start_time
+                        if elapsed + wait_time > timeout:
+                            return False
+                    await asyncio.sleep(wait_time)
+
+            remaining_timeout = timeout
+            if timeout is not None:
+                remaining_timeout = timeout - (time.monotonic() - start_time)
+                if remaining_timeout <= 0:
+                    return False
+
+            acquired = await bucket.acquire(remaining_timeout)
+            if acquired:
+                self._per_api_last_grant[api_id] = time.monotonic()
+            return acquired
 
     async def acquire(
         self,
         request_type: RequestType,
         timeout: Optional[float] = 30.0,
+        api_id: Optional[str] = None,
     ) -> bool:
         """
         API 요청 전 rate limit 토큰 획득
@@ -173,6 +239,9 @@ class KiwoomRateLimiter:
         Args:
             request_type: 요청 유형 (QUERY or ORDER)
             timeout: 대기 최대 시간 (초)
+            api_id: API ID (예: "ka10001"). 지정하면 전역 버킷(1701/1702 보호)에
+                더해 동일 api_id 요청 간 최소 간격(1700 보호)도 적용된다.
+                None이면 기존과 동일하게 전역 버킷만 적용된다.
 
         Returns:
             True if acquired, False if timeout
@@ -188,7 +257,12 @@ class KiwoomRateLimiter:
             else self._order_bucket
         )
 
-        acquired = await bucket.acquire(timeout)
+        if api_id:
+            acquired = await self._acquire_per_api_then_global(
+                api_id, bucket, timeout, start_time
+            )
+        else:
+            acquired = await bucket.acquire(timeout)
 
         # 통계 업데이트
         elapsed = time.monotonic() - start_time
