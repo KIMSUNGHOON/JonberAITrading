@@ -1579,7 +1579,9 @@ class TestApplyDecisionReducePartialP1:
         self, config, monkeypatch
     ):
         """A gate-allowed reduce whose order does not fill at all must leave
-        the monitored quantity untouched (no phantom decrement)."""
+        the monitored quantity untouched (no phantom decrement), and the
+        operator must be notified — an accepted-but-unfilled order is not
+        something that should only show up in logs (P1/P2 review MEDIUM)."""
         pm, pos = self._position(config, quantity=100)
 
         fake_coord = MagicMock()
@@ -1598,11 +1600,58 @@ class TestApplyDecisionReducePartialP1:
 
         monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
 
-        await pm._apply_decision(
-            pos, _honesty_decision(DecisionAction.REDUCE, quantity=30)
-        )
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(
+                pos, _honesty_decision(DecisionAction.REDUCE, quantity=30)
+            )
 
         assert pm.get_position("005930").quantity == 100
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "005930" in msg
+
+    @pytest.mark.asyncio
+    async def test_partial_reduce_no_coordinator_position_notifies_desync(
+        self, config, monkeypatch
+    ):
+        """A gate-allowed reduce whose coordinator lookup returns None (no
+        matching position on the coordinator's OWN ledger) is a genuine
+        ledger desync between this manager and the coordinator — the
+        operator must be notified, not just logged (P1/P2 review MEDIUM)."""
+        pm, pos = self._position(config, quantity=100)
+
+        fake_coord = MagicMock()
+        fake_coord._reduce_position = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(
+                pos, _honesty_decision(DecisionAction.REDUCE, quantity=30)
+            )
+
+        assert pm.get_position("005930").quantity == 100, (
+            "no coordinator position means nothing was placed — this "
+            "manager's quantity must stay untouched"
+        )
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "005930" in msg
 
     @pytest.mark.asyncio
     async def test_partial_reduce_coordinator_clamp_collapses_to_full_close(
@@ -1902,7 +1951,9 @@ class TestApplyDecisionAddP2:
     @pytest.mark.asyncio
     async def test_add_unfilled_leaves_quantity_unchanged(self, config, monkeypatch):
         """A gate-allowed add whose order does not fill at all must leave the
-        monitored quantity/avg_price untouched (no phantom merge)."""
+        monitored quantity/avg_price untouched (no phantom merge), and the
+        operator must be notified — an accepted-but-unfilled order is not
+        something that should only show up in logs (P1/P2 review MEDIUM)."""
         pm, pos = self._position(config, quantity=100, current_price=72500)
 
         fake_coord = MagicMock()
@@ -1921,10 +1972,18 @@ class TestApplyDecisionAddP2:
 
         monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
 
-        await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
 
         assert pm.get_position("005930").quantity == 100
         assert pm.get_position("005930").avg_price == 72500
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "005930" in msg
 
     @pytest.mark.asyncio
     async def test_add_no_coordinator_position_leaves_quantity_unchanged(
@@ -1932,7 +1991,9 @@ class TestApplyDecisionAddP2:
     ):
         """The coordinator's own ledger has no matching position (a
         divergent/desynced ledger) — nothing was placed, so this manager's
-        quantity/avg_price must stay untouched rather than guess."""
+        quantity/avg_price must stay untouched rather than guess. The
+        operator must be notified of the desync, not just logged (P1/P2
+        review MEDIUM — this is the real ledger-desync red flag)."""
         pm, pos = self._position(config, quantity=100, current_price=72500)
 
         fake_coord = MagicMock()
@@ -1947,9 +2008,17 @@ class TestApplyDecisionAddP2:
 
         monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
 
-        await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
 
         assert pm.get_position("005930").quantity == 100
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "005930" in msg
 
     @pytest.mark.asyncio
     async def test_add_decision_still_applies_sane_stop_adjustment(self, config, monkeypatch):

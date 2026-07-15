@@ -1024,6 +1024,61 @@ class PositionManager:
                 error=str(e),
             )
 
+    async def _notify_reduce_ledger_desync(
+        self, position: MonitoredPosition, requested_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a gate-allowed partial REDUCE
+        finds NO matching position on the trading coordinator's own ledger
+        (P1/P2 review MEDIUM, 2026-07-15) — a genuine desync between this
+        manager's `_positions` and `ExecutionCoordinator._state.positions`,
+        not a quantity or gate problem. Previously this branch only logged a
+        warning, leaving the operator with no out-of-band signal that the
+        two ledgers have diverged."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚨 부분청산 실패 — 코디네이터 원장 불일치 ({position.ticker}): "
+                    f"에이전트가 {requested_quantity}주 축소를 결정했으나 코디네이터 "
+                    f"원장에 해당 종목 포지션이 없어 주문이 접수되지 않았습니다. "
+                    f"이 매니저의 보유 수량({position.quantity}주)과 코디네이터 원장이 "
+                    f"어긋났을 수 있어 수동 확인이 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "reduce_ledger_desync_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_reduce_unfilled(
+        self, position: MonitoredPosition, requested_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a gate-allowed, coordinator-placed
+        partial REDUCE order fills zero shares (P1/P2 review MEDIUM,
+        2026-07-15). The order was accepted but nothing executed — the
+        position quantity is left unchanged and the operator needs to know
+        the reduce did NOT happen."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"⏸ 부분청산 미체결 ({position.ticker}): "
+                    f"{requested_quantity}주 매도 주문이 게이트를 통과해 접수되었으나 "
+                    f"체결되지 않았습니다. 보유 수량 {position.quantity}주 그대로 "
+                    f"유지됩니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "reduce_unfilled_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
     async def _execute_reduce_position(
         self,
         position: MonitoredPosition,
@@ -1103,6 +1158,7 @@ class PositionManager:
                     "partial_reduce_no_coordinator_position",
                     ticker=position.ticker,
                 )
+                await self._notify_reduce_ledger_desync(position, clamped_quantity)
                 return
 
             filled = result.filled_quantity
@@ -1112,6 +1168,7 @@ class PositionManager:
                     ticker=position.ticker,
                     requested_quantity=clamped_quantity,
                 )
+                await self._notify_reduce_unfilled(position, clamped_quantity)
                 return
 
             new_quantity = position.quantity - filled
@@ -1197,6 +1254,62 @@ class PositionManager:
                 error=str(e),
             )
 
+    async def _notify_add_ledger_desync(
+        self, position: MonitoredPosition, add_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a gate-allowed ADD finds NO
+        matching position on the trading coordinator's own ledger (P1/P2
+        review MEDIUM, 2026-07-15) — mirrors
+        `_notify_reduce_ledger_desync` for the exposure-increasing side. A
+        genuine desync between this manager's `_positions` and
+        `ExecutionCoordinator._state.positions`, not a sizing or gate
+        problem."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚨 추가매수 실패 — 코디네이터 원장 불일치 ({position.ticker}): "
+                    f"에이전트가 {add_quantity}주 추가매수를 결정했으나 코디네이터 "
+                    f"원장에 해당 종목 포지션이 없어 주문이 접수되지 않았습니다. "
+                    f"이 매니저의 보유 수량({position.quantity}주)과 코디네이터 원장이 "
+                    f"어긋났을 수 있어 수동 확인이 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "add_ledger_desync_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_add_unfilled(
+        self, position: MonitoredPosition, add_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a gate-allowed, coordinator-placed
+        ADD (BUY) order fills zero shares (P1/P2 review MEDIUM,
+        2026-07-15) — mirrors `_notify_reduce_unfilled`. The order was
+        accepted but nothing executed — the position quantity/avg_price is
+        left unchanged and the operator needs to know the add did NOT
+        happen."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"⏸ 추가매수 미체결 ({position.ticker}): "
+                    f"{add_quantity}주 매수 주문이 게이트를 통과해 접수되었으나 "
+                    f"체결되지 않았습니다. 보유 수량 {position.quantity}주 그대로 "
+                    f"유지됩니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "add_unfilled_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
     async def _execute_add_position(
         self,
         position: MonitoredPosition,
@@ -1272,6 +1385,7 @@ class PositionManager:
                     "add_no_coordinator_position",
                     ticker=position.ticker,
                 )
+                await self._notify_add_ledger_desync(position, add_quantity)
                 return
 
             filled = result.filled_quantity
@@ -1281,6 +1395,7 @@ class PositionManager:
                     ticker=position.ticker,
                     requested_quantity=add_quantity,
                 )
+                await self._notify_add_unfilled(position, add_quantity)
                 return
 
             old_quantity = position.quantity
