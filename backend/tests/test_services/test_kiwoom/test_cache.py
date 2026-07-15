@@ -48,6 +48,13 @@ class TestKiwoomCache:
         assert cache.size == 0
         assert cache._max_size == 100
 
+    def test_default_ttl_pending_and_filled_orders_is_10s(self):
+        """Monitoring-cadence tuning: pending/filled orders TTL bumped to 10s
+        to match the FE Operations poll slowing from 5s to 10s (frees the
+        biggest steady consumer of the shared Kiwoom QUERY rate budget)."""
+        assert KiwoomCache.DEFAULT_TTL["pending_orders"] == 10.0
+        assert KiwoomCache.DEFAULT_TTL["filled_orders"] == 10.0
+
     def test_cache_disabled(self):
         """Test disabled cache returns None"""
         cache = KiwoomCache(enabled=False)

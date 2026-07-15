@@ -37,7 +37,14 @@ import { pnlColor } from '@/utils/pnl';
 import { Awaiting, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
 
 type FetchState = 'loading' | 'ready' | 'error';
-const POLL_MS = 5_000;
+// Monitoring-cadence tuning: this poll (pending + filled orders) is the
+// single biggest steady consumer of the shared Kiwoom QUERY rate budget
+// per audit. Slowed 5s → 10s, and gated to skip while the tab is hidden
+// (see the effect below) — reclaiming budget for the autonomous
+// monitoring loops when nobody's watching the screen. A matching backend
+// cache TTL bump (services/kiwoom/cache.py pending_orders/filled_orders)
+// keeps 10s-fresh data without extra broker calls.
+const POLL_MS = 10_000;
 
 /**
  * Shared data source — exported so FunnelPanel's WATCHLIST + PIPELINE
@@ -70,8 +77,22 @@ export function useOperations() {
   useEffect(() => {
     aliveRef.current = true;
     refetch(true);
-    const id = setInterval(() => refetch(false), POLL_MS);
-    return () => { aliveRef.current = false; clearInterval(id); };
+    // Tab-visibility gating: skip the periodic data fetch while the tab is
+    // hidden (no one is watching, so there's nothing to refresh for), and
+    // catch up immediately the moment the tab regains visibility so the
+    // board isn't stale on return.
+    const id = setInterval(() => {
+      if (document.visibilityState === 'visible') refetch(false);
+    }, POLL_MS);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') refetch(false);
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      aliveRef.current = false;
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [refetch]);
 
   // 체결/큐/워치 이벤트 push 시 즉시 재조회

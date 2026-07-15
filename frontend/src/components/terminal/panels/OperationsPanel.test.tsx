@@ -1,5 +1,5 @@
-import { it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, waitFor, renderHook, act } from '@testing-library/react';
 
 const getOperations = vi.fn();
 const submitApproval = vi.fn().mockResolvedValue({});
@@ -37,7 +37,7 @@ vi.mock('react-router-dom', () => ({ useNavigate: () => navigate }));
 // always "succeeds". See store/index.ts injectAwaitingKiwoomSession /
 // focusAwaitingCoinSession.
 import { useStore } from '@/store';
-import { OperationsPanel } from './OperationsPanel';
+import { OperationsPanel, useOperations } from './OperationsPanel';
 
 const BASE = {
   analyzing: [], awaiting: [], watching: [],
@@ -392,4 +392,67 @@ it('coin: 두 개의 동시 승인대기 세션이 있어도 각 행 클릭이 �
   // Switching back to the first must retarget again (proves it's not stuck).
   fireEvent.click(screen.getByText('비트코인'));
   expect(useStore.getState().coin.activeSessionId).toBe('c1');
+});
+
+// -------------------------------------------
+// Monitoring-cadence tuning (final task of the arc): the shared
+// useOperations poll is the single biggest steady Kiwoom QUERY-budget
+// consumer per the audit. Slow it to 10s and pause it while the tab is
+// hidden — reclaiming budget for the autonomous monitoring loops when
+// nobody's looking at the screen — while an immediate refetch on
+// regaining visibility keeps the board from looking stale on return.
+// -------------------------------------------
+describe('useOperations 폴링 주기(10s) + 탭 가시성 게이팅', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function setVisibility(state: DocumentVisibilityState) {
+    Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
+  }
+
+  it('폴 간격은 10_000ms — 9_999ms 경과로는 재조회 없음, +1ms에 재조회', async () => {
+    getOperations.mockResolvedValue(BASE);
+    setVisibility('visible');
+    renderHook(() => useOperations());
+    await act(() => vi.advanceTimersByTimeAsync(0)); // flush mount-time refetch(true)
+    expect(getOperations).toHaveBeenCalledTimes(1);
+
+    await act(() => vi.advanceTimersByTimeAsync(9_999));
+    expect(getOperations).toHaveBeenCalledTimes(1); // still not due
+
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(getOperations).toHaveBeenCalledTimes(2); // due at exactly 10_000ms
+  });
+
+  it('탭이 hidden이면 폴 타이머가 지나도 데이터 재조회를 하지 않는다', async () => {
+    getOperations.mockResolvedValue(BASE);
+    setVisibility('hidden');
+    renderHook(() => useOperations());
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(getOperations).toHaveBeenCalledTimes(1); // mount refetch(true) unaffected by visibility
+
+    await act(() => vi.advanceTimersByTimeAsync(30_000)); // 3 poll ticks worth, all hidden
+    expect(getOperations).toHaveBeenCalledTimes(1); // no polling while hidden
+  });
+
+  it('hidden → visible 전환 시 visibilitychange 이벤트로 즉시 재조회한다', async () => {
+    getOperations.mockResolvedValue(BASE);
+    setVisibility('hidden');
+    renderHook(() => useOperations());
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(getOperations).toHaveBeenCalledTimes(1);
+
+    await act(() => vi.advanceTimersByTimeAsync(30_000));
+    expect(getOperations).toHaveBeenCalledTimes(1); // confirm still gated before the flip
+
+    setVisibility('visible');
+    act(() => { document.dispatchEvent(new Event('visibilitychange')); });
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(getOperations).toHaveBeenCalledTimes(2); // immediate refetch on regaining visibility
+  });
 });
