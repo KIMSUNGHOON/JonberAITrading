@@ -584,7 +584,7 @@ class ChatCoordinator:
                 # never execute). on_trade_approved does NOT go through
                 # convert_watch_to_queue, so without this the watch entry
                 # would stay ACTIVE and could be re-discussed/duplicate-
-                # triggered on the next 5-min check. No-op if the ticker
+                # triggered on the next periodic (1-min) check. No-op if the ticker
                 # isn't (or is no longer) an active watch entry.
                 #
                 # T2 review gap (2026-07-14): on_trade_approved has non-

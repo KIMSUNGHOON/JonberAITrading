@@ -1205,7 +1205,7 @@ class ExecutionCoordinator:
 
         Watch-list entries (P2 SSOT prep, 2026-07-14) get the same treatment:
         `WatchedStock.current_price` was only ever set at registration time,
-        so the 5-min opportunity check (`ChatCoordinator._detect_opportunity`'s
+        so the periodic opportunity check (`ChatCoordinator._detect_opportunity`'s
         target-price proximity test) judged against a price that could be
         hours or days stale. Only ACTIVE entries are repriced — a
         CONVERTED/REMOVED entry's price is historical, not live.
@@ -1246,8 +1246,29 @@ class ExecutionCoordinator:
         falsy quote (0/None, `_get_current_price`'s fail-safe "no fresh
         data" signal) must never overwrite the last-known price. A single
         ticker's fetch raising must not abort the sweep for the rest.
+
+        Held-ticker skip (whole-arc integration review finding, 2026-07-15):
+        RiskMonitor refreshes HELD positions on its own, much tighter
+        `compute_held_ttl` cadence (2-20s) against the SAME
+        `stock_info:<ticker>` cache key (one shared KiwoomClient). A ticker
+        that is BOTH held AND an ACTIVE watch entry (reachable —
+        `add_to_watch_list` has no held-position guard, and the analysis/
+        HITL approval route doesn't call `mark_watch_converted`) would get
+        its cache entry overwritten here with this loop's much longer
+        `compute_watch_ttl` TTL (10-60s), making RiskMonitor read a stale
+        price for up to that TTL and delaying stop-loss/take-profit
+        reaction. So held tickers are excluded from `active` up front — they
+        stay owned exclusively by RiskMonitor. `W` (fed into
+        `compute_watch_ttl`) is deliberately the ACTIVE-and-not-held count
+        (i.e. what this sweep actually fetches), not the raw ACTIVE count,
+        so the cadence reflects the real request load.
         """
-        active = [w for w in self._state.watch_list if w.status == WatchStatus.ACTIVE]
+        held_tickers = {p.ticker for p in self._state.positions}
+        active = [
+            w
+            for w in self._state.watch_list
+            if w.status == WatchStatus.ACTIVE and w.ticker not in held_tickers
+        ]
         ttl = compute_watch_ttl(len(active))
         for watched in active:
             try:
@@ -2343,7 +2364,7 @@ class ExecutionCoordinator:
         Used by the autonomous agent-chat path (`ChatCoordinator._execute_trade`)
         WITHOUT going through `convert_watch_to_queue` — that path calls
         `on_trade_approved` directly, so without this call the watch entry
-        stayed ACTIVE forever. The 5-min watch-list check
+        stayed ACTIVE forever. The periodic watch-list check
         (`ChatCoordinator._check_watch_list`) could then re-detect the same
         "opportunity" and start a duplicate discussion/execution on the same
         ticker (P2 funnel-consolidation audit finding, 2026-07-14).

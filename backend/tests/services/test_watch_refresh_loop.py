@@ -22,7 +22,7 @@ import pytest
 
 from services.trading.cadence import compute_watch_ttl
 from services.trading.coordinator import ExecutionCoordinator
-from services.trading.models import WatchedStock, WatchStatus
+from services.trading.models import ManagedPosition, WatchedStock, WatchStatus
 
 pytestmark = pytest.mark.asyncio
 
@@ -34,6 +34,17 @@ def _watched(ticker="005930", current_price=71_000.0, status=WatchStatus.ACTIVE,
         stock_name="삼성전자",
         current_price=current_price,
         status=status,
+        **kw,
+    )
+
+
+def _position(ticker="005930", quantity=10, avg_price=70_000.0, **kw) -> ManagedPosition:
+    kw.setdefault("current_price", avg_price)
+    return ManagedPosition(
+        ticker=ticker,
+        stock_name="삼성전자",
+        quantity=quantity,
+        avg_price=avg_price,
         **kw,
     )
 
@@ -127,6 +138,41 @@ async def test_refresh_watch_prices_survives_single_ticker_exception():
     by_ticker = {w.ticker: w for w in coord._state.watch_list}
     assert by_ticker["005930"].current_price == 71_000.0  # untouched, fetch raised
     assert by_ticker["000660"].current_price == 99_000.0  # sweep continued
+
+
+async def test_refresh_watch_prices_skips_held_tickers():
+    """A ticker that is BOTH held (open position) AND an ACTIVE watch entry
+    must be SKIPPED by the watch sweep entirely — RiskMonitor already
+    refreshes held tickers on its own tight `compute_held_ttl` cadence
+    against the SAME `stock_info:<ticker>` cache key. If the watch loop also
+    writes that key (on its much longer `compute_watch_ttl` TTL), it can
+    clobber RiskMonitor's fresh read with a stale cached price for up to the
+    watch TTL, delaying stop-loss/take-profit reaction (held+watched
+    integration finding). W for the TTL formula must be the count of entries
+    actually fetched (ACTIVE-and-not-held), so a held "AAA" + watched "BBB"
+    fetches only "BBB" at ttl=compute_watch_ttl(1), not compute_watch_ttl(2)."""
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    fetcher = AsyncMock(return_value=80_000.0)
+    coord._get_current_price = fetcher
+    coord._state.positions.append(_position(ticker="AAA"))
+    coord._state.watch_list.append(_watched(ticker="AAA", current_price=71_000.0))
+    coord._state.watch_list.append(_watched(ticker="BBB", current_price=140_000.0))
+
+    await coord._refresh_watch_prices()
+
+    fetched_tickers = [call.args[0] for call in fetcher.await_args_list]
+    assert "AAA" not in fetched_tickers
+    assert fetched_tickers == ["BBB"]
+
+    expected_ttl = compute_watch_ttl(1)
+    for call in fetcher.await_args_list:
+        _, kwargs = call
+        assert kwargs.get("ttl") == expected_ttl
+
+    by_ticker = {w.ticker: w for w in coord._state.watch_list}
+    assert by_ticker["AAA"].current_price == 71_000.0  # untouched, held -> skipped
+    assert by_ticker["AAA"].last_checked is None
+    assert by_ticker["BBB"].current_price == 80_000.0
 
 
 async def test_refresh_watch_prices_noop_on_empty_watch_list():
