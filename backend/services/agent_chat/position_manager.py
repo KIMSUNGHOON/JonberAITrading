@@ -947,12 +947,73 @@ class PositionManager:
                 error=str(e),
             )
 
+    async def _notify_reduce_not_executed(
+        self, position: MonitoredPosition, requested_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a discussion decided REDUCE
+        (partial close) but no partial-sell execution path exists yet (P0,
+        2026-07-15) — the human must know the position was NOT reduced and
+        still holds its current quantity, instead of a shadow-ledger
+        decrement silently pretending a sell happened."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"⏸ 부분청산 미지원 — 실행 보류 ({position.ticker}): "
+                    f"에이전트가 {requested_quantity}주 축소를 결정했으나 부분매도 실행 "
+                    f"경로가 아직 없어 미실행. 보유 수량 {position.quantity}주 그대로 유지됩니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "reduce_not_executed_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_add_not_executed(self, position: MonitoredPosition) -> None:
+        """Best-effort Telegram notice when a discussion decided ADD
+        (increase position) but no ADD/buy execution path exists yet (P0,
+        2026-07-15) — previously this decision was silently swallowed into
+        the HOLD branch (stop/take adjustment only, no notice), so the human
+        had no way to learn the agents wanted to add to the position."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"⏸ 추가매수 미실행 — 보류 ({position.ticker}): "
+                    f"에이전트가 추가매수(ADD)를 결정했으나 자동 추가매수 실행 경로가 "
+                    f"아직 없어 미실행되었습니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "add_not_executed_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
     async def _apply_decision(
         self,
         position: MonitoredPosition,
         decision,
     ) -> None:
-        """Apply a decision from agent discussion to the position."""
+        """Apply a decision from agent discussion to the position.
+
+        P0 (2026-07-15, docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md):
+        honesty fix only — no new execution added here.
+        - Partial REDUCE has no execution path yet, so it must NOT mutate the
+          monitored quantity (that would be a shadow-ledger lie with no broker
+          order behind it, desynced from the real account until the next
+          sync_from_account overwrites it). The full-close REDUCE path
+          (new_quantity <= 0 -> _execute_close_position) is real execution and
+          is unchanged.
+        - ADD has no execution path yet either. It used to fall silently into
+          the same branch as HOLD (stop/take adjustment only) with the "add"
+          intent discarded. It must be surfaced instead of demoted in silence.
+        """
         from services.agent_chat.models import DecisionAction
 
         logger.info(
@@ -968,14 +1029,41 @@ class PositionManager:
             elif decision.action == DecisionAction.REDUCE:
                 # Partial close - calculate quantity
                 if decision.quantity:
-                    # Update position quantity
                     new_quantity = position.quantity - decision.quantity
                     if new_quantity <= 0:
+                        # Full close: the REAL executing path. Unchanged.
                         await self._execute_close_position(position, "agent_decision_reduce")
                     else:
-                        self.update_position(position.ticker, quantity=new_quantity)
+                        # Partial reduce: no broker order is placed for this
+                        # (P1, not yet implemented). Previously this called
+                        # update_position(quantity=new_quantity), silently
+                        # decrementing the monitored quantity with nothing
+                        # backing it at the broker — a lie about the position
+                        # that would only self-correct at the next
+                        # sync_from_account. Leave the monitored quantity
+                        # untouched (consistent with the real account) and
+                        # surface the non-execution explicitly instead.
+                        logger.warning(
+                            "reduce_not_executed",
+                            ticker=position.ticker,
+                            requested_quantity=decision.quantity,
+                            current_quantity=position.quantity,
+                        )
+                        await self._notify_reduce_not_executed(
+                            position, decision.quantity
+                        )
 
             elif decision.action in (DecisionAction.HOLD, DecisionAction.ADD):
+                if decision.action == DecisionAction.ADD:
+                    # No buy-execution path exists yet (P2, not yet
+                    # implemented). Previously ADD fell into this same branch
+                    # as HOLD with no distinction at all — the "we should add"
+                    # decision was silently demoted to a no-op HOLD. Surface
+                    # it explicitly; the stop/take adjustment below still
+                    # applies same as for HOLD.
+                    logger.warning("add_not_executed", ticker=position.ticker)
+                    await self._notify_add_not_executed(position)
+
                 # Update stops if provided — after sanity validation (P0-2a).
                 new_stop = decision.stop_loss or None
                 new_take = decision.take_profit or None

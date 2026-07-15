@@ -1307,3 +1307,182 @@ class TestStopSanity:
         msg = notifier.send_message.await_args.args[0]
         assert "복원 스탑 기각" in msg
         assert "005930" in msg
+
+
+# -------------------------------------------
+# Apply-Decision Honesty (P0, 2026-07-15)
+# -------------------------------------------
+#
+# _apply_decision previously (a) let a partial REDUCE decision silently
+# decrement the monitored quantity via update_position(quantity=...) with NO
+# broker sell order behind it — a shadow-ledger lie that desynced from the
+# real account until the next sync_from_account overwrote it; and (b) let an
+# ADD decision fall into the exact same branch as HOLD, discarding the "add"
+# intent in silence. These tests pin the P0 honesty fix: no more silent
+# quantity mutation for an unexecuted partial reduce, plus an explicit
+# not-executed notice for both partial REDUCE and ADD. The full-close REDUCE
+# path (new_quantity <= 0) and plain SELL are real execution and must keep
+# working exactly as before (regression).
+#
+# Audit: docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md
+# Plan: docs/superpowers/plans/2026-07-15-position-mgmt-execution.md (Task P0)
+
+import services.autonomy as autonomy_pkg
+from services.autonomy import GateDecision
+
+
+def _honesty_decision(action, quantity=None, stop_loss=None, take_profit=None):
+    return SimpleNamespace(
+        action=action,
+        quantity=quantity,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+
+
+class TestApplyDecisionHonestyP0:
+    """P0: partial REDUCE must not desync the shadow ledger; ADD must not be
+    silently demoted to HOLD."""
+
+    @staticmethod
+    def _position(config, quantity=100, current_price=72500):
+        pm = PositionManager(config=config)
+        pos = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=quantity,
+            avg_price=72500,
+            current_price=current_price,
+        )
+        return pm, pos
+
+    @staticmethod
+    def _notifier():
+        notifier = MagicMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock()
+        return notifier
+
+    @pytest.mark.asyncio
+    async def test_partial_reduce_leaves_quantity_unchanged_and_notifies(self, config):
+        """The core bug: a partial REDUCE (new_quantity > 0) must NOT mutate
+        the monitored quantity — there is no broker order behind it yet — and
+        must emit an explicit not-executed notice instead of quiet drift."""
+        pm, pos = self._position(config, quantity=100)
+        notifier = self._notifier()
+
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(
+                pos, _honesty_decision(DecisionAction.REDUCE, quantity=30)
+            )
+
+        assert pos.quantity == 100, (
+            "partial REDUCE must not silently decrement the shadow ledger"
+        )
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "부분청산" in msg
+        assert "005930" in msg
+
+    @pytest.mark.asyncio
+    async def test_add_decision_notifies_not_executed(self, config):
+        """ADD must not be silently swallowed into HOLD — it must emit an
+        explicit not-executed notice, and must not touch quantity (no buy
+        execution path exists yet)."""
+        pm, pos = self._position(config, quantity=100)
+        notifier = self._notifier()
+
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        assert pos.quantity == 100, "ADD has no buy execution path yet"
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "추가매수" in msg
+        assert "005930" in msg
+
+    @pytest.mark.asyncio
+    async def test_add_decision_still_applies_sane_stop_adjustment(self, config):
+        """The not-executed notice for ADD must not swallow the stop/take
+        adjustment behavior it shares with the HOLD branch."""
+        pm, pos = self._position(config, quantity=100, current_price=72500)
+        notifier = self._notifier()
+
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(
+                pos,
+                _honesty_decision(
+                    DecisionAction.ADD, stop_loss=70000, take_profit=80000
+                ),
+            )
+
+        assert pos.stop_loss == 70000
+        assert pos.take_profit == 80000
+
+    # ---- Regression: real execution paths must be unaffected ----
+
+    @pytest.mark.asyncio
+    async def test_full_close_reduce_still_executes(self, config, monkeypatch):
+        """A REDUCE decision whose quantity closes the whole position
+        (new_quantity <= 0) is real execution and must be unaffected."""
+        pm, pos = self._position(config, quantity=100)
+
+        closed = []
+        fake_coord = MagicMock()
+
+        async def _close(ticker):
+            closed.append(ticker)
+
+        fake_coord._close_position = _close
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(
+            pos, _honesty_decision(DecisionAction.REDUCE, quantity=100)
+        )
+
+        assert closed == ["005930"]
+        assert pm.get_position("005930") is None
+
+    @pytest.mark.asyncio
+    async def test_sell_still_executes(self, config, monkeypatch):
+        """A plain SELL decision is real execution and must be unaffected."""
+        pm, pos = self._position(config, quantity=100)
+
+        closed = []
+        fake_coord = MagicMock()
+
+        async def _close(ticker):
+            closed.append(ticker)
+
+        fake_coord._close_position = _close
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(pos, _honesty_decision(DecisionAction.SELL))
+
+        assert closed == ["005930"]
+        assert pm.get_position("005930") is None
