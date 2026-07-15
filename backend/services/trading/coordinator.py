@@ -210,6 +210,11 @@ class ExecutionCoordinator:
         # BEFORE the monitor starts so recovered stops are watched immediately.
         await self._restore_state()
 
+        # Phase3: restore the active strategy from its revision pointer.
+        # Independent of _restore_state (its own try/except) — a strategy
+        # restore failure must never block the state restore above.
+        await self._restore_strategy()
+
         # Activate persistence BEFORE the startup queue drain below, so trades
         # executed at open are persisted — otherwise a crash before the next
         # persist re-executes them and loses their stop defense (review #3).
@@ -1160,6 +1165,37 @@ class ExecutionCoordinator:
             )
         except Exception as e:
             logger.error(f"[Coordinator] Failed to restore state: {e}")
+
+    async def _restore_strategy(self) -> None:
+        """Phase3: reload the active TradingStrategy from the
+        strategy_revisions ledger via the 'strategy:active_revision_id'
+        pointer (coordinator._strategy alone is in-memory and lost on
+        restart). Pointer invariant (strategy_orchestrator): the pointed
+        revision's strategy_json is always the strategy that WAS in effect,
+        so applying it verbatim is safe. Best-effort — a missing/empty
+        pointer, missing row, or corrupt json starts clean (mirrors
+        _restore_state's contract). Never re-persists on restore."""
+        try:
+            from services.storage_service import get_storage_service
+            from services.trading.strategy_orchestrator import (
+                ACTIVE_STRATEGY_REVISION_KEY,
+            )
+
+            storage = await get_storage_service()
+            revision_id = await storage.get_app_setting(ACTIVE_STRATEGY_REVISION_KEY)
+            if not revision_id:
+                return
+            row = await storage.get_strategy_revision(revision_id)
+            if not row or not row.get("strategy_json"):
+                return
+            strategy = TradingStrategy.model_validate_json(row["strategy_json"])
+            self.set_strategy(strategy)
+            logger.info(
+                f"[Coordinator] Strategy restored from revision {revision_id}"
+                f" ({strategy.name})"
+            )
+        except Exception as e:
+            logger.warning(f"[Coordinator] strategy restore failed: {e}")
 
     def _schedule_persist(self) -> None:
         """Fire-and-forget persist from a (possibly sync) mutator. No-op outside a

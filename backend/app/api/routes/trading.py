@@ -4,6 +4,7 @@ Trading API Routes
 Provides endpoints for auto-trading system control and monitoring.
 """
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List
@@ -49,6 +50,11 @@ from services.trading.paper_performance import (
 # (get_operations) — net-of-cost projection only, never fed back into the
 # broker ledger (see services/trading/fill_costs.py docstring).
 from services.trading.fill_costs import effective_pnl, effective_pnl_pct
+from services.storage_service import get_storage_service
+from services.trading.strategy_orchestrator import (
+    ACTIVE_STRATEGY_REVISION_KEY,
+    run_strategy_consensus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -634,6 +640,38 @@ async def get_preset_details(preset_name: str):
         raise HTTPException(404, f"Preset '{preset_name}' not found")
 
 
+async def _persist_manual_strategy(strategy) -> bool:
+    """POST/PUT /strategy의 인메모리 적용을 revision 원장에 미러(source=
+    'manual') + 활성 포인터 이동. 실패는 정직 강등(False) — 인메모리 적용
+    자체(현행 동작)는 유지된다."""
+    from uuid import uuid4
+
+    try:
+        storage = await get_storage_service()
+        revision_id = str(uuid4())
+        parent_id = await storage.get_app_setting(ACTIVE_STRATEGY_REVISION_KEY)
+        strategy.id = revision_id
+        saved = await storage.save_strategy_revision({
+            "id": revision_id,
+            "trade_date": datetime.now().strftime("%Y-%m-%d"),
+            "source": "manual",
+            "stance": None,
+            "consensus_level": None,
+            "changed": 1,
+            "strategy_json": strategy.model_dump_json(),
+            "parent_revision_id": parent_id or None,
+            "rationale": "manual set via /trading/strategy",
+            "votes_json": None,
+            "regime_snapshot_id": None,
+        })
+        if saved:
+            await storage.set_app_setting(ACTIVE_STRATEGY_REVISION_KEY, revision_id)
+        return saved
+    except Exception as e:
+        logger.warning(f"manual strategy persist failed: {e}")
+        return False
+
+
 @router.get("/strategy")
 async def get_current_strategy(
     coordinator=Depends(get_trading_coordinator),
@@ -714,9 +752,12 @@ async def set_strategy(
 
         logger.info(f"[Strategy API] Set strategy: {strategy.name}")
 
+        persisted = await _persist_manual_strategy(strategy)
+
         return {
             "status": "created",
             "strategy": strategy.model_dump(),
+            "persisted": persisted,
         }
 
     except HTTPException:
@@ -794,9 +835,12 @@ async def update_strategy(
 
         logger.info(f"[Strategy API] Updated strategy: {strategy.name}")
 
+        persisted = await _persist_manual_strategy(strategy)
+
         return {
             "status": "updated",
             "strategy": strategy.model_dump(),
+            "persisted": persisted,
         }
 
     except HTTPException:
@@ -815,6 +859,12 @@ async def clear_strategy(
     """
     coordinator.set_strategy(None)
     logger.info("[Strategy API] Strategy cleared")
+
+    try:
+        storage = await get_storage_service()
+        await storage.set_app_setting(ACTIVE_STRATEGY_REVISION_KEY, "")
+    except Exception as e:
+        logger.warning(f"strategy pointer clear failed: {e}")
 
     return {
         "status": "cleared",
@@ -846,6 +896,42 @@ async def apply_preset(
 
     except ValueError:
         raise HTTPException(404, f"Preset '{preset_name}' not found")
+
+
+@router.get("/strategy/revisions")
+async def get_strategy_revisions(limit: int = 30):
+    """Phase3: 전략 버전 이력 (최신순). strategy_json/votes_json은 파싱해
+    내보낸다(FE 편의)."""
+    storage = await get_storage_service()
+    rows = await storage.get_strategy_revisions(limit=limit)
+    active_id = await storage.get_app_setting(ACTIVE_STRATEGY_REVISION_KEY)
+    revisions = []
+    for row in rows:
+        item = dict(row)
+        for key in ("strategy_json", "votes_json"):
+            try:
+                item[key] = json.loads(item[key]) if item.get(key) else None
+            except (TypeError, ValueError):
+                pass  # 손상 blob은 원문 그대로 정직 노출
+        item["is_active"] = row["id"] == active_id
+        revisions.append(item)
+    return {"revisions": revisions, "active_revision_id": active_id or None}
+
+
+class ConsensusRunRequest(BaseModel):
+    trade_date: Optional[str] = None  # 생략 시 오늘
+
+
+@router.post("/strategy/consensus/run")
+async def run_consensus_now(
+    request: ConsensusRunRequest,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """Phase3: 수동 전략 합의 실행 (배포 검증·백필용). ENABLED 게이트를
+    우회(force)하지만 never-raise 계약은 동일 — 실패도 200 + ok=False."""
+    trade_date = request.trade_date or datetime.now().strftime("%Y-%m-%d")
+    storage = await get_storage_service()
+    return await run_strategy_consensus(coordinator, storage, trade_date, force=True)
 
 
 # -------------------------------------------
