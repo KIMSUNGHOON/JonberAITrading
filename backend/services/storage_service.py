@@ -265,6 +265,29 @@ class StorageService:
                     )
                 """)
 
+                # Per-agent calibration ledger (Phase2 Task 1): Phase1 backfills
+                # outcome_realized_pnl onto the entry decision but leaves
+                # outcome_label nullable and never scores which agent's vote
+                # was actually right — without that, adaptive strategy
+                # re-weighting (Phase 3) has no data to re-weight against.
+                # One row per agent_type per calibration run (as_of_date is
+                # NOT a PK/UNIQUE constraint — re-running for the same date
+                # simply appends a fresh snapshot row rather than overwriting,
+                # mirroring how this ledger accretes elsewhere in this file).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_calibration (
+                        id TEXT PRIMARY KEY,
+                        agent_type TEXT,
+                        as_of_date TEXT,
+                        window_days INTEGER,
+                        decisions_scored INTEGER,
+                        correct INTEGER,
+                        accuracy REAL,
+                        avg_confidence REAL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # Trade <-> decision provenance (Phase1 C2): kr_stock_trades
                 # and coin_trades predate decision_id/strategy_id/
                 # entry_or_exit -- there is no migration mechanism in this
@@ -370,6 +393,11 @@ class StorageService:
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_acv_decision ON agent_chat_votes(decision_id)"
+                )
+
+                # Agent calibration ledger index (Phase2 Task 1)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ac_agent_type ON agent_calibration(agent_type)"
                 )
 
                 await conn.commit()
@@ -1731,6 +1759,136 @@ class StorageService:
             logger.error(
                 "agent_chat_votes_get_failed", decision_id=decision_id, error=str(e)
             )
+            return []
+
+    async def update_decision_label(self, decision_id: str, label: str) -> bool:
+        """
+        Backfill the outcome_label ("correct"/"incorrect"/"flat") of an
+        already-recorded agent-chat decision (Phase2 Task 1).
+
+        Called by services/trading/calibration.py::label_and_calibrate once
+        a decision's outcome_realized_pnl has been judged. Mirrors
+        update_decision_outcome's shape/semantics exactly (a decision_id
+        with no matching row is not treated as an error).
+
+        Args:
+            decision_id: agent_chat_decisions.id to update
+            label: "correct", "incorrect", or "flat"
+
+        Returns:
+            True if the UPDATE executed successfully (including a no-op
+            match), False on any exception.
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE agent_chat_decisions SET outcome_label = ? WHERE id = ?",
+                    (label, decision_id),
+                )
+                await conn.commit()
+                logger.debug(
+                    "decision_label_updated", decision_id=decision_id, label=label
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "decision_label_update_failed",
+                decision_id=decision_id,
+                error=str(e),
+            )
+            return False
+
+    # -------------------------------------------
+    # Agent Calibration Ledger (Phase2 Task 1)
+    # -------------------------------------------
+
+    async def save_agent_calibration(self, record: dict[str, Any]) -> bool:
+        """
+        Persist one per-agent calibration snapshot row.
+
+        (Phase2 Task 1: per-agent accuracy/avg_confidence over a trailing
+        window, computed by services/trading/calibration.py::
+        label_and_calibrate from the agent_chat_decisions/agent_chat_votes
+        ledger. Mirrors save_coin_realized_pnl's shape.)
+
+        Args:
+            record: dict with keys id, agent_type, as_of_date, window_days,
+                decisions_scored, correct, accuracy, avg_confidence.
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO agent_calibration
+                    (id, agent_type, as_of_date, window_days, decisions_scored,
+                     correct, accuracy, avg_confidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"],
+                        record.get("agent_type"),
+                        record.get("as_of_date"),
+                        record.get("window_days"),
+                        record.get("decisions_scored"),
+                        record.get("correct"),
+                        record.get("accuracy"),
+                        record.get("avg_confidence"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "agent_calibration_saved",
+                    agent_type=record.get("agent_type"),
+                    accuracy=record.get("accuracy"),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "agent_calibration_save_failed",
+                agent_type=record.get("agent_type"),
+                error=str(e),
+            )
+            return False
+
+    async def get_agent_calibration(
+        self, as_of_date: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Get agent calibration rows, newest first, optionally filtered by
+        as_of_date."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                if as_of_date:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM agent_calibration
+                        WHERE as_of_date = ?
+                        ORDER BY created_at DESC
+                        """,
+                        (as_of_date,),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM agent_calibration
+                        ORDER BY created_at DESC
+                        """
+                    )
+
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("agent_calibration_get_failed", error=str(e))
             return []
 
     # -------------------------------------------

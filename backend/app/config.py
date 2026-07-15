@@ -106,6 +106,17 @@ class Settings(BaseSettings):
     AUTONOMY_ENABLED: bool = False
 
     # -------------------------------------------
+    # EOD Review / Agent Calibration (Phase2 Task 1)
+    # -------------------------------------------
+    # A closed decision's realized P&L within this many KRW of zero (either
+    # direction) is labeled "flat" rather than correct/incorrect — small
+    # noise-level P&L shouldn't count as a directional win or loss for
+    # per-agent calibration (services/trading/calibration.py). Config-driven
+    # per audit requirement, not a hardcoded literal (mirrors
+    # KIWOOM_PER_API_MIN_INTERVAL's single-field pattern above).
+    EOD_FLAT_THRESHOLD_KRW: float = Field(default=10000.0, ge=0)
+
+    # -------------------------------------------
     # Naver API Configuration (News Search)
     # https://developers.naver.com/apps
     # -------------------------------------------
