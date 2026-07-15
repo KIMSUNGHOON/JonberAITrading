@@ -336,3 +336,116 @@ describe('ManagedSocket', () => {
     expect(socket.state).toBe('connected');
   });
 });
+
+describe('ManagedSocket revival (online / tab-visible)', () => {
+  // Once a socket exhausts its reconnect budget it stops forever — a backend
+  // restart that outlasts the budget leaves the UI permanently stale until a
+  // manual page refresh. The browser 'online' event and the tab regaining
+  // visibility must nudge a given-up socket back to life. Assertions filter
+  // FakeWebSocket instances by a per-test unique path so listeners leaked by
+  // earlier tests (whose sockets share '/ws/test') can't skew the counts.
+  function minesFor(path: string): FakeWebSocket[] {
+    return FakeWebSocket.instances.filter((w) => w.url.includes(path));
+  }
+
+  it('revives a given-up socket when the browser comes back online', () => {
+    const path = '/ws/revive-online';
+    const socket = new ManagedSocket({ path, maxReconnectAttempts: 1, baseReconnectDelayMs: 1 });
+    socket.connect();
+    minesFor(path)[0].simulateServerClose(); // attempt 0 used
+    vi.advanceTimersByTime(5); // reconnect attempt 1
+    minesFor(path)[1].simulateServerClose(); // budget exhausted → give up
+    expect(socket.state).toBe('disconnected');
+    expect(minesFor(path)).toHaveLength(2);
+
+    window.dispatchEvent(new Event('online'));
+    expect(socket.state).toBe('connecting');
+    expect(minesFor(path)).toHaveLength(3); // revived with a fresh socket + budget
+    socket.disconnect();
+  });
+
+  it('revives a given-up socket when the tab becomes visible', () => {
+    const path = '/ws/revive-visible';
+    const socket = new ManagedSocket({ path, maxReconnectAttempts: 0 });
+    socket.connect();
+    minesFor(path)[0].simulateServerClose(); // no retries allowed → give up now
+    expect(socket.state).toBe('disconnected');
+
+    // jsdom default document.visibilityState is 'visible'.
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(socket.state).toBe('connecting');
+    expect(minesFor(path)).toHaveLength(2);
+    socket.disconnect();
+  });
+
+  it('does not revive after a clean client disconnect', () => {
+    const path = '/ws/revive-clean';
+    const socket = new ManagedSocket({ path });
+    socket.connect();
+    minesFor(path)[0].simulateOpen();
+    socket.disconnect();
+    expect(minesFor(path)).toHaveLength(1);
+
+    window.dispatchEvent(new Event('online'));
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(minesFor(path)).toHaveLength(1); // listeners removed on disconnect → no revival
+    expect(socket.state).toBe('disconnected');
+  });
+
+  it('actually removes the revive listeners on disconnect() (not just relies on isClosing)', () => {
+    // Guards the detachReviveListeners() call directly: revive() also bails on
+    // isClosing, so a "no new socket after disconnect" assertion would still
+    // pass if detach were deleted — leaking a window/document listener per
+    // socket across the whole app lifetime. Assert the exact bound handlers are
+    // removed, independent of the isClosing short-circuit.
+    const winAdd = vi.spyOn(window, 'addEventListener');
+    const winRemove = vi.spyOn(window, 'removeEventListener');
+    const docAdd = vi.spyOn(document, 'addEventListener');
+    const docRemove = vi.spyOn(document, 'removeEventListener');
+    try {
+      const socket = new ManagedSocket({ path: '/ws/revive-detach' });
+      socket.connect();
+      const onlineHandler = winAdd.mock.calls.find(([type]) => type === 'online')?.[1];
+      const visHandler = docAdd.mock.calls.find(([type]) => type === 'visibilitychange')?.[1];
+      expect(onlineHandler).toBeTypeOf('function');
+      expect(visHandler).toBeTypeOf('function');
+
+      socket.disconnect();
+      expect(winRemove).toHaveBeenCalledWith('online', onlineHandler);
+      expect(docRemove).toHaveBeenCalledWith('visibilitychange', visHandler);
+    } finally {
+      winAdd.mockRestore();
+      winRemove.mockRestore();
+      docAdd.mockRestore();
+      docRemove.mockRestore();
+    }
+  });
+
+  it('is a no-op while already connected', () => {
+    const path = '/ws/revive-open';
+    const socket = new ManagedSocket({ path });
+    socket.connect();
+    minesFor(path)[0].simulateOpen();
+
+    window.dispatchEvent(new Event('online'));
+    expect(minesFor(path)).toHaveLength(1); // no duplicate socket while open
+    expect(socket.state).toBe('connected');
+    socket.disconnect();
+  });
+
+  it('coming online mid-backoff reconnects immediately without a duplicate', () => {
+    const path = '/ws/revive-backoff';
+    const socket = new ManagedSocket({ path, maxReconnectAttempts: 5, baseReconnectDelayMs: 30000 });
+    socket.connect();
+    minesFor(path)[0].simulateServerClose(); // schedules a reconnect 30s out
+    expect(socket.state).toBe('reconnecting');
+
+    window.dispatchEvent(new Event('online'));
+    expect(socket.state).toBe('connecting');
+    expect(minesFor(path)).toHaveLength(2); // immediate, not after 30s
+
+    vi.advanceTimersByTime(60000); // the cancelled backoff timer must NOT fire a second reconnect
+    expect(minesFor(path)).toHaveLength(2);
+    socket.disconnect();
+  });
+});

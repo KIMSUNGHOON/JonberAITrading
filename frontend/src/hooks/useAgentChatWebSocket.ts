@@ -171,14 +171,17 @@ export function useAgentChatWebSocket({
     // Drop any stale socket (e.g. one still backing off) before replacing it.
     socketRef.current?.disconnect();
 
-    // Policy values preserved from the pre-core implementation:
-    // max 5 attempts, 1s base delay, UNCAPPED backoff, 30s heartbeat.
+    // Reconnect budget: 10 attempts, 1s base delay, capped at 30s, 30s
+    // heartbeat. The old 5-attempt/uncapped policy gave up after ~31s — shorter
+    // than a backend restart — stranding the debate/decision stream (and its
+    // 'WebSocket connection error' banner) until a manual refresh. ManagedSocket
+    // also revives it on 'online' and tab-visibility regain.
     const socket = new ManagedSocket({
       path: `/api/agent-chat/ws/${sid}`,
       label: 'AgentChatWebSocket',
-      maxReconnectAttempts: 5,
+      maxReconnectAttempts: 10,
       baseReconnectDelayMs: 1000,
-      reconnectCapMs: null,
+      reconnectCapMs: 30000,
       pingIntervalMs: 30000,
       onOpen: () => {
         setLastError(null);

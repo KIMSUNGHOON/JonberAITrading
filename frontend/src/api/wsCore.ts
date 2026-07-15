@@ -63,6 +63,7 @@ export class ManagedSocket {
   private pingTimer: number | null = null;
   private isClosing = false;
   private _state: ConnectionState = 'disconnected';
+  private reviveListenersAttached = false;
 
   constructor(options: ManagedSocketOptions) {
     this.path = options.path;
@@ -104,6 +105,7 @@ export class ManagedSocket {
     }
 
     this.isClosing = false;
+    this.attachReviveListeners();
     const url = buildWsUrl(this.path);
     console.log(`[${this.label}] Connecting to:`, url);
     this.setState('connecting');
@@ -121,6 +123,7 @@ export class ManagedSocket {
   disconnect(): void {
     this.isClosing = true;
     this.stopHeartbeat();
+    this.detachReviveListeners();
 
     if (this.reconnectTimeout !== null) {
       clearTimeout(this.reconnectTimeout);
@@ -132,6 +135,62 @@ export class ManagedSocket {
       this.ws = null;
     }
     this.setState('disconnected');
+  }
+
+  // --- Revival: nudge a socket that gave up (or is mid-backoff) back to life
+  // when the environment changes for the better. Without this, a socket that
+  // exhausts maxReconnectAttempts stays dead until a manual page refresh — so a
+  // backend restart outlasting the reconnect budget freezes the whole UI. The
+  // browser firing 'online' (network restored) or the tab regaining visibility
+  // (user came back) are exactly the moments a fresh attempt is worth making.
+  private readonly handleOnline = (): void => {
+    this.revive();
+  };
+
+  private readonly handleVisibility = (): void => {
+    if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+      this.revive();
+    }
+  };
+
+  private attachReviveListeners(): void {
+    if (this.reviveListenersAttached) return;
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', this.handleOnline);
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.handleVisibility);
+    }
+    this.reviveListenersAttached = true;
+  }
+
+  private detachReviveListeners(): void {
+    if (!this.reviveListenersAttached) return;
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', this.handleOnline);
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.handleVisibility);
+    }
+    this.reviveListenersAttached = false;
+  }
+
+  /**
+   * Reconnect immediately with a fresh backoff budget, unless the socket is
+   * intentionally closed, already open, or a connect is already in flight. A
+   * pending backoff timer is cancelled so recovery is instant rather than
+   * waiting out the (possibly 30s) delay.
+   */
+  private revive(): void {
+    if (this.isClosing) return;
+    if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (this._state === 'connecting') return;
+    if (this.reconnectTimeout !== null) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    this.reconnectAttempts = 0;
+    this.connect();
   }
 
   private setState(state: ConnectionState): void {
