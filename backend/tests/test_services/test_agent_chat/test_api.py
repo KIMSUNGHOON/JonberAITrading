@@ -230,6 +230,28 @@ class TestCoordinatorControlEndpoints:
             assert mock_coordinator.max_concurrent == 5
 
     @pytest.mark.asyncio
+    async def test_start_coordinator_empty_body_defaults_to_60s_interval(self, mock_coordinator):
+        """T5 follow-up: FE always POSTs a body (`request || {}`), so an empty
+        JSON object `{}` is what production actually sends — NOT no-body at
+        all. Pydantic fills in Field defaults for the omitted keys, and the
+        route unconditionally applies them (`if request: coordinator.check_interval
+        = request.check_interval_minutes`). The ctor default cadence is 1
+        minute (60s); the request model's default must match, or every real
+        start call silently resets a running coordinator back to a slower
+        cadence.
+        """
+        with patch('app.api.routes.agent_chat.get_chat_coordinator') as mock_get:
+            mock_get.return_value = mock_coordinator
+
+            from app.main import app
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post("/api/agent-chat/start", json={})
+
+            assert response.status_code == 200
+            assert mock_coordinator.check_interval == 1
+
+    @pytest.mark.asyncio
     async def test_stop_coordinator(self, mock_coordinator):
         """Test stopping the coordinator."""
         with patch('app.api.routes.agent_chat.get_chat_coordinator') as mock_get:

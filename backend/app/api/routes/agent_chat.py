@@ -102,7 +102,7 @@ class CoordinatorStatusResponse(BaseModel):
 
 class StartCoordinatorRequest(BaseModel):
     """Request to start the coordinator."""
-    check_interval_minutes: int = Field(default=5, ge=1, le=60)
+    check_interval_minutes: int = Field(default=1, ge=1, le=60)
     max_concurrent_discussions: int = Field(default=3, ge=1, le=10)
 
 
