@@ -10,6 +10,7 @@ No external server required - uses embedded SQLite database.
 """
 
 import json
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -36,7 +37,7 @@ class StorageService:
     """
 
     def __init__(self, db_path: Optional[Path] = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialized = False
 
@@ -166,6 +167,55 @@ class StorageService:
                     )
                 """)
 
+                # Agent-chat decisions ledger (Phase1 C1: decisions/votes were
+                # in-memory-only and evaporated on restart). One row per
+                # decision reached by the agent-chat debate for a ticker;
+                # regime_snapshot_id/outcome_* are placeholders for later
+                # tasks (provenance/EOD outcome labeling) and stay unused here.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_chat_decisions (
+                        id TEXT PRIMARY KEY,
+                        ticker TEXT NOT NULL,
+                        stock_name TEXT,
+                        trade_date TEXT,
+                        status TEXT,
+                        action TEXT,
+                        confidence REAL,
+                        consensus_level REAL,
+                        rationale TEXT,
+                        dissenting_opinions TEXT,
+                        entry_price REAL,
+                        stop_loss REAL,
+                        take_profit REAL,
+                        position_pct REAL,
+                        news_sentiment TEXT,
+                        news_count INTEGER,
+                        behavioral_signals TEXT,
+                        market_sentiment TEXT,
+                        flow TEXT,
+                        regime_snapshot_id TEXT,
+                        outcome_realized_pnl REAL,
+                        outcome_label TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                # Per-agent votes backing a decision (technical/risk/sentiment/...).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_chat_votes (
+                        id TEXT PRIMARY KEY,
+                        decision_id TEXT NOT NULL,
+                        agent_type TEXT NOT NULL,
+                        vote TEXT,
+                        confidence REAL,
+                        reasoning TEXT,
+                        key_factors TEXT,
+                        suggested_position_pct REAL,
+                        suggested_stop_loss_pct REAL,
+                        suggested_take_profit_pct REAL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # Create indexes for better query performance
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
@@ -233,6 +283,17 @@ class StorageService:
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_coin_realized_pnl_created ON coin_realized_pnl(created_at DESC)"
+                )
+
+                # Agent-chat ledger indexes (Phase1 C1)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_acd_ticker ON agent_chat_decisions(ticker)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_acd_trade_date ON agent_chat_decisions(trade_date)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_acv_decision ON agent_chat_votes(decision_id)"
                 )
 
                 await conn.commit()
@@ -1162,6 +1223,184 @@ class StorageService:
             )
             await conn.commit()
         logger.debug("app_setting_saved", key=key)
+
+    # -------------------------------------------
+    # Agent-Chat Decisions Ledger (Phase1 C1)
+    # -------------------------------------------
+
+    async def save_agent_chat_decision(
+        self, decision: dict[str, Any], votes: list[dict[str, Any]]
+    ) -> bool:
+        """
+        Persist an agent-chat decision plus its backing per-agent votes.
+
+        (Phase1 C1: decisions/votes were in-memory-only and evaporated on
+        restart. Mirrors add_kr_stock_trade's shape — a single connection/
+        transaction covers the decision row and all vote rows so a decision
+        never persists without its votes or vice versa.)
+
+        Args:
+            decision: dict with keys id, ticker, stock_name, trade_date,
+                status, action, confidence, consensus_level, rationale,
+                dissenting_opinions (list), entry_price, stop_loss,
+                take_profit, position_pct, news_sentiment, news_count,
+                behavioral_signals (dict), market_sentiment (dict/None),
+                flow (dict/None).
+            votes: list of dicts with keys decision_id, agent_type, vote,
+                confidence, reasoning, key_factors (list),
+                suggested_position_pct, suggested_stop_loss_pct,
+                suggested_take_profit_pct.
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO agent_chat_decisions
+                    (id, ticker, stock_name, trade_date, status, action,
+                     confidence, consensus_level, rationale, dissenting_opinions,
+                     entry_price, stop_loss, take_profit, position_pct,
+                     news_sentiment, news_count, behavioral_signals,
+                     market_sentiment, flow)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        decision["id"],
+                        decision["ticker"],
+                        decision.get("stock_name"),
+                        decision.get("trade_date"),
+                        decision.get("status"),
+                        decision.get("action"),
+                        decision.get("confidence"),
+                        decision.get("consensus_level"),
+                        decision.get("rationale"),
+                        json.dumps(decision["dissenting_opinions"])
+                        if decision.get("dissenting_opinions") is not None
+                        else None,
+                        decision.get("entry_price"),
+                        decision.get("stop_loss"),
+                        decision.get("take_profit"),
+                        decision.get("position_pct"),
+                        decision.get("news_sentiment"),
+                        decision.get("news_count"),
+                        json.dumps(decision["behavioral_signals"])
+                        if decision.get("behavioral_signals") is not None
+                        else None,
+                        json.dumps(decision["market_sentiment"])
+                        if decision.get("market_sentiment") is not None
+                        else None,
+                        json.dumps(decision["flow"])
+                        if decision.get("flow") is not None
+                        else None,
+                    ),
+                )
+
+                for v in votes:
+                    await conn.execute(
+                        """
+                        INSERT INTO agent_chat_votes
+                        (id, decision_id, agent_type, vote, confidence, reasoning,
+                         key_factors, suggested_position_pct,
+                         suggested_stop_loss_pct, suggested_take_profit_pct)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            v["decision_id"],
+                            v["agent_type"],
+                            v.get("vote"),
+                            v.get("confidence"),
+                            v.get("reasoning"),
+                            json.dumps(v["key_factors"])
+                            if v.get("key_factors") is not None
+                            else None,
+                            v.get("suggested_position_pct"),
+                            v.get("suggested_stop_loss_pct"),
+                            v.get("suggested_take_profit_pct"),
+                        ),
+                    )
+
+                await conn.commit()
+                logger.debug(
+                    "agent_chat_decision_saved",
+                    decision_id=decision.get("id"),
+                    ticker=decision.get("ticker"),
+                    vote_count=len(votes),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "agent_chat_decision_save_failed",
+                decision_id=decision.get("id"),
+                error=str(e),
+            )
+            return False
+
+    async def get_agent_chat_decisions(
+        self,
+        ticker: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Get agent-chat decisions, newest first, optionally filtered by ticker."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                if ticker:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM agent_chat_decisions
+                        WHERE ticker = ?
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (ticker, limit, offset),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM agent_chat_decisions
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (limit, offset),
+                    )
+
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("agent_chat_decisions_get_failed", error=str(e))
+            return []
+
+    async def get_agent_chat_votes(self, decision_id: str) -> list[dict[str, Any]]:
+        """Get all per-agent votes backing a decision."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM agent_chat_votes
+                    WHERE decision_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (decision_id,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(
+                "agent_chat_votes_get_failed", decision_id=decision_id, error=str(e)
+            )
+            return []
 
     # -------------------------------------------
     # Health Check
