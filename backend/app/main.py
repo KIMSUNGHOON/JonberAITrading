@@ -112,6 +112,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("session_manager_init_failed", error=str(e))
 
+    # Re-arm the autonomy auto-approve injector for sessions ALREADY
+    # awaiting_approval (R3 gap fix): producers only schedule the injector at
+    # the moment a session first sets awaiting_approval, so a session that
+    # reached it while the master gate was off (or before a restart) never
+    # got a countdown — and AUTONOMY_ENABLED only takes effect via a restart.
+    # Runs after SessionManager init (above) so session state is available;
+    # per-session errors are handled inside and never propagate here, but the
+    # pass is wrapped too so it can never block startup.
+    try:
+        from app.api.routes._autonomy_injector import rearm_awaiting_approvals
+
+        await rearm_awaiting_approvals()
+        logger.info("autonomy_rearm_complete")
+    except Exception as e:
+        logger.error("autonomy_rearm_failed", error=str(e))
+
     # Start session cleanup background task
     asyncio.create_task(cleanup_old_sessions())
     logger.info("session_cleanup_task_started")

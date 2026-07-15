@@ -27,7 +27,12 @@ from datetime import datetime, timedelta, timezone
 import structlog
 
 from services.autonomy import check_autonomy
-from services.session_manager import mirror_session_state
+from services.session_manager import (
+    MarketType,
+    SessionStatus,
+    get_session_manager,
+    mirror_session_state,
+)
 
 logger = structlog.get_logger()
 
@@ -199,3 +204,134 @@ async def _notify_pending(session_id: str, market: str, fields: dict, grace_secs
             )
     except Exception as e:
         logger.warning("auto_approve_notify_failed", session_id=session_id, error=str(e))
+
+
+# -------------------------------------------
+# Startup re-arm pass
+# -------------------------------------------
+
+
+def _has_future_auto_approve_at(value) -> bool:
+    """True only if `value` parses to an aware datetime strictly in the
+    future. A live grace task's own re-checks race harmlessly against this
+    (worst case: we skip a session whose countdown is about to fire anyway,
+    and the timer either approves it or stands down on its own)."""
+    if not value:
+        return False
+    try:
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt > datetime.now(timezone.utc)
+
+
+def _scan_legacy_dict(get_dict, market: str, candidates: dict) -> None:
+    """Add every AWAITING_APPROVAL session from a legacy in-memory dict into
+    `candidates` (session_id -> (market, session)), first-writer-wins."""
+    try:
+        sessions = get_dict()
+    except Exception as e:
+        logger.error("autonomy_rearm_legacy_import_failed", market=market, error=str(e))
+        return
+
+    for session_id, session in sessions.items():
+        try:
+            if session.get("status") == SessionStatus.AWAITING_APPROVAL.value:
+                candidates.setdefault(session_id, (market, session))
+        except Exception as e:
+            logger.error(
+                "autonomy_rearm_legacy_scan_failed",
+                market=market,
+                session_id=session_id,
+                error=str(e),
+            )
+
+
+async def rearm_awaiting_approvals() -> None:
+    """Re-arm the auto-approve injector for sessions ALREADY awaiting_approval.
+
+    Producers only call maybe_schedule_auto_approve() at the moment a session
+    first sets awaiting_approval (see the module docstring). A session that
+    reached awaiting_approval while the master autonomy gate was off never
+    gets a countdown scheduled by anyone — and since AUTONOMY_ENABLED is read
+    once at process/settings startup, turning it on always means a restart,
+    which never revisits already-awaiting sessions on its own. Without this
+    pass such a session stays plain HITL forever even after the operator
+    turns autonomy on.
+
+    Meant to be called once, from the app startup lifespan, after the
+    SessionManager (and its stranded-session reconcile pass) have
+    initialized. Walks every session currently AWAITING_APPROVAL from:
+      - the SessionManager (the durable source of truth — legacy in-memory
+        dicts are always empty this early in a freshly started process), and
+      - the legacy dicts (kr_stock_sessions / coin_sessions) themselves,
+        defensively, in case this is ever invoked again on a warm process
+        (e.g. a future coordinator-start hook) where they are already
+        populated.
+    A session found in a legacy dict wins over its SessionManager copy for
+    the same session_id (the legacy dict is the live, mutation-of-record
+    object producers and approval.py read/write during normal operation).
+
+    Idempotent / fail-closed:
+    - a session that already carries a FUTURE auto_approve_at is skipped —
+      a live grace task is presumably already counting it down, so scheduling
+      another would stack a duplicate timer.
+    - maybe_schedule_auto_approve() itself pre-checks the gate; a deny (e.g.
+      master gate still off, or a coin session under HITL-only mode) writes
+      nothing and the session stays plain HITL.
+    - any error scanning or scheduling a single session is logged and that
+      session is skipped — never raised — so one bad session can't block
+      startup or the rest of the pass.
+    """
+    candidates: dict[str, tuple[str, dict]] = {}
+
+    try:
+        from app.api.routes.kr_stocks import get_kr_stock_sessions
+
+        _scan_legacy_dict(get_kr_stock_sessions, "kiwoom", candidates)
+    except Exception as e:
+        logger.error("autonomy_rearm_legacy_import_failed", market="kiwoom", error=str(e))
+
+    try:
+        from app.api.routes.coin import get_coin_sessions
+
+        _scan_legacy_dict(get_coin_sessions, "coin", candidates)
+    except Exception as e:
+        logger.error("autonomy_rearm_legacy_import_failed", market="coin", error=str(e))
+
+    try:
+        manager = await get_session_manager()
+        sm_sessions = await manager.get_all_sessions(status=SessionStatus.AWAITING_APPROVAL)
+    except Exception as e:
+        logger.error("autonomy_rearm_sm_scan_failed", error=str(e))
+        sm_sessions = {}
+
+    for session_id, sm_session in sm_sessions.items():
+        if session_id in candidates:
+            continue  # already have the live legacy-dict copy
+        if sm_session.market_type == MarketType.KIWOOM:
+            market = "kiwoom"
+        elif sm_session.market_type == MarketType.COIN:
+            market = "coin"
+        else:
+            continue  # US stock stack removed (R2) — nothing to re-arm there
+        candidates[session_id] = (market, sm_session.to_legacy_dict())
+
+    if not candidates:
+        return
+
+    logger.info("autonomy_rearm_scan", candidate_count=len(candidates))
+
+    for session_id, (market, session) in candidates.items():
+        try:
+            state = session.get("state") or {}
+            if not state.get("awaiting_approval"):
+                continue
+            if _has_future_auto_approve_at(state.get("auto_approve_at")):
+                logger.info("autonomy_rearm_skip_live_countdown", session_id=session_id)
+                continue
+            await maybe_schedule_auto_approve(session_id, market, session)
+        except Exception as e:
+            logger.error("autonomy_rearm_session_failed", session_id=session_id, error=str(e))

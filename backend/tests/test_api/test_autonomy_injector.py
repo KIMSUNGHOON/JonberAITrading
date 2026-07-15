@@ -308,3 +308,210 @@ async def test_kr_producer_invokes_injector(sm, monkeypatch):
     finally:
         kr_stock_sessions.clear()
         kr_stock_sessions.update(saved)
+
+
+# -------------------------------------------
+# Startup re-arm pass: re-arm sessions that were ALREADY awaiting_approval
+# when the gate turns on (or the process restarts) — not just sessions that
+# transition to awaiting afterward.
+# -------------------------------------------
+
+
+@pytest.fixture
+def empty_legacy_dicts():
+    """Simulate a fresh process: legacy in-memory session dicts are empty
+    (the shape a restart actually leaves behind — the sm row survives, the
+    process-local dict does not)."""
+    from app.api.routes.kr_stocks.constants import kr_stock_sessions
+    from app.api.routes.coin.constants import coin_sessions
+
+    saved_kr = dict(kr_stock_sessions)
+    saved_coin = dict(coin_sessions)
+    kr_stock_sessions.clear()
+    coin_sessions.clear()
+    try:
+        yield
+    finally:
+        kr_stock_sessions.clear()
+        kr_stock_sessions.update(saved_kr)
+        coin_sessions.clear()
+        coin_sessions.update(saved_coin)
+
+
+async def _seed_awaiting_sm(
+    sm,
+    session_id: str,
+    *,
+    market_type: MarketType = MarketType.KIWOOM,
+    auto_approve_at: str | None = None,
+) -> None:
+    """Seed an AWAITING_APPROVAL session directly into the SessionManager,
+    bypassing the legacy dicts entirely."""
+    state = {
+        "awaiting_approval": True,
+        "approval_status": None,
+        "trade_proposal": {
+            "id": "p-rearm-1",
+            "action": "BUY",
+            "quantity": 10,
+            "entry_price": 50_000,
+        },
+        "reasoning_log": ["[t] 분석 완료"],
+    }
+    if auto_approve_at is not None:
+        state["auto_approve_at"] = auto_approve_at
+    ticker = "005930" if market_type == MarketType.KIWOOM else "KRW-BTC"
+    await sm.create_session(
+        session_id=session_id,
+        market_type=market_type,
+        ticker=ticker,
+        display_name="테스트",
+        state=state,
+    )
+    from services.session_manager import SessionStatus
+
+    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+
+
+async def test_rearm_schedules_for_sm_only_awaiting_session(
+    sm, fast_grace, gate_allow, submit_recorder, empty_legacy_dicts
+):
+    """A session that survived only in the SessionManager (legacy dict
+    empty -- the restart shape) gets handed to maybe_schedule_auto_approve
+    when the gate allows."""
+    session_id = "rearm-1"
+    await _seed_awaiting_sm(sm, session_id)
+
+    await injector_module.rearm_awaiting_approvals()
+
+    sm_session = await sm.get_session(session_id)
+    assert sm_session.state.get("auto_approve_at") is not None
+
+    await _wait_for(lambda: len(submit_recorder) == 1)
+    assert submit_recorder[0]["session_id"] == session_id
+    assert submit_recorder[0]["actor"] == "system"
+
+
+async def test_rearm_gate_deny_schedules_nothing(
+    sm, fast_grace, monkeypatch, submit_recorder, empty_legacy_dicts
+):
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="AUTONOMY_ENABLED is off", check="master_gate")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", deny_gate)
+
+    session_id = "rearm-2"
+    await _seed_awaiting_sm(sm, session_id)
+
+    await injector_module.rearm_awaiting_approvals()
+    await asyncio.sleep(0.1)
+
+    sm_session = await sm.get_session(session_id)
+    assert sm_session.state.get("auto_approve_at") is None
+    assert submit_recorder == []
+
+
+async def test_rearm_skips_session_with_live_future_countdown(
+    sm, fast_grace, monkeypatch, empty_legacy_dicts
+):
+    """A session that already carries a FUTURE auto_approve_at (a live grace
+    task presumably already counting it down) must not be re-armed -- doing
+    so would stack a duplicate timer."""
+    from datetime import datetime, timedelta, timezone
+
+    future = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+    session_id = "rearm-3"
+    await _seed_awaiting_sm(sm, session_id, auto_approve_at=future)
+
+    calls = []
+
+    async def recorder(sid, market, session):
+        calls.append(sid)
+
+    monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", recorder)
+
+    await injector_module.rearm_awaiting_approvals()
+
+    assert calls == []
+    sm_session = await sm.get_session(session_id)
+    assert sm_session.state.get("auto_approve_at") == future  # left untouched
+
+
+async def test_rearm_skips_non_awaiting_sessions(sm, monkeypatch, empty_legacy_dicts):
+    session_id = "rearm-4"
+    await sm.create_session(
+        session_id=session_id,
+        market_type=MarketType.KIWOOM,
+        ticker="005930",
+        display_name="테스트",
+        state={"reasoning_log": []},
+    )
+    # default status is RUNNING, not AWAITING_APPROVAL
+
+    calls = []
+
+    async def recorder(sid, market, session):
+        calls.append(sid)
+
+    monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", recorder)
+
+    await injector_module.rearm_awaiting_approvals()
+
+    assert calls == []
+
+
+async def test_rearm_continues_after_one_session_errors(
+    sm, fast_grace, gate_allow, submit_recorder, empty_legacy_dicts, monkeypatch
+):
+    """A single session raising during scheduling must not stop the pass --
+    the other awaiting sessions still get re-armed."""
+    boom_id = "rearm-boom"
+    ok_id = "rearm-ok"
+    await _seed_awaiting_sm(sm, boom_id)
+    await _seed_awaiting_sm(sm, ok_id)
+
+    real = injector_module.maybe_schedule_auto_approve
+
+    async def flaky(sid, market, session):
+        if sid == boom_id:
+            raise RuntimeError("boom")
+        return await real(sid, market, session)
+
+    monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", flaky)
+
+    await injector_module.rearm_awaiting_approvals()  # must not raise
+
+    await _wait_for(lambda: len(submit_recorder) == 1)
+    assert submit_recorder[0]["session_id"] == ok_id
+
+
+async def test_rearm_covers_both_markets_gate_can_deny_coin_only(
+    sm, fast_grace, monkeypatch, submit_recorder, empty_legacy_dicts
+):
+    """coin is HITL-only in this codebase's default posture -- the gate
+    denies it, but the pass must still attempt it (not skip coin entirely),
+    while kiwoom (allowed) gets scheduled normally."""
+    calls = []
+
+    async def per_market_gate(market, **kwargs):
+        calls.append(market)
+        if market == "coin":
+            return GateDecision(allowed=False, reason="coin is hitl", check="market_mode")
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", per_market_gate)
+
+    kr_id = "rearm-kr-both"
+    coin_id = "rearm-coin-both"
+    await _seed_awaiting_sm(sm, kr_id, market_type=MarketType.KIWOOM)
+    await _seed_awaiting_sm(sm, coin_id, market_type=MarketType.COIN)
+
+    await injector_module.rearm_awaiting_approvals()
+    await asyncio.sleep(0.1)
+
+    assert "kiwoom" in calls and "coin" in calls
+    coin_sm = await sm.get_session(coin_id)
+    assert coin_sm.state.get("auto_approve_at") is None  # denied -> stays HITL
+
+    await _wait_for(lambda: len(submit_recorder) == 1)
+    assert submit_recorder[0]["session_id"] == kr_id
