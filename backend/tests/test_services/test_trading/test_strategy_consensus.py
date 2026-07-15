@@ -44,6 +44,7 @@ def test_error_entries_and_bad_stances_are_excluded():
     votes = [
         {"panelist": "regime_strategist", "error": "LLMAllBackendsFailed"},
         _vote(stance="mystery"),          # 미지 stance → 무효
+        _vote(stance="abstain"),          # 명시적 기권도 유권자 아님 (plan ABSTAIN 배제)
         _vote(stance="defensive"),
     ]
     assert len(valid_votes(votes)) == 1
@@ -102,6 +103,8 @@ def test_knob_median_within_delta_cap_applies():
     ]
     out = apply_consensus(current, votes, "defensive", 0.8, "2026-07-15", "rev-1")
     assert out.exit_conditions.stop_loss_pct == pytest.approx(0.065)  # median
+    # 원본 불변: 중첩 서브모델까지 deep copy여야 함 (shallow copy 회귀 감지)
+    assert current.exit_conditions.stop_loss_pct == pytest.approx(0.07)
 
 
 def test_knob_delta_cap_limits_change():
@@ -113,6 +116,8 @@ def test_knob_delta_cap_limits_change():
     assert out.position_sizing.max_position_pct == pytest.approx(
         0.10 * (1 + MAX_RELATIVE_DELTA)
     )
+    # 원본 불변: 중첩 서브모델까지 deep copy여야 함 (shallow copy 회귀 감지)
+    assert current.position_sizing.max_position_pct == pytest.approx(0.10)
 
 
 def test_knob_hard_bounds_clamp_before_delta():
@@ -152,6 +157,16 @@ def test_non_numeric_adjustment_is_ignored():
              _vote(adjustments={"stop_loss_pct": 0.06}, panelist="b")]
     out = apply_consensus(current, votes, "defensive", 0.8, "2026-07-15", "rev-1")
     assert out.exit_conditions.stop_loss_pct == pytest.approx(0.06)
+
+
+def test_bool_adjustment_is_rejected():
+    """bool은 int 서브클래스지만 노브 값이 아니다 — True가 1.0으로 새면 안 됨."""
+    current = TradingStrategy()  # stop_loss_pct=0.07
+    votes = [_vote(adjustments={"stop_loss_pct": True}, panelist="a"),
+             _vote(adjustments={"stop_loss_pct": True}, panelist="b")]
+    out = apply_consensus(current, votes, "defensive", 0.8, "2026-07-15", "rev-1")
+    # 두 제안 모두 bool → 무시 → 노브 불변
+    assert out.exit_conditions.stop_loss_pct == pytest.approx(0.07)
 
 
 def test_identity_and_provenance_stamp():
