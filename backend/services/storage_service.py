@@ -216,6 +216,30 @@ class StorageService:
                     )
                 """)
 
+                # Trade <-> decision provenance (Phase1 C2): kr_stock_trades
+                # and coin_trades predate decision_id/strategy_id/
+                # entry_or_exit -- there is no migration mechanism in this
+                # project, so an already-deployed DB only ever gets these
+                # columns via this ALTER path on the next initialize().
+                await self._ensure_columns(
+                    conn,
+                    "kr_stock_trades",
+                    {
+                        "decision_id": "TEXT",
+                        "strategy_id": "TEXT",
+                        "entry_or_exit": "TEXT",
+                    },
+                )
+                await self._ensure_columns(
+                    conn,
+                    "coin_trades",
+                    {
+                        "decision_id": "TEXT",
+                        "strategy_id": "TEXT",
+                        "entry_or_exit": "TEXT",
+                    },
+                )
+
                 # Create indexes for better query performance
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
@@ -302,6 +326,27 @@ class StorageService:
         except Exception as e:
             logger.error("storage_init_failed", error=str(e))
             raise
+
+    @staticmethod
+    async def _ensure_columns(
+        conn: "aiosqlite.Connection", table: str, cols: dict[str, str]
+    ) -> None:
+        """Add any of `cols` missing from `table` via ALTER TABLE ADD COLUMN.
+
+        This project has no migration mechanism -- CREATE TABLE IF NOT EXISTS
+        is a no-op against a table that already exists, so a column added to
+        the schema after a DB file was first created would otherwise never
+        appear on that file. Every column added this way must be nullable
+        (no DEFAULT/NOT NULL requirement), since SQLite's ADD COLUMN cannot
+        backfill existing rows with anything but a constant.
+        """
+        cursor = await conn.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cursor.fetchall()}
+        for name, col_type in cols.items():
+            if name not in existing:
+                await conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {col_type}"
+                )
 
     # -------------------------------------------
     # Session Management
@@ -1079,8 +1124,9 @@ class StorageService:
                     """
                     INSERT INTO kr_stock_trades
                     (id, session_id, stk_cd, stk_nm, side, order_type, price,
-                     quantity, executed_quantity, fee, total_krw, status, order_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     quantity, executed_quantity, fee, total_krw, status, order_id, created_at,
+                     decision_id, strategy_id, entry_or_exit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["id"],
@@ -1097,6 +1143,9 @@ class StorageService:
                         record["status"],
                         record.get("order_id"),
                         record.get("created_at", datetime.now()),
+                        record.get("decision_id"),
+                        record.get("strategy_id"),
+                        record.get("entry_or_exit"),
                     ),
                 )
                 await conn.commit()

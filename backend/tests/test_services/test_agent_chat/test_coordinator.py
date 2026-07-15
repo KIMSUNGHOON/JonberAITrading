@@ -621,8 +621,9 @@ class TestAutonomousExecutionMarksWatchConverted:
                 quantity=10,
                 entry_price=72_500,
             )
+            session = ChatSession(ticker="005930", stock_name="삼성전자")
 
-            await coordinator._execute_trade("005930", decision)
+            await coordinator._execute_trade("005930", decision, session)
 
         return fake_trading_coord
 
@@ -720,8 +721,9 @@ class TestAutonomousExecutionMarksWatchConverted:
                 consensus_level=0.9,
                 rationale="관망",
             )
+            session = ChatSession(ticker="005930", stock_name="삼성전자")
 
-            await coordinator._execute_trade("005930", decision)
+            await coordinator._execute_trade("005930", decision, session)
 
         fake_trading_coord.on_trade_approved.assert_not_awaited()
         fake_trading_coord.mark_watch_converted.assert_not_called()

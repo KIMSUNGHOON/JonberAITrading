@@ -183,7 +183,7 @@ async def test_coordinator_execution_gated(monkeypatch):
     coord = ChatCoordinator()
     executed = []
 
-    async def record_execute(ticker, decision):
+    async def record_execute(ticker, decision, session):
         executed.append(ticker)
 
     async def noop(*args, **kwargs):
@@ -196,13 +196,14 @@ async def test_coordinator_execution_gated(monkeypatch):
         action=DecisionAction.BUY, confidence=0.9, consensus_level=0.9,
         rationale="테스트", quantity=10, entry_price=50_000,
     )
+    session = ChatSession(ticker="005930", stock_name="테스트")
 
     # Gate denies → no execution
     async def deny_gate(market, **kwargs):
         return GateDecision(allowed=False, reason="AUTONOMY_ENABLED is off", check="master_gate")
 
     monkeypatch.setattr(cm, "check_autonomy", deny_gate)
-    await coord._handle_decision("005930", decision)
+    await coord._handle_decision("005930", decision, session)
     assert executed == []
 
     # Gate allows → existing execution path runs
@@ -210,7 +211,7 @@ async def test_coordinator_execution_gated(monkeypatch):
         return GateDecision(allowed=True, reason="ok", check="all")
 
     monkeypatch.setattr(cm, "check_autonomy", allow_gate)
-    await coord._handle_decision("005930", decision)
+    await coord._handle_decision("005930", decision, session)
     assert executed == ["005930"]
 
 

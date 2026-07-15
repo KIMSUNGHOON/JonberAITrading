@@ -636,6 +636,8 @@ class ExecutionCoordinator:
                     ),
                     order_id=result.order_id,
                     session_id=session_id,
+                    decision_id=session_id,
+                    entry_or_exit="exit",
                 )
         else:
             self._log_activity(
@@ -781,6 +783,8 @@ class ExecutionCoordinator:
                     ),
                     order_id=result.order_id,
                     session_id=order.session_id,
+                    decision_id=order.session_id,
+                    entry_or_exit="entry",
                 )
 
         await self._notify_state_change()
@@ -985,6 +989,8 @@ class ExecutionCoordinator:
                 ),
                 order_id=result.order_id,
                 session_id=order.session_id,
+                decision_id=order.session_id,
+                entry_or_exit="exit",
             )
 
         position = next(
@@ -2081,6 +2087,8 @@ class ExecutionCoordinator:
                     status="completed" if order_status == "filled" else "partial",
                     order_id=order.ord_no,
                     session_id=order.source_session_id,
+                    decision_id=order.source_session_id,
+                    entry_or_exit="entry" if order.side == "buy" else "exit",
                 )
 
             await register_fill_as_position(

@@ -57,6 +57,9 @@ async def record_trade_fill_async(
     total_krw: Optional[float] = None,
     order_id: Optional[str] = None,
     trade_id: Optional[str] = None,
+    decision_id: Optional[str] = None,
+    strategy_id: Optional[str] = None,
+    entry_or_exit: Optional[str] = None,
 ) -> None:
     """Persist one confirmed KR stock trade fill. Awaitable core — never
     raises; storage failures are logged only so a recording failure can
@@ -84,6 +87,9 @@ async def record_trade_fill_async(
             "status": status,
             "order_id": order_id,
             "created_at": datetime.now(),
+            "decision_id": decision_id,
+            "strategy_id": strategy_id,
+            "entry_or_exit": entry_or_exit,
         }
         await storage.add_kr_stock_trade(record)
     except Exception as e:

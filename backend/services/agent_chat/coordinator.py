@@ -433,7 +433,7 @@ class ChatCoordinator:
 
             # Handle decision
             if session.decision:
-                await self._handle_decision(ticker, session.decision)
+                await self._handle_decision(ticker, session.decision, session)
 
             # Notify callbacks
             for callback in self._on_session_complete_callbacks:
@@ -471,6 +471,7 @@ class ChatCoordinator:
         self,
         ticker: str,
         decision: TradeDecision,
+        session: ChatSession,
     ) -> None:
         """Handle a trading decision from the discussion."""
         logger.info(
@@ -508,7 +509,7 @@ class ChatCoordinator:
                 entry_price=decision.entry_price,
             )
             if gate.allowed:
-                await self._execute_trade(ticker, decision)
+                await self._execute_trade(ticker, decision, session)
             else:
                 logger.warning(
                     "coordinator_execution_gate_denied",
@@ -541,6 +542,7 @@ class ChatCoordinator:
         self,
         ticker: str,
         decision: TradeDecision,
+        session: ChatSession,
     ) -> None:
         """Execute the trading decision."""
         logger.info(
@@ -566,7 +568,7 @@ class ChatCoordinator:
             if action:
                 # Execute via trading coordinator
                 allocation = await trading_coord.on_trade_approved(
-                    session_id=f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    session_id=session.id,
                     ticker=ticker,
                     stock_name=None,  # Will be looked up
                     action=action,
