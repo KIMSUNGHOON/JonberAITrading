@@ -39,6 +39,7 @@ class PositionEventType(str, Enum):
     HOLDING_PERIOD_LONG = "holding_long"       # Position held for extended period
     VOLATILITY_SPIKE = "volatility_spike"      # Sudden volatility increase
     NEWS_IMPACT = "news_impact"                # News affecting position
+    STRATEGIC_REEVAL = "strategic_reeval"      # Periodic/price-change proactive re-judgment (P3)
 
 
 # Korean translations for position events
@@ -82,6 +83,11 @@ POSITION_EVENT_KOREAN = {
     PositionEventType.NEWS_IMPACT: {
         "name": "뉴스 영향",
         "description": "관련 뉴스가 포지션에 영향을 줄 수 있습니다. 상황을 모니터링 해주세요.",
+    },
+    PositionEventType.STRATEGIC_REEVAL: {
+        "name": "전략 재평가",
+        "description": "일정 시간 경과 또는 유의미한 가격 변동으로 포지션을 능동적으로 재평가합니다 "
+                        "(추가매수/축소/청산/유지를 다시 판단합니다).",
     },
 }
 
@@ -129,6 +135,16 @@ class MonitoredPosition(BaseModel):
     entry_time: datetime = Field(default_factory=datetime.now)
     last_check: datetime = Field(default_factory=datetime.now)
     last_discussion: Optional[datetime] = None
+
+    # Strategic re-evaluation tracking (P3, 2026-07-15,
+    # docs/superpowers/plans/2026-07-15-position-mgmt-execution.md). When
+    # this position was last proactively re-judged (interval OR
+    # price-change trigger — see PositionManager._check_strategic_reeval)
+    # and the price it was measured against. Seeded at add_position() time
+    # (monitoring-start baseline, so a freshly-synced position doesn't
+    # immediately fire) and reset every time a strategic re-eval fires.
+    last_reeval_at: Optional[datetime] = None
+    last_reeval_price: Optional[float] = None
 
     # Event tracking
     events_triggered: List[str] = Field(default_factory=list)
@@ -234,6 +250,36 @@ class PositionManagerConfig(BaseModel):
         description="Fraction of the currently held quantity to buy on an "
                      "autonomous ADD decision (e.g. 0.25 = add 25% of "
                      "current holding). 0 disables autonomous ADD sizing.",
+    )
+
+    # Strategic re-evaluation trigger (P3, 2026-07-15,
+    # docs/superpowers/plans/2026-07-15-position-mgmt-execution.md Task P3).
+    # The 30s loop above only reacts to DEFENSIVE conditions (stop/take
+    # proximity, big P&L swings, long holding). Without this, a held
+    # position is never proactively re-judged for ADD/REDUCE — it's only
+    # ever reacted to. When NO defensive event fires this cycle, a position
+    # becomes due for a STRATEGIC_REEVAL event (see
+    # PositionManager._check_strategic_reeval) once EITHER: enough
+    # wall-clock time has passed since its last re-eval, OR its price has
+    # moved enough since that re-eval's price baseline. STRATEGIC_REEVAL
+    # then flows through the SAME min_discussion_interval_minutes /
+    # max_discussions_per_position throttle as defensive events, so this
+    # bounds LLM-discussion volume/cost exactly like the existing events do
+    # — it does not bypass or duplicate that throttle. Conservative
+    # defaults: at most an hourly re-judgment (sooner only on a real move).
+    reeval_interval_minutes: int = Field(
+        default=60,
+        ge=1,
+        description="Minutes since a position's last strategic re-eval "
+                     "before it becomes due again (periodic trigger).",
+    )
+    reeval_price_change_pct: float = Field(
+        default=3.0,
+        ge=0.0,
+        description="Absolute price move (%) from the last re-eval's price "
+                     "baseline that makes a position due for strategic "
+                     "re-eval immediately, independent of the interval "
+                     "timer (change-based trigger).",
     )
 
 
@@ -382,6 +428,13 @@ class PositionManager:
             trailing_stop_pct=trailing_stop_pct,
             highest_price=current_price or avg_price,
             lowest_price=current_price or avg_price,
+            # Strategic re-eval baseline starts at monitoring-start (P3) —
+            # NOT None — so a position that just began being monitored
+            # (fresh entry, or re-synced from the broker on restart) doesn't
+            # immediately count as "due" and fire a re-eval discussion on
+            # the very next 30s tick.
+            last_reeval_at=datetime.now(),
+            last_reeval_price=current_price or avg_price,
         )
 
         self._positions[ticker] = position
@@ -645,9 +698,99 @@ class PositionManager:
                 ))
                 position.events_triggered.append(PositionEventType.HOLDING_PERIOD_LONG.value)
 
+        # Strategic re-evaluation trigger (P3, 2026-07-15,
+        # docs/superpowers/plans/2026-07-15-position-mgmt-execution.md Task
+        # P3). Everything above is DEFENSIVE — it reacts to a threat that's
+        # already crystallizing. This is the proactive counterpart: only
+        # when NOTHING defensive fired this cycle do we check whether the
+        # position is due for a periodic/change-based strategic re-judgment
+        # (ADD/REDUCE/HOLD/SELL), so one tick never double-triggers both a
+        # defensive AND a strategic discussion (dedup — the defensive event
+        # takes priority; the throttle below still bounds cross-tick
+        # firing).
+        if not events:
+            reeval_event = self._check_strategic_reeval(position)
+            if reeval_event:
+                events.append(reeval_event)
+
         # Process events
         for event in events:
             await self._handle_event(event, position)
+
+    def _check_strategic_reeval(self, position: MonitoredPosition) -> Optional[PositionEvent]:
+        """Return a STRATEGIC_REEVAL event if `position` is due for a
+        proactive strategic re-evaluation, else None (P3).
+
+        Hybrid OR trigger: due once EITHER enough wall-clock time has
+        passed since the last re-eval (``reeval_interval_minutes``), OR the
+        price has moved far enough from the last re-eval's price baseline
+        (``reeval_price_change_pct``). Only ever called from
+        `_check_position` when no defensive event fired this cycle.
+
+        The returned event flows through the exact same
+        `_handle_event` -> `_should_trigger_discussion` -> `_trigger_discussion`
+        -> `_apply_decision` chain the defensive events already use, so the
+        resulting ADD/REDUCE/HOLD/SELL decision reaches the SAME real,
+        gated execution paths (P0/P1/P2) — this method only decides
+        WHETHER a re-eval discussion is due, never how it executes.
+
+        The time/price baseline is reset here, at detection time,
+        regardless of whether the downstream discussion throttle
+        (`_should_trigger_discussion`) ends up allowing an actual
+        discussion this cycle. Otherwise a throttled position would
+        re-detect "due" on every single 30s monitor tick until the throttle
+        window passes — spamming the event log/Telegram once per
+        `check_interval_seconds` instead of once per
+        `reeval_interval_minutes`/price-move, and burning the interval
+        immediately rather than preserving it for the next attempt.
+        """
+        now = datetime.now()
+
+        interval_due = (
+            position.last_reeval_at is None
+            or (now - position.last_reeval_at)
+            >= timedelta(minutes=self.config.reeval_interval_minutes)
+        )
+
+        price_change_pct = 0.0
+        price_due = False
+        if position.last_reeval_price:
+            price_change_pct = (
+                abs(position.current_price - position.last_reeval_price)
+                / position.last_reeval_price
+                * 100
+            )
+            price_due = price_change_pct >= self.config.reeval_price_change_pct
+
+        if not (interval_due or price_due):
+            return None
+
+        if price_due:
+            message = (
+                f"전략 재평가(가격변동): {price_change_pct:.1f}% 변동 "
+                f"(기준 ₩{position.last_reeval_price:,.0f} → "
+                f"현재 ₩{position.current_price:,.0f})"
+            )
+            trigger_value = price_change_pct
+        else:
+            elapsed_minutes = (
+                (now - position.last_reeval_at).total_seconds() / 60
+                if position.last_reeval_at is not None else 0.0
+            )
+            message = f"전략 재평가(주기): 마지막 재평가 이후 {elapsed_minutes:.0f}분 경과"
+            trigger_value = elapsed_minutes
+
+        # Reset baseline NOW (see docstring) — before the event even reaches
+        # _handle_event/the discussion throttle.
+        position.last_reeval_at = now
+        position.last_reeval_price = position.current_price
+
+        return self._create_event(
+            position,
+            PositionEventType.STRATEGIC_REEVAL,
+            trigger_value,
+            message,
+        )
 
     async def _check_trailing_stop(
         self,
@@ -1556,6 +1699,7 @@ class PositionManager:
                 PositionEventType.HOLDING_PERIOD_LONG: "📅",
                 PositionEventType.VOLATILITY_SPIKE: "⚡",
                 PositionEventType.NEWS_IMPACT: "📰",
+                PositionEventType.STRATEGIC_REEVAL: "🔄",
             }
 
             emoji = event_emoji.get(event.event_type, "📋")

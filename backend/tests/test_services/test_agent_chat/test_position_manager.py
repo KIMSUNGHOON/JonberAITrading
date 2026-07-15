@@ -2120,3 +2120,318 @@ class TestApplyDecisionAddP2:
         notifier.send_message.assert_awaited_once()
         msg = notifier.send_message.await_args.args[0]
         assert "005930" in msg
+
+
+# -------------------------------------------
+# Strategic Re-Evaluation Trigger (P3, 2026-07-15)
+# -------------------------------------------
+#
+# The 30s _check_position loop previously only reacted to DEFENSIVE events
+# (stop/take proximity, big P&L swings, long holding). It never proactively
+# re-judged a held position for ADD/REDUCE/HOLD/SELL. P3 adds a hybrid
+# INTERVAL + PRICE-CHANGE trigger (STRATEGIC_REEVAL) that fires
+# _check_position's SAME _handle_event -> _should_trigger_discussion ->
+# _trigger_discussion -> _apply_decision chain the defensive events already
+# use, so the resulting decision reaches the SAME real, gated execution
+# (P0/P1/P2) — no duplicated execution logic.
+#
+# Audit: docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md §C P3
+# Plan: docs/superpowers/plans/2026-07-15-position-mgmt-execution.md Task P3
+
+
+class TestStrategicReevalConfig:
+    """PositionManagerConfig gets two new, conservative-by-default fields."""
+
+    def test_defaults(self):
+        cfg = PositionManagerConfig()
+        assert cfg.reeval_interval_minutes == 60
+        assert cfg.reeval_price_change_pct == 3.0
+
+    def test_interval_minutes_rejects_non_positive(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            PositionManagerConfig(reeval_interval_minutes=0)
+
+    def test_price_change_pct_rejects_negative(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            PositionManagerConfig(reeval_price_change_pct=-1.0)
+
+
+class TestStrategicReevalTriggerP3:
+    """_check_position: STRATEGIC_REEVAL fires the SAME discussion path as
+    defensive events, but only when no defensive event fired this cycle."""
+
+    @staticmethod
+    def _position_manager(**config_overrides):
+        cfg = PositionManagerConfig(
+            check_interval_seconds=30,
+            stop_loss_warning_pct=2.0,
+            take_profit_warning_pct=2.0,
+            significant_gain_pct=10.0,
+            significant_loss_pct=5.0,
+            **config_overrides,
+        )
+        return PositionManager(config=cfg)
+
+    @staticmethod
+    def _fresh_no_defensive_position(pm, current_price=72500, avg_price=72500):
+        """A position with no stop/take-profit set and current_price ==
+        avg_price (0% P&L) — no defensive event of any kind can fire for
+        it, isolating the strategic-reeval branch."""
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=avg_price,
+            current_price=current_price,
+        )
+        return pm.get_position("005930")
+
+    # ---- 1. Interval-elapsed fires ----
+
+    @pytest.mark.asyncio
+    async def test_interval_elapsed_triggers_strategic_reeval(self):
+        """No defensive event, price baseline unchanged, but the configured
+        interval has elapsed since the last re-eval -> STRATEGIC_REEVAL
+        fires and _trigger_discussion is called (strategically, not from a
+        defensive event)."""
+        pm = self._position_manager(reeval_interval_minutes=60, reeval_price_change_pct=3.0)
+        position = self._fresh_no_defensive_position(pm)
+        # Backdate past the 60-minute interval; price baseline untouched
+        # (0% change) so ONLY the interval condition is due.
+        position.last_reeval_at = datetime.now() - timedelta(minutes=61)
+
+        pm._trigger_discussion = AsyncMock()
+
+        await pm._check_position(position)
+
+        pm._trigger_discussion.assert_awaited_once()
+        fired_event = pm._trigger_discussion.await_args.args[0]
+        assert fired_event.event_type == PositionEventType.STRATEGIC_REEVAL
+
+    # ---- 2. Price-change threshold crossed (no interval) fires ----
+
+    @pytest.mark.asyncio
+    async def test_price_change_triggers_strategic_reeval_without_interval(self):
+        """No interval elapsed, but the price has moved >= the configured
+        threshold since the last re-eval baseline -> STRATEGIC_REEVAL fires
+        purely on the price-change leg of the OR."""
+        pm = self._position_manager(reeval_interval_minutes=60, reeval_price_change_pct=3.0)
+        position = self._fresh_no_defensive_position(pm, current_price=72500, avg_price=72500)
+        # last_reeval_at is fresh (just seeded by add_position) -> interval
+        # NOT due. Move price +4% (> 3% threshold, < 5% trailing-activation,
+        # < 10% significant-gain) so no OTHER event branch fires either.
+        pm.update_position("005930", current_price=72500 * 1.04)
+
+        pm._trigger_discussion = AsyncMock()
+
+        await pm._check_position(position)
+
+        pm._trigger_discussion.assert_awaited_once()
+        fired_event = pm._trigger_discussion.await_args.args[0]
+        assert fired_event.event_type == PositionEventType.STRATEGIC_REEVAL
+
+    # ---- 3. Neither condition met -> no spurious firing ----
+
+    @pytest.mark.asyncio
+    async def test_neither_interval_nor_change_no_spurious_firing(self):
+        """Freshly-monitored position, checked immediately: neither the
+        interval nor the price-change condition is met -> no strategic
+        re-eval, no discussion, baseline untouched."""
+        pm = self._position_manager(reeval_interval_minutes=60, reeval_price_change_pct=3.0)
+        position = self._fresh_no_defensive_position(pm)
+        baseline_at = position.last_reeval_at
+        baseline_price = position.last_reeval_price
+
+        pm._trigger_discussion = AsyncMock()
+
+        await pm._check_position(position)
+
+        pm._trigger_discussion.assert_not_awaited()
+        assert position.last_reeval_at == baseline_at, "baseline must not reset without a fire"
+        assert position.last_reeval_price == baseline_price
+
+    # ---- 4. Throttle: min_discussion_interval_minutes blocks it ----
+
+    @pytest.mark.asyncio
+    async def test_min_discussion_interval_throttle_blocks_strategic_reeval(self):
+        """Due by interval, but a discussion for this position happened very
+        recently (within min_discussion_interval_minutes) -> the SAME
+        _should_trigger_discussion throttle defensive events use blocks the
+        strategic discussion too."""
+        pm = self._position_manager(
+            reeval_interval_minutes=60,
+            reeval_price_change_pct=3.0,
+            min_discussion_interval_minutes=30,
+        )
+        position = self._fresh_no_defensive_position(pm)
+        position.last_reeval_at = datetime.now() - timedelta(minutes=61)
+        position.last_discussion = datetime.now() - timedelta(minutes=5)  # within 30-min throttle
+
+        pm._trigger_discussion = AsyncMock()
+
+        await pm._check_position(position)
+
+        pm._trigger_discussion.assert_not_awaited()
+
+    # ---- 5. Throttle: max_discussions_per_position blocks it ----
+
+    @pytest.mark.asyncio
+    async def test_max_discussions_throttle_blocks_strategic_reeval(self):
+        """Due by interval, but this position already hit
+        max_discussions_per_position -> throttled, no discussion."""
+        pm = self._position_manager(
+            reeval_interval_minutes=60,
+            reeval_price_change_pct=3.0,
+            max_discussions_per_position=5,
+        )
+        position = self._fresh_no_defensive_position(pm)
+        position.last_reeval_at = datetime.now() - timedelta(minutes=61)
+        position.discussion_count = 5
+
+        pm._trigger_discussion = AsyncMock()
+
+        await pm._check_position(position)
+
+        pm._trigger_discussion.assert_not_awaited()
+
+    # ---- 6. last_reeval_at/price updates on fire; prevents immediate refire ----
+
+    @pytest.mark.asyncio
+    async def test_last_reeval_fields_update_on_fire_and_prevent_immediate_refire(self):
+        """Once a strategic re-eval fires, both baseline fields reset to
+        "now"/current price, so an immediate second check does NOT re-fire
+        even though nothing else changed."""
+        pm = self._position_manager(reeval_interval_minutes=60, reeval_price_change_pct=3.0)
+        position = self._fresh_no_defensive_position(pm, current_price=72500, avg_price=72500)
+        old_reeval_at = datetime.now() - timedelta(minutes=61)
+        position.last_reeval_at = old_reeval_at
+
+        pm._trigger_discussion = AsyncMock()
+
+        await pm._check_position(position)
+
+        pm._trigger_discussion.assert_awaited_once()
+        assert position.last_reeval_at > old_reeval_at, "baseline must reset to ~now on fire"
+        assert position.last_reeval_price == position.current_price
+
+        # Second check, same tick conditions: must NOT re-fire.
+        await pm._check_position(position)
+        pm._trigger_discussion.assert_awaited_once()  # still only the one call
+
+    # ---- 7. Defensive event present -> dedup, no double-trigger ----
+
+    @pytest.mark.asyncio
+    async def test_defensive_event_present_skips_strategic_check_same_tick(self):
+        """A defensive event (SIGNIFICANT_LOSS here) fires this cycle AND the
+        strategic-reeval interval is independently due -> only the
+        defensive discussion fires (exactly once), and the strategic
+        baseline is left untouched (the strategic branch never even ran)."""
+        pm = self._position_manager(reeval_interval_minutes=60, reeval_price_change_pct=3.0)
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=68000,  # ~6.2% loss -> SIGNIFICANT_LOSS (> 5% default)
+        )
+        position = pm.get_position("005930")
+        stale_reeval_at = datetime.now() - timedelta(minutes=61)
+        position.last_reeval_at = stale_reeval_at
+
+        pm._trigger_discussion = AsyncMock()
+
+        await pm._check_position(position)
+
+        pm._trigger_discussion.assert_awaited_once()
+        fired_event = pm._trigger_discussion.await_args.args[0]
+        assert fired_event.event_type == PositionEventType.SIGNIFICANT_LOSS, (
+            "the defensive event must win this tick, not STRATEGIC_REEVAL"
+        )
+        assert position.last_reeval_at == stale_reeval_at, (
+            "strategic branch must not even run (and thus not reset the "
+            "baseline) when a defensive event already fired this tick"
+        )
+
+    # ---- 8. End-to-end: strategic reeval decision flows to real _apply_decision ----
+
+    @pytest.mark.asyncio
+    async def test_strategic_reeval_decision_flows_to_apply_decision(self, monkeypatch):
+        """Full chain, no shortcuts: STRATEGIC_REEVAL -> _trigger_discussion
+        (real) -> a manual discussion whose session.decision is SELL ->
+        _apply_decision (real) -> the SAME gated close path defensive SELLs
+        already use. Proves P3 reuses the existing chain end-to-end rather
+        than duplicating execution."""
+        pm = self._position_manager(reeval_interval_minutes=60, reeval_price_change_pct=3.0)
+        position = self._fresh_no_defensive_position(pm)
+        position.last_reeval_at = datetime.now() - timedelta(minutes=61)
+
+        decision = SimpleNamespace(
+            action=DecisionAction.SELL,
+            quantity=None,
+            stop_loss=None,
+            take_profit=None,
+        )
+        session = SimpleNamespace(decision=decision)
+
+        fake_coordinator = MagicMock()
+        fake_coordinator.start_manual_discussion = AsyncMock(return_value=session)
+        pm.set_chat_coordinator(fake_coordinator)
+
+        closed = []
+        fake_trading_coord = MagicMock()
+
+        async def _close(ticker):
+            closed.append(ticker)
+
+        fake_trading_coord._close_position = _close
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_trading_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._check_position(position)
+
+        fake_coordinator.start_manual_discussion.assert_awaited_once()
+        call_kwargs = fake_coordinator.start_manual_discussion.await_args.kwargs
+        assert call_kwargs["ticker"] == "005930"
+        assert call_kwargs["wait"] is True
+        assert closed == ["005930"], "the SELL decision must reach the REAL gated close path"
+        assert pm.get_position("005930") is None
+
+    # ---- 9. Regression: existing defensive-event detection unaffected ----
+
+    @pytest.mark.asyncio
+    async def test_regression_stop_loss_hit_still_detected_with_reeval_present(self):
+        """A defensive STOP_LOSS_HIT must still fire exactly as before, even
+        though a strategic-reeval config is now active by default."""
+        pm = self._position_manager()
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=68000,  # Below stop-loss
+            stop_loss=68875,
+        )
+
+        events = []
+        pm.on_event(lambda e: events.append(e))
+
+        position = pm.get_position("005930")
+        await pm._check_position(position)
+
+        stop_loss_events = [e for e in events if e.event_type == PositionEventType.STOP_LOSS_HIT]
+        assert len(stop_loss_events) >= 1
+        strategic_events = [
+            e for e in events if e.event_type == PositionEventType.STRATEGIC_REEVAL
+        ]
+        assert strategic_events == [], "defensive event must suppress strategic reeval this tick"
