@@ -411,6 +411,98 @@ async def _capture_no_order(coord):
 
 
 # -------------------------------------------
+# P2 (2026-07-15) — percentage-of-holding add-to-position (`_add_to_position`)
+# -------------------------------------------
+#
+# Plan: docs/superpowers/plans/2026-07-15-position-mgmt-execution.md (Task P2)
+# Audit: docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md
+#
+# `PositionManager._execute_add_position` is the autonomous caller (gated by
+# check_autonomy(BUY) before it ever reaches here — see
+# test_position_manager.py::TestApplyDecisionAddP2). These tests pin the
+# coordinator-side contract in isolation: places a BUY for the SPECIFIED
+# quantity (opposite side of `_reduce_position`), merges it into the
+# existing tracked position via the SAME average-in math `_add_position`
+# already applies to a fresh entry BUY, and requires an existing position on
+# this coordinator's own ledger (mirrors `_reduce_position`'s
+# divergent-ledger contract).
+
+
+async def test_add_to_position_places_buy_for_specified_quantity(temp_storage):
+    """An add for 25 shares against a 100-share position places a BUY for
+    exactly 25, and the tracked quantity/avg_price are updated by the
+    ACTUAL fill via the existing average-in merge."""
+    coord = _coord_with_position(qty=100)  # avg_price=72_500 (see fixture)
+    coord._state.positions[0].current_price = 74_000
+    _stub_execute_order(coord, filled_quantity=25)
+
+    result = await coord._add_to_position("005930", 25)
+
+    assert result.filled_quantity == 25
+    assert len(coord._state.positions) == 1
+    merged = coord._state.positions[0]
+    assert merged.quantity == 125
+    expected_avg = (100 * 72_500 + 25 * 74_000) / 125
+    assert merged.avg_price == expected_avg
+    assert "005930" in coord.risk_monitor._watching, "merged position stays defended"
+    assert coord.risk_monitor._watching["005930"].quantity == 125
+
+
+async def test_add_to_position_partial_fill_merges_actual_amount(temp_storage):
+    """A BUY that only partially fills merges by the ACTUAL filled amount,
+    not the requested one — no phantom over-crediting."""
+    coord = _coord_with_position(qty=100)
+    coord._state.positions[0].current_price = 74_000
+    _stub_execute_order(coord, filled_quantity=10)
+
+    result = await coord._add_to_position("005930", 25)
+
+    assert result.filled_quantity == 10
+    merged = coord._state.positions[0]
+    assert merged.quantity == 110
+    expected_avg = (100 * 72_500 + 10 * 74_000) / 110
+    assert merged.avg_price == expected_avg
+
+
+async def test_add_to_position_unfilled_retains_original_quantity(temp_storage):
+    """A BUY that does not fill at all must leave the tracked position
+    unchanged (no phantom quantity/avg_price mutation)."""
+    coord = _coord_with_position(qty=100)
+    _stub_execute_order(coord, filled_quantity=0, status="rejected")
+
+    result = await coord._add_to_position("005930", 25)
+
+    assert result.filled_quantity == 0
+    assert len(coord._state.positions) == 1
+    assert coord._state.positions[0].quantity == 100
+    assert coord._state.positions[0].avg_price == 72_500
+
+
+async def test_add_to_position_no_position_returns_none(temp_storage):
+    """An add for a ticker the coordinator does not track returns None
+    without placing any order — the caller (PositionManager) treats this as
+    a divergent/desynced ledger and leaves its own quantity untouched."""
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    captured = await _capture_no_order(coord)
+
+    result = await coord._add_to_position("005930", 25)
+
+    assert result is None
+    assert captured == []
+
+
+async def test_add_to_position_non_positive_quantity_returns_none(temp_storage):
+    """An add request for zero (or negative) shares places no order."""
+    coord = _coord_with_position(qty=100)
+    captured = await _capture_no_order(coord)
+
+    result = await coord._add_to_position("005930", 0)
+
+    assert result is None
+    assert captured == []
+
+
+# -------------------------------------------
 # A3 — fill confirmation via ka10076 (no "accept == full fill")
 # -------------------------------------------
 

@@ -219,6 +219,23 @@ class PositionManagerConfig(BaseModel):
     auto_execute_take_profit: bool = False
     auto_update_trailing: bool = True
 
+    # ADD (increase) sizing policy (P2, 2026-07-15,
+    # docs/superpowers/plans/2026-07-15-position-mgmt-execution.md). An
+    # autonomous decision to ADD to an already-held position sizes the buy
+    # as a percentage of the CURRENTLY held quantity —
+    # round(held_quantity * add_position_pct) — rather than trusting a
+    # free-text quantity from the discussion. Conservative default: at most
+    # a quarter of the current holding per ADD decision (mirrors the
+    # conservatism of max_single_position_pct=0.15 and the 8% default
+    # stop/take distances in services.trading.models.RiskParameters).
+    add_position_pct: float = Field(
+        default=0.25,
+        ge=0.0, le=1.0,
+        description="Fraction of the currently held quantity to buy on an "
+                     "autonomous ADD decision (e.g. 0.25 = add 25% of "
+                     "current holding). 0 disables autonomous ADD sizing.",
+    )
+
 
 # -------------------------------------------
 # Position Manager
@@ -385,12 +402,18 @@ class PositionManager:
         self,
         ticker: str,
         quantity: Optional[int] = None,
+        avg_price: Optional[float] = None,
         current_price: Optional[float] = None,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
     ) -> Optional[MonitoredPosition]:
-        """Update a monitored position."""
+        """Update a monitored position.
+
+        ``avg_price`` (P2, 2026-07-15): distinct from ``current_price`` — the
+        cost basis, only ever recomputed by an ADD's weighted-average merge
+        (`_execute_add_position`). No other caller passes it.
+        """
         if ticker not in self._positions:
             return None
 
@@ -398,6 +421,9 @@ class PositionManager:
 
         if quantity is not None:
             position.quantity = quantity
+
+        if avg_price is not None:
+            position.avg_price = avg_price
 
         if current_price is not None:
             position.current_price = current_price
@@ -1116,25 +1142,169 @@ class PositionManager:
                 error=str(e),
             )
 
-    async def _notify_add_not_executed(self, position: MonitoredPosition) -> None:
+    async def _notify_add_not_executed(
+        self, position: MonitoredPosition, computed_quantity: int
+    ) -> None:
         """Best-effort Telegram notice when a discussion decided ADD
-        (increase position) but no ADD/buy execution path exists yet (P0,
-        2026-07-15) — previously this decision was silently swallowed into
-        the HOLD branch (stop/take adjustment only, no notice), so the human
-        had no way to learn the agents wanted to add to the position."""
+        (increase position) but the sizing policy
+        (``add_position_pct`` × held quantity) computes to zero or less —
+        e.g. a very small existing holding (P2, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+        Superseded P0's "no execution path exists" notice now that ADD has
+        real execution — this is the sizing-clamps-to-zero case, distinct
+        from `_notify_add_gate_denied` (a real, executable request blocked
+        by the autonomy gate, not a sizing problem)."""
         try:
             from services.telegram import get_telegram_notifier
 
             notifier = await get_telegram_notifier()
             if notifier.is_ready:
                 await notifier.send_message(
-                    f"⏸ 추가매수 미실행 — 보류 ({position.ticker}): "
-                    f"에이전트가 추가매수(ADD)를 결정했으나 자동 추가매수 실행 경로가 "
-                    f"아직 없어 미실행되었습니다."
+                    f"⏸ 추가매수 미실행 ({position.ticker}): "
+                    f"에이전트가 추가매수(ADD)를 결정했으나 사이징 결과 매수 수량이 "
+                    f"{computed_quantity}주로 계산되어(보유 {position.quantity}주 기준) "
+                    f"미실행되었습니다."
                 )
         except Exception as e:
             logger.warning(
                 "add_not_executed_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_add_gate_denied(
+        self, position: MonitoredPosition, add_quantity: int, gate_reason: str
+    ) -> None:
+        """Best-effort Telegram notice when the autonomy gate blocks an
+        autonomous ADD (percentage-of-holding BUY) — mirrors
+        `_notify_reduce_gate_denied` for the exposure-increasing side (P2,
+        2026-07-15). The human must know the add did NOT execute and the
+        position quantity is unchanged."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚫 자율 추가매수 게이트 거부 ({position.ticker}, "
+                    f"{add_quantity}주): {gate_reason}. "
+                    f"보유 수량 {position.quantity}주 그대로 유지됩니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "add_gate_denied_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _execute_add_position(
+        self,
+        position: MonitoredPosition,
+        add_quantity: int,
+        reason: str,
+    ) -> None:
+        """Execute a percentage-of-holding ADD (increase) via the trading
+        coordinator (P2, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+
+        Replaces P0's "추가매수 미실행 — 보류" notify-only stand-in with real
+        execution: an ADD decision now places an ACTUAL BUY order for
+        ``add_quantity`` — computed by the caller as
+        ``round(held_quantity * add_position_pct)``, a percentage of the
+        CURRENTLY held quantity, NOT the discussion's own free-text quantity
+        — through the SAME autonomy gate (`check_autonomy`) the full-close /
+        partial-reduce SELL paths already enforce: master gate, market mode,
+        paper-only, daily-loss breaker, max-open-positions, and — because
+        this is a BUY/ADD — the per-trade notional cap. Identical safety
+        level to the entry BUY path (`on_trade_approved`).
+
+        On any real fill, the monitored quantity is incremented by the
+        ACTUAL filled amount (never the requested one) and avg_entry_price
+        is recomputed as the cost-weighted average of the old holding and
+        the new fill — the same average-in math
+        `ExecutionCoordinator._add_position` already applies on its own
+        (separate) ledger for an entry BUY.
+        """
+        try:
+            if add_quantity <= 0:
+                logger.warning(
+                    "add_quantity_non_positive",
+                    ticker=position.ticker,
+                    add_quantity=add_quantity,
+                )
+                await self._notify_add_not_executed(position, add_quantity)
+                return
+
+            from services.autonomy import check_autonomy
+
+            gate = await check_autonomy(
+                "kiwoom",
+                action="BUY",
+                quantity=add_quantity,
+                entry_price=position.current_price,
+            )
+            if not gate.allowed:
+                logger.warning(
+                    "add_gate_denied",
+                    ticker=position.ticker,
+                    reason=reason,
+                    check=gate.check,
+                    gate_reason=gate.reason,
+                )
+                await self._notify_add_gate_denied(
+                    position, add_quantity, gate.reason
+                )
+                return
+
+            from app.dependencies import get_trading_coordinator
+
+            trading_coord = await get_trading_coordinator()
+            result = await trading_coord._add_to_position(
+                position.ticker, add_quantity
+            )
+
+            if result is None:
+                # Coordinator had no matching position (a divergent/desynced
+                # ledger) — nothing was placed. Leave this manager's
+                # quantity/avg untouched rather than guess at what happened
+                # (mirrors _execute_reduce_position's same-shaped guard).
+                logger.warning(
+                    "add_no_coordinator_position",
+                    ticker=position.ticker,
+                )
+                return
+
+            filled = result.filled_quantity
+            if filled <= 0:
+                logger.warning(
+                    "add_unfilled",
+                    ticker=position.ticker,
+                    requested_quantity=add_quantity,
+                )
+                return
+
+            old_quantity = position.quantity
+            old_avg_price = position.avg_price
+            new_quantity = old_quantity + filled
+            new_avg_price = (
+                (old_quantity * old_avg_price) + (filled * result.avg_price)
+            ) / new_quantity
+
+            self.update_position(
+                position.ticker, quantity=new_quantity, avg_price=new_avg_price
+            )
+
+            logger.info(
+                "position_added_to",
+                ticker=position.ticker,
+                filled=filled,
+                new_quantity=new_quantity,
+                new_avg_price=new_avg_price,
+            )
+
+        except Exception as e:
+            logger.error(
+                "execute_add_position_failed",
                 ticker=position.ticker,
                 error=str(e),
             )
@@ -1158,9 +1328,14 @@ class PositionManager:
         The full-close REDUCE path (new_quantity <= 0 -> _execute_close_position)
         and plain SELL are real execution and remain unaffected.
 
-        - ADD still has no execution path (P2, not yet implemented). It
-          falls into the same branch as HOLD (stop/take adjustment only)
-          with an explicit not-executed notice, as P0 left it.
+        P2 (2026-07-15, Task P2): ADD now also has a real execution path
+        (`_execute_add_position`) — the buy quantity is sized as a
+        configurable percentage of the CURRENTLY held quantity
+        (``round(position.quantity * config.add_position_pct)``), then
+        placed through the SAME autonomy gate (`check_autonomy(BUY)`) the
+        SELL paths already enforce, with the same identical safety level as
+        the entry BUY path. A sizing result of zero or less keeps P0's
+        not-executed notice (no buy execution attempted, no gate call).
         """
         from services.agent_chat.models import DecisionAction
 
@@ -1192,14 +1367,16 @@ class PositionManager:
 
             elif decision.action in (DecisionAction.HOLD, DecisionAction.ADD):
                 if decision.action == DecisionAction.ADD:
-                    # No buy-execution path exists yet (P2, not yet
-                    # implemented). Previously ADD fell into this same branch
-                    # as HOLD with no distinction at all — the "we should add"
-                    # decision was silently demoted to a no-op HOLD. Surface
-                    # it explicitly; the stop/take adjustment below still
-                    # applies same as for HOLD.
-                    logger.warning("add_not_executed", ticker=position.ticker)
-                    await self._notify_add_not_executed(position)
+                    # P2 (2026-07-15): ADD now has a real execution path — a
+                    # BUY sized as a percentage of the CURRENTLY held
+                    # quantity (config.add_position_pct), gated the SAME way
+                    # the SELL paths already are (check_autonomy). The
+                    # stop/take adjustment below still applies same as for
+                    # HOLD regardless of the add's own outcome.
+                    add_qty = round(position.quantity * self.config.add_position_pct)
+                    await self._execute_add_position(
+                        position, add_qty, "agent_decision_add"
+                    )
 
                 # Update stops if provided — after sanity validation (P0-2a).
                 new_stop = decision.stop_loss or None

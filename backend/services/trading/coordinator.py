@@ -1498,6 +1498,83 @@ class ExecutionCoordinator:
         self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
         return result
 
+    async def _add_to_position(self, ticker: str, quantity: int) -> Optional[OrderResult]:
+        """Place a BUY order for a SPECIFIC quantity to increase an existing
+        position — the opposite side of `_reduce_position` (P2, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+
+        `PositionManager._execute_add_position` is the (only) autonomous
+        caller today: it already passes the request through
+        `check_autonomy(BUY)` — the SAME gate (master gate, market mode,
+        paper-only, daily-loss breaker, max-open-positions, per-trade
+        notional cap) the entry BUY path (`on_trade_approved`) enforces —
+        before reaching here.
+
+        Requires a matching position on THIS coordinator's OWN ledger
+        (`_state.positions`). The caller (PositionManager) works off a
+        SEPARATE ledger (`MonitoredPosition`) that can diverge from this
+        one — mirrors `_reduce_position`'s conservative contract: rather
+        than blindly opening an untracked position with unknown stop
+        levels, a divergent/desynced ledger is a no-op here (logged), same
+        as a reduce against a ticker this coordinator doesn't track.
+
+        On any real fill, reuses `_add_position`'s existing "average in"
+        merge (quantity summed, avg_price recomputed as the cost-weighted
+        average) — the exact same code path an entry BUY's
+        `on_trade_approved` already exercises, so this doesn't duplicate
+        that arithmetic.
+
+        Returns the OrderResult of the placed order (or None if there's no
+        matching position to add to, or the requested quantity is
+        non-positive), so the caller can react to the ACTUAL filled
+        quantity — never the requested one.
+        """
+        position = next(
+            (p for p in self._state.positions if p.ticker == ticker), None
+        )
+        if not position:
+            logger.warning(f"[Coordinator] Position {ticker} not found for add")
+            return None
+
+        if quantity <= 0:
+            logger.warning(
+                f"[Coordinator] Add for {ticker} requested non-positive "
+                f"quantity ({quantity})"
+            )
+            return None
+
+        order = OrderRequest(
+            ticker=ticker,
+            stock_name=position.stock_name,
+            side=OrderSide.BUY,
+            quantity=quantity,
+            price=position.current_price,
+            reason="Autonomous add-to-position",
+        )
+
+        result = await self._execute_order(order)
+        if result.filled_quantity > 0:
+            # Reuse the SAME average-in merge an entry BUY's
+            # on_trade_approved already exercises via _add_position — sums
+            # quantity, recomputes avg_price as the cost-weighted average
+            # against whatever this coordinator's ledger already tracked.
+            self._add_position(
+                ManagedPosition(
+                    ticker=ticker,
+                    stock_name=position.stock_name,
+                    quantity=result.filled_quantity,
+                    avg_price=result.avg_price,
+                    current_price=result.avg_price,
+                    stop_loss=position.stop_loss,
+                    take_profit=position.take_profit,
+                    stop_loss_mode=position.stop_loss_mode,
+                    status=PositionStatus.FILLED,
+                    risk_score=position.risk_score,
+                )
+            )
+
+        return result
+
     # -------------------------------------------
     # State Access
     # -------------------------------------------

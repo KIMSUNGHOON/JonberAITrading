@@ -1341,12 +1341,15 @@ def _honesty_decision(action, quantity=None, stop_loss=None, take_profit=None):
 
 
 class TestApplyDecisionHonestyP0:
-    """P0: ADD must not be silently demoted to HOLD.
+    """P0: no silent quantity mutation / demotion to a no-op.
 
     (Partial REDUCE's P0 "must not desync the shadow ledger / notify only"
     behavior was superseded by P1's real execution path — see
-    TestApplyDecisionReducePartialP1 below. ADD still has no execution path
-    (P2) and keeps the P0 not-executed-notice behavior pinned here.)"""
+    TestApplyDecisionReducePartialP1 below. ADD's P0 "no execution path"
+    behavior was likewise superseded by P2's real execution path — see
+    TestApplyDecisionAddP2 below, including the sizing-computes-to-zero
+    not-executed notice that replaces this class's old "no execution path"
+    one.)"""
 
     @staticmethod
     def _position(config, quantity=100, current_price=72500):
@@ -1366,47 +1369,6 @@ class TestApplyDecisionHonestyP0:
         notifier.is_ready = True
         notifier.send_message = AsyncMock()
         return notifier
-
-    @pytest.mark.asyncio
-    async def test_add_decision_notifies_not_executed(self, config):
-        """ADD must not be silently swallowed into HOLD — it must emit an
-        explicit not-executed notice, and must not touch quantity (no buy
-        execution path exists yet)."""
-        pm, pos = self._position(config, quantity=100)
-        notifier = self._notifier()
-
-        with patch(
-            "services.telegram.get_telegram_notifier",
-            AsyncMock(return_value=notifier),
-        ):
-            await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
-
-        assert pos.quantity == 100, "ADD has no buy execution path yet"
-        notifier.send_message.assert_awaited_once()
-        msg = notifier.send_message.await_args.args[0]
-        assert "추가매수" in msg
-        assert "005930" in msg
-
-    @pytest.mark.asyncio
-    async def test_add_decision_still_applies_sane_stop_adjustment(self, config):
-        """The not-executed notice for ADD must not swallow the stop/take
-        adjustment behavior it shares with the HOLD branch."""
-        pm, pos = self._position(config, quantity=100, current_price=72500)
-        notifier = self._notifier()
-
-        with patch(
-            "services.telegram.get_telegram_notifier",
-            AsyncMock(return_value=notifier),
-        ):
-            await pm._apply_decision(
-                pos,
-                _honesty_decision(
-                    DecisionAction.ADD, stop_loss=70000, take_profit=80000
-                ),
-            )
-
-        assert pos.stop_loss == 70000
-        assert pos.take_profit == 80000
 
     # ---- Regression: real execution paths must be unaffected ----
 
@@ -1479,7 +1441,7 @@ class TestApplyDecisionHonestyP0:
 # Audit: docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md
 # Plan: docs/superpowers/plans/2026-07-15-position-mgmt-execution.md (Task P1)
 
-from services.trading.models import OrderResult, OrderSide
+from services.trading.models import OrderResult, OrderSide, RiskParameters
 
 
 def _order_result(filled_quantity: int, requested_quantity: int = None) -> OrderResult:
@@ -1716,6 +1678,376 @@ class TestApplyDecisionReducePartialP1:
 
         assert gate_called == [], "a zero-clamp request must short-circuit before the gate"
         fake_coord._reduce_position.assert_not_awaited()
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "005930" in msg
+
+
+# -------------------------------------------
+# ADD Real Execution + Percentage-of-Holding Sizing (P2, 2026-07-15)
+# -------------------------------------------
+#
+# P2 replaces P0's notify-only "추가매수 미실행 — 보류" stand-in with a real,
+# quantity-specified BUY through `ExecutionCoordinator._add_to_position`,
+# gated the same way the REDUCE/SELL paths are gated: check_autonomy(BUY).
+# The buy quantity is sized as a configurable percentage of the CURRENTLY
+# held quantity (add_position_pct), not any free-text quantity the
+# discussion itself proposed.
+#
+# Audit: docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md
+# Plan: docs/superpowers/plans/2026-07-15-position-mgmt-execution.md (Task P2)
+
+
+def _buy_order_result(filled_quantity: int, avg_price: float = 74_000) -> OrderResult:
+    return OrderResult(
+        order_id="o-add-1",
+        ticker="005930",
+        side=OrderSide.BUY,
+        requested_quantity=filled_quantity,
+        filled_quantity=filled_quantity,
+        avg_price=avg_price,
+        status="filled" if filled_quantity > 0 else "rejected",
+    )
+
+
+class TestApplyDecisionAddP2:
+    """ADD now places a real, percentage-of-holding BUY order via the SAME
+    autonomy gate the SELL/REDUCE paths use, and updates the monitored
+    quantity/avg_price by the ACTUAL fill (weighted-average merge)."""
+
+    @staticmethod
+    def _position(config, quantity=100, current_price=72500):
+        pm = PositionManager(config=config)
+        pos = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=quantity,
+            avg_price=72500,
+            current_price=current_price,
+        )
+        return pm, pos
+
+    @staticmethod
+    def _notifier():
+        notifier = MagicMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock()
+        return notifier
+
+    @pytest.mark.asyncio
+    async def test_add_gate_allowed_places_buy_sized_as_pct_of_held_and_merges_avg(
+        self, config, monkeypatch
+    ):
+        """Happy path: 100 held, default add_position_pct=0.25 → a BUY for
+        25 is placed via check_autonomy(BUY), and the monitored
+        quantity/avg_price merge to the weighted average of the ACTUAL
+        fill."""
+        pm, pos = self._position(config, quantity=100, current_price=72500)
+
+        add_calls = []
+        fake_coord = MagicMock()
+
+        async def _add(ticker, quantity):
+            add_calls.append((ticker, quantity))
+            return _buy_order_result(filled_quantity=quantity, avg_price=74_000)
+
+        fake_coord._add_to_position = _add
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        gate_calls = []
+
+        async def allow_gate(market, **kwargs):
+            gate_calls.append(kwargs)
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        assert add_calls == [("005930", 25)], (
+            "must place a BUY for round(held * add_position_pct) = "
+            "round(100 * 0.25) = 25"
+        )
+        assert gate_calls and gate_calls[0]["action"] == "BUY"
+        assert gate_calls[0]["quantity"] == 25
+        assert gate_calls[0]["entry_price"] == 72500
+
+        merged = pm.get_position("005930")
+        assert merged.quantity == 125, "monitored quantity must increment by the ACTUAL fill"
+        expected_avg = (100 * 72500 + 25 * 74_000) / 125
+        assert merged.avg_price == expected_avg, "avg_entry_price must be the cost-weighted average"
+
+    @pytest.mark.asyncio
+    async def test_add_position_pct_is_configurable(self, monkeypatch):
+        """A custom add_position_pct changes the sized quantity — proves the
+        sizing policy is a config field, not a hardcoded constant."""
+        custom_config = PositionManagerConfig(add_position_pct=0.5)
+        pm, pos = self._position(custom_config, quantity=100, current_price=72500)
+
+        add_calls = []
+        fake_coord = MagicMock()
+
+        async def _add(ticker, quantity):
+            add_calls.append((ticker, quantity))
+            return _buy_order_result(filled_quantity=quantity)
+
+        fake_coord._add_to_position = _add
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        assert add_calls == [("005930", 50)], "0.5 * 100 held = 50"
+
+    @pytest.mark.asyncio
+    async def test_add_qty_rounds_correctly(self, monkeypatch):
+        """round(held * add_position_pct) must round, not truncate/floor."""
+        custom_config = PositionManagerConfig(add_position_pct=0.25)
+        pm, pos = self._position(custom_config, quantity=33, current_price=72500)
+
+        add_calls = []
+        fake_coord = MagicMock()
+
+        async def _add(ticker, quantity):
+            add_calls.append((ticker, quantity))
+            return _buy_order_result(filled_quantity=quantity)
+
+        fake_coord._add_to_position = _add
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        assert add_calls == [("005930", round(33 * 0.25))]
+        assert add_calls[0][1] == 8
+
+    @pytest.mark.asyncio
+    async def test_add_zero_computed_quantity_notifies_not_executed(self, config):
+        """A sizing result of zero (e.g. a very small existing holding)
+        keeps the not-executed notice and never calls the gate/coordinator
+        at all — distinct from a gate denial."""
+        pm, pos = self._position(config, quantity=1, current_price=72500)
+        # round(1 * 0.25) == 0
+        notifier = self._notifier()
+
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        assert pos.quantity == 1, "sizing-clamped-to-zero must not touch quantity"
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "추가매수" in msg
+        assert "005930" in msg
+
+    @pytest.mark.asyncio
+    async def test_add_gate_denied_leaves_quantity_unchanged(self, config, monkeypatch):
+        """check_autonomy(BUY) denied → no order placed, position quantity
+        unchanged, human notified."""
+        pm, pos = self._position(config, quantity=100, current_price=72500)
+
+        add_calls = []
+        fake_coord = MagicMock()
+
+        async def _add(ticker, quantity):
+            add_calls.append((ticker, quantity))
+            return _buy_order_result(filled_quantity=quantity)
+
+        fake_coord._add_to_position = _add
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def deny_gate(market, **kwargs):
+            return GateDecision(
+                allowed=False, reason="trading_mode:kiwoom is 'hitl'", check="market_mode"
+            )
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        assert add_calls == [], "gate-denied add must not place an order"
+        assert pm.get_position("005930").quantity == 100
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "005930" in msg
+        assert "hitl" in msg
+
+    @pytest.mark.asyncio
+    async def test_add_unfilled_leaves_quantity_unchanged(self, config, monkeypatch):
+        """A gate-allowed add whose order does not fill at all must leave the
+        monitored quantity/avg_price untouched (no phantom merge)."""
+        pm, pos = self._position(config, quantity=100, current_price=72500)
+
+        fake_coord = MagicMock()
+
+        async def _add(ticker, quantity):
+            return _buy_order_result(filled_quantity=0)
+
+        fake_coord._add_to_position = _add
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        assert pm.get_position("005930").quantity == 100
+        assert pm.get_position("005930").avg_price == 72500
+
+    @pytest.mark.asyncio
+    async def test_add_no_coordinator_position_leaves_quantity_unchanged(
+        self, config, monkeypatch
+    ):
+        """The coordinator's own ledger has no matching position (a
+        divergent/desynced ledger) — nothing was placed, so this manager's
+        quantity/avg_price must stay untouched rather than guess."""
+        pm, pos = self._position(config, quantity=100, current_price=72500)
+
+        fake_coord = MagicMock()
+        fake_coord._add_to_position = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        assert pm.get_position("005930").quantity == 100
+
+    @pytest.mark.asyncio
+    async def test_add_decision_still_applies_sane_stop_adjustment(self, config, monkeypatch):
+        """The ADD execution attempt must not swallow the stop/take
+        adjustment behavior it shares with the HOLD branch."""
+        pm, pos = self._position(config, quantity=100, current_price=72500)
+
+        fake_coord = MagicMock()
+
+        async def _add(ticker, quantity):
+            return _buy_order_result(filled_quantity=quantity)
+
+        fake_coord._add_to_position = _add
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(
+            pos,
+            _honesty_decision(
+                DecisionAction.ADD, stop_loss=70000, take_profit=80000
+            ),
+        )
+
+        assert pos.stop_loss == 70000
+        assert pos.take_profit == 80000
+
+    @pytest.mark.asyncio
+    async def test_add_notional_cap_denies_oversized_add(self, config, monkeypatch):
+        """The REAL autonomy gate's per-trade notional cap — the same one
+        the entry BUY path enforces — denies an ADD whose notional exceeds
+        it. Proves identical safety level to entry, not just that SOME gate
+        function gets called."""
+        from app.config import settings as app_settings
+        from services.autonomy.gate import check_autonomy as real_check_autonomy
+
+        pm, pos = self._position(config, quantity=100, current_price=72500)
+        # add_qty = round(100 * 0.25) = 25; notional = 25 * 72500 = 1,812,500
+
+        monkeypatch.setattr(app_settings, "AUTONOMY_ENABLED", True)
+
+        tiny_cap_params = RiskParameters(max_trade_notional_krw=10_000)
+
+        async def permissive_mode(market):
+            return "autonomous"
+
+        async def permissive_paper(market):
+            return True
+
+        async def permissive_loss(market):
+            return 0.0
+
+        async def permissive_positions(market):
+            return 0
+
+        async def permissive_coordinator_active(market):
+            return True
+
+        async def gate_with_tiny_notional_cap(market, **kwargs):
+            return await real_check_autonomy(
+                market,
+                action=kwargs["action"],
+                quantity=kwargs["quantity"],
+                entry_price=kwargs["entry_price"],
+                mode_provider=permissive_mode,
+                paper_provider=permissive_paper,
+                daily_loss_provider=permissive_loss,
+                positions_count_provider=permissive_positions,
+                risk_params_provider=lambda: tiny_cap_params,
+                coordinator_active_provider=permissive_coordinator_active,
+            )
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", gate_with_tiny_notional_cap)
+
+        fake_coord = MagicMock()
+        fake_coord._add_to_position = AsyncMock()
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        fake_coord._add_to_position.assert_not_awaited()
+        assert pm.get_position("005930").quantity == 100, (
+            "a cap-exceeding ADD must not execute"
+        )
         notifier.send_message.assert_awaited_once()
         msg = notifier.send_message.await_args.args[0]
         assert "005930" in msg
