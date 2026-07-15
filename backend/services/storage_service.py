@@ -182,6 +182,30 @@ class StorageService:
                     )
                 """)
 
+                # Daily performance snapshot table (Phase1 Task 5/C3b): equity/
+                # realized-P&L/win-rate were only ever recomputed live from
+                # ka10074+kt00004, which have a rolling broker query window —
+                # a durable end-of-day row per trade_date survives past that
+                # window. trade_date is the PK so a snapshot exists at most
+                # once per day; the writer uses INSERT OR IGNORE so a second
+                # write on the same day is a no-op rather than clobbering the
+                # first (see save_daily_perf_snapshot below).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS daily_perf_snapshot (
+                        trade_date TEXT PRIMARY KEY,
+                        equity REAL,
+                        realized_pnl REAL,
+                        commission REAL,
+                        tax REAL,
+                        net_pnl REAL,
+                        win_trades INTEGER,
+                        loss_trades INTEGER,
+                        cumulative_return_pct REAL,
+                        regime_snapshot_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # App settings table (generic key-value; e.g. trading_mode:kiwoom)
                 # — runtime settings that must survive restarts (R3).
                 await conn.execute("""
@@ -1229,6 +1253,88 @@ class StorageService:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error("kr_realized_pnl_get_failed", error=str(e))
+            return []
+
+    # -------------------------------------------
+    # Daily Performance Snapshot (Phase1 Task 5/C3b)
+    # -------------------------------------------
+
+    async def save_daily_perf_snapshot(self, record: dict[str, Any]) -> bool:
+        """
+        Persist one end-of-day performance snapshot row.
+
+        Uses INSERT OR IGNORE against the trade_date PRIMARY KEY: a second
+        write for a trade_date that already has a row is a silent no-op
+        rather than an overwrite or an error — durable "at most once per
+        day" semantics without needing a separate existence check.
+
+        Args:
+            record: dict with keys trade_date, equity, realized_pnl,
+                commission, tax, net_pnl, win_trades, loss_trades,
+                cumulative_return_pct, and optionally regime_snapshot_id.
+
+        Returns:
+            True if the statement executed successfully (including when the
+            row already existed and the insert was ignored).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR IGNORE INTO daily_perf_snapshot
+                    (trade_date, equity, realized_pnl, commission, tax,
+                     net_pnl, win_trades, loss_trades, cumulative_return_pct,
+                     regime_snapshot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["trade_date"],
+                        record.get("equity"),
+                        record.get("realized_pnl"),
+                        record.get("commission"),
+                        record.get("tax"),
+                        record.get("net_pnl"),
+                        record.get("win_trades"),
+                        record.get("loss_trades"),
+                        record.get("cumulative_return_pct"),
+                        record.get("regime_snapshot_id"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "daily_perf_snapshot_saved",
+                    trade_date=record.get("trade_date"),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "daily_perf_snapshot_save_failed",
+                trade_date=record.get("trade_date"),
+                error=str(e),
+            )
+            return False
+
+    async def get_daily_perf_snapshots(self, limit: int = 60) -> list[dict[str, Any]]:
+        """Get daily performance snapshots, newest first by trade_date."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM daily_perf_snapshot
+                    ORDER BY trade_date DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("daily_perf_snapshots_get_failed", error=str(e))
             return []
 
     # -------------------------------------------

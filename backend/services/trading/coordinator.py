@@ -45,6 +45,8 @@ from .position_registration import register_fill_as_position
 from .reconciler import reconcile
 from .trade_log import record_trade_fill, record_kr_realized_pnl
 from .cadence import compute_watch_ttl
+from .eod_snapshot import write_daily_snapshot
+from services.storage_service import get_storage_service
 
 logger = logging.getLogger(__name__)
 
@@ -2004,6 +2006,10 @@ class ExecutionCoordinator:
     async def _check_queue_on_market_open(self) -> None:
         """One scheduler tick: process the queue on a KRX closed→open transition,
         and expire tracked orders on the inverse open→closed transition (F3).
+        The open→closed edge ALSO writes the day's durable EOD performance
+        snapshot (Phase1 Task 5/C3b — see .eod_snapshot.write_daily_snapshot),
+        after the fill poll/expiry so it reflects the final post-close ka10076
+        fills.
 
         start() already drains the queue if the market is open at start time; this
         covers the case where the system is started (or a trade is queued) while
@@ -2027,6 +2033,7 @@ class ExecutionCoordinator:
             # first would drop a fill that landed on this very edge.
             await self._poll_tracked_fills()
             await self._expire_tracked_orders_on_market_close()
+            await write_daily_snapshot(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # T5c: 마감 1회
         self._market_was_open = is_open
 
     async def _expire_tracked_orders_on_market_close(self) -> None:
