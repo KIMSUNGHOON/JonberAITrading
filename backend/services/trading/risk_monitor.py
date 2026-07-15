@@ -589,11 +589,33 @@ class RiskMonitor:
             logger.error(f"[RiskMonitor] Take-profit execution failed: {e}")
 
     async def _add_alert(self, alert: TradingAlert):
-        """Add and send alert."""
+        """Add and send alert.
+
+        Dedup by (ticker, alert_type): `_pending_alerts` previously grew
+        unboundedly for the process lifetime because every `action_required`
+        alert was appended unconditionally on each 1s monitor tick and
+        resolved alerts were never removed (live `pending_alerts_count` was
+        observed at 1542). If an UNRESOLVED pending alert already exists for
+        the same (ticker, alert_type), replace it in place instead of
+        appending a duplicate — at most one such alert stays pending per key.
+        A different alert_type for the same ticker is tracked separately,
+        and once the prior alert for a key is resolved a fresh one may be
+        added again. `self._alerts` (full history) is unaffected — every
+        call is still appended there.
+        """
         self._alerts.append(alert)
 
         if alert.action_required:
-            self._pending_alerts.append(alert)
+            for idx, existing in enumerate(self._pending_alerts):
+                if (
+                    not existing.resolved
+                    and existing.ticker == alert.ticker
+                    and existing.alert_type == alert.alert_type
+                ):
+                    self._pending_alerts[idx] = alert
+                    break
+            else:
+                self._pending_alerts.append(alert)
 
         if self._send_alert:
             try:
