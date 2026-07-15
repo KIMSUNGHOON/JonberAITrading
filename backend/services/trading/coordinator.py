@@ -46,6 +46,7 @@ from .reconciler import reconcile
 from .trade_log import record_trade_fill, record_kr_realized_pnl
 from .cadence import compute_watch_ttl
 from .eod_snapshot import write_daily_snapshot
+from .eod_orchestrator import run_eod_review
 from services.storage_service import get_storage_service
 
 logger = logging.getLogger(__name__)
@@ -2009,7 +2010,10 @@ class ExecutionCoordinator:
         The open→closed edge ALSO writes the day's durable EOD performance
         snapshot (Phase1 Task 5/C3b — see .eod_snapshot.write_daily_snapshot),
         after the fill poll/expiry so it reflects the final post-close ka10076
-        fills.
+        fills, and then runs the Phase2 EOD review chain (regime snapshot +
+        per-agent calibration + review report + regime FK backfill — see
+        .eod_orchestrator.run_eod_review), which reads that snapshot row so
+        it MUST run after it exists.
 
         start() already drains the queue if the market is open at start time; this
         covers the case where the system is started (or a trade is queued) while
@@ -2034,6 +2038,7 @@ class ExecutionCoordinator:
             await self._poll_tracked_fills()
             await self._expire_tracked_orders_on_market_close()
             await write_daily_snapshot(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # T5c: 마감 1회
+            await run_eod_review(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase2 T4: EOD 리뷰(레짐/캘리브레이션/리포트+FK 백필)
         self._market_was_open = is_open
 
     async def _expire_tracked_orders_on_market_close(self) -> None:

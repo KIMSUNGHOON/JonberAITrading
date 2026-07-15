@@ -2085,6 +2085,56 @@ class StorageService:
             return []
 
     # -------------------------------------------
+    # Regime FK Backfill (Phase2 Task 4)
+    # -------------------------------------------
+
+    async def backfill_regime_id(self, trade_date: str, regime_snapshot_id: str) -> None:
+        """
+        Backfill `regime_snapshot_id` onto the day's `daily_perf_snapshot`
+        row AND every `agent_chat_decisions` row for that trade_date.
+
+        (Phase2 Task 4: both FKs were left nullable by Phase1/Task2 since
+        the regime snapshot is only computed AFTER the day's decisions and
+        performance snapshot already exist — this is the tail step of
+        services/trading/eod_orchestrator.py::run_eod_review, called once
+        the regime_snapshot row itself has been saved.)
+
+        Failure-harmless: any error is logged and swallowed (never raises)
+        — this runs off the live market-close scheduler tick.
+
+        Args:
+            trade_date: "YYYY-MM-DD" to backfill.
+            regime_snapshot_id: id of the regime_snapshot row to attach.
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE daily_perf_snapshot SET regime_snapshot_id = ? "
+                    "WHERE trade_date = ?",
+                    (regime_snapshot_id, trade_date),
+                )
+                await conn.execute(
+                    "UPDATE agent_chat_decisions SET regime_snapshot_id = ? "
+                    "WHERE trade_date = ?",
+                    (regime_snapshot_id, trade_date),
+                )
+                await conn.commit()
+                logger.debug(
+                    "regime_id_backfilled",
+                    trade_date=trade_date,
+                    regime_snapshot_id=regime_snapshot_id,
+                )
+        except Exception as e:
+            logger.error(
+                "regime_id_backfill_failed",
+                trade_date=trade_date,
+                error=str(e),
+            )
+            return
+
+    # -------------------------------------------
     # Health Check
     # -------------------------------------------
 
