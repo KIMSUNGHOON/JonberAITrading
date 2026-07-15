@@ -39,6 +39,7 @@ from .order_agent import OrderAgent, KiwoomRateLimiter
 from .risk_monitor import RiskMonitor
 from .market_hours import MarketType, get_market_hours_service
 from .strategy import TradingStrategy
+from .strategy_apply import apply_strategy_to_risk_params
 from .pending_order_tracker import PendingOrderTracker, TrackedOrder
 from .position_registration import register_fill_as_position
 from .reconciler import reconcile
@@ -2492,6 +2493,10 @@ class ExecutionCoordinator:
         """
         self._strategy = strategy
 
+        # Phase4: 전략 노브 -> 공유 RiskParameters in-place 매핑 (해제=기본값 복귀).
+        # allowlist/클램프/denylist는 strategy_apply.py — 게이트 필드는 불변.
+        risk_param_changes = apply_strategy_to_risk_params(strategy, self.risk_params)
+
         if strategy:
             self._log_activity(
                 ActivityType.STRATEGY_CHANGED,
@@ -2502,6 +2507,7 @@ class ExecutionCoordinator:
                     "preset": strategy.preset.value,
                     "risk_tolerance": strategy.risk_tolerance.value,
                     "trading_style": strategy.trading_style.value,
+                    "risk_param_changes": {k: [v[0], v[1]] for k, v in risk_param_changes.items()},
                 },
             )
 
@@ -2511,6 +2517,9 @@ class ExecutionCoordinator:
                 ActivityType.STRATEGY_CHANGED,
                 "Strategy cleared",
                 agent="system",
+                details={
+                    "risk_param_changes": {k: [v[0], v[1]] for k, v in risk_param_changes.items()},
+                },
             )
 
             logger.info("[Coordinator] Strategy cleared")

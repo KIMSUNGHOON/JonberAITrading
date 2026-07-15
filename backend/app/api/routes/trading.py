@@ -140,7 +140,12 @@ async def start_trading(
     """
     try:
         if request and request.risk_params:
-            coordinator.risk_params = request.risk_params
+            # In-place update — coordinator.risk_params는 PortfolioAgent/
+            # RiskMonitor/TradingState와 참조 공유라 rebind하면 그들이 옛
+            # 객체를 계속 봄 (pre-existing 잠복 버그 수정, Phase4).
+            incoming = request.risk_params
+            for field in type(incoming).model_fields:
+                setattr(coordinator.risk_params, field, getattr(incoming, field))
 
         await coordinator.start()
 
