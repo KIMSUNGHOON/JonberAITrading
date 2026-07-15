@@ -157,6 +157,31 @@ class StorageService:
                     )
                 """)
 
+                # KR realized P&L table (Phase1 Task 4/C3a: KR had no
+                # per-trade realized-P&L record anywhere — only the broker's
+                # day-level ka10074, ephemeral and not matched to entry/exit.
+                # Mirrors coin_realized_pnl's shape, plus entry/exit decision
+                # IDs and holding_period_seconds so a matched close can be
+                # attributed back to the agent-chat decision that opened it
+                # (see update_decision_outcome below) and to how long the
+                # position was held.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS kr_realized_pnl (
+                        id TEXT PRIMARY KEY,
+                        stk_cd TEXT NOT NULL,
+                        entry_price REAL,
+                        exit_price REAL,
+                        quantity INTEGER,
+                        realized_amount REAL,
+                        entry_decision_id TEXT,
+                        exit_decision_id TEXT,
+                        holding_period_seconds INTEGER,
+                        entry_at TIMESTAMP,
+                        exit_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # App settings table (generic key-value; e.g. trading_mode:kiwoom)
                 # — runtime settings that must survive restarts (R3).
                 await conn.execute("""
@@ -307,6 +332,9 @@ class StorageService:
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_coin_realized_pnl_created ON coin_realized_pnl(created_at DESC)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_kr_realized_pnl_stk_cd ON kr_realized_pnl(stk_cd)"
                 )
 
                 # Agent-chat ledger indexes (Phase1 C1)
@@ -1100,6 +1128,109 @@ class StorageService:
             logger.error("coin_realized_pnl_get_failed", error=str(e))
             return []
 
+    async def save_kr_realized_pnl(self, record: dict[str, Any]) -> bool:
+        """
+        Persist a matched entry/exit realized-P&L record for a KR stock
+        close/reduce.
+
+        (Phase1 Task 4/C3a: KR had no per-trade realized-P&L record at all —
+        only the broker's day-level ka10074, ephemeral and unmatched to a
+        specific entry. Mirrors save_coin_realized_pnl's shape, plus
+        entry/exit decision IDs and holding_period_seconds. Derived/display
+        record only — the broker ledger (ka10074) remains the source of
+        truth for KR realized P&L math.)
+
+        Args:
+            record: dict with keys id, stk_cd, entry_price, exit_price,
+                quantity, realized_amount, and optionally
+                entry_decision_id/exit_decision_id/holding_period_seconds/
+                entry_at/exit_at/created_at.
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO kr_realized_pnl
+                    (id, stk_cd, entry_price, exit_price, quantity,
+                     realized_amount, entry_decision_id, exit_decision_id,
+                     holding_period_seconds, entry_at, exit_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"],
+                        record["stk_cd"],
+                        record.get("entry_price"),
+                        record.get("exit_price"),
+                        record.get("quantity"),
+                        record.get("realized_amount"),
+                        record.get("entry_decision_id"),
+                        record.get("exit_decision_id"),
+                        record.get("holding_period_seconds"),
+                        record.get("entry_at"),
+                        record.get("exit_at"),
+                        record.get("created_at", datetime.now()),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "kr_realized_pnl_saved",
+                    stk_cd=record["stk_cd"],
+                    realized_amount=record.get("realized_amount"),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "kr_realized_pnl_save_failed",
+                stk_cd=record.get("stk_cd"),
+                error=str(e),
+            )
+            return False
+
+    async def get_kr_realized_pnl(
+        self,
+        stk_cd: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Get realized KR stock P&L records, newest first, optionally
+        filtered by stk_cd."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                if stk_cd:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM kr_realized_pnl
+                        WHERE stk_cd = ?
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (stk_cd, limit, offset),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM kr_realized_pnl
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (limit, offset),
+                    )
+
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("kr_realized_pnl_get_failed", error=str(e))
+            return []
+
     # -------------------------------------------
     # KR Stock Trading Operations (P1-1)
     # -------------------------------------------
@@ -1427,6 +1558,51 @@ class StorageService:
         except Exception as e:
             logger.error("agent_chat_decisions_get_failed", error=str(e))
             return []
+
+    async def update_decision_outcome(
+        self, decision_id: str, realized_pnl: float
+    ) -> bool:
+        """
+        Backfill the realized P&L outcome of an already-recorded agent-chat
+        decision (Phase1 Task 4/C3a).
+
+        Called once the position that decision opened is matched-closed
+        (see save_kr_realized_pnl / trade_log.record_kr_realized_pnl_async),
+        so a decision's eventual real-world outcome can be attributed back
+        to it for later analysis.
+
+        Args:
+            decision_id: agent_chat_decisions.id to update
+            realized_pnl: realized P&L amount to record
+
+        Returns:
+            True if the UPDATE executed successfully (including when no row
+            matched decision_id — this is not treated as an error since a
+            decision may legitimately not exist, e.g. a monitor-driven
+            stop/take-profit close with no originating decision).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE agent_chat_decisions SET outcome_realized_pnl = ? WHERE id = ?",
+                    (realized_pnl, decision_id),
+                )
+                await conn.commit()
+                logger.debug(
+                    "decision_outcome_updated",
+                    decision_id=decision_id,
+                    realized_pnl=realized_pnl,
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "decision_outcome_update_failed",
+                decision_id=decision_id,
+                error=str(e),
+            )
+            return False
 
     async def get_agent_chat_votes(self, decision_id: str) -> list[dict[str, Any]]:
         """Get all per-agent votes backing a decision."""

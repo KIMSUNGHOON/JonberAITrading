@@ -43,7 +43,7 @@ from .strategy_engine import StrategyEngine
 from .pending_order_tracker import PendingOrderTracker, TrackedOrder
 from .position_registration import register_fill_as_position
 from .reconciler import reconcile
-from .trade_log import record_trade_fill
+from .trade_log import record_trade_fill, record_kr_realized_pnl
 from .cadence import compute_watch_ttl
 
 logger = logging.getLogger(__name__)
@@ -998,6 +998,17 @@ class ExecutionCoordinator:
         )
         if position is None:
             return
+
+        # T4: matched realized P&L — entry avg_price+analysis_session_id and exit fill both in scope here
+        if self._persistence_active and order is not None and result is not None:
+            _matched = min(filled_quantity, position.quantity)
+            _exit = result.avg_price or order.price or 0
+            record_kr_realized_pnl(
+                stk_cd=ticker, entry_price=position.avg_price, exit_price=_exit,
+                quantity=_matched, realized_amount=(_exit - position.avg_price) * _matched,
+                entry_decision_id=position.analysis_session_id, exit_decision_id=order.session_id,
+            )
+
         if filled_quantity >= position.quantity:
             self._remove_position(ticker)
         else:

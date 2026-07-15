@@ -127,3 +127,65 @@ async def wait_for_pending_trade_fill_writes() -> None:
     tasks = list(_pending_tasks)
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def record_kr_realized_pnl_async(
+    *,
+    stk_cd: str,
+    entry_price: float,
+    exit_price: float,
+    quantity: int,
+    realized_amount: float,
+    entry_decision_id: Optional[str] = None,
+    exit_decision_id: Optional[str] = None,
+) -> None:
+    """Persist one matched KR entry/exit realized-P&L record, then backfill
+    the originating decision's outcome. Awaitable core — never raises;
+    storage failures are logged only so a recording failure can never break
+    the caller's sell path (mirrors record_trade_fill_async's contract).
+
+    (Phase1 Task 4/C3a: the single write path `coordinator._apply_sell_fill`
+    funnels through, called via the fire-and-forget `record_kr_realized_pnl`
+    below since `_apply_sell_fill` is sync and cannot await this directly.)
+    """
+    from services.storage_service import get_storage_service
+
+    try:
+        storage = await get_storage_service()
+        record: dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "stk_cd": stk_cd,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "quantity": quantity,
+            "realized_amount": realized_amount,
+            "entry_decision_id": entry_decision_id,
+            "exit_decision_id": exit_decision_id,
+        }
+        await storage.save_kr_realized_pnl(record)
+        if entry_decision_id:
+            await storage.update_decision_outcome(entry_decision_id, realized_amount)
+    except Exception as e:
+        logger.warning(
+            "kr_realized_pnl_record_failed", stk_cd=stk_cd, error=str(e)
+        )
+
+
+def record_kr_realized_pnl(**kwargs) -> None:
+    """Fire-and-forget: schedule `record_kr_realized_pnl_async` without
+    blocking the caller. Identical contract to `record_trade_fill` — safe to
+    call from any (a)synchronous fill choke point that already has a running
+    event loop; the absence of a running loop (e.g. a bare unit-test call)
+    degrades to a logged no-op rather than an exception."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning(
+            "kr_realized_pnl_record_no_event_loop",
+            stk_cd=kwargs.get("stk_cd"),
+        )
+        return
+
+    task = loop.create_task(record_kr_realized_pnl_async(**kwargs))
+    _pending_tasks.add(task)
+    task.add_done_callback(_pending_tasks.discard)
