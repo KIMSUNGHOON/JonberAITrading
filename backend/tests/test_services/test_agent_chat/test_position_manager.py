@@ -2144,8 +2144,10 @@ class TestStrategicReevalConfig:
 
     def test_defaults(self):
         cfg = PositionManagerConfig()
-        assert cfg.reeval_interval_minutes == 60
-        assert cfg.reeval_price_change_pct == 3.0
+        assert cfg.reeval_interval_minutes == 30
+        assert cfg.reeval_price_change_pct == 2.0
+        assert cfg.min_discussion_interval_minutes == 15
+        assert cfg.max_discussions_per_position == 8
 
     def test_interval_minutes_rejects_non_positive(self):
         from pydantic import ValidationError
@@ -2158,6 +2160,36 @@ class TestStrategicReevalConfig:
 
         with pytest.raises(ValidationError):
             PositionManagerConfig(reeval_price_change_pct=-1.0)
+
+    def test_default_config_2pct_move_is_price_due(self):
+        """Behavior proof for the tightened default: at DEFAULT config (no
+        explicit overrides), a +2.0% move from the last re-eval price
+        baseline crosses the new reeval_price_change_pct=2.0 threshold (was
+        3.0) and _check_strategic_reeval reports the position as due,
+        purely on the price-change leg (the interval leg is kept far from
+        due via a fresh last_reeval_at)."""
+        pm = PositionManager(config=PositionManagerConfig())
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=10000,
+            current_price=10000,
+        )
+        position = pm.get_position("005930")
+        # Isolate the price-change leg: fresh last_reeval_at means the
+        # (new, tighter) interval leg is nowhere near due.
+        position.last_reeval_at = datetime.now()
+        position.last_reeval_price = 10000
+        position.current_price = 10200  # +2.0% vs. the 10000 baseline
+
+        event = pm._check_strategic_reeval(position)
+
+        assert event is not None, (
+            "a +2.0% move must be price_due under the new default "
+            "reeval_price_change_pct=2.0"
+        )
+        assert event.event_type == PositionEventType.STRATEGIC_REEVAL
 
 
 class TestStrategicReevalTriggerP3:

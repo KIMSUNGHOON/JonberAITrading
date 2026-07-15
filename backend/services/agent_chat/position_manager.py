@@ -224,8 +224,8 @@ class PositionManagerConfig(BaseModel):
     trailing_activation_pct: float = 5.0  # Activate trailing after 5% gain
 
     # Discussion limits
-    min_discussion_interval_minutes: int = 30
-    max_discussions_per_position: int = 5
+    min_discussion_interval_minutes: int = 15
+    max_discussions_per_position: int = 8
 
     # Holding period
     long_holding_days: int = 30
@@ -265,16 +265,18 @@ class PositionManagerConfig(BaseModel):
     # then flows through the SAME min_discussion_interval_minutes /
     # max_discussions_per_position throttle as defensive events, so this
     # bounds LLM-discussion volume/cost exactly like the existing events do
-    # — it does not bypass or duplicate that throttle. Conservative
-    # defaults: at most an hourly re-judgment (sooner only on a real move).
+    # — it does not bypass or duplicate that throttle. Tuned (2026-07-15,
+    # monitoring-cadence-tuning arc) for faster-market responsiveness so a
+    # held position is never silent for a full day: at most a
+    # half-hourly re-judgment (sooner on a real move).
     reeval_interval_minutes: int = Field(
-        default=60,
+        default=30,
         ge=1,
         description="Minutes since a position's last strategic re-eval "
                      "before it becomes due again (periodic trigger).",
     )
     reeval_price_change_pct: float = Field(
-        default=3.0,
+        default=2.0,
         ge=0.0,
         description="Absolute price move (%) from the last re-eval's price "
                      "baseline that makes a position due for strategic "
