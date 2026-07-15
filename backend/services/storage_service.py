@@ -1953,7 +1953,7 @@ class StorageService:
                         """
                         SELECT * FROM agent_calibration
                         WHERE as_of_date = ?
-                        ORDER BY created_at DESC
+                        ORDER BY created_at DESC, rowid DESC
                         """,
                         (as_of_date,),
                     )
@@ -1961,7 +1961,7 @@ class StorageService:
                     cursor = await conn.execute(
                         """
                         SELECT * FROM agent_calibration
-                        ORDER BY created_at DESC
+                        ORDER BY created_at DESC, rowid DESC
                         """
                     )
 
@@ -2039,7 +2039,7 @@ class StorageService:
                 cursor = await conn.execute(
                     """
                     SELECT * FROM regime_snapshot
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, rowid DESC
                     LIMIT ?
                     """,
                     (limit,),
