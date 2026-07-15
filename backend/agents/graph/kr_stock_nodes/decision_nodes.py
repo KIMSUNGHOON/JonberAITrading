@@ -29,6 +29,7 @@ from agents.prompts import (
     KR_STOCK_STRATEGIC_DECISION_PROMPT,
 )
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+from services.trading.strategy_consensus import clamp_knob
 from .helpers import (
     _get_stk_cd_safely,
     _calculate_kr_stock_risk_score,
@@ -54,11 +55,19 @@ async def _get_active_strategy():
 
 def _strategy_stop_params(strategy, risk_score: float) -> tuple[float, float, float]:
     """전략 exit/sizing 노브 + risk_score 감산 → (stop_pct 분율, take_pct 분율,
-    max_position_pct 퍼센트). 고리스크(>=0.5)는 손절 타이트(×1.15 캡 0.50),
-    익절 보수(×0.8 플로어 0.01), 포지션 축소(×0.6 — 기존 5.0→3.0 비율 준용)."""
-    base_stop = strategy.exit_conditions.stop_loss_pct
-    base_take = strategy.exit_conditions.take_profit_pct
-    base_position = strategy.position_sizing.max_position_pct * 100.0
+    max_position_pct 퍼센트). 고리스크(>=0.5)는 손절 거리 확대(완화, ×1.15 캡
+    0.50 — 레거시 5%→8% 방향 준용), 익절 보수(×0.8 플로어 0.01), 포지션 축소
+    (×0.6 — 기존 5.0→3.0 비율 준용).
+
+    Phase4 최종리뷰 Fix2: 전략 원본 노브는 `clamp_knob`로 KNOB_BOUNDS 클램프한
+    뒤 사용 — 수동 PUT /strategy가 Pydantic 필드 범위(예: stop_loss_pct 0.50)
+    까지 허용해도, T2(strategy_apply)와 다른 무클램프 수치가 이 그래프 경로에
+    유입되지 않도록 한다."""
+    base_stop = clamp_knob("stop_loss_pct", strategy.exit_conditions.stop_loss_pct)
+    base_take = clamp_knob("take_profit_pct", strategy.exit_conditions.take_profit_pct)
+    base_position = (
+        clamp_knob("max_position_pct", strategy.position_sizing.max_position_pct) * 100.0
+    )
     if risk_score < 0.5:
         return base_stop, base_take, base_position
     return (

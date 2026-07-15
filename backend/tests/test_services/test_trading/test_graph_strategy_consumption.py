@@ -49,6 +49,23 @@ async def test_graph_risk_node_uses_strategy_exits():
     assert hi == (pytest.approx(0.069), pytest.approx(0.16), pytest.approx(4.8))
 
 
+async def test_strategy_stop_params_clamps_extreme_knobs():
+    """Final-review Fix2: 수동 PUT /strategy가 Pydantic 필드 범위(예:
+    stop_loss_pct 0.50, max_position_pct 0.50)까지 허용해도, 이 그래프 소비
+    경로는 T2(strategy_apply)와 동일 KNOB_BOUNDS로 클램프한다 — 클램프 전:
+    stop=0.50, take=1.0, position=0.50; 클램프 후(KNOB_BOUNDS): stop=0.15,
+    take=0.30, position=0.30(→30.0%)."""
+    from agents.graph.kr_stock_nodes import decision_nodes
+
+    strategy = TradingStrategy()
+    strategy.exit_conditions.stop_loss_pct = 0.50
+    strategy.exit_conditions.take_profit_pct = 1.0
+    strategy.position_sizing.max_position_pct = 0.50
+
+    lo = decision_nodes._strategy_stop_params(strategy, risk_score=0.3)
+    assert lo == (pytest.approx(0.15), pytest.approx(0.30), pytest.approx(30.0))
+
+
 async def test_graph_strategy_fetch_failure_is_none():
     from agents.graph.kr_stock_nodes import decision_nodes
 

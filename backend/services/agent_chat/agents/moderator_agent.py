@@ -364,9 +364,16 @@ class ModeratorAgent(BaseDiscussionAgent):
 
             stop_loss = int(entry_price * (1 - stop_loss_pct / 100))
             take_profit = int(entry_price * (1 + take_profit_pct / 100))
-        elif strategy_knobs.get("stop_loss_pct") or strategy_knobs.get("take_profit_pct"):
+        elif not context.has_position and (
+            strategy_knobs.get("stop_loss_pct") or strategy_knobs.get("take_profit_pct")
+        ):
             # Phase4: risk 투표 자체가 없어도 활성 전략이 있으면 스탑을 채운다
-            # (기존엔 None 스탑 결정 → 감시 skip이 잠복 갭이었음).
+            # (기존엔 None 스탑 결정 → 감시 skip이 잠복 갭이었음) — 단, 신규
+            # 진입(no position)에만. 보유 포지션 재평가(STRATEGIC_REEVAL)에서
+            # 이 분기가 채우면, 합의 미달 시 액션이 HOLD로 강제된 뒤
+            # PositionManager._apply_decision의 HOLD 분기가 그 스탑을 기존
+            # 포지션에 그대로 적용한다 — 가격이 진입가 아래로 내려간 상태라면
+            # 스탑이 아래로 재앵커되어 방어가 완화되는 회귀(final-review 발견).
             if strategy_knobs.get("stop_loss_pct"):
                 stop_loss = int(entry_price * (1 - strategy_knobs["stop_loss_pct"] / 100))
             if strategy_knobs.get("take_profit_pct"):

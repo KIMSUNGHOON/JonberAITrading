@@ -41,6 +41,18 @@ KNOB_BOUNDS: dict[str, tuple[float, float]] = {
 
 _INT_KNOBS = {"max_positions"}
 
+
+def clamp_knob(knob: str, value: float) -> float:
+    """Clamp a raw (fractional-unit) knob value into its KNOB_BOUNDS hard
+    rail. Single source for the safety bounds — reused outside this module
+    by the tactical consumption paths (agent_chat coordinator's strategy
+    context, KR graph decision nodes' `_strategy_stop_params`) so a manual
+    PUT /strategy edit (which bypasses `apply_consensus`'s `_bounded`
+    clamp) can't diverge into different numbers across consumers of the
+    same live TradingStrategy (final-review Fix2, Phase4)."""
+    lo, hi = KNOB_BOUNDS[knob]
+    return max(lo, min(hi, value))
+
 # One EOD run may move a knob at most this relative fraction from its
 # current value — bounded adaptation (25%/run).
 MAX_RELATIVE_DELTA = 0.25

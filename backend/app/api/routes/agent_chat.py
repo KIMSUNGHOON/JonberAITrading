@@ -21,6 +21,7 @@ from services.agent_chat import (
     DecisionAction,
 )
 from services.agent_chat.coordinator import register_room_created_hook
+from services.agent_chat.models import DEFAULT_AGENT_WEIGHTS
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/agent-chat", tags=["Agent Group Chat"])
@@ -111,16 +112,12 @@ class StartCoordinatorRequest(BaseModel):
 # -------------------------------------------
 
 
-# Phase4: models.py DEFAULT_AGENT_WEIGHTS의 미러 — 세션 실가중
-# (session.agent_weights, 캘리브레이션 틸트)이 있으면 그것이 우선이고, 이
-# dict는 세션에 접근할 수 없는 호출부의 폴백으로만 쓰인다.
-_AGENT_WEIGHTS = {
-    "technical": 0.25,
-    "fundamental": 0.25,
-    "sentiment": 0.20,
-    "risk": 0.30,
-    "moderator": 0.0,
-}
+# Phase4: models.py DEFAULT_AGENT_WEIGHTS에서 파생(드리프트 클래스 제거,
+# final-review Fix4) — 세션 실가중(session.agent_weights, 캘리브레이션 틸트)
+# 이 있으면 그것이 우선이고, 이 dict는 세션에 접근할 수 없는 호출부의
+# 폴백으로만 쓰인다. moderator는 투표하지 않으므로 DEFAULT_AGENT_WEIGHTS에
+# 키가 없다 — 여기서만 0.0으로 명시 추가.
+_AGENT_WEIGHTS = {t.value: w for t, w in DEFAULT_AGENT_WEIGHTS.items()} | {"moderator": 0.0}
 
 
 def _session_to_summary(session: ChatSession) -> dict:

@@ -383,6 +383,17 @@ class ChatRoom:
         # Calculate consensus
         self.session.calculate_consensus()
 
+        # Final-review Fix3: 가중 틸트가 합의 게이트 판정 자체를 뒤집었을 때
+        # 관측 가능하게 로그(판정만 계산 — consensus_level은 위에서 이미 확정).
+        flipped = self.session.tilt_changed_gate_verdict()
+        if flipped:
+            logger.warning(
+                "consensus_gate_flipped_by_weights",
+                ticker=self.ticker,
+                consensus=self.session.consensus_level,
+                threshold=self.session.consensus_threshold,
+            )
+
         logger.info(
             "voting_round_completed",
             ticker=self.ticker,

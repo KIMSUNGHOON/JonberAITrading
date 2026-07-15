@@ -35,7 +35,7 @@ from typing import Optional
 from .models import RiskParameters
 from .strategy import TradingStrategy
 
-# risk_params 필드명 -> (lo, hi) 매핑 바운드. 값 출처는 아래 _SOURCE_GETTERS.
+# risk_params 필드명 -> (lo, hi) 매핑 바운드. 값 출처는 아래 _source_values.
 # 단위: max_single_position_pct/min_cash_ratio는 소수분율,
 #       default_*_pct는 퍼센트(전략 분율 ×100 후 클램프).
 STRATEGY_MAPPED_FIELDS: dict[str, tuple[float, float]] = {
@@ -76,6 +76,8 @@ def apply_strategy_to_risk_params(
     IN-PLACE. Returns {field: (before, after)} for fields that actually
     changed (for the STRATEGY_CHANGED activity log). strategy=None resets
     the mapped fields to model defaults ("no strategy = factory defaults").
+    The reset branch reports all 4 fields unconditionally (before may equal
+    after) — see the "deterministic, all-4-fields event" note above.
     """
     if strategy is None:
         # Reset is a deterministic, all-4-fields event for logging purposes

@@ -105,6 +105,21 @@ def test_moderator_without_risk_vote_fills_stops_from_strategy():
     assert decision.take_profit == int(70000 * 1.18)
 
 
+def test_moderator_with_position_and_no_risk_vote_leaves_stops_none():
+    """Final-review Fix1: 보유 포지션 재평가(has_position=True)에서 risk 투표가
+    없으면 전략 스탑도 채우지 않는다 — 채우면 합의 미달 시 HOLD 경유로 그
+    스탑이 기존 포지션에 재앵커돼 방어가 완화되는 회귀였다. 신규 진입
+    (has_position=False, 위 test_moderator_without_risk_vote_fills_stops_from_strategy)
+    에서만 전략 폴백을 채운다."""
+    moderator = ModeratorAgent()
+    ctx = _context(strategy_knobs=dict(KNOBS), has_position=True)
+    session = _session([AgentVote(agent_type=AgentType.TECHNICAL, vote=VoteType.BUY,
+                                  confidence=0.8, reasoning="r")])
+    decision = moderator._parse_decision("보유 (HOLD)", session, ctx)
+    assert decision.stop_loss is None
+    assert decision.take_profit is None
+
+
 def test_moderator_without_any_strategy_keeps_legacy_behavior():
     moderator = ModeratorAgent()
     ctx = _context(available_cash=10_000_000)
@@ -152,3 +167,22 @@ async def test_build_strategy_context_formats_percent_units():
     assert knobs["stop_loss_pct"] == pytest.approx(6.0)     # 분율→퍼센트
     assert knobs["max_position_pct"] == pytest.approx(8.0)
     assert "테스트 전략" in directive and "6.0%" in directive
+
+
+async def test_build_strategy_context_clamps_extreme_knobs():
+    """Final-review Fix2: 수동 PUT /strategy는 KNOB_BOUNDS를 우회해 Pydantic
+    필드 범위(stop_loss_pct 최대 0.50)까지 값을 허용한다 — 이 소비 경로가
+    T2(strategy_apply)와 같은 클램프(0.03-0.15)를 적용하는지 확인."""
+    from services.agent_chat.coordinator import ChatCoordinator
+    from services.trading.strategy import TradingStrategy
+
+    strategy = TradingStrategy(name="극단 전략")
+    strategy.exit_conditions.stop_loss_pct = 0.50  # KNOB_BOUNDS hi=0.15
+    trading = MagicMock()
+    trading.get_strategy.return_value = strategy
+
+    coordinator = ChatCoordinator()
+    with patch("app.dependencies.get_trading_coordinator",
+               new=AsyncMock(return_value=trading)):
+        _, knobs = await coordinator._build_strategy_context()
+    assert knobs["stop_loss_pct"] == pytest.approx(15.0)  # 0.15 클램프 × 100

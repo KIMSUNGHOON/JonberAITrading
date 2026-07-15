@@ -362,6 +362,63 @@ class ChatSession(BaseModel):
 
         return self.consensus_level
 
+    def _consensus_from_votes(self, weights: Optional[Dict[str, float]]) -> float:
+        """Pure consensus computation for an arbitrary weights mapping (None =
+        base DEFAULT_AGENT_WEIGHTS). Does NOT read or write self.consensus_level
+        — mirrors calculate_consensus's math (incl. the <2-scoring-votes
+        single-vote guard) exactly, but as a side-effect-free helper so
+        tilt_changed_gate_verdict can compute the base-weight counterfactual
+        without disturbing the live (already-computed, possibly tilted)
+        consensus_level field or calling calculate_consensus with a
+        temporary weight swap."""
+        bullish_weight = 0.0
+        bearish_weight = 0.0
+        neutral_weight = 0.0
+        scoring_votes = 0
+
+        for vote in self.votes:
+            if vote.agent_type == AgentType.MODERATOR:
+                continue
+
+            weight = resolve_agent_weight(vote.agent_type, weights)
+            weighted_confidence = weight * vote.confidence
+
+            if vote.vote in (VoteType.STRONG_BUY, VoteType.BUY):
+                bullish_weight += weighted_confidence
+                scoring_votes += 1
+            elif vote.vote in (VoteType.STRONG_SELL, VoteType.SELL):
+                bearish_weight += weighted_confidence
+                scoring_votes += 1
+            elif vote.vote == VoteType.HOLD:
+                neutral_weight += weighted_confidence
+                scoring_votes += 1
+
+        if scoring_votes < 2:
+            return 0.0
+
+        total_weight = bullish_weight + bearish_weight + neutral_weight
+        if total_weight == 0:
+            return 0.0
+
+        return max(bullish_weight, bearish_weight, neutral_weight) / total_weight
+
+    def tilt_changed_gate_verdict(self) -> Optional[bool]:
+        """동적 가중(캘리브레이션 틸트)이 합의 게이트(consensus_threshold) 통과
+        여부를 기본 가중 대비 뒤집었는지 판정.
+
+        agent_weights가 없으면(옵트인 안 함) None — 비교 자체가 무의미.
+        있으면 현재 self.consensus_level(이미 가중 계산된 라이브 값, 보통
+        calculate_consensus 직후 호출됨) >= threshold와, 같은 votes를 기본
+        가중으로 재계산한 값 >= threshold를 비교해 다르면 True, 같으면
+        False. 판정만 계산하며 consensus_level 필드는 절대 건드리지 않는다.
+        """
+        if not self.agent_weights:
+            return None
+
+        weighted_pass = self.consensus_level >= self.consensus_threshold
+        base_pass = self._consensus_from_votes(None) >= self.consensus_threshold
+        return weighted_pass != base_pass
+
     def get_majority_direction(self) -> VoteType:
         """Get the majority vote direction."""
         if not self.votes:

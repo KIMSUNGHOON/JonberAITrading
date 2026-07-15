@@ -74,6 +74,49 @@ def test_weighted_confidence_accepts_weights_param():
     assert tilted == pytest.approx((0.375 * 1.0 + 0.15 * 0.5) / 0.525)
 
 
+def _vote_conf(agent_type, vote, confidence):
+    return AgentVote(agent_type=agent_type, vote=vote, confidence=confidence, reasoning="r")
+
+
+def test_tilt_changed_gate_verdict_none_without_weights():
+    """agent_weights 없음(옵트인 안 함) → 비교 자체가 무의미하므로 None."""
+    votes = [_vote(AgentType.TECHNICAL), _vote(AgentType.FUNDAMENTAL)]
+    session = _session(votes)
+    session.calculate_consensus()
+    assert session.tilt_changed_gate_verdict() is None
+
+
+def test_tilt_changed_gate_verdict_false_when_unanimous():
+    """만장일치 강세 → 가중/기본 모두 게이트 통과(threshold 0.75) → 뒤집힘 없음."""
+    votes = [
+        _vote_conf(AgentType.TECHNICAL, VoteType.STRONG_BUY, 0.95),
+        _vote_conf(AgentType.FUNDAMENTAL, VoteType.STRONG_BUY, 0.95),
+        _vote_conf(AgentType.SENTIMENT, VoteType.STRONG_BUY, 0.90),
+        _vote_conf(AgentType.RISK, VoteType.STRONG_BUY, 0.90),
+    ]
+    session = _session(votes, weights={"technical": 0.375, "fundamental": 0.375,
+                                        "sentiment": 0.10, "risk": 0.15})
+    session.calculate_consensus()
+    assert session.tilt_changed_gate_verdict() is False
+
+
+def test_tilt_changed_gate_verdict_true_when_flipped():
+    """최종리뷰 산술 예: TECH/FUND 0.375 BUY conf 0.95 + RISK 0.15 SELL 0.90 +
+    SENT 0.10 HOLD 0.90 → 가중 합의 0.76>=0.75(통과), 기본 가중 0.514<0.75
+    (미달) → 게이트 판정이 가중 때문에 뒤집힘 → True."""
+    votes = [
+        _vote_conf(AgentType.TECHNICAL, VoteType.BUY, 0.95),
+        _vote_conf(AgentType.FUNDAMENTAL, VoteType.BUY, 0.95),
+        _vote_conf(AgentType.RISK, VoteType.SELL, 0.90),
+        _vote_conf(AgentType.SENTIMENT, VoteType.HOLD, 0.90),
+    ]
+    session = _session(votes, weights={"technical": 0.375, "fundamental": 0.375,
+                                        "sentiment": 0.10, "risk": 0.15})
+    consensus = session.calculate_consensus()
+    assert consensus == pytest.approx(0.76, abs=0.005)
+    assert session.tilt_changed_gate_verdict() is True
+
+
 def test_majority_direction_uses_same_weights():
     votes = [_vote(AgentType.TECHNICAL, VoteType.BUY, 0.9),
              _vote(AgentType.RISK, VoteType.SELL, 0.9)]

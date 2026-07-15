@@ -698,15 +698,28 @@ class ChatCoordinator:
         (is_stale 승격 금지)."""
         try:
             from app.dependencies import get_trading_coordinator
+            from services.trading.strategy_consensus import clamp_knob
 
             strategy = (await get_trading_coordinator()).get_strategy()
             if strategy is None:
                 return None, None
+            # Phase4 최종리뷰 Fix2: T2(strategy_apply)와 동일 KNOB_BOUNDS로
+            # 클램프한 뒤 퍼센트로 변환 — 수동 PUT /strategy가 Pydantic 필드
+            # 범위(예: stop_loss_pct 0.50)까지 허용해도, 이 소비 경로가
+            # T2와 다른(무클램프) 수치를 에이전트에 주입하지 않도록 한다.
             knobs = {
-                "stop_loss_pct": strategy.exit_conditions.stop_loss_pct * 100.0,
-                "take_profit_pct": strategy.exit_conditions.take_profit_pct * 100.0,
-                "max_position_pct": strategy.position_sizing.max_position_pct * 100.0,
-                "min_cash_ratio": strategy.position_sizing.min_cash_ratio * 100.0,
+                "stop_loss_pct": clamp_knob(
+                    "stop_loss_pct", strategy.exit_conditions.stop_loss_pct
+                ) * 100.0,
+                "take_profit_pct": clamp_knob(
+                    "take_profit_pct", strategy.exit_conditions.take_profit_pct
+                ) * 100.0,
+                "max_position_pct": clamp_knob(
+                    "max_position_pct", strategy.position_sizing.max_position_pct
+                ) * 100.0,
+                "min_cash_ratio": clamp_knob(
+                    "min_cash_ratio", strategy.position_sizing.min_cash_ratio
+                ) * 100.0,
             }
             lines = [
                 f"전략명: {strategy.name} / 성향: {strategy.risk_tolerance.value}"
