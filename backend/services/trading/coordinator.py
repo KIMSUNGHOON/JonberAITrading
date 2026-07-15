@@ -1003,10 +1003,17 @@ class ExecutionCoordinator:
         if self._persistence_active and order is not None and result is not None:
             _matched = min(filled_quantity, position.quantity)
             _exit = result.avg_price or order.price or 0
+            _now = datetime.now()
             record_kr_realized_pnl(
                 stk_cd=ticker, entry_price=position.avg_price, exit_price=_exit,
                 quantity=_matched, realized_amount=(_exit - position.avg_price) * _matched,
                 entry_decision_id=position.analysis_session_id, exit_decision_id=order.session_id,
+                entry_at=position.entry_time,
+                exit_at=_now,
+                holding_period_seconds=(
+                    int((_now - position.entry_time).total_seconds())
+                    if position.entry_time else None
+                ),
             )
 
         if filled_quantity >= position.quantity:

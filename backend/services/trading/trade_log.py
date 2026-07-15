@@ -138,6 +138,9 @@ async def record_kr_realized_pnl_async(
     realized_amount: float,
     entry_decision_id: Optional[str] = None,
     exit_decision_id: Optional[str] = None,
+    entry_at: Optional[datetime] = None,
+    exit_at: Optional[datetime] = None,
+    holding_period_seconds: Optional[int] = None,
 ) -> None:
     """Persist one matched KR entry/exit realized-P&L record, then backfill
     the originating decision's outcome. Awaitable core — never raises;
@@ -161,6 +164,9 @@ async def record_kr_realized_pnl_async(
             "realized_amount": realized_amount,
             "entry_decision_id": entry_decision_id,
             "exit_decision_id": exit_decision_id,
+            "entry_at": entry_at,
+            "exit_at": exit_at,
+            "holding_period_seconds": holding_period_seconds,
         }
         await storage.save_kr_realized_pnl(record)
         if entry_decision_id:

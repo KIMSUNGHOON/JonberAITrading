@@ -11,6 +11,7 @@ storage failure can never break the sell path.
 """
 
 import uuid
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -151,6 +152,31 @@ async def test_record_kr_realized_pnl_async_writes_expected_row(temp_storage):
     assert row["realized_amount"] == 20000.0
     assert row["entry_decision_id"] == "dec-entry-1"
     assert row["exit_decision_id"] == "dec-exit-1"
+
+
+async def test_record_kr_realized_pnl_async_persists_holding_period(temp_storage):
+    """Important review finding (Phase1 C3a): holding_period_seconds/entry_at/
+    exit_at must be captured at write time — the source (ManagedPosition.
+    entry_time) is destroyed by _remove_position immediately after, so it's
+    capture-now-or-lose-forever. The async core must accept and forward
+    these params through to storage."""
+    entry_at = datetime(2026, 7, 15, 9, 0, 0)
+    exit_at = datetime(2026, 7, 15, 10, 0, 0)
+
+    await trade_log.record_kr_realized_pnl_async(
+        **_kwargs(
+            entry_at=entry_at,
+            exit_at=exit_at,
+            holding_period_seconds=3600,
+        )
+    )
+
+    rows = await temp_storage.get_kr_realized_pnl(stk_cd="005930")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["holding_period_seconds"] == 3600
+    assert row["entry_at"] == entry_at.isoformat(sep=" ")
+    assert row["exit_at"] == exit_at.isoformat(sep=" ")
 
 
 async def test_record_kr_realized_pnl_async_backfills_decision_outcome(
