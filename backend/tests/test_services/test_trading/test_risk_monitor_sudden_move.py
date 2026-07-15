@@ -76,7 +76,7 @@ async def test_sudden_move_pauses_only_that_ticker_other_still_fires():
 
     prices = {"AAAA": 55_000, "BBBB": 47_000}  # AAAA: -21.4% (sudden); BBBB: -6% (plain stop-loss)
 
-    async def fetcher(ticker):
+    async def fetcher(ticker, ttl=None):
         return prices[ticker]
 
     monitor._get_price = fetcher
@@ -122,7 +122,7 @@ async def test_sudden_move_ticker_own_stop_loss_stays_gated_until_ticks_elapse()
     ]
     idx = {"i": 0}
 
-    async def fetcher(ticker):
+    async def fetcher(ticker, ttl=None):
         price = prices[idx["i"]]
         idx["i"] += 1
         return price
@@ -168,7 +168,7 @@ async def test_sudden_move_auto_recovers_early_on_price_stabilization():
     ]
     idx = {"i": 0}
 
-    async def fetcher(ticker):
+    async def fetcher(ticker, ttl=None):
         price = prices[idx["i"]]
         idx["i"] += 1
         return price
@@ -211,7 +211,7 @@ async def test_manual_global_pause_still_gates_all_tickers():
     # gate specifically, not the per-ticker sudden-move path.
     config.last_price = 66_000
 
-    async def fetcher(_ticker):
+    async def fetcher(_ticker, ttl=None):
         return 64_000  # -3.0% tick move (not sudden), but <= stop_loss
 
     monitor._get_price = fetcher
@@ -269,7 +269,7 @@ async def test_sudden_move_perpetual_re_arm_force_recovers_after_absolute_cap():
         prices.append(price)
     idx = {"i": 0}
 
-    async def fetcher(_ticker):
+    async def fetcher(_ticker, ttl=None):
         p = prices[idx["i"]]
         idx["i"] += 1
         return p

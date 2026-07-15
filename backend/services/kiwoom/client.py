@@ -404,12 +404,18 @@ class KiwoomClient:
             return 0.0
         return float(value)
 
-    async def get_stock_info(self, stk_cd: str) -> StockBasicInfo:
+    async def get_stock_info(
+        self, stk_cd: str, ttl: Optional[float] = None
+    ) -> StockBasicInfo:
         """
         주식기본정보요청 (ka10001)
 
         Args:
             stk_cd: 종목코드 (예: "005930")
+            ttl: 캐시 저장 TTL(초) 오버라이드. None이면 `stock_info` 프리픽스
+                기본값(3.0s)을 그대로 사용 — 감시 종목 수(N)에 따라 동적으로
+                산출한 TTL(`services.trading.cadence.compute_held_ttl`)을
+                보유 종목 조회 경로에서 넘길 때 사용 (감시 튜닝 아크).
 
         Returns:
             StockBasicInfo 객체
@@ -466,7 +472,7 @@ class KiwoomClient:
 
         # 캐시 저장
         if self._cache:
-            self._cache.set(cache_key, stock_info)
+            self._cache.set(cache_key, stock_info, ttl=ttl)
 
         return stock_info
 

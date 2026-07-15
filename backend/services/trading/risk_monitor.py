@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, Dict, List, Callable, Awaitable
 
+from .cadence import compute_held_ttl
 from .models import (
     ManagedPosition,
     StopLossMode,
@@ -50,7 +51,7 @@ class RiskMonitor:
     def __init__(
         self,
         risk_params: Optional[RiskParameters] = None,
-        price_fetcher: Optional[Callable[[str], Awaitable[float]]] = None,
+        price_fetcher: Optional[Callable[..., Awaitable[float]]] = None,
         alert_sender: Optional[Callable[[TradingAlert], Awaitable[None]]] = None,
         order_executor: Optional[Callable[[OrderRequest], Awaitable[None]]] = None,
         price_sink: Optional[Callable[[str, float], None]] = None,
@@ -60,7 +61,11 @@ class RiskMonitor:
 
         Args:
             risk_params: Risk parameters
-            price_fetcher: Async function to get current price
+            price_fetcher: Async function to get current price. Called as
+                `price_fetcher(ticker, ttl=compute_held_ttl(len(watching)))`
+                for each held-position tick (monitoring-cadence-tuning arc)
+                — the fetcher must accept an optional `ttl` keyword and
+                forward it to its own cache layer.
             alert_sender: Async function to send alerts
             order_executor: Async function to execute orders
             price_sink: Optional callback(ticker, price) invoked every tick
@@ -238,7 +243,14 @@ class RiskMonitor:
         # Get current price
         if self._get_price:
             try:
-                current_price = await self._get_price(ticker)
+                # Monitoring-cadence-tuning arc: TTL scales with the number
+                # of held positions (`compute_held_ttl`) so this 1s poll's
+                # responsiveness/cost tradeoff adapts to load N instead of a
+                # hardcoded cache TTL either starving responsiveness (N
+                # small) or blowing the request budget (N large).
+                current_price = await self._get_price(
+                    ticker, ttl=compute_held_ttl(len(self._watching))
+                )
             except Exception as e:
                 logger.warning(f"[RiskMonitor] Failed to get price for {ticker}: {e}")
                 return

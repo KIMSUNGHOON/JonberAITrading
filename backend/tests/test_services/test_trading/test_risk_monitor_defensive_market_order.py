@@ -99,7 +99,7 @@ async def test_stop_loss_fires_as_market_order_through_check_position():
     monitor.add_position(position)
     config = monitor._watching["005930"]
 
-    async def fetcher(_ticker):
+    async def fetcher(_ticker, ttl=None):
         return 64_000  # below stop_loss -> triggers
 
     monitor._get_price = fetcher
@@ -125,7 +125,7 @@ async def test_take_profit_fires_as_market_order_through_check_position():
     monitor.add_position(position)
     config = monitor._watching["005930"]
 
-    async def fetcher(_ticker):
+    async def fetcher(_ticker, ttl=None):
         return 76_000  # above take_profit -> triggers
 
     monitor._get_price = fetcher

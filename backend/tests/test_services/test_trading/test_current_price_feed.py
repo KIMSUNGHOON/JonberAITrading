@@ -32,7 +32,10 @@ async def test_get_current_price_uses_real_client_api():
     price = await coord._get_current_price("005930")
 
     assert price == 75000.0
-    client.get_stock_info.assert_awaited_once_with("005930")
+    # ttl=None when the caller (here) doesn't pass one — monitoring-cadence-
+    # tuning arc: _get_current_price forwards an optional `ttl` override to
+    # get_stock_info; callers that omit it keep today's behavior unchanged.
+    client.get_stock_info.assert_awaited_once_with("005930", ttl=None)
 
 
 async def test_get_current_price_exception_fails_safe_to_zero():

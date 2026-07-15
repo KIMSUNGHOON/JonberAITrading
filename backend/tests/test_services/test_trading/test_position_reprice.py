@@ -108,7 +108,7 @@ async def test_reprice_only_updates_matching_ticker():
     client = MagicMock()
     client.get_account_balance = AsyncMock(return_value=_balance())
 
-    async def _get_stock_info(stk_cd):
+    async def _get_stock_info(stk_cd, ttl=None):
         prices = {"005930": _stock_info(80_000, "005930"), "000660": _stock_info(150_000, "000660")}
         return prices[stk_cd]
 

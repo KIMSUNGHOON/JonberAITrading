@@ -159,6 +159,37 @@ class TestKiwoomClientStockInfo:
 
             assert info.stk_cd == "005930"
 
+    @pytest.mark.asyncio
+    async def test_get_stock_info_passes_explicit_ttl_to_cache(
+        self, client, mock_stock_response
+    ):
+        """Dynamic held-position TTL (monitoring-cadence-tuning arc): when a
+        caller passes `ttl=`, it must be forwarded to `cache.set` so held
+        lookups can use a TTL derived from `compute_held_ttl(N)` instead of
+        the hardcoded 3.0s `stock_info` prefix default."""
+        with patch.object(client, '_request', new_callable=AsyncMock) as mock_request, \
+                patch.object(client._cache, 'set') as mock_cache_set:
+            mock_request.return_value = mock_stock_response
+
+            await client.get_stock_info("005930", ttl=7.0)
+
+            assert mock_cache_set.call_args.kwargs.get("ttl") == 7.0
+
+    @pytest.mark.asyncio
+    async def test_get_stock_info_no_ttl_keeps_prefix_default(
+        self, client, mock_stock_response
+    ):
+        """Regression guard: a caller passing NO ttl must behave exactly as
+        before — `cache.set` still receives `ttl=None` so the cache falls
+        back to the `stock_info` prefix default (3.0s)."""
+        with patch.object(client, '_request', new_callable=AsyncMock) as mock_request, \
+                patch.object(client._cache, 'set') as mock_cache_set:
+            mock_request.return_value = mock_stock_response
+
+            await client.get_stock_info("005930")
+
+            assert mock_cache_set.call_args.kwargs.get("ttl") is None
+
 
 class TestKiwoomClientOrderbook:
     """Test get_orderbook method"""

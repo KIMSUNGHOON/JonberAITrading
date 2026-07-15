@@ -1205,8 +1205,19 @@ class ExecutionCoordinator:
             watched.current_price = price
             watched.last_checked = datetime.now()
 
-    async def _get_current_price(self, ticker: str) -> float:
-        """Get current price for a ticker."""
+    async def _get_current_price(
+        self, ticker: str, ttl: Optional[float] = None
+    ) -> float:
+        """Get current price for a ticker.
+
+        `ttl`: optional cache-TTL override forwarded to
+        `KiwoomClient.get_stock_info` (monitoring-cadence-tuning arc). Used
+        by `RiskMonitor` (injected as this coordinator's `price_fetcher`) to
+        pass a held-position-count-derived TTL
+        (`services.trading.cadence.compute_held_ttl`) for its 1s poll of
+        held positions; callers that omit it (e.g. `_reprice_positions`)
+        keep today's prefix-default caching behavior unchanged.
+        """
         if self._kiwoom:
             try:
                 # KiwoomClient has no `get_quote` method (that was a
@@ -1216,7 +1227,7 @@ class ExecutionCoordinator:
                 # checks via the `current_price <= 0` guard). The real quote
                 # API is `get_stock_info` (ka10001), same one
                 # agents/tools/kr_market_data.py uses.
-                info = await self._kiwoom.get_stock_info(ticker)
+                info = await self._kiwoom.get_stock_info(ticker, ttl=ttl)
                 return float(info.cur_prc)
             except Exception as e:
                 logger.error(f"[Coordinator] Failed to get price for {ticker}: {e}")
