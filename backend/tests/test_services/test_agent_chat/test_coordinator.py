@@ -90,10 +90,15 @@ class TestCoordinatorInitialization:
         assert not coord._running
 
     def test_default_values(self):
-        """Test default values."""
+        """Test default values (monitoring-cadence tuning, 2026-07-15):
+        watch-list checks now default to 60s (1 minute), not 5 minutes --
+        the checks read already-fresh watch prices (periodic refresh loop)
+        and make no Kiwoom call themselves, so tightening the cadence is
+        safe; the discussion throttle (min_discussion_interval/
+        max_concurrent) remains the real rate limit."""
         coord = ChatCoordinator()
 
-        assert coord.check_interval == 5
+        assert coord.check_interval == 1
         assert coord.max_concurrent == 3
 
 
@@ -133,6 +138,32 @@ class TestCoordinatorLifecycle:
             await coordinator.stop()
 
         assert not coordinator._running
+
+    @pytest.mark.asyncio
+    async def test_start_schedules_watch_list_check_every_60_seconds(self):
+        """Monitoring-cadence tuning (2026-07-15): a coordinator built with
+        no explicit check_interval_minutes (i.e. via the default, as the
+        `get_chat_coordinator()` singleton does) must schedule the
+        watch-list job on a 60s / 1-minute APScheduler interval -- not the
+        old 5-minute one. Deliberately does NOT use the `coordinator`
+        fixture, which pins check_interval_minutes=5 explicitly."""
+        coord = ChatCoordinator()
+
+        with patch.object(coord, '_position_manager', None):
+            with patch('services.agent_chat.coordinator.get_position_manager') as mock_pm:
+                mock_pm.return_value = AsyncMock()
+                mock_pm.return_value.start = AsyncMock()
+                mock_pm.return_value.sync_from_account = AsyncMock()
+                mock_pm.return_value.set_chat_coordinator = MagicMock()
+                mock_pm.return_value.get_all_positions = MagicMock(return_value=[])
+
+                await coord.start()
+
+                job = coord._scheduler.get_job('watch_list_check')
+                assert job is not None
+                assert job.trigger.interval == timedelta(minutes=1)
+
+                await coord.stop()
 
     @pytest.mark.asyncio
     async def test_start_idempotent(self, coordinator):

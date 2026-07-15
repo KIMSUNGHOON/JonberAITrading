@@ -116,7 +116,7 @@ class ChatCoordinator:
 
     def __init__(
         self,
-        check_interval_minutes: int = 5,
+        check_interval_minutes: int = 1,
         max_concurrent_discussions: int = 3,
         min_discussion_interval_minutes: int = 30,
     ):
@@ -124,7 +124,12 @@ class ChatCoordinator:
         Initialize chat coordinator.
 
         Args:
-            check_interval_minutes: How often to check watch list
+            check_interval_minutes: How often to check watch list (default
+                1 minute / 60s — monitoring-cadence tuning, 2026-07-15. The
+                check itself makes no Kiwoom call (reads stored/periodically
+                refreshed watch prices); the discussion throttle
+                (min_discussion_interval_minutes + max_concurrent_discussions)
+                is the real rate limit, unchanged.
             max_concurrent_discussions: Max simultaneous discussions
             min_discussion_interval_minutes: Min time between discussions for same stock
         """
