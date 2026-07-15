@@ -1341,8 +1341,12 @@ def _honesty_decision(action, quantity=None, stop_loss=None, take_profit=None):
 
 
 class TestApplyDecisionHonestyP0:
-    """P0: partial REDUCE must not desync the shadow ledger; ADD must not be
-    silently demoted to HOLD."""
+    """P0: ADD must not be silently demoted to HOLD.
+
+    (Partial REDUCE's P0 "must not desync the shadow ledger / notify only"
+    behavior was superseded by P1's real execution path — see
+    TestApplyDecisionReducePartialP1 below. ADD still has no execution path
+    (P2) and keeps the P0 not-executed-notice behavior pinned here.)"""
 
     @staticmethod
     def _position(config, quantity=100, current_price=72500):
@@ -1362,30 +1366,6 @@ class TestApplyDecisionHonestyP0:
         notifier.is_ready = True
         notifier.send_message = AsyncMock()
         return notifier
-
-    @pytest.mark.asyncio
-    async def test_partial_reduce_leaves_quantity_unchanged_and_notifies(self, config):
-        """The core bug: a partial REDUCE (new_quantity > 0) must NOT mutate
-        the monitored quantity — there is no broker order behind it yet — and
-        must emit an explicit not-executed notice instead of quiet drift."""
-        pm, pos = self._position(config, quantity=100)
-        notifier = self._notifier()
-
-        with patch(
-            "services.telegram.get_telegram_notifier",
-            AsyncMock(return_value=notifier),
-        ):
-            await pm._apply_decision(
-                pos, _honesty_decision(DecisionAction.REDUCE, quantity=30)
-            )
-
-        assert pos.quantity == 100, (
-            "partial REDUCE must not silently decrement the shadow ledger"
-        )
-        notifier.send_message.assert_awaited_once()
-        msg = notifier.send_message.await_args.args[0]
-        assert "부분청산" in msg
-        assert "005930" in msg
 
     @pytest.mark.asyncio
     async def test_add_decision_notifies_not_executed(self, config):
@@ -1486,3 +1466,256 @@ class TestApplyDecisionHonestyP0:
 
         assert closed == ["005930"]
         assert pm.get_position("005930") is None
+
+
+# -------------------------------------------
+# Partial REDUCE Real Execution (P1, 2026-07-15)
+# -------------------------------------------
+#
+# P1 replaces P0's notify-only "부분청산 미지원" stand-in with a real,
+# quantity-specified SELL through `ExecutionCoordinator._reduce_position`,
+# gated the same way the full-close path is gated: check_autonomy(SELL).
+#
+# Audit: docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md
+# Plan: docs/superpowers/plans/2026-07-15-position-mgmt-execution.md (Task P1)
+
+from services.trading.models import OrderResult, OrderSide
+
+
+def _order_result(filled_quantity: int, requested_quantity: int = None) -> OrderResult:
+    return OrderResult(
+        order_id="o1",
+        ticker="005930",
+        side=OrderSide.SELL,
+        requested_quantity=(
+            requested_quantity if requested_quantity is not None else filled_quantity
+        ),
+        filled_quantity=filled_quantity,
+        avg_price=72_500,
+        status="filled" if filled_quantity > 0 else "rejected",
+    )
+
+
+class TestApplyDecisionReducePartialP1:
+    """Partial REDUCE (new_quantity > 0) now places a real, quantity-specified
+    SELL order via the SAME autonomy gate the full-close path uses, and
+    decrements the monitored quantity by the ACTUAL filled amount."""
+
+    @staticmethod
+    def _position(config, quantity=100, current_price=72500):
+        pm = PositionManager(config=config)
+        pos = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=quantity,
+            avg_price=72500,
+            current_price=current_price,
+        )
+        return pm, pos
+
+    @staticmethod
+    def _notifier():
+        notifier = MagicMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock()
+        return notifier
+
+    @pytest.mark.asyncio
+    async def test_partial_reduce_places_sell_for_specified_quantity_not_full(
+        self, config, monkeypatch
+    ):
+        """The gate-allowed happy path: a REDUCE for 30 of 100 places a SELL
+        for exactly 30 (not the full 100), and the monitored quantity
+        decrements by the ACTUAL fill."""
+        pm, pos = self._position(config, quantity=100)
+
+        reduce_calls = []
+        fake_coord = MagicMock()
+
+        async def _reduce(ticker, quantity):
+            reduce_calls.append((ticker, quantity))
+            return _order_result(filled_quantity=quantity)
+
+        fake_coord._reduce_position = _reduce
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        gate_calls = []
+
+        async def allow_gate(market, **kwargs):
+            gate_calls.append(kwargs)
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(
+            pos, _honesty_decision(DecisionAction.REDUCE, quantity=30)
+        )
+
+        assert reduce_calls == [("005930", 30)], (
+            "must place a SELL for the SPECIFIED (clamped) quantity, not the "
+            "full position"
+        )
+        assert gate_calls and gate_calls[0]["quantity"] == 30, (
+            "check_autonomy must be called with the intended sell quantity"
+        )
+        assert pm.get_position("005930").quantity == 70, (
+            "monitored quantity must decrement by the ACTUAL executed amount"
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_reduce_gate_denied_leaves_quantity_unchanged(
+        self, config, monkeypatch
+    ):
+        """check_autonomy(SELL) denied → no order placed, position quantity
+        unchanged, human notified (P0's behavior for the genuine
+        can't-execute case, preserved for gate denial)."""
+        pm, pos = self._position(config, quantity=100)
+
+        reduce_calls = []
+        fake_coord = MagicMock()
+
+        async def _reduce(ticker, quantity):
+            reduce_calls.append((ticker, quantity))
+            return _order_result(filled_quantity=quantity)
+
+        fake_coord._reduce_position = _reduce
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def deny_gate(market, **kwargs):
+            return GateDecision(
+                allowed=False, reason="trading_mode:kiwoom is 'hitl'", check="market_mode"
+            )
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(
+                pos, _honesty_decision(DecisionAction.REDUCE, quantity=30)
+            )
+
+        assert reduce_calls == [], "gate-denied reduce must not place an order"
+        assert pm.get_position("005930").quantity == 100, (
+            "gate-denied reduce must leave the position unchanged"
+        )
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "005930" in msg
+        assert "hitl" in msg
+
+    @pytest.mark.asyncio
+    async def test_partial_reduce_unfilled_leaves_quantity_unchanged(
+        self, config, monkeypatch
+    ):
+        """A gate-allowed reduce whose order does not fill at all must leave
+        the monitored quantity untouched (no phantom decrement)."""
+        pm, pos = self._position(config, quantity=100)
+
+        fake_coord = MagicMock()
+
+        async def _reduce(ticker, quantity):
+            return _order_result(filled_quantity=0, requested_quantity=quantity)
+
+        fake_coord._reduce_position = _reduce
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(
+            pos, _honesty_decision(DecisionAction.REDUCE, quantity=30)
+        )
+
+        assert pm.get_position("005930").quantity == 100
+
+    @pytest.mark.asyncio
+    async def test_partial_reduce_coordinator_clamp_collapses_to_full_close(
+        self, config, monkeypatch
+    ):
+        """Oversell/divergence clamp: PositionManager's own ledger considers
+        this a partial reduce (new_quantity=70 > 0), but the coordinator's
+        SEPARATE ledger only actually holds — and sells — up to its own
+        quantity. When the ACTUAL fill consumes this manager's entire
+        tracked quantity, the position must be fully removed from
+        monitoring, not left at a negative/zero quantity."""
+        pm, pos = self._position(config, quantity=100)
+
+        fake_coord = MagicMock()
+
+        async def _reduce(ticker, quantity):
+            # Simulate the coordinator's own clamp/ledger actually selling
+            # the full 100 (e.g. its ManagedPosition only held 100 too, and
+            # the clamp there collapsed the request into a full close).
+            return _order_result(filled_quantity=100, requested_quantity=quantity)
+
+        fake_coord._reduce_position = _reduce
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(
+            pos, _honesty_decision(DecisionAction.REDUCE, quantity=30)
+        )
+
+        assert pm.get_position("005930") is None, (
+            "a real fill that consumes the whole tracked quantity must "
+            "remove the position, not just decrement it"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reduce_zero_clamped_quantity_notifies_not_executed(
+        self, config, monkeypatch
+    ):
+        """Direct-call edge case: if the requested quantity clamps to zero or
+        less against the currently monitored quantity (e.g. already fully
+        reduced by a concurrent path), no order is placed and the human is
+        notified — distinct from a gate denial."""
+        pm, pos = self._position(config, quantity=0)
+
+        fake_coord = MagicMock()
+        fake_coord._reduce_position = AsyncMock()
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        gate_called = []
+
+        async def allow_gate(market, **kwargs):
+            gate_called.append(kwargs)
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._execute_reduce_position(pos, 30, "agent_decision_reduce_partial")
+
+        assert gate_called == [], "a zero-clamp request must short-circuit before the gate"
+        fake_coord._reduce_position.assert_not_awaited()
+        notifier.send_message.assert_awaited_once()
+        msg = notifier.send_message.await_args.args[0]
+        assert "005930" in msg

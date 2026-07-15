@@ -299,6 +299,118 @@ async def test_monitor_stop_execution_reduces_on_partial_fill(temp_storage, monk
 
 
 # -------------------------------------------
+# P1 (2026-07-15) — quantity-specified partial sell (`_reduce_position`)
+# -------------------------------------------
+#
+# Plan: docs/superpowers/plans/2026-07-15-position-mgmt-execution.md (Task P1)
+# Audit: docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md
+#
+# `PositionManager._execute_reduce_position` is the autonomous caller (gated
+# by check_autonomy(SELL) before it ever reaches here — see
+# test_position_manager.py::TestApplyDecisionReducePartialP1). These tests
+# pin the coordinator-side contract in isolation: places a SELL for the
+# SPECIFIED quantity (not the full position), clamps oversell against ITS
+# OWN tracked quantity, and delegates a clamp-to-zero-remaining request to
+# the existing full-close path.
+
+
+async def test_reduce_position_places_sell_for_specified_quantity_not_full(
+    temp_storage,
+):
+    """A reduce for 30 of a 100-share position places a SELL for exactly 30,
+    not the full 100, and decrements the tracked quantity by the ACTUAL
+    fill."""
+    coord = _coord_with_position(qty=100)
+    _stub_execute_order(coord, filled_quantity=30)
+
+    result = await coord._reduce_position("005930", 30)
+
+    assert result.filled_quantity == 30
+    assert len(coord._state.positions) == 1
+    assert coord._state.positions[0].quantity == 70
+    assert "005930" in coord.risk_monitor._watching, "remainder stays defended"
+
+
+async def test_reduce_position_oversell_clamped_to_full_close(temp_storage):
+    """Requesting more than the held quantity must NOT oversell — it clamps
+    to the held quantity, which collapses the request into a full close via
+    the existing `_close_position` path (position removed, stops cleaned
+    up), rather than placing a SELL for more than is held."""
+    coord = _coord_with_position(qty=50)
+
+    captured = []
+
+    async def _exec(order):
+        captured.append(order)
+        return OrderResult(
+            order_id="o1",
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=order.price or 68_000,
+            status="filled",
+        )
+
+    coord._execute_order = _exec
+
+    result = await coord._reduce_position("005930", 999)
+
+    assert len(captured) == 1
+    assert captured[0].quantity == 50, "the placed order must be clamped to the held quantity"
+    assert result.filled_quantity == 50
+    assert coord._state.positions == [], "clamp-to-full collapses to a real full close"
+    assert "005930" not in coord.risk_monitor._watching
+
+
+async def test_reduce_position_unfilled_retains_full_quantity(temp_storage):
+    """A reduce whose SELL does not fill at all must retain the position at
+    its ORIGINAL quantity (no phantom decrement)."""
+    coord = _coord_with_position(qty=100)
+    _stub_execute_order(coord, filled_quantity=0, status="rejected")
+
+    result = await coord._reduce_position("005930", 30)
+
+    assert result.filled_quantity == 0
+    assert len(coord._state.positions) == 1
+    assert coord._state.positions[0].quantity == 100
+
+
+async def test_reduce_position_no_position_returns_none(temp_storage):
+    """A reduce for a ticker the coordinator does not track returns None
+    without placing any order — the caller (PositionManager) treats this as
+    a divergent/desynced ledger and leaves its own quantity untouched."""
+    coord = ExecutionCoordinator(kiwoom_client=None)
+
+    result = await coord._reduce_position("005930", 30)
+
+    assert result is None
+
+
+async def test_reduce_position_non_positive_quantity_returns_none(temp_storage):
+    """A reduce request that clamps to zero or less (e.g. a stale request
+    against an already-diminished position) places no order."""
+    coord = _coord_with_position(qty=100)
+    captured = await _capture_no_order(coord)
+
+    result = await coord._reduce_position("005930", 0)
+
+    assert result is None
+    assert captured == []
+
+
+async def _capture_no_order(coord):
+    captured = []
+
+    async def _exec(order):
+        captured.append(order)
+        raise AssertionError("no order should be placed")
+
+    coord._execute_order = _exec
+    return captured
+
+
+# -------------------------------------------
 # A3 — fill confirmation via ka10076 (no "accept == full fill")
 # -------------------------------------------
 

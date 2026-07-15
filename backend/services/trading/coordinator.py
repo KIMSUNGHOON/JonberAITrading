@@ -1400,8 +1400,17 @@ class ExecutionCoordinator:
 
         await self._notify_state_change()
 
-    async def _close_position(self, ticker: str):
-        """Close a position at market price."""
+    async def _close_position(self, ticker: str) -> Optional[OrderResult]:
+        """Close a position at market price.
+
+        Returns the OrderResult of the placed SELL (or None if there was no
+        position to close) — P1 (2026-07-15) added this return value so
+        `_reduce_position` can delegate here when its own oversell clamp
+        collapses a partial request into a full close, and still learn the
+        ACTUAL filled quantity. Existing callers that ignore the return value
+        (`handle_alert_action`'s CLOSE_POSITION, PositionManager's
+        `_execute_close_position`) are unaffected.
+        """
         position = next(
             (p for p in self._state.positions if p.ticker == ticker),
             None
@@ -1409,7 +1418,7 @@ class ExecutionCoordinator:
 
         if not position:
             logger.warning(f"[Coordinator] Position {ticker} not found")
-            return
+            return None
 
         order = OrderRequest(
             ticker=ticker,
@@ -1424,6 +1433,70 @@ class ExecutionCoordinator:
         # Only drop/reduce tracking by the ACTUAL fill — a rejected or unfilled
         # sell must keep the position under defense (A3).
         self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+        return result
+
+    async def _reduce_position(self, ticker: str, quantity: int) -> Optional[OrderResult]:
+        """Place a SELL order for a SPECIFIC quantity — a partial reduce, not
+        a full close (P1, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+
+        `PositionManager._execute_reduce_position` is the (only) autonomous
+        caller today: it already passes the request through
+        `check_autonomy(SELL)` before reaching here, mirroring the existing
+        full-close pattern (`PositionManager._execute_close_position` gates,
+        then calls `_close_position`).
+
+        Oversell-proof against THIS coordinator's OWN tracked quantity. The
+        caller may be working off a separate ledger (PositionManager's
+        `MonitoredPosition`, distinct from this coordinator's
+        `ManagedPosition`) that can diverge from this one, so the clamp is
+        re-applied here rather than trusted from the caller: `sell_qty =
+        min(quantity, position.quantity)`. If that clamp collapses the
+        request into a full close (requested >= held), delegates to the
+        existing `_close_position` instead of duplicating its
+        position-removal/risk-monitor-stop cleanup.
+
+        Returns the OrderResult of whichever order was actually placed (the
+        partial sell, or the delegated full close) so the caller can react to
+        the ACTUAL filled quantity — never the requested one — the same
+        choke-point discipline `_apply_sell_fill` already applies to every
+        other SELL path.
+        """
+        position = next(
+            (p for p in self._state.positions if p.ticker == ticker), None
+        )
+        if not position:
+            logger.warning(f"[Coordinator] Position {ticker} not found for reduce")
+            return None
+
+        sell_qty = min(quantity, position.quantity)
+        if sell_qty <= 0:
+            logger.warning(
+                f"[Coordinator] Reduce for {ticker} requested non-positive "
+                f"sell quantity ({quantity} vs held {position.quantity})"
+            )
+            return None
+
+        if sell_qty >= position.quantity:
+            # Clamp collapses this into a full close — delegate rather than
+            # duplicate _close_position's removal/stop-cleanup logic.
+            return await self._close_position(ticker)
+
+        order = OrderRequest(
+            ticker=ticker,
+            stock_name=position.stock_name,
+            side=OrderSide.SELL,
+            quantity=sell_qty,
+            price=position.current_price,
+            reason="Autonomous partial reduce",
+        )
+
+        result = await self._execute_order(order)
+        # Reconcile by the ACTUAL fill, not the requested quantity — same
+        # choke point every other SELL path uses (full → remove, partial →
+        # decrement, none → retain).
+        self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+        return result
 
     # -------------------------------------------
     # State Access

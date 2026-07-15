@@ -951,23 +951,167 @@ class PositionManager:
         self, position: MonitoredPosition, requested_quantity: int
     ) -> None:
         """Best-effort Telegram notice when a discussion decided REDUCE
-        (partial close) but no partial-sell execution path exists yet (P0,
-        2026-07-15) — the human must know the position was NOT reduced and
-        still holds its current quantity, instead of a shadow-ledger
-        decrement silently pretending a sell happened."""
+        (partial close) but the requested quantity clamps to zero or less
+        against the currently monitored quantity (P1, 2026-07-15) — e.g. the
+        position is already effectively closed on this manager's own ledger.
+        Distinct from `_notify_reduce_gate_denied` (a real, executable
+        request blocked by the autonomy gate, not a quantity problem)."""
         try:
             from services.telegram import get_telegram_notifier
 
             notifier = await get_telegram_notifier()
             if notifier.is_ready:
                 await notifier.send_message(
-                    f"⏸ 부분청산 미지원 — 실행 보류 ({position.ticker}): "
-                    f"에이전트가 {requested_quantity}주 축소를 결정했으나 부분매도 실행 "
-                    f"경로가 아직 없어 미실행. 보유 수량 {position.quantity}주 그대로 유지됩니다."
+                    f"⏸ 부분청산 미실행 ({position.ticker}): "
+                    f"에이전트가 {requested_quantity}주 축소를 결정했으나 유효 매도 수량이 "
+                    f"0 이하로 계산되어 미실행. 보유 수량 {position.quantity}주 그대로 유지됩니다."
                 )
         except Exception as e:
             logger.warning(
                 "reduce_not_executed_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_reduce_gate_denied(
+        self, position: MonitoredPosition, requested_quantity: int, gate_reason: str
+    ) -> None:
+        """Best-effort Telegram notice when the autonomy gate blocks a
+        quantity-specified partial REDUCE (P1, 2026-07-15) — mirrors
+        `_notify_close_gate_denied` for the full-close path. The human must
+        know the reduce did NOT execute and the position quantity is
+        unchanged."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚫 자율 부분매도 게이트 거부 ({position.ticker}, "
+                    f"{requested_quantity}주): {gate_reason}. "
+                    f"보유 수량 {position.quantity}주 그대로 유지되며 수동 조치가 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "reduce_gate_denied_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _execute_reduce_position(
+        self,
+        position: MonitoredPosition,
+        requested_quantity: int,
+        reason: str,
+    ) -> None:
+        """Execute a quantity-specified partial sell via the trading
+        coordinator (P1, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+
+        Replaces P0's "부분청산 미지원" notification with real execution: a
+        partial REDUCE now places an ACTUAL SELL order for the requested
+        quantity (not the full position), through the SAME autonomy gate
+        (`check_autonomy`) the full-close path (`_execute_close_position`)
+        already enforces — master gate, market mode, paper-only, daily-loss
+        breaker, notional cap.
+
+        Oversell-proof at two layers: clamped here against this manager's own
+        tracked quantity before the gate check (so the gate never evaluates a
+        request larger than what this manager believes is held), and
+        re-clamped inside `ExecutionCoordinator._reduce_position` against ITS
+        OWN tracked quantity — a separate ledger that can diverge from this
+        one. Either clamp collapsing the request into a full close delegates
+        to the existing full-close machinery rather than duplicating it.
+
+        On any real fill, the monitored quantity is decremented by the
+        ACTUAL filled amount (not the requested one) — this is now backed by
+        a real broker order, unlike the P0-removed silent shadow-ledger
+        decrement.
+        """
+        try:
+            from services.autonomy import check_autonomy
+
+            clamped_quantity = min(requested_quantity, position.quantity)
+            if clamped_quantity <= 0:
+                logger.warning(
+                    "reduce_requested_non_positive",
+                    ticker=position.ticker,
+                    requested_quantity=requested_quantity,
+                    current_quantity=position.quantity,
+                )
+                await self._notify_reduce_not_executed(position, requested_quantity)
+                return
+
+            gate = await check_autonomy(
+                "kiwoom",
+                action="SELL",
+                quantity=clamped_quantity,
+                entry_price=position.current_price,
+            )
+            if not gate.allowed:
+                logger.warning(
+                    "partial_reduce_gate_denied",
+                    ticker=position.ticker,
+                    reason=reason,
+                    check=gate.check,
+                    gate_reason=gate.reason,
+                )
+                await self._notify_reduce_gate_denied(
+                    position, clamped_quantity, gate.reason
+                )
+                return
+
+            from app.dependencies import get_trading_coordinator
+
+            trading_coord = await get_trading_coordinator()
+            result = await trading_coord._reduce_position(
+                position.ticker, clamped_quantity
+            )
+
+            if result is None:
+                # Coordinator had no matching position (a divergent/desynced
+                # ledger, or a zero/negative clamp on its own side) — nothing
+                # was placed. Leave this manager's quantity untouched rather
+                # than guess at what happened.
+                logger.warning(
+                    "partial_reduce_no_coordinator_position",
+                    ticker=position.ticker,
+                )
+                return
+
+            filled = result.filled_quantity
+            if filled <= 0:
+                logger.warning(
+                    "partial_reduce_unfilled",
+                    ticker=position.ticker,
+                    requested_quantity=clamped_quantity,
+                )
+                return
+
+            new_quantity = position.quantity - filled
+            if new_quantity <= 0:
+                # The ACTUAL fill consumed this manager's whole tracked
+                # quantity (e.g. the coordinator's own clamp collapsed this
+                # into a real full close on its side) — mirror
+                # _execute_close_position's cleanup.
+                self.remove_position(position.ticker)
+                logger.info(
+                    "position_reduced_to_full_close",
+                    ticker=position.ticker,
+                    filled=filled,
+                )
+            else:
+                self.update_position(position.ticker, quantity=new_quantity)
+                logger.info(
+                    "position_reduced",
+                    ticker=position.ticker,
+                    filled=filled,
+                    remaining=new_quantity,
+                )
+
+        except Exception as e:
+            logger.error(
+                "execute_reduce_position_failed",
                 ticker=position.ticker,
                 error=str(e),
             )
@@ -1002,17 +1146,21 @@ class PositionManager:
     ) -> None:
         """Apply a decision from agent discussion to the position.
 
-        P0 (2026-07-15, docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md):
-        honesty fix only — no new execution added here.
-        - Partial REDUCE has no execution path yet, so it must NOT mutate the
-          monitored quantity (that would be a shadow-ledger lie with no broker
-          order behind it, desynced from the real account until the next
-          sync_from_account overwrites it). The full-close REDUCE path
-          (new_quantity <= 0 -> _execute_close_position) is real execution and
-          is unchanged.
-        - ADD has no execution path yet either. It used to fall silently into
-          the same branch as HOLD (stop/take adjustment only) with the "add"
-          intent discarded. It must be surfaced instead of demoted in silence.
+        P1 (2026-07-15, docs/superpowers/plans/2026-07-15-position-mgmt-execution.md
+        Task P1): partial REDUCE now has a real execution path
+        (`_execute_reduce_position`) — it places a quantity-specified SELL
+        through the SAME autonomy gate (`check_autonomy`) the full-close path
+        already enforces, then updates the monitored quantity by the ACTUAL
+        filled amount (oversell-proof, clamped against both this manager's
+        and the coordinator's own tracked quantity). This replaces P0's
+        notify-only "부분청산 미지원" stand-in
+        (docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md).
+        The full-close REDUCE path (new_quantity <= 0 -> _execute_close_position)
+        and plain SELL are real execution and remain unaffected.
+
+        - ADD still has no execution path (P2, not yet implemented). It
+          falls into the same branch as HOLD (stop/take adjustment only)
+          with an explicit not-executed notice, as P0 left it.
         """
         from services.agent_chat.models import DecisionAction
 
@@ -1034,23 +1182,12 @@ class PositionManager:
                         # Full close: the REAL executing path. Unchanged.
                         await self._execute_close_position(position, "agent_decision_reduce")
                     else:
-                        # Partial reduce: no broker order is placed for this
-                        # (P1, not yet implemented). Previously this called
-                        # update_position(quantity=new_quantity), silently
-                        # decrementing the monitored quantity with nothing
-                        # backing it at the broker — a lie about the position
-                        # that would only self-correct at the next
-                        # sync_from_account. Leave the monitored quantity
-                        # untouched (consistent with the real account) and
-                        # surface the non-execution explicitly instead.
-                        logger.warning(
-                            "reduce_not_executed",
-                            ticker=position.ticker,
-                            requested_quantity=decision.quantity,
-                            current_quantity=position.quantity,
-                        )
-                        await self._notify_reduce_not_executed(
-                            position, decision.quantity
+                        # Partial reduce: real execution path (P1,
+                        # 2026-07-15) — a quantity-specified SELL through the
+                        # SAME autonomy gate the full-close path uses.
+                        # Replaces P0's notify-only stand-in.
+                        await self._execute_reduce_position(
+                            position, decision.quantity, "agent_decision_reduce_partial"
                         )
 
             elif decision.action in (DecisionAction.HOLD, DecisionAction.ADD):
