@@ -171,7 +171,7 @@ PER: {per}배 / PBR: {pbr}배
             position_info=position_info,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         confidence = self._parse_confidence(response)
 
         return self._create_message(
@@ -214,7 +214,7 @@ PER: {per}배 / PBR: {pbr}배
             pbr=context.pbr or "N/A",
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         msg_type = MessageType.OPINION
         if "동의" in response or "맞습니다" in response:
@@ -254,7 +254,7 @@ PER: {per}배 / PBR: {pbr}배
         )
 
         messages = [
-            SystemMessage(content=self.system_prompt),
+            SystemMessage(content=self._effective_system_prompt()),
             HumanMessage(content=prompt),
         ]
         data = await self._structured_vote(messages, schema=VOTE_SCHEMA)
@@ -270,7 +270,7 @@ PER: {per}배 / PBR: {pbr}배
             except (ValueError, KeyError, TypeError):
                 pass  # malformed structured payload (incl. null confidence) -> regex fallback
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         return AgentVote(
             agent_type=self.agent_type,
             vote=self._parse_vote(response),

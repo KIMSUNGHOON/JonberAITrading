@@ -182,7 +182,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             position_info=position_info,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         confidence = self._parse_confidence(response)
 
         # Risk agent calculates risk parameters
@@ -239,7 +239,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             available_cash=available_cash,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         # Risk agent often raises concerns
         msg_type = MessageType.OPINION
@@ -284,7 +284,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
         risk_level = self._calculate_risk_level(context)
 
         messages = [
-            SystemMessage(content=self.system_prompt),
+            SystemMessage(content=self._effective_system_prompt()),
             HumanMessage(content=prompt),
         ]
         data = await self._structured_vote(messages, schema=RISK_VOTE_SCHEMA, task=TaskType.RISK)
@@ -309,7 +309,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             except (ValueError, KeyError, TypeError):
                 pass  # malformed structured payload (incl. null confidence) -> regex fallback
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         vote_type = self._parse_vote(response)
         confidence = self._parse_confidence(response)

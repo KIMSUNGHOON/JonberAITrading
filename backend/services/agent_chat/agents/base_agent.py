@@ -39,12 +39,26 @@ class BaseDiscussionAgent(ABC):
         self.agent_type = agent_type
         self.agent_name = agent_name
         self.llm = get_llm_provider()
+        # Phase4: active TradingStrategy directive, distributed per-room by
+        # ChatRoom.__init__. None when no strategy is active/reachable.
+        self.strategy_directive: Optional[str] = None
 
     @property
     @abstractmethod
     def system_prompt(self) -> str:
         """System prompt for this agent's persona."""
         pass
+
+    def _effective_system_prompt(self) -> str:
+        """페르소나 프롬프트 + (있으면) 활성 전략 지침. 전략은 참고 프레임이며
+        에이전트의 독립 판단을 대체하지 않는다는 문구를 포함한다."""
+        if not self.strategy_directive:
+            return self.system_prompt
+        return (
+            f"{self.system_prompt}\n\n"
+            "## 활성 전략 지침 (운용 프레임 — 당신의 독립적 분석을 대체하지 않음)\n"
+            f"{self.strategy_directive}"
+        )
 
     @property
     @abstractmethod

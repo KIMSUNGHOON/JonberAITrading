@@ -165,7 +165,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             news_count=context.news_count or 0,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         confidence = self._parse_confidence(response)
 
         # Adjust confidence based on data availability
@@ -213,7 +213,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             price_change_pct=context.price_change_pct,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         msg_type = MessageType.OPINION
         if "동의" in response or "지지" in response:
@@ -253,7 +253,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
         )
 
         messages = [
-            SystemMessage(content=self.system_prompt),
+            SystemMessage(content=self._effective_system_prompt()),
             HumanMessage(content=prompt),
         ]
         data = await self._structured_vote(messages, schema=VOTE_SCHEMA)
@@ -274,7 +274,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             except (ValueError, KeyError, TypeError):
                 pass  # malformed structured payload (incl. null confidence) -> regex fallback
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         vote_type = self._parse_vote(response)
         confidence = self._parse_confidence(response)

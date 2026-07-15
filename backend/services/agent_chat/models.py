@@ -189,6 +189,12 @@ class MarketContext(BaseModel):
     total_portfolio_value: Optional[float] = None
     current_sector_exposure: Optional[float] = None
 
+    # Phase4: 활성 TradingStrategy 주입 (best-effort — None이면 전략 없음/조회 실패.
+    # directive=LLM 프롬프트용 한국어 요약, knobs=퍼센트 단위 수치(모더레이터 소비:
+    # AgentVote.suggested_*와 동일 단위 — 전략 원본은 소수분율이라 ×100 변환됨)).
+    strategy_directive: Optional[str] = Field(default=None)
+    strategy_knobs: Optional[Dict[str, float]] = Field(default=None)
+
 
 class ChatRound(BaseModel):
     """

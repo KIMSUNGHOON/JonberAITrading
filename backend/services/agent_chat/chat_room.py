@@ -86,6 +86,13 @@ class ChatRoom:
             AgentType.MODERATOR: ModeratorAgent(),
         }
 
+        # Phase4: 활성 전략 디렉티브를 룸의 5 에이전트에 배포 (룸마다 새
+        # 인스턴스라 룸 간 누수 없음).
+        directive = getattr(context, "strategy_directive", None)
+        if directive:
+            for agent in self.agents.values():
+                agent.strategy_directive = directive
+
         # Discussion order (excluding moderator)
         self.discussion_order = [
             AgentType.TECHNICAL,

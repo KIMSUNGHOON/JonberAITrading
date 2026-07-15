@@ -157,7 +157,7 @@ class ModeratorAgent(BaseDiscussionAgent):
             current_price=context.current_price,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         return self._create_message(
             message_type=MessageType.SUMMARY,
@@ -188,7 +188,7 @@ class ModeratorAgent(BaseDiscussionAgent):
             chat_history=history_str,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         return self._create_message(
             message_type=MessageType.SUMMARY,
@@ -240,7 +240,7 @@ class ModeratorAgent(BaseDiscussionAgent):
             discussion_summary=discussion_summary,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         # Parse decision from response
         decision = self._parse_decision(response, session, context)
@@ -339,6 +339,8 @@ class ModeratorAgent(BaseDiscussionAgent):
             None,
         )
 
+        strategy_knobs = context.strategy_knobs or {}
+
         # Calculate trade parameters
         quantity = None
         entry_price = context.current_price
@@ -348,16 +350,37 @@ class ModeratorAgent(BaseDiscussionAgent):
 
         if risk_vote:
             position_pct = risk_vote.suggested_position_pct
-            stop_loss_pct = risk_vote.suggested_stop_loss_pct or 5.0
-            take_profit_pct = risk_vote.suggested_take_profit_pct or 10.0
+            # Phase4: 폴백 우선순위 — risk 에이전트 제안 > 활성 전략 > 레거시 상수
+            stop_loss_pct = (
+                risk_vote.suggested_stop_loss_pct
+                or strategy_knobs.get("stop_loss_pct")
+                or 5.0
+            )
+            take_profit_pct = (
+                risk_vote.suggested_take_profit_pct
+                or strategy_knobs.get("take_profit_pct")
+                or 10.0
+            )
 
             stop_loss = int(entry_price * (1 - stop_loss_pct / 100))
             take_profit = int(entry_price * (1 + take_profit_pct / 100))
+        elif strategy_knobs.get("stop_loss_pct") or strategy_knobs.get("take_profit_pct"):
+            # Phase4: risk 투표 자체가 없어도 활성 전략이 있으면 스탑을 채운다
+            # (기존엔 None 스탑 결정 → 감시 skip이 잠복 갭이었음).
+            if strategy_knobs.get("stop_loss_pct"):
+                stop_loss = int(entry_price * (1 - strategy_knobs["stop_loss_pct"] / 100))
+            if strategy_knobs.get("take_profit_pct"):
+                take_profit = int(entry_price * (1 + strategy_knobs["take_profit_pct"] / 100))
 
-            # Calculate quantity if we have portfolio info
-            if context.available_cash and position_pct:
-                investment = context.available_cash * (position_pct / 100)
-                quantity = int(investment / entry_price)
+        # Phase4: 전략 사이징 캡 — 자율 경로의 quantity_override가 PortfolioAgent
+        # 캡을 우회하므로, 수량의 원천인 position_pct를 여기서 캡한다.
+        max_position_pct = strategy_knobs.get("max_position_pct")
+        if position_pct and max_position_pct:
+            position_pct = min(position_pct, max_position_pct)
+
+        if risk_vote and context.available_cash and position_pct:
+            investment = context.available_cash * (position_pct / 100)
+            quantity = int(investment / entry_price)
 
         # Collect key factors from all votes
         key_factors = []
@@ -444,7 +467,7 @@ class ModeratorAgent(BaseDiscussionAgent):
 - 이견 사항
 - 다음 라운드에서 논의할 점"""
 
-        response = await self._call_llm(self.system_prompt, summary_prompt)
+        response = await self._call_llm(self._effective_system_prompt(), summary_prompt)
 
         return self._create_message(
             message_type=MessageType.SUMMARY,

@@ -167,7 +167,7 @@ class TechnicalDiscussionAgent(BaseDiscussionAgent):
             chart_summary=chart_summary,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         confidence = self._parse_confidence(response)
 
         return self._create_message(
@@ -209,7 +209,7 @@ class TechnicalDiscussionAgent(BaseDiscussionAgent):
             indicators_summary=indicators_summary,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         # Determine message type based on content
         msg_type = MessageType.OPINION
@@ -249,7 +249,7 @@ class TechnicalDiscussionAgent(BaseDiscussionAgent):
         )
 
         messages = [
-            SystemMessage(content=self.system_prompt),
+            SystemMessage(content=self._effective_system_prompt()),
             HumanMessage(content=prompt),
         ]
         data = await self._structured_vote(messages, schema=VOTE_SCHEMA)
@@ -265,7 +265,7 @@ class TechnicalDiscussionAgent(BaseDiscussionAgent):
             except (ValueError, KeyError, TypeError):
                 pass  # malformed structured payload (incl. null confidence) -> regex fallback
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         return AgentVote(
             agent_type=self.agent_type,
             vote=self._parse_vote(response),

@@ -672,6 +672,39 @@ class ChatCoordinator:
         except Exception as e:
             logger.warning("telegram_notification_failed", error=str(e))
 
+    async def _build_strategy_context(self) -> tuple[Optional[str], Optional[dict]]:
+        """활성 TradingStrategy → (프롬프트 디렉티브, 퍼센트 노브). 조회 실패/
+        전략 없음 = (None, None) — 절대 raise하지 않고, 토론을 막지 않는다
+        (is_stale 승격 금지)."""
+        try:
+            from app.dependencies import get_trading_coordinator
+
+            strategy = (await get_trading_coordinator()).get_strategy()
+            if strategy is None:
+                return None, None
+            knobs = {
+                "stop_loss_pct": strategy.exit_conditions.stop_loss_pct * 100.0,
+                "take_profit_pct": strategy.exit_conditions.take_profit_pct * 100.0,
+                "max_position_pct": strategy.position_sizing.max_position_pct * 100.0,
+                "min_cash_ratio": strategy.position_sizing.min_cash_ratio * 100.0,
+            }
+            lines = [
+                f"전략명: {strategy.name} / 성향: {strategy.risk_tolerance.value}"
+                f" / 스타일: {strategy.trading_style.value}",
+                f"사이징 지침: 종목당 최대 {knobs['max_position_pct']:.1f}%,"
+                f" 최소 현금 {knobs['min_cash_ratio']:.1f}%",
+                f"청산 지침: 손절 {knobs['stop_loss_pct']:.1f}%,"
+                f" 익절 {knobs['take_profit_pct']:.1f}%",
+            ]
+            if strategy.system_prompt:
+                lines.append(f"운용 원칙: {strategy.system_prompt[:400]}")
+            if strategy.custom_instructions:
+                lines.append(f"추가 지침: {strategy.custom_instructions[:400]}")
+            return "\n".join(lines), knobs
+        except Exception as e:
+            logger.warning("strategy_context_build_failed", error=str(e))
+            return None, None
+
     async def _fetch_market_context(
         self,
         ticker: str,
@@ -792,6 +825,11 @@ class ChatCoordinator:
             except Exception as e:
                 logger.warning("news_fetch_failed", error=str(e))
 
+            # Phase4: best-effort active-strategy context. Never raises and
+            # never promotes is_stale — a strategy fetch failure must not
+            # block the debate (see _build_strategy_context docstring).
+            strategy_directive, strategy_knobs = await self._build_strategy_context()
+
             return MarketContext(
                 ticker=ticker,
                 stock_name=stock_name or stock_info.get("stk_nm", ticker),
@@ -811,6 +849,8 @@ class ChatCoordinator:
                 position_pnl_pct=position_pnl_pct,
                 available_cash=available_cash,
                 total_portfolio_value=total_portfolio,
+                strategy_directive=strategy_directive,
+                strategy_knobs=strategy_knobs,
             )
 
         except Exception as e:
