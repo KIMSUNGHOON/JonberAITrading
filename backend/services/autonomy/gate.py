@@ -8,7 +8,7 @@ ChatCoordinator execution path — both autonomy engines share one policy.
 Check chain (first failure denies):
     master_gate → market_mode → paper_only → daily_loss_breaker
     → coordinator_active (BUY/ADD, kiwoom only)
-    → max_positions (BUY/ADD only) → notional_cap (BUY/ADD only)
+    → max_positions (BUY/ADD only) → notional_cap (BUY/ADD only, kiwoom only)
 
 Design rules:
 - FAIL-CLOSED: any provider error converts to a deny with the failing check's
@@ -16,7 +16,7 @@ Design rules:
 - The paper_only check is HARDCODED — no setting can produce autonomous+live.
   (Relaxing it is an explicit, separate P3 change.)
 - Limits come from RiskParameters (max_daily_loss_pct / max_open_positions /
-  max_trade_notional_krw), adjustable via the existing risk-params API.
+  max_trade_notional_pct), adjustable via the existing risk-params API.
 
 Spec: docs/superpowers/specs/2026-07-11-r3-autonomous-hitl-mode-design.md §2.1
 """
@@ -207,6 +207,17 @@ async def _default_coordinator_active_provider(market: str) -> bool:
     return coordinator is not None and bool(coordinator.is_active)
 
 
+async def _default_account_equity_provider(market: str) -> Optional[float]:
+    """총평가액 = evlu_amt + d2_ord_psbl_amt (daily-loss breaker와 동일 소스, F4b/B2)."""
+    if market != "kiwoom":
+        return None  # coin은 범위 밖 (notional %상한 미적용)
+    from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+
+    client = await get_shared_kiwoom_client_async()
+    balance = await client.get_account_balance()
+    return float(balance.evlu_amt + balance.d2_ord_psbl_amt)
+
+
 # -------------------------------------------
 # The gate
 # -------------------------------------------
@@ -224,6 +235,7 @@ async def check_autonomy(
     positions_count_provider: Optional[Provider] = None,
     risk_params_provider: Optional[Callable[[], RiskParameters]] = None,
     coordinator_active_provider: Optional[Provider] = None,
+    account_equity_provider: Optional[Provider] = None,
 ) -> GateDecision:
     """Decide whether an autonomous execution is allowed. Fail-closed.
 
@@ -244,6 +256,7 @@ async def check_autonomy(
     positions_count_provider = positions_count_provider or _default_positions_count_provider
     risk_params_provider = risk_params_provider or _default_risk_params
     coordinator_active_provider = coordinator_active_provider or _default_coordinator_active_provider
+    account_equity_provider = account_equity_provider or _default_account_equity_provider
 
     # 1. Master gate (env)
     if not settings.AUTONOMY_ENABLED:
@@ -317,14 +330,23 @@ async def check_autonomy(
                 f"open positions {count} >= limit {params.max_open_positions}",
             )
 
-        # 7. Per-trade notional cap (unknown size = fail-closed)
+        # 7. Per-trade notional cap = equity × pct (fail-closed)
         if quantity is None or entry_price is None:
             return _deny("notional_cap", "quantity/entry_price unknown for a BUY/ADD")
-        notional = float(quantity) * float(entry_price)
-        if notional > params.max_trade_notional_krw:
-            return _deny(
-                "notional_cap",
-                f"notional ₩{notional:,.0f} > cap ₩{params.max_trade_notional_krw:,.0f}",
-            )
+        if market == "kiwoom":
+            try:
+                equity = await (account_equity_provider or _default_account_equity_provider)(market)
+            except Exception as e:
+                return _deny("notional_cap", f"account equity unavailable: {e}")
+            if not equity or equity <= 0:
+                return _deny("notional_cap", "account equity unknown/zero")
+            cap = equity * params.max_trade_notional_pct / 100.0
+            notional = float(quantity) * float(entry_price)
+            if notional > cap:
+                return _deny(
+                    "notional_cap",
+                    f"notional ₩{notional:,.0f} > cap ₩{cap:,.0f} "
+                    f"({params.max_trade_notional_pct}% of ₩{equity:,.0f})",
+                )
 
     return GateDecision(allowed=True, reason="ok", check="all")

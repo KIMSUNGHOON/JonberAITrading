@@ -11,6 +11,7 @@ Any provider exception denies (fail-closed).
 import pytest
 
 from services.autonomy import GateDecision, check_autonomy
+from services.trading.models import RiskParameters
 import services.autonomy.gate as gate_module
 
 
@@ -52,8 +53,17 @@ def master_on(monkeypatch):
     monkeypatch.setattr(settings, "AUTONOMY_ENABLED", True)
 
 
+async def _default_account_equity(market):
+    # T1: notional cap is now equity-relative. Default a large-but-realistic
+    # equity (10M) so pre-existing pass-fixture tests (written for the old
+    # fixed-krw cap) keep their original allow/deny outcomes without needing
+    # to touch every call site — override explicitly where a test cares.
+    return 10_000_000
+
+
 async def _check(market="kiwoom", action="BUY", quantity=10, entry_price=50_000, **overrides):
     providers = _providers()
+    providers.setdefault("account_equity_provider", _default_account_equity)
     providers.update(overrides)
     return await check_autonomy(
         market, action=action, quantity=quantity, entry_price=entry_price, **providers
@@ -168,8 +178,12 @@ class TestCoordinatorActiveGate:
         monkeypatch.setattr(deps, "_trading_coordinator_instance", FakeCoordinator())
         providers = _providers()
         providers.pop("coordinator_active_provider")
+        # T1: reaches the (kiwoom-only) notional check now — supply a
+        # deterministic equity so this stays a coordinator-active test, not
+        # an incidental notional/broker-reachability test.
         decision = await check_autonomy(
-            "kiwoom", action="BUY", quantity=10, entry_price=50_000, **providers
+            "kiwoom", action="BUY", quantity=10, entry_price=50_000,
+            account_equity_provider=_default_account_equity, **providers
         )
         assert decision == GateDecision(allowed=True, reason="ok", check="all")
 
@@ -563,3 +577,45 @@ class TestDefaultPositionsCountProvider:
         )
         assert not decision.allowed
         assert decision.check == "max_positions"
+
+
+def _params(pct=15.0):
+    p = RiskParameters()
+    p.max_trade_notional_pct = pct
+    return p
+
+
+class TestNotionalPctCap:
+    """T1: notional cap is equity-relative (equity × pct), fail-closed on a
+    broker/equity lookup failure — replaces the old fixed max_trade_notional_krw."""
+
+    async def test_notional_pct_cap_allows_and_denies(self, master_on):
+        async def equity(market):
+            return 100_000_000  # ₩100M, pct 15% → cap ₩15M
+
+        # 50×200k=₩10M < 15M → allow
+        d = await check_autonomy(
+            "kiwoom", action="BUY", quantity=50, entry_price=200_000,
+            risk_params_provider=lambda: _params(15.0), account_equity_provider=equity,
+            **_providers(),
+        )
+        assert d.allowed is True
+
+        # 100×200k=₩20M > 15M → deny
+        d = await check_autonomy(
+            "kiwoom", action="BUY", quantity=100, entry_price=200_000,
+            risk_params_provider=lambda: _params(15.0), account_equity_provider=equity,
+            **_providers(),
+        )
+        assert d.allowed is False and d.check == "notional_cap"
+
+    async def test_notional_equity_fetch_fail_fail_closed(self, master_on):
+        async def boom(market):
+            raise RuntimeError("1700")
+
+        d = await check_autonomy(
+            "kiwoom", action="BUY", quantity=1, entry_price=1000,
+            risk_params_provider=lambda: _params(15.0), account_equity_provider=boom,
+            **_providers(),
+        )
+        assert d.allowed is False and d.check == "notional_cap"

@@ -203,10 +203,10 @@ class RiskParameters(BaseModel):
         ge=1, le=50,
         description="Maximum concurrent open positions for autonomous BUY/ADD"
     )
-    max_trade_notional_krw: float = Field(
-        default=1_000_000,
-        ge=10_000,
-        description="Per-trade notional cap in KRW for autonomous BUY/ADD"
+    max_trade_notional_pct: float = Field(
+        default=15.0,
+        ge=0.5, le=50.0,
+        description="Per-trade notional cap as % of total account equity for autonomous BUY/ADD (전략이 [5,30] 바운드 내 적응)"
     )
 
     # Risk thresholds
