@@ -68,6 +68,11 @@ def wired(monkeypatch):
 
     for name in (
         "mirror_session_state", "mirror_session_status",
+        # P1-5: write-through commit_* siblings of the mirror_* pair above --
+        # same no-op treatment (see test_approval_restart_resume.py for the
+        # full rationale: these resolve get_session_manager via their own
+        # defining module, not this fixture's approval_module patch).
+        "commit_session_state", "commit_session_status",
         "broadcast_trade_rejected", "broadcast_trade_executed",
         "broadcast_trade_queued", "broadcast_watch_added",
     ):

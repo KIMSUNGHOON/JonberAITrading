@@ -112,6 +112,19 @@ def wired(monkeypatch):
     for name in (
         "mirror_session_state",
         "mirror_session_status",
+        # P1-5: the decision-entry + final-status sites in
+        # _submit_decision_locked now write through commit_session_state/
+        # commit_session_status instead of the best-effort mirror_* pair --
+        # those helpers are DEFINED in services/session_manager.py, so their
+        # internal `get_session_manager()` call resolves via THAT module's
+        # globals, not this fixture's `set_sm_session` patch of
+        # approval_module.get_session_manager (a name-binding in a
+        # DIFFERENT module's namespace). Left unfaked, they would hit the
+        # real singleton, find this test's session_id untracked, and raise
+        # -- exactly the same reason mirror_session_state/status above are
+        # no-op'd rather than routed through _FakeSessionManager.
+        "commit_session_state",
+        "commit_session_status",
         "broadcast_trade_rejected",
         "broadcast_trade_executed",
         "broadcast_trade_queued",
@@ -560,6 +573,11 @@ async def test_concurrent_cancel_during_slow_reject_is_serialized(wired, monkeyp
         mirrored_statuses.append(st)
 
     monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+    # P1-5: the reject's own final-status write now goes through the
+    # write-through commit_session_status, not the best-effort mirror_* --
+    # route it into the SAME capture list so the interleaving-order
+    # assertion below still sees both decisions' status transitions.
+    monkeypatch.setattr(approval_module, "commit_session_status", capture_mirror_status)
 
     reject_task = asyncio.create_task(
         approval_module.submit_decision(session_id, "rejected", feedback="retry")
@@ -723,6 +741,10 @@ async def test_completion_preserves_cancel_marked_during_resume(wired, monkeypat
         mirrored_statuses.append(st)
 
     monkeypatch.setattr(approval_module, "mirror_session_status", capture_mirror_status)
+    # P1-5: the final-status write this test pins ("cancelled" preserved
+    # through the belt-and-braces check) now goes through the write-through
+    # commit_session_status, not the best-effort mirror_session_status.
+    monkeypatch.setattr(approval_module, "commit_session_status", capture_mirror_status)
 
     result = await approval_module.submit_decision(session_id, "rejected", feedback="x")
 

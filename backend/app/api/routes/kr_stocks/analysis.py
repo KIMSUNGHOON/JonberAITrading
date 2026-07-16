@@ -9,6 +9,7 @@ Endpoints for stock analysis:
 
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 import structlog
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
@@ -31,6 +32,7 @@ from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from services.session_manager import (
     MarketType,
     SessionStatus,
+    commit_session_status,
     get_session_manager,
     mirror_session_state,
     mirror_session_status,
@@ -192,10 +194,21 @@ async def start_kr_stock_analysis(
             state={**initial_state, "reasoning_log": []},
         )
     except Exception as e:
-        logger.warning(
-            "sm_session_registration_failed",
+        # P1: with C-only reads a session that failed SM registration is
+        # invisible everywhere -- fail fast instead of running blind. No
+        # analysis slot was acquired yet at this point (that happens inside
+        # run_kr_stock_analysis_task, which this failure prevents from ever
+        # being scheduled), so there is nothing to release here.
+        logger.error(
+            "session_manager_create_failed_failfast",
             session_id=session_id,
             error=str(e),
+        )
+        kr_stock_sessions[session_id]["status"] = "error"
+        kr_stock_sessions[session_id]["error"] = f"session registry create failed: {e}"
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"session registry create failed: {e}",
         )
 
     # Run analysis in background
@@ -212,6 +225,41 @@ async def start_kr_stock_analysis(
         message="한국주식 분석이 시작되었습니다. WebSocket으로 실시간 업데이트를 받을 수 있습니다.",
         position_exists=position_exists,
     )
+
+
+async def _finalize_awaiting_transition(session_id: str, session: dict) -> None:
+    """
+    Awaiting-critical write-through (P1, spec §P1): the AWAITING_APPROVAL
+    transition MUST land in the SessionManager -- with C-only reads a session
+    whose transition never reached the SM is an invisible interrupt (parked
+    graph nobody can see or approve). One retry, then fail closed: the session
+    becomes ERROR in BOTH stores and no auto-approve is scheduled.
+    """
+    last_error: Optional[Exception] = None
+    for _attempt in range(2):
+        try:
+            await commit_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
+            session["status"] = "awaiting_approval"
+            logger.info("kr_stock_analysis_awaiting_approval", session_id=session_id)
+            await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+            return
+        except Exception as e:  # noqa: BLE001 -- any SM failure fails closed below
+            last_error = e
+
+    session["status"] = "error"
+    session["error"] = f"awaiting transition write-through failed: {last_error}"
+    session["state"]["awaiting_approval"] = False
+    session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
+        "[Error] 승인대기 상태를 영속 저장소에 기록하지 못해 세션을 안전 종료했습니다."
+    ]
+    logger.critical(
+        "awaiting_writethrough_failclosed",
+        session_id=session_id,
+        error=str(last_error),
+    )
+    # Best-effort: try to land the ERROR in the SM too (same failure likely,
+    # but the reconcile pass will repair a stale AWAITING row on restart).
+    await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
 
 
 async def run_kr_stock_analysis_task(session_id: str):
@@ -288,16 +336,9 @@ async def run_kr_stock_analysis_task(session_id: str):
             # cancelled status must not be overwritten by this final write.
             pass
         elif state.get("awaiting_approval"):
-            session["status"] = "awaiting_approval"
-            await mirror_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
-            logger.info(
-                "kr_stock_analysis_awaiting_approval",
-                session_id=session_id,
-                stk_cd=stk_cd,
-            )
-            # R3: in autonomous mode (gate-checked) this schedules a 60s-grace
-            # auto-approval; in HITL mode (or any gate deny) it is a no-op.
-            await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+            # P1-5: write-through -- fails closed to ERROR (both stores) if the
+            # SM commit doesn't land, instead of silently mirroring best-effort.
+            await _finalize_awaiting_transition(session_id, session)
         elif state.get("error"):
             session["status"] = "error"
             session["error"] = state.get("error")
@@ -481,20 +522,29 @@ async def cancel_kr_stock_analysis(session_id: str):
         # restart then resurrects this cancelled session as a visible-but-unapprovable
         # zombie (approve → 400 "Session is not awaiting approval"). Do not swallow
         # that failure: log it loudly and tell the caller via `mirror_failed`.
+        # P1-5: one retry before surfacing mirror_failed -- a transient SQLite
+        # hiccup should not zombie-resurrect this session on restart if a
+        # single retry would have landed the write.
         mirror_failed = False
-        try:
-            manager = await get_session_manager()
-            await manager.update_status(session_id, SessionStatus.CANCELLED)
-            await manager.update_state(
-                session_id,
-                {"awaiting_approval": False, "approval_status": "cancelled"},
-            )
-        except Exception as e:
+        last_error: Optional[Exception] = None
+        for _attempt in range(2):
+            try:
+                manager = await get_session_manager()
+                await manager.update_status(session_id, SessionStatus.CANCELLED)
+                await manager.update_state(
+                    session_id,
+                    {"awaiting_approval": False, "approval_status": "cancelled"},
+                )
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+        if last_error is not None:
             mirror_failed = True
             logger.error(
                 "kr_stock_analysis_cancel_mirror_failed",
                 session_id=session_id,
-                error=str(e),
+                error=str(last_error),
             )
 
         logger.info("kr_stock_analysis_cancelled", session_id=session_id)

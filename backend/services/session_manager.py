@@ -986,6 +986,48 @@ async def mirror_session_removal(session_id: str) -> None:
 
 
 # -------------------------------------------
+# Write-through Commits (Awaiting-critical Transitions)
+# -------------------------------------------
+# Unlike the mirror_* helpers above, these RAISE on any failure — including
+# the session not being tracked by the SessionManager at all. Reserved for
+# transitions where a swallowed failure would create an "invisible interrupt"
+# (P1, spec §P1): a session parked awaiting approval that no read surface can
+# see, because C-only reads mean the SessionManager IS the read path. Callers
+# are expected to fail closed (see kr_stocks/analysis.py
+# _finalize_awaiting_transition and app/api/routes/approval.py).
+
+
+async def commit_session_status(
+    session_id: str,
+    status: "SessionStatus",
+    *,
+    error: Optional[str] = None,
+) -> None:
+    """
+    Write-through variant of mirror_session_status for awaiting-critical
+    transitions (P1, spec §P1): raises on ANY failure — including the session
+    not being tracked — instead of swallowing. Callers fail closed.
+    """
+    manager = await get_session_manager()
+    if await manager.get_session(session_id) is None:
+        raise KeyError(f"session {session_id} not tracked by SessionManager")
+    await manager.update_status(session_id, status, error=error)
+
+
+async def commit_session_state(
+    session_id: str,
+    state_updates: Dict[str, Any],
+    *,
+    last_node: Optional[str] = None,
+) -> None:
+    """Write-through variant of mirror_session_state — raises on failure."""
+    manager = await get_session_manager()
+    if await manager.get_session(session_id) is None:
+        raise KeyError(f"session {session_id} not tracked by SessionManager")
+    await manager.update_state(session_id, state_updates, last_node=last_node)
+
+
+# -------------------------------------------
 # Convenience Functions (Backward Compatibility)
 # -------------------------------------------
 

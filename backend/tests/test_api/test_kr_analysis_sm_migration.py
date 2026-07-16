@@ -13,7 +13,7 @@ import asyncio
 import os
 
 import pytest
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 import services.session_manager as sm_module
 from services.session_manager import MarketType, SessionManager, SessionStatus
@@ -485,20 +485,28 @@ async def test_analysis_task_survives_sm_mirror_failure(sm, kr_sessions, monkeyp
     assert record["error"] is None
 
 
-async def test_start_route_survives_sm_registration_failure(sm, kr_sessions, fake_kiwoom, monkeypatch):
-    """sm registration failure must degrade to poll-only, not 500 the start route."""
+async def test_start_route_failfast_on_sm_registration_failure(sm, kr_sessions, fake_kiwoom, monkeypatch):
+    """P1-5: sm registration failure must fail the start route loud (503), not
+    silently degrade to poll-only -- with C-only reads (SESSION_SSOT_READS,
+    the default) a session the SM never registered is invisible to every read
+    surface, so a 200 "started" response here would be lying to the caller.
+    Supersedes the pre-P1-5 "must degrade" contract this test used to assert."""
 
     async def boom(*args, **kwargs):
         raise RuntimeError("sqlite down")
 
     monkeypatch.setattr(sm, "create_session", boom)
 
-    response = await start_kr_stock_analysis(
-        KRStockAnalysisRequest(stk_cd="005930"), BackgroundTasks()
-    )
+    with pytest.raises(HTTPException) as exc_info:
+        await start_kr_stock_analysis(
+            KRStockAnalysisRequest(stk_cd="005930"), BackgroundTasks()
+        )
 
-    assert response.status == "started"
-    assert response.session_id in kr_sessions
+    assert exc_info.value.status_code == 503
+    # The legacy dict record still exists (created before the sm call) but is
+    # marked error, not left as a silently-running phantom.
+    session_id = next(iter(kr_sessions))
+    assert kr_sessions[session_id]["status"] == "error"
 
 
 async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, kr_sessions, monkeypatch):

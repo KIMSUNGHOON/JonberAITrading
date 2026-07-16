@@ -96,6 +96,12 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(approval_module, "mirror_session_state", noop)
     monkeypatch.setattr(approval_module, "mirror_session_status", noop)
+    # P1-5: the decision-entry + final-status sites now go through the
+    # write-through commit_* helpers instead of the best-effort mirror_*
+    # ones -- same no-op treatment, otherwise they'd hit the real
+    # (untracked-session) SessionManager singleton and fail loud with a 503.
+    monkeypatch.setattr(approval_module, "commit_session_state", noop)
+    monkeypatch.setattr(approval_module, "commit_session_status", noop)
     monkeypatch.setattr(approval_module, "broadcast_watch_added", noop)
 
     ws_calls = {"executed": [], "queued": [], "rejected": []}

@@ -12,7 +12,7 @@ import asyncio
 import os
 
 import pytest
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 import services.session_manager as sm_module
 from services.session_manager import MarketType, SessionManager, SessionStatus
@@ -445,15 +445,22 @@ async def test_analysis_task_survives_sm_mirror_failure(sm, coin_sessions_fixtur
     assert record["error"] is None
 
 
-async def test_start_route_survives_sm_registration_failure(sm, coin_sessions_fixture, monkeypatch):
+async def test_start_route_failfast_on_sm_registration_failure(sm, coin_sessions_fixture, monkeypatch):
+    """P1-5: sm registration failure must fail the start route loud (503), not
+    silently degrade to poll-only -- see the KR analog in
+    test_kr_analysis_sm_migration.py for the full rationale (C-only reads
+    make an sm-unregistered session invisible everywhere)."""
+
     async def boom(*args, **kwargs):
         raise RuntimeError("sqlite down")
 
     monkeypatch.setattr(sm, "create_session", boom)
 
-    response = await start_coin_analysis(
-        CoinAnalysisRequest(market="KRW-BTC"), BackgroundTasks()
-    )
+    with pytest.raises(HTTPException) as exc_info:
+        await start_coin_analysis(
+            CoinAnalysisRequest(market="KRW-BTC"), BackgroundTasks()
+        )
 
-    assert response.status == "started"
-    assert response.session_id in coin_sessions_fixture
+    assert exc_info.value.status_code == 503
+    session_id = next(iter(coin_sessions_fixture))
+    assert coin_sessions_fixture[session_id]["status"] == "error"

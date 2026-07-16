@@ -28,6 +28,8 @@ from app.dependencies import get_trading_coordinator
 from services.session_manager import (
     MarketType,
     SessionStatus,
+    commit_session_state,
+    commit_session_status,
     get_session_manager,
     mirror_session_state,
     mirror_session_status,
@@ -293,10 +295,11 @@ async def _submit_decision_locked(
                         value=value,
                     )
 
-    # Mirror the decision into the SessionManager (best-effort, no-op for
-    # sessions not tracked there). Without this, sm-tracked sessions stay
-    # AWAITING_APPROVAL forever (never TTL-cleaned) and the session WebSocket's
-    # sm fallback would replay the already-decided proposal after a restart.
+    # Mirror the decision into the SessionManager. P1-5: write-through -- the
+    # decision MUST land in the SM before the graph resumes below (which may
+    # place a real broker order). A swallowed failure here would leave the SM
+    # stuck AWAITING_APPROVAL forever with no persisted record the decision
+    # was ever made, so this fails loud instead of proceeding blind.
     decision_updates = {
         "approval_status": decision,
         "user_feedback": feedback,
@@ -306,7 +309,19 @@ async def _submit_decision_locked(
     }
     if decision == "modified" and state.get("trade_proposal"):
         decision_updates["trade_proposal"] = state["trade_proposal"]
-    await mirror_session_state(session_id, decision_updates)
+    try:
+        await commit_session_state(session_id, decision_updates)
+    except Exception as e:
+        logger.critical(
+            "approval_decision_writethrough_failed",
+            session_id=session_id,
+            decision=decision,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="approval state could not be persisted — retry",
+        )
 
     # Resume graph execution - select appropriate graph based on session type
     if session_id in kr_stock_sessions:
@@ -463,8 +478,30 @@ async def _submit_decision_locked(
             session["status"] = "cancelled"
             execution_status = "cancelled"
 
-        # Mirror the final status to the SessionManager (completed/running/cancelled)
-        await mirror_session_status(session_id, session["status"])
+        # Mirror the final status to the SessionManager (completed/running/
+        # cancelled). P1-5: write-through -- for a decision that may already
+        # have executed a broker order (approved/modified), a silently
+        # swallowed mirror failure here would leave the SM showing a stale
+        # AWAITING_APPROVAL status for a session that is actually done.
+        try:
+            # commit_session_status is a strict (enum-only) write-through --
+            # session["status"] here is always a plain str value assigned a
+            # few lines above (completed/running/cancelled), so it must be
+            # coerced back to SessionStatus (unlike mirror_session_status,
+            # which does this conversion internally as a str-or-enum
+            # convenience for its best-effort callers).
+            await commit_session_status(session_id, SessionStatus(session["status"]))
+        except Exception as e:
+            logger.critical(
+                "approval_final_status_writethrough_failed",
+                session_id=session_id,
+                status=session["status"],
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="approval state could not be persisted — retry",
+            )
 
         # Log state AFTER approval to verify analysis results are preserved
         logger.info(
@@ -612,6 +649,11 @@ async def _submit_decision_locked(
         except Exception as te:
             logger.warning("telegram_notification_failed", error=str(te))
 
+    except HTTPException:
+        # P1-5: a deliberate fail-loud raise (SM write-through failures
+        # above) must propagate with its own status/detail -- the generic
+        # handler below must not rewrap it into a 500.
+        raise
     except Exception as e:
         logger.error(
             "approval_processing_failed",

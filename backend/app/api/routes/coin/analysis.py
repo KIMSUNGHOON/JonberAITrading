@@ -9,6 +9,7 @@ Endpoints for coin analysis:
 
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 import structlog
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
@@ -31,6 +32,7 @@ from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from services.session_manager import (
     MarketType,
     SessionStatus,
+    commit_session_status,
     get_session_manager,
     mirror_session_state,
     mirror_session_status,
@@ -152,10 +154,21 @@ async def start_coin_analysis(
             state={**initial_state, "reasoning_log": []},
         )
     except Exception as e:
-        logger.warning(
-            "sm_session_registration_failed",
+        # P1: with C-only reads a session that failed SM registration is
+        # invisible everywhere -- fail fast instead of running blind. No
+        # analysis slot was acquired yet at this point (that happens inside
+        # run_coin_analysis_task, which this failure prevents from ever
+        # being scheduled), so there is nothing to release here.
+        logger.error(
+            "session_manager_create_failed_failfast",
             session_id=session_id,
             error=str(e),
+        )
+        coin_sessions[session_id]["status"] = "error"
+        coin_sessions[session_id]["error"] = f"session registry create failed: {e}"
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"session registry create failed: {e}",
         )
 
     # Run analysis in background
@@ -171,6 +184,44 @@ async def start_coin_analysis(
         message="Coin analysis started. Connect to WebSocket for live updates.",
         position_exists=position_exists,
     )
+
+
+async def _finalize_awaiting_transition(session_id: str, session: dict) -> None:
+    """
+    Awaiting-critical write-through (P1, spec §P1): coin's counterpart to the
+    kr_stocks/analysis.py helper of the same name -- see that docstring for
+    the full rationale (C-only reads make an SM-invisible AWAITING_APPROVAL
+    transition a parked graph nobody can see or approve). One retry, then
+    fail closed: the session becomes ERROR in BOTH stores and no
+    auto-approve is scheduled.
+    """
+    last_error: Optional[Exception] = None
+    for _attempt in range(2):
+        try:
+            await commit_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
+            session["status"] = "awaiting_approval"
+            update_session_status(session_id, "awaiting_approval")
+            logger.info("coin_analysis_awaiting_approval", session_id=session_id)
+            await maybe_schedule_auto_approve(session_id, "coin", session)
+            return
+        except Exception as e:  # noqa: BLE001 -- any SM failure fails closed below
+            last_error = e
+
+    session["status"] = "error"
+    session["error"] = f"awaiting transition write-through failed: {last_error}"
+    session["state"]["awaiting_approval"] = False
+    session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
+        "[Error] Failed to persist awaiting-approval state -- session safely terminated."
+    ]
+    update_session_status(session_id, "error", session["error"])
+    logger.critical(
+        "awaiting_writethrough_failclosed",
+        session_id=session_id,
+        error=str(last_error),
+    )
+    # Best-effort: try to land the ERROR in the SM too (same failure likely,
+    # but the reconcile pass will repair a stale AWAITING row on restart).
+    await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
 
 
 async def run_coin_analysis_task(session_id: str):
@@ -252,17 +303,9 @@ async def run_coin_analysis_task(session_id: str):
             # cancelled status must not be overwritten by this final write.
             pass
         elif state.get("awaiting_approval"):
-            session["status"] = "awaiting_approval"
-            update_session_status(session_id, "awaiting_approval")
-            await mirror_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
-            logger.info(
-                "coin_analysis_awaiting_approval",
-                session_id=session_id,
-                market=market,
-            )
-            # R3: in autonomous mode (gate-checked) this schedules a 60s-grace
-            # auto-approval; in HITL mode (or any gate deny) it is a no-op.
-            await maybe_schedule_auto_approve(session_id, "coin", session)
+            # P1-5: write-through -- fails closed to ERROR (both stores) if the
+            # SM commit doesn't land, instead of silently mirroring best-effort.
+            await _finalize_awaiting_transition(session_id, session)
         elif state.get("error"):
             session["status"] = "error"
             session["error"] = state.get("error")
@@ -440,13 +483,33 @@ async def cancel_coin_analysis(session_id: str):
         session["state"]["reasoning_log"].append("[System] Analysis cancelled by user")
 
         # Mirror to sm — the notify wakes the WebSocket, which re-reads the fresh
-        # legacy snapshot (cancelled status + the appended log entry).
-        await mirror_session_status(session_id, SessionStatus.CANCELLED)
-        await mirror_session_state(
-            session_id,
-            {"awaiting_approval": False, "approval_status": "cancelled"},
-        )
+        # legacy snapshot (cancelled status + the appended log entry). Unified
+        # with the kr_stocks cancel route (P1-5): direct manager calls + one
+        # retry + mirror_failed surfaced to the caller instead of a swallowed
+        # best-effort mirror -- see that route's zombie-resurrection comment
+        # for the full rationale.
+        mirror_failed = False
+        last_error: Optional[Exception] = None
+        for _attempt in range(2):
+            try:
+                manager = await get_session_manager()
+                await manager.update_status(session_id, SessionStatus.CANCELLED)
+                await manager.update_state(
+                    session_id,
+                    {"awaiting_approval": False, "approval_status": "cancelled"},
+                )
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+        if last_error is not None:
+            mirror_failed = True
+            logger.error(
+                "coin_analysis_cancel_mirror_failed",
+                session_id=session_id,
+                error=str(last_error),
+            )
 
         logger.info("coin_analysis_cancelled", session_id=session_id)
 
-        return {"message": f"Session {session_id} cancelled"}
+        return {"message": f"Session {session_id} cancelled", "mirror_failed": mirror_failed}
