@@ -35,12 +35,18 @@ async def fetch_index_snapshot(client: Any) -> Optional[dict]:
     """KOSPI(001)/KOSDAQ(101) 종합지수 레벨·등락률. 둘 다 실패 → None."""
     if client is None:
         return None
+
     try:
         kospi_rows = await client.get_sector_index(_KOSPI_CODE)
+    except Exception as e:
+        logger.warning(f"[MarketData] fetch_index_snapshot({_KOSPI_CODE}) failed: {e}")
+        kospi_rows = None
+
+    try:
         kosdaq_rows = await client.get_sector_index(_KOSDAQ_CODE)
     except Exception as e:
-        logger.warning(f"[MarketData] fetch_index_snapshot failed: {e}")
-        return None
+        logger.warning(f"[MarketData] fetch_index_snapshot({_KOSDAQ_CODE}) failed: {e}")
+        kosdaq_rows = None
 
     kospi = _pick_composite(kospi_rows, _KOSPI_CODE)
     kosdaq = _pick_composite(kosdaq_rows, _KOSDAQ_CODE)
