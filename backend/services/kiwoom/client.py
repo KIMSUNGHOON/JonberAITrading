@@ -612,6 +612,64 @@ class KiwoomClient:
 
         return chart_data
 
+    async def get_sector_index(self, inds_cd: str = "001") -> Optional[list[dict]]:
+        """전업종지수요청 (ka20003). inds_cd: "001"=KOSPI계열, "101"=KOSDAQ계열.
+        실패-무해: 예외/빈응답이면 None (EOD 배치가 절대 안 깨지도록)."""
+        try:
+            result = await self._request(
+                api_id="ka20003",
+                endpoint="/api/dostk/sect",
+                data={"inds_cd": inds_cd},
+            )
+            rows = result.get("all_inds_idex")
+            if not rows:
+                return None
+            out = []
+            for r in rows:
+                out.append({
+                    "stk_cd": r.get("stk_cd", ""),
+                    "stk_nm": r.get("stk_nm", ""),
+                    "cur_prc": abs(self._parse_float(r.get("cur_prc"))),  # 부호=방향
+                    "chg_pct": self._parse_float(r.get("flu_rt")),        # 부호 유지
+                    "rising": int(self._parse_float(r.get("rising"))),
+                    "stdns": int(self._parse_float(r.get("stdns"))),
+                    "fall": int(self._parse_float(r.get("fall"))),
+                })
+            return out
+        except Exception as e:
+            logger.warning(f"[Kiwoom] get_sector_index({inds_cd}) failed: {e}")
+            return None
+
+    async def get_inst_foreign_flow(self, mrkt_tp: str = "001") -> Optional[list[dict]]:
+        """기관외국인연속매매현황요청 (ka10131). mrkt_tp: "001"=KOSPI, "101"=KOSDAQ.
+        실패-무해: 예외/빈응답이면 None."""
+        try:
+            result = await self._request(
+                api_id="ka10131",
+                endpoint="/api/dostk/frgnistt",
+                data={
+                    "dt": "1", "strt_dt": "", "end_dt": "",
+                    "mrkt_tp": mrkt_tp, "netslmt_tp": "2", "stk_inds_tp": "0",
+                    "amt_qty_tp": "0", "stex_tp": "1",
+                },
+            )
+            rows = result.get("orgn_frgnr_cont_trde_prst")
+            if not rows:
+                return None
+            out = []
+            for r in rows:
+                out.append({
+                    "stk_cd": r.get("stk_cd", ""),
+                    "orgn_net_amt": self._parse_float(r.get("orgn_nettrde_amt")),
+                    "frgnr_net_amt": self._parse_float(r.get("frgnr_nettrde_amt")),
+                    "orgn_cont_days": int(self._parse_float(r.get("orgn_cont_netprps_dys"))),
+                    "frgnr_cont_days": int(self._parse_float(r.get("frgnr_cont_netprps_dys"))),
+                })
+            return out
+        except Exception as e:
+            logger.warning(f"[Kiwoom] get_inst_foreign_flow({mrkt_tp}) failed: {e}")
+            return None
+
     async def get_daily_chart_df(
         self,
         stk_cd: str,

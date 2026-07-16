@@ -320,6 +320,8 @@ API_REQUEST_TYPE_MAP = {
     "ka10081": RequestType.QUERY,  # 일봉차트
     "ka10075": RequestType.QUERY,  # 미체결
     "ka10076": RequestType.QUERY,  # 체결
+    "ka20003": RequestType.QUERY,  # 전업종지수 (Phase5)
+    "ka10131": RequestType.QUERY,  # 기관외국인연속매매 (Phase5)
     "kt00001": RequestType.QUERY,  # 예수금상세
     "kt00004": RequestType.QUERY,  # 계좌평가현황
 
