@@ -18,6 +18,21 @@ Invariants:
   plain HITL; any exception → the session stays awaiting_approval and the
   normal HITL flow owns it.
 
+P2-6 (session-SSOT): this module is a native SessionManager (SM) reader/
+writer. Every entry point takes only a `session_id` (+ `market` where the
+caller already knows it) — never a session dict/snapshot/view — and resolves
+the live AnalysisSession itself via `sm.get_session(session_id)`, both at
+schedule time (maybe_schedule_auto_approve) and again inside the grace
+task's re-check (_auto_approve_after_grace). auto_approve_at / reasoning_log
+writes go through a single `sm.update_state(...)` call; there is no longer a
+"mutate a shared dict, then best-effort mirror_session_state it" pair to keep
+in sync, and no snapshot anywhere in this path that can go stale relative to
+a decision another caller records during the grace window. This retired
+approval.py's `_SmSessionView` shim (it existed only to hand this module
+something dict-shaped from a live AnalysisSession) and the
+`sm_session.to_legacy_dict()` calls the KR/coin producers and the rearm scan
+used to build for it.
+
 Spec: docs/superpowers/specs/2026-07-11-r3-autonomous-hitl-mode-design.md §2.4
 """
 
@@ -32,7 +47,6 @@ from services.session_manager import (
     MarketType,
     SessionStatus,
     get_session_manager,
-    mirror_session_state,
 )
 
 logger = structlog.get_logger()
@@ -41,8 +55,11 @@ logger = structlog.get_logger()
 AUTONOMY_GRACE_SECONDS = 60.0
 
 
-def _proposal_fields(session: dict) -> dict:
-    proposal = session.get("state", {}).get("trade_proposal") or {}
+def _proposal_fields(state: dict) -> dict:
+    """P2-6: operates on a session's `state` dict directly (a live
+    AnalysisSession.state reference) — callers no longer wrap it in a
+    session-shaped dict first."""
+    proposal = state.get("trade_proposal") or {}
     action = proposal.get("action", "HOLD")
     if hasattr(action, "value"):
         action = action.value
@@ -53,14 +70,31 @@ def _proposal_fields(session: dict) -> dict:
     }
 
 
-async def maybe_schedule_auto_approve(session_id: str, market: str, session: dict) -> None:
-    """Called by a producer right after it set awaiting_approval (+ mirrors).
+async def maybe_schedule_auto_approve(session_id: str, market: str) -> None:
+    """Called by a producer (or approval.py's reject->re-analysis rearm)
+    right after it committed awaiting_approval to the SessionManager.
+    Pre-checks the gate; if allowed, announces the countdown and schedules
+    the grace task. A deny here writes NOTHING — the session is ordinary
+    HITL.
 
-    Pre-checks the gate; if allowed, announces the countdown and schedules the
-    grace task. A deny here writes NOTHING — the session is ordinary HITL.
+    P2-6: no `session` argument — the session is resolved here via a live
+    `sm.get_session(session_id)` lookup. A session that has vanished from
+    the SM by the time this runs (removed, or never existed — e.g. a
+    kill-switch-only legacy-dict candidate, see rearm_awaiting_approvals) is
+    a no-op: nothing to schedule against.
     """
     try:
-        fields = _proposal_fields(session)
+        sm = await get_session_manager()
+        sm_session = await sm.get_session(session_id)
+        if sm_session is None:
+            logger.warning(
+                "auto_approve_schedule_skipped_session_missing",
+                session_id=session_id,
+                market=market,
+            )
+            return
+
+        fields = _proposal_fields(sm_session.state)
         decision = await check_autonomy(market, **fields)
         if not decision.allowed:
             logger.info(
@@ -77,28 +111,30 @@ async def maybe_schedule_auto_approve(session_id: str, market: str, session: dic
         ).isoformat()
         grace_secs = int(AUTONOMY_GRACE_SECONDS)
 
-        # Legacy first (the WS read path), then the sm mirror (fires the push).
-        state = session["state"]
-        state["auto_approve_at"] = auto_approve_at
-        state["reasoning_log"] = state.get("reasoning_log", []) + [
+        # Single write-through: sm.update_state applies both keys to the
+        # live SM row, flushes them (auto_approve_at is a critical key —
+        # see services/session_manager.py::_CRITICAL_STATE_KEYS), and
+        # notifies WS subscribers — replacing the old "mutate the shared
+        # dict directly, then best-effort mirror_session_state" pair.
+        reasoning_log = sm_session.state.get("reasoning_log", []) + [
             f"[System] {grace_secs}초 후 자율 승인 예정 — REJECT로 거부 가능"
         ]
-        await mirror_session_state(
+        await sm.update_state(
             session_id,
-            {"auto_approve_at": auto_approve_at, "reasoning_log": state["reasoning_log"]},
+            {"auto_approve_at": auto_approve_at, "reasoning_log": reasoning_log},
         )
 
         await _notify_pending(session_id, market, fields, grace_secs)
 
         # Pin the proposal identity: the grace task may only approve the exact
         # proposal it announced. A reject→re-analyze cycle mutates the SAME
-        # session dict in place and can re-arm awaiting_approval with a NEW
+        # SM row in place and can re-arm awaiting_approval with a NEW
         # proposal — without this pin the stale timer could approve a proposal
         # the user never saw (and with zero grace).
-        proposal_id = (session["state"].get("trade_proposal") or {}).get("id")
+        proposal_id = (sm_session.state.get("trade_proposal") or {}).get("id")
 
         asyncio.create_task(
-            _auto_approve_after_grace(session_id, market, session, proposal_id)
+            _auto_approve_after_grace(session_id, market, proposal_id)
         )
         logger.info(
             "auto_approve_scheduled",
@@ -111,27 +147,40 @@ async def maybe_schedule_auto_approve(session_id: str, market: str, session: dic
         logger.error("auto_approve_schedule_failed", session_id=session_id, error=str(e))
 
 
-async def _clear_countdown(session_id: str, session: dict) -> None:
-    """Remove a no-longer-valid auto_approve_at from state + the sm mirror so
-    late-joining WS clients and restart recovery never see a stale countdown."""
-    session["state"].pop("auto_approve_at", None)
-    await mirror_session_state(session_id, {"auto_approve_at": None})
+async def _clear_countdown(session_id: str) -> None:
+    """Remove a no-longer-valid auto_approve_at directly on the SM so
+    late-joining WS clients and restart recovery never see a stale
+    countdown. Only ever called from inside _auto_approve_after_grace's own
+    try/except (fail-closed logging), so no separate error handling here —
+    a raise here (e.g. the session was removed between the caller's checks
+    and this call) just gets logged as auto_approve_failed."""
+    sm = await get_session_manager()
+    await sm.update_state(session_id, {"auto_approve_at": None})
 
 
 async def _auto_approve_after_grace(
-    session_id: str, market: str, session: dict, proposal_id: str | None
+    session_id: str, market: str, proposal_id: str | None
 ) -> None:
     try:
         await asyncio.sleep(AUTONOMY_GRACE_SECONDS)
 
-        state = session["state"]
+        sm = await get_session_manager()
+        sm_session = await sm.get_session(session_id)
+        if sm_session is None:
+            logger.info("auto_approve_stood_down_session_missing", session_id=session_id)
+            return
 
-        # Manual decisions during the grace always win. approval_status is set
-        # the moment ANY decision is recorded — it also guards the brief
-        # mid-reject window where the resuming graph re-emits
-        # awaiting_approval=True before re_analyze clears it.
+        state = sm_session.state
+
+        # Manual decisions during the grace always win. Read LIVE off the SM
+        # (P2-6): sm_session is the exact object any concurrent writer
+        # (submit_decision, a cancel route, ...) mutates in place, so this
+        # always observes the latest status/state, never a frozen snapshot.
+        # approval_status is set the moment ANY decision is recorded — it
+        # also guards the brief mid-reject window where the resuming graph
+        # re-emits awaiting_approval=True before re_analyze clears it.
         if (
-            session.get("status") != "awaiting_approval"
+            sm_session.status != SessionStatus.AWAITING_APPROVAL
             or not state.get("awaiting_approval")
             or state.get("approval_status")
         ):
@@ -149,19 +198,17 @@ async def _auto_approve_after_grace(
                 scheduled_for=proposal_id,
                 current=current_id,
             )
-            await _clear_countdown(session_id, session)
+            await _clear_countdown(session_id)
             return
 
         # Re-check the gate — the mode may have been flipped or a limit tripped
         # during the grace window.
-        decision = await check_autonomy(market, **_proposal_fields(session))
+        decision = await check_autonomy(market, **_proposal_fields(state))
         if not decision.allowed:
             entry = f"[System] 자율 승인 취소: {decision.reason}"
-            session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [entry]
-            await mirror_session_state(
-                session_id, {"reasoning_log": session["state"]["reasoning_log"]}
-            )
-            await _clear_countdown(session_id, session)
+            reasoning_log = state.get("reasoning_log", []) + [entry]
+            await sm.update_state(session_id, {"reasoning_log": reasoning_log})
+            await _clear_countdown(session_id)
             logger.info(
                 "auto_approve_cancelled_at_recheck",
                 session_id=session_id,
@@ -229,8 +276,15 @@ def _has_future_auto_approve_at(value) -> bool:
 
 
 def _scan_legacy_dict(get_dict, market: str, candidates: dict) -> None:
-    """Add every AWAITING_APPROVAL session from a legacy in-memory dict into
-    `candidates` (session_id -> (market, session)), first-writer-wins."""
+    """Add every AWAITING_APPROVAL session_id from a legacy in-memory dict
+    into `candidates` (session_id -> market), first-writer-wins.
+
+    P2-6: candidates map to a plain market string now, not a
+    (market, session) snapshot pair — maybe_schedule_auto_approve no longer
+    accepts a session argument at all, so there is nothing left to snapshot
+    here; every candidate's actual state is re-resolved live from the SM
+    right before it is scheduled (see rearm_awaiting_approvals's final
+    loop)."""
     try:
         sessions = get_dict()
     except Exception as e:
@@ -240,7 +294,7 @@ def _scan_legacy_dict(get_dict, market: str, candidates: dict) -> None:
     for session_id, session in sessions.items():
         try:
             if session.get("status") == SessionStatus.AWAITING_APPROVAL.value:
-                candidates.setdefault(session_id, (market, session))
+                candidates.setdefault(session_id, market)
         except Exception as e:
             logger.error(
                 "autonomy_rearm_legacy_scan_failed",
@@ -270,14 +324,20 @@ async def rearm_awaiting_approvals() -> None:
     sole rearm source, so the old "legacy wins" tie-break for a session
     found in both places is obsolete.
 
-    SESSION_SSOT_READS=False (kill switch) restores the pre-P1-4 fallback:
-    the legacy dicts (kr_stock_sessions / coin_sessions) are scanned too,
-    defensively, in case this is ever invoked again on a warm process (e.g.
-    a future coordinator-start hook) where they are already populated. A
-    session found in a legacy dict wins over its SessionManager copy for the
-    same session_id in that branch (the legacy dict is the live,
-    mutation-of-record object producers and approval.py read/write during
-    normal operation).
+    SESSION_SSOT_READS=False (kill switch): P2-6 declares this branch
+    INVALID going forward (see the field's docstring in app/config.py) — it
+    is left in place unchanged (P3-1 deletes it) so flipping the flag stays
+    a pure config change, but it no longer restores any real fallback
+    behavior. It still scans the legacy dicts (kr_stock_sessions /
+    coin_sessions) for AWAITING_APPROVAL entries, but nothing has written to
+    those dicts since P2 — so in practice this scan only ever adds
+    candidates that either don't exist, or are also independently found via
+    the SessionManager scan below (in which case the SM copy is skipped as a
+    duplicate, since a legacy-scan candidate already claimed the session_id
+    key). Even in the hypothetical case of a genuine legacy-only session,
+    maybe_schedule_auto_approve (P2-6) now ALWAYS re-resolves the session via
+    a live sm.get_session() call before doing anything — a session that was
+    never created in the SM simply schedules nothing.
 
     Idempotent / fail-closed:
     - a session that already carries a FUTURE auto_approve_at is skipped —
@@ -290,12 +350,12 @@ async def rearm_awaiting_approvals() -> None:
       session is skipped — never raised — so one bad session can't block
       startup or the rest of the pass.
     """
-    candidates: dict[str, tuple[str, dict]] = {}
+    candidates: dict[str, str] = {}  # session_id -> market
 
     if not get_settings().SESSION_SSOT_READS:
-        # kill-switch fallback only — P1 removed the legacy dicts from the
-        # rearm scan (SM is the sole awaiting source; the "legacy wins"
-        # tie-break is obsolete once there is a single source).
+        # kill-switch fallback only — see the docstring above and
+        # SESSION_SSOT_READS in app/config.py: this branch is declared
+        # invalid since P2, kept unchanged until P3-1 deletes it.
         try:
             from app.api.routes.kr_stocks import get_kr_stock_sessions
 
@@ -319,28 +379,36 @@ async def rearm_awaiting_approvals() -> None:
 
     for session_id, sm_session in sm_sessions.items():
         if session_id in candidates:
-            continue  # already have the live legacy-dict copy
+            continue  # already have a candidate for this session_id
         if sm_session.market_type == MarketType.KIWOOM:
             market = "kiwoom"
         elif sm_session.market_type == MarketType.COIN:
             market = "coin"
         else:
             continue  # US stock stack removed (R2) — nothing to re-arm there
-        candidates[session_id] = (market, sm_session.to_legacy_dict())
+        candidates[session_id] = market
 
     if not candidates:
         return
 
     logger.info("autonomy_rearm_scan", candidate_count=len(candidates))
 
-    for session_id, (market, session) in candidates.items():
+    # P2-6: re-fetch each candidate live right before scheduling it, rather
+    # than acting on the scan-time sm_session/to_legacy_dict() snapshot above
+    # — maybe_schedule_auto_approve does its own live lookup anyway, so the
+    # awaiting/countdown pre-filter here should see the same freshest state.
+    manager = await get_session_manager()
+    for session_id, market in candidates.items():
         try:
-            state = session.get("state") or {}
+            sm_session = await manager.get_session(session_id)
+            if sm_session is None:
+                continue  # legacy-only candidate never reached the SM (or vanished)
+            state = sm_session.state or {}
             if not state.get("awaiting_approval"):
                 continue
             if _has_future_auto_approve_at(state.get("auto_approve_at")):
                 logger.info("autonomy_rearm_skip_live_countdown", session_id=session_id)
                 continue
-            await maybe_schedule_auto_approve(session_id, market, session)
+            await maybe_schedule_auto_approve(session_id, market)
         except Exception as e:
             logger.error("autonomy_rearm_session_failed", session_id=session_id, error=str(e))

@@ -170,8 +170,8 @@ def wired(monkeypatch):
 
     reschedule_calls = []
 
-    async def fake_reschedule(session_id, market, session):
-        reschedule_calls.append((session_id, market, session))
+    async def fake_reschedule(session_id, market):
+        reschedule_calls.append((session_id, market))
 
     monkeypatch.setattr(approval_module, "maybe_schedule_auto_approve", fake_reschedule)
 
@@ -262,16 +262,12 @@ async def test_reject_reanalysis_creates_new_awaiting_directly_in_sm(wired):
     assert sm_session.state["trade_proposal"]["id"] == "prop-direct-2"
     assert sm_session.state["awaiting_approval"] is True
 
-    # Injector re-armed exactly once, for this session/market.
-    assert len(wired["reschedule_calls"]) == 1
-    resched_session_id, resched_market, resched_session_arg = wired["reschedule_calls"][0]
-    assert resched_session_id == session_id
-    assert resched_market == "kiwoom"
-    # The injector arg is a live view over the SAME sm_session (P2-5's
-    # _SmSessionView), not a to_legacy_dict() snapshot -- state["state"]/
-    # ["status"] read through to the live object.
-    assert resched_session_arg["state"] is sm_session.state
-    assert resched_session_arg["status"] == "awaiting_approval"
+    # Injector re-armed exactly once, for this session/market. P2-6: the
+    # call carries only (session_id, market) -- no snapshot/view object at
+    # all, since maybe_schedule_auto_approve now resolves the session
+    # itself via a live sm.get_session() call (retires the P2-5
+    # _SmSessionView shim entirely).
+    assert wired["reschedule_calls"] == [(session_id, "kiwoom")]
 
     assert wired["kr_stock_sessions"] == {}
     assert wired["coin_sessions"] == {}

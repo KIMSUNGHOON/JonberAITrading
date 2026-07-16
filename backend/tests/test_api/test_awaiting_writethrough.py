@@ -50,7 +50,7 @@ async def test_awaiting_transition_failclosed_on_sm_failure(monkeypatch):
 
     scheduled = []
 
-    async def fake_schedule(session_id, market, session):
+    async def fake_schedule(session_id, market):
         scheduled.append(session_id)
 
     monkeypatch.setattr(kr_analysis, "maybe_schedule_auto_approve", fake_schedule)
@@ -99,6 +99,12 @@ async def test_awaiting_transition_failclosed_on_sm_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_awaiting_transition_success_path(monkeypatch):
+    """P2-6: the success path no longer fetches the SM row at all (there is
+    no legacy-shaped snapshot left to build for the injector) -- it commits
+    the status, then just triggers maybe_schedule_auto_approve(session_id,
+    market), which does its own live sm.get_session() lookup internally.
+    get_session_manager is intentionally left unpatched-to-raise here to pin
+    that this path never calls it."""
     from app.api.routes.kr_stocks import analysis as kr_analysis
 
     committed = []
@@ -109,48 +115,22 @@ async def test_awaiting_transition_success_path(monkeypatch):
     monkeypatch.setattr(kr_analysis, "commit_session_status", ok_commit)
     scheduled = []
 
-    async def fake_schedule(session_id, market, session):
-        scheduled.append((session_id, market, session))
+    async def fake_schedule(session_id, market):
+        scheduled.append((session_id, market))
 
     monkeypatch.setattr(kr_analysis, "maybe_schedule_auto_approve", fake_schedule)
 
-    fake_sm_session = SimpleNamespace(
-        session_id="wt-2",
-        status="awaiting_approval",
-        error=None,
-        last_node=None,
-        stk_cd="005930",
-        stk_nm="삼성전자",
-        state={"awaiting_approval": True,
-               "trade_proposal": {"action": "BUY"},
-               "reasoning_log": []},
-    )
+    async def unexpected_get_session_manager():
+        raise AssertionError(
+            "success path must not touch the SessionManager directly -- "
+            "maybe_schedule_auto_approve owns that lookup now (P2-6)"
+        )
 
-    def to_legacy_dict():
-        return {
-            "session_id": fake_sm_session.session_id,
-            "status": fake_sm_session.status,
-            "state": fake_sm_session.state,
-            "stk_cd": fake_sm_session.stk_cd,
-            "stk_nm": fake_sm_session.stk_nm,
-        }
-
-    fake_sm_session.to_legacy_dict = to_legacy_dict
-
-    class _FakeSM:
-        async def get_session(self, session_id):
-            return fake_sm_session
-
-    async def fake_get_session_manager():
-        return _FakeSM()
-
-    monkeypatch.setattr(kr_analysis, "get_session_manager", fake_get_session_manager)
+    monkeypatch.setattr(kr_analysis, "get_session_manager", unexpected_get_session_manager)
 
     await kr_analysis._finalize_awaiting_transition("wt-2")
 
-    assert scheduled and scheduled[0][0] == "wt-2"
-    assert scheduled[0][1] == "kiwoom"
-    assert scheduled[0][2]["state"] is fake_sm_session.state
+    assert scheduled == [("wt-2", "kiwoom")]
     assert committed and committed[0][0] == "wt-2"
     assert committed[0][1] == SessionStatus.AWAITING_APPROVAL
 
@@ -184,7 +164,7 @@ async def test_coin_awaiting_transition_failclosed_on_sm_failure(monkeypatch):
 
     scheduled = []
 
-    async def fake_schedule(session_id, market, session):
+    async def fake_schedule(session_id, market):
         scheduled.append(session_id)
 
     monkeypatch.setattr(coin_analysis, "maybe_schedule_auto_approve", fake_schedule)
@@ -441,7 +421,7 @@ async def test_approval_rejected_rearm_failed_commit_never_schedules(monkeypatch
 
     scheduled = []
 
-    async def fake_schedule(sid, market, session):
+    async def fake_schedule(sid, market):
         scheduled.append(sid)
 
     monkeypatch.setattr(approval_module, "maybe_schedule_auto_approve", fake_schedule)

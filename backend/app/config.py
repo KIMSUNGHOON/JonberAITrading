@@ -6,8 +6,11 @@ Loads settings from environment variables with sensible defaults.
 from functools import lru_cache
 from typing import Literal
 
+import structlog
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_logger = structlog.get_logger()
 
 
 class Settings(BaseSettings):
@@ -132,8 +135,19 @@ class Settings(BaseSettings):
     # P1 (session-SSOT): read-unification kill switch. True = /approval/pending,
     # /pending/{id}, WS snapshot, status routes, injector rearm read the
     # SessionManager ONLY. False = legacy-first reads (pre-P1 behavior).
-    # VALID ONLY UNTIL P2 lands — P2 removes legacy writes, after which False
-    # would read empty dicts (documented in the spec §P2).
+    #
+    # P2-6: INVALID since P2 landed — False is NOT a supported configuration
+    # anymore. P2 removed every write to the legacy in-memory session dicts
+    # (kr_stock_sessions / coin_sessions), so a False read here just sees
+    # permanently-empty dicts at every P1 read-branch site (approval
+    # /pending, /pending/{id}, websocket._get_session_snapshot, the KR/coin
+    # status routes, the autonomy injector's rearm scan) — there is no
+    # dual-write left for this flag to fall back to. Those branches are left
+    # in place unchanged (P3-1 deletes them) so flipping this flag stays a
+    # pure config change either way, but flipping it to False will NOT
+    # restore the old pre-P1 behavior. get_settings() logs one warning at
+    # startup when this is False. ROLLBACK: revert the P2 commits — do not
+    # rely on this flag to undo them.
     SESSION_SSOT_READS: bool = True
 
     # -------------------------------------------
@@ -221,7 +235,23 @@ def get_settings() -> Settings:
     Get cached settings instance.
     Settings are loaded once and cached for performance.
     """
-    return Settings()
+    instance = Settings()
+    if not instance.SESSION_SSOT_READS:
+        # P2-6: the kill switch is declared invalid since P2 (see the field's
+        # docstring above) -- a single startup warning documents that a
+        # False deployment is running on unsupported config, without
+        # spamming (get_settings() is @lru_cache, so Settings() -- and this
+        # branch -- runs at most once per process).
+        _logger.warning(
+            "session_ssot_reads_disabled_unsupported",
+            message=(
+                "SESSION_SSOT_READS=False is unsupported since P2 (session-SSOT) -- "
+                "no code path writes to the legacy in-memory session dicts anymore, "
+                "so the pre-P1 fallback this flag used to restore no longer exists. "
+                "Rollback = revert the P2 commits, not this flag."
+            ),
+        )
+    return instance
 
 
 # Convenience alias for direct import

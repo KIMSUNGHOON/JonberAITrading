@@ -5,6 +5,14 @@ injector announces (auto_approve_at + reasoning + Telegram), waits the grace
 period, RE-checks (session still awaiting + gate still green), then submits
 the decision as actor='system' through the extracted submit_decision. Any
 failure leaves the session awaiting (HITL fallback).
+
+P2-6 (session-SSOT): maybe_schedule_auto_approve/rearm_awaiting_approvals no
+longer take a session dict/snapshot at all -- every entry point resolves the
+live AnalysisSession itself via sm.get_session(session_id), both at schedule
+time and again inside the grace task's re-check. Every test below therefore
+seeds ONLY the SessionManager (never a legacy dict, never a passed-in
+snapshot) and asserts against a fresh `sm.get_session(...)` read -- there is
+no local `session` object left to go stale relative to the SM.
 """
 
 import asyncio
@@ -14,7 +22,7 @@ import types
 import pytest
 
 import services.session_manager as sm_module
-from services.session_manager import MarketType, SessionManager
+from services.session_manager import MarketType, SessionManager, SessionStatus
 from services.autonomy import GateDecision
 
 import app.api.routes._autonomy_injector as injector_module
@@ -78,6 +86,10 @@ def submit_recorder(monkeypatch):
 
 
 def _awaiting_session(session_id: str) -> dict:
+    """Legacy-shaped dict, used only to seed the (dead-since-P2) legacy
+    in-memory dicts for the kill-switch/rearm-source tests below -- never
+    passed to maybe_schedule_auto_approve, which takes no session argument
+    at all (P2-6)."""
     return {
         "session_id": session_id,
         "stk_cd": "005930",
@@ -107,6 +119,41 @@ async def _seed_sm(sm, session_id: str):
     )
 
 
+async def _seed_awaiting_sm(
+    sm,
+    session_id: str,
+    *,
+    market_type: MarketType = MarketType.KIWOOM,
+    auto_approve_at: str | None = None,
+    proposal_id: str = "p-rearm-1",
+) -> None:
+    """Seed an AWAITING_APPROVAL session directly into the SessionManager,
+    bypassing the legacy dicts entirely -- the only seeding path
+    maybe_schedule_auto_approve/rearm can observe post-P2-6."""
+    state = {
+        "awaiting_approval": True,
+        "approval_status": None,
+        "trade_proposal": {
+            "id": proposal_id,
+            "action": "BUY",
+            "quantity": 10,
+            "entry_price": 50_000,
+        },
+        "reasoning_log": ["[t] 분석 완료"],
+    }
+    if auto_approve_at is not None:
+        state["auto_approve_at"] = auto_approve_at
+    ticker = "005930" if market_type == MarketType.KIWOOM else "KRW-BTC"
+    await sm.create_session(
+        session_id=session_id,
+        market_type=market_type,
+        ticker=ticker,
+        display_name="테스트",
+        state=state,
+    )
+    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+
+
 async def _wait_for(predicate, timeout=2.0):
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
@@ -118,17 +165,16 @@ async def _wait_for(predicate, timeout=2.0):
 
 async def test_auto_approves_after_grace_as_system(sm, fast_grace, gate_allow, submit_recorder):
     session_id = "inj-1"
-    session = _awaiting_session(session_id)
-    await _seed_sm(sm, session_id)
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
     queue = await sm.subscribe(session_id)
 
-    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
 
-    # Announcement written immediately: countdown field + reasoning entry
-    assert "auto_approve_at" in session["state"]
-    assert any("자율 승인 예정" in e for e in session["state"]["reasoning_log"])
+    # Announcement written immediately: countdown field + reasoning entry,
+    # both landed directly on the SM row via a single sm.update_state call.
     sm_session = await sm.get_session(session_id)
-    assert sm_session.state.get("auto_approve_at") == session["state"]["auto_approve_at"]
+    assert sm_session.state.get("auto_approve_at") is not None
+    assert any("자율 승인 예정" in e for e in sm_session.state["reasoning_log"])
     assert not queue.empty()  # notify fired → WS pushes the countdown
 
     await _wait_for(lambda: len(submit_recorder) == 1)
@@ -144,13 +190,15 @@ async def test_auto_approves_after_grace_as_system(sm, fast_grace, gate_allow, s
 
 async def test_manual_decision_during_grace_wins(sm, fast_grace, gate_allow, submit_recorder):
     session_id = "inj-2"
-    session = _awaiting_session(session_id)
-    await _seed_sm(sm, session_id)
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
 
-    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
-    # User decides during the grace window
-    session["status"] = "completed"
-    session["state"]["awaiting_approval"] = False
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
+    # User decides during the grace window -- mutate the LIVE SM row
+    # directly (the injector re-reads sm.get_session() live, P2-6; there is
+    # no separate snapshot for this mutation to fall out of sync with).
+    await sm.update_status(session_id, SessionStatus.COMPLETED)
+    sm_session = await sm.get_session(session_id)
+    sm_session.state["awaiting_approval"] = False
 
     await asyncio.sleep(0.2)
     assert submit_recorder == []  # injector silently stood down
@@ -168,15 +216,15 @@ async def test_gate_deny_at_recheck_stays_hitl(sm, fast_grace, monkeypatch, subm
     monkeypatch.setattr(injector_module, "check_autonomy", flip_gate)
 
     session_id = "inj-3"
-    session = _awaiting_session(session_id)
-    await _seed_sm(sm, session_id)
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
 
-    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
     await asyncio.sleep(0.2)
 
     assert submit_recorder == []
-    assert session["status"] == "awaiting_approval"  # stays HITL
-    assert any("자율 승인 취소" in e for e in session["state"]["reasoning_log"])
+    sm_session = await sm.get_session(session_id)
+    assert sm_session.status == SessionStatus.AWAITING_APPROVAL  # stays HITL
+    assert any("자율 승인 취소" in e for e in sm_session.state["reasoning_log"])
 
 
 async def test_pre_check_deny_writes_nothing(sm, fast_grace, monkeypatch, submit_recorder):
@@ -186,15 +234,15 @@ async def test_pre_check_deny_writes_nothing(sm, fast_grace, monkeypatch, submit
     monkeypatch.setattr(injector_module, "check_autonomy", deny_gate)
 
     session_id = "inj-4"
-    session = _awaiting_session(session_id)
-    await _seed_sm(sm, session_id)
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
 
-    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
     await asyncio.sleep(0.15)
 
-    assert "auto_approve_at" not in session["state"]
+    sm_session = await sm.get_session(session_id)
+    assert "auto_approve_at" not in sm_session.state
     assert submit_recorder == []
-    assert session["status"] == "awaiting_approval"
+    assert sm_session.status == SessionStatus.AWAITING_APPROVAL
 
 
 async def test_submit_failure_leaves_session_awaiting(sm, fast_grace, gate_allow, monkeypatch):
@@ -204,43 +252,46 @@ async def test_submit_failure_leaves_session_awaiting(sm, fast_grace, gate_allow
     monkeypatch.setattr("app.api.routes.approval.submit_decision", boom)
 
     session_id = "inj-5"
-    session = _awaiting_session(session_id)
-    await _seed_sm(sm, session_id)
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
 
-    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
     await asyncio.sleep(0.2)
 
     # Fail-closed: the normal HITL flow still owns the session
-    assert session["status"] == "awaiting_approval"
-    assert session["state"]["awaiting_approval"] is True
+    sm_session = await sm.get_session(session_id)
+    assert sm_session.status == SessionStatus.AWAITING_APPROVAL
+    assert sm_session.state["awaiting_approval"] is True
 
 
 async def test_stale_timer_stands_down_when_proposal_changed(sm, fast_grace, gate_allow, submit_recorder):
-    """SAFETY (review fix): a reject→re-analyze cycle mutates the SAME session
-    dict and can re-arm awaiting with a NEW proposal — the stale timer must
+    """SAFETY (review fix): a reject→re-analyze cycle mutates the SAME SM
+    row and can re-arm awaiting with a NEW proposal — the stale timer must
     never approve a proposal it did not announce."""
     session_id = "inj-6"
-    session = _awaiting_session(session_id)
-    await _seed_sm(sm, session_id)
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
 
-    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
     # During the grace: re-analysis replaced the proposal (new id), awaiting re-armed.
-    session["state"]["trade_proposal"] = {"id": "p2-NEW", "action": "BUY", "quantity": 1, "entry_price": 1000}
+    sm_session = await sm.get_session(session_id)
+    sm_session.state["trade_proposal"] = {"id": "p2-NEW", "action": "BUY", "quantity": 1, "entry_price": 1000}
 
     await asyncio.sleep(0.2)
     assert submit_recorder == []
-    assert "auto_approve_at" not in session["state"], "stale countdown must be cleared"
+    # _clear_countdown writes auto_approve_at=None via sm.update_state (a
+    # dict merge, same convention submit_decision's decision_updates uses)
+    # rather than popping the key -- there is only one state dict now.
+    assert sm_session.state.get("auto_approve_at") is None, "stale countdown must be cleared"
 
 
 async def test_recorded_decision_blocks_stale_timer(sm, fast_grace, gate_allow, submit_recorder):
     """approval_status set (a decision was recorded) must stand the timer down
     even if awaiting flags look re-armed (mid-reject resume window)."""
     session_id = "inj-7"
-    session = _awaiting_session(session_id)
-    await _seed_sm(sm, session_id)
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
 
-    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
-    session["state"]["approval_status"] = "rejected"  # decision recorded; flags still awaiting
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
+    sm_session = await sm.get_session(session_id)
+    sm_session.state["approval_status"] = "rejected"  # decision recorded; flags still awaiting
 
     await asyncio.sleep(0.2)
     assert submit_recorder == []
@@ -258,13 +309,11 @@ async def test_recheck_deny_clears_countdown(sm, fast_grace, monkeypatch, submit
     monkeypatch.setattr(injector_module, "check_autonomy", flip_gate)
 
     session_id = "inj-8"
-    session = _awaiting_session(session_id)
-    await _seed_sm(sm, session_id)
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
 
-    await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
     await asyncio.sleep(0.2)
 
-    assert "auto_approve_at" not in session["state"]
     sm_session = await sm.get_session(session_id)
     assert sm_session.state.get("auto_approve_at") is None
 
@@ -276,7 +325,7 @@ async def test_kr_producer_invokes_injector(sm, monkeypatch):
 
     calls = []
 
-    async def recorder(session_id, market, session):
+    async def recorder(session_id, market):
         calls.append((session_id, market))
 
     monkeypatch.setattr(
@@ -312,6 +361,65 @@ async def test_kr_producer_invokes_injector(sm, monkeypatch):
 
 
 # -------------------------------------------
+# P2-6 dedicated pins: B/snapshot fully excluded, and the grace-window
+# re-check is a LIVE SessionManager read (not a locally-cached flag).
+# -------------------------------------------
+
+
+async def test_full_cycle_no_snapshot_or_b_ever_touched_auto_approves(
+    sm, fast_grace, gate_allow, submit_recorder
+):
+    """End-to-end with the legacy dicts (B) never populated at all and no
+    snapshot/session argument passed anywhere in the call chain --
+    maybe_schedule_auto_approve's signature is (session_id, market) only, so
+    this is structurally guaranteed rather than merely asserted, but this
+    test also pins that B stays empty throughout the full grace cycle."""
+    from app.api.routes.kr_stocks import get_kr_stock_sessions
+    from app.api.routes.coin import get_coin_sessions
+
+    session_id = "inj-b-free-1"
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
+
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
+    assert session_id not in get_kr_stock_sessions()
+    assert session_id not in get_coin_sessions()
+
+    await _wait_for(lambda: len(submit_recorder) == 1)
+    assert submit_recorder[0] == {
+        "session_id": session_id,
+        "decision": "approved",
+        "actor": "system",
+        "expected_proposal_id": "p1",
+    }
+    assert session_id not in get_kr_stock_sessions()
+    assert session_id not in get_coin_sessions()
+
+
+async def test_sm_cancel_during_grace_stands_down_via_live_status_check(
+    sm, fast_grace, gate_allow, submit_recorder
+):
+    """P2-6: the manual-wins re-check reads sm_session.status LIVE, not a
+    locally-cached flag -- flip ONLY the SM status to CANCELLED (leave
+    state["awaiting_approval"]/["approval_status"] in their pre-cancel
+    shape, mirroring how a status-only mutation could reach the SM from a
+    concurrent route) and confirm the grace task still stands down. This
+    isolates the live-status half of the guard from the state-flag half
+    already covered by test_manual_decision_during_grace_wins."""
+    session_id = "inj-cancel-live"
+    await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
+
+    await maybe_schedule_auto_approve(session_id, "kiwoom")
+
+    await sm.update_status(session_id, SessionStatus.CANCELLED)
+    sm_session = await sm.get_session(session_id)
+    assert sm_session.state["awaiting_approval"] is True  # deliberately untouched
+    assert sm_session.state.get("approval_status") is None  # deliberately untouched
+
+    await asyncio.sleep(0.2)
+    assert submit_recorder == []  # live status re-check caught it regardless
+
+
+# -------------------------------------------
 # Startup re-arm pass: re-arm sessions that were ALREADY awaiting_approval
 # when the gate turns on (or the process restarts) — not just sessions that
 # transition to awaiting afterward.
@@ -339,47 +447,12 @@ def empty_legacy_dicts():
         coin_sessions.update(saved_coin)
 
 
-async def _seed_awaiting_sm(
-    sm,
-    session_id: str,
-    *,
-    market_type: MarketType = MarketType.KIWOOM,
-    auto_approve_at: str | None = None,
-) -> None:
-    """Seed an AWAITING_APPROVAL session directly into the SessionManager,
-    bypassing the legacy dicts entirely."""
-    state = {
-        "awaiting_approval": True,
-        "approval_status": None,
-        "trade_proposal": {
-            "id": "p-rearm-1",
-            "action": "BUY",
-            "quantity": 10,
-            "entry_price": 50_000,
-        },
-        "reasoning_log": ["[t] 분석 완료"],
-    }
-    if auto_approve_at is not None:
-        state["auto_approve_at"] = auto_approve_at
-    ticker = "005930" if market_type == MarketType.KIWOOM else "KRW-BTC"
-    await sm.create_session(
-        session_id=session_id,
-        market_type=market_type,
-        ticker=ticker,
-        display_name="테스트",
-        state=state,
-    )
-    from services.session_manager import SessionStatus
-
-    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
-
-
 async def test_rearm_schedules_for_sm_only_awaiting_session(
     sm, fast_grace, gate_allow, submit_recorder, empty_legacy_dicts
 ):
     """A session that survived only in the SessionManager (legacy dict
     empty -- the restart shape) gets handed to maybe_schedule_auto_approve
-    when the gate allows."""
+    when the gate allows -- full rearm→schedule→auto-approve e2e."""
     session_id = "rearm-1"
     await _seed_awaiting_sm(sm, session_id)
 
@@ -426,7 +499,7 @@ async def test_rearm_skips_session_with_live_future_countdown(
 
     calls = []
 
-    async def recorder(sid, market, session):
+    async def recorder(sid, market):
         calls.append(sid)
 
     monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", recorder)
@@ -451,7 +524,7 @@ async def test_rearm_skips_non_awaiting_sessions(sm, monkeypatch, empty_legacy_d
 
     calls = []
 
-    async def recorder(sid, market, session):
+    async def recorder(sid, market):
         calls.append(sid)
 
     monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", recorder)
@@ -473,10 +546,10 @@ async def test_rearm_continues_after_one_session_errors(
 
     real = injector_module.maybe_schedule_auto_approve
 
-    async def flaky(sid, market, session):
+    async def flaky(sid, market):
         if sid == boom_id:
             raise RuntimeError("boom")
-        return await real(sid, market, session)
+        return await real(sid, market)
 
     monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", flaky)
 
@@ -526,7 +599,7 @@ async def test_rearm_scans_sm_only(sm, monkeypatch, empty_legacy_dicts):
     source."""
     scheduled: list[str] = []
 
-    async def fake_schedule(session_id, market, session):
+    async def fake_schedule(session_id, market):
         scheduled.append(session_id)
 
     monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", fake_schedule)
@@ -544,13 +617,22 @@ async def test_rearm_scans_sm_only(sm, monkeypatch, empty_legacy_dicts):
     assert "legacy-only-p14" not in scheduled
 
 
-async def test_rearm_kill_switch_scans_legacy_when_false(
+async def test_rearm_kill_switch_legacy_only_candidate_now_inert(
     sm, fast_grace, gate_allow, submit_recorder, empty_legacy_dicts, monkeypatch
 ):
-    """P1-4 kill switch: SESSION_SSOT_READS=False restores the pre-P1-4
-    fallback -- legacy dicts are scanned too, so a legacy-only session (never
-    reached the SM) still gets rearmed. get_settings() is @lru_cache, so the
-    name the target module imported is patched directly (test_approval_
+    """P2-6: SESSION_SSOT_READS=False's legacy-dict fallback scan (the
+    _scan_legacy_dict branch) still runs unchanged -- it is left in place
+    until P3-1 deletes it -- but it is now declared INVALID (config.py
+    SESSION_SSOT_READS docstring): maybe_schedule_auto_approve no longer
+    accepts a session snapshot, so it ALWAYS re-resolves the candidate via a
+    live sm.get_session() lookup before doing anything. Since nothing has
+    written to the legacy dicts since P2, a "legacy-only" session was never
+    created in the SessionManager either -- that live lookup returns None,
+    so nothing gets scheduled. This is the kill switch's declared-inert
+    behavior made concrete (the pre-P2-6 version of this test asserted the
+    opposite -- that the legacy-only session DID get rearmed; that fallback
+    no longer exists to restore). get_settings() is @lru_cache, so the name
+    the target module imported is patched directly (test_approval_
     pending_ssot.py precedent)."""
     monkeypatch.setattr(
         injector_module, "get_settings",
@@ -563,6 +645,67 @@ async def test_rearm_kill_switch_scans_legacy_when_false(
     get_kr_stock_sessions()[legacy_id] = _awaiting_session(legacy_id)
 
     await injector_module.rearm_awaiting_approvals()
+    await asyncio.sleep(0.1)
 
-    await _wait_for(lambda: len(submit_recorder) == 1)
-    assert submit_recorder[0]["session_id"] == legacy_id
+    assert submit_recorder == []
+    assert (await sm.get_session(legacy_id)) is None  # never existed in the SM
+
+
+# -------------------------------------------
+# P2-6: SESSION_SSOT_READS=False startup warning (app/config.py)
+# -------------------------------------------
+
+
+def test_session_ssot_reads_false_warns_once_at_settings_load(monkeypatch):
+    """The kill switch is declared unsupported since P2 -- get_settings()
+    logs one warning when SESSION_SSOT_READS resolves to False, so a
+    misconfigured deployment is discoverable at startup instead of silently
+    running on dead-fallback config. get_settings() is @lru_cache (module-
+    global), so the cache is cleared before AND after this test to avoid
+    leaking a False-flavored Settings instance into any other test."""
+    import app.config as config_module
+
+    config_module.get_settings.cache_clear()
+    monkeypatch.setenv("SESSION_SSOT_READS", "false")
+
+    warnings = []
+
+    def fake_warning(event, **kw):
+        warnings.append((event, kw))
+
+    monkeypatch.setattr(config_module._logger, "warning", fake_warning)
+
+    try:
+        settings = config_module.get_settings()
+        assert settings.SESSION_SSOT_READS is False
+        assert len(warnings) == 1
+        assert warnings[0][0] == "session_ssot_reads_disabled_unsupported"
+
+        # @lru_cache: a second call must NOT log again (one warning per
+        # process, not per call).
+        config_module.get_settings()
+        assert len(warnings) == 1
+    finally:
+        config_module.get_settings.cache_clear()
+
+
+def test_session_ssot_reads_true_never_warns(monkeypatch):
+    """The default (True) must never trigger the kill-switch warning."""
+    import app.config as config_module
+
+    config_module.get_settings.cache_clear()
+    monkeypatch.delenv("SESSION_SSOT_READS", raising=False)
+
+    warnings = []
+
+    def fake_warning(event, **kw):
+        warnings.append((event, kw))
+
+    monkeypatch.setattr(config_module._logger, "warning", fake_warning)
+
+    try:
+        settings = config_module.get_settings()
+        assert settings.SESSION_SSOT_READS is True
+        assert warnings == []
+    finally:
+        config_module.get_settings.cache_clear()

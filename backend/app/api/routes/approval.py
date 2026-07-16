@@ -87,43 +87,6 @@ async def _session_decision_lock(session_id: str):
             _decision_locks.pop(session_id, None)
 
 
-class _SmSessionView:
-    """Minimal dict-style live view over an AnalysisSession, for callers
-    (the autonomy injector) that still expect ``session["state"]`` /
-    ``session.get("status")`` access.
-
-    P2-5 (session-SSOT): unlike ``sm_session.to_legacy_dict()``, which
-    snapshots "status" as a plain string at call time, this wraps the LIVE
-    AnalysisSession object -- ``.get("status")`` re-reads ``sm_session.status``
-    on every access, so a decision recorded by another caller (e.g. a manual
-    cancel arriving during the autonomy injector's 60s grace window) is
-    visible immediately instead of frozen at scheduling time. ``state`` is
-    the SessionManager's own dict (already live/shared), so mutations
-    through it reach the SM row directly, same as the pre-P2-5
-    to_legacy_dict() shape.
-
-    Scoped to exactly what ``_autonomy_injector.py`` reads today
-    (``session["state"]``, ``session.get("status")``); migrating the
-    injector itself to a native SM handle is P2-6's job.
-    """
-
-    def __init__(self, sm_session):
-        self._sm_session = sm_session
-
-    def __getitem__(self, key):
-        if key == "state":
-            return self._sm_session.state
-        if key == "status":
-            return self._sm_session.status.value
-        return getattr(self._sm_session, key)
-
-    def get(self, key, default=None):
-        try:
-            return self[key]
-        except (KeyError, AttributeError):
-            return default
-
-
 async def submit_decision(
     session_id: str,
     decision: str,
@@ -563,17 +526,12 @@ async def _submit_decision_locked(
 
                 final_status = SessionStatus.AWAITING_APPROVAL
                 execution_status = "awaiting_approval"
-                # P2-5: the injector's `session` argument is no longer a
-                # to_legacy_dict() snapshot (its "status" key would freeze
-                # at schedule time) -- _SmSessionView is a thin live
-                # dict-style proxy over sm_session so _autonomy_injector's
-                # existing session["state"] / session.get("status") reads
-                # always see the current SM state/status, including any
-                # decision made by another caller during the grace window.
-                # Migrating the injector itself to a native SM handle is
-                # P2-6's job; this is the narrowest fix that keeps
-                # /decide's own call site honest in the meantime.
-                await maybe_schedule_auto_approve(session_id, market, _SmSessionView(sm_session))
+                # P2-6: maybe_schedule_auto_approve resolves the session
+                # itself via a live sm.get_session() call -- no snapshot or
+                # view object to pass here at all (retires the P2-5
+                # _SmSessionView shim, which existed only to bridge this
+                # call site's still-dict-shaped call).
+                await maybe_schedule_auto_approve(session_id, market)
             else:
                 final_status = SessionStatus.RUNNING
                 execution_status = "re_analyzing"

@@ -212,10 +212,10 @@ async def _finalize_awaiting_transition(session_id: str) -> None:
     graph nobody can see or approve). One retry, then fail closed: the
     session becomes ERROR and no auto-approve is scheduled.
 
-    P2-3: SM-only -- there is no legacy dict left to keep in sync. The
-    caller (run_kr_stock_analysis_task) holds no session dict of its own
-    either; this function re-fetches the SM row itself for the reasoning-log
-    append and for the legacy-shaped dict maybe_schedule_auto_approve expects.
+    P2-3/P2-6: SM-only -- there is no legacy dict left to keep in sync, and
+    (P2-6) no legacy-shaped snapshot to build for the injector either:
+    maybe_schedule_auto_approve now resolves the session itself via a live
+    sm.get_session() call, so this success path only needs to trigger it.
     """
     last_error: Optional[Exception] = None
     for _attempt in range(2):
@@ -228,25 +228,7 @@ async def _finalize_awaiting_transition(session_id: str) -> None:
 
     if last_error is None:
         logger.info("kr_stock_analysis_awaiting_approval", session_id=session_id)
-        # Outside the retry loop on purpose (see comment above) -- any
-        # exception here propagates to the caller unchanged (run_kr_stock_
-        # analysis_task's own outer except marks the session error, same end
-        # state, without corrupting the SM status this function just
-        # correctly committed).
-        sm = await get_session_manager()
-        sm_session = await sm.get_session(session_id)
-        # sm_session.state is shared BY REFERENCE with the SessionManager's
-        # copy (to_legacy_dict() does not deep-copy state) -- any state
-        # mutation the injector makes (auto_approve_at, reasoning_log, ...)
-        # reaches the real SM row directly. This is a known seam (its
-        # "status" key is a point-in-time snapshot, not live) accepted until
-        # P2-6 gives the injector a proper SM-native session handle.
-        legacy_session = sm_session.to_legacy_dict() if sm_session is not None else {
-            "session_id": session_id,
-            "status": "awaiting_approval",
-            "state": {},
-        }
-        await maybe_schedule_auto_approve(session_id, "kiwoom", legacy_session)
+        await maybe_schedule_auto_approve(session_id, "kiwoom")
         return
 
     logger.critical(

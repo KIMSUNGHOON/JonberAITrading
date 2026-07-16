@@ -145,7 +145,7 @@ def wired(monkeypatch):
 
     reschedule_calls = []
 
-    async def fake_reschedule(session_id, market, session):
+    async def fake_reschedule(session_id, market):
         reschedule_calls.append((session_id, market))
 
     monkeypatch.setattr(approval_module, "maybe_schedule_auto_approve", fake_reschedule)
