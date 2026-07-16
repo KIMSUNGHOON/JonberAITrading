@@ -824,7 +824,7 @@ async def test_status_endpoint_serves_completed_session_from_sm(sm):
     run_kr_stock_analysis_task pipeline)."""
     from app.api.routes.kr_stocks.analysis import get_kr_stock_analysis_status
 
-    session_id = "kr-legacy-wins-1"
+    session_id = "kr-sm-only-empty-1"
     await sm.create_session(
         session_id=session_id,
         market_type=MarketType.KIWOOM,
@@ -842,7 +842,7 @@ async def test_status_endpoint_serves_completed_session_from_sm(sm):
     assert response.analyses == []
 
 
-async def test_status_endpoint_404s_when_legacy_and_sm_both_miss(sm):
+async def test_status_endpoint_404s_when_sm_session_missing(sm):
     from fastapi import HTTPException
 
     from app.api.routes.kr_stocks.analysis import get_kr_stock_analysis_status

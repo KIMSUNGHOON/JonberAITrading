@@ -84,30 +84,6 @@ def submit_recorder(monkeypatch):
     return calls
 
 
-def _awaiting_session(session_id: str) -> dict:
-    """Legacy-shaped dict, used only to seed the (dead-since-P2) legacy
-    in-memory dicts for the kill-switch/rearm-source tests below -- never
-    passed to maybe_schedule_auto_approve, which takes no session argument
-    at all (P2-6)."""
-    return {
-        "session_id": session_id,
-        "stk_cd": "005930",
-        "status": "awaiting_approval",
-        "state": {
-            "awaiting_approval": True,
-            "reasoning_log": ["[t] 분석 완료"],
-            "trade_proposal": {
-                "id": "p1",
-                "action": "BUY",
-                "quantity": 10,
-                "entry_price": 50_000,
-            },
-        },
-        "created_at": None,
-        "error": None,
-    }
-
-
 async def _seed_sm(sm, session_id: str):
     await sm.create_session(
         session_id=session_id,

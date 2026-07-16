@@ -26,7 +26,6 @@ from app.core.analysis_limiter import (
     get_active_analysis_count,
     release_analysis_slot,
 )
-from app.config import get_settings
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from services.session_manager import (

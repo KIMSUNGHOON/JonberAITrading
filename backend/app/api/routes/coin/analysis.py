@@ -21,7 +21,6 @@ from app.api.schemas.coin import (
     CoinAnalysisSummary,
     CoinTradeProposalResponse,
 )
-from app.config import get_settings
 from app.core.analysis_limiter import (
     acquire_analysis_slot,
     get_active_analysis_count,
