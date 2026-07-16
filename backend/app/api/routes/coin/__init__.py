@@ -4,7 +4,7 @@ Coin API Routes Package
 This package provides cryptocurrency trading endpoints for Upbit exchange.
 
 Modules:
-- constants: Cache variables and session store
+- constants: Cache variables
 - helpers: Helper functions (client, session lookup)
 - market_data: Market data endpoints (/markets, /ticker, /candles, /orderbook)
 - analysis: Analysis endpoints (/analysis/*)
@@ -31,7 +31,6 @@ router.include_router(trades_router)
 
 # Re-export for backwards compatibility
 from .constants import (
-    coin_sessions,
     CACHE_TTL_SECONDS,
     get_cached_markets,
     set_cached_markets,
@@ -39,23 +38,18 @@ from .constants import (
 )
 from .helpers import (
     get_upbit_client,
-    get_coin_session,
     check_api_keys,
-    get_coin_sessions,
 )
 
 __all__ = [
     # Router
     "router",
     # Constants
-    "coin_sessions",
     "CACHE_TTL_SECONDS",
     "get_cached_markets",
     "set_cached_markets",
     "get_markets_cache_time",
     # Helpers
     "get_upbit_client",
-    "get_coin_session",
     "check_api_keys",
-    "get_coin_sessions",
 ]

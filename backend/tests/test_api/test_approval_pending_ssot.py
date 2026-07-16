@@ -1,9 +1,8 @@
 """P1-1: /approval/pending 이 SessionManager 를 단독 소스로 읽는다.
 
-SESSION_SSOT_READS=True (default) 일 때 list_pending_approvals /
-get_pending_approval 은 legacy dict(kr_stock_sessions/coin_sessions) 를
-전혀 스캔하지 않고 SessionManager(SQLite 영속) 만 읽는다. 판정 술어는
-현행과 byte-동일하게 보존: state["awaiting_approval"] truthy &&
+list_pending_approvals / get_pending_approval 은 SessionManager(SQLite
+영속) 만 읽는다(legacy in-memory dict 는 P3-1 에서 완전 삭제됨). 판정
+술어는 현행과 byte-동일하게 보존: state["awaiting_approval"] truthy &&
 state["trade_proposal"] 존재. status 는 검사하지 않는다(action-blind,
 status-blind 그대로).
 
@@ -14,17 +13,8 @@ _session_manager) + 기본 DB_PATH="data/sessions.db"(612MB 라이브 파일) �
 싱글턴을 테스트 전용 파일로 monkeypatch 해야 실 DB 오염을 막을 수 있다
 (tests/test_api/test_kr_analysis_sm_migration.py 의 `sm` 픽스처와 동일
 패턴).
-
-킬스위치 회귀(리뷰 픽스): SESSION_SSOT_READS=False 는 P2가 legacy 쓰기를
-제거하기 전까지 유일한 롤백 수단이므로, False 분기가 legacy-first 거동으로
-완전히 복귀하는지(= SM-only 세션은 보이지 않고 legacy dict 세션만 보이는지)
-별도로 고정한다. get_settings() 는 @lru_cache 이므로 env 로 값을 바꿔치기
-할 수 없다 -- tests/test_eod_orchestrator_phase5.py:90-93 의 전례대로 대상
-모듈(approval.py)이 import 한 이름 `get_settings` 를 직접 monkeypatch 한다
-(approval.py: `from app.config import get_settings`).
 """
 import os
-import types
 
 import pytest
 from fastapi.testclient import TestClient
@@ -134,100 +124,3 @@ async def test_pending_detail_404_when_absent(client):
     resp = client.get("/api/approval/pending/ssot-p11-does-not-exist")
     assert resp.status_code == 404
 
-
-@pytest.mark.asyncio
-async def test_pending_kill_switch_reads_legacy_when_false(client, monkeypatch):
-    """SESSION_SSOT_READS=False: legacy-first 거동으로 완전 복귀.
-
-    SM-only 세션(legacy dict 에 전혀 없음)은 더 이상 보이지 않고, legacy
-    dict(kr_stock_sessions)에 직접 심은 awaiting 세션만 /pending 에 나타난다
-    -- 리뷰 요구: 킬스위치 분기가 회귀하지 않는지 감시.
-    """
-    from app.api.routes.kr_stocks import get_kr_stock_sessions
-    from services.session_manager import MarketType, get_session_manager
-
-    monkeypatch.setattr(
-        approval_module, "get_settings",
-        lambda: types.SimpleNamespace(SESSION_SSOT_READS=False),
-    )
-
-    sm = await get_session_manager()
-    await sm.create_session(
-        "ssot-p11-ks-sm-only", MarketType.KIWOOM, "005930", "삼성전자",
-        stk_cd="005930", stk_nm="삼성전자",
-        state={"awaiting_approval": True,
-               "trade_proposal": {"action": "BUY", "quantity": 1,
-                                  "risk_score": 0.2, "rationale": "sm",
-                                  "created_at": "2026-07-16T00:00:00+00:00"},
-               "reasoning_log": []},
-    )
-
-    kr_sessions = get_kr_stock_sessions()
-    kr_sessions["ssot-p11-ks-legacy"] = {
-        "stk_cd": "000660",
-        "stk_nm": "SK하이닉스",
-        "status": "awaiting_approval",
-        "state": {
-            "awaiting_approval": True,
-            "trade_proposal": {"action": "BUY", "quantity": 2,
-                               "risk_score": 0.4, "rationale": "legacy",
-                               "created_at": "2026-07-16T00:00:01+00:00"},
-            "reasoning_log": [],
-        },
-    }
-    try:
-        resp = client.get("/api/approval/pending")
-        assert resp.status_code == 200
-        ids = [p["session_id"] for p in resp.json()["pending_approvals"]]
-        assert "ssot-p11-ks-legacy" in ids
-        assert "ssot-p11-ks-sm-only" not in ids
-    finally:
-        kr_sessions.pop("ssot-p11-ks-legacy", None)
-        await sm.remove_session("ssot-p11-ks-sm-only")
-
-
-@pytest.mark.asyncio
-async def test_pending_detail_kill_switch_reads_legacy_when_false(client, monkeypatch):
-    """/pending/{id} 도 False 분기에서는 legacy dict 만 본다 (SM-only=404)."""
-    from app.api.routes.kr_stocks import get_kr_stock_sessions
-    from services.session_manager import MarketType, get_session_manager
-
-    monkeypatch.setattr(
-        approval_module, "get_settings",
-        lambda: types.SimpleNamespace(SESSION_SSOT_READS=False),
-    )
-
-    sm = await get_session_manager()
-    await sm.create_session(
-        "ssot-p11-ksd-sm-only", MarketType.KIWOOM, "005930", "삼성전자",
-        stk_cd="005930", stk_nm="삼성전자",
-        state={"awaiting_approval": True,
-               "trade_proposal": {"action": "BUY", "quantity": 1,
-                                  "risk_score": 0.2, "rationale": "sm",
-                                  "created_at": "2026-07-16T00:00:00+00:00"},
-               "reasoning_log": []},
-    )
-
-    kr_sessions = get_kr_stock_sessions()
-    kr_sessions["ssot-p11-ksd-legacy"] = {
-        "stk_cd": "000660",
-        "stk_nm": "SK하이닉스",
-        "status": "awaiting_approval",
-        "state": {
-            "awaiting_approval": True,
-            "trade_proposal": {"action": "BUY", "quantity": 2,
-                               "risk_score": 0.4, "rationale": "legacy",
-                               "created_at": "2026-07-16T00:00:01+00:00"},
-            "reasoning_log": [],
-        },
-    }
-    try:
-        legacy_detail = client.get("/api/approval/pending/ssot-p11-ksd-legacy")
-        assert legacy_detail.status_code == 200
-        assert legacy_detail.json()["session_id"] == "ssot-p11-ksd-legacy"
-
-        sm_only_detail = client.get("/api/approval/pending/ssot-p11-ksd-sm-only")
-        assert sm_only_detail.status_code == 404
-    finally:
-        kr_sessions.pop("ssot-p11-ksd-legacy", None)
-        await sm.remove_session("ssot-p11-ksd-sm-only")

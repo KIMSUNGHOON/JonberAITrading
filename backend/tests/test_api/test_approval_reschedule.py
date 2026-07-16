@@ -9,9 +9,9 @@ awaiting_approval + 새 제안으로 끝났으면 — status를 'awaiting_approv
 
 P2-5 (session-SSOT): submit_decision now resolves the session and all its
 state/status entirely off the SessionManager (SM) -- there is no legacy
-dict ("B") lookup and no _adopt_session_from_manager fallback. This
-fixture's fake SessionManager is the SOLE source of truth; the legacy
-kr/coin session dicts are asserted to stay untouched.
+dict ("B") lookup and no _adopt_session_from_manager fallback (the legacy
+dicts themselves were fully retired in P3-1). This fixture's fake
+SessionManager is the SOLE source of truth.
 """
 
 from unittest.mock import AsyncMock
@@ -87,11 +87,6 @@ class _FakeGraph:
 @pytest.fixture
 def wired(monkeypatch):
     """SM-only session + no-op notification side channels + reschedule spy."""
-    coin_sessions: dict = {}
-    kr_stock_sessions: dict = {}
-    monkeypatch.setattr(approval_module, "get_kr_stock_sessions", lambda: kr_stock_sessions)
-    monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: coin_sessions)
-
     reschedule_calls = []
 
     async def fake_reschedule(session_id, market):
@@ -165,8 +160,6 @@ def wired(monkeypatch):
         "set_sm_session": set_sm_session,
         "set_graph": set_graph,
         "set_coin_graph": set_coin_graph,
-        "coin_sessions": coin_sessions,
-        "kr_stock_sessions": kr_stock_sessions,
     }
 
 
@@ -189,8 +182,6 @@ async def test_reject_rearms_injector_when_new_proposal_awaits(wired):
 
     assert wired["holder"]["manager"]._session.status == SessionStatus.AWAITING_APPROVAL
     assert wired["reschedule_calls"] == [(session_id, "kiwoom")]
-    assert session_id not in wired["kr_stock_sessions"]
-    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio

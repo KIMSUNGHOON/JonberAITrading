@@ -2,7 +2,6 @@
 Coin Constants and Cache
 
 Contains:
-- coin_sessions: In-memory session store
 - Market cache variables
 """
 
@@ -10,9 +9,6 @@ from datetime import datetime
 from typing import Optional
 
 from app.api.schemas.coin import MarketInfo
-
-# In-memory session store for coin analysis
-coin_sessions: dict[str, dict] = {}
 
 # Cached market list
 _cached_markets: list[MarketInfo] = []

@@ -5,16 +5,12 @@ Contains:
 - KOREAN_STOCKS: Extended list of KOSPI/KOSDAQ stocks
 - POPULAR_STOCKS: Subset for quick access
 - Cache variables for popular stocks
-- Session store for analysis
 """
 
 from datetime import datetime
 from typing import Optional
 
 from app.api.schemas.kr_stocks import KRStockInfo
-
-# In-memory session store for Korean stock analysis
-kr_stock_sessions: dict[str, dict] = {}
 
 # Cached stock list (popular stocks for quick access)
 _cached_popular_stocks: list[KRStockInfo] = []

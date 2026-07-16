@@ -48,28 +48,6 @@ async def sm(monkeypatch):
 
 
 @pytest.fixture
-def kr_sessions():
-    from app.api.routes.kr_stocks.constants import kr_stock_sessions
-
-    saved = dict(kr_stock_sessions)
-    kr_stock_sessions.clear()
-    yield kr_stock_sessions
-    kr_stock_sessions.clear()
-    kr_stock_sessions.update(saved)
-
-
-@pytest.fixture
-def coin_sessions_fixture():
-    from app.api.routes.coin.constants import coin_sessions
-
-    saved = dict(coin_sessions)
-    coin_sessions.clear()
-    yield coin_sessions
-    coin_sessions.clear()
-    coin_sessions.update(saved)
-
-
-@pytest.fixture
 async def temp_storage(tmp_path, monkeypatch):
     """Real (temp-file) StorageService installed as the process singleton —
     NOT a self-mocking fixture, so `storage.get_coin_position` exercises the
@@ -131,7 +109,7 @@ def _install_fake_kiwoom(monkeypatch, held_stk_cds=()):
 # -------------------------------------------
 
 
-async def test_kr_start_position_exists_true_for_held_ticker(sm, kr_sessions, monkeypatch):
+async def test_kr_start_position_exists_true_for_held_ticker(sm, monkeypatch):
     _install_fake_kiwoom(monkeypatch, held_stk_cds=["005930"])
 
     response = await start_kr_stock_analysis(
@@ -144,10 +122,9 @@ async def test_kr_start_position_exists_true_for_held_ticker(sm, kr_sessions, mo
     # store), so /status agrees too.
     session = await sm.get_session(response.session_id)
     assert session.state["position_exists"] is True
-    assert kr_sessions == {}
 
 
-async def test_kr_start_position_exists_false_for_unheld_ticker(sm, kr_sessions, monkeypatch):
+async def test_kr_start_position_exists_false_for_unheld_ticker(sm, monkeypatch):
     _install_fake_kiwoom(monkeypatch, held_stk_cds=["000660"])  # a different stock held
 
     response = await start_kr_stock_analysis(
@@ -160,7 +137,7 @@ async def test_kr_start_position_exists_false_for_unheld_ticker(sm, kr_sessions,
 
 
 async def test_kr_start_position_exists_defaults_false_on_broker_failure(
-    sm, kr_sessions, monkeypatch
+    sm, monkeypatch
 ):
     """Best-effort: a broker fetch failure must degrade to False, never
     raise or block the analysis-start request."""
@@ -193,7 +170,7 @@ async def test_kr_start_position_exists_defaults_false_on_broker_failure(
 
 
 async def test_coin_start_position_exists_true_for_held_market(
-    sm, coin_sessions_fixture, temp_storage
+    sm, temp_storage
 ):
     await temp_storage.save_coin_position(
         {
@@ -214,11 +191,10 @@ async def test_coin_start_position_exists_true_for_held_market(
     # store), so /status agrees too.
     session = await sm.get_session(response.session_id)
     assert session.state["position_exists"] is True
-    assert coin_sessions_fixture == {}
 
 
 async def test_coin_start_position_exists_false_for_unheld_market(
-    sm, coin_sessions_fixture, temp_storage
+    sm, temp_storage
 ):
     response = await start_coin_analysis(
         CoinAnalysisRequest(market="KRW-ETH"), BackgroundTasks()
@@ -227,11 +203,10 @@ async def test_coin_start_position_exists_false_for_unheld_market(
     assert response.position_exists is False
     session = await sm.get_session(response.session_id)
     assert session.state["position_exists"] is False
-    assert coin_sessions_fixture == {}
 
 
 async def test_coin_start_position_exists_false_for_zero_quantity_position(
-    sm, coin_sessions_fixture, temp_storage
+    sm, temp_storage
 ):
     """A stored position row with quantity<=0 must not count as held (the
     same >0 guard `coin/positions.py` and `coin_nodes.py`'s data-collection
@@ -264,12 +239,11 @@ async def test_coin_start_position_exists_false_for_zero_quantity_position(
 
 
 async def test_kr_dedup_hit_reports_position_exists_from_session_state(
-    sm, kr_sessions, monkeypatch
+    sm, monkeypatch
 ):
     """P2-3: the dedup hit's `existing` session comes straight from the sm
     (the atomic `create_session_if_no_active` reservation's collision
-    branch) -- position_exists must be sourced from ITS state, not a legacy
-    dict (which is never populated in the first place)."""
+    branch) -- position_exists must be sourced from ITS state."""
     from app.api.routes.kr_stocks.helpers import find_active_kr_session  # noqa: F401  (sanity import)
 
     existing_id = "kr-existing-held-1"

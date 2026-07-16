@@ -17,7 +17,6 @@ no local `session` object left to go stale relative to the SM.
 
 import asyncio
 import os
-import types
 
 import pytest
 
@@ -320,7 +319,6 @@ async def test_recheck_deny_clears_countdown(sm, fast_grace, monkeypatch, submit
 
 async def test_kr_producer_invokes_injector(sm, monkeypatch):
     """The KR analysis task must hand awaiting sessions to the injector."""
-    from app.api.routes.kr_stocks.constants import kr_stock_sessions
     from app.api.routes.kr_stocks.analysis import run_kr_stock_analysis_task
 
     calls = []
@@ -344,45 +342,31 @@ async def test_kr_producer_invokes_injector(sm, monkeypatch):
         "agents.graph.kr_stock_graph.get_kr_stock_trading_graph", lambda: FakeGraph()
     )
 
-    saved = dict(kr_stock_sessions)
-    kr_stock_sessions.clear()
-    try:
-        kr_stock_sessions["inj-kr-1"] = _awaiting_session("inj-kr-1")
-        kr_stock_sessions["inj-kr-1"]["status"] = "running"
-        kr_stock_sessions["inj-kr-1"]["state"]["awaiting_approval"] = False
-        await _seed_sm(sm, "inj-kr-1")
+    await _seed_sm(sm, "inj-kr-1")
 
-        await run_kr_stock_analysis_task("inj-kr-1")
+    await run_kr_stock_analysis_task("inj-kr-1")
 
-        assert calls == [("inj-kr-1", "kiwoom")]
-    finally:
-        kr_stock_sessions.clear()
-        kr_stock_sessions.update(saved)
+    assert calls == [("inj-kr-1", "kiwoom")]
 
 
 # -------------------------------------------
-# P2-6 dedicated pins: B/snapshot fully excluded, and the grace-window
-# re-check is a LIVE SessionManager read (not a locally-cached flag).
+# P2-6 dedicated pins: no snapshot ever passed through the call chain, and
+# the grace-window re-check is a LIVE SessionManager read (not a
+# locally-cached flag).
 # -------------------------------------------
 
 
-async def test_full_cycle_no_snapshot_or_b_ever_touched_auto_approves(
+async def test_full_cycle_no_snapshot_ever_touched_auto_approves(
     sm, fast_grace, gate_allow, submit_recorder
 ):
-    """End-to-end with the legacy dicts (B) never populated at all and no
-    snapshot/session argument passed anywhere in the call chain --
-    maybe_schedule_auto_approve's signature is (session_id, market) only, so
-    this is structurally guaranteed rather than merely asserted, but this
-    test also pins that B stays empty throughout the full grace cycle."""
-    from app.api.routes.kr_stocks import get_kr_stock_sessions
-    from app.api.routes.coin import get_coin_sessions
-
+    """End-to-end with no snapshot/session argument passed anywhere in the
+    call chain -- maybe_schedule_auto_approve's signature is (session_id,
+    market) only, so this is structurally guaranteed rather than merely
+    asserted."""
     session_id = "inj-b-free-1"
     await _seed_awaiting_sm(sm, session_id, proposal_id="p1")
 
     await maybe_schedule_auto_approve(session_id, "kiwoom")
-    assert session_id not in get_kr_stock_sessions()
-    assert session_id not in get_coin_sessions()
 
     await _wait_for(lambda: len(submit_recorder) == 1)
     assert submit_recorder[0] == {
@@ -391,8 +375,6 @@ async def test_full_cycle_no_snapshot_or_b_ever_touched_auto_approves(
         "actor": "system",
         "expected_proposal_id": "p1",
     }
-    assert session_id not in get_kr_stock_sessions()
-    assert session_id not in get_coin_sessions()
 
 
 async def test_sm_cancel_during_grace_stands_down_via_live_status_check(
@@ -426,29 +408,8 @@ async def test_sm_cancel_during_grace_stands_down_via_live_status_check(
 # -------------------------------------------
 
 
-@pytest.fixture
-def empty_legacy_dicts():
-    """Simulate a fresh process: legacy in-memory session dicts are empty
-    (the shape a restart actually leaves behind — the sm row survives, the
-    process-local dict does not)."""
-    from app.api.routes.kr_stocks.constants import kr_stock_sessions
-    from app.api.routes.coin.constants import coin_sessions
-
-    saved_kr = dict(kr_stock_sessions)
-    saved_coin = dict(coin_sessions)
-    kr_stock_sessions.clear()
-    coin_sessions.clear()
-    try:
-        yield
-    finally:
-        kr_stock_sessions.clear()
-        kr_stock_sessions.update(saved_kr)
-        coin_sessions.clear()
-        coin_sessions.update(saved_coin)
-
-
 async def test_rearm_schedules_for_sm_only_awaiting_session(
-    sm, fast_grace, gate_allow, submit_recorder, empty_legacy_dicts
+    sm, fast_grace, gate_allow, submit_recorder
 ):
     """A session that survived only in the SessionManager (legacy dict
     empty -- the restart shape) gets handed to maybe_schedule_auto_approve
@@ -467,7 +428,7 @@ async def test_rearm_schedules_for_sm_only_awaiting_session(
 
 
 async def test_rearm_gate_deny_schedules_nothing(
-    sm, fast_grace, monkeypatch, submit_recorder, empty_legacy_dicts
+    sm, fast_grace, monkeypatch, submit_recorder
 ):
     async def deny_gate(market, **kwargs):
         return GateDecision(allowed=False, reason="AUTONOMY_ENABLED is off", check="master_gate")
@@ -486,7 +447,7 @@ async def test_rearm_gate_deny_schedules_nothing(
 
 
 async def test_rearm_skips_session_with_live_future_countdown(
-    sm, fast_grace, monkeypatch, empty_legacy_dicts
+    sm, fast_grace, monkeypatch
 ):
     """A session that already carries a FUTURE auto_approve_at (a live grace
     task presumably already counting it down) must not be re-armed -- doing
@@ -511,7 +472,7 @@ async def test_rearm_skips_session_with_live_future_countdown(
     assert sm_session.state.get("auto_approve_at") == future  # left untouched
 
 
-async def test_rearm_skips_non_awaiting_sessions(sm, monkeypatch, empty_legacy_dicts):
+async def test_rearm_skips_non_awaiting_sessions(sm, monkeypatch):
     session_id = "rearm-4"
     await sm.create_session(
         session_id=session_id,
@@ -535,7 +496,7 @@ async def test_rearm_skips_non_awaiting_sessions(sm, monkeypatch, empty_legacy_d
 
 
 async def test_rearm_continues_after_one_session_errors(
-    sm, fast_grace, gate_allow, submit_recorder, empty_legacy_dicts, monkeypatch
+    sm, fast_grace, gate_allow, submit_recorder, monkeypatch
 ):
     """A single session raising during scheduling must not stop the pass --
     the other awaiting sessions still get re-armed."""
@@ -560,7 +521,7 @@ async def test_rearm_continues_after_one_session_errors(
 
 
 async def test_rearm_covers_both_markets_gate_can_deny_coin_only(
-    sm, fast_grace, monkeypatch, submit_recorder, empty_legacy_dicts
+    sm, fast_grace, monkeypatch, submit_recorder
 ):
     """coin is HITL-only in this codebase's default posture -- the gate
     denies it, but the pass must still attempt it (not skip coin entirely),
@@ -591,12 +552,9 @@ async def test_rearm_covers_both_markets_gate_can_deny_coin_only(
     assert submit_recorder[0]["session_id"] == kr_id
 
 
-async def test_rearm_scans_sm_only(sm, monkeypatch, empty_legacy_dicts):
-    """P1-4: SESSION_SSOT_READS=True (default) -- rearm scans the
-    SessionManager alone. A session that exists only in a legacy dict (never
-    reached the SM) must NOT be rearmed; the "legacy wins" tie-break that
-    existed when both sources were scanned is obsolete once SM is the sole
-    source."""
+async def test_rearm_scans_sm_only(sm, monkeypatch):
+    """P1-4/P3-1: rearm scans the SessionManager alone (legacy in-memory
+    dicts have been retired) -- an awaiting SM session gets rearmed."""
     scheduled: list[str] = []
 
     async def fake_schedule(session_id, market):
@@ -607,105 +565,7 @@ async def test_rearm_scans_sm_only(sm, monkeypatch, empty_legacy_dicts):
     session_id = "ssot-p14"
     await _seed_awaiting_sm(sm, session_id)
 
-    from app.api.routes.kr_stocks import get_kr_stock_sessions
-
-    get_kr_stock_sessions()["legacy-only-p14"] = _awaiting_session("legacy-only-p14")
-
     await injector_module.rearm_awaiting_approvals()
 
     assert session_id in scheduled
-    assert "legacy-only-p14" not in scheduled
 
-
-async def test_rearm_kill_switch_legacy_only_candidate_now_inert(
-    sm, fast_grace, gate_allow, submit_recorder, empty_legacy_dicts, monkeypatch
-):
-    """P2-6: SESSION_SSOT_READS=False's legacy-dict fallback scan (the
-    _scan_legacy_dict branch) still runs unchanged -- it is left in place
-    until P3-1 deletes it -- but it is now declared INVALID (config.py
-    SESSION_SSOT_READS docstring): maybe_schedule_auto_approve no longer
-    accepts a session snapshot, so it ALWAYS re-resolves the candidate via a
-    live sm.get_session() lookup before doing anything. Since nothing has
-    written to the legacy dicts since P2, a "legacy-only" session was never
-    created in the SessionManager either -- that live lookup returns None,
-    so nothing gets scheduled. This is the kill switch's declared-inert
-    behavior made concrete (the pre-P2-6 version of this test asserted the
-    opposite -- that the legacy-only session DID get rearmed; that fallback
-    no longer exists to restore). get_settings() is @lru_cache, so the name
-    the target module imported is patched directly (test_approval_
-    pending_ssot.py precedent)."""
-    monkeypatch.setattr(
-        injector_module, "get_settings",
-        lambda: types.SimpleNamespace(SESSION_SSOT_READS=False),
-    )
-
-    from app.api.routes.kr_stocks import get_kr_stock_sessions
-
-    legacy_id = "legacy-only-p14-killswitch"
-    get_kr_stock_sessions()[legacy_id] = _awaiting_session(legacy_id)
-
-    await injector_module.rearm_awaiting_approvals()
-    await asyncio.sleep(0.1)
-
-    assert submit_recorder == []
-    assert (await sm.get_session(legacy_id)) is None  # never existed in the SM
-
-
-# -------------------------------------------
-# P2-6: SESSION_SSOT_READS=False startup warning (app/config.py)
-# -------------------------------------------
-
-
-def test_session_ssot_reads_false_warns_once_at_settings_load(monkeypatch):
-    """The kill switch is declared unsupported since P2 -- get_settings()
-    logs one warning when SESSION_SSOT_READS resolves to False, so a
-    misconfigured deployment is discoverable at startup instead of silently
-    running on dead-fallback config. get_settings() is @lru_cache (module-
-    global), so the cache is cleared before AND after this test to avoid
-    leaking a False-flavored Settings instance into any other test."""
-    import app.config as config_module
-
-    config_module.get_settings.cache_clear()
-    monkeypatch.setenv("SESSION_SSOT_READS", "false")
-
-    warnings = []
-
-    def fake_warning(event, **kw):
-        warnings.append((event, kw))
-
-    monkeypatch.setattr(config_module._logger, "warning", fake_warning)
-
-    try:
-        settings = config_module.get_settings()
-        assert settings.SESSION_SSOT_READS is False
-        assert len(warnings) == 1
-        assert warnings[0][0] == "session_ssot_reads_disabled_unsupported"
-
-        # @lru_cache: a second call must NOT log again (one warning per
-        # process, not per call).
-        config_module.get_settings()
-        assert len(warnings) == 1
-    finally:
-        config_module.get_settings.cache_clear()
-
-
-def test_session_ssot_reads_true_never_warns(monkeypatch):
-    """The default (True) must never trigger the kill-switch warning."""
-    import app.config as config_module
-
-    config_module.get_settings.cache_clear()
-    monkeypatch.delenv("SESSION_SSOT_READS", raising=False)
-
-    warnings = []
-
-    def fake_warning(event, **kw):
-        warnings.append((event, kw))
-
-    monkeypatch.setattr(config_module._logger, "warning", fake_warning)
-
-    try:
-        settings = config_module.get_settings()
-        assert settings.SESSION_SSOT_READS is True
-        assert warnings == []
-    finally:
-        config_module.get_settings.cache_clear()

@@ -132,24 +132,6 @@ class Settings(BaseSettings):
     # 복합 시장심리 라벨 경계(EOD_REGIME_BREADTH_THRESHOLD 패턴).
     PHASE5_SENTIMENT_THRESHOLD: float = Field(default=0.1, ge=0)
 
-    # P1 (session-SSOT): read-unification kill switch. True = /approval/pending,
-    # /pending/{id}, WS snapshot, status routes, injector rearm read the
-    # SessionManager ONLY. False = legacy-first reads (pre-P1 behavior).
-    #
-    # P2-6: INVALID since P2 landed — False is NOT a supported configuration
-    # anymore. P2 removed every write to the legacy in-memory session dicts
-    # (kr_stock_sessions / coin_sessions), so a False read here just sees
-    # permanently-empty dicts at every P1 read-branch site (approval
-    # /pending, /pending/{id}, websocket._get_session_snapshot, the KR/coin
-    # status routes, the autonomy injector's rearm scan) — there is no
-    # dual-write left for this flag to fall back to. Those branches are left
-    # in place unchanged (P3-1 deletes them) so flipping this flag stays a
-    # pure config change either way, but flipping it to False will NOT
-    # restore the old pre-P1 behavior. get_settings() logs one warning at
-    # startup when this is False. ROLLBACK: revert the P2 commits — do not
-    # rely on this flag to undo them.
-    SESSION_SSOT_READS: bool = True
-
     # -------------------------------------------
     # Phase3: EOD strategy consensus (strategy_orchestrator.py). ENABLED
     # gates the market-close LLM panel (3 structured calls via the
@@ -236,21 +218,6 @@ def get_settings() -> Settings:
     Settings are loaded once and cached for performance.
     """
     instance = Settings()
-    if not instance.SESSION_SSOT_READS:
-        # P2-6: the kill switch is declared invalid since P2 (see the field's
-        # docstring above) -- a single startup warning documents that a
-        # False deployment is running on unsupported config, without
-        # spamming (get_settings() is @lru_cache, so Settings() -- and this
-        # branch -- runs at most once per process).
-        _logger.warning(
-            "session_ssot_reads_disabled_unsupported",
-            message=(
-                "SESSION_SSOT_READS=False is unsupported since P2 (session-SSOT) -- "
-                "no code path writes to the legacy in-memory session dicts anymore, "
-                "so the pre-P1 fallback this flag used to restore no longer exists. "
-                "Rollback = revert the P2 commits, not this flag."
-            ),
-        )
     return instance
 
 

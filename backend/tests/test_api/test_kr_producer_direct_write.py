@@ -1,8 +1,9 @@
 """P2-3: KR producer SM 직접쓰기 전환 — characterization tests (목표 거동).
 
-세션 SSOT 통합 P2-3. `kr_stocks/analysis.py`가 legacy dict(B, `kr_stock_sessions`)
-와 SessionManager(SM)에 이중쓰기하던 것을 SM 직접쓰기 단독으로 전환한다. 이
-파일은 REFACTOR 전 실패(RED)해야 하는, 목표 거동을 고정하는 특성화 테스트다:
+세션 SSOT 통합 P2-3. `kr_stocks/analysis.py`가 legacy dict(B)와
+SessionManager(SM)에 이중쓰기하던 것을 SM 직접쓰기 단독으로 전환한다
+(legacy dict는 P3-1에서 완전 삭제됨). 이 파일은 REFACTOR 전 실패(RED)해야
+하는, 목표 거동을 고정하는 특성화 테스트다:
 
   1) 동시 start 2건(asyncio.gather) — 원자 예약(`create_session_if_no_active`)
      이 dedup을 대체하므로 정확히 하나만 새 세션을 예약하고, 그래프는 정확히
@@ -10,8 +11,6 @@
   2) awaiting_approval 세션이 3개의 읽기 표면(/approval/pending,
      GET /api/trading/operations, WS `_get_session_snapshot`)에서 동일하게
      보인다 — SM이 유일한 쓰기 대상이므로 셋 다 같은 진실을 읽는다.
-  3) legacy dict(`kr_stock_sessions`, B)는 start~cancel 전 생애주기 동안
-     완전히 비어 있다 — B 쓰기가 하나도 남지 않았다는 핀.
 
 awaiting-commit 실패 시 fail-closed(2회 시도 후 ERROR + schedule 금지)는
 `test_awaiting_writethrough.py`의 조정된 KR 테스트가 커버한다(새 시그니처
@@ -66,18 +65,6 @@ async def sm(monkeypatch):
     manager._sessions.clear()
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
-
-
-@pytest.fixture
-def kr_sessions():
-    """Isolated view of the legacy KR session dict (B) -- must stay empty."""
-    from app.api.routes.kr_stocks.constants import kr_stock_sessions
-
-    saved = dict(kr_stock_sessions)
-    kr_stock_sessions.clear()
-    yield kr_stock_sessions
-    kr_stock_sessions.clear()
-    kr_stock_sessions.update(saved)
 
 
 @pytest.fixture
@@ -137,7 +124,7 @@ class _AwaitingGraph:
 
 
 async def test_concurrent_starts_same_ticker_reserve_exactly_once(
-    sm, kr_sessions, fake_kiwoom, monkeypatch
+    sm, fake_kiwoom, monkeypatch
 ):
     graph = _CountingCompletingGraph()
     _patch_graph(monkeypatch, graph)
@@ -183,7 +170,7 @@ async def test_concurrent_starts_same_ticker_reserve_exactly_once(
 
 
 async def test_awaiting_session_visible_on_pending_operations_and_ws_snapshot(
-    sm, kr_sessions, fake_kiwoom, monkeypatch
+    sm, fake_kiwoom, monkeypatch
 ):
     _patch_graph(monkeypatch, _AwaitingGraph())
 
@@ -225,44 +212,23 @@ async def test_awaiting_session_visible_on_pending_operations_and_ws_snapshot(
 
 
 # -------------------------------------------
-# 3) The legacy dict (B) stays empty across the ENTIRE lifecycle -- start,
-#    run-to-completion, run-to-awaiting, and cancel never write it.
+# 3) Cancel-after-awaiting lifecycle transitions correctly through the SM
+#    alone (legacy dict writes were retired in P3-1).
 # -------------------------------------------
 
 
-async def test_b_dict_stays_empty_through_completed_lifecycle(
-    sm, kr_sessions, fake_kiwoom, monkeypatch
-):
-    _patch_graph(monkeypatch, _CountingCompletingGraph())
-
-    bg = BackgroundTasks()
-    response = await start_kr_stock_analysis(KRStockAnalysisRequest(stk_cd="005930"), bg)
-    assert kr_sessions == {}, "start must never write the legacy dict"
-
-    await run_kr_stock_analysis_task(response.session_id)
-    assert kr_sessions == {}, "the background task must never write the legacy dict"
-
-    session = await sm.get_session(response.session_id)
-    assert session.status == SessionStatus.COMPLETED
-
-
-async def test_b_dict_stays_empty_through_awaiting_and_cancel_lifecycle(
-    sm, kr_sessions, fake_kiwoom, monkeypatch
-):
+async def test_awaiting_and_cancel_lifecycle(sm, fake_kiwoom, monkeypatch):
     _patch_graph(monkeypatch, _AwaitingGraph())
 
     bg = BackgroundTasks()
     response = await start_kr_stock_analysis(KRStockAnalysisRequest(stk_cd="005930"), bg)
-    assert kr_sessions == {}
 
     await run_kr_stock_analysis_task(response.session_id)
-    assert kr_sessions == {}, "reaching the approval interrupt must never write the legacy dict"
 
     session = await sm.get_session(response.session_id)
     assert session.status == SessionStatus.AWAITING_APPROVAL
 
     result = await cancel_kr_stock_analysis(response.session_id)
-    assert kr_sessions == {}, "cancel must never write the legacy dict"
     assert result["mirror_failed"] is False
 
     session = await sm.get_session(response.session_id)

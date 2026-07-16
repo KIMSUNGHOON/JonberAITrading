@@ -54,28 +54,6 @@ async def sm(monkeypatch):
         os.remove(TEST_DB_PATH)
 
 
-@pytest.fixture
-def kr_sessions():
-    from app.api.routes.kr_stocks.constants import kr_stock_sessions
-
-    saved = dict(kr_stock_sessions)
-    kr_stock_sessions.clear()
-    yield kr_stock_sessions
-    kr_stock_sessions.clear()
-    kr_stock_sessions.update(saved)
-
-
-@pytest.fixture
-def coin_sessions_fixture():
-    from app.api.routes.coin.constants import coin_sessions
-
-    saved = dict(coin_sessions)
-    coin_sessions.clear()
-    yield coin_sessions
-    coin_sessions.clear()
-    coin_sessions.update(saved)
-
-
 class _FakeStockInfo:
     stk_nm = "삼성전자"
 
@@ -93,46 +71,6 @@ def fake_kiwoom(monkeypatch):
     monkeypatch.setattr(
         "app.api.routes.kr_stocks.analysis.get_shared_kiwoom_client_async", _fake_client
     )
-
-
-def _seed_kr_session(kr_sessions, session_id: str, status: str = "running") -> dict:
-    record = {
-        "session_id": session_id,
-        "stk_cd": "005930",
-        "stk_nm": "삼성전자",
-        "status": status,
-        "state": {
-            "stk_cd": "005930",
-            "stk_nm": "삼성전자",
-            "query": None,
-            "reasoning_log": [],
-            "current_stage": "data_collection",
-        },
-        "created_at": None,
-        "error": None,
-    }
-    kr_sessions[session_id] = record
-    return record
-
-
-def _seed_coin_session(coin_sessions, session_id: str, status: str = "running") -> dict:
-    record = {
-        "session_id": session_id,
-        "market": "KRW-BTC",
-        "korean_name": "비트코인",
-        "status": status,
-        "state": {
-            "market": "KRW-BTC",
-            "korean_name": "비트코인",
-            "query": None,
-            "reasoning_log": [],
-            "current_stage": "data_collection",
-        },
-        "created_at": None,
-        "error": None,
-    }
-    coin_sessions[session_id] = record
-    return record
 
 
 async def _seed_kr_sm_session(sm, session_id: str, status: SessionStatus = SessionStatus.RUNNING):
@@ -168,10 +106,9 @@ async def _seed_coin_sm_session(sm, session_id: str, status: SessionStatus = Ses
 
 @pytest.mark.parametrize("blocking_status", ["running", "awaiting_approval"])
 async def test_kr_start_dedup_returns_existing_session(
-    sm, kr_sessions, fake_kiwoom, blocking_status
+    sm, fake_kiwoom, blocking_status
 ):
     existing_id = "kr-existing-1"
-    _seed_kr_session(kr_sessions, existing_id, status=blocking_status)
     await _seed_kr_sm_session(
         sm,
         existing_id,
@@ -187,15 +124,13 @@ async def test_kr_start_dedup_returns_existing_session(
     assert response.duplicate is True
     assert response.status == blocking_status
     # No second session was created, and no second graph run was queued.
-    assert len(kr_sessions) == 1
     assert bg.tasks == []
 
 
-async def test_kr_start_dedup_does_not_call_kiwoom_client(sm, kr_sessions, monkeypatch):
+async def test_kr_start_dedup_does_not_call_kiwoom_client(sm, monkeypatch):
     """A dedup hit should short-circuit before the (network-bound) stock-name
     lookup — no reason to pay that cost for a session we're not creating."""
     existing_id = "kr-existing-nocall"
-    _seed_kr_session(kr_sessions, existing_id, status="running")
     await _seed_kr_sm_session(sm, existing_id)
 
     called = {"n": 0}
@@ -218,10 +153,9 @@ async def test_kr_start_dedup_does_not_call_kiwoom_client(sm, kr_sessions, monke
 
 @pytest.mark.parametrize("settled_status", ["completed", "error", "cancelled"])
 async def test_kr_start_allows_new_analysis_after_settled_session(
-    sm, kr_sessions, fake_kiwoom, settled_status
+    sm, fake_kiwoom, settled_status
 ):
     prior_id = "kr-settled-1"
-    _seed_kr_session(kr_sessions, prior_id, status=settled_status)
     await _seed_kr_sm_session(sm, prior_id, status=SessionStatus.RUNNING)
     await sm.update_status(
         prior_id,
@@ -237,23 +171,17 @@ async def test_kr_start_allows_new_analysis_after_settled_session(
 
     assert response.session_id != prior_id
     assert response.duplicate is False
-    # P2-3: the producer writes the SM only -- `kr_sessions` here still has
-    # its ONE fixture-seeded entry (the settled prior session, planted
-    # directly by this test's own setup, not by the route) and gains no
-    # second entry from the fresh start.
-    assert len(kr_sessions) == 1
     all_sessions = await sm.get_all_sessions(market_type=MarketType.KIWOOM)
     assert len(all_sessions) == 2  # the settled one + the freshly-started one
     assert len(bg.tasks) == 1  # a new graph run WAS queued
 
 
-async def test_kr_start_dedup_falls_back_to_sm_when_legacy_dict_misses(sm, kr_sessions):
-    """Post-restart shape: kr_stock_sessions (plain in-process dict) is wiped,
-    but SessionManager reloaded/reconciled the session as still
-    AWAITING_APPROVAL from SQLite. The dedup guard must still catch it."""
+async def test_kr_dedup_reads_sm_directly(sm):
+    """`find_active_kr_session` resolves an AWAITING_APPROVAL session
+    entirely off the SessionManager (SQLite-backed) -- no in-memory dict
+    involved at all."""
     existing_id = "kr-restart-active-1"
     await _seed_kr_sm_session(sm, existing_id, status=SessionStatus.AWAITING_APPROVAL)
-    assert existing_id not in kr_sessions
 
     found = await find_active_kr_session("005930")
 
@@ -262,13 +190,12 @@ async def test_kr_start_dedup_falls_back_to_sm_when_legacy_dict_misses(sm, kr_se
 
 
 async def test_kr_start_ticker_isolation_different_stk_cd_not_blocked(
-    sm, kr_sessions, fake_kiwoom
+    sm, fake_kiwoom
 ):
     """An active session for one stk_cd must not block a different stk_cd."""
     existing_id = "kr-other-ticker-1"
-    record = _seed_kr_session(kr_sessions, existing_id, status="running")
-    record["stk_cd"] = "000660"
-    record["state"]["stk_cd"] = "000660"
+    await _seed_kr_sm_session(sm, existing_id, status=SessionStatus.RUNNING)
+    sm._sessions[existing_id].stk_cd = "000660"
 
     bg = BackgroundTasks()
     response = await start_kr_stock_analysis(KRStockAnalysisRequest(stk_cd="005930"), bg)
@@ -292,7 +219,7 @@ async def test_kr_start_ticker_isolation_different_stk_cd_not_blocked(
 
 
 async def test_kr_start_concurrent_same_ticker_only_one_session_created(
-    sm, kr_sessions, monkeypatch
+    sm, monkeypatch
 ):
     """Two near-simultaneous starts for the SAME stk_cd, with NO prior
     session: task A is parked mid-lookup (blocked inside `get_stock_info` on
@@ -335,7 +262,6 @@ async def test_kr_start_concurrent_same_ticker_only_one_session_created(
     assert len(sm._sessions) == 1, "A's sm reservation must already be recorded"
     existing_id = next(iter(sm._sessions))
     assert sm._sessions[existing_id].status == SessionStatus.RUNNING
-    assert kr_sessions == {}, "P2-3: the legacy dict is never written"
 
     # Task B "arrives" while A is still parked — same stk_cd, no gating on
     # its own client lookup needed since it must dedup before reaching it.
@@ -358,11 +284,10 @@ async def test_kr_start_concurrent_same_ticker_only_one_session_created(
     assert len(bg_a.tasks) == 1  # exactly one graph run total, from A
     assert len(sm._sessions) == 1  # B never created a second entry
     assert sm._sessions[existing_id].stk_nm == "삼성전자"  # finalized after the lookup
-    assert kr_sessions == {}
 
 
 async def test_kr_start_cleans_up_placeholder_on_kiwoom_client_failure(
-    sm, kr_sessions, monkeypatch
+    sm, monkeypatch
 ):
     """If resolving the kiwoom client itself blows up (distinct from the
     already-guarded, best-effort inner get_stock_info/get_account_balance
@@ -383,7 +308,6 @@ async def test_kr_start_cleans_up_placeholder_on_kiwoom_client_failure(
         )
 
     assert len(sm._sessions) == 0  # no stranded reservation left behind
-    assert kr_sessions == {}
 
     # A subsequent analysis for the SAME ticker must not be blocked by
     # anything left over from the failed attempt.
@@ -400,7 +324,6 @@ async def test_kr_start_cleans_up_placeholder_on_kiwoom_client_failure(
     assert response.duplicate is False
     assert len(bg.tasks) == 1
     assert len(sm._sessions) == 1
-    assert kr_sessions == {}
 
 
 # -------------------------------------------
@@ -410,13 +333,9 @@ async def test_kr_start_cleans_up_placeholder_on_kiwoom_client_failure(
 
 @pytest.mark.parametrize("blocking_status", ["running", "awaiting_approval"])
 async def test_coin_start_dedup_returns_existing_session(
-    sm, coin_sessions_fixture, blocking_status
+    sm, blocking_status
 ):
     existing_id = "coin-existing-1"
-    # P2-4: the coin producer writes the SM only now -- this legacy-dict seed
-    # represents a pre-existing (test-planted) entry the route never touches;
-    # dedup itself is driven entirely by the SM seed below.
-    _seed_coin_session(coin_sessions_fixture, existing_id, status=blocking_status)
     await _seed_coin_sm_session(
         sm,
         existing_id,
@@ -432,16 +351,14 @@ async def test_coin_start_dedup_returns_existing_session(
     assert response.duplicate is True
     assert response.status == blocking_status
     # No second session was created, and no second graph run was queued.
-    assert len(coin_sessions_fixture) == 1
     assert bg.tasks == []
 
 
 @pytest.mark.parametrize("settled_status", ["completed", "error", "cancelled"])
 async def test_coin_start_allows_new_analysis_after_settled_session(
-    sm, coin_sessions_fixture, settled_status
+    sm, settled_status
 ):
     prior_id = "coin-settled-1"
-    _seed_coin_session(coin_sessions_fixture, prior_id, status=settled_status)
     await _seed_coin_sm_session(sm, prior_id, status=SessionStatus.RUNNING)
     await sm.update_status(
         prior_id,
@@ -457,22 +374,17 @@ async def test_coin_start_allows_new_analysis_after_settled_session(
 
     assert response.session_id != prior_id
     assert response.duplicate is False
-    # P2-4: the producer writes the SM only -- `coin_sessions_fixture` here
-    # still has its ONE fixture-seeded entry (the settled prior session,
-    # planted directly by this test's own setup, not by the route) and gains
-    # no second entry from the fresh start.
-    assert len(coin_sessions_fixture) == 1
     all_sessions = await sm.get_all_sessions(market_type=MarketType.COIN)
     assert len(all_sessions) == 2  # the settled one + the freshly-started one
     assert len(bg.tasks) == 1  # a new graph run WAS queued
 
 
-async def test_coin_start_dedup_falls_back_to_sm_when_legacy_dict_misses(
-    sm, coin_sessions_fixture
-):
+async def test_coin_dedup_reads_sm_directly(sm):
+    """`find_active_coin_session` resolves an AWAITING_APPROVAL session
+    entirely off the SessionManager (SQLite-backed) -- no in-memory dict
+    involved at all."""
     existing_id = "coin-restart-active-1"
     await _seed_coin_sm_session(sm, existing_id, status=SessionStatus.AWAITING_APPROVAL)
-    assert existing_id not in coin_sessions_fixture
 
     found = await find_active_coin_session("KRW-BTC")
 
@@ -481,12 +393,12 @@ async def test_coin_start_dedup_falls_back_to_sm_when_legacy_dict_misses(
 
 
 async def test_coin_start_ticker_isolation_different_market_not_blocked(
-    sm, coin_sessions_fixture
+    sm
 ):
+    """An active session for one market must not block a different market."""
     existing_id = "coin-other-market-1"
-    record = _seed_coin_session(coin_sessions_fixture, existing_id, status="running")
-    record["market"] = "KRW-ETH"
-    record["state"]["market"] = "KRW-ETH"
+    await _seed_coin_sm_session(sm, existing_id, status=SessionStatus.RUNNING)
+    sm._sessions[existing_id].market = "KRW-ETH"
 
     bg = BackgroundTasks()
     response = await start_coin_analysis(CoinAnalysisRequest(market="KRW-BTC"), bg)
@@ -505,7 +417,7 @@ async def test_coin_start_ticker_isolation_different_market_not_blocked(
 
 
 async def test_coin_start_concurrent_same_market_only_one_session_created(
-    sm, coin_sessions_fixture, monkeypatch
+    sm, monkeypatch
 ):
     """Two near-simultaneous starts for the SAME market, with NO prior
     session: task A is parked mid-lookup (blocked inside the storage
@@ -545,7 +457,6 @@ async def test_coin_start_concurrent_same_market_only_one_session_created(
     assert len(sm._sessions) == 1, "A's sm reservation must already be recorded"
     existing_id = next(iter(sm._sessions))
     assert sm._sessions[existing_id].status == SessionStatus.RUNNING
-    assert coin_sessions_fixture == {}, "P2-4: the legacy dict is never written"
 
     # Task B "arrives" while A is still parked — same market, no gating on
     # its own storage lookup needed since it must dedup before reaching it.
@@ -567,4 +478,3 @@ async def test_coin_start_concurrent_same_market_only_one_session_created(
     assert response_a.session_id == existing_id
     assert len(bg_a.tasks) == 1  # exactly one graph run total, from A
     assert len(sm._sessions) == 1  # B never created a second entry
-    assert coin_sessions_fixture == {}

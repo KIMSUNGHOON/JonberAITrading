@@ -36,7 +36,6 @@ from services.session_manager import (
     mirror_session_status,
 )
 from .constants import get_cached_markets
-from .helpers import get_coin_session
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -370,23 +369,16 @@ async def get_coin_analysis_status(session_id: str):
     Returns:
         Full status including market data and trade proposal
     """
-    # P1-3 (session-SSOT): the SessionManager is the ONLY read source when
-    # SESSION_SSOT_READS is on (default) — this is coin's first restart-tolerant
-    # read path (previously `get_coin_session` read the legacy in-process dict
-    # alone, so a session that survived a restart into the SM would 404 here).
-    # The legacy-only path survives solely as the kill-switch fallback until
-    # P2 removes legacy writes entirely — see app/api/routes/approval.py and
-    # websocket.py for the same switch.
-    if get_settings().SESSION_SSOT_READS:
-        session_manager = await get_session_manager()
-        session = await session_manager.get_session_dict(session_id)
-        if session is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Coin session {session_id} not found",
-            )
-    else:
-        session = get_coin_session(session_id)
+    # P1-3 (session-SSOT): the SessionManager is the sole read source —
+    # legacy in-memory dicts were retired in P3-1 (see app/api/routes/
+    # approval.py and websocket.py for the same read path).
+    session_manager = await get_session_manager()
+    session = await session_manager.get_session_dict(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Coin session {session_id} not found",
+        )
     state = session["state"]
 
     # Build trade proposal response
@@ -459,11 +451,12 @@ async def cancel_coin_analysis(session_id: str):
         Confirmation message
     """
     # I3: local import — approval.py is imported at coin-package init time
-    # (__init__.py -> .analysis, this module), and approval.py itself imports
-    # get_coin_sessions from this package at module level. A module-level
-    # import of approval here would close a real import cycle (approval ->
-    # coin -> analysis -> approval, partially-initialized). Deferred import
-    # breaks the cycle; by request time approval.py is always fully loaded.
+    # (__init__.py -> .analysis, this module). A module-level import of
+    # approval here risks closing an import cycle back through this package
+    # (approval -> coin -> analysis -> approval, partially-initialized) if
+    # approval.py ever imports from coin again at module level. Deferred
+    # import stays safe regardless; by request time approval.py is always
+    # fully loaded.
     from app.api.routes.approval import _session_decision_lock
 
     # Route this cancel through the SAME per-session lock /decide uses, so it

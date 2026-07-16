@@ -96,15 +96,9 @@ class _FakeGraph:
 
 @pytest.fixture
 def wired(monkeypatch):
-    """No legacy dicts at all are ever populated by this fixture -- B is
-    asserted to remain completely untouched by every test in this file
-    (see get_coin_sessions/get_kr_stock_sessions patched to always-empty
-    dicts, and the explicit "B never touched" assertions below)."""
-    coin_sessions: dict = {}
-    kr_stock_sessions: dict = {}
-    monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: coin_sessions)
-    monkeypatch.setattr(approval_module, "get_kr_stock_sessions", lambda: kr_stock_sessions)
-
+    """No legacy dicts exist anymore (retired in P3-1) -- this fixture wires
+    only the SessionManager fake and the write-path monkeypatches submit_
+    decision depends on."""
     holder: dict = {"manager": _FakeSessionManager(None)}
 
     async def fake_get_session_manager():
@@ -180,8 +174,6 @@ def wired(monkeypatch):
 
     return {
         "holder": holder,
-        "coin_sessions": coin_sessions,
-        "kr_stock_sessions": kr_stock_sessions,
         "set_sm_session": set_sm_session,
         "set_graph": set_graph,
         "reschedule_calls": reschedule_calls,
@@ -221,10 +213,6 @@ async def test_approve_cycle_with_b_fully_empty_lands_sm_completed(wired):
     resume_config, resume_update = graph.aupdate_state_calls[0]
     assert resume_config == {"configurable": {"thread_id": session_id}}
     assert resume_update["approval_status"] == "approved"
-
-    # B never participated at any point.
-    assert wired["kr_stock_sessions"] == {}
-    assert wired["coin_sessions"] == {}
 
 
 # --- 2. reject -> re-analysis makes a NEW awaiting directly in the SM -------
@@ -268,9 +256,6 @@ async def test_reject_reanalysis_creates_new_awaiting_directly_in_sm(wired):
     # itself via a live sm.get_session() call (retires the P2-5
     # _SmSessionView shim entirely).
     assert wired["reschedule_calls"] == [(session_id, "kiwoom")]
-
-    assert wired["kr_stock_sessions"] == {}
-    assert wired["coin_sessions"] == {}
 
 
 # --- 3. cancel concurrency guard preserved without _adopt --------------------

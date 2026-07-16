@@ -15,8 +15,6 @@ from fastapi import APIRouter, HTTPException, status
 from agents.graph.coin_trading_graph import get_coin_trading_graph
 from agents.graph.kr_stock_graph import get_kr_stock_trading_graph
 from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
-from app.api.routes.coin import get_coin_sessions
-from app.api.routes.kr_stocks import get_kr_stock_sessions
 from app.api.schemas.approval import (
     ApprovalRequest,
     ApprovalResponse,
@@ -24,7 +22,6 @@ from app.api.schemas.approval import (
     PendingApprovalsResponse,
     PendingProposalSummary,
 )
-from app.config import get_settings
 from app.dependencies import get_trading_coordinator
 from services.session_manager import (
     MarketType,
@@ -789,19 +786,13 @@ async def list_pending_approvals():
     Returns:
         List of pending approvals with trade proposal details
     """
-    # P1 (session-SSOT): SESSION_SSOT_READS=True (default) reads the
-    # SessionManager exclusively. False = legacy dict merge (pre-P1
-    # behavior) -- kill switch only, valid until P2 removes legacy writes.
-    if get_settings().SESSION_SSOT_READS:
-        sm = await get_session_manager()
-        sm_sessions = await sm.get_all_sessions()
-        all_sessions = {
-            sid: s.to_legacy_dict() for sid, s in sm_sessions.items()
-        }
-    else:
-        coin_sessions = get_coin_sessions()
-        kr_stock_sessions = get_kr_stock_sessions()
-        all_sessions = {**coin_sessions, **kr_stock_sessions}
+    # P1 (session-SSOT): the SessionManager is the sole read source --
+    # legacy in-memory dicts were retired in P3-1.
+    sm = await get_session_manager()
+    sm_sessions = await sm.get_all_sessions()
+    all_sessions = {
+        sid: s.to_legacy_dict() for sid, s in sm_sessions.items()
+    }
     pending = []
 
     for session_id, session in all_sessions.items():
@@ -862,15 +853,10 @@ async def get_pending_approval(session_id: str):
     Returns:
         Detailed trade proposal and analyses
     """
-    # P1 (session-SSOT): SM-only lookup (no legacy-dict fallback) when the
-    # flag is on -- see list_pending_approvals above for the same switch.
-    if get_settings().SESSION_SSOT_READS:
-        sm = await get_session_manager()
-        session = await sm.get_session_dict(session_id)
-    else:
-        coin_sessions = get_coin_sessions()
-        kr_stock_sessions = get_kr_stock_sessions()
-        session = coin_sessions.get(session_id) or kr_stock_sessions.get(session_id)
+    # P1 (session-SSOT): SM-only lookup -- see list_pending_approvals above
+    # for the same read path.
+    sm = await get_session_manager()
+    session = await sm.get_session_dict(session_id)
 
     if not session:
         raise HTTPException(

@@ -12,15 +12,13 @@ from app.api.routes.settings import (
     get_kiwoom_app_key,
     get_kiwoom_secret_key,
 )
-from .constants import kr_stock_sessions
 
 
 async def find_active_kr_session(stk_cd: str) -> Optional[dict]:
     """Return the first RUNNING/AWAITING_APPROVAL session for `stk_cd`, if any.
 
     P2-3: the KR producer (kr_stocks/analysis.py) writes ONLY to the
-    SessionManager now -- the legacy `kr_stock_sessions` dict is never
-    populated by it -- so the SessionManager is the sole read source here
+    SessionManager now -- so the SessionManager is the sole read source here
     too. `/analysis/start` itself no longer calls this: its dedup check is
     now folded into the atomic `SessionManager.create_session_if_no_active`
     reservation, which closes the check-then-create race directly instead of
@@ -42,17 +40,6 @@ async def find_active_kr_session(stk_cd: str) -> Optional[dict]:
     return None
 
 
-def get_kr_stock_session(session_id: str) -> dict:
-    """Get session or raise 404."""
-    session = kr_stock_sessions.get(session_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Korean stock session {session_id} not found",
-        )
-    return session
-
-
 def check_kiwoom_api_keys() -> None:
     """Check if Kiwoom API keys are configured (runtime or env)."""
     app_key = get_kiwoom_app_key()
@@ -64,7 +51,3 @@ def check_kiwoom_api_keys() -> None:
             detail="Kiwoom API keys not configured. Please configure in Settings.",
         )
 
-
-def get_kr_stock_sessions() -> dict:
-    """Get reference to Korean stock sessions (for WebSocket, approval routes)."""
-    return kr_stock_sessions

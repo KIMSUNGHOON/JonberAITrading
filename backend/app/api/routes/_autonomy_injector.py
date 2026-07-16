@@ -41,7 +41,6 @@ from datetime import datetime, timedelta, timezone
 
 import structlog
 
-from app.config import get_settings
 from services.autonomy import check_autonomy
 from services.session_manager import (
     MarketType,
@@ -275,35 +274,6 @@ def _has_future_auto_approve_at(value) -> bool:
     return dt > datetime.now(timezone.utc)
 
 
-def _scan_legacy_dict(get_dict, market: str, candidates: dict) -> None:
-    """Add every AWAITING_APPROVAL session_id from a legacy in-memory dict
-    into `candidates` (session_id -> market), first-writer-wins.
-
-    P2-6: candidates map to a plain market string now, not a
-    (market, session) snapshot pair — maybe_schedule_auto_approve no longer
-    accepts a session argument at all, so there is nothing left to snapshot
-    here; every candidate's actual state is re-resolved live from the SM
-    right before it is scheduled (see rearm_awaiting_approvals's final
-    loop)."""
-    try:
-        sessions = get_dict()
-    except Exception as e:
-        logger.error("autonomy_rearm_legacy_import_failed", market=market, error=str(e))
-        return
-
-    for session_id, session in sessions.items():
-        try:
-            if session.get("status") == SessionStatus.AWAITING_APPROVAL.value:
-                candidates.setdefault(session_id, market)
-        except Exception as e:
-            logger.error(
-                "autonomy_rearm_legacy_scan_failed",
-                market=market,
-                session_id=session_id,
-                error=str(e),
-            )
-
-
 async def rearm_awaiting_approvals() -> None:
     """Re-arm the auto-approve injector for sessions ALREADY awaiting_approval.
 
@@ -319,25 +289,8 @@ async def rearm_awaiting_approvals() -> None:
     Meant to be called once, from the app startup lifespan, after the
     SessionManager (and its stranded-session reconcile pass) have
     initialized. Walks every session currently AWAITING_APPROVAL from the
-    SessionManager (the durable source of truth — SESSION_SSOT_READS=True,
-    the default) — legacy in-memory dicts are no longer scanned; SM is the
-    sole rearm source, so the old "legacy wins" tie-break for a session
-    found in both places is obsolete.
-
-    SESSION_SSOT_READS=False (kill switch): P2-6 declares this branch
-    INVALID going forward (see the field's docstring in app/config.py) — it
-    is left in place unchanged (P3-1 deletes it) so flipping the flag stays
-    a pure config change, but it no longer restores any real fallback
-    behavior. It still scans the legacy dicts (kr_stock_sessions /
-    coin_sessions) for AWAITING_APPROVAL entries, but nothing has written to
-    those dicts since P2 — so in practice this scan only ever adds
-    candidates that either don't exist, or are also independently found via
-    the SessionManager scan below (in which case the SM copy is skipped as a
-    duplicate, since a legacy-scan candidate already claimed the session_id
-    key). Even in the hypothetical case of a genuine legacy-only session,
-    maybe_schedule_auto_approve (P2-6) now ALWAYS re-resolves the session via
-    a live sm.get_session() call before doing anything — a session that was
-    never created in the SM simply schedules nothing.
+    SessionManager (the durable source of truth) — legacy in-memory dicts
+    were retired in P3-1; SM is the sole rearm source.
 
     Idempotent / fail-closed:
     - a session that already carries a FUTURE auto_approve_at is skipped —
@@ -351,24 +304,6 @@ async def rearm_awaiting_approvals() -> None:
       startup or the rest of the pass.
     """
     candidates: dict[str, str] = {}  # session_id -> market
-
-    if not get_settings().SESSION_SSOT_READS:
-        # kill-switch fallback only — see the docstring above and
-        # SESSION_SSOT_READS in app/config.py: this branch is declared
-        # invalid since P2, kept unchanged until P3-1 deletes it.
-        try:
-            from app.api.routes.kr_stocks import get_kr_stock_sessions
-
-            _scan_legacy_dict(get_kr_stock_sessions, "kiwoom", candidates)
-        except Exception as e:
-            logger.error("autonomy_rearm_legacy_import_failed", market="kiwoom", error=str(e))
-
-        try:
-            from app.api.routes.coin import get_coin_sessions
-
-            _scan_legacy_dict(get_coin_sessions, "coin", candidates)
-        except Exception as e:
-            logger.error("autonomy_rearm_legacy_import_failed", market="coin", error=str(e))
 
     try:
         manager = await get_session_manager()

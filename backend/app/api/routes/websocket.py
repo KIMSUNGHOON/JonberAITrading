@@ -18,9 +18,6 @@ from typing import Optional, Any
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.api.routes.coin import get_coin_sessions
-from app.api.routes.kr_stocks import get_kr_stock_sessions
-from app.config import get_settings
 from services.session_manager import get_session_manager
 
 logger = structlog.get_logger()
@@ -528,23 +525,12 @@ async def _get_session_snapshot(session_id: str) -> Optional[dict]:
     """
     Look up a session snapshot.
 
-    P1 (session-SSOT): the SessionManager is the ONLY read source when
-    SESSION_SSOT_READS is on (default). The legacy-first path survives
-    solely as the kill-switch fallback until P2 removes legacy writes
-    entirely -- see app/api/routes/approval.py for the same switch.
+    P1 (session-SSOT): the SessionManager is the sole read source -- legacy
+    in-memory dicts were retired in P3-1 (see app/api/routes/approval.py for
+    the same read path).
     """
-    if get_settings().SESSION_SSOT_READS:
-        sm = await get_session_manager()
-        return await sm.get_session_dict(session_id)
-
-    session = (
-        get_coin_sessions().get(session_id)
-        or get_kr_stock_sessions().get(session_id)
-    )
-    if session is None:
-        sm = await get_session_manager()
-        session = await sm.get_session_dict(session_id)
-    return session
+    sm = await get_session_manager()
+    return await sm.get_session_dict(session_id)
 
 
 class _SessionFrameCursor:

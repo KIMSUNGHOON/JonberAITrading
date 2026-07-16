@@ -1,15 +1,14 @@
 """P7 Phase 2 -> P2-4: coin analysis producer migration to the
 SessionManager, then to SM-only direct writes.
 
-The coin analysis routes historically wrote ONLY the legacy in-process
-coin_sessions dict (P7 Phase 2 made it write BOTH -- legacy dict first, then
+The coin analysis routes historically wrote ONLY a legacy in-process
+session dict (P7 Phase 2 made it write BOTH -- legacy dict first, then
 the SessionManager, so pub/sub could fire). P2-4 (session-SSOT) removed the
 legacy-dict write entirely -- and dropped the 4th-copy analysis_limiter
 sync writes (register_session/update_session_status) too: the producer now
-writes the SessionManager ONLY, so `coin_sessions` stays empty for the life
-of every session this file drives through the real routes. Tests that need
-a "session that already exists" fixture seed the SessionManager directly
-(`_seed_sm_session`).
+writes the SessionManager ONLY (the legacy dict itself was fully deleted in
+P3-1). Tests that need a "session that already exists" fixture seed the
+SessionManager directly (`_seed_sm_session`).
 
 Headless: stubbed graph astream + a real SessionManager on a test SQLite db.
 """
@@ -64,17 +63,6 @@ async def sm(monkeypatch):
         os.remove(TEST_DB_PATH)
 
 
-@pytest.fixture
-def coin_sessions():
-    from app.api.routes.coin.constants import coin_sessions as _coin_sessions
-
-    saved = dict(_coin_sessions)
-    _coin_sessions.clear()
-    yield _coin_sessions
-    _coin_sessions.clear()
-    _coin_sessions.update(saved)
-
-
 async def _seed_sm_session(sm, session_id: str):
     """Register the sm-side session the migrated start route creates."""
     await sm.create_session(
@@ -105,7 +93,7 @@ def _patch_graph(monkeypatch, graph: FakeGraph):
 # -------------------------------------------
 
 
-async def test_start_route_registers_sm_session(sm, coin_sessions):
+async def test_start_route_registers_sm_session(sm):
     response = await start_coin_analysis(
         CoinAnalysisRequest(market="KRW-BTC"), BackgroundTasks()
     )
@@ -115,8 +103,6 @@ async def test_start_route_registers_sm_session(sm, coin_sessions):
     assert session.market_type == MarketType.COIN
     assert session.market == "KRW-BTC"
     assert session.state.get("reasoning_log") == []
-    # P2-4: SM direct-write -- the legacy dict is never populated at all.
-    assert coin_sessions == {}
 
 
 # -------------------------------------------
@@ -124,7 +110,7 @@ async def test_start_route_registers_sm_session(sm, coin_sessions):
 # -------------------------------------------
 
 
-async def test_analysis_task_mirrors_node_updates_and_notifies(sm, coin_sessions, monkeypatch):
+async def test_analysis_task_mirrors_node_updates_and_notifies(sm, monkeypatch):
     session_id = "coin-mirror-1"
     await _seed_sm_session(sm, session_id)
     queue = await sm.subscribe(session_id)
@@ -146,9 +132,6 @@ async def test_analysis_task_mirrors_node_updates_and_notifies(sm, coin_sessions
 
     await run_coin_analysis_task(session_id)
 
-    # P2-4: SM direct-write -- there is no legacy dict to check separately.
-    assert coin_sessions == {}
-
     session = await sm.get_session(session_id)
     assert session.state.get("reasoning_log") == ["[t] 수집", "[t] 결정"]
     assert session.last_node == "strategic_decision"
@@ -167,7 +150,7 @@ async def test_analysis_task_mirrors_node_updates_and_notifies(sm, coin_sessions
     )
 
 
-async def test_analysis_task_mirrors_completed_status(sm, coin_sessions, monkeypatch):
+async def test_analysis_task_mirrors_completed_status(sm, monkeypatch):
     session_id = "coin-mirror-2"
     await _seed_sm_session(sm, session_id)
 
@@ -178,12 +161,11 @@ async def test_analysis_task_mirrors_completed_status(sm, coin_sessions, monkeyp
 
     await run_coin_analysis_task(session_id)
 
-    assert coin_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.COMPLETED
 
 
-async def test_analysis_task_mirrors_error_status(sm, coin_sessions, monkeypatch):
+async def test_analysis_task_mirrors_error_status(sm, monkeypatch):
     session_id = "coin-mirror-3"
     await _seed_sm_session(sm, session_id)
 
@@ -191,7 +173,6 @@ async def test_analysis_task_mirrors_error_status(sm, coin_sessions, monkeypatch
 
     await run_coin_analysis_task(session_id)
 
-    assert coin_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.ERROR
     assert "graph exploded" in (session.error or "")
@@ -202,13 +183,12 @@ async def test_analysis_task_mirrors_error_status(sm, coin_sessions, monkeypatch
 # -------------------------------------------
 
 
-async def test_cancel_route_mirrors_cancelled_status(sm, coin_sessions):
+async def test_cancel_route_mirrors_cancelled_status(sm):
     session_id = "coin-cancel-1"
     await _seed_sm_session(sm, session_id)
 
     await cancel_coin_analysis(session_id)
 
-    assert coin_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.CANCELLED
 
@@ -227,7 +207,7 @@ async def test_cancel_route_mirrors_cancelled_status(sm, coin_sessions):
 # -------------------------------------------
 
 
-async def test_cancel_clears_awaiting_flag_on_sm(sm, coin_sessions):
+async def test_cancel_clears_awaiting_flag_on_sm(sm):
     """P2-4: there is no separate legacy-dict copy to desync from the sm
     anymore -- the zombie-resurrection guard this test pins now applies to
     the SM's own state directly (a restart resurrects from SQLite, not from
@@ -242,8 +222,6 @@ async def test_cancel_clears_awaiting_flag_on_sm(sm, coin_sessions):
 
     await cancel_coin_analysis(session_id)
 
-    assert coin_sessions == {}
-
     # sm cleared too -- without this, a restart resurrects the session as
     # AWAITING_APPROVAL with awaiting_approval still True (zombie), and a
     # live stale auto-approve would sail through the pin check unopposed.
@@ -253,7 +231,7 @@ async def test_cancel_clears_awaiting_flag_on_sm(sm, coin_sessions):
     assert session.status == SessionStatus.CANCELLED
 
 
-async def test_cancel_failure_is_surfaced_as_503_not_swallowed(sm, coin_sessions, monkeypatch):
+async def test_cancel_failure_is_surfaced_as_503_not_swallowed(sm, monkeypatch):
     """P2-4: with the SM as the sole store, a persistent write failure during
     cancel can no longer be treated as a best-effort 'mirror' -- there is no
     second store whose local success could paper over it. It now fails loud
@@ -296,10 +274,9 @@ async def test_cancel_failure_is_surfaced_as_503_not_swallowed(sm, coin_sessions
     # AWAITING_APPROVAL-with-awaiting_approval=True shape was created.
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.RUNNING
-    assert coin_sessions == {}
 
 
-async def test_cancel_mirror_success_reports_mirror_failed_false(sm, coin_sessions):
+async def test_cancel_mirror_success_reports_mirror_failed_false(sm):
     session_id = "coin-cancel-mirror-ok-1"
     await _seed_sm_session(sm, session_id)
 
@@ -313,7 +290,7 @@ async def test_cancel_mirror_success_reports_mirror_failed_false(sm, coin_sessio
 # -------------------------------------------
 
 
-async def test_cancel_route_serializes_against_concurrent_decision_lock_holder(sm, coin_sessions):
+async def test_cancel_route_serializes_against_concurrent_decision_lock_holder(sm):
     """(I3) cancel must wait if another decision (e.g. an in-flight reject
     resume through /decide) currently holds the per-session decision lock for
     this session_id — otherwise the cancel races the resume directly against
@@ -349,7 +326,6 @@ async def test_cancel_route_serializes_against_concurrent_decision_lock_holder(s
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.CANCELLED
     assert result["mirror_failed"] is False
-    assert coin_sessions == {}
 
     assert approval_module._decision_locks == {}
     assert approval_module._decision_lock_refs == {}
@@ -360,7 +336,7 @@ async def test_cancel_route_serializes_against_concurrent_decision_lock_holder(s
 # -------------------------------------------
 
 
-async def test_cancel_route_refuses_completed_session_409(sm, coin_sessions):
+async def test_cancel_route_refuses_completed_session_409(sm):
     session_id = "coin-cancel-done-1"
     await _seed_sm_session(sm, session_id)
     await sm.update_status(session_id, SessionStatus.COMPLETED)
@@ -371,10 +347,9 @@ async def test_cancel_route_refuses_completed_session_409(sm, coin_sessions):
     assert exc_info.value.status_code == 409
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.COMPLETED
-    assert coin_sessions == {}
 
 
-async def test_cancel_route_refuses_error_session_409(sm, coin_sessions):
+async def test_cancel_route_refuses_error_session_409(sm):
     session_id = "coin-cancel-err-1"
     await _seed_sm_session(sm, session_id)
     await sm.update_status(session_id, SessionStatus.ERROR)
@@ -385,10 +360,9 @@ async def test_cancel_route_refuses_error_session_409(sm, coin_sessions):
     assert exc_info.value.status_code == 409
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.ERROR
-    assert coin_sessions == {}
 
 
-async def test_cancel_route_still_200s_for_awaiting_session(sm, coin_sessions):
+async def test_cancel_route_still_200s_for_awaiting_session(sm):
     """Normal case unchanged: an actively-running (not yet settled) session
     cancels cleanly with 200."""
     session_id = "coin-cancel-normal-1"
@@ -399,7 +373,6 @@ async def test_cancel_route_still_200s_for_awaiting_session(sm, coin_sessions):
     assert response["mirror_failed"] is False
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.CANCELLED
-    assert coin_sessions == {}
 
 
 # -------------------------------------------
@@ -408,7 +381,7 @@ async def test_cancel_route_still_200s_for_awaiting_session(sm, coin_sessions):
 
 
 async def test_analysis_task_propagates_sm_write_failure_but_releases_slot(
-    sm, coin_sessions, monkeypatch
+    sm, monkeypatch
 ):
     """P2-4: with the SM as the SOLE write target (all mirror_* calls
     replaced by direct sm.update_state/update_status), a SessionManager
@@ -449,14 +422,13 @@ async def test_analysis_task_propagates_sm_write_failure_but_releases_slot(
         await run_coin_analysis_task(session_id)
 
     assert released["n"] == 1, "the analysis slot must still be released via finally"
-    assert coin_sessions == {}
 
 
-async def test_start_route_failfast_on_sm_registration_failure(sm, coin_sessions, monkeypatch):
+async def test_start_route_failfast_on_sm_registration_failure(sm, monkeypatch):
     """P1-5: sm reservation failure must fail the start route loud (503), not
-    silently degrade to poll-only -- with C-only reads (SESSION_SSOT_READS,
-    the default) a session the SM never registered is invisible to every read
-    surface, so a 200 "started" response here would be lying to the caller.
+    silently degrade to poll-only -- with SM-only reads a session the SM
+    never registered is invisible to every read surface, so a 200 "started"
+    response here would be lying to the caller.
 
     P2-4: the atomic reservation (`create_session_if_no_active`) IS the
     registration call now -- there is no separate legacy-dict placeholder
@@ -475,11 +447,10 @@ async def test_start_route_failfast_on_sm_registration_failure(sm, coin_sessions
         )
 
     assert exc_info.value.status_code == 503
-    assert coin_sessions == {}
     assert await sm.get_all_sessions(market_type=MarketType.COIN) == {}
 
 
-async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, coin_sessions, monkeypatch):
+async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, monkeypatch):
     """User cancel during a run must stick — the task's final status write must not flap it."""
     session_id = "coin-cancelflap-1"
     await _seed_sm_session(sm, session_id)
@@ -494,12 +465,11 @@ async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, coin_sessio
 
     await run_coin_analysis_task(session_id)
 
-    assert coin_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.CANCELLED
 
 
-async def test_state_error_branch_mirrors_error(sm, coin_sessions, monkeypatch):
+async def test_state_error_branch_mirrors_error(sm, monkeypatch):
     """A graph that finishes cleanly WITH state['error'] set (e.g. Upbit fetch
     failure) must mirror ERROR — else sm keeps a never-TTL-cleaned RUNNING row."""
     session_id = "coin-stateerr-1"
@@ -517,13 +487,12 @@ async def test_state_error_branch_mirrors_error(sm, coin_sessions, monkeypatch):
 
     await run_coin_analysis_task(session_id)
 
-    assert coin_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.ERROR
     assert "업비트" in (session.error or "")
 
 
-async def test_slot_timeout_mirrors_error(sm, coin_sessions, monkeypatch):
+async def test_slot_timeout_mirrors_error(sm, monkeypatch):
     session_id = "coin-slot-1"
     await _seed_sm_session(sm, session_id)
 
@@ -534,11 +503,10 @@ async def test_slot_timeout_mirrors_error(sm, coin_sessions, monkeypatch):
 
     await run_coin_analysis_task(session_id)
 
-    assert coin_sessions == {}
     assert (await sm.get_session(session_id)).status == SessionStatus.ERROR
 
 
-async def test_cancel_during_slot_wait_keeps_cancelled(sm, coin_sessions, monkeypatch):
+async def test_cancel_during_slot_wait_keeps_cancelled(sm, monkeypatch):
     """Cancel while waiting for an analysis slot must not be overwritten by the
     slot-timeout error write."""
     session_id = "coin-cancelslot-1"
@@ -552,11 +520,10 @@ async def test_cancel_during_slot_wait_keeps_cancelled(sm, coin_sessions, monkey
 
     await run_coin_analysis_task(session_id)
 
-    assert coin_sessions == {}
     assert (await sm.get_session(session_id)).status == SessionStatus.CANCELLED
 
 
-async def test_cancel_then_graph_exception_keeps_cancelled(sm, coin_sessions, monkeypatch):
+async def test_cancel_then_graph_exception_keeps_cancelled(sm, monkeypatch):
     """The diff's own invariant — terminal cancelled must not be overwritten —
     must hold on the exception path too, not just the normal-completion write."""
     session_id = "coin-cancelerr-1"
@@ -572,5 +539,4 @@ async def test_cancel_then_graph_exception_keeps_cancelled(sm, coin_sessions, mo
 
     await run_coin_analysis_task(session_id)
 
-    assert coin_sessions == {}
     assert (await sm.get_session(session_id)).status == SessionStatus.CANCELLED

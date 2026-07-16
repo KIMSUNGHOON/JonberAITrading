@@ -19,7 +19,6 @@ from app.api.schemas.coin import (
     TickerResponse,
 )
 from services.upbit import UpbitClient
-from .constants import coin_sessions
 
 
 # =============================================================================
@@ -35,23 +34,11 @@ def get_upbit_client() -> UpbitClient:
     )
 
 
-def get_coin_session(session_id: str) -> dict:
-    """Get session or raise 404."""
-    session = coin_sessions.get(session_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Coin session {session_id} not found",
-        )
-    return session
-
-
 async def find_active_coin_session(market: str) -> Optional[dict]:
     """Return the first RUNNING/AWAITING_APPROVAL session for `market`, if any.
 
     P2-4: the coin producer (coin/analysis.py) writes ONLY to the
-    SessionManager now -- the legacy `coin_sessions` dict is never populated
-    by it -- so the SessionManager is the sole read source here too.
+    SessionManager now -- so the SessionManager is the sole read source here too.
     `/analysis/start` itself no longer calls this: its dedup check is now
     folded into the atomic `SessionManager.create_session_if_no_active`
     reservation, which closes the check-then-create race directly instead of
@@ -80,11 +67,6 @@ def check_api_keys() -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Upbit API keys not configured. Set UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY.",
         )
-
-
-def get_coin_sessions() -> dict:
-    """Get reference to coin sessions (for WebSocket, approval routes)."""
-    return coin_sessions
 
 
 # =============================================================================

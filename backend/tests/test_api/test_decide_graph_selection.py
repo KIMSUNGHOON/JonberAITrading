@@ -2,19 +2,18 @@
 record's market_type, never legacy-dict (B) membership.
 
 CRITICAL (spec adversarial review, P2-2): the pre-fix code selected the
-resume graph via `if session_id in kr_stock_sessions: kr_graph else:
-coin_graph`. That membership check was only satisfied because
+resume graph via a membership check against the legacy KR session dict
+(`if session_id in <legacy KR dict>: kr_graph else: coin_graph`). That
+membership check was only satisfied because
 _adopt_session_from_manager (the restart fallback) happened to register the
 adopted session into the matching legacy dict as a side effect, BEFORE the
 graph-selection line ran.
 
 P2-5 (session-SSOT) removed _adopt_session_from_manager and every legacy
-dict lookup from submit_decision entirely: the session, its state, its
-market_type and its final status now all come from a single
-sm.get_session() call, held as `sm_session` for the whole function. This
-file now pins that reality directly (no legacy dict simulation needed at
-all -- B never enters the picture) rather than simulating "B empty after
-adoption" against the pre-P2-5 code.
+dict lookup from submit_decision entirely (the legacy dicts themselves were
+fully retired in P3-1): the session, its state, its market_type and its
+final status now all come from a single sm.get_session() call, held as
+`sm_session` for the whole function. This file pins that reality directly.
 """
 
 import pytest
@@ -91,10 +90,6 @@ class _FakeSessionManager:
 @pytest.fixture
 def wired(monkeypatch):
     """No-op notification/commit/mirror side channels + settable SM session."""
-    coin_sessions: dict = {}
-    kr_stock_sessions: dict = {}
-    monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: coin_sessions)
-    monkeypatch.setattr(approval_module, "get_kr_stock_sessions", lambda: kr_stock_sessions)
 
     async def noop(*a, **k):
         return None
@@ -128,8 +123,6 @@ def wired(monkeypatch):
         monkeypatch.setattr(approval_module, "get_coin_trading_graph", factory)
 
     return {
-        "coin_sessions": coin_sessions,
-        "kr_stock_sessions": kr_stock_sessions,
         "set_sm_session": set_sm_session,
         "set_kr_graph": set_kr_graph,
         "set_coin_graph": set_coin_graph,
@@ -139,8 +132,7 @@ def wired(monkeypatch):
 @pytest.mark.asyncio
 async def test_kr_session_decide_resumes_kr_graph(wired):
     """CRITICAL pin: a KIWOOM SM session -> /decide must select the KR graph,
-    never the COIN graph. B never participates at all (no legacy dict, no
-    adoption step)."""
+    never the COIN graph (no legacy dict or adoption step exists anymore)."""
     session_id = "b-empty-kr-1"
     wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.KIWOOM))
 
@@ -161,8 +153,6 @@ async def test_kr_session_decide_resumes_kr_graph(wired):
         await approval_module.submit_decision(session_id, "approved")
 
     assert picked.get("graph") == "kr"
-    assert session_id not in wired["kr_stock_sessions"]
-    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio
@@ -188,8 +178,6 @@ async def test_coin_session_decide_resumes_coin_graph(wired):
         await approval_module.submit_decision(session_id, "approved")
 
     assert picked.get("graph") == "coin"
-    assert session_id not in wired["kr_stock_sessions"]
-    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio

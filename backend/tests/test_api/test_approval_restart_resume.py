@@ -3,15 +3,14 @@
 P2-5 (session-SSOT): submit_decision now looks up sessions in the
 SessionManager ONLY -- there is no legacy in-memory dict ("B") lookup and no
 _adopt_session_from_manager restart fallback (that function was deleted by
-this task). This file used to pin the restart-recovery FALLBACK behavior
-(legacy dict miss -> adopt from sm -> re-register into the legacy dict); it
-now pins the SM-direct behavior that fallback was migrated into: every
-/decide call -- restart-recovered or not -- resolves the session, its state,
-its market_type and its final status entirely off the AnalysisSession object
+this task; the legacy dicts themselves were fully retired in P3-1). This
+file used to pin the restart-recovery FALLBACK behavior (legacy dict miss ->
+adopt from sm -> re-register into the legacy dict); it now pins the
+SM-direct behavior that fallback was migrated into: every /decide call --
+restart-recovered or not -- resolves the session, its state, its
+market_type and its final status entirely off the AnalysisSession object
 sm.get_session() returns (a live reference, not a to_legacy_dict()
-snapshot). The legacy dicts (get_coin_sessions()/get_kr_stock_sessions())
-play no role in /decide at all anymore; they stay empty throughout every
-test in this file and are asserted to remain so.
+snapshot).
 
 Hardening carried over from the original adoption-era tests: a CANCELLED (or
 otherwise settled) sm_session.status must never be resumed just because
@@ -113,15 +112,12 @@ class _FakeGraph:
 
 @pytest.fixture
 def wired(monkeypatch):
-    """Empty legacy dicts (asserted to stay empty) + no-op notification side
-    channels + a live-mutating fake SessionManager.
+    """No-op notification side channels + a live-mutating fake SessionManager
+    (legacy in-memory dicts were retired in P3-1; there is nothing left to
+    stub out for them).
 
     Mirrors the mocking approach in tests/test_api/test_approval_reschedule.py.
     """
-    coin_sessions: dict = {}
-    kr_stock_sessions: dict = {}
-    monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: coin_sessions)
-    monkeypatch.setattr(approval_module, "get_kr_stock_sessions", lambda: kr_stock_sessions)
 
     async def noop(*a, **k):
         return None
@@ -206,8 +202,6 @@ def wired(monkeypatch):
         monkeypatch.setattr(approval_module, "get_coin_trading_graph", lambda: graph)
 
     return {
-        "coin_sessions": coin_sessions,
-        "kr_stock_sessions": kr_stock_sessions,
         "reschedule_calls": reschedule_calls,
         "set_sm_session": set_sm_session,
         "set_graph": set_graph,
@@ -240,9 +234,6 @@ async def test_approve_after_restart_falls_back_to_session_manager(wired):
     resume_config, resume_update = graph.aupdate_state.await_args.args
     assert resume_config == {"configurable": {"thread_id": session_id}}
     assert resume_update["approval_status"] == "approved"
-    # B genuinely never participates -- stays empty throughout.
-    assert session_id not in wired["kr_stock_sessions"]
-    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio
@@ -270,14 +261,12 @@ async def test_reject_after_restart_falls_back_to_session_manager(wired):
     assert resume_update["approval_status"] == "rejected"
     sm_session = wired["holder"]["manager"]._session
     assert sm_session.status == SessionStatus.RUNNING
-    assert session_id not in wired["kr_stock_sessions"]
-    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio
 async def test_coin_session_resolves_coin_graph(wired):
-    """COIN market happy path: SM row alone selects the coin graph, and B is
-    never touched (no "adoption" into a legacy dict happens anymore)."""
+    """COIN market happy path: SM row alone selects the coin graph (no
+    legacy in-memory "adoption" step exists anymore)."""
     session_id = "restart-coin-1"
     wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.COIN))
     coin_graph = _FakeGraph(
@@ -291,9 +280,6 @@ async def test_coin_session_resolves_coin_graph(wired):
 
     assert result.session_id == session_id
     assert result.status == "completed"
-    # Never registered into either legacy dict.
-    assert session_id not in wired["coin_sessions"]
-    assert session_id not in wired["kr_stock_sessions"]
     # The COIN graph's resume machinery ran.
     coin_graph.aupdate_state.assert_awaited_once()
     resume_config, resume_update = coin_graph.aupdate_state.await_args.args
@@ -329,8 +315,6 @@ async def test_sm_session_not_awaiting_approval_400s(wired):
 
     assert exc_info.value.status_code == 400
     assert "not awaiting approval" in exc_info.value.detail
-    assert session_id not in wired["kr_stock_sessions"]
-    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio
@@ -342,8 +326,7 @@ async def test_cancelled_sm_session_with_stale_awaiting_flag_404s(wired):
     gate; P2-5 deleted that function but the general (actor-agnostic) guard
     it provided is still needed -- resuming a graph off a stale True flag
     here would let an approve run against a proposal the SM already
-    considers settled/dead. Must not register anything into a legacy dict
-    either (there is nothing left to register into).
+    considers settled/dead.
     """
     from fastapi import HTTPException
 
@@ -356,8 +339,6 @@ async def test_cancelled_sm_session_with_stale_awaiting_flag_404s(wired):
         await approval_module.submit_decision(session_id, "approved")
 
     assert exc_info.value.status_code == 404
-    assert session_id not in wired["kr_stock_sessions"]
-    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio
@@ -396,8 +377,6 @@ async def test_unsupported_market_type_fails_closed_400(wired):
 
     assert exc_info.value.status_code == 400
     assert "unknown session market" in exc_info.value.detail
-    assert session_id not in wired["kr_stock_sessions"]
-    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio
