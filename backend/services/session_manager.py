@@ -270,6 +270,15 @@ class SessionManager:
         if self._initialized:
             return
 
+        # P5-1 review fix: reconcile_stranded_sessions() runs with
+        # fire_hooks=False below (it executes INSIDE the async with
+        # self._lock: block, non-reentrantly, on behalf of this method --
+        # see the NOTE at the call site) so its checkpoint-GC hooks can be
+        # fired from out here, AFTER the lock is released, instead of
+        # while it's held. Stays None if this call hits the early-return-
+        # inside-the-lock race below (another caller already initialized).
+        reconcile_report: Optional["ReconcileReport"] = None
+
         async with self._lock:
             if self._initialized:
                 return
@@ -346,7 +355,12 @@ class SessionManager:
             # them. NOTE: reconcile_stranded_sessions() does NOT acquire
             # self._lock itself — we are already holding it here, and
             # asyncio.Lock is not reentrant (re-acquiring would deadlock).
-            reconcile_report = await self.reconcile_stranded_sessions()
+            # P5-1 review fix: fire_hooks=False -- this call runs while
+            # self._lock is held (by this very block, non-reentrantly).
+            # The terminal-transition checkpoint-GC hooks it would
+            # otherwise fire per-branch are fired below instead, AFTER the
+            # lock is released.
+            reconcile_report = await self.reconcile_stranded_sessions(fire_hooks=False)
 
             # Initialize semaphore
             self._analysis_semaphore = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
@@ -359,6 +373,18 @@ class SessionManager:
                 reconciled_errored=len(reconcile_report.errored),
                 reconciled_cancelled=len(reconcile_report.cancelled),
             )
+
+        # P5-1 review fix: fire checkpoint GC hooks for reconcile's
+        # terminal transitions AFTER self._lock is released above (never
+        # while the SM lock is held -- storage.db I/O contending with a
+        # live graph's checkpoint writes could otherwise stall every SM
+        # reader/writer for up to its busy-timeout window). `errored` and
+        # `cancelled` never overlap (each sid lands in exactly one
+        # ReconcileReport list per reconcile pass), the union just avoids
+        # assuming that invariant here too.
+        if reconcile_report is not None:
+            for sid in set(reconcile_report.errored) | set(reconcile_report.cancelled):
+                await self._on_terminal_transition(sid)
 
     async def _load_active_sessions(self) -> None:
         """Load active sessions from SQLite on startup."""
@@ -431,6 +457,7 @@ class SessionManager:
         *,
         now: Optional[datetime] = None,
         checkpoint_next: Optional[Callable[[str], Awaitable[Optional[tuple]]]] = None,
+        fire_hooks: bool = True,
     ) -> ReconcileReport:
         """
         Repair the shape of sessions an unclean restart stranded mid-graph.
@@ -496,6 +523,19 @@ class SessionManager:
                 graph checkpoint's pending next node(s) for that session.
                 Production wiring (a real LangGraph checkpointer lookup) is
                 not part of this task; None (the default) skips the check.
+            fire_hooks: P5-1 review fix. When True (default -- the shape
+                every direct caller, including tests, gets), each
+                ERROR/CANCELLED direct-assignment branch below fires
+                `_on_terminal_transition` for its own sid immediately, same
+                as before. initialize() passes False, because it calls this
+                method from INSIDE its own `async with self._lock:` block
+                (see the locking note above) -- storage.db I/O must never
+                run while self._lock is held (an SM-wide freeze risk if it
+                contends with a live graph's checkpoint writes under
+                SQLite's busy-timeout). With fire_hooks=False, initialize()
+                is responsible for firing the hook itself, for every sid in
+                the returned report's `errored`/`cancelled` lists, AFTER
+                releasing the lock.
 
         Returns:
             ReconcileReport with the session_ids that were flipped to
@@ -509,6 +549,12 @@ class SessionManager:
             awaiting = bool(st.get("awaiting_approval"))
             appr = st.get("approval_status")
             prop = st.get("trade_proposal") or None
+            # P5-1: set True at the exact branch below that appends this
+            # sid to rep.errored/rep.cancelled -- an O(1) per-iteration flag
+            # instead of the `sid in rep.errored or sid in rep.cancelled`
+            # membership scan this replaced (that scan was O(n) against
+            # lists that grow across iterations, i.e. O(n^2) overall).
+            terminal_now = False
 
             # A restart always invalidates any pending auto-approve deadline
             # (the injector task that would fire it is gone).
@@ -569,6 +615,7 @@ class SessionManager:
                     st["cancelled_reason"] = "재시작으로 토론 중단"
                     st["sub_status"] = "cancelled"
                     rep.cancelled.append(sid)
+                    terminal_now = True
 
             elif s.status == SessionStatus.RUNNING and awaiting and prop:
                 action = str(prop.get("action") or "").upper()
@@ -591,6 +638,7 @@ class SessionManager:
                     s.status = SessionStatus.ERROR
                     s.error = "서버 재시작으로 분석 중단 (제안 만료/체크포인트 불일치)"
                     rep.errored.append(sid)
+                    terminal_now = True
                 else:
                     s.status = SessionStatus.AWAITING_APPROVAL
                     st["approval_status"] = None  # new decision must overwrite, not be shadowed
@@ -600,6 +648,7 @@ class SessionManager:
                 s.status = SessionStatus.ERROR
                 s.error = "서버 재시작으로 분석 중단"
                 rep.errored.append(sid)
+                terminal_now = True
 
             elif (
                 s.status == SessionStatus.AWAITING_APPROVAL
@@ -609,28 +658,32 @@ class SessionManager:
                 s.status = SessionStatus.ERROR
                 s.error = "실행 중단 — 체결 확인 필요"
                 rep.errored.append(sid)
+                terminal_now = True
 
             elif s.status == SessionStatus.AWAITING_APPROVAL and appr == "cancelled":
                 s.status = SessionStatus.CANCELLED
                 rep.cancelled.append(sid)
+                terminal_now = True
 
             else:
                 rep.kept.append(sid)
 
-            if sid in rep.flipped or sid in rep.errored or sid in rep.cancelled or changed_common:
+            if sid in rep.flipped or terminal_now or changed_common:
                 s.updated_at = now
                 await self._save_session(s)
 
-            # P5-1: reconcile assigns terminal statuses directly (bypassing
-            # update_status, which is where the hook normally lives) across
-            # several branches above -- the analysis ERROR/CANCELLED flips
-            # AND the discussion-kind CANCELLED branch. rep.errored/
-            # rep.cancelled are exactly and only the sids that landed in a
-            # terminal status this iteration (rep.flipped is
-            # AWAITING_APPROVAL, never terminal -- must stay excluded so a
-            # resumable session keeps its checkpoint). Fired after the save
-            # above, mirroring update_status's post-persist placement.
-            if sid in rep.errored or sid in rep.cancelled:
+            # P5-1 (review fix): reconcile assigns terminal statuses
+            # directly (bypassing update_status, which is where the hook
+            # normally lives) across several branches above -- the analysis
+            # ERROR/CANCELLED flips AND the discussion-kind CANCELLED
+            # branch. `terminal_now` is set at the exact branch that made
+            # THIS sid terminal this iteration (never for rep.flipped --
+            # that's AWAITING_APPROVAL, a resumable session that must keep
+            # its checkpoint). Gated on fire_hooks: initialize() calls this
+            # method while self._lock is held and passes fire_hooks=False
+            # so it can fire these itself after releasing the lock instead
+            # (see initialize() and this method's fire_hooks docstring).
+            if fire_hooks and terminal_now:
                 await self._on_terminal_transition(sid)
 
         logger.info(
@@ -867,6 +920,7 @@ class SessionManager:
         """
         await self.initialize()
 
+        fire_gc = False
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"session {session_id} not tracked by SessionManager")
@@ -887,15 +941,18 @@ class SessionManager:
                 status=status.value,
             )
 
-            # P5-1: fire the checkpoint GC hook only AFTER the transition is
-            # durably persisted above (_save_session already committed).
-            # Still inside self._lock -- matches the existing
-            # _notify_subscribers call just above, which is also a
-            # post-save side effect run under the lock; _on_terminal_transition
-            # is a plain storage_service call (a different DB file, no SM
-            # lock involved) so this cannot deadlock.
-            if status in _TERMINAL_STATUSES:
-                await self._on_terminal_transition(session_id)
+            fire_gc = status in _TERMINAL_STATUSES
+
+        # P5-1 (review fix): fire the checkpoint GC hook only AFTER the
+        # transition is durably persisted above AND self._lock is released
+        # -- storage.db I/O must never run while the SM lock is held (an
+        # SM-wide freeze risk if it contends with a live graph's checkpoint
+        # writes under SQLite's busy-timeout). No race from deferring past
+        # the lock: the session is already terminal in both memory and
+        # SQLite by the time we get here, so nothing else can be racing to
+        # resume it out from under this call.
+        if fire_gc:
+            await self._on_terminal_transition(session_id)
 
     async def update_state(
         self,
@@ -1048,6 +1105,7 @@ class SessionManager:
         """Remove a session."""
         await self.initialize()
 
+        removed = False
         async with self._lock:
             if session_id in self._sessions:
                 del self._sessions[session_id]
@@ -1063,21 +1121,25 @@ class SessionManager:
                     )
                     await db.commit()
 
-                # P5-1: the session row (and any resume path to it) is gone
-                # unconditionally at this point regardless of what status it
-                # was removed in -- GC its checkpoint rows too, so removal
-                # can never leave an orphan behind for a session_id nothing
-                # can look up again.
-                await self._on_terminal_transition(session_id)
-
                 # Cleanup subscribers
                 if session_id in self._subscribers:
                     del self._subscribers[session_id]
 
                 logger.info("session_removed", session_id=session_id)
-                return True
+                removed = True
 
-        return False
+        if removed:
+            # P5-1 (review fix): the session row (and any resume path to
+            # it) is gone unconditionally at this point regardless of what
+            # status it was removed in -- GC its checkpoint rows too, so
+            # removal can never leave an orphan behind for a session_id
+            # nothing can look up again. Fired AFTER self._lock is released
+            # (never while held -- see update_status for the same rationale
+            # spelled out in full); no race, the row is already gone from
+            # both memory and SQLite by the time we get here.
+            await self._on_terminal_transition(session_id)
+
+        return removed
 
     async def cleanup_expired_sessions(self) -> int:
         """
@@ -1113,12 +1175,15 @@ class SessionManager:
                     )
                     await db.commit()
 
-                # P5-1: every id in `expired` was filtered to a terminal
-                # status above (COMPLETED/ERROR/CANCELLED) before being
-                # queued for deletion -- GC each one's checkpoint rows now
-                # that the row itself is gone.
-                for session_id in expired:
-                    await self._on_terminal_transition(session_id)
+        # P5-1 (review fix): every id in `expired` was filtered to a
+        # terminal status above (COMPLETED/ERROR/CANCELLED) before being
+        # queued for deletion -- GC each one's checkpoint rows now that the
+        # row itself is gone. Fired AFTER self._lock is released (never
+        # while held -- see update_status for the full rationale); this was
+        # the worst-case site for the lock-held-I/O risk, since it can do N
+        # sequential DELETEs under a single lock acquisition.
+        for session_id in expired:
+            await self._on_terminal_transition(session_id)
 
         if expired:
             logger.info(

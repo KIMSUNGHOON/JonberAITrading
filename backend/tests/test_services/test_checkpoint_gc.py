@@ -17,11 +17,24 @@ Session SSOT 통합 Phase P5(retention/GC)의 첫 태스크. LangGraph 체크포
 storage_service는 실제 SQLite를 건드리지 않는 페이크로 교체한다 -- 여기서는
 SM의 호출 계약만 검증하면 충분하다(delete_checkpoints 자체의 SQL 정확성은
 storage_service 자신의 테스트 몫).
+
+리뷰 픽스(락 밖 발화): 4사이트 전부 원래 `async with self._lock:` **안**에서
+훅을 발화했다 -- SM 락은 앱 전역 SSOT 읽기/쓰기를 직렬화하는데, storage.db
+DELETE가 라이브 그래프 체크포인트 쓰기와 SQLite busy-timeout 경합을 일으키면
+그 대기 시간 동안 SM 전체가 동결될 위험이 있었다. 지금은 모두 락 해제 후
+발화한다(세션은 이미 terminal/removed라 락 밖 발화에 레이스가 없다).
+`reconcile_stranded_sessions`는 새 `fire_hooks` 파라미터(기본 True)로 이
+경로를 지원한다: 직접 호출자(테스트 등, 락 미보유)는 기존과 동일하게 즉시
+발화하고, `initialize()`는 자신이 락을 보유한 채로 reconcile을 호출하므로
+`fire_hooks=False`로 억제한 뒤 락 해제 후 `ReconcileReport.errored`/
+`.cancelled`를 직접 순회해 발화한다.
 """
 
 import asyncio
+import logging
 import os
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytest
 
@@ -38,13 +51,25 @@ NOW = datetime(2026, 7, 17, 9, 0, tzinfo=timezone.utc)
 
 
 class _FakeStorage:
-    """Records delete_checkpoints(session_id) calls; can be told to raise."""
+    """Records delete_checkpoints(session_id) calls; can be told to raise.
 
-    def __init__(self, fail: bool = False):
+    Also records whether `lock` (if given) was held at call time. This is
+    what actually distinguishes the P5-1 review fix (fire the GC hook only
+    AFTER releasing SessionManager._lock) from the pre-fix behavior (fired
+    from inside the lock) -- both produce the identical final `calls` list
+    either way, so a plain "was it called" assertion can't tell them apart;
+    only observing lock state at the moment of the call can.
+    """
+
+    def __init__(self, fail: bool = False, lock: Optional[asyncio.Lock] = None):
         self.calls: list[str] = []
         self.fail = fail
+        self.lock = lock
+        self.locked_during_call: list[bool] = []
 
     async def delete_checkpoints(self, session_id: str) -> bool:
+        if self.lock is not None:
+            self.locked_during_call.append(self.lock.locked())
         self.calls.append(session_id)
         if self.fail:
             raise RuntimeError("boom: simulated delete_checkpoints failure")
@@ -82,6 +107,11 @@ async def sm(clean_db, monkeypatch):
     )
 
     manager = SessionManager()
+    # Review fix: wire the manager's own lock into the fake so
+    # delete_checkpoints can record whether it was held at call time (see
+    # _FakeStorage's docstring -- this is the only way to actually
+    # distinguish the lock-safe fix from the pre-fix in-lock firing).
+    fake_storage.lock = manager._lock
     await manager.initialize()
     manager._fake_storage = fake_storage  # test-only handle
     yield manager
@@ -126,6 +156,8 @@ async def test_update_status_terminal_calls_delete_checkpoints(sm, status):
     await sm.create_session("t1", MarketType.KIWOOM, "005930", "삼성전자")
     await sm.update_status("t1", status)
     assert sm._fake_storage.calls == ["t1"]
+    # Review fix pin: fired AFTER self._lock was released, never while held.
+    assert sm._fake_storage.locked_during_call == [False]
 
 
 @pytest.mark.parametrize(
@@ -151,6 +183,8 @@ async def test_reconcile_running_no_proposal_errors_and_gcs(sm):
     rep = await sm.reconcile_stranded_sessions(now=NOW)
     assert "r1" in rep.errored
     assert sm._fake_storage.calls == ["r1"]
+    # Direct call, fire_hooks defaults True, no lock held by this caller.
+    assert sm._fake_storage.locked_during_call == [False]
 
 
 async def test_reconcile_awaiting_cancelled_appr_flip_gcs(sm):
@@ -164,6 +198,7 @@ async def test_reconcile_awaiting_cancelled_appr_flip_gcs(sm):
     rep = await sm.reconcile_stranded_sessions(now=NOW)
     assert "r2" in rep.cancelled
     assert sm._fake_storage.calls == ["r2"]
+    assert sm._fake_storage.locked_during_call == [False]
 
 
 async def test_reconcile_discussion_cancelled_gcs(sm):
@@ -176,6 +211,7 @@ async def test_reconcile_discussion_cancelled_gcs(sm):
     rep = await sm.reconcile_stranded_sessions(now=NOW)
     assert "r3" in rep.cancelled
     assert sm._fake_storage.calls == ["r3"]
+    assert sm._fake_storage.locked_during_call == [False]
 
 
 async def test_reconcile_flip_to_awaiting_does_not_gc(sm):
@@ -225,6 +261,8 @@ async def test_remove_session_gcs(sm):
     removed = await sm.remove_session("t3")
     assert removed is True
     assert sm._fake_storage.calls == ["t3"]
+    # Review fix pin: fired AFTER self._lock was released, never while held.
+    assert sm._fake_storage.locked_during_call == [False]
 
 
 async def test_cleanup_expired_sessions_gcs(sm):
@@ -239,6 +277,8 @@ async def test_cleanup_expired_sessions_gcs(sm):
     removed_count = await sm.cleanup_expired_sessions()
     assert removed_count == 1
     assert sm._fake_storage.calls == ["t4"]
+    # Review fix pin: fired AFTER self._lock was released, never while held.
+    assert sm._fake_storage.locked_during_call == [False]
 
 
 async def test_cleanup_expired_sessions_no_expired_does_not_gc(sm):
@@ -256,31 +296,40 @@ async def test_cleanup_expired_sessions_no_expired_does_not_gc(sm):
 # -------------------------------------------
 
 
-async def test_delete_checkpoints_failure_does_not_break_update_status(sm):
+async def test_delete_checkpoints_failure_does_not_break_update_status(sm, caplog):
     sm._fake_storage.fail = True
     await sm.create_session("t5", MarketType.KIWOOM, "005930", "삼성전자")
-    await sm.update_status("t5", SessionStatus.COMPLETED)  # must not raise
+    with caplog.at_level(logging.WARNING, logger="services.session_manager"):
+        await sm.update_status("t5", SessionStatus.COMPLETED)  # must not raise
 
     session = await sm.get_session("t5")
     assert session.status == SessionStatus.COMPLETED
     assert sm._fake_storage.calls == ["t5"]  # attempted; failure swallowed
+    assert sm._fake_storage.locked_during_call == [False]
+    # Not just "didn't raise" -- the failure must actually be surfaced
+    # somewhere (P5-2's sweep is the recovery path, not silence).
+    assert "checkpoint_gc_failed" in caplog.text
 
 
-async def test_delete_checkpoints_failure_does_not_break_remove_session(sm):
+async def test_delete_checkpoints_failure_does_not_break_remove_session(sm, caplog):
     sm._fake_storage.fail = True
     await sm.create_session("t6", MarketType.KIWOOM, "005930", "삼성전자")
-    removed = await sm.remove_session("t6")  # must not raise
+    with caplog.at_level(logging.WARNING, logger="services.session_manager"):
+        removed = await sm.remove_session("t6")  # must not raise
     assert removed is True
+    assert "checkpoint_gc_failed" in caplog.text
 
 
-async def test_delete_checkpoints_failure_does_not_break_reconcile(sm):
+async def test_delete_checkpoints_failure_does_not_break_reconcile(sm, caplog):
     sm._fake_storage.fail = True
     s = _sess("r6", SessionStatus.RUNNING)
     sm._sessions["r6"] = s
     await sm._save_session(s)
-    rep = await sm.reconcile_stranded_sessions(now=NOW)  # must not raise
+    with caplog.at_level(logging.WARNING, logger="services.session_manager"):
+        rep = await sm.reconcile_stranded_sessions(now=NOW)  # must not raise
     assert "r6" in rep.errored
     assert sm._sessions["r6"].status == SessionStatus.ERROR
+    assert "checkpoint_gc_failed" in caplog.text
 
 
 # -------------------------------------------
@@ -294,5 +343,74 @@ async def test_duplicate_terminal_calls_are_harmless(sm):
     await sm.update_status("t7", SessionStatus.COMPLETED)  # re-fire, no error
 
     assert sm._fake_storage.calls == ["t7", "t7"]
+    assert sm._fake_storage.locked_during_call == [False, False]
     session = await sm.get_session("t7")
     assert session.status == SessionStatus.COMPLETED
+
+
+# -------------------------------------------
+# 6) Review fix: hooks fire OUTSIDE self._lock (never while it's held)
+# -------------------------------------------
+
+
+async def test_reconcile_fire_hooks_false_suppresses_immediate_gc(sm):
+    """`fire_hooks=False` is what initialize() passes because IT calls
+    reconcile while holding self._lock -- this pins that the flag actually
+    suppresses the per-branch firing (the other half of the contract,
+    initialize() firing them itself after releasing the lock, is pinned by
+    test_initialize_fires_gc_for_reconciled_terminal_sessions below)."""
+    s = _sess("r7", SessionStatus.RUNNING)
+    sm._sessions["r7"] = s
+    await sm._save_session(s)
+    rep = await sm.reconcile_stranded_sessions(now=NOW, fire_hooks=False)
+    assert "r7" in rep.errored
+    assert sm._fake_storage.calls == []
+
+
+async def test_initialize_fires_gc_for_reconciled_terminal_sessions(tmp_path, monkeypatch):
+    """End-to-end pin for the lock-safety review fix: SessionManager.
+    initialize() must fire the checkpoint-GC hook for sessions that
+    reconcile_stranded_sessions flips to a terminal status during startup
+    -- AFTER releasing self._lock, never from inside reconcile itself
+    (which initialize() calls with fire_hooks=False for exactly this
+    reason). A dedicated tmp DB/manager pair is used here (not the `sm`
+    fixture) because the behavior under test IS initialize()'s own
+    reconcile pass, which the `sm` fixture already consumed on an empty
+    DB during its own setup.
+    """
+    db_path = str(tmp_path / "init_gc.db")
+    fake_storage = _FakeStorage()
+
+    async def _fake_get_storage_service():
+        return fake_storage
+
+    monkeypatch.setattr("services.session_manager.DB_PATH", db_path)
+    monkeypatch.setattr(
+        "services.session_manager.get_storage_service", _fake_get_storage_service
+    )
+
+    # Phase 1: seed a RUNNING session (no awaiting/proposal -- reconcile's
+    # "no live task behind it" branch) directly into SQLite, simulating
+    # what a killed process would have left behind.
+    seed_mgr = SessionManager()
+    await seed_mgr.initialize()  # creates schema; no sessions yet -> no GC
+    stranded = _sess("init-r1", SessionStatus.RUNNING)
+    seed_mgr._sessions[stranded.session_id] = stranded
+    await seed_mgr._save_session(stranded)
+    fake_storage.calls.clear()  # ignore anything from seed_mgr's own init
+
+    # Phase 2: a fresh manager loading that same DB simulates the restart.
+    # Its initialize() runs reconcile_stranded_sessions (RUNNING -> ERROR,
+    # fire_hooks=False) then must fire the GC hook for it itself, once
+    # self._lock is released.
+    restarted_mgr = SessionManager()
+    # Wire the lock BEFORE initialize() runs -- this is the crux of the
+    # whole review fix: pre-fix, this call recorded locked_during_call ==
+    # [True] (fired from inside reconcile, which ran under initialize()'s
+    # held lock); post-fix it must be [False].
+    fake_storage.lock = restarted_mgr._lock
+    await restarted_mgr.initialize()
+
+    assert restarted_mgr._sessions["init-r1"].status == SessionStatus.ERROR
+    assert fake_storage.calls == ["init-r1"]
+    assert fake_storage.locked_during_call == [False]
