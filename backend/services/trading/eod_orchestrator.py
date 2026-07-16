@@ -36,9 +36,12 @@ import json
 import logging
 from typing import Any
 
+from app.config import get_settings
+
 from .calibration import label_and_calibrate
 from .eod_review import build_eod_review
-from .regime import SCANNER_DB_PATH, compute_regime_snapshot
+from .market_data import fetch_index_snapshot, fetch_market_flow
+from .regime import SCANNER_DB_PATH, compute_regime_snapshot, compute_market_regime
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +67,23 @@ async def run_eod_review(coordinator: Any, storage: Any, trade_date: str) -> boo
         snap = await asyncio.to_thread(
             compute_regime_snapshot, SCANNER_DB_PATH, trade_date
         )
+        # Phase 5: 지수·수급 심화 (실패-무해, 핫패스 무관 EOD 1회)
+        settings = get_settings()
+        index = flow = None
+        kiwoom = getattr(coordinator, "_kiwoom", None)
+        if settings.PHASE5_MARKET_DATA_ENABLED and kiwoom is not None:
+            try:
+                index = await fetch_index_snapshot(kiwoom)
+                flow = await fetch_market_flow(kiwoom)
+            except Exception as e:
+                logger.warning(f"[EODOrchestrator] market-data enrich failed: {e}")
+        enriched = compute_market_regime(
+            snap, index, flow, settings.PHASE5_SENTIMENT_THRESHOLD
+        )
         rid = None
-        if snap:
-            await storage.save_regime_snapshot(snap)
-            rid = snap["id"]
+        if enriched:
+            await storage.save_regime_snapshot(enriched)
+            rid = enriched["id"]
 
         await label_and_calibrate(storage, trade_date)
 
