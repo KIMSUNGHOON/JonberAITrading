@@ -8,11 +8,13 @@ awaiting_approval + 새 제안으로 끝났으면 — status를 'awaiting_approv
 한다. 기존 제안 ID 피닝이 이중 승인을 방지한다.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 import app.api.routes.approval as approval_module
+from services.session_manager import MarketType
 
 
 def _kr_session(session_id: str) -> dict:
@@ -87,6 +89,27 @@ def wired(monkeypatch):
         monkeypatch.setattr(
             approval_module, "get_kr_stock_trading_graph", lambda: graph
         )
+
+    # P2-2 fast-follow: graph selection now independently reads the SM row's
+    # market_type (no B-membership fallback). This fixture's sessions dict IS
+    # the legacy dict (B) with no backing SM row, so resolve market_type from
+    # whichever legacy dict (kr vs coin -- both read fresh through
+    # approval_module so a test's own later monkeypatch override, e.g. the
+    # coin test below, is still picked up) currently contains the id.
+    class _FakeSM:
+        async def get_session(self, session_id):
+            kr = approval_module.get_kr_stock_sessions()
+            if session_id in kr:
+                return SimpleNamespace(market_type=MarketType.KIWOOM)
+            coin = approval_module.get_coin_sessions()
+            if session_id in coin:
+                return SimpleNamespace(market_type=MarketType.COIN)
+            return None
+
+    async def fake_get_session_manager():
+        return _FakeSM()
+
+    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
 
     return sessions, reschedule_calls, set_graph
 

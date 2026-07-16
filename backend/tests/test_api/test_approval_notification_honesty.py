@@ -23,11 +23,13 @@ Fix: branch on state["execution_status"] directly.
     telegram.send_trade_rejected) with the execution error as the reason.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 import app.api.routes.approval as approval_module
+from services.session_manager import MarketType
 
 
 def _kr_session(session_id: str) -> dict:
@@ -133,6 +135,26 @@ def wired(monkeypatch):
 
     def set_graph(graph):
         monkeypatch.setattr(approval_module, "get_kr_stock_trading_graph", lambda: graph)
+
+    # P2-2 fast-follow: graph selection now independently reads the SM row's
+    # market_type (no B-membership fallback). This fixture's sessions dict IS
+    # the legacy dict (B) with no backing SM row -- resolve market_type from
+    # whichever legacy dict (kr vs coin, both read fresh through
+    # approval_module) currently contains the id.
+    class _FakeSM:
+        async def get_session(self, session_id):
+            kr = approval_module.get_kr_stock_sessions()
+            if session_id in kr:
+                return SimpleNamespace(market_type=MarketType.KIWOOM)
+            coin = approval_module.get_coin_sessions()
+            if session_id in coin:
+                return SimpleNamespace(market_type=MarketType.COIN)
+            return None
+
+    async def fake_get_session_manager():
+        return _FakeSM()
+
+    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
 
     return sessions, ws_calls, telegram, set_graph
 
