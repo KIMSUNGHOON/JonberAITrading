@@ -13,6 +13,7 @@ zero production registrants and the manual path never fires it, so direct
 calls are the only way to cover both).
 """
 
+import json
 from typing import Any, Optional
 
 import structlog
@@ -137,6 +138,17 @@ def serialize_session(
         # tilt was active). save_agent_chat_decision JSON-serializes this the
         # same way it does dissenting_opinions/behavioral_signals/etc.
         "agent_weights": session.agent_weights,
+        # session-ssot P4-3: message/round counts, cheap summary fields for
+        # a list view (P4-4) that must not parse agent_chat_transcripts'
+        # JSON blob per row just to show transcript size.
+        "total_messages": (
+            len(session.all_messages)
+            if isinstance(session.all_messages, list)
+            else None
+        ),
+        "total_rounds": (
+            len(session.rounds) if isinstance(session.rounds, list) else None
+        ),
     }
 
     votes: list[dict[str, Any]] = [
@@ -158,20 +170,49 @@ def serialize_session(
 
 
 async def persist_session(session: ChatSession) -> None:
-    """Persist a completed ChatSession to durable storage.
+    """Persist a completed ChatSession to durable storage: the decision+
+    votes summary (agent_chat_decisions/agent_chat_votes) AND the full
+    message/round transcript (agent_chat_transcripts, session-ssot P4-3) that
+    P4-4's session-detail reads need for terminated sessions once SM's
+    in-memory/TTL'd state is gone.
 
-    Failure-harmless by design: a storage outage (or any unexpected session
-    shape) must never break the discussion flow that's calling this right
-    after appending to `_session_history` — so every failure is caught and
-    logged, never raised.
+    Failure-harmless by design, independently per artifact: a storage outage
+    (or any unexpected session shape) must never break the discussion flow
+    that's calling this right after appending to `_session_history` -- so
+    both writes below run in their own try/except and neither ever raises.
+    The two writes are also independent of EACH OTHER: a transcript-save
+    failure must not skip or roll back the decision+votes save, and a
+    decision+votes-save failure must not skip the transcript save (or vice
+    versa) -- so each gets its own try/except rather than sharing one.
     """
+    session_id = getattr(session, "id", None)
+
     try:
         storage = await get_storage_service()
+    except Exception as e:
+        logger.warning(
+            "agent_chat_session_persist_failed",
+            session_id=session_id,
+            error=str(e),
+        )
+        return
+
+    try:
         decision, votes = serialize_session(session)
         await storage.save_agent_chat_decision(decision, votes)
     except Exception as e:
         logger.warning(
             "agent_chat_session_persist_failed",
-            session_id=getattr(session, "id", None),
+            session_id=session_id,
+            error=str(e),
+        )
+
+    try:
+        transcript_json = json.dumps(session.model_dump(mode="json"), default=str)
+        await storage.save_agent_chat_transcript(session_id, transcript_json)
+    except Exception as e:
+        logger.warning(
+            "agent_chat_transcript_persist_failed",
+            session_id=session_id,
             error=str(e),
         )

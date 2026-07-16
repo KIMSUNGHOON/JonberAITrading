@@ -334,6 +334,23 @@ class StorageService:
                     )
                 """)
 
+                # Discussion transcript ledger (session-ssot P4-3): a completed
+                # ChatSession's decision/vote summary lands in
+                # agent_chat_decisions/agent_chat_votes above, but the full
+                # message/round transcript (context/rounds/all_messages/votes/
+                # decision, i.e. ChatSession.model_dump(mode="json")) used to
+                # live only in the coordinator's in-memory history and
+                # SessionManager's TTL'd state -- evaporating on restart or
+                # TTL expiry. One row per session, additive to the existing
+                # ledger tables above (no column/semantic changes to either).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_chat_transcripts (
+                        session_id TEXT PRIMARY KEY,
+                        transcript_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                """)
+
                 # Per-agent calibration ledger (Phase2 Task 1): Phase1 backfills
                 # outcome_realized_pnl onto the entry decision but leaves
                 # outcome_label nullable and never scores which agent's vote
@@ -366,6 +383,17 @@ class StorageService:
                     conn,
                     "agent_chat_decisions",
                     {"agent_weights": "TEXT"},
+                )
+
+                # agent_chat_decisions.total_messages/total_rounds (session-ssot
+                # P4-3): additive count columns so a list view can show
+                # transcript size (P4-4) without parsing agent_chat_transcripts'
+                # JSON blob per row. serialize_session fills these for new
+                # rows; existing rows stay NULL (P4-4 falls back to 0).
+                await self._ensure_columns(
+                    conn,
+                    "agent_chat_decisions",
+                    {"total_messages": "INTEGER", "total_rounds": "INTEGER"},
                 )
 
                 # Trade <-> decision provenance (Phase1 C2): kr_stock_trades
@@ -1668,7 +1696,10 @@ class StorageService:
                 take_profit, position_pct, news_sentiment, news_count,
                 behavioral_signals (dict), market_sentiment (dict/None),
                 flow (dict/None), agent_weights (dict/None — Phase4:
-                consensus weights actually used, JSON-serialized).
+                consensus weights actually used, JSON-serialized),
+                total_messages/total_rounds (int/None — session-ssot P4-3:
+                transcript size, for a list view that shouldn't have to
+                parse agent_chat_transcripts' JSON blob per row).
             votes: list of dicts with keys decision_id, agent_type, vote,
                 confidence, reasoning, key_factors (list),
                 suggested_position_pct, suggested_stop_loss_pct,
@@ -1688,8 +1719,9 @@ class StorageService:
                      confidence, consensus_level, rationale, dissenting_opinions,
                      entry_price, stop_loss, take_profit, position_pct,
                      news_sentiment, news_count, behavioral_signals,
-                     market_sentiment, flow, agent_weights)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     market_sentiment, flow, agent_weights,
+                     total_messages, total_rounds)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         decision["id"],
@@ -1722,6 +1754,8 @@ class StorageService:
                         json.dumps(decision["agent_weights"])
                         if decision.get("agent_weights") is not None
                         else None,
+                        decision.get("total_messages"),
+                        decision.get("total_rounds"),
                     ),
                 )
 
@@ -1872,6 +1906,79 @@ class StorageService:
                 "agent_chat_votes_get_failed", decision_id=decision_id, error=str(e)
             )
             return []
+
+    # -------------------------------------------
+    # Agent-Chat Transcripts Ledger (session-ssot P4-3)
+    # -------------------------------------------
+
+    async def save_agent_chat_transcript(
+        self, session_id: str, transcript_json: str
+    ) -> bool:
+        """
+        Persist the full discussion transcript (ChatSession.model_dump(mode=
+        "json"), JSON-encoded by the caller) for a completed session.
+
+        INSERT OR REPLACE so re-persisting the same session_id (a session
+        that somehow completes twice, or a retry) is idempotent rather than
+        erroring on the PRIMARY KEY. Independent of
+        save_agent_chat_decision -- decision_log.persist_session calls both
+        in separate try/except blocks so a failure in one never blocks or
+        rolls back the other.
+
+        Args:
+            session_id: ChatSession.id -- same id agent_chat_decisions.id
+                uses for the same session, so callers can join the two.
+            transcript_json: pre-serialized JSON string (the full
+                ChatSession dump), not a dict -- mirrors how other *_json
+                columns in this file are already-serialized TEXT blobs.
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO agent_chat_transcripts
+                    (session_id, transcript_json, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (session_id, transcript_json, datetime.now().isoformat()),
+                )
+                await conn.commit()
+                logger.debug("agent_chat_transcript_saved", session_id=session_id)
+                return True
+        except Exception as e:
+            logger.error(
+                "agent_chat_transcript_save_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return False
+
+    async def get_agent_chat_transcript(self, session_id: str) -> Optional[str]:
+        """Get the persisted transcript JSON for a session, or None if this
+        session was never persisted (or storage errors)."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                async with conn.execute(
+                    "SELECT transcript_json FROM agent_chat_transcripts"
+                    " WHERE session_id = ?",
+                    (session_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    return row[0] if row else None
+        except Exception as e:
+            logger.error(
+                "agent_chat_transcript_get_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return None
 
     async def update_decision_label(self, decision_id: str, label: str) -> bool:
         """
