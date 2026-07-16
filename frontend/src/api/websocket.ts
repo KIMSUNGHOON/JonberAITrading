@@ -22,6 +22,7 @@ export type WebSocketMessageType =
   | 'proposal'
   | 'position'
   | 'complete'
+  | 'not_found'
   | 'heartbeat'
   | 'sessions';
 
@@ -126,6 +127,7 @@ export interface WebSocketHandlers {
   onProposal?: (proposal: ProposalMessage['data']) => void;
   onPosition?: (position: PositionMessage['data']) => void;
   onComplete?: (data: CompleteMessage['data']) => void;
+  onNotFound?: () => void;
   onConnect?: () => void;
   onDisconnect?: () => void;
   onError?: (error: Event) => void;
@@ -214,6 +216,9 @@ export class TradingWebSocket {
       case 'complete':
         this.handlers.onComplete?.(message.data as CompleteMessage['data']);
         break;
+      case 'not_found':
+        this.handlers.onNotFound?.();
+        break;
     }
   }
 
@@ -235,7 +240,7 @@ export class TradingWebSocket {
 
       if (message.type !== 'reasoning' && message.type !== 'status' &&
           message.type !== 'proposal' && message.type !== 'position' &&
-          message.type !== 'complete') {
+          message.type !== 'complete' && message.type !== 'not_found') {
         console.log('Unknown message type:', message.type);
       }
     } catch (error) {

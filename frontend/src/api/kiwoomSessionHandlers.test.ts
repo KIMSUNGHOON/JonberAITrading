@@ -747,3 +747,26 @@ describe('P0-1 complete-final: terminal complete 프레임은 소켓을 정상 �
     expect(mockWsManager.disconnect).not.toHaveBeenCalled();
   });
 });
+
+describe('P0-3 not_found: 서버가 모르는 세션은 카드 드롭 + 재연결 금지', () => {
+  // Note: this file mocks the store via a per-test `mockState` object (see the
+  // top-of-file vi.mock('@/store', ...)), not a shared `storeActions` object —
+  // removeKiwoomSession is stubbed here the same way the P0-1 block above
+  // stubs its own action set.
+  let removeKiwoomSession: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    removeKiwoomSession = vi.fn();
+    mockState = {
+      kiwoom: { sessions: [] },
+      removeKiwoomSession,
+    };
+  });
+
+  it('not_found 프레임 수신 시 removeKiwoomSession 호출', () => {
+    const handlers = createKiwoomWebSocketHandlers('sess-x');
+    handlers.onNotFound!();
+    expect(removeKiwoomSession).toHaveBeenCalledWith('sess-x');
+  });
+});

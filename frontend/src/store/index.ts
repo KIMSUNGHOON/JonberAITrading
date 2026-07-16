@@ -30,6 +30,9 @@ import type {
   TradingModeResponse,
 } from '@/types';
 import type { TradeNotificationType, TradeNotification } from '@/hooks/useTradeNotifications';
+// P0-3: a removed card must take its socket with it (see removeKiwoomSession
+// below). No cycle — websocket.ts does not import '@/store'.
+import { wsManager } from '@/api/websocket';
 
 // P1-3: how many trade notifications survive a page refresh (bounded, most
 // recent first). The live WS stream (useTradeNotifications) can carry far
@@ -1068,8 +1071,12 @@ export const useStore = create<Store>()(
         return true;
       },
 
-      removeKiwoomSession: (sessionId) =>
-        set((state) => {
+      removeKiwoomSession: (sessionId) => {
+        // P0-3: a removed card must take its socket with it — the rehydrate
+        // purge and every UI close path funnel through this action, and a
+        // socket left behind reconnects forever against a dead session.
+        wsManager.disconnect(sessionId);
+        return set((state) => {
           const newSessions = state.kiwoom.sessions.filter(s => s.sessionId !== sessionId);
           const wasActive = state.kiwoom.activeSessionId === sessionId;
           const newActiveId = wasActive
@@ -1109,7 +1116,8 @@ export const useStore = create<Store>()(
               } : {}),
             },
           };
-        }),
+        });
+      },
 
       setActiveKiwoomSession: (sessionId) =>
         set((state) => {

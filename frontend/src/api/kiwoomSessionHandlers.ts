@@ -192,6 +192,12 @@ export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandl
       // budget in wsCore, so the loop never expires).
       wsManager.disconnect(sessionId);
     },
+    onNotFound: () => {
+      flushReasoningBuffer(sessionId);
+      // Server does not know this session at all (post-restart ghost).
+      // Dropping the card also tears down this socket via removeKiwoomSession.
+      store().removeKiwoomSession(sessionId);
+    },
     onError: () => {
       flushReasoningBuffer(sessionId);
       store().setKiwoomSessionError(sessionId, 'WebSocket connection error');
