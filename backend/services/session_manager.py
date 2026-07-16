@@ -41,6 +41,15 @@ DB_PATH = "data/sessions.db"
 # (realtime favors the latest state), so a slow/dead socket cannot grow unbounded.
 SUBSCRIBER_QUEUE_MAXSIZE = 256
 
+# state_updates keys that can hide an "invisible interrupt" (P1 spec Sec.P1) if
+# their SQLite write is delayed -- a session parked awaiting approval that a
+# restart-time reload wouldn't see yet. update_state() flushes synchronously
+# whenever a state_update touches one of these; every other key is debounced
+# (see _FLUSH_DEBOUNCE_SECONDS, P2-1).
+_CRITICAL_STATE_KEYS = {"awaiting_approval", "trade_proposal", "approval_status", "auto_approve_at"}
+# Debounce window for non-critical state_update flushes (P2-1).
+_FLUSH_DEBOUNCE_SECONDS = 1.0
+
 
 class MarketType(str, Enum):
     """Supported market types."""
@@ -206,6 +215,13 @@ class SessionManager:
 
         # Subscribers for session updates (WebSocket integration)
         self._subscribers: Dict[str, Set[asyncio.Queue]] = {}
+
+        # P2-1: debounced-flush bookkeeping for update_state's non-critical
+        # path. _dirty holds session_ids with an in-memory update that has
+        # not yet been written to SQLite; _flush_task is the single
+        # in-flight debounce timer (never more than one at a time).
+        self._dirty: Set[str] = set()
+        self._flush_task: Optional[asyncio.Task] = None
 
     async def initialize(self) -> None:
         """Initialize the session manager and SQLite database."""
@@ -532,6 +548,79 @@ class SessionManager:
 
         return session
 
+    async def create_session_if_no_active(
+        self,
+        session_id: str,
+        market_type: MarketType,
+        ticker: str,
+        display_name: str,
+        **kwargs,
+    ) -> tuple[Optional[AnalysisSession], Optional[AnalysisSession]]:
+        """
+        Atomically reserve a session_id for (market_type, ticker) iff no
+        other session for that same pair is currently RUNNING or
+        AWAITING_APPROVAL.
+
+        This collapses the check-then-create race that a separate
+        "is there an active session for this ticker?" read followed by a
+        plain create_session() call would have: two callers racing to open
+        analysis on the same ticker could otherwise both observe "no active
+        session" and both create one. Holding self._lock across the check
+        AND the create closes that window.
+
+        Args:
+            session_id: Unique session identifier for the NEW session (only
+                used if no active session for the ticker exists).
+            market_type: Type of market (stock, coin, kiwoom)
+            ticker: Stock/coin code
+            display_name: Human-readable name
+            **kwargs: Additional fields (stk_cd, stk_nm, market, korean_name, state)
+
+        Returns:
+            (created, existing) -- exactly one is None. `created` is the
+            newly reserved AnalysisSession when no collision was found;
+            `existing` is the already-active session blocking the
+            reservation otherwise.
+        """
+        await self.initialize()
+
+        async with self._lock:
+            for candidate in self._sessions.values():
+                if candidate.market_type != market_type:
+                    continue
+                candidate_ticker = candidate.stk_cd or candidate.market or candidate.ticker
+                if candidate_ticker != ticker:
+                    continue
+                if candidate.status in (SessionStatus.RUNNING, SessionStatus.AWAITING_APPROVAL):
+                    return None, candidate
+
+            # NOTE: do NOT call self.create_session() here -- it re-acquires
+            # self._lock (not reentrant) and would deadlock. Construct and
+            # persist the session directly instead (mirrors create_session's
+            # body).
+            session = AnalysisSession(
+                session_id=session_id,
+                market_type=market_type,
+                ticker=ticker,
+                display_name=display_name,
+                stk_cd=kwargs.get("stk_cd"),
+                stk_nm=kwargs.get("stk_nm"),
+                market=kwargs.get("market"),
+                korean_name=kwargs.get("korean_name"),
+                state=kwargs.get("state", {}),
+            )
+            self._sessions[session_id] = session
+            await self._save_session(session)
+
+        logger.info(
+            "session_reserved",
+            session_id=session_id,
+            market_type=market_type.value,
+            ticker=ticker,
+        )
+
+        return session, None
+
     async def _save_session(self, session: AnalysisSession) -> None:
         """Save session to SQLite."""
         async with aiosqlite.connect(DB_PATH) as db:
@@ -575,25 +664,36 @@ class SessionManager:
         status: SessionStatus,
         error: Optional[str] = None,
     ) -> None:
-        """Update session status."""
+        """
+        Update session status. Always flushed to SQLite immediately (never
+        debounced) -- a status transition is exactly the kind of change the
+        P1 "invisible interrupt" guard exists for.
+
+        Raises:
+            KeyError: session_id is not tracked by this SessionManager
+                (fail-loud -- P2-1 retired the previous silent no-op).
+        """
         await self.initialize()
 
         async with self._lock:
-            if session_id in self._sessions:
-                session = self._sessions[session_id]
-                session.status = status
-                session.updated_at = datetime.now(timezone.utc)
-                if error:
-                    session.error = error
+            if session_id not in self._sessions:
+                raise KeyError(f"session {session_id} not tracked by SessionManager")
 
-                await self._save_session(session)
-                await self._notify_subscribers(session_id, {"type": "status", "status": status.value})
+            session = self._sessions[session_id]
+            session.status = status
+            session.updated_at = datetime.now(timezone.utc)
+            if error:
+                session.error = error
 
-                logger.debug(
-                    "session_status_updated",
-                    session_id=session_id,
-                    status=status.value,
-                )
+            self._dirty.discard(session_id)
+            await self._save_session(session)
+            await self._notify_subscribers(session_id, {"type": "status", "status": status.value})
+
+            logger.debug(
+                "session_status_updated",
+                session_id=session_id,
+                status=status.value,
+            )
 
     async def update_state(
         self,
@@ -601,39 +701,105 @@ class SessionManager:
         state_updates: Dict[str, Any],
         last_node: Optional[str] = None,
     ) -> None:
-        """Update session state."""
+        """
+        Update session state.
+
+        SQLite write policy (P2-1): if `state_updates` touches any key in
+        _CRITICAL_STATE_KEYS, this flushes to SQLite synchronously before
+        returning -- those keys are how an "invisible interrupt" (P1 spec
+        Sec.P1) could otherwise hide. Everything else (reasoning-log entries,
+        stage/progress chatter) is coalesced instead: the session is marked
+        dirty and a single debounced flush task (per-manager, ~1s) writes
+        every dirty session once and clears the set, so a burst of
+        non-critical updates costs one SQLite write instead of N.
+
+        Durability trade-off: a process crash inside the debounce window
+        loses at most the last ~1s of non-critical state. This is accepted
+        by design -- the next critical-key update or status transition
+        flushes synchronously anyway, so THAT is the durability point that
+        actually matters, not every reasoning-log line.
+
+        Pub/sub notification is never debounced: both the critical and
+        non-critical paths call _notify_subscribers immediately after the
+        in-memory update, so WebSocket subscribers see live-latency updates
+        regardless of the SQLite write policy.
+
+        Raises:
+            KeyError: session_id is not tracked by this SessionManager
+                (fail-loud -- P2-1 retired the previous silent no-op).
+        """
         await self.initialize()
 
         async with self._lock:
-            if session_id in self._sessions:
-                session = self._sessions[session_id]
+            if session_id not in self._sessions:
+                raise KeyError(f"session {session_id} not tracked by SessionManager")
 
-                # Compute the reasoning-log delta BEFORE applying the update, so the
-                # WS can stream only the newly-appended entries instead of re-diffing
-                # the whole log.
-                reasoning_delta = None
-                if "reasoning_log" in state_updates:
-                    old_log = session.state.get("reasoning_log") or []
-                    new_log = state_updates.get("reasoning_log") or []
-                    if isinstance(new_log, list) and len(new_log) >= len(old_log):
-                        reasoning_delta = new_log[len(old_log):]
+            session = self._sessions[session_id]
 
-                session.state.update(state_updates)
-                session.updated_at = datetime.now(timezone.utc)
-                if last_node:
-                    session.last_node = last_node
+            # Compute the reasoning-log delta BEFORE applying the update, so the
+            # WS can stream only the newly-appended entries instead of re-diffing
+            # the whole log.
+            reasoning_delta = None
+            if "reasoning_log" in state_updates:
+                old_log = session.state.get("reasoning_log") or []
+                new_log = state_updates.get("reasoning_log") or []
+                if isinstance(new_log, list) and len(new_log) >= len(old_log):
+                    reasoning_delta = new_log[len(old_log):]
 
+            session.state.update(state_updates)
+            session.updated_at = datetime.now(timezone.utc)
+            if last_node:
+                session.last_node = last_node
+
+            if set(state_updates.keys()) & _CRITICAL_STATE_KEYS:
+                self._dirty.discard(session_id)
                 await self._save_session(session)
+            else:
+                self._dirty.add(session_id)
+                self._schedule_dirty_flush()
 
-                payload: Dict[str, Any] = {
-                    "type": "state_update",
-                    "updates": list(state_updates.keys()),
-                }
-                if last_node:
-                    payload["last_node"] = last_node
-                if reasoning_delta:
-                    payload["reasoning_delta"] = reasoning_delta
-                await self._notify_subscribers(session_id, payload)
+            payload: Dict[str, Any] = {
+                "type": "state_update",
+                "updates": list(state_updates.keys()),
+            }
+            if last_node:
+                payload["last_node"] = last_node
+            if reasoning_delta:
+                payload["reasoning_delta"] = reasoning_delta
+            await self._notify_subscribers(session_id, payload)
+
+    def _schedule_dirty_flush(self) -> None:
+        """
+        Arm the debounced flush task if one is not already pending.
+
+        Must be called while holding self._lock (update_state's caller
+        already does). Safe to call from inside the lock even though the
+        task itself also acquires self._lock: create_task() only schedules
+        the coroutine, it does not start running it -- by the time
+        _flush_dirty_after_delay actually reaches its `async with
+        self._lock:`, this call's own `async with self._lock:` block (in
+        update_state) has long since exited and released it (the task
+        sleeps _FLUSH_DEBOUNCE_SECONDS first).
+        """
+        if self._flush_task is not None and not self._flush_task.done():
+            return
+        self._flush_task = asyncio.create_task(self._flush_dirty_after_delay())
+
+    async def _flush_dirty_after_delay(self) -> None:
+        """Debounced SQLite flush for update_state's non-critical path.
+
+        If cancelled (e.g. by a caller tearing the manager down) or if the
+        process exits during the sleep, the pending writes are simply lost
+        -- accepted per update_state's durability trade-off docstring.
+        """
+        await asyncio.sleep(_FLUSH_DEBOUNCE_SECONDS)
+        async with self._lock:
+            dirty_ids = list(self._dirty)
+            self._dirty.clear()
+            for sid in dirty_ids:
+                session = self._sessions.get(sid)
+                if session is not None:
+                    await self._save_session(session)
 
     async def get_all_sessions(
         self,
@@ -677,6 +843,9 @@ class SessionManager:
         async with self._lock:
             if session_id in self._sessions:
                 del self._sessions[session_id]
+                # P2-1: a debounced flush must not resurrect/overwrite a
+                # session that was removed before its 1s window fired.
+                self._dirty.discard(session_id)
 
                 # Remove from SQLite
                 async with aiosqlite.connect(DB_PATH) as db:
@@ -715,6 +884,9 @@ class SessionManager:
 
             for session_id in expired:
                 del self._sessions[session_id]
+                # P2-1: same reasoning as remove_session -- don't let a
+                # debounced flush write back an expired-and-deleted session.
+                self._dirty.discard(session_id)
 
             # Also clean from SQLite
             if expired:
