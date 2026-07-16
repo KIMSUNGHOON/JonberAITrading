@@ -132,8 +132,30 @@ class KiwoomError(Exception):
 
     @property
     def is_token_expired(self) -> bool:
-        """토큰 만료/무효 — 재발급 후 재시도 대상"""
-        return self.code in INVALID_TOKEN_CODES or self.code == KiwoomErrorCode.TOKEN_EXPIRED
+        """토큰 만료/무효 — 재발급 후 재시도 대상.
+
+        Kiwoom는 토큰 무효를 최상위 return_code로 주기도 하지만(8005 등),
+        일반 인증실패 코드(예: 3)로 감싸고 실제 8005를 return_msg 문자열에
+        중첩해 반환하기도 한다(라이브 관측:
+        "인증에 실패했습니다[8005:Token이 유효하지 않습니다]"). 후자를 코드로만
+        판정하면 놓쳐 client._request의 재발급-재시도가 안 떠 죽은 토큰이 무한
+        전송된다. 따라서 코드뿐 아니라 메시지에 중첩된 토큰-무효 코드/문구도
+        감지한다. (오탐이 나더라도 재발급-재시도 1회는 멱등·무해.)
+        """
+        if self.code in INVALID_TOKEN_CODES or self.code == KiwoomErrorCode.TOKEN_EXPIRED:
+            return True
+        msg = self.message or ""
+        # 메시지에 중첩된 토큰-무효 코드(예: "[8005:...]")
+        if any(str(code) in msg for code in INVALID_TOKEN_CODES):
+            return True
+        # 코드 없이 문구만 오는 경우 대비
+        token_phrases = (
+            "Token이 유효하지 않",
+            "토큰이 유효하지 않",
+            "유효하지 않은 접근토큰",
+            "접근토큰이 만료",
+        )
+        return any(p in msg for p in token_phrases)
 
     @property
     def is_retryable(self) -> bool:

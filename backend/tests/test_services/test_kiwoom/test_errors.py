@@ -111,6 +111,38 @@ class TestKiwoomError:
         error = KiwoomError(code=KiwoomErrorCode.INVALID_STOCK_CODE)
         assert error.is_retryable is False
 
+    def test_is_token_expired_nested_code_in_message(self):
+        # 라이브 관측: Kiwoom가 최상위 return_code=3(일반 인증실패)로 감싸고
+        # 실제 8005를 return_msg에 중첩해 반환 → 코드만 보면 놓친다.
+        error = KiwoomError(
+            code=3,
+            message="인증에 실패했습니다[8005:Token이 유효하지 않습니다]",
+        )
+        assert error.is_token_expired is True
+        assert error.is_retryable is True
+
+    def test_is_token_expired_phrase_only(self):
+        # 코드 없이 문구만 오는 경우도 감지
+        error = KiwoomError(code=3, message="Token이 유효하지 않습니다")
+        assert error.is_token_expired is True
+
+    def test_is_token_expired_false_for_unrelated_error(self):
+        # 오탐 방지: 토큰과 무관한 에러는 False
+        error = KiwoomError(
+            code=KiwoomErrorCode.INVALID_STOCK_CODE,
+            message="잘못된 종목코드입니다",
+        )
+        assert error.is_token_expired is False
+
+    def test_from_response_nested_8005_is_token_expired(self):
+        # from_response 경로(실 응답 형태) end-to-end
+        response = {
+            "return_code": 3,
+            "return_msg": "인증에 실패했습니다[8005:Token이 유효하지 않습니다]",
+        }
+        error = KiwoomError.from_response(response, api_id="kt00001")
+        assert error.is_token_expired is True
+
     def test_is_auth_error_true(self):
         error = KiwoomError(code=KiwoomErrorCode.TOKEN_EXPIRED)
         assert error.is_auth_error is True
