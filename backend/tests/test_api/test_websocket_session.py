@@ -36,6 +36,7 @@ class FakeWebSocket:
         self.sent: list[dict] = []
         self.sent_text: list[str] = []
         self.accepted = False
+        self.closed_code: int | None = None
         self._incoming: asyncio.Queue = asyncio.Queue()
 
     async def accept(self):
@@ -46,6 +47,9 @@ class FakeWebSocket:
 
     async def send_text(self, text: str):
         self.sent_text.append(text)
+
+    async def close(self, code: int = 1000):
+        self.closed_code = code
 
     async def receive_text(self) -> str:
         item = await self._incoming.get()
@@ -588,3 +592,28 @@ async def test_subscriber_registered_and_cleaned_up(sm, kr_sessions, fast_linger
         await asyncio.wait_for(task, timeout=2.0)
 
     assert not sm._subscribers.get("push-3"), "subscription must be cleaned up on disconnect"
+
+
+# -------------------------------------------
+# Not-found close (P0-2)
+# -------------------------------------------
+
+
+async def test_ws_unknown_session_not_found_close(sm, kr_sessions, monkeypatch):
+    """A session id with no snapshot anywhere (legacy dicts or SessionManager)
+    must not be safety-polled forever: after NOT_FOUND_GRACE_SECONDS of
+    consecutive None snapshots, the server sends a not_found frame and closes
+    with code 4404 (P0-2). P0-3's FE consumes this frame/code to drop the
+    card instead of reconnecting."""
+    monkeypatch.setattr(ws_module, "NOT_FOUND_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(ws_module, "SAFETY_POLL_SECONDS", 0.05)
+
+    ws = FakeWebSocket()
+    async with running_ws(ws, "no-such-session-id") as task:
+        await wait_for_frame(ws, lambda f: f.get("type") == "not_found", timeout=1.0)
+        await asyncio.wait_for(task, timeout=1.0)
+
+    not_found_frames = [f for f in ws.sent if f["type"] == "not_found"]
+    assert len(not_found_frames) == 1
+    assert not_found_frames[0]["data"]["session_id"] == "no-such-session-id"
+    assert ws.closed_code == 4404

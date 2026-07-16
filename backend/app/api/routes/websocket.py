@@ -11,6 +11,7 @@ Provides real-time streaming of:
 
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from typing import Optional, Any
 
@@ -33,6 +34,13 @@ router = APIRouter()
 SAFETY_POLL_SECONDS = 1.0
 # Keep the connection open briefly after the complete frame so slow clients read it.
 COMPLETE_LINGER_SECONDS = 2.0
+
+# P0-2: a session id with no snapshot anywhere (legacy dicts AND SessionManager)
+# will never produce frames. Give producers a short grace to register the
+# session (start-path race), then close with a dedicated code instead of
+# safety-polling forever — the FE drops its card and never reconnects on 4404.
+NOT_FOUND_GRACE_SECONDS = 10.0
+WS_CLOSE_SESSION_NOT_FOUND = 4404
 
 # Cap the initial full-log replay on connect: long sessions (hundreds of
 # reasoning entries) were serialized+sent back-to-back in a tight loop on
@@ -824,13 +832,25 @@ async def websocket_session(websocket: WebSocket, session_id: str):
         queue = await sm.subscribe(session_id)
         recv_task = asyncio.create_task(websocket.receive_text())
         queue_task = asyncio.create_task(queue.get())
+        none_since: Optional[float] = None
 
         while True:
             session = await _get_session_snapshot(session_id)
             if session is not None:
+                none_since = None
                 if await cursor.emit(websocket, session):
                     # Keep connection open for a bit, then close
                     await asyncio.sleep(COMPLETE_LINGER_SECONDS)
+                    break
+            else:
+                now = time.monotonic()
+                if none_since is None:
+                    none_since = now
+                elif now - none_since >= NOT_FOUND_GRACE_SECONDS:
+                    await websocket.send_json(
+                        {"type": "not_found", "data": {"session_id": session_id}}
+                    )
+                    await websocket.close(code=WS_CLOSE_SESSION_NOT_FOUND)
                     break
 
             done, _pending = await asyncio.wait(
