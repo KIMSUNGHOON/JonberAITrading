@@ -68,18 +68,23 @@ async def run_eod_review(coordinator: Any, storage: Any, trade_date: str) -> boo
             compute_regime_snapshot, SCANNER_DB_PATH, trade_date
         )
         # Phase 5: 지수·수급 심화 (실패-무해, 핫패스 무관 EOD 1회)
+        # PHASE5_MARKET_DATA_ENABLED=False = 진짜 킬스위치(레거시 breadth만 저장,
+        # compute_market_regime 자체를 호출하지 않음 — C6).
         settings = get_settings()
-        index = flow = None
-        kiwoom = getattr(coordinator, "_kiwoom", None)
-        if settings.PHASE5_MARKET_DATA_ENABLED and kiwoom is not None:
-            try:
-                index = await fetch_index_snapshot(kiwoom)
-                flow = await fetch_market_flow(kiwoom)
-            except Exception as e:
-                logger.warning(f"[EODOrchestrator] market-data enrich failed: {e}")
-        enriched = compute_market_regime(
-            snap, index, flow, settings.PHASE5_SENTIMENT_THRESHOLD
-        )
+        if settings.PHASE5_MARKET_DATA_ENABLED:
+            index = flow = None
+            kiwoom = getattr(coordinator, "_kiwoom", None)
+            if kiwoom is not None:
+                try:
+                    index = await fetch_index_snapshot(kiwoom)
+                    flow = await fetch_market_flow(kiwoom)
+                except Exception as e:
+                    logger.warning(f"[EODOrchestrator] market-data enrich failed: {e}")
+            enriched = compute_market_regime(
+                snap, index, flow, trade_date, settings.PHASE5_SENTIMENT_THRESHOLD
+            )
+        else:
+            enriched = snap
         rid = None
         if enriched:
             await storage.save_regime_snapshot(enriched)

@@ -1,3 +1,5 @@
+import types
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from services.trading import eod_orchestrator
@@ -74,3 +76,43 @@ async def test_never_raises_when_fetch_errors(monkeypatch):
 
     ok = await eod_orchestrator.run_eod_review(coord, storage, "2026-07-16")
     assert ok is True  # never-raise; enrich 실패해도 EOD 완주
+
+
+@pytest.mark.asyncio
+async def test_flag_off_saves_bare_breadth_no_backfill(monkeypatch):
+    """FIX 2: PHASE5_MARKET_DATA_ENABLED=False = 진짜 킬스위치 — compute_market_regime을
+    호출하지 않고 bare breadth snap을 그대로 저장. 심화 필드/backfill_market_context 없음,
+    fetcher도 호출되지 않아야 함."""
+    storage = _FakeStorage()
+    coord = MagicMock()
+    coord._kiwoom = MagicMock()
+    coord.get_portfolio_summary = MagicMock(return_value={})
+
+    fake_settings = types.SimpleNamespace(
+        PHASE5_MARKET_DATA_ENABLED=False,
+        PHASE5_SENTIMENT_THRESHOLD=0.1,
+    )
+    monkeypatch.setattr(eod_orchestrator, "get_settings", lambda: fake_settings)
+
+    bare_breadth = {"id": "b1", "trade_date": "2026-07-16", "breadth_ratio": 0.5,
+                     "regime_label": "risk_on", "source": "scanner"}
+    monkeypatch.setattr(eod_orchestrator, "compute_regime_snapshot",
+                        lambda p, td: bare_breadth)
+
+    async def _idx_should_not_run(c):
+        raise AssertionError("fetch_index_snapshot must not be called when flag is off")
+
+    async def _flow_should_not_run(c):
+        raise AssertionError("fetch_market_flow must not be called when flag is off")
+
+    monkeypatch.setattr(eod_orchestrator, "fetch_index_snapshot", _idx_should_not_run)
+    monkeypatch.setattr(eod_orchestrator, "fetch_market_flow", _flow_should_not_run)
+    monkeypatch.setattr(eod_orchestrator, "label_and_calibrate", AsyncMock())
+    monkeypatch.setattr(eod_orchestrator, "build_eod_review", AsyncMock(return_value={}))
+
+    ok = await eod_orchestrator.run_eod_review(coord, storage, "2026-07-16")
+
+    assert ok is True
+    assert storage.saved_regime == bare_breadth
+    assert storage.saved_regime.get("market_sentiment_label") is None
+    assert storage.saved_regime.get("index_kospi") is None

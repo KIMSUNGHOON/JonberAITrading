@@ -132,6 +132,7 @@ def compute_market_regime(
     breadth: Optional[dict],
     index: Optional[dict],
     flow: Optional[dict],
+    trade_date: Optional[str],
     threshold: float,
 ) -> Optional[dict]:
     """breadth 스냅샷에 지수·수급을 병합하고 파생 시장심리를 산출.
@@ -153,7 +154,7 @@ def compute_market_regime(
     else:
         out = {
             "id": str(uuid.uuid4()),
-            "trade_date": (index or flow or {}).get("trade_date"),
+            "trade_date": trade_date,
             "breadth_buy": None, "breadth_sell": None, "breadth_hold": None,
             "breadth_ratio": None, "regime_label": "neutral", "source": "market",
         }

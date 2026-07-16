@@ -9,7 +9,7 @@ def test_compose_bullish_when_all_positive():
     index = {"index_kospi": 2500.0, "index_kospi_chg_pct": 1.5,
              "index_kosdaq": 850.0, "index_kosdaq_chg_pct": 1.0}
     flow = {"foreign_net_amount": 500.0, "institution_net_amount": 300.0}
-    out = compute_market_regime(breadth, index, flow, threshold=0.1)
+    out = compute_market_regime(breadth, index, flow, "2026-07-16", threshold=0.1)
     assert out["market_sentiment_label"] == "bullish"
     assert out["sentiment_score"] > 0.1
     assert out["index_kospi_chg_pct"] == 1.5
@@ -26,7 +26,7 @@ def test_compose_bearish_when_all_negative():
     index = {"index_kospi": 2200.0, "index_kospi_chg_pct": -2.0,
              "index_kosdaq": 750.0, "index_kosdaq_chg_pct": -1.5}
     flow = {"foreign_net_amount": -400.0, "institution_net_amount": -200.0}
-    out = compute_market_regime(breadth, index, flow, threshold=0.1)
+    out = compute_market_regime(breadth, index, flow, "2026-07-16", threshold=0.1)
     assert out["market_sentiment_label"] == "bearish"
     assert out["sentiment_score"] < -0.1
 
@@ -35,7 +35,7 @@ def test_fallback_breadth_only_when_index_and_flow_none():
     breadth = {"id": "z", "trade_date": "2026-07-16", "breadth_buy": 100,
                "breadth_sell": 100, "breadth_hold": 100, "breadth_ratio": 0.0,
                "regime_label": "neutral", "source": "scanner"}
-    out = compute_market_regime(breadth, None, None, threshold=0.1)
+    out = compute_market_regime(breadth, None, None, "2026-07-16", threshold=0.1)
     assert out["market_sentiment_label"] == "neutral"
     assert out["index_kospi"] is None
     assert out["foreign_net_amount"] is None
@@ -43,7 +43,19 @@ def test_fallback_breadth_only_when_index_and_flow_none():
 
 
 def test_none_when_all_inputs_none():
-    assert compute_market_regime(None, None, None, threshold=0.1) is None
+    assert compute_market_regime(None, None, None, "2026-07-16", threshold=0.1) is None
+
+
+def test_no_breadth_still_gets_trade_date_from_arg():
+    """FIX 1: breadth=None 스켈레톤도 trade_date 인자를 정확히 반영해야 함
+    (index/flow dict는 trade_date 키를 갖지 않으므로 반드시 인자로 threading)."""
+    index = {"index_kospi": 2500.0, "index_kospi_chg_pct": 1.5,
+             "index_kosdaq": 850.0, "index_kosdaq_chg_pct": 1.0}
+    flow = {"foreign_net_amount": 500.0, "institution_net_amount": 300.0}
+    out = compute_market_regime(None, index, flow, "2026-07-16", 0.1)
+    assert out["trade_date"] == "2026-07-16"
+    assert out["index_kospi"] == 2500.0
+    assert out["foreign_net_amount"] == 500.0
 
 
 def test_index_only_no_flow_still_scores():
@@ -52,7 +64,7 @@ def test_index_only_no_flow_still_scores():
                "regime_label": "risk_on", "source": "scanner"}
     index = {"index_kospi": 2500.0, "index_kospi_chg_pct": 2.0,
              "index_kosdaq": 850.0, "index_kosdaq_chg_pct": 2.0}
-    out = compute_market_regime(breadth, index, None, threshold=0.1)
+    out = compute_market_regime(breadth, index, None, "2026-07-16", threshold=0.1)
     assert out["market_sentiment_label"] == "bullish"
     assert out["foreign_net_amount"] is None
 
