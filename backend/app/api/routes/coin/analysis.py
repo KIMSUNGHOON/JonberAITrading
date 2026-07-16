@@ -166,9 +166,12 @@ async def start_coin_analysis(
         )
         coin_sessions[session_id]["status"] = "error"
         coin_sessions[session_id]["error"] = f"session registry create failed: {e}"
+        # P1-5 review fix (Minor): static client-facing detail -- the raw
+        # exception stays server-side (logger.error above + the legacy-dict
+        # session["error"]).
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"session registry create failed: {e}",
+            detail="session registry unavailable — retry",
         )
 
     # Run analysis in background
@@ -195,17 +198,26 @@ async def _finalize_awaiting_transition(session_id: str, session: dict) -> None:
     fail closed: the session becomes ERROR in BOTH stores and no
     auto-approve is scheduled.
     """
+    # P1-5 review fix (Minor): the retry loop wraps ONLY the commit -- see
+    # the kr_stocks/analysis.py counterpart for the full rationale (a
+    # schedule-step exception must not be treated as a persistence failure
+    # and fail-close a session whose write-through actually succeeded).
     last_error: Optional[Exception] = None
     for _attempt in range(2):
         try:
             await commit_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
-            session["status"] = "awaiting_approval"
-            update_session_status(session_id, "awaiting_approval")
-            logger.info("coin_analysis_awaiting_approval", session_id=session_id)
-            await maybe_schedule_auto_approve(session_id, "coin", session)
-            return
+            last_error = None
+            break
         except Exception as e:  # noqa: BLE001 -- any SM failure fails closed below
             last_error = e
+
+    if last_error is None:
+        session["status"] = "awaiting_approval"
+        update_session_status(session_id, "awaiting_approval")
+        logger.info("coin_analysis_awaiting_approval", session_id=session_id)
+        # Outside the retry loop on purpose (see comment above).
+        await maybe_schedule_auto_approve(session_id, "coin", session)
+        return
 
     session["status"] = "error"
     session["error"] = f"awaiting transition write-through failed: {last_error}"

@@ -206,9 +206,13 @@ async def start_kr_stock_analysis(
         )
         kr_stock_sessions[session_id]["status"] = "error"
         kr_stock_sessions[session_id]["error"] = f"session registry create failed: {e}"
+        # P1-5 review fix (Minor): the client-facing detail is a static
+        # message -- the raw exception (potentially containing internal
+        # details like a db path or driver error) stays server-side, in the
+        # logger.error call above and the legacy-dict session["error"].
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"session registry create failed: {e}",
+            detail="session registry unavailable — retry",
         )
 
     # Run analysis in background
@@ -235,16 +239,32 @@ async def _finalize_awaiting_transition(session_id: str, session: dict) -> None:
     graph nobody can see or approve). One retry, then fail closed: the session
     becomes ERROR in BOTH stores and no auto-approve is scheduled.
     """
+    # P1-5 review fix (Minor): the retry loop wraps ONLY the commit -- a bug
+    # or exception inside maybe_schedule_auto_approve must not be treated as
+    # a persistence failure. Pre-fix, a schedule-step exception was caught by
+    # this same except and fed into the fail-closed branch below, which would
+    # (a) retry an already-successful commit for no reason and (b) mark this
+    # session ERROR and overwrite its correctly-committed SM AWAITING_APPROVAL
+    # with ERROR, even though the write-through itself never failed.
     last_error: Optional[Exception] = None
     for _attempt in range(2):
         try:
             await commit_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
-            session["status"] = "awaiting_approval"
-            logger.info("kr_stock_analysis_awaiting_approval", session_id=session_id)
-            await maybe_schedule_auto_approve(session_id, "kiwoom", session)
-            return
+            last_error = None
+            break
         except Exception as e:  # noqa: BLE001 -- any SM failure fails closed below
             last_error = e
+
+    if last_error is None:
+        session["status"] = "awaiting_approval"
+        logger.info("kr_stock_analysis_awaiting_approval", session_id=session_id)
+        # Outside the retry loop on purpose (see comment above) -- any
+        # exception here propagates to the caller unchanged (pre-P1-5
+        # behavior: run_kr_stock_analysis_task's own outer except marks the
+        # session error, same end state, without corrupting the SM status
+        # this function just correctly committed).
+        await maybe_schedule_auto_approve(session_id, "kiwoom", session)
+        return
 
     session["status"] = "error"
     session["error"] = f"awaiting transition write-through failed: {last_error}"

@@ -7,6 +7,7 @@ Endpoints for human-in-the-loop trade approval workflow.
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Optional
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
@@ -273,7 +274,51 @@ async def _submit_decision_locked(
         state_keys=list(state.keys()),
     )
 
-    # Update state with approval decision
+    # P1-5 review fix (Important A): commit-first ordering. The decision is
+    # committed to the SM (C) BEFORE any of it is applied to local state (B)
+    # -- previously B was mutated first, so a failed commit left the session
+    # wedged: state["awaiting_approval"] already False (B says decided) while
+    # the SM still showed AWAITING_APPROVAL (C never heard), and a retry of
+    # the same decision immediately hit the "not awaiting approval" 400 (or
+    # the zombie-cancel branch for decision='cancelled') instead of being
+    # cleanly retryable. Modifications are computed against a COPY of the
+    # proposal here so state["trade_proposal"] is only mutated in place once
+    # the commit has actually landed.
+    updated_proposal = None
+    if decision == "modified" and state.get("trade_proposal"):
+        updated_proposal = dict(state["trade_proposal"])
+        if modifications:
+            for key, value in modifications.items():
+                if key in updated_proposal:
+                    updated_proposal[key] = value
+
+    decision_updates = {
+        "approval_status": decision,
+        "user_feedback": feedback,
+        "awaiting_approval": False,
+        "approval_actor": actor,
+        "auto_approve_at": None,
+    }
+    if updated_proposal is not None:
+        decision_updates["trade_proposal"] = updated_proposal
+
+    try:
+        await commit_session_state(session_id, decision_updates)
+    except Exception as e:
+        logger.critical(
+            "approval_decision_writethrough_failed",
+            session_id=session_id,
+            decision=decision,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="approval state could not be persisted — retry",
+        )
+
+    # The SM write succeeded -- now apply the decision to local state (B), so
+    # B and C move together instead of B racing ahead of a commit that could
+    # still fail.
     state["approval_status"] = decision
     state["user_feedback"] = feedback
     state["awaiting_approval"] = False
@@ -294,34 +339,6 @@ async def _submit_decision_locked(
                         field=key,
                         value=value,
                     )
-
-    # Mirror the decision into the SessionManager. P1-5: write-through -- the
-    # decision MUST land in the SM before the graph resumes below (which may
-    # place a real broker order). A swallowed failure here would leave the SM
-    # stuck AWAITING_APPROVAL forever with no persisted record the decision
-    # was ever made, so this fails loud instead of proceeding blind.
-    decision_updates = {
-        "approval_status": decision,
-        "user_feedback": feedback,
-        "awaiting_approval": False,
-        "approval_actor": actor,
-        "auto_approve_at": None,
-    }
-    if decision == "modified" and state.get("trade_proposal"):
-        decision_updates["trade_proposal"] = state["trade_proposal"]
-    try:
-        await commit_session_state(session_id, decision_updates)
-    except Exception as e:
-        logger.critical(
-            "approval_decision_writethrough_failed",
-            session_id=session_id,
-            decision=decision,
-            error=str(e),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="approval state could not be persisted — retry",
-        )
 
     # Resume graph execution - select appropriate graph based on session type
     if session_id in kr_stock_sessions:
@@ -448,9 +465,41 @@ async def _submit_decision_locked(
                 # 경로와 동일하게 정합시키고 injector를 재암한다 (B3; 기존
                 # 제안 ID 피닝이 이중 승인을 방지). 게이트 deny/hitl이면
                 # maybe_schedule_auto_approve가 아무것도 쓰지 않는다(plain HITL).
+                #
+                # P1-5 review fix (Important B): mirrors _finalize_awaiting_
+                # transition's commit-first ordering (kr_stocks/coin
+                # analysis.py) -- commit_session_status(AWAITING_APPROVAL)
+                # must land (1 retry) BEFORE session["status"] is set and
+                # BEFORE any schedule call. The pre-fix code scheduled the
+                # 60s auto-approve timer unconditionally, ahead of the
+                # shared final-status commit far below -- if THAT commit
+                # then failed, the timer was already armed against an SM row
+                # that never learned about this transition: a live violation
+                # of the core invariant ("SM 기록 실패 시 schedule 절대
+                # 금지"), since a brief SM recovery could let the timer fire
+                # an autonomous order for a transition nobody could see.
+                market = "kiwoom" if session_id in kr_stock_sessions else "coin"
+                last_error: Optional[Exception] = None
+                for _attempt in range(2):
+                    try:
+                        await commit_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
+                        last_error = None
+                        break
+                    except Exception as e:
+                        last_error = e
+                if last_error is not None:
+                    logger.critical(
+                        "approval_rearm_writethrough_failed",
+                        session_id=session_id,
+                        error=str(last_error),
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="approval state could not be persisted — retry",
+                    )
+
                 session["status"] = "awaiting_approval"
                 execution_status = "awaiting_approval"
-                market = "kiwoom" if session_id in kr_stock_sessions else "coin"
                 await maybe_schedule_auto_approve(session_id, market, session)
             else:
                 session["status"] = "running"
