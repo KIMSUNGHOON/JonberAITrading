@@ -25,6 +25,7 @@ from app.core.analysis_limiter import (
     get_active_analysis_count,
     release_analysis_slot,
 )
+from app.config import get_settings
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from services.session_manager import (
@@ -337,17 +338,26 @@ async def get_kr_stock_analysis_status(session_id: str):
     Returns:
         Full status including market data and trade proposal
     """
-    session = kr_stock_sessions.get(session_id)
-    if session is None:
-        # Legacy dict miss: `kr_stock_sessions` is a plain in-process dict —
-        # every restart wipes it. Sessions that were running/awaiting_approval
-        # at shutdown are reloaded into the SessionManager at startup (see
-        # SessionManager._load_active_sessions) and may since have completed
-        # via the resume/approval flow; fall back to its persisted copy so
-        # this session's analyses/trade_proposal are still servable instead
-        # of a bare 404.
+    # P1-3 (session-SSOT): the SessionManager is the ONLY read source when
+    # SESSION_SSOT_READS is on (default). The legacy-first + SM-fallback path
+    # survives solely as the kill-switch fallback until P2 removes legacy
+    # writes entirely — see app/api/routes/approval.py and websocket.py for
+    # the same switch.
+    if get_settings().SESSION_SSOT_READS:
         session_manager = await get_session_manager()
         session = await session_manager.get_session_dict(session_id)
+    else:
+        session = kr_stock_sessions.get(session_id)
+        if session is None:
+            # Legacy dict miss: `kr_stock_sessions` is a plain in-process dict —
+            # every restart wipes it. Sessions that were running/awaiting_approval
+            # at shutdown are reloaded into the SessionManager at startup (see
+            # SessionManager._load_active_sessions) and may since have completed
+            # via the resume/approval flow; fall back to its persisted copy so
+            # this session's analyses/trade_proposal are still servable instead
+            # of a bare 404.
+            session_manager = await get_session_manager()
+            session = await session_manager.get_session_dict(session_id)
     if session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

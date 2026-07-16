@@ -20,6 +20,7 @@ from app.api.schemas.coin import (
     CoinAnalysisSummary,
     CoinTradeProposalResponse,
 )
+from app.config import get_settings
 from app.core.analysis_limiter import (
     acquire_analysis_slot,
     register_session,
@@ -308,7 +309,23 @@ async def get_coin_analysis_status(session_id: str):
     Returns:
         Full status including market data and trade proposal
     """
-    session = get_coin_session(session_id)
+    # P1-3 (session-SSOT): the SessionManager is the ONLY read source when
+    # SESSION_SSOT_READS is on (default) — this is coin's first restart-tolerant
+    # read path (previously `get_coin_session` read the legacy in-process dict
+    # alone, so a session that survived a restart into the SM would 404 here).
+    # The legacy-only path survives solely as the kill-switch fallback until
+    # P2 removes legacy writes entirely — see app/api/routes/approval.py and
+    # websocket.py for the same switch.
+    if get_settings().SESSION_SSOT_READS:
+        session_manager = await get_session_manager()
+        session = await session_manager.get_session_dict(session_id)
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Coin session {session_id} not found",
+            )
+    else:
+        session = get_coin_session(session_id)
     state = session["state"]
 
     # Build trade proposal response
