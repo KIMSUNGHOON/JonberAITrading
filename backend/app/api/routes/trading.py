@@ -1298,14 +1298,23 @@ class OperationsAwaiting(BaseModel):
     # AnalysisSession.state was a separate copy of a legacy in-memory dict
     # that could silently fail to mirror a cancel -- that legacy dict is gone
     # (P3-1), so cross-store divergence can no longer happen. The guard still
-    # earns its keep: kr_stocks/analysis.py and coin/analysis.py's cancel
-    # routes each issue TWO separate SessionManager calls (update_status then
-    # update_state) inside a bounded retry that does not roll back a
-    # successful status write if the follow-up state write keeps failing, so
-    # status==AWAITING_APPROVAL can persist while state["awaiting_approval"]
-    # is already False. Same-store, not cross-store -- but a single
-    # source (status alone) would still miss it. Keep computing this from
-    # state.
+    # earns its keep: approval.py's _submit_decision_locked splits one
+    # decision into two independent write-through SessionManager calls with
+    # the full graph resume running between them -- an early
+    # commit_session_state(...) (~L335) that lands state["awaiting_approval"]
+    # =False as part of decision_updates, and a later, separate
+    # commit_session_status(...) that lands the terminal/rearm status
+    # (~L564 for approved/modified/cancelled; ~L508 for reject's rearm back
+    # to AWAITING_APPROVAL). approval.py's own comment at ~L558-562 spells
+    # out the resulting risk: if that later status commit fails, the sm row
+    # is left showing a stale AWAITING_APPROVAL status for a session whose
+    # state has already moved on -- exactly status==AWAITING_APPROVAL +
+    # state["awaiting_approval"]==False. This split-commit failure mode is
+    # exercised by
+    # tests/test_api/test_awaiting_writethrough.py::test_approval_rejected_rearm_failed_commit_never_schedules
+    # (commit_session_state succeeds, commit_session_status fails). Same
+    # store, not cross-store -- but a single source (status alone) would
+    # still miss it. Keep computing this from state.
     actionable: bool = True
 
 
