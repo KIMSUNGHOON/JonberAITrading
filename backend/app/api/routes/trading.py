@@ -1290,9 +1290,22 @@ class OperationsAwaiting(BaseModel):
     proposal: Optional[Dict[str, Any]] = None  # session.state["trade_proposal"] 원본
     auto_approve_at: Optional[str] = None
     # Zombie-resurrection guard: a sm row can be stuck at status=AWAITING_APPROVAL
-    # while its state["awaiting_approval"] was already cleared (e.g. a cancel whose
-    # sm mirror failed) — surface that mismatch so the board can't offer a doomed
-    # approve/reject on an unapprovable session.
+    # while its state["awaiting_approval"] was already cleared -- surface that
+    # mismatch so the board can't offer a doomed approve/reject on an
+    # unapprovable session.
+    #
+    # P3-3 (session-SSOT) audit: originally written (ed56505) when the sm's
+    # AnalysisSession.state was a separate copy of a legacy in-memory dict
+    # that could silently fail to mirror a cancel -- that legacy dict is gone
+    # (P3-1), so cross-store divergence can no longer happen. The guard still
+    # earns its keep: kr_stocks/analysis.py and coin/analysis.py's cancel
+    # routes each issue TWO separate SessionManager calls (update_status then
+    # update_state) inside a bounded retry that does not roll back a
+    # successful status write if the follow-up state write keeps failing, so
+    # status==AWAITING_APPROVAL can persist while state["awaiting_approval"]
+    # is already False. Same-store, not cross-store -- but a single
+    # source (status alone) would still miss it. Keep computing this from
+    # state.
     actionable: bool = True
 
 

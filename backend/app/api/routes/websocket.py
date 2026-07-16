@@ -642,11 +642,26 @@ class _SessionFrameCursor:
         # proposal is now a dict after serialization fix
         #
         # Gated on current_status too (not just state.awaiting_approval): a
-        # restart-stranded session can be reconciled back to a terminal/
-        # running legacy status while its state dict still carries a stale
+        # restart-stranded session can be reconciled back to a terminal or
+        # running status while its state dict still carries a stale
         # awaiting_approval=True + trade_proposal from before the crash. A
         # reconnecting tab must not be told to approve a proposal that is no
         # longer actually pending.
+        #
+        # P3-3 (session-SSOT) audit: this AND was never a legacy-dict(B)-vs-
+        # SessionManager(C) divergence guard (P3-1 deleted B; that class of
+        # bug is gone), so it did not become dead weight when B was removed.
+        # It guards a same-store gap inside SessionManager itself:
+        # reconcile_stranded_sessions() (services/session_manager.py) does
+        # NOT clear state["awaiting_approval"] on every terminal transition
+        # it applies at startup -- the RUNNING+awaiting+prop branch that
+        # flips to ERROR on a stale/unparked proposal, and the
+        # AWAITING_APPROVAL branch that flips to CANCELLED off a recorded
+        # approval_status=="cancelled", both leave the flag (and
+        # trade_proposal) untouched while `status` moves to a terminal
+        # value. Collapsing this to state.awaiting_approval alone would
+        # re-advertise that stale proposal to a reconnecting tab. Keep both
+        # conditions.
         if (
             state.get("trade_proposal")
             and state.get("awaiting_approval")
