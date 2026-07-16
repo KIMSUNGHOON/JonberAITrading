@@ -33,19 +33,24 @@ from services.agent_chat.models import (
 
 @pytest.fixture
 def mock_coordinator():
-    """Create a mock ChatCoordinator."""
+    """Create a mock ChatCoordinator.
+
+    P4-4 (session-ssot): get_session_history/get_session_by_id/
+    count_total_sessions are async now (SM + ledger merge) -- AsyncMock, not
+    the retired in-memory _session_history list.
+    """
     coordinator = MagicMock()
     coordinator._running = False
     coordinator._active_rooms = {}
-    coordinator._session_history = []
     coordinator.check_interval = 5
     coordinator.max_concurrent = 3
     coordinator.position_manager = None
     coordinator.start = AsyncMock()
     coordinator.stop = AsyncMock()
     coordinator.get_active_discussions = MagicMock(return_value=[])
-    coordinator.get_session_history = MagicMock(return_value=[])
-    coordinator.get_session_by_id = MagicMock(return_value=None)
+    coordinator.get_session_history = AsyncMock(return_value=[])
+    coordinator.get_session_by_id = AsyncMock(return_value=None)
+    coordinator.count_total_sessions = AsyncMock(return_value=0)
     coordinator.start_manual_discussion = AsyncMock()
     return coordinator
 
@@ -133,7 +138,10 @@ class TestCoordinatorStatusEndpoint:
         """Test getting coordinator status when running."""
         mock_coordinator._running = True
         mock_coordinator._active_rooms = {"005930": MagicMock()}
-        mock_coordinator._session_history = [MagicMock(), MagicMock()]
+        # P4-4 (session-ssot): total_sessions is now the durable ledger
+        # count (async coordinator.count_total_sessions()), not the retired
+        # in-memory _session_history's len().
+        mock_coordinator.count_total_sessions = AsyncMock(return_value=2)
 
         with patch('app.api.routes.agent_chat.get_chat_coordinator') as mock_get:
             mock_get.return_value = mock_coordinator
@@ -375,8 +383,27 @@ class TestSessionHistoryEndpoints:
 
     @pytest.mark.asyncio
     async def test_get_sessions_with_data(self, mock_coordinator, mock_session):
-        """Test getting sessions with data."""
-        mock_coordinator.get_session_history.return_value = [mock_session]
+        """Test getting sessions with data.
+
+        P4-4 (session-ssot): the coordinator's get_session_history now
+        returns pre-built summary dicts (merged SM + ledger), not
+        ChatSession objects -- the route forwards them as-is.
+        """
+        mock_coordinator.get_session_history.return_value = [
+            {
+                "id": mock_session.id,
+                "ticker": mock_session.ticker,
+                "stock_name": mock_session.stock_name,
+                "status": mock_session.status.value,
+                "started_at": mock_session.started_at.isoformat(),
+                "ended_at": mock_session.ended_at.isoformat(),
+                "total_messages": 0,
+                "total_rounds": 0,
+                "consensus_level": mock_session.consensus_level,
+                "decision_action": mock_session.decision.action.value,
+                "decision_confidence": mock_session.decision.confidence,
+            }
+        ]
 
         with patch('app.api.routes.agent_chat.get_chat_coordinator') as mock_get:
             mock_get.return_value = mock_coordinator

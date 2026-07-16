@@ -27,6 +27,7 @@ from services.agent_chat.models import (
     AgentVote,
     ChatSession,
     DecisionAction,
+    MarketContext,
     MessageType,
     SessionStatus,
     TradeDecision,
@@ -39,7 +40,11 @@ class FakeRoom:
 
     instances: list = []
 
-    def __init__(self, ticker: str, stock_name: str, context=None):
+    def __init__(self, ticker: str, stock_name: str, context=None, agent_weights=None):
+        # Pre-existing bug fix (unrelated to P4-4, verified via `git stash`
+        # against HEAD 5551cf8 -- ChatRoom.__init__ gained `agent_weights` in
+        # an earlier, unrelated Phase4 calibration feature; this double was
+        # never updated to accept it, so any real call site TypeErrors here).
         self.ticker = ticker
         self.stock_name = stock_name
         self.session = ChatSession(ticker=ticker, stock_name=stock_name)
@@ -58,6 +63,11 @@ class FakeRoom:
     async def start(self):
         await self.release.wait()
         self.session.status = SessionStatus.DECIDED
+        # P4-4: get_session_by_id now reads through SM's mirrored
+        # chat_snapshot -- fire the status callback (as the real ChatRoom
+        # does on every transition) so the SM row this test's coordinator
+        # registered doesn't stay stuck at its initial snapshot.
+        await self.emit_status(SessionStatus.DECIDED)
         return self.session
 
     async def emit_message(self, message):
@@ -82,7 +92,15 @@ def coordinator(monkeypatch):
     coord = ChatCoordinator()
 
     async def fake_ctx(ticker, stock_name):
-        return None
+        # Pre-existing bug fix (unrelated to P4-4, verified via `git stash`
+        # against HEAD 5551cf8 -- this fixture returning None already
+        # AttributeError'd on `context.is_stale` in start_manual_discussion's
+        # CRITICAL safety check, added 2026-07-14, well before this task):
+        # a real (non-stale) MarketContext is what a successful fetch
+        # actually returns.
+        return MarketContext(
+            ticker=ticker, stock_name=stock_name, current_price=72500.0, price_change_pct=0.5,
+        )
 
     monkeypatch.setattr(coord, "_fetch_market_context", fake_ctx)
     monkeypatch.setattr(coordinator_module, "ChatRoom", FakeRoom)
@@ -118,8 +136,8 @@ async def test_manual_discussion_returns_before_completion(coordinator):
     room_gate = asyncio.Event()
 
     class SlowFakeRoom(FakeRoom):
-        def __init__(self, ticker, stock_name, context=None):
-            super().__init__(ticker, stock_name, context)
+        def __init__(self, ticker, stock_name, context=None, agent_weights=None):
+            super().__init__(ticker, stock_name, context, agent_weights)
             self.release = room_gate  # don't finish until the test says so
 
     import services.agent_chat.coordinator as cm
@@ -136,7 +154,13 @@ async def test_manual_discussion_returns_before_completion(coordinator):
 
     room_gate.set()
     await _wait_until(lambda: "005930" not in coordinator._active_rooms)
-    assert coordinator._session_history and coordinator._session_history[-1] is session
+    # P4-4: _session_history is retired -- get_session_by_id now reads
+    # through SM's mirrored chat_snapshot (identity is not preserved once
+    # the room leaves _active_rooms, so compare by id/status instead of `is`).
+    found = await coordinator.get_session_by_id(session.id)
+    assert found is not None
+    assert found.id == session.id
+    assert found.status == SessionStatus.DECIDED
 
 
 async def test_manual_discussion_never_executes_decision(coordinator):
@@ -158,6 +182,7 @@ async def test_manual_discussion_never_executes_decision(coordinator):
                 rationale="테스트",
             )
             self.session.status = SessionStatus.DECIDED
+            await self.emit_status(SessionStatus.DECIDED)
             return self.session
 
     import services.agent_chat.coordinator as cm
@@ -247,13 +272,17 @@ class DecidingFakeRoom(FakeRoom):
             rationale="손절 근접",
         )
         self.session.status = SessionStatus.DECIDED
+        await self.emit_status(SessionStatus.DECIDED)
         return self.session
 
 
 class FailingFakeRoom(FakeRoom):
     async def start(self):
-        # Mirrors ChatRoom.start: sets CANCELLED, then re-raises.
+        # Mirrors ChatRoom.start: sets CANCELLED, fires the status callback
+        # (so SM's mirrored chat_snapshot reflects it -- P4-4's
+        # get_session_by_id reads through SM), then re-raises.
         self.session.status = SessionStatus.CANCELLED
+        await self.emit_status(SessionStatus.CANCELLED)
         raise RuntimeError("discussion blew up")
 
 
@@ -268,7 +297,12 @@ async def test_wait_true_blocks_until_decided(coordinator):
     assert session.status == SessionStatus.DECIDED
     assert session.decision is not None
     assert "005930" not in coordinator._active_rooms
-    assert coordinator._session_history[-1] is session
+    # P4-4: _session_history is retired -- confirm the session became
+    # queryable through the new SM/ledger-backed read path instead.
+    found = await coordinator.get_session_by_id(session.id)
+    assert found is not None
+    assert found.id == session.id
+    assert found.status == SessionStatus.DECIDED
 
 
 async def test_wait_true_propagates_failure(coordinator):
@@ -330,7 +364,7 @@ async def test_failed_async_discussion_recorded_as_cancelled(coordinator):
     session = await coordinator.start_manual_discussion("005930", "삼성전자")
     await _wait_until(lambda: "005930" not in coordinator._active_rooms)
 
-    stored = coordinator.get_session_by_id(session.id)
+    stored = await coordinator.get_session_by_id(session.id)
     assert stored is not None, "failed session must remain queryable (was a 404 dangle)"
     assert stored.status == SessionStatus.CANCELLED
 
@@ -459,7 +493,7 @@ async def test_ws_endpoint_sends_snapshot_on_connect(monkeypatch):
     session.status = SessionStatus.DISCUSSING
 
     class FakeCoordinator:
-        def get_session_by_id(self, session_id):
+        async def get_session_by_id(self, session_id):
             return session if session_id == session.id else None
 
     async def fake_get_coordinator():

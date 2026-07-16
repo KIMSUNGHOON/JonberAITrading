@@ -120,23 +120,6 @@ class StartCoordinatorRequest(BaseModel):
 _AGENT_WEIGHTS = {t.value: w for t, w in DEFAULT_AGENT_WEIGHTS.items()} | {"moderator": 0.0}
 
 
-def _session_to_summary(session: ChatSession) -> dict:
-    """Convert session to summary dict."""
-    return {
-        "id": session.id,
-        "ticker": session.ticker,
-        "stock_name": session.stock_name,
-        "status": session.status.value,
-        "started_at": session.started_at.isoformat() if session.started_at else None,
-        "ended_at": session.ended_at.isoformat() if session.ended_at else None,
-        "total_messages": len(session.all_messages),
-        "total_rounds": len(session.rounds),
-        "consensus_level": session.consensus_level,
-        "decision_action": session.decision.action.value if session.decision else None,
-        "decision_confidence": session.decision.confidence if session.decision else None,
-    }
-
-
 def _session_to_detail(session: ChatSession) -> dict:
     """Convert session to detailed dict."""
     return {
@@ -248,7 +231,9 @@ async def get_coordinator_status():
     return CoordinatorStatusResponse(
         is_running=coordinator._running,
         active_discussions=len(coordinator._active_rooms),
-        total_sessions=len(coordinator._session_history),
+        # P4-4 (session-ssot): the durable ledger count, not the retired
+        # in-memory _session_history's len().
+        total_sessions=await coordinator.count_total_sessions(),
         check_interval_minutes=coordinator.check_interval,
         max_concurrent_discussions=coordinator.max_concurrent,
         last_check_at=last_check_at,
@@ -396,10 +381,13 @@ async def get_sessions(
         List of session summaries
     """
     coordinator = await get_chat_coordinator()
-    sessions = coordinator.get_session_history(limit=limit, ticker=ticker)
+    # P4-4 (session-ssot): the coordinator now returns pre-built summary
+    # dicts (merged SM + ledger) -- a ledger-only row has no full ChatSession
+    # to build one from without parsing its transcript JSON per list row.
+    sessions = await coordinator.get_session_history(limit=limit, ticker=ticker)
 
     return {
-        "sessions": [_session_to_summary(s) for s in sessions],
+        "sessions": sessions,
         "count": len(sessions),
     }
 
@@ -412,7 +400,7 @@ async def get_session_detail(session_id: str):
     Includes all messages, votes, and decision details.
     """
     coordinator = await get_chat_coordinator()
-    session = coordinator.get_session_by_id(session_id)
+    session = await coordinator.get_session_by_id(session_id)
 
     if not session:
         raise HTTPException(
@@ -431,7 +419,7 @@ async def get_session_messages(session_id: str):
     Returns messages in chronological order.
     """
     coordinator = await get_chat_coordinator()
-    session = coordinator.get_session_by_id(session_id)
+    session = await coordinator.get_session_by_id(session_id)
 
     if not session:
         raise HTTPException(
@@ -453,7 +441,7 @@ async def get_session_decision(session_id: str):
     Returns decision details including rationale and key factors.
     """
     coordinator = await get_chat_coordinator()
-    session = coordinator.get_session_by_id(session_id)
+    session = await coordinator.get_session_by_id(session_id)
 
     if not session:
         raise HTTPException(
@@ -605,7 +593,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # the socket is connected).
         try:
             coordinator = await get_chat_coordinator()
-            session = coordinator.get_session_by_id(session_id)
+            session = await coordinator.get_session_by_id(session_id)
             if session is not None:
                 await websocket.send_json({
                     "type": "status_change",

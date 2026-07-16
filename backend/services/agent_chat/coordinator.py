@@ -6,7 +6,8 @@ Handles watch list monitoring, opportunity detection, and trade execution.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+import json
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable
 
 import structlog
@@ -27,6 +28,7 @@ from services.session_manager import (
     SessionStatus as SmSessionStatus,
     get_session_manager,
 )
+from services.storage_service import get_storage_service
 from services.trading.models import ActivityType
 
 # -------------------------------------------
@@ -178,6 +180,117 @@ async def _register_sm_discussion(room: "ChatRoom") -> None:
 
 
 # -------------------------------------------
+# Session-history read merge (P4-4, session-ssot Phase P4)
+# -------------------------------------------
+# get_session_history/get_session_by_id used to read exclusively from the
+# coordinator's in-memory `_session_history` list (capped at 100, evaporates
+# on restart). That list is retired -- both methods now read through the
+# same two durable/live sources P4-2/P4-3 already write:
+#   - SessionManager (SM, kind="discussion"): running discussions plus any
+#     terminal one not yet past SM's TTL/restart-reload window (see
+#     services/session_manager.py's COMPLETED_SESSION_TTL and
+#     _load_active_sessions -- only RUNNING/AWAITING_APPROVAL rows survive a
+#     restart, so SM alone is never a durable history source on its own).
+#   - The agent_chat_decisions/agent_chat_transcripts ledger (decision_log.
+#     persist_session, P4-3): permanent, survives restart, but only ever
+#     gains a row once a discussion actually finishes.
+# When both sources have a row for the same session id (the window right
+# after a discussion finalizes, before SM's TTL evicts it), the SM row wins
+# -- it is the fresher of the two (chat_snapshot is mirrored on every
+# message/status event; the ledger row is written once, at finalize).
+
+
+def _naive_utc(dt: Optional[datetime]) -> datetime:
+    """Normalize a (possibly tz-aware) datetime to naive-UTC for cross-source
+    sort-key comparison -- SM's AnalysisSession.created_at is tz-aware (UTC),
+    while ChatSession's own started_at/created_at (datetime.now() default
+    factory) and the ledger's parsed SQLite CURRENT_TIMESTAMP are naive.
+    `None` sorts as the oldest possible value rather than raising."""
+    if dt is None:
+        return datetime.min
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _parse_ledger_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Best-effort parse of a ledger row's `created_at` (SQLite
+    CURRENT_TIMESTAMP text, e.g. "2026-07-16 09:00:00"). Returns None on any
+    unparseable/missing value rather than raising -- a summary row with an
+    unparseable timestamp still renders, it just sorts as oldest."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+# SM RUNNING/COMPLETED/CANCELLED -> agent-chat vocabulary fallback, used only
+# when a discussion's SM row is missing state["sub_status"] (an SM row
+# written before this mirror existed, or reconcile_stranded_sessions flipping
+# a restart-orphaned RUNNING discussion straight to ERROR without touching
+# state -- ERROR/AWAITING_APPROVAL have no discussion-native equivalent, so
+# both fall back conservatively rather than inventing a new FE vocab word).
+_SM_STATUS_TO_AGENT_CHAT_VOCAB: Dict[SmSessionStatus, str] = {
+    SmSessionStatus.RUNNING: "discussing",
+    SmSessionStatus.AWAITING_APPROVAL: "discussing",
+    SmSessionStatus.COMPLETED: "decided",
+    SmSessionStatus.CANCELLED: "cancelled",
+    SmSessionStatus.ERROR: "cancelled",
+}
+
+
+def _summary_from_chat_session(session: ChatSession, sub_status: Optional[str]) -> dict:
+    """The exact shape app/api/routes/agent_chat.py's `_session_to_summary`
+    (pre-P4-4) built from a live ChatSession -- reproduced here since this is
+    now the coordinator's own return contract (a ledger-only row has no full
+    ChatSession to build one from without parsing its transcript JSON per
+    list row -- see module docstring above). `sub_status` (when given) is
+    SM's own agent-chat-vocabulary status field -- preferred over
+    `session.status` itself per the brief (both are normally identical,
+    mirrored together in the same write, but sub_status is the one source of
+    truth this reader trusts)."""
+    return {
+        "id": session.id,
+        "ticker": session.ticker,
+        "stock_name": session.stock_name,
+        "status": sub_status or session.status.value,
+        "started_at": session.started_at.isoformat() if session.started_at else None,
+        "ended_at": session.ended_at.isoformat() if session.ended_at else None,
+        "total_messages": len(session.all_messages),
+        "total_rounds": len(session.rounds),
+        "consensus_level": session.consensus_level,
+        "decision_action": session.decision.action.value if session.decision else None,
+        "decision_confidence": session.decision.confidence if session.decision else None,
+    }
+
+
+def _summary_from_ledger_row(row: dict) -> dict:
+    """Same shape from an agent_chat_decisions row. `started_at` is not a
+    ledger column (only `trade_date`/`created_at` are), so it is always None
+    here; `ended_at` falls back to the row's own `created_at` (persist_session
+    writes it synchronously right after the session ends, so it is a close
+    proxy). Pre-P4-3 rows have NULL total_messages/total_rounds -> 0 fallback
+    (NULL-safety requirement)."""
+    created_at = row.get("created_at")
+    parsed = _parse_ledger_timestamp(created_at)
+    return {
+        "id": row.get("id"),
+        "ticker": row.get("ticker"),
+        "stock_name": row.get("stock_name"),
+        "status": row.get("status"),
+        "started_at": None,
+        "ended_at": parsed.isoformat() if parsed else created_at,
+        "total_messages": row.get("total_messages") or 0,
+        "total_rounds": row.get("total_rounds") or 0,
+        "consensus_level": row.get("consensus_level"),
+        "decision_action": row.get("action"),
+        "decision_confidence": row.get("confidence"),
+    }
+
+
+# -------------------------------------------
 # Trade-outcome discriminator (P2 review gap, 2026-07-14)
 # -------------------------------------------
 
@@ -276,8 +389,10 @@ class ChatCoordinator:
         # Active chat rooms
         self._active_rooms: Dict[str, ChatRoom] = {}  # ticker -> room
 
-        # Session history
-        self._session_history: List[ChatSession] = []
+        # P4-4 (session-ssot): the in-memory `_session_history` list was
+        # retired -- get_session_history/get_session_by_id now read through
+        # SM (kind="discussion") + the durable ledger instead (see the
+        # module-level "Session-history read merge" section above).
         self._last_discussion: Dict[str, datetime] = {}  # ticker -> last discussion time
 
         # Scheduler for periodic checks
@@ -581,11 +696,9 @@ class ChatCoordinator:
             # Record last discussion time
             self._last_discussion[ticker] = datetime.now()
 
-            # Store in history
-            self._session_history.append(session)
+            # P4-4 (session-ssot): durable persistence only -- the in-memory
+            # history list is retired (see module docstring above).
             await persist_session(session)
-            if len(self._session_history) > 100:  # Keep last 100
-                self._session_history = self._session_history[-100:]
 
             # Handle decision
             if session.decision:
@@ -1152,7 +1265,6 @@ class ChatCoordinator:
             # failures).
             try:
                 session = await room.start()
-                self._session_history.append(session)
                 await persist_session(session)
                 self._last_discussion[ticker] = datetime.now()
                 return session
@@ -1174,7 +1286,6 @@ class ChatCoordinator:
         try:
             session = await room.start()
 
-            self._session_history.append(session)
             await persist_session(session)
             self._last_discussion[ticker] = datetime.now()
 
@@ -1184,10 +1295,10 @@ class ChatCoordinator:
                 ticker=ticker,
                 error=str(e),
             )
-            # The session id was already handed out by /discuss — keep the
-            # (CANCELLED) session queryable instead of letting the id dangle
-            # as a permanent 404.
-            self._session_history.append(room.session)
+            # The session id was already handed out by /discuss — persisting
+            # it here (P4-4: the ledger, not the retired in-memory history,
+            # is what makes it queryable) keeps the (CANCELLED) session from
+            # dangling as a permanent 404.
             await persist_session(room.session)
         finally:
             self._active_rooms.pop(ticker, None)
@@ -1205,31 +1316,136 @@ class ChatCoordinator:
             for ticker, room in self._active_rooms.items()
         ]
 
-    def get_session_history(
+    async def get_session_history(
         self,
         limit: int = 20,
         ticker: Optional[str] = None,
-    ) -> List[ChatSession]:
-        """Get session history."""
-        sessions = self._session_history
+    ) -> List[dict]:
+        """Session history: SM (kind="discussion") merged with the durable
+        ledger, deduped by id (SM wins -- see the module-level "Session-
+        history read merge" section above), sorted ascending by start/
+        created time and truncated to the most recent `limit` -- the exact
+        `[-limit:]` semantics the retired `_session_history` list had,
+        applied to the merged pool instead of an in-memory list. Returns a
+        list of summary dicts (the shape app/api/routes/agent_chat.py's
+        `_session_to_summary` used to build from a ChatSession) rather than
+        ChatSession objects: a ledger-only row has no full ChatSession to
+        build one from without parsing its transcript JSON per list row.
+        Failure-harmless per source: an SM or ledger outage degrades to
+        whatever the other source has, never a raise (routes never 500)."""
+        summaries: Dict[str, dict] = {}
+        sort_keys: Dict[str, datetime] = {}
+        sm_discussion_count = 0
 
-        if ticker:
-            sessions = [s for s in sessions if s.ticker == ticker]
+        try:
+            sm = await get_session_manager()
+            sm_sessions = await sm.get_all_sessions(kind="discussion")
+            sm_discussion_count = len(sm_sessions)
+            for sm_session in sm_sessions.values():
+                if ticker and sm_session.ticker != ticker:
+                    continue
+                snapshot = (sm_session.state or {}).get("chat_snapshot")
+                if not snapshot:
+                    continue
+                try:
+                    chat_session = ChatSession.model_validate(snapshot)
+                except Exception as e:
+                    logger.warning(
+                        "session_history_sm_snapshot_invalid",
+                        session_id=sm_session.session_id,
+                        error=str(e),
+                    )
+                    continue
+                sub_status = (sm_session.state or {}).get(
+                    "sub_status"
+                ) or _SM_STATUS_TO_AGENT_CHAT_VOCAB.get(sm_session.status)
+                summaries[chat_session.id] = _summary_from_chat_session(chat_session, sub_status)
+                sort_keys[chat_session.id] = _naive_utc(
+                    chat_session.started_at or chat_session.created_at
+                )
+        except Exception as e:
+            logger.warning("session_history_sm_read_failed", error=str(e))
 
-        return sessions[-limit:]
+        try:
+            storage = await get_storage_service()
+            # Bounded fetch (existing DESC+LIMIT contract) -- buffered by the
+            # SM row count so dedup collapsing an SM/ledger overlap never
+            # starves the merged pool below `limit` distinct sessions.
+            rows = await storage.get_agent_chat_decisions(
+                ticker=ticker, limit=limit + sm_discussion_count
+            )
+            for row in rows:
+                row_id = row.get("id")
+                if not row_id or row_id in summaries:
+                    continue  # SM row wins on dedup
+                summaries[row_id] = _summary_from_ledger_row(row)
+                sort_keys[row_id] = _naive_utc(_parse_ledger_timestamp(row.get("created_at")))
+        except Exception as e:
+            logger.warning("session_history_ledger_read_failed", error=str(e))
 
-    def get_session_by_id(self, session_id: str) -> Optional[ChatSession]:
-        """Get a specific session by ID."""
-        for session in self._session_history:
-            if session.id == session_id:
-                return session
+        ordered_ids = sorted(summaries.keys(), key=lambda sid: sort_keys.get(sid, datetime.min))
+        return [summaries[sid] for sid in ordered_ids][-limit:]
 
-        # Check active rooms
+    async def get_session_by_id(self, session_id: str) -> Optional[ChatSession]:
+        """Get a specific session by ID -- three-tier fallback: (1) a live
+        room in _active_rooms (freshest, exact object identity), (2) SM's
+        kind="discussion" row (covers running discussions plus any terminal
+        one still within SM's TTL/reload window), (3) the durable ledger
+        transcript (P4-3) for everything else. Returns None (never raises)
+        when no tier has it or a source errors -- callers 404, not 500."""
         for room in self._active_rooms.values():
             if room.session.id == session_id:
                 return room.session
 
+        try:
+            sm = await get_session_manager()
+            sm_session = await sm.get_session(session_id)
+            if sm_session is not None and sm_session.kind == "discussion":
+                snapshot = (sm_session.state or {}).get("chat_snapshot")
+                if snapshot:
+                    try:
+                        return ChatSession.model_validate(snapshot)
+                    except Exception as e:
+                        logger.warning(
+                            "session_by_id_sm_snapshot_invalid",
+                            session_id=session_id,
+                            error=str(e),
+                        )
+        except Exception as e:
+            logger.warning(
+                "session_by_id_sm_read_failed", session_id=session_id, error=str(e)
+            )
+
+        try:
+            storage = await get_storage_service()
+            transcript_json = await storage.get_agent_chat_transcript(session_id)
+            if transcript_json:
+                try:
+                    return ChatSession.model_validate(json.loads(transcript_json))
+                except Exception as e:
+                    logger.warning(
+                        "session_by_id_ledger_transcript_invalid",
+                        session_id=session_id,
+                        error=str(e),
+                    )
+        except Exception as e:
+            logger.warning(
+                "session_by_id_ledger_read_failed", session_id=session_id, error=str(e)
+            )
+
         return None
+
+    async def count_total_sessions(self) -> int:
+        """Durable total-session count for /status's `total_sessions` field
+        (P4-4: replaces the retired in-memory `_session_history`'s len() --
+        the ledger is the sole, permanent source now). Failure-harmless: an
+        outage degrades to 0 rather than a 500."""
+        try:
+            storage = await get_storage_service()
+            return await storage.count_agent_chat_decisions()
+        except Exception as e:
+            logger.warning("count_total_sessions_failed", error=str(e))
+            return 0
 
 
 # -------------------------------------------

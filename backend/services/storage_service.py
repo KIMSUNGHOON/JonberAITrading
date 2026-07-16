@@ -1839,6 +1839,38 @@ class StorageService:
             logger.error("agent_chat_decisions_get_failed", error=str(e))
             return []
 
+    async def count_agent_chat_decisions(self, ticker: Optional[str] = None) -> int:
+        """
+        Count agent_chat_decisions rows, optionally filtered by ticker.
+
+        session-ssot P4-4: the durable/permanent session count the agent-chat
+        `/status` endpoint's `total_sessions` field now reports (the retired
+        in-memory `_session_history` list's `len()` used to serve this and
+        evaporated on restart; the ledger is the sole, permanent source now).
+
+        Returns:
+            Row count, or 0 on any storage error (failure-harmless -- a
+            counting outage must never 500 the status endpoint).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                if ticker:
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM agent_chat_decisions WHERE ticker = ?",
+                        (ticker,),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM agent_chat_decisions"
+                    )
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error("agent_chat_decisions_count_failed", error=str(e))
+            return 0
+
     async def update_decision_outcome(
         self, decision_id: str, realized_pnl: float
     ) -> bool:

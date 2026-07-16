@@ -216,7 +216,16 @@ class TestCoordinatorCallbacks:
 
 
 class TestDiscussionManagement:
-    """Tests for discussion management."""
+    """Tests for discussion management.
+
+    P4-4 (session-ssot): get_session_history/get_session_by_id no longer
+    read the retired in-memory `_session_history` list -- they merge
+    SessionManager (kind="discussion") with the durable ledger. The deeper
+    merge/dedup/sort semantics (multiple sources, NULL-safety, restart
+    simulation) are covered by test_history_merge.py against real SM/storage
+    backends; this class keeps only shallow wiring-level checks (mocked
+    sources) plus the _active_rooms fast-path, which is coordinator-local.
+    """
 
     def test_get_active_discussions_empty(self, coordinator):
         """Test getting active discussions when none exist."""
@@ -224,57 +233,108 @@ class TestDiscussionManagement:
 
         assert active == []
 
-    def test_get_session_history_empty(self, coordinator):
-        """Test getting session history when empty."""
-        history = coordinator.get_session_history()
+    @pytest.mark.asyncio
+    async def test_get_session_history_empty(self, coordinator, monkeypatch):
+        """Test getting session history when both SM and the ledger are empty."""
+        async def fake_get_session_manager():
+            sm = AsyncMock()
+            sm.get_all_sessions = AsyncMock(return_value={})
+            return sm
+
+        async def fake_get_storage_service():
+            storage = AsyncMock()
+            storage.get_agent_chat_decisions = AsyncMock(return_value=[])
+            return storage
+
+        monkeypatch.setattr(
+            "services.agent_chat.coordinator.get_session_manager", fake_get_session_manager
+        )
+        monkeypatch.setattr(
+            "services.agent_chat.coordinator.get_storage_service", fake_get_storage_service
+        )
+
+        history = await coordinator.get_session_history()
 
         assert history == []
 
-    def test_get_session_history_with_limit(self, coordinator, mock_session):
-        """Test getting session history with limit."""
-        # Add sessions
-        coordinator._session_history = [mock_session] * 10
+    @pytest.mark.asyncio
+    async def test_get_session_history_ledger_only_null_safe(self, coordinator, monkeypatch):
+        """A legacy (pre-P4-3) ledger row with NULL total_messages/total_rounds
+        0-falls-back, and the ledger's own status vocabulary passes through
+        unchanged when SM has nothing for this ticker."""
+        async def fake_get_session_manager():
+            sm = AsyncMock()
+            sm.get_all_sessions = AsyncMock(return_value={})
+            return sm
 
-        history = coordinator.get_session_history(limit=5)
+        rows = [
+            {
+                "id": "d1",
+                "ticker": "005930",
+                "stock_name": "삼성전자",
+                "status": "decided",
+                "action": "BUY",
+                "confidence": 0.8,
+                "consensus_level": 0.9,
+                "created_at": "2026-07-16 09:00:00",
+                "total_messages": None,
+                "total_rounds": None,
+            }
+        ]
 
-        assert len(history) == 5
+        async def fake_get_storage_service():
+            storage = AsyncMock()
+            storage.get_agent_chat_decisions = AsyncMock(return_value=rows)
+            return storage
 
-    def test_get_session_history_filter_by_ticker(self, coordinator, mock_market_context):
-        """Test filtering session history by ticker."""
-        session1 = ChatSession(
-            ticker="005930",
-            stock_name="삼성전자",
-            context=mock_market_context,
+        monkeypatch.setattr(
+            "services.agent_chat.coordinator.get_session_manager", fake_get_session_manager
         )
-        session2 = ChatSession(
-            ticker="000660",
-            stock_name="SK하이닉스",
-            context=MarketContext(
-                ticker="000660",
-                stock_name="SK하이닉스",
-                current_price=120000,
-                price_change_pct=1.0,
-            ),
+        monkeypatch.setattr(
+            "services.agent_chat.coordinator.get_storage_service", fake_get_storage_service
         )
 
-        coordinator._session_history = [session1, session2]
-
-        history = coordinator.get_session_history(ticker="005930")
+        history = await coordinator.get_session_history()
 
         assert len(history) == 1
-        assert history[0].ticker == "005930"
+        assert history[0]["id"] == "d1"
+        assert history[0]["status"] == "decided"
+        assert history[0]["total_messages"] == 0
+        assert history[0]["total_rounds"] == 0
 
-    def test_get_session_by_id(self, coordinator, mock_session):
-        """Test getting session by ID."""
-        coordinator._session_history = [mock_session]
+    @pytest.mark.asyncio
+    async def test_get_session_by_id_active_room_wins(self, coordinator, mock_session):
+        """Tier 1: a live room in _active_rooms returns the exact object,
+        without touching SM/storage at all."""
+        room = MagicMock()
+        room.session = mock_session
+        coordinator._active_rooms[mock_session.ticker] = room
 
-        found = coordinator.get_session_by_id(mock_session.id)
+        found = await coordinator.get_session_by_id(mock_session.id)
 
-        assert found == mock_session
+        assert found is mock_session
 
-    def test_get_session_by_id_not_found(self, coordinator):
-        """Test getting session by ID when not found."""
-        found = coordinator.get_session_by_id("non-existent")
+    @pytest.mark.asyncio
+    async def test_get_session_by_id_not_found(self, coordinator, monkeypatch):
+        """No active room, no SM row, no ledger transcript -> None (not a raise)."""
+        async def fake_get_session_manager():
+            sm = AsyncMock()
+            sm.get_session = AsyncMock(return_value=None)
+            return sm
+
+        async def fake_get_storage_service():
+            storage = AsyncMock()
+            storage.get_agent_chat_transcript = AsyncMock(return_value=None)
+            return storage
+
+        monkeypatch.setattr(
+            "services.agent_chat.coordinator.get_session_manager", fake_get_session_manager
+        )
+        monkeypatch.setattr(
+            "services.agent_chat.coordinator.get_storage_service", fake_get_storage_service
+        )
+
+        found = await coordinator.get_session_by_id("non-existent")
 
         assert found is None
 
