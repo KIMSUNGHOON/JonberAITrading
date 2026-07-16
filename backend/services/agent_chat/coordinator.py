@@ -22,6 +22,11 @@ from services.agent_chat.models import (
 from services.agent_chat.chat_room import ChatRoom
 from services.agent_chat.decision_log import persist_session
 from services.autonomy import check_autonomy
+from services.session_manager import (
+    MarketType as SmMarketType,
+    SessionStatus as SmSessionStatus,
+    get_session_manager,
+)
 from services.trading.models import ActivityType
 
 # -------------------------------------------
@@ -45,6 +50,131 @@ def _fire_room_created(room: "ChatRoom") -> None:
             hook(room)
         except Exception as e:
             logger.warning("room_created_hook_failed", error=str(e))
+
+
+# -------------------------------------------
+# Session-SSOT mirror (P4-2, session-ssot Phase P4)
+# -------------------------------------------
+# ChatSession lifecycle -> SessionManager (SM) mirroring. Additive: the
+# discussion's own read/write paths (_session_history, _active_rooms,
+# decision_log.persist_session) are completely unchanged by this -- it
+# purely gives every discussion room a companion row in SM's
+# analysis_sessions table (kind="discussion", filtered out of every
+# analysis-only scan by P4-1's kind column) so a later phase can read
+# discussions through the same SM surface analysis sessions already use.
+#
+# SM's SessionStatus enum keeps its existing 5 values (no new member for
+# discussions): every non-terminal agent-chat status (INITIALIZING/
+# ANALYZING/DISCUSSING/VOTING) maps to SM RUNNING, with the real phase
+# carried in state["sub_status"] instead. DECIDED -> COMPLETED;
+# CANCELLED/TIMEOUT -> CANCELLED.
+_SM_TERMINAL_STATUS: Dict[SessionStatus, SmSessionStatus] = {
+    SessionStatus.DECIDED: SmSessionStatus.COMPLETED,
+    SessionStatus.CANCELLED: SmSessionStatus.CANCELLED,
+    SessionStatus.TIMEOUT: SmSessionStatus.CANCELLED,
+}
+
+
+async def _register_sm_discussion(room: "ChatRoom") -> None:
+    """Register a freshly-created discussion room with the SessionManager
+    and wire lifecycle mirror callbacks onto it.
+
+    Called once per room, between construction and the (task-scheduled or
+    inline) `await room.start()` -- both room-construction call sites
+    (_start_discussion for the watch-list auto path, start_manual_discussion
+    for BOTH the background and wait=True manual paths) share this single
+    choke point, so every discussion entry route ends up with a companion
+    SM row and live mirror callbacks.
+
+    Failure-harmless by design (same contract as decision_log.persist_session
+    and the mirror_* helpers in services/session_manager.py): an SM outage
+    must never break a discussion. create_session's own failure is caught
+    and logged here; the mirror callbacks are still wired afterward so no
+    call site needs special-casing, and each of THEIR SM calls is caught and
+    logged too -- including the KeyError update_state/update_status raise
+    fail-loud when a session_id isn't tracked (P2-1), which is exactly what
+    happens on every subsequent event once create_session has failed.
+    """
+    session = room.session
+
+    try:
+        sm = await get_session_manager()
+        await sm.create_session(
+            session_id=session.id,
+            market_type=SmMarketType.KIWOOM,
+            ticker=room.ticker,
+            display_name=room.stock_name or room.ticker,
+            kind="discussion",
+            stk_cd=room.ticker,
+            stk_nm=room.stock_name,
+            state={
+                "sub_status": session.status.value,
+                "chat_snapshot": session.model_dump(mode="json"),
+            },
+        )
+    except Exception as e:
+        logger.warning(
+            "sm_discussion_register_failed",
+            session_id=session.id,
+            ticker=room.ticker,
+            error=str(e),
+        )
+
+    async def _mirror_state(sub_status: str) -> None:
+        """Push {sub_status, chat_snapshot} into SM state. chat_snapshot is
+        a non-critical key (P2-1), so bursts of these during a fast-moving
+        discussion coalesce into one SQLite write per ~1s instead of one per
+        message/status event. The serialization boundary is always
+        `ChatSession.model_dump(mode="json")` -- never the raw pydantic
+        model or a partially-converted dict -- so SM's own SQLite layer
+        (`json.dumps(state, default=str)`) always receives JSON-native
+        values and its `default=str` fallback never has to (silently)
+        mangle a datetime/numpy value.
+        """
+        try:
+            sm = await get_session_manager()
+            await sm.update_state(
+                session.id,
+                {
+                    "sub_status": sub_status,
+                    "chat_snapshot": session.model_dump(mode="json"),
+                },
+            )
+        except Exception as e:
+            logger.warning(
+                "sm_discussion_state_mirror_failed",
+                session_id=session.id,
+                ticker=room.ticker,
+                error=str(e),
+            )
+
+    async def _on_message(message) -> None:
+        # Votes and the moderator's decision announcement arrive as chat
+        # messages (message_type VOTE / DECISION) -- there is no separate
+        # ChatRoom callback for them (mirrors how the WS route in
+        # app/api/routes/agent_chat.py derives its 'vote'/'decision' frames
+        # from this same on_message/on_status_change pair).
+        await _mirror_state(session.status.value)
+
+    async def _on_status_change(status: SessionStatus, sess: ChatSession) -> None:
+        await _mirror_state(status.value)
+
+        terminal = _SM_TERMINAL_STATUS.get(status)
+        if terminal is not None:
+            try:
+                sm = await get_session_manager()
+                await sm.update_status(session.id, terminal)
+            except Exception as e:
+                logger.warning(
+                    "sm_discussion_status_mirror_failed",
+                    session_id=session.id,
+                    ticker=room.ticker,
+                    status=terminal.value,
+                    error=str(e),
+                )
+
+    room.on_message(_on_message)
+    room.on_status_change(_on_status_change)
 
 
 # -------------------------------------------
@@ -426,6 +556,12 @@ class ChatCoordinator:
             _fire_room_created(room)
 
             self._active_rooms[ticker] = room
+
+            # P4-2 (session-ssot): register the room with SessionManager and
+            # wire its lifecycle mirror callbacks -- must happen before
+            # room.start() is ever awaited (inside _run_discussion below) so
+            # no early message/status event can race an unregistered session.
+            await _register_sm_discussion(room)
 
             # Start discussion in background
             asyncio.create_task(self._run_discussion(ticker, room))
@@ -1004,6 +1140,11 @@ class ChatCoordinator:
         _fire_room_created(room)
 
         self._active_rooms[ticker] = room
+
+        # P4-2 (session-ssot): single choke point for BOTH manual entry
+        # paths below (wait=True inline await and the wait=False background
+        # task) -- must happen before room.start() is ever awaited.
+        await _register_sm_discussion(room)
 
         if wait:
             # Old synchronous contract: return the completed session, raise on
