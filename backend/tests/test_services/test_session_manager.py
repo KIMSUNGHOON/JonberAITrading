@@ -45,7 +45,20 @@ def clean_db():
 @pytest.fixture
 async def session_manager(clean_db):
     """Create a fresh SessionManager for testing."""
-    with patch("services.session_manager.DB_PATH", TEST_DB_PATH):
+    # P5-1: update_status/remove_session/cleanup_expired_sessions now fire a
+    # checkpoint-GC hook (services.session_manager._on_terminal_transition)
+    # that calls the REAL storage_service singleton unless patched -- that
+    # singleton points at the production backend/data/storage.db by default,
+    # which a live dev server may have open concurrently. Stub it out so
+    # this test file never touches that file.
+    fake_storage = AsyncMock()
+    fake_storage.delete_checkpoints = AsyncMock(return_value=True)
+
+    async def _fake_get_storage_service():
+        return fake_storage
+
+    with patch("services.session_manager.DB_PATH", TEST_DB_PATH), \
+         patch("services.session_manager.get_storage_service", _fake_get_storage_service):
         manager = SessionManager()
         await manager.initialize()
         yield manager

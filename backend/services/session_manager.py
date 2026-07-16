@@ -27,6 +27,12 @@ import aiosqlite
 
 import structlog
 
+# P5-1 (session-ssot): checkpoint GC hook needs the storage service's
+# delete_checkpoints(). services/storage_service.py has zero intra-repo
+# imports of its own (stdlib + aiosqlite + structlog only), so importing it
+# here at module scope cannot form an import cycle back into this module.
+from services.storage_service import get_storage_service
+
 logger = structlog.get_logger()
 
 
@@ -82,6 +88,19 @@ class SessionStatus(str, Enum):
     COMPLETED = "completed"
     ERROR = "error"
     CANCELLED = "cancelled"
+
+
+# P5-1 (session-ssot): statuses a session can never leave once entered --
+# no code path resumes a COMPLETED/ERROR/CANCELLED session back to
+# RUNNING/AWAITING_APPROVAL. Every transition INTO one of these is exactly
+# the trigger for SessionManager._on_terminal_transition's checkpoint GC
+# (AWAITING_APPROVAL is deliberately excluded: a resume still needs its
+# checkpoint row).
+_TERMINAL_STATUSES = {
+    SessionStatus.COMPLETED,
+    SessionStatus.ERROR,
+    SessionStatus.CANCELLED,
+}
 
 
 @dataclass
@@ -602,6 +621,18 @@ class SessionManager:
                 s.updated_at = now
                 await self._save_session(s)
 
+            # P5-1: reconcile assigns terminal statuses directly (bypassing
+            # update_status, which is where the hook normally lives) across
+            # several branches above -- the analysis ERROR/CANCELLED flips
+            # AND the discussion-kind CANCELLED branch. rep.errored/
+            # rep.cancelled are exactly and only the sids that landed in a
+            # terminal status this iteration (rep.flipped is
+            # AWAITING_APPROVAL, never terminal -- must stay excluded so a
+            # resumable session keeps its checkpoint). Fired after the save
+            # above, mirroring update_status's post-persist placement.
+            if sid in rep.errored or sid in rep.cancelled:
+                await self._on_terminal_transition(sid)
+
         logger.info(
             "session_reconcile_done",
             flipped=len(rep.flipped),
@@ -776,6 +807,39 @@ class SessionManager:
             ))
             await db.commit()
 
+    async def _on_terminal_transition(self, session_id: str) -> None:
+        """
+        Best-effort LangGraph checkpoint GC hook (P5-1, spec Sec.P5 rule 3).
+
+        Fired whenever a session's status BECOMES COMPLETED/ERROR/CANCELLED.
+        The checkpoints table (services/storage_service.py) is the graph's
+        resume state -- a terminal session will never resume from it again,
+        so its rows are pure leak once the session lands here. Never fired
+        for AWAITING_APPROVAL (or any non-terminal status): a resume still
+        needs that checkpoint.
+
+        Best-effort by design: `delete_checkpoints` already swallows its own
+        DB errors internally (returns False), but this also guards against
+        get_storage_service() itself raising (e.g. mid-initialize). Any
+        failure here must never turn an already-persisted status transition
+        into a caller-visible error -- P5-2's periodic sweep is the
+        backstop that reclaims whatever this call missed.
+
+        Idempotent / kind-agnostic: calling this twice for the same
+        session_id, or for a kind="discussion" session that never had any
+        checkpoint rows, is simply a 0-row DELETE both times -- no dedup or
+        kind check needed here.
+        """
+        try:
+            storage = await get_storage_service()
+            await storage.delete_checkpoints(session_id)
+        except Exception as e:
+            logger.warning(
+                "checkpoint_gc_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+
     async def get_session(self, session_id: str) -> Optional[AnalysisSession]:
         """Get session by ID."""
         await self.initialize()
@@ -822,6 +886,16 @@ class SessionManager:
                 session_id=session_id,
                 status=status.value,
             )
+
+            # P5-1: fire the checkpoint GC hook only AFTER the transition is
+            # durably persisted above (_save_session already committed).
+            # Still inside self._lock -- matches the existing
+            # _notify_subscribers call just above, which is also a
+            # post-save side effect run under the lock; _on_terminal_transition
+            # is a plain storage_service call (a different DB file, no SM
+            # lock involved) so this cannot deadlock.
+            if status in _TERMINAL_STATUSES:
+                await self._on_terminal_transition(session_id)
 
     async def update_state(
         self,
@@ -989,6 +1063,13 @@ class SessionManager:
                     )
                     await db.commit()
 
+                # P5-1: the session row (and any resume path to it) is gone
+                # unconditionally at this point regardless of what status it
+                # was removed in -- GC its checkpoint rows too, so removal
+                # can never leave an orphan behind for a session_id nothing
+                # can look up again.
+                await self._on_terminal_transition(session_id)
+
                 # Cleanup subscribers
                 if session_id in self._subscribers:
                     del self._subscribers[session_id]
@@ -1031,6 +1112,13 @@ class SessionManager:
                         expired
                     )
                     await db.commit()
+
+                # P5-1: every id in `expired` was filtered to a terminal
+                # status above (COMPLETED/ERROR/CANCELLED) before being
+                # queued for deletion -- GC each one's checkpoint rows now
+                # that the row itself is gone.
+                for session_id in expired:
+                    await self._on_terminal_transition(session_id)
 
         if expired:
             logger.info(

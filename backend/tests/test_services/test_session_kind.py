@@ -49,10 +49,28 @@ def clean_db():
         os.remove(TEST_DB_PATH)
 
 
+async def _fake_get_storage_service():
+    """P5-1: stand-in for services.storage_service.get_storage_service.
+
+    update_status/remove_session/cleanup_expired_sessions now fire a
+    checkpoint-GC hook that calls the REAL storage_service singleton unless
+    patched -- that singleton points at the production
+    backend/data/storage.db by default, which a live dev server may have
+    open concurrently. Every fixture in this file patches it out.
+    """
+    class _NoopStorage:
+        async def delete_checkpoints(self, session_id):
+            return True
+    return _NoopStorage()
+
+
 @pytest.fixture
 async def sm(clean_db, monkeypatch):
     """Fresh SessionManager on an isolated tmp DB -- no singleton involved."""
     monkeypatch.setattr("services.session_manager.DB_PATH", TEST_DB_PATH)
+    monkeypatch.setattr(
+        "services.session_manager.get_storage_service", _fake_get_storage_service
+    )
     manager = SessionManager()
     await manager.initialize()
     yield manager

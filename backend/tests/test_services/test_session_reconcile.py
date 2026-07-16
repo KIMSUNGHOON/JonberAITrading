@@ -23,9 +23,25 @@ def _sess(sid, status, state, created=NOW, market=MarketType.KIWOOM, kind="analy
     )
 
 
+async def _fake_get_storage_service():
+    """P5-1: stand-in for services.storage_service.get_storage_service.
+
+    reconcile_stranded_sessions now fires a checkpoint-GC hook on its
+    ERROR/CANCELLED direct-assignment branches, which calls the REAL
+    storage_service singleton unless patched -- that singleton points at
+    the production backend/data/storage.db by default, which a live dev
+    server may have open concurrently.
+    """
+    class _NoopStorage:
+        async def delete_checkpoints(self, session_id):
+            return True
+    return _NoopStorage()
+
+
 async def _mgr_with(sessions, tmp_path, monkeypatch):
     import services.session_manager as sm_mod
     monkeypatch.setattr(sm_mod, "DB_PATH", str(tmp_path / "s.db"))
+    monkeypatch.setattr(sm_mod, "get_storage_service", _fake_get_storage_service)
     mgr = SessionManager()
     await mgr.initialize()  # reconcile 포함 — 빈 상태
     for s in sessions:
