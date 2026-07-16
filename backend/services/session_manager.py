@@ -51,6 +51,12 @@ SUBSCRIBER_QUEUE_MAXSIZE = 256
 # session (and every caller that doesn't pass `kind` explicitly) defaults to
 # this value, so today's behavior is byte-identical after this change.
 KIND_ANALYSIS = "analysis"
+# P4-5: the discussion producer's kind value (services/agent_chat/
+# coordinator.py's _register_sm_discussion writes kind="discussion" as a
+# literal today) -- named here too so reconcile_stranded_sessions'
+# kind-aware branch has a single source of truth instead of a second
+# hardcoded literal.
+KIND_DISCUSSION = "discussion"
 
 # state_updates keys that can hide an "invisible interrupt" (P1 spec Sec.P1) if
 # their SQLite write is delayed -- a session parked awaiting approval that a
@@ -418,7 +424,13 @@ class SessionManager:
         sessions once and flips each into a shape that is safe to resume
         or that fails closed.
 
-        Rules (see specs/.../task-1-brief.md for the full shape table):
+        Rules (see specs/.../task-1-brief.md for the full shape table). All
+        rules below apply to kind="analysis" sessions only (P4-5); a
+        kind="discussion" session is handled by its own, separate rule
+        first (see the dedicated branch in the loop below): any
+        non-terminal status -> CANCELLED with an explicit state marker,
+        since a discussion's ChatRoom lives only in-process and nothing
+        survives a restart to resume it.
           - RUNNING + awaiting_approval flag + a trade_proposal in state:
             this is a graph parked at (or just before) the HITL interrupt.
               - BUY/SELL proposals older than 6h are considered stale
@@ -493,7 +505,53 @@ class SessionManager:
                     "재시작으로 자율 승인 타이머 해제 — 수동 승인 필요"
                 )
 
-            if s.status == SessionStatus.RUNNING and awaiting and prop:
+            if s.kind == KIND_DISCUSSION:
+                # P4-5 (session-ssot): discussion rows never carry a
+                # trade_proposal/awaiting_approval HITL shape -- none of the
+                # analysis-only branches below (awaiting-flip, 6h staleness,
+                # checkpoint verification, approved-mismatch) apply to them,
+                # so they get their own, much simpler rule instead of
+                # falling into the generic "RUNNING, no proposal" -> ERROR
+                # branch (which used to mislabel a stranded discussion with
+                # an analysis-flavored reason, "서버 재시작으로 분석 중단",
+                # even though it's harmless -- P4-1's kind filters already
+                # keep it out of every analysis-only consumer).
+                #
+                # A discussion's ChatRoom lives only in-process
+                # (coordinator._active_rooms); nothing survives a restart to
+                # resume it, so any non-terminal row found here (RUNNING is
+                # the expected shape; AWAITING_APPROVAL/ERROR should never
+                # happen -- _register_sm_discussion's status map only ever
+                # writes RUNNING/COMPLETED/CANCELLED) unconditionally
+                # resolves to CANCELLED with an explicit marker -- never
+                # ERROR (that vocabulary means "an analysis proposal HITL is
+                # stuck", which is not this).
+                #
+                # Seam for P5-1: like every other branch in this loop, this
+                # assigns s.status/state directly rather than going through
+                # update_status/update_state -- when P5-1 adds lifecycle
+                # hooks on those methods, this branch is in scope for
+                # whatever shim/replay it needs to cover reconcile's direct
+                # writes too.
+                if s.status in (
+                    SessionStatus.COMPLETED,
+                    SessionStatus.CANCELLED,
+                    SessionStatus.ERROR,
+                ):
+                    rep.kept.append(sid)
+                else:
+                    if s.status != SessionStatus.RUNNING:
+                        logger.warning(
+                            "discussion_reconcile_unexpected_status",
+                            session_id=sid,
+                            status=s.status.value,
+                        )
+                    s.status = SessionStatus.CANCELLED
+                    st["cancelled_reason"] = "재시작으로 토론 중단"
+                    st["sub_status"] = "cancelled"
+                    rep.cancelled.append(sid)
+
+            elif s.status == SessionStatus.RUNNING and awaiting and prop:
                 action = str(prop.get("action") or "").upper()
 
                 stale = False

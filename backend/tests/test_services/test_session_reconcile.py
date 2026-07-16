@@ -15,11 +15,11 @@ from services.session_manager import (
 NOW = datetime(2026, 7, 14, 9, 0, tzinfo=timezone.utc)
 
 
-def _sess(sid, status, state, created=NOW, market=MarketType.KIWOOM):
+def _sess(sid, status, state, created=NOW, market=MarketType.KIWOOM, kind="analysis"):
     return AnalysisSession(
         session_id=sid, market_type=market, ticker="005930",
         display_name="삼성전자", status=status, state=state,
-        created_at=created, stk_cd="005930", stk_nm="삼성전자",
+        created_at=created, stk_cd="005930", stk_nm="삼성전자", kind=kind,
     )
 
 
@@ -162,3 +162,127 @@ async def test_r1_flip_denied_when_checkpoint_not_parked(tmp_path, monkeypatch):
 
     rep = await mgr.reconcile_stranded_sessions(now=NOW, checkpoint_next=_next)
     assert "r1d" in rep.errored
+
+
+# -------------------------------------------
+# P4-5 (session-ssot): kind="discussion" reconcile branch
+# -------------------------------------------
+# reconcile_stranded_sessions used to be kind-blind: a restart-orphaned
+# discussion row (kind="discussion", left RUNNING when its ChatRoom died
+# with the process) fell into the generic "RUNNING, no proposal" branch
+# and was flipped to ERROR with an analysis-flavored reasoning ("서버
+# 재시작으로 분석 중단") -- harmless (defense-in-depth filters everywhere
+# else already exclude non-analysis kinds from every consumer) but
+# semantically wrong. These pin the new kind-aware branch: discussions
+# always resolve to CANCELLED with an explicit marker, never ERROR/
+# AWAITING_APPROVAL, and the pre-existing analysis branches (awaiting-flip,
+# 6h staleness, checkpoint verification, approved-mismatch) are untouched
+# for kind="analysis" rows (the r1-r5 tests above are the byte-invariance
+# pin -- they stay GREEN unmodified).
+
+
+async def test_p45_discussion_running_reconciled_to_cancelled_with_marker(tmp_path, monkeypatch):
+    """① RUNNING discussion 행 → reconcile 후 CANCELLED + state 마커."""
+    s = _sess("d1", SessionStatus.RUNNING, {"sub_status": "discussing"}, kind="discussion")
+    mgr = await _mgr_with([s], tmp_path, monkeypatch)
+    rep = await mgr.reconcile_stranded_sessions(now=NOW)
+    assert "d1" in rep.cancelled
+    assert mgr._sessions["d1"].status == SessionStatus.CANCELLED
+    assert mgr._sessions["d1"].state.get("cancelled_reason") == "재시작으로 토론 중단"
+    assert mgr._sessions["d1"].state.get("sub_status") == "cancelled"
+    # never mistaken for an analysis-flavored outcome
+    assert mgr._sessions["d1"].error is None
+
+
+async def test_p45_mixed_pass_analysis_branch_unaffected_by_discussion_branch(tmp_path, monkeypatch):
+    """② 동일 reconcile pass에 analysis + discussion 행이 섞여도 kind 분기가
+    서로 오염되지 않음 -- 기존 analysis flip 로직(awaiting+HOLD→AWAITING_APPROVAL)
+    그대로."""
+    analysis = _sess("a1", SessionStatus.RUNNING, {
+        "awaiting_approval": True,
+        "trade_proposal": {"action": "HOLD", "created_at": NOW.isoformat()},
+    })
+    discussion = _sess("d2", SessionStatus.RUNNING, {"sub_status": "voting"}, kind="discussion")
+    mgr = await _mgr_with([analysis, discussion], tmp_path, monkeypatch)
+    rep = await mgr.reconcile_stranded_sessions(now=NOW)
+
+    assert "a1" in rep.flipped
+    assert mgr._sessions["a1"].status == SessionStatus.AWAITING_APPROVAL
+
+    assert "d2" in rep.cancelled
+    assert mgr._sessions["d2"].status == SessionStatus.CANCELLED
+    assert mgr._sessions["d2"].state.get("cancelled_reason") == "재시작으로 토론 중단"
+
+
+async def test_p45_discussion_awaiting_approval_failsafe_cancelled(tmp_path, monkeypatch):
+    """③ 정상적으론 불가능한 discussion AWAITING_APPROVAL 행도 fail-safe로
+    동일하게 CANCELLED (ERROR/AWAITING_APPROVAL로 남기지 않음)."""
+    s = _sess("d3", SessionStatus.AWAITING_APPROVAL, {"sub_status": "discussing"}, kind="discussion")
+    mgr = await _mgr_with([s], tmp_path, monkeypatch)
+    rep = await mgr.reconcile_stranded_sessions(now=NOW)
+    assert "d3" in rep.cancelled
+    assert mgr._sessions["d3"].status == SessionStatus.CANCELLED
+    assert mgr._sessions["d3"].state.get("cancelled_reason") == "재시작으로 토론 중단"
+
+
+async def test_p45_discussion_terminal_states_left_alone(tmp_path, monkeypatch):
+    """터미널 discussion 행(COMPLETED/CANCELLED/ERROR)은 stranded가 아니므로
+    reconcile이 건드리지 않고 kept로 분류."""
+    done = _sess("d4", SessionStatus.COMPLETED, {"sub_status": "decided"}, kind="discussion")
+    already_cancelled = _sess("d5", SessionStatus.CANCELLED, {"sub_status": "cancelled"}, kind="discussion")
+    mgr = await _mgr_with([done, already_cancelled], tmp_path, monkeypatch)
+    rep = await mgr.reconcile_stranded_sessions(now=NOW)
+    assert "d4" in rep.kept
+    assert "d5" in rep.kept
+    assert mgr._sessions["d4"].status == SessionStatus.COMPLETED
+    assert mgr._sessions["d5"].status == SessionStatus.CANCELLED
+
+
+async def test_p45_discussion_reconcile_visible_as_cancelled_in_history(tmp_path, monkeypatch):
+    """④ 통합: 재시작 시뮬 — RUNNING discussion 행 로드 → reconcile →
+    P4-4의 ChatCoordinator.get_session_history()에서 'cancelled'로 노출.
+    P4-2(SM mirror 계약: state["chat_snapshot"]/state["sub_status"]) +
+    P4-4(read merge: sub_status가 있으면 그 값을 그대로 status로 노출) +
+    본 태스크(kind-aware reconcile이 sub_status="cancelled"를 씀)를 잇는
+    end-to-end 증거."""
+    from unittest.mock import AsyncMock
+
+    import services.session_manager as sm_module
+    from services.agent_chat.coordinator import ChatCoordinator
+    from services.agent_chat.models import ChatSession, MarketContext
+    from services.storage_service import StorageService
+
+    context = MarketContext(
+        ticker="005930", stock_name="삼성전자",
+        current_price=72500.0, price_change_pct=0.5,
+    )
+    chat_session = ChatSession(ticker="005930", stock_name="삼성전자", context=context)
+    chat_session.started_at = NOW
+
+    row = AnalysisSession(
+        session_id=chat_session.id, market_type=MarketType.KIWOOM, ticker="005930",
+        display_name="삼성전자", kind="discussion", status=SessionStatus.RUNNING,
+        state={
+            "sub_status": "discussing",
+            "chat_snapshot": chat_session.model_dump(mode="json"),
+        },
+        created_at=NOW, stk_cd="005930", stk_nm="삼성전자",
+    )
+    mgr = await _mgr_with([row], tmp_path, monkeypatch)
+    monkeypatch.setattr(sm_module, "_session_manager", mgr)
+
+    rep = await mgr.reconcile_stranded_sessions(now=NOW)
+    assert chat_session.id in rep.cancelled
+
+    storage = StorageService(db_path=str(tmp_path / "ledger.db"))
+    await storage.initialize()
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_storage_service",
+        AsyncMock(return_value=storage),
+    )
+
+    coordinator = ChatCoordinator()
+    history = await coordinator.get_session_history()
+    found = next((entry for entry in history if entry["id"] == chat_session.id), None)
+    assert found is not None, "reconciled discussion must still surface in history"
+    assert found["status"] == "cancelled"
