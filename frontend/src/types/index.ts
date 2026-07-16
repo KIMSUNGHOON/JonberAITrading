@@ -919,11 +919,14 @@ export type AlertType =
   | 'news_alert';
 
 export interface TradingRiskParameters {
+  max_trade_notional_pct: number;
   max_single_position_pct: number;
   min_cash_ratio: number;
   max_total_stock_pct: number;
   sudden_move_threshold_pct: number;
   max_daily_trades: number;
+  max_daily_loss_pct: number;
+  max_open_positions: number;
   stop_loss_mode: StopLossMode;
   take_profit_mode: StopLossMode;
 }
@@ -1014,11 +1017,14 @@ export interface TradingAlertActionRequest {
 }
 
 export interface TradingRiskParamsUpdateRequest {
+  max_trade_notional_pct?: number;
   max_single_position_pct?: number;
   min_cash_ratio?: number;
   max_total_stock_pct?: number;
   sudden_move_threshold_pct?: number;
   max_daily_trades?: number;
+  max_daily_loss_pct?: number;
+  max_open_positions?: number;
   stop_loss_mode?: string;
   take_profit_mode?: string;
 }

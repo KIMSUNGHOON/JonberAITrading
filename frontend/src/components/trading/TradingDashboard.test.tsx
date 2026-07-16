@@ -28,9 +28,16 @@ const stopTrading = vi.fn();
 const pauseTrading = vi.fn();
 const resumeTrading = vi.fn();
 const getTradingRiskParams = vi.fn();
+const updateTradingRiskParams = vi.fn();
+const getTradingPortfolio = vi.fn();
 vi.mock('@/api/client', () => ({
   getAgentChatStatus: (...a: unknown[]) => getAgentChatStatus(...a),
   getTradingStatus: (...a: unknown[]) => getTradingStatus(...a),
+  getTradingPortfolio: (...a: unknown[]) => getTradingPortfolio(...a),
+  // Named exports (as opposed to the apiClient.* form below) — consumed by
+  // RiskParamsPanel, which TradingDashboard now mounts directly.
+  getTradingRiskParams: (...a: unknown[]) => getTradingRiskParams(...a),
+  updateTradingRiskParams: (...a: unknown[]) => updateTradingRiskParams(...a),
   // NOT imported by TradingDashboard anymore — kept here only so a future
   // regression (re-adding a direct start/stop call) has something to
   // assert against; the demotion test below asserts these are NEVER called.
@@ -62,6 +69,12 @@ beforeEach(() => {
     mode: 'paper', is_active: false, started_at: null, daily_trades: 0, max_daily_trades: 20,
   });
   getTradingRiskParams.mockResolvedValue({});
+  updateTradingRiskParams.mockResolvedValue({ status: 'updated', risk_params: {} });
+  getTradingPortfolio.mockResolvedValue({
+    total_equity: 0, cash: 0, cash_ratio: 0, stock_value: 0, stock_ratio: 0,
+    positions: [], total_unrealized_pnl: 0, total_unrealized_pnl_pct: 0,
+    daily_trades: 0, max_daily_trades: 20,
+  });
 });
 
 function brainCard(): HTMLElement {

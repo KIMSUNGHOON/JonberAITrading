@@ -44,6 +44,7 @@ import {
 import {
   getAgentChatStatus,
   getTradingStatus,
+  getTradingPortfolio,
   startTrading,
   stopTrading,
   pauseTrading,
@@ -52,6 +53,7 @@ import {
 } from '@/api/client';
 import { useStore } from '@/store';
 import { TradingModeSection } from '@/components/settings/TradingModeSection';
+import { RiskParamsPanel } from '@/components/trading/RiskParamsPanel';
 import type { AgentChatCoordinatorStatus } from '@/types';
 
 /** HH:mm for the last coordinator watch-list tick; DASH when unknown. */
@@ -74,7 +76,7 @@ interface ExecutionStatus {
 interface RiskLimits {
   max_daily_loss_pct?: number;
   max_open_positions?: number;
-  max_trade_notional_krw?: number;
+  max_trade_notional_pct?: number;
 }
 
 function StatusDot({ on }: { on: boolean }) {
@@ -136,17 +138,20 @@ export default function TradingDashboard() {
   const [execStatus, setExecStatus] = useState<ExecutionStatus | null>(null);
   const [brainStatus, setBrainStatus] = useState<AgentChatCoordinatorStatus | null>(null);
   const [riskLimits, setRiskLimits] = useState<RiskLimits | null>(null);
+  const [totalEquity, setTotalEquity] = useState(0);
   const [busy, setBusy] = useState<string | null>(null);
 
   const fetchAll = useCallback(async () => {
-    const [exec, brain, risk] = await Promise.allSettled([
+    const [exec, brain, risk, portfolio] = await Promise.allSettled([
       getTradingStatus(),
       getAgentChatStatus(),
       apiClient.getTradingRiskParams(),
+      getTradingPortfolio(),
     ]);
     if (exec.status === 'fulfilled') setExecStatus(exec.value as ExecutionStatus);
     if (brain.status === 'fulfilled') setBrainStatus(brain.value);
     if (risk.status === 'fulfilled') setRiskLimits(risk.value as RiskLimits);
+    if (portfolio.status === 'fulfilled') setTotalEquity(portfolio.value.total_equity);
   }, []);
 
   useEffect(() => {
@@ -329,8 +334,14 @@ export default function TradingDashboard() {
               <div>
                 <div className="text-[11px] text-dim uppercase tracking-wide">거래당 상한</div>
                 <div className="text-ink tabular-nums">
-                  {riskLimits?.max_trade_notional_krw != null
-                    ? `₩${riskLimits.max_trade_notional_krw.toLocaleString()}`
+                  {riskLimits?.max_trade_notional_pct != null
+                    ? `${riskLimits.max_trade_notional_pct}%${
+                        totalEquity > 0
+                          ? ` (≈₩${Math.round(
+                              (riskLimits.max_trade_notional_pct / 100) * totalEquity,
+                            ).toLocaleString('ko-KR')})`
+                          : ''
+                      }`
                     : '—'}
                 </div>
               </div>
@@ -342,6 +353,9 @@ export default function TradingDashboard() {
               거부할 수 있습니다.
             </p>
           </div>
+
+          {/* 3행: 리스크 파라미터 편집 */}
+          <RiskParamsPanel totalEquity={totalEquity} />
         </div>
       </div>
     </div>
