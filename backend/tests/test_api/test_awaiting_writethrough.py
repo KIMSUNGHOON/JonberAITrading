@@ -19,7 +19,7 @@ import pytest
 from fastapi import HTTPException
 from types import SimpleNamespace
 
-from services.session_manager import MarketType
+from services.session_manager import MarketType, SessionStatus
 
 
 # -------------------------------------------
@@ -29,7 +29,15 @@ from services.session_manager import MarketType
 
 @pytest.mark.asyncio
 async def test_awaiting_transition_failclosed_on_sm_failure(monkeypatch):
-    """SM awaiting 기록이 계속 실패하면 세션은 error 가 되고 auto-approve 는 안 뜬다."""
+    """SM awaiting 기록이 계속 실패하면 세션은 error 가 되고 auto-approve 는 안 뜬다.
+
+    P2-3: `_finalize_awaiting_transition` no longer takes a legacy-dict
+    `session` argument -- the KR producer writes to the SessionManager only,
+    so the helper re-fetches the SM row itself. A minimal fake SessionManager
+    (only `get_session`/`update_state`) stands in for the real singleton,
+    following this file's isolation principle (only names the target module
+    imported are faked).
+    """
     from app.api.routes.kr_stocks import analysis as kr_analysis
 
     calls = {"n": 0}
@@ -56,20 +64,37 @@ async def test_awaiting_transition_failclosed_on_sm_failure(monkeypatch):
 
     monkeypatch.setattr(kr_analysis, "mirror_session_status", fake_mirror_status)
 
-    session = {"session_id": "wt-1", "status": "running", "error": None,
-               "state": {"awaiting_approval": True,
-                         "trade_proposal": {"action": "BUY"},
-                         "reasoning_log": []}}
+    fake_sm_session = SimpleNamespace(
+        state={"awaiting_approval": True,
+               "trade_proposal": {"action": "BUY"},
+               "reasoning_log": []},
+    )
+    state_updates_seen = []
 
-    await kr_analysis._finalize_awaiting_transition("wt-1", session)
+    class _FakeSM:
+        async def get_session(self, session_id):
+            return fake_sm_session
+
+        async def update_state(self, session_id, updates, **kw):
+            state_updates_seen.append(updates)
+            fake_sm_session.state.update(updates)
+
+    async def fake_get_session_manager():
+        return _FakeSM()
+
+    monkeypatch.setattr(kr_analysis, "get_session_manager", fake_get_session_manager)
+
+    await kr_analysis._finalize_awaiting_transition("wt-1")
 
     assert calls["n"] == 2                      # 1회 재시도 포함 2회 시도
-    assert session["status"] == "error"          # fail-closed
-    assert session["state"]["awaiting_approval"] is False
     assert scheduled == []                       # 보이지 않는 자동승인 금지
+    # The reasoning-log/awaiting_approval cleanup landed directly on the sm.
+    assert fake_sm_session.state["awaiting_approval"] is False
+    assert "안전 종료" in fake_sm_session.state["reasoning_log"][-1]
     # Best-effort ERROR mirror to the sm still attempted exactly once.
     assert len(mirrored) == 1
     assert mirrored[0][0] == "wt-1"
+    assert mirrored[0][1] == SessionStatus.ERROR
 
 
 @pytest.mark.asyncio
@@ -85,18 +110,49 @@ async def test_awaiting_transition_success_path(monkeypatch):
     scheduled = []
 
     async def fake_schedule(session_id, market, session):
-        scheduled.append(session_id)
+        scheduled.append((session_id, market, session))
 
     monkeypatch.setattr(kr_analysis, "maybe_schedule_auto_approve", fake_schedule)
 
-    session = {"session_id": "wt-2", "status": "running", "error": None,
-               "state": {"awaiting_approval": True,
-                         "trade_proposal": {"action": "BUY"},
-                         "reasoning_log": []}}
-    await kr_analysis._finalize_awaiting_transition("wt-2", session)
-    assert session["status"] == "awaiting_approval"
-    assert scheduled == ["wt-2"]
+    fake_sm_session = SimpleNamespace(
+        session_id="wt-2",
+        status="awaiting_approval",
+        error=None,
+        last_node=None,
+        stk_cd="005930",
+        stk_nm="삼성전자",
+        state={"awaiting_approval": True,
+               "trade_proposal": {"action": "BUY"},
+               "reasoning_log": []},
+    )
+
+    def to_legacy_dict():
+        return {
+            "session_id": fake_sm_session.session_id,
+            "status": fake_sm_session.status,
+            "state": fake_sm_session.state,
+            "stk_cd": fake_sm_session.stk_cd,
+            "stk_nm": fake_sm_session.stk_nm,
+        }
+
+    fake_sm_session.to_legacy_dict = to_legacy_dict
+
+    class _FakeSM:
+        async def get_session(self, session_id):
+            return fake_sm_session
+
+    async def fake_get_session_manager():
+        return _FakeSM()
+
+    monkeypatch.setattr(kr_analysis, "get_session_manager", fake_get_session_manager)
+
+    await kr_analysis._finalize_awaiting_transition("wt-2")
+
+    assert scheduled and scheduled[0][0] == "wt-2"
+    assert scheduled[0][1] == "kiwoom"
+    assert scheduled[0][2]["state"] is fake_sm_session.state
     assert committed and committed[0][0] == "wt-2"
+    assert committed[0][1] == SessionStatus.AWAITING_APPROVAL
 
 
 # -------------------------------------------

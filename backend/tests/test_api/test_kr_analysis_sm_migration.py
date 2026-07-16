@@ -1,10 +1,16 @@
-"""P7 Phase 1: KR (kiwoom) analysis producer migration to the SessionManager.
+"""P7 Phase 1 -> P2-3: KR (kiwoom) analysis producer migration to the
+SessionManager, then to SM-only direct writes.
 
 The KR analysis routes historically wrote ONLY the legacy in-process
-kr_stock_sessions dict, so the SessionManager pub/sub never fired and the
-session WebSocket could only poll. After the migration the producer writes
-BOTH — legacy dict first (still the read path), then the SessionManager —
-so every graph node / status transition fires a subscriber notification.
+kr_stock_sessions dict (P7 Phase 1 made it write BOTH -- legacy dict first,
+then the SessionManager, so pub/sub could fire). P2-3 (session-SSOT) removed
+the legacy-dict write entirely: the producer now writes the SessionManager
+ONLY, so `kr_stock_sessions` stays empty for the life of every session this
+file drives through the real routes. Tests that need a "session that already
+exists" fixture seed the SessionManager directly (`_seed_sm_session`); the
+`_seed_session`/`kr_stock_sessions` helpers below survive only for the
+approval.py-flow tests near the bottom of this file, which exercise
+approval.py's OWN (out of this task's scope) legacy-dict adoption path.
 
 Headless: stubbed graph astream + a real SessionManager on a test SQLite db.
 """
@@ -151,14 +157,8 @@ async def test_start_route_registers_sm_session(sm, kr_sessions, fake_kiwoom):
     assert session.stk_cd == "005930"
     assert session.stk_nm == "삼성전자"
     assert session.state.get("reasoning_log") == []
-    # Legacy record still created (read path unchanged)
-    assert response.session_id in kr_sessions
-    # sm state must be an independent copy, not the legacy dict's objects
-    assert session.state is not kr_sessions[response.session_id]["state"]
-    assert (
-        session.state["reasoning_log"]
-        is not kr_sessions[response.session_id]["state"]["reasoning_log"]
-    )
+    # P2-3: SM direct-write -- the legacy dict is never populated at all.
+    assert kr_sessions == {}
 
 
 # -------------------------------------------
@@ -168,7 +168,6 @@ async def test_start_route_registers_sm_session(sm, kr_sessions, fake_kiwoom):
 
 async def test_analysis_task_mirrors_node_updates_and_notifies(sm, kr_sessions, monkeypatch):
     session_id = "kr-mirror-1"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
     queue = await sm.subscribe(session_id)
 
@@ -194,13 +193,13 @@ async def test_analysis_task_mirrors_node_updates_and_notifies(sm, kr_sessions, 
 
     await run_kr_stock_analysis_task(session_id)
 
-    # Legacy behavior unchanged
-    assert record["status"] == "awaiting_approval"
-    assert record["state"]["reasoning_log"][-1] == "[t] 결정"
+    # P2-3: SM direct-write -- there is no legacy dict to check separately.
+    assert kr_sessions == {}
 
-    # sm mirrored per node: full state + last_node + status
+    # sm updated per node: full state + last_node + status
     session = await sm.get_session(session_id)
     assert session.state.get("reasoning_log") == ["[t] 데이터 수집", "[t] 기술 분석", "[t] 결정"]
+    assert session.state["reasoning_log"][-1] == "[t] 결정"
     assert session.last_node == "strategic_decision"
     assert session.status == SessionStatus.AWAITING_APPROVAL
 
@@ -218,7 +217,6 @@ async def test_analysis_task_mirrors_node_updates_and_notifies(sm, kr_sessions, 
 
 async def test_analysis_task_mirrors_completed_status(sm, kr_sessions, monkeypatch):
     session_id = "kr-mirror-2"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
     _patch_graph(
@@ -233,14 +231,13 @@ async def test_analysis_task_mirrors_completed_status(sm, kr_sessions, monkeypat
 
     await run_kr_stock_analysis_task(session_id)
 
-    assert record["status"] == "completed"
+    assert kr_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.COMPLETED
 
 
 async def test_analysis_task_mirrors_error_status(sm, kr_sessions, monkeypatch):
     session_id = "kr-mirror-3"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
     _patch_graph(
@@ -253,7 +250,7 @@ async def test_analysis_task_mirrors_error_status(sm, kr_sessions, monkeypatch):
 
     await run_kr_stock_analysis_task(session_id)
 
-    assert record["status"] == "error"
+    assert kr_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.ERROR
     assert "graph exploded" in (session.error or "")
@@ -266,13 +263,12 @@ async def test_analysis_task_mirrors_error_status(sm, kr_sessions, monkeypatch):
 
 async def test_cancel_route_mirrors_cancelled_status(sm, kr_sessions):
     session_id = "kr-cancel-1"
-    _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
     queue = await sm.subscribe(session_id)
 
     await cancel_kr_stock_analysis(session_id)
 
-    assert kr_sessions[session_id]["status"] == "cancelled"
+    assert kr_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.CANCELLED
     msg = await asyncio.wait_for(queue.get(), timeout=1)
@@ -288,38 +284,46 @@ async def test_cancel_route_mirrors_cancelled_status(sm, kr_sessions):
 
 
 async def test_cancel_clears_awaiting_flag_on_legacy_and_sm(sm, kr_sessions):
+    """P2-3: there is no separate legacy-dict copy to desync from the sm
+    anymore -- the zombie-resurrection guard this test pins now applies to
+    the SM's own state directly (a restart resurrects from SQLite, not from
+    an in-process dict)."""
     session_id = "kr-cancel-clear-1"
-    record = _seed_session(kr_sessions, session_id)
-    record["status"] = "awaiting_approval"
-    record["state"]["awaiting_approval"] = True
-    record["state"]["trade_proposal"] = {"id": "p1", "action": "HOLD"}
     await _seed_sm_session(sm, session_id)
-    await sm.update_state(session_id, {"awaiting_approval": True})
+    await sm.update_state(
+        session_id,
+        {"awaiting_approval": True, "trade_proposal": {"id": "p1", "action": "HOLD"}},
+    )
     await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
 
     await cancel_kr_stock_analysis(session_id)
 
-    # Legacy dict cleared (pinned)
-    assert record["state"]["awaiting_approval"] is False
-    assert record["state"]["approval_status"] == "cancelled"
+    assert kr_sessions == {}
 
-    # sm mirror cleared too — without this, a restart resurrects the session
-    # as AWAITING_APPROVAL with awaiting_approval still True (zombie).
+    # Without this, a restart resurrects the session as AWAITING_APPROVAL
+    # with awaiting_approval still True (zombie).
     session = await sm.get_session(session_id)
     assert session.state.get("awaiting_approval") is False
     assert session.state.get("approval_status") == "cancelled"
     assert session.status == SessionStatus.CANCELLED
 
 
-async def test_cancel_mirror_failure_is_surfaced_not_swallowed(sm, kr_sessions, monkeypatch):
-    """A failing sm mirror during cancel must not silently plant a zombie —
-    the local cancel still succeeds, but the response says mirror_failed=True
-    and the failure is logged at error (not warning) level."""
+async def test_cancel_failure_is_surfaced_as_503_not_swallowed(sm, kr_sessions, monkeypatch):
+    """P2-3: with the SM as the sole store, a persistent write failure during
+    cancel can no longer be treated as a best-effort 'mirror' -- there is no
+    second store whose local success could paper over it. It now fails loud
+    (503) after one retry instead of returning 200 with mirror_failed=True
+    (the old dual-store semantics from test_cancel_mirror_failure_is_
+    surfaced_not_swallowed). Without this, a silently-accepted cancel could
+    leave the SM row stuck AWAITING_APPROVAL with awaiting_approval still
+    True -- a restart-time zombie."""
     session_id = "kr-cancel-mirror-fail-1"
-    _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
+    calls = {"n": 0}
+
     async def boom(*args, **kwargs):
+        calls["n"] += 1
         raise RuntimeError("sqlite down")
 
     monkeypatch.setattr(sm, "update_status", boom)
@@ -334,16 +338,21 @@ async def test_cancel_mirror_failure_is_surfaced_not_swallowed(sm, kr_sessions, 
 
     monkeypatch.setattr(analysis_mod.logger, "error", fake_error)
 
-    response = await cancel_kr_stock_analysis(session_id)
+    with pytest.raises(HTTPException) as exc_info:
+        await cancel_kr_stock_analysis(session_id)
 
-    # Local cancel still succeeds despite the mirror failure
-    assert kr_sessions[session_id]["status"] == "cancelled"
-    assert kr_sessions[session_id]["state"]["awaiting_approval"] is False
+    assert exc_info.value.status_code == 503
+    assert calls["n"] == 2  # one retry, then fail closed
 
-    assert response["mirror_failed"] is True
-    assert logged["event"] == "kr_stock_analysis_cancel_mirror_failed"
+    assert logged["event"] == "kr_stock_analysis_cancel_failed"
     assert logged["kwargs"]["session_id"] == session_id
     assert "sqlite down" in logged["kwargs"]["error"]
+
+    # The sm row was never actually transitioned -- no zombie
+    # AWAITING_APPROVAL-with-awaiting_approval=True shape was created.
+    session = await sm.get_session(session_id)
+    assert session.status == SessionStatus.RUNNING
+    assert kr_sessions == {}
 
 
 async def test_cancel_mirror_success_reports_mirror_failed_false(sm, kr_sessions):
@@ -365,13 +374,12 @@ async def test_cancel_route_serializes_against_concurrent_decision_lock_holder(s
     """(I3) cancel must wait if another decision (e.g. an in-flight reject
     resume through /decide) currently holds the per-session decision lock for
     this session_id — otherwise the cancel races the resume directly against
-    the legacy dict + sm mirror, and whichever writes last silently wins even
-    if it is the stale one.
+    the sm, and whichever writes last silently wins even if it is the stale
+    one.
     """
     import app.api.routes.approval as approval_module
 
     session_id = "kr-cancel-lock-1"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
     lock_acquired = asyncio.Event()
@@ -398,8 +406,10 @@ async def test_cancel_route_serializes_against_concurrent_decision_lock_holder(s
     await holder
     result = await cancel_task
 
-    assert record["status"] == "cancelled"
+    session = await sm.get_session(session_id)
+    assert session.status == SessionStatus.CANCELLED
     assert result["mirror_failed"] is False
+    assert kr_sessions == {}
 
     # Lock bookkeeping fully pruned afterwards.
     assert approval_module._decision_locks == {}
@@ -412,47 +422,45 @@ async def test_cancel_route_serializes_against_concurrent_decision_lock_holder(s
 
 
 async def test_cancel_route_refuses_completed_session_409(sm, kr_sessions):
-    from fastapi import HTTPException
-
     session_id = "kr-cancel-done-1"
-    record = _seed_session(kr_sessions, session_id)
-    record["status"] = "completed"
     await _seed_sm_session(sm, session_id)
+    await sm.update_status(session_id, SessionStatus.COMPLETED)
 
     with pytest.raises(HTTPException) as exc_info:
         await cancel_kr_stock_analysis(session_id)
 
     assert exc_info.value.status_code == 409
-    assert record["status"] == "completed"  # not flipped to cancelled
+    session = await sm.get_session(session_id)
+    assert session.status == SessionStatus.COMPLETED  # not flipped to cancelled
+    assert kr_sessions == {}
 
 
 async def test_cancel_route_refuses_error_session_409(sm, kr_sessions):
-    from fastapi import HTTPException
-
     session_id = "kr-cancel-err-1"
-    record = _seed_session(kr_sessions, session_id)
-    record["status"] = "error"
     await _seed_sm_session(sm, session_id)
+    await sm.update_status(session_id, SessionStatus.ERROR)
 
     with pytest.raises(HTTPException) as exc_info:
         await cancel_kr_stock_analysis(session_id)
 
     assert exc_info.value.status_code == 409
-    assert record["status"] == "error"  # not flipped to cancelled
+    session = await sm.get_session(session_id)
+    assert session.status == SessionStatus.ERROR  # not flipped to cancelled
+    assert kr_sessions == {}
 
 
 async def test_cancel_route_still_200s_for_awaiting_session(sm, kr_sessions):
     """Normal case unchanged: an actively-running (not yet settled) session
     cancels cleanly with 200."""
     session_id = "kr-cancel-normal-1"
-    record = _seed_session(kr_sessions, session_id)
-    await _seed_sm_session(sm, session_id)
-    assert record["status"] == "running"  # _seed_session default
+    await _seed_sm_session(sm, session_id)  # RUNNING by default
 
     response = await cancel_kr_stock_analysis(session_id)
 
     assert response["mirror_failed"] is False
-    assert record["status"] == "cancelled"
+    session = await sm.get_session(session_id)
+    assert session.status == SessionStatus.CANCELLED
+    assert kr_sessions == {}
 
 
 # -------------------------------------------
@@ -460,10 +468,20 @@ async def test_cancel_route_still_200s_for_awaiting_session(sm, kr_sessions):
 # -------------------------------------------
 
 
-async def test_analysis_task_survives_sm_mirror_failure(sm, kr_sessions, monkeypatch):
-    """A SessionManager hiccup (e.g. SQLite lock) must not abort a healthy run."""
+async def test_analysis_task_propagates_sm_write_failure_but_releases_slot(
+    sm, kr_sessions, monkeypatch
+):
+    """P2-3: with the SM as the SOLE write target (all mirror_* calls
+    replaced by direct sm.update_state/update_status), a SessionManager
+    write failure is a REAL failure now — it propagates instead of being
+    silently swallowed the way the old best-effort mirror_session_state/
+    mirror_session_status wrappers used to (superseding this test's old
+    'a mirror failure must not abort a healthy run' premise, which no longer
+    holds: there is no second store whose local success could paper over an
+    SM outage). The analysis slot must still be released via `finally`, so a
+    persistent SQLite outage doesn't also starve the concurrency semaphore
+    for every other ticker."""
     session_id = "kr-guard-1"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
     async def boom(*args, **kwargs):
@@ -472,6 +490,15 @@ async def test_analysis_task_survives_sm_mirror_failure(sm, kr_sessions, monkeyp
     monkeypatch.setattr(sm, "update_state", boom)
     monkeypatch.setattr(sm, "update_status", boom)
 
+    released = {"n": 0}
+
+    def counting_release():
+        released["n"] += 1
+
+    monkeypatch.setattr(
+        "app.api.routes.kr_stocks.analysis.release_analysis_slot", counting_release
+    )
+
     _patch_graph(
         monkeypatch,
         FakeGraph([
@@ -479,23 +506,29 @@ async def test_analysis_task_survives_sm_mirror_failure(sm, kr_sessions, monkeyp
         ]),
     )
 
-    await run_kr_stock_analysis_task(session_id)
+    with pytest.raises(RuntimeError):
+        await run_kr_stock_analysis_task(session_id)
 
-    assert record["status"] == "completed", "mirror failure must not fail the analysis"
-    assert record["error"] is None
+    assert released["n"] == 1, "the analysis slot must still be released via finally"
+    assert kr_sessions == {}
 
 
 async def test_start_route_failfast_on_sm_registration_failure(sm, kr_sessions, fake_kiwoom, monkeypatch):
-    """P1-5: sm registration failure must fail the start route loud (503), not
+    """P1-5: sm reservation failure must fail the start route loud (503), not
     silently degrade to poll-only -- with C-only reads (SESSION_SSOT_READS,
     the default) a session the SM never registered is invisible to every read
     surface, so a 200 "started" response here would be lying to the caller.
-    Supersedes the pre-P1-5 "must degrade" contract this test used to assert."""
+
+    P2-3: the atomic reservation (`create_session_if_no_active`) IS the
+    registration call now -- there is no separate legacy-dict placeholder
+    left behind to mark "error" on failure; the reservation itself simply
+    never lands, so nothing is created anywhere.
+    """
 
     async def boom(*args, **kwargs):
         raise RuntimeError("sqlite down")
 
-    monkeypatch.setattr(sm, "create_session", boom)
+    monkeypatch.setattr(sm, "create_session_if_no_active", boom)
 
     with pytest.raises(HTTPException) as exc_info:
         await start_kr_stock_analysis(
@@ -503,16 +536,13 @@ async def test_start_route_failfast_on_sm_registration_failure(sm, kr_sessions, 
         )
 
     assert exc_info.value.status_code == 503
-    # The legacy dict record still exists (created before the sm call) but is
-    # marked error, not left as a silently-running phantom.
-    session_id = next(iter(kr_sessions))
-    assert kr_sessions[session_id]["status"] == "error"
+    assert kr_sessions == {}
+    assert await sm.get_all_sessions(market_type=MarketType.KIWOOM) == {}
 
 
 async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, kr_sessions, monkeypatch):
     """User cancel during a run must stick — the task's final status write must not flap it."""
     session_id = "kr-cancelflap-1"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
     class CancellingGraph:
@@ -526,7 +556,7 @@ async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, kr_sessions
 
     await run_kr_stock_analysis_task(session_id)
 
-    assert record["status"] == "cancelled"
+    assert kr_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.CANCELLED
 
@@ -534,7 +564,6 @@ async def test_cancel_mid_run_is_not_overwritten_by_final_status(sm, kr_sessions
 async def test_state_error_branch_mirrors_error(sm, kr_sessions, monkeypatch):
     """A graph that finishes cleanly WITH state['error'] set must mirror ERROR."""
     session_id = "kr-stateerr-1"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
     _patch_graph(
@@ -549,7 +578,7 @@ async def test_state_error_branch_mirrors_error(sm, kr_sessions, monkeypatch):
 
     await run_kr_stock_analysis_task(session_id)
 
-    assert record["status"] == "error"
+    assert kr_sessions == {}
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.ERROR
     assert "키움" in (session.error or "")
@@ -557,7 +586,6 @@ async def test_state_error_branch_mirrors_error(sm, kr_sessions, monkeypatch):
 
 async def test_slot_timeout_mirrors_error(sm, kr_sessions, monkeypatch):
     session_id = "kr-slot-1"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
     async def no_slot(timeout=60.0):
@@ -567,13 +595,12 @@ async def test_slot_timeout_mirrors_error(sm, kr_sessions, monkeypatch):
 
     await run_kr_stock_analysis_task(session_id)
 
-    assert record["status"] == "error"
+    assert kr_sessions == {}
     assert (await sm.get_session(session_id)).status == SessionStatus.ERROR
 
 
 async def test_cancel_during_slot_wait_keeps_cancelled(sm, kr_sessions, monkeypatch):
     session_id = "kr-cancelslot-1"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
     async def cancel_then_timeout(timeout=60.0):
@@ -584,7 +611,7 @@ async def test_cancel_during_slot_wait_keeps_cancelled(sm, kr_sessions, monkeypa
 
     await run_kr_stock_analysis_task(session_id)
 
-    assert record["status"] == "cancelled"
+    assert kr_sessions == {}
     assert (await sm.get_session(session_id)).status == SessionStatus.CANCELLED
 
 
@@ -592,7 +619,6 @@ async def test_cancel_then_graph_exception_keeps_cancelled(sm, kr_sessions, monk
     """Terminal cancelled must survive the exception path too (same invariant
     as the normal-completion flap guard)."""
     session_id = "kr-cancelerr-1"
-    record = _seed_session(kr_sessions, session_id)
     await _seed_sm_session(sm, session_id)
 
     class CancelThenExplodeGraph:
@@ -605,7 +631,7 @@ async def test_cancel_then_graph_exception_keeps_cancelled(sm, kr_sessions, monk
 
     await run_kr_stock_analysis_task(session_id)
 
-    assert record["status"] == "cancelled"
+    assert kr_sessions == {}
     assert (await sm.get_session(session_id)).status == SessionStatus.CANCELLED
 
 
@@ -847,14 +873,35 @@ async def test_status_endpoint_falls_back_to_sm_when_legacy_dict_misses(sm, kr_s
     assert response.trade_proposal.quantity == 10
 
 
-async def test_status_endpoint_prefers_legacy_dict_over_sm(sm, kr_sessions):
-    """Normal (non-restart) case is unchanged: when the legacy dict has the
-    session, it wins — no sm lookup needed."""
+async def test_status_endpoint_serves_completed_session_from_sm(sm, kr_sessions):
+    """P2-3 finding: this test used to be named '..._prefers_legacy_dict_
+    over_sm' and asserted that a directly-seeded legacy-dict session wins
+    over the sm when SESSION_SSOT_READS is on (the default) -- but the
+    status route's True branch (`get_kr_stock_analysis_status`, unchanged by
+    P2-3 per design decision #6: the kill-switch False branch is left alone)
+    reads the SessionManager EXCLUSIVELY and never even looks at the legacy
+    dict, so that premise was already false pre-P2-3 (confirmed: this test
+    failed the same way against the pre-P2-3 HEAD revision too -- a
+    pre-existing bug unrelated to this task, not introduced by it). Now that
+    the producer never populates the legacy dict at all (P2-3), the scenario
+    it purported to test can no longer arise in production either way; kept
+    as a direct-seed variant of test_status_endpoint_falls_back_to_sm_when_
+    legacy_dict_misses below (seeds the sm directly instead of driving the
+    full run_kr_stock_analysis_task pipeline)."""
     from app.api.routes.kr_stocks.analysis import get_kr_stock_analysis_status
 
     session_id = "kr-legacy-wins-1"
-    record = _seed_session(kr_sessions, session_id)
-    record["status"] = "completed"
+    await sm.create_session(
+        session_id=session_id,
+        market_type=MarketType.KIWOOM,
+        ticker="005930",
+        display_name="삼성전자",
+        stk_cd="005930",
+        stk_nm="삼성전자",
+        state={"reasoning_log": [], "current_stage": "data_collection"},
+    )
+    await sm.update_status(session_id, SessionStatus.COMPLETED)
+    assert kr_sessions == {}
 
     response = await get_kr_stock_analysis_status(session_id)
 

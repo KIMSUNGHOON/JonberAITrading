@@ -140,8 +140,11 @@ async def test_kr_start_position_exists_true_for_held_ticker(sm, kr_sessions, mo
 
     assert response.duplicate is False
     assert response.position_exists is True
-    # The flag is threaded into the session's state, so /status agrees too.
-    assert kr_stock_sessions_state(kr_sessions, response.session_id)["position_exists"] is True
+    # P2-3: the flag is threaded into the sm session's state (the sole
+    # store), so /status agrees too.
+    session = await sm.get_session(response.session_id)
+    assert session.state["position_exists"] is True
+    assert kr_sessions == {}
 
 
 async def test_kr_start_position_exists_false_for_unheld_ticker(sm, kr_sessions, monkeypatch):
@@ -152,7 +155,8 @@ async def test_kr_start_position_exists_false_for_unheld_ticker(sm, kr_sessions,
     )
 
     assert response.position_exists is False
-    assert kr_stock_sessions_state(kr_sessions, response.session_id)["position_exists"] is False
+    session = await sm.get_session(response.session_id)
+    assert session.state["position_exists"] is False
 
 
 async def test_kr_start_position_exists_defaults_false_on_broker_failure(
@@ -181,10 +185,6 @@ async def test_kr_start_position_exists_defaults_false_on_broker_failure(
 
     assert response.status == "started"
     assert response.position_exists is False
-
-
-def kr_stock_sessions_state(kr_sessions, session_id):
-    return kr_sessions[session_id]["state"]
 
 
 # -------------------------------------------
@@ -260,23 +260,13 @@ async def test_coin_start_position_exists_false_for_zero_quantity_position(
 async def test_kr_dedup_hit_reports_position_exists_from_session_state(
     sm, kr_sessions, monkeypatch
 ):
+    """P2-3: the dedup hit's `existing` session comes straight from the sm
+    (the atomic `create_session_if_no_active` reservation's collision
+    branch) -- position_exists must be sourced from ITS state, not a legacy
+    dict (which is never populated in the first place)."""
     from app.api.routes.kr_stocks.helpers import find_active_kr_session  # noqa: F401  (sanity import)
 
     existing_id = "kr-existing-held-1"
-    kr_sessions[existing_id] = {
-        "session_id": existing_id,
-        "stk_cd": "005930",
-        "stk_nm": "삼성전자",
-        "status": "running",
-        "state": {
-            "stk_cd": "005930",
-            "reasoning_log": [],
-            "current_stage": "data_collection",
-            "position_exists": True,
-        },
-        "created_at": None,
-        "error": None,
-    }
     from services.session_manager import MarketType, SessionStatus
 
     await sm.create_session(
@@ -286,7 +276,12 @@ async def test_kr_dedup_hit_reports_position_exists_from_session_state(
         display_name="삼성전자",
         stk_cd="005930",
         stk_nm="삼성전자",
-        state={"stk_cd": "005930", "reasoning_log": [], "current_stage": "data_collection"},
+        state={
+            "stk_cd": "005930",
+            "reasoning_log": [],
+            "current_stage": "data_collection",
+            "position_exists": True,
+        },
     )
     await sm.update_status(existing_id, SessionStatus.RUNNING)
 

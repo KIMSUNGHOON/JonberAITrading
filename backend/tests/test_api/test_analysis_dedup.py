@@ -237,7 +237,13 @@ async def test_kr_start_allows_new_analysis_after_settled_session(
 
     assert response.session_id != prior_id
     assert response.duplicate is False
-    assert len(kr_sessions) == 2  # the settled one + the freshly-started one
+    # P2-3: the producer writes the SM only -- `kr_sessions` here still has
+    # its ONE fixture-seeded entry (the settled prior session, planted
+    # directly by this test's own setup, not by the route) and gains no
+    # second entry from the fresh start.
+    assert len(kr_sessions) == 1
+    all_sessions = await sm.get_all_sessions(market_type=MarketType.KIWOOM)
+    assert len(all_sessions) == 2  # the settled one + the freshly-started one
     assert len(bg.tasks) == 1  # a new graph run WAS queued
 
 
@@ -290,11 +296,13 @@ async def test_kr_start_concurrent_same_ticker_only_one_session_created(
 ):
     """Two near-simultaneous starts for the SAME stk_cd, with NO prior
     session: task A is parked mid-lookup (blocked inside `get_stock_info` on
-    `gate`) — by the time it parks there, the fix must already have written
-    A's placeholder into `kr_stock_sessions` (synchronously, before the
-    kiwoom awaits). Task B's start, arriving while A is still parked, must
-    then see that placeholder via `find_active_kr_session` and dedup onto it
-    instead of minting a second session + a second graph run."""
+    `gate`) — by the time it parks there, `sm.create_session_if_no_active`
+    must already have reserved A's session in the SessionManager (P2-3: the
+    atomic reservation happens entirely BEFORE any kiwoom await, replacing
+    the old synchronous-B-placeholder-before-awaits ordering trick). Task
+    B's start, arriving while A is still parked, must then see that
+    reservation and dedup onto it instead of minting a second session + a
+    second graph run."""
     gate = asyncio.Event()
 
     class _BlockingClient:
@@ -318,15 +326,16 @@ async def test_kr_start_concurrent_same_ticker_only_one_session_created(
     )
 
     # Let task A run up to (and park inside) the gated get_stock_info call —
-    # by construction of the fix this is AFTER the synchronous placeholder
-    # write and BEFORE the kiwoom name lookup resolves.
+    # by construction of the fix this is AFTER the atomic sm reservation and
+    # BEFORE the kiwoom name lookup resolves.
     for _ in range(50):
         await asyncio.sleep(0)
-        if kr_sessions:
+        if sm._sessions:
             break
-    assert len(kr_sessions) == 1, "A's placeholder must already be recorded"
-    existing_id = next(iter(kr_sessions))
-    assert kr_sessions[existing_id]["status"] == "running"
+    assert len(sm._sessions) == 1, "A's sm reservation must already be recorded"
+    existing_id = next(iter(sm._sessions))
+    assert sm._sessions[existing_id].status == SessionStatus.RUNNING
+    assert kr_sessions == {}, "P2-3: the legacy dict is never written"
 
     # Task B "arrives" while A is still parked — same stk_cd, no gating on
     # its own client lookup needed since it must dedup before reaching it.
@@ -338,7 +347,7 @@ async def test_kr_start_concurrent_same_ticker_only_one_session_created(
     assert response_b.duplicate is True
     assert response_b.session_id == existing_id
     assert bg_b.tasks == []  # no second graph run queued for B
-    assert len(kr_sessions) == 1  # still exactly one session record
+    assert len(sm._sessions) == 1  # still exactly one session record
 
     # Release A and let it finish.
     gate.set()
@@ -347,8 +356,9 @@ async def test_kr_start_concurrent_same_ticker_only_one_session_created(
     assert response_a.duplicate is False
     assert response_a.session_id == existing_id
     assert len(bg_a.tasks) == 1  # exactly one graph run total, from A
-    assert len(kr_sessions) == 1  # B never created a second entry
-    assert kr_sessions[existing_id]["stk_nm"] == "삼성전자"  # finalized after the lookup
+    assert len(sm._sessions) == 1  # B never created a second entry
+    assert sm._sessions[existing_id].stk_nm == "삼성전자"  # finalized after the lookup
+    assert kr_sessions == {}
 
 
 async def test_kr_start_cleans_up_placeholder_on_kiwoom_client_failure(
@@ -356,9 +366,9 @@ async def test_kr_start_cleans_up_placeholder_on_kiwoom_client_failure(
 ):
     """If resolving the kiwoom client itself blows up (distinct from the
     already-guarded, best-effort inner get_stock_info/get_account_balance
-    calls), the just-reserved placeholder must be removed. Otherwise a
-    stranded "running" session would permanently dedup-block all future
-    analysis of this ticker."""
+    calls), the just-reserved sm session must be removed (P2-3:
+    `session_manager.remove_session`). Otherwise a stranded "running" session
+    would permanently dedup-block all future analysis of this ticker."""
 
     async def _boom_client():
         raise RuntimeError("kiwoom client unavailable")
@@ -372,7 +382,8 @@ async def test_kr_start_cleans_up_placeholder_on_kiwoom_client_failure(
             KRStockAnalysisRequest(stk_cd="005930"), BackgroundTasks()
         )
 
-    assert len(kr_sessions) == 0  # no stranded placeholder left behind
+    assert len(sm._sessions) == 0  # no stranded reservation left behind
+    assert kr_sessions == {}
 
     # A subsequent analysis for the SAME ticker must not be blocked by
     # anything left over from the failed attempt.
@@ -388,7 +399,8 @@ async def test_kr_start_cleans_up_placeholder_on_kiwoom_client_failure(
 
     assert response.duplicate is False
     assert len(bg.tasks) == 1
-    assert len(kr_sessions) == 1
+    assert len(sm._sessions) == 1
+    assert kr_sessions == {}
 
 
 # -------------------------------------------
