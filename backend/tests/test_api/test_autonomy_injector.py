@@ -545,3 +545,37 @@ async def test_rearm_scans_sm_only(sm, monkeypatch):
 
     assert session_id in scheduled
 
+
+async def test_rearm_excludes_non_analysis_kind_session(sm, monkeypatch):
+    """P4-1: an AWAITING_APPROVAL session with kind='discussion' must never
+    be picked up as a rearm candidate -- only kind='analysis' sessions are
+    eligible for autonomous auto-approve scheduling. Pre-empts P4-2's future
+    agent-chat discussion sessions from being auto-approved as if they were
+    trade proposals."""
+    scheduled: list[str] = []
+
+    async def fake_schedule(session_id, market):
+        scheduled.append(session_id)
+
+    monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", fake_schedule)
+
+    discussion_id = "rearm-discussion-1"
+    await sm.create_session(
+        session_id=discussion_id,
+        market_type=MarketType.KIWOOM,
+        ticker="005930",
+        display_name="테스트",
+        kind="discussion",
+        state={
+            "awaiting_approval": True,
+            "approval_status": None,
+            "trade_proposal": {"id": "p-x", "action": "BUY", "quantity": 10},
+            "reasoning_log": [],
+        },
+    )
+    await sm.update_status(discussion_id, SessionStatus.AWAITING_APPROVAL)
+
+    await injector_module.rearm_awaiting_approvals()
+
+    assert scheduled == []
+

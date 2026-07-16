@@ -31,6 +31,7 @@ from services.trading import (
 )
 from app.dependencies import get_trading_coordinator
 from services.session_manager import (
+    KIND_ANALYSIS,
     MarketType as SessionMarketType,
     SessionStatus,
     get_session_manager,
@@ -1403,7 +1404,10 @@ async def get_operations(
     try:
         sm = await get_session_manager()
         mt = SessionMarketType.COIN if market == "coin" else SessionMarketType.KIWOOM
-        sessions = await sm.get_all_sessions(market_type=mt)
+        # P4-1: kind='analysis' only -- a discussion (or other non-analysis
+        # producer) session sharing the SM store must never surface as a
+        # ghost "analyzing"/"awaiting" card on the operations board.
+        sessions = await sm.get_all_sessions(market_type=mt, kind=KIND_ANALYSIS)
         analyzing, awaiting = [], []
         for s in sessions.values():
             if s.status == SessionStatus.RUNNING:

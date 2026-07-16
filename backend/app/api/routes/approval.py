@@ -24,6 +24,7 @@ from app.api.schemas.approval import (
 )
 from app.dependencies import get_trading_coordinator
 from services.session_manager import (
+    KIND_ANALYSIS,
     MarketType,
     SessionStatus,
     commit_session_state,
@@ -788,8 +789,11 @@ async def list_pending_approvals():
     """
     # P1 (session-SSOT): the SessionManager is the sole read source --
     # legacy in-memory dicts were retired in P3-1.
+    # P4-1: kind='analysis' only -- a discussion (or other non-analysis
+    # producer) session sharing the SM store must never be listed as a
+    # pending trade approval here.
     sm = await get_session_manager()
-    sm_sessions = await sm.get_all_sessions()
+    sm_sessions = await sm.get_all_sessions(kind=KIND_ANALYSIS)
     all_sessions = {
         sid: s.to_legacy_dict() for sid, s in sm_sessions.items()
     }

@@ -43,6 +43,7 @@ import structlog
 
 from services.autonomy import check_autonomy
 from services.session_manager import (
+    KIND_ANALYSIS,
     MarketType,
     SessionStatus,
     get_session_manager,
@@ -307,7 +308,12 @@ async def rearm_awaiting_approvals() -> None:
 
     try:
         manager = await get_session_manager()
-        sm_sessions = await manager.get_all_sessions(status=SessionStatus.AWAITING_APPROVAL)
+        # P4-1: kind='analysis' only -- a discussion (or other non-analysis
+        # producer) session sharing the SM store must never be re-armed for
+        # autonomous trade approval.
+        sm_sessions = await manager.get_all_sessions(
+            status=SessionStatus.AWAITING_APPROVAL, kind=KIND_ANALYSIS
+        )
     except Exception as e:
         logger.error("autonomy_rearm_sm_scan_failed", error=str(e))
         sm_sessions = {}

@@ -10,11 +10,11 @@ from services.trading.fill_costs import effective_pnl, effective_pnl_pct
 from services.kiwoom.models import FilledOrder, Holding, PendingOrder
 
 
-def _session(sid, status, state=None, stk_cd="005930", stk_nm="삼성전자"):
+def _session(sid, status, state=None, stk_cd="005930", stk_nm="삼성전자", kind="analysis"):
     return AnalysisSession(
         session_id=sid, market_type=MarketType.KIWOOM, ticker=stk_cd,
         display_name=stk_nm, status=status, state=state or {},
-        stk_cd=stk_cd, stk_nm=stk_nm,
+        stk_cd=stk_cd, stk_nm=stk_nm, kind=kind,
     )
 
 
@@ -39,11 +39,12 @@ def _kiwoom(pending=None, filled=None, holdings=None):
 def _sm(sessions):
     sm = MagicMock()
 
-    async def _get_all(market_type=None, status=None):
+    async def _get_all(market_type=None, status=None, kind=None):
         return {
             s.session_id: s for s in sessions
             if (market_type is None or s.market_type == market_type)
             and (status is None or s.status == status)
+            and (kind is None or s.kind == kind)
         }
 
     sm.get_all_sessions = AsyncMock(side_effect=_get_all)
@@ -313,6 +314,30 @@ async def test_operations_awaiting_approval_actionable_reflects_state_flag():
     by_id = {a.session_id: a for a in res.awaiting}
     assert by_id["s-actionable"].actionable is True
     assert by_id["s-zombie"].actionable is False
+
+
+async def test_operations_excludes_non_analysis_kind_sessions():
+    """P4-1: a kind='discussion' session sharing the SM store must never
+    surface on /operations -- neither as 'analyzing' (RUNNING) nor as
+    'awaiting' (AWAITING_APPROVAL). Guards against P4-2's future agent-chat
+    discussion sessions polluting the operations board with ghost cards."""
+    analysis_running = _session("s-analysis-run", SessionStatus.RUNNING)
+    discussion_running = _session(
+        "s-discussion-run", SessionStatus.RUNNING, kind="discussion"
+    )
+    discussion_awaiting = _session(
+        "s-discussion-await", SessionStatus.AWAITING_APPROVAL, kind="discussion",
+        state={"trade_proposal": {"id": "p1", "action": "BUY"}, "awaiting_approval": True},
+    )
+
+    with patch.object(
+        trading_mod, "get_session_manager",
+        AsyncMock(return_value=_sm([analysis_running, discussion_running, discussion_awaiting])),
+    ):
+        res = await trading_mod.get_operations(market="kiwoom", coordinator=_coordinator())
+
+    assert [a.session_id for a in res.analyzing] == ["s-analysis-run"]
+    assert res.awaiting == []
 
 
 async def test_operations_coin_market_returns_sessions_only():

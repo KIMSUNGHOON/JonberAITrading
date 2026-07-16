@@ -189,6 +189,29 @@ async def test_kr_dedup_reads_sm_directly(sm):
     assert found["session_id"] == existing_id
 
 
+async def test_kr_dedup_ignores_non_analysis_kind_session(sm):
+    """P4-1: a kind='discussion' session for the SAME stk_cd must never be
+    picked up by find_active_kr_session -- only kind='analysis' sessions are
+    'active' from this scanner's point of view. Pre-empts P4-2's future
+    agent-chat discussion sessions from being absorbed as a duplicate."""
+    discussion_id = "kr-discussion-1"
+    await sm.create_session(
+        session_id=discussion_id,
+        market_type=MarketType.KIWOOM,
+        ticker="005930",
+        display_name="삼성전자",
+        stk_cd="005930",
+        stk_nm="삼성전자",
+        kind="discussion",
+        state={"reasoning_log": []},
+    )
+    await sm.update_status(discussion_id, SessionStatus.RUNNING)
+
+    found = await find_active_kr_session("005930")
+
+    assert found is None
+
+
 async def test_kr_start_ticker_isolation_different_stk_cd_not_blocked(
     sm, fake_kiwoom
 ):
@@ -390,6 +413,28 @@ async def test_coin_dedup_reads_sm_directly(sm):
 
     assert found is not None
     assert found["session_id"] == existing_id
+
+
+async def test_coin_dedup_ignores_non_analysis_kind_session(sm):
+    """P4-1: coin counterpart of the KR guard above -- a kind='discussion'
+    session for the SAME market must never be picked up by
+    find_active_coin_session."""
+    discussion_id = "coin-discussion-1"
+    await sm.create_session(
+        session_id=discussion_id,
+        market_type=MarketType.COIN,
+        ticker="KRW-BTC",
+        display_name="비트코인",
+        market="KRW-BTC",
+        korean_name="비트코인",
+        kind="discussion",
+        state={"reasoning_log": []},
+    )
+    await sm.update_status(discussion_id, SessionStatus.RUNNING)
+
+    found = await find_active_coin_session("KRW-BTC")
+
+    assert found is None
 
 
 async def test_coin_start_ticker_isolation_different_market_not_blocked(

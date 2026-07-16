@@ -41,6 +41,17 @@ DB_PATH = "data/sessions.db"
 # (realtime favors the latest state), so a slow/dead socket cannot grow unbounded.
 SUBSCRIBER_QUEUE_MAXSIZE = 256
 
+# P4-1 (session-SSOT): the SessionManager store is about to gain a second
+# producer (P4-2's agent-chat discussion sessions) sharing the exact same
+# `analysis_sessions` table. `kind` distinguishes the two so market-wide
+# scans (ticker dedup, /operations, /pending, autonomy rearm) keep seeing
+# ONLY the analysis-pipeline sessions they were built for -- a discussion
+# session must never be absorbed as a dedup "duplicate" of a real analysis
+# run, nor show up as a ghost card on the operations board. Every existing
+# session (and every caller that doesn't pass `kind` explicitly) defaults to
+# this value, so today's behavior is byte-identical after this change.
+KIND_ANALYSIS = "analysis"
+
 # state_updates keys that can hide an "invisible interrupt" (P1 spec Sec.P1) if
 # their SQLite write is delayed -- a session parked awaiting approval that a
 # restart-time reload wouldn't see yet. update_state() flushes synchronously
@@ -78,6 +89,11 @@ class AnalysisSession:
     market_type: MarketType
     ticker: str                          # AAPL, KRW-BTC, 005930
     display_name: str                    # Apple Inc, 비트코인, 삼성전자
+    # P4-1: which producer this session belongs to -- "analysis" (default,
+    # today's only value) vs. e.g. a future "discussion" kind. Global scans
+    # filter on this so non-analysis producers sharing this store can never
+    # pollute analysis-only consumers.
+    kind: str = KIND_ANALYSIS
     status: SessionStatus = SessionStatus.RUNNING
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -127,6 +143,7 @@ class AnalysisSession:
             "created_at": self.created_at,
             "error": self.error,
             "last_node": self.last_node,
+            "kind": self.kind,
         }
 
         if self.market_type == MarketType.STOCK:
@@ -253,9 +270,22 @@ class SessionManager:
                         stk_cd TEXT,
                         stk_nm TEXT,
                         market TEXT,
-                        korean_name TEXT
+                        korean_name TEXT,
+                        kind TEXT NOT NULL DEFAULT 'analysis'
                     )
                 """)
+
+                # P4-1: this project has no migration mechanism -- a column
+                # added to the schema after a DB file was first created only
+                # ever appears on that file via this ALTER path (see
+                # _ensure_columns; ported from services/storage_service.py's
+                # helper of the same name/pattern). Kept nullable here even
+                # though the CREATE TABLE above defaults new rows to
+                # 'analysis' -- SQLite ADD COLUMN cannot backfill existing
+                # rows with a caller-supplied default via this helper, so old
+                # rows land NULL and _row_to_session() falls back to
+                # KIND_ANALYSIS when reading them back.
+                await self._ensure_columns(db, "analysis_sessions", {"kind": "TEXT"})
 
                 # Create indexes for common queries
                 await db.execute("""
@@ -273,6 +303,10 @@ class SessionManager:
                 await db.execute("""
                     CREATE INDEX IF NOT EXISTS idx_sessions_created_at
                     ON analysis_sessions(created_at DESC)
+                """)
+                await db.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_sessions_kind
+                    ON analysis_sessions(kind)
                 """)
 
                 await db.commit()
@@ -316,6 +350,26 @@ class SessionManager:
                     session = self._row_to_session(row)
                     self._sessions[session.session_id] = session
 
+    @staticmethod
+    async def _ensure_columns(
+        db: "aiosqlite.Connection", table: str, cols: Dict[str, str]
+    ) -> None:
+        """Add any of `cols` missing from `table` via ALTER TABLE ADD COLUMN.
+
+        Ported from services/storage_service.py's `_ensure_columns` (same
+        name, same contract) -- this project has no migration mechanism, so
+        a column added to the schema after a DB file was first created only
+        ever appears on that file via this ALTER path on the next
+        initialize(). Every column added this way must be nullable (no
+        DEFAULT/NOT NULL requirement), since SQLite's ADD COLUMN cannot
+        backfill existing rows with anything but a constant.
+        """
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cursor.fetchall()}
+        for name, col_type in cols.items():
+            if name not in existing:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+
     def _row_to_session(self, row: aiosqlite.Row) -> AnalysisSession:
         """Convert a SQLite row to AnalysisSession."""
         state = {}
@@ -344,6 +398,7 @@ class SessionManager:
             stk_nm=row["stk_nm"],
             market=row["market"],
             korean_name=row["korean_name"],
+            kind=row["kind"] or KIND_ANALYSIS,
         )
 
     async def reconcile_stranded_sessions(
@@ -504,6 +559,7 @@ class SessionManager:
         market_type: MarketType,
         ticker: str,
         display_name: str,
+        kind: str = KIND_ANALYSIS,
         **kwargs,
     ) -> AnalysisSession:
         """
@@ -514,6 +570,8 @@ class SessionManager:
             market_type: Type of market (stock, coin, kiwoom)
             ticker: Stock/coin code
             display_name: Human-readable name
+            kind: Session producer kind (P4-1) -- defaults to "analysis" so
+                every existing caller is unaffected.
             **kwargs: Additional fields (stk_cd, stk_nm, market, korean_name)
 
         Returns:
@@ -526,6 +584,7 @@ class SessionManager:
             market_type=market_type,
             ticker=ticker,
             display_name=display_name,
+            kind=kind,
             stk_cd=kwargs.get("stk_cd"),
             stk_nm=kwargs.get("stk_nm"),
             market=kwargs.get("market"),
@@ -554,6 +613,7 @@ class SessionManager:
         market_type: MarketType,
         ticker: str,
         display_name: str,
+        kind: str = KIND_ANALYSIS,
         **kwargs,
     ) -> tuple[Optional[AnalysisSession], Optional[AnalysisSession]]:
         """
@@ -574,6 +634,12 @@ class SessionManager:
             market_type: Type of market (stock, coin, kiwoom)
             ticker: Stock/coin code
             display_name: Human-readable name
+            kind: Session producer kind (P4-1) -- defaults to "analysis".
+                The active-collision check below only ever compares
+                candidates of the SAME kind, so a reservation for one kind
+                (e.g. a future "discussion" producer) can never collide with
+                -- or be blocked by -- an active session of a different kind
+                for the same (market_type, ticker).
             **kwargs: Additional fields (stk_cd, stk_nm, market, korean_name, state)
 
         Returns:
@@ -587,6 +653,8 @@ class SessionManager:
         async with self._lock:
             for candidate in self._sessions.values():
                 if candidate.market_type != market_type:
+                    continue
+                if candidate.kind != kind:
                     continue
                 candidate_ticker = candidate.stk_cd or candidate.market or candidate.ticker
                 if candidate_ticker != ticker:
@@ -603,6 +671,7 @@ class SessionManager:
                 market_type=market_type,
                 ticker=ticker,
                 display_name=display_name,
+                kind=kind,
                 stk_cd=kwargs.get("stk_cd"),
                 stk_nm=kwargs.get("stk_nm"),
                 market=kwargs.get("market"),
@@ -628,8 +697,8 @@ class SessionManager:
                 INSERT OR REPLACE INTO analysis_sessions
                 (session_id, market_type, ticker, display_name, status,
                  created_at, updated_at, error, last_node, state_json,
-                 stk_cd, stk_nm, market, korean_name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 stk_cd, stk_nm, market, korean_name, kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 session.session_id,
                 session.market_type.value if isinstance(session.market_type, MarketType) else session.market_type,
@@ -645,6 +714,7 @@ class SessionManager:
                 session.stk_nm,
                 session.market,
                 session.korean_name,
+                session.kind,
             ))
             await db.commit()
 
@@ -805,6 +875,7 @@ class SessionManager:
         self,
         market_type: Optional[MarketType] = None,
         status: Optional[SessionStatus] = None,
+        kind: Optional[str] = None,
     ) -> Dict[str, AnalysisSession]:
         """
         Get all sessions, optionally filtered.
@@ -812,6 +883,9 @@ class SessionManager:
         Args:
             market_type: Filter by market type
             status: Filter by status
+            kind: Filter by session producer kind (P4-1). None (default) is
+                unfiltered -- every existing caller that doesn't pass this
+                keeps seeing every kind, preserving current behavior.
 
         Returns:
             Dict of session_id -> AnalysisSession
@@ -823,6 +897,8 @@ class SessionManager:
             if market_type and session.market_type != market_type:
                 continue
             if status and session.status != status:
+                continue
+            if kind and session.kind != kind:
                 continue
             result[session_id] = session
 

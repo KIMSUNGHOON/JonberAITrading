@@ -124,3 +124,33 @@ async def test_pending_detail_404_when_absent(client):
     resp = client.get("/api/approval/pending/ssot-p11-does-not-exist")
     assert resp.status_code == 404
 
+
+@pytest.mark.asyncio
+async def test_pending_excludes_non_analysis_kind_session(client):
+    """P4-1: a kind='discussion' session with awaiting_approval=True and a
+    trade_proposal (the exact predicate /pending checks) must NOT be listed
+    -- kind='analysis' is a precondition on top of the existing status-blind
+    predicate, not a replacement for it. Pre-empts P4-2's future agent-chat
+    discussion sessions from surfacing as a spurious pending approval."""
+    from services.session_manager import MarketType, get_session_manager
+
+    sm = await get_session_manager()
+    await sm.create_session(
+        "ssot-p41-discussion", MarketType.KIWOOM, "005930", "삼성전자",
+        stk_cd="005930", stk_nm="삼성전자",
+        kind="discussion",
+        state={
+            "awaiting_approval": True,
+            "trade_proposal": {"action": "BUY", "quantity": 1,
+                               "risk_score": 0.3, "rationale": "t",
+                               "created_at": "2026-07-16T00:00:00+00:00"},
+            "reasoning_log": [],
+        },
+    )
+
+    resp = client.get("/api/approval/pending")
+    ids = [p["session_id"] for p in resp.json()["pending_approvals"]]
+    assert "ssot-p41-discussion" not in ids
+
+    await sm.remove_session("ssot-p41-discussion")
+

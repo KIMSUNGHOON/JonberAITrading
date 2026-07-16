@@ -26,12 +26,20 @@ async def find_active_kr_session(stk_cd: str) -> Optional[dict]:
     This helper remains for any other caller that needs a plain "is this
     ticker active?" read (and for its own direct test coverage).
     """
-    from services.session_manager import MarketType, SessionStatus, get_session_manager
+    from services.session_manager import (
+        KIND_ANALYSIS,
+        MarketType,
+        SessionStatus,
+        get_session_manager,
+    )
 
     manager = await get_session_manager()
     for sm_status in (SessionStatus.RUNNING, SessionStatus.AWAITING_APPROVAL):
+        # P4-1: kind='analysis' only -- a discussion (or other non-analysis
+        # producer) session sharing the SM store must never be picked up as
+        # an "active session" here.
         sessions = await manager.get_all_sessions(
-            market_type=MarketType.KIWOOM, status=sm_status
+            market_type=MarketType.KIWOOM, status=sm_status, kind=KIND_ANALYSIS
         )
         for sm_session in sessions.values():
             if (sm_session.stk_cd or sm_session.ticker) == stk_cd:
