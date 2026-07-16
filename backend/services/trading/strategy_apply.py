@@ -12,17 +12,23 @@ them, the exact POST /trading/start bug this phase also fixes).
 
 SELF-DEREGULATION SEAL — the reason this is an explicit allowlist, not a
 dict walk: RiskParameters also carries the autonomy gate's hard caps
-(max_trade_notional_krw, max_open_positions, max_daily_loss_pct — the ONLY
+(max_trade_notional_pct, max_open_positions, max_daily_loss_pct — the ONLY
 three fields gate.py reads) plus the breaker/mode knobs. An LLM-adapted
 strategy must never be able to move those, so:
-  - STRATEGY_MAPPED_FIELDS enumerates the only 4 assignable fields, each
+  - STRATEGY_MAPPED_FIELDS enumerates the assignable fields, each
     with its own hard bounds (KNOB_BOUNDS-equivalent — the manual
     PUT /strategy path bypasses Phase 3's consensus clamps, so the mapping
     clamps independently);
   - GATE_PROTECTED_FIELDS is the tested denylist — see
     test_gate_protected_fields_never_move.
 
-Field priority: the 4 mapped fields become strategy-owned. A manual
+Phase5 결정B (자율 사이징): max_trade_notional_pct는 더 이상 GATE_PROTECTED가
+아니라 STRATEGY_MAPPED_FIELDS로 allowlist화됐다 — EOD 전략 합의가 1건당 명목
+상한을 [5, 30] 하드 바운드 내에서 적응시킬 수 있다(의도적 self-deregulation
+완화, 사용자 결정 B). 바운드 자체는 이 모듈이 독립적으로 클램프하므로 전략이
+아무리 극단값을 내놓아도 [5,30]% 밖으로는 못 나간다.
+
+Field priority: the mapped fields become strategy-owned. A manual
 PUT /risk-params edit of them survives only until the next set_strategy
 (EOD consensus / restart restore) — intended: the strategy is their SSOT.
 Clearing the strategy (set_strategy(None)) resets them to model defaults.
@@ -43,13 +49,13 @@ STRATEGY_MAPPED_FIELDS: dict[str, tuple[float, float]] = {
     "min_cash_ratio": (0.05, 0.50),
     "default_stop_loss_pct": (3.0, 15.0),
     "default_take_profit_pct": (5.0, 30.0),
+    "max_trade_notional_pct": (5.0, 30.0),
 }
 
 # 자율 게이트·브레이커·모드 필드 — 전략이 절대 못 움직인다(테스트로 봉인).
 GATE_PROTECTED_FIELDS: frozenset[str] = frozenset({
     "max_daily_loss_pct",
     "max_open_positions",
-    "max_trade_notional_krw",
     "stop_loss_mode",
     "take_profit_mode",
     "sudden_move_threshold_pct",
@@ -66,6 +72,7 @@ def _source_values(strategy: TradingStrategy) -> dict[str, float]:
         "min_cash_ratio": strategy.position_sizing.min_cash_ratio,
         "default_stop_loss_pct": strategy.exit_conditions.stop_loss_pct * 100.0,
         "default_take_profit_pct": strategy.exit_conditions.take_profit_pct * 100.0,
+        "max_trade_notional_pct": strategy.position_sizing.max_trade_notional_pct,
     }
 
 
@@ -76,11 +83,11 @@ def apply_strategy_to_risk_params(
     IN-PLACE. Returns {field: (before, after)} for fields that actually
     changed (for the STRATEGY_CHANGED activity log). strategy=None resets
     the mapped fields to model defaults ("no strategy = factory defaults").
-    The reset branch reports all 4 fields unconditionally (before may equal
-    after) — see the "deterministic, all-4-fields event" note above.
+    The reset branch reports all mapped fields unconditionally (before may
+    equal after) — see the "deterministic, all-fields event" note above.
     """
     if strategy is None:
-        # Reset is a deterministic, all-4-fields event for logging purposes
+        # Reset is a deterministic, all-fields event for logging purposes
         # (STRATEGY_CHANGED "cleared" detail) even if a given field's value
         # happens to coincide with the model default already (e.g. a
         # strategy that never overrode min_cash_ratio) — unlike the

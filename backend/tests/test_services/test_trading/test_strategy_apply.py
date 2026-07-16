@@ -1,8 +1,12 @@
 """Phase4 T2: strategy -> RiskParameters safe mapping.
 
-The self-deregulation seal: an LLM-adapted strategy may move ONLY the 4
+The self-deregulation seal: an LLM-adapted strategy may move ONLY the
 allowlisted sizing/stop knobs, never the autonomy-gate fields. The denylist
 invariant test here is the cheapest permanent seal against that vector.
+
+Phase5 결정B: max_trade_notional_pct는 이제 allowlist(STRATEGY_MAPPED_FIELDS)
+소속 — [5,30] 하드 바운드 내 자율 사이징 적응(test_strategy_notional_pct_
+clamped_to_bounds).
 """
 
 import pytest
@@ -30,9 +34,10 @@ def test_allowlist_and_denylist_are_disjoint_and_exact():
     assert set(STRATEGY_MAPPED_FIELDS) == {
         "max_single_position_pct", "min_cash_ratio",
         "default_stop_loss_pct", "default_take_profit_pct",
+        "max_trade_notional_pct",
     }
     assert GATE_PROTECTED_FIELDS == frozenset({
-        "max_daily_loss_pct", "max_open_positions", "max_trade_notional_krw",
+        "max_daily_loss_pct", "max_open_positions",
         "stop_loss_mode", "take_profit_mode", "sudden_move_threshold_pct",
         "sudden_move_cooldown_ticks", "sudden_move_stabilization_pct",
         "max_daily_trades",
@@ -44,10 +49,34 @@ def test_allowlist_and_denylist_are_disjoint_and_exact():
     assert GATE_PROTECTED_FIELDS <= fields
 
 
+def test_strategy_notional_pct_clamped_to_bounds():
+    """결정 B: EOD 전략 합의가 조정한 max_trade_notional_pct는 [5, 30] 하드
+    바운드 밖으로 못 나간다 — StrategyPreset에는 MODERATE가 없어(실제 enum은
+    CONSERVATIVE_INCOME/GROWTH_MOMENTUM/TECHNICAL_BREAKOUT/VALUE_INVESTING/
+    CUSTOM) risk_tolerance=MODERATE인 TECHNICAL_BREAKOUT 프리셋으로 대체."""
+    from services.trading.strategy import get_strategy_preset, StrategyPreset
+
+    rp = RiskParameters()
+    s = get_strategy_preset(StrategyPreset.TECHNICAL_BREAKOUT)
+    s.position_sizing.max_trade_notional_pct = 40.0  # > 상한 30
+    apply_strategy_to_risk_params(s, rp)
+    assert rp.max_trade_notional_pct == 30.0
+    s.position_sizing.max_trade_notional_pct = 2.0  # < 하한 5
+    apply_strategy_to_risk_params(s, rp)
+    assert rp.max_trade_notional_pct == 5.0
+
+
+def test_notional_pct_not_in_gate_protected():
+    assert "max_trade_notional_pct" in STRATEGY_MAPPED_FIELDS
+    assert "max_trade_notional_pct" not in GATE_PROTECTED_FIELDS
+    assert "max_trade_notional_krw" not in GATE_PROTECTED_FIELDS  # 필드 자체 제거
+
+
 def test_mapping_applies_with_unit_conversion_in_place():
     rp = RiskParameters()
     strategy = _strategy(max_position_pct=0.12, min_cash_ratio=0.25,
-                         stop_loss_pct=0.06, take_profit_pct=0.20)
+                         stop_loss_pct=0.06, take_profit_pct=0.20,
+                         max_trade_notional_pct=20.0)
     rp_id = id(rp)
     changes = apply_strategy_to_risk_params(strategy, rp)
     assert id(rp) == rp_id  # in-place, 객체 교체 없음
@@ -55,6 +84,7 @@ def test_mapping_applies_with_unit_conversion_in_place():
     assert rp.min_cash_ratio == pytest.approx(0.25)
     assert rp.default_stop_loss_pct == pytest.approx(6.0)   # 분율→퍼센트 ×100
     assert rp.default_take_profit_pct == pytest.approx(20.0)
+    assert rp.max_trade_notional_pct == pytest.approx(20.0)
     assert set(changes) == set(STRATEGY_MAPPED_FIELDS)
     assert changes["default_stop_loss_pct"] == (pytest.approx(8.0), pytest.approx(6.0))
 

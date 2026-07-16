@@ -103,6 +103,10 @@ class PositionSizingRules(BaseModel):
     max_sector_concentration: float = Field(default=0.30, ge=0.10, le=1.0)
     max_positions: int = Field(default=10, ge=1, le=50)
 
+    # Phase5 결정B: 1건당 명목 상한(% of equity) — strategy_apply가 [5,30] 하드
+    # 바운드로 클램프해 RiskParameters.max_trade_notional_pct에 매핑(자율 사이징).
+    max_trade_notional_pct: float = Field(default=15.0, ge=0.5, le=50.0)
+
 
 class TradingStrategy(BaseModel):
     """Complete trading strategy configuration"""
@@ -177,6 +181,7 @@ STRATEGY_PRESETS: Dict[StrategyPreset, TradingStrategy] = {
             min_cash_ratio=0.30,
             max_total_stock_pct=0.70,
             adjust_by_risk_score=True,
+            max_trade_notional_pct=10.0,
         ),
     ),
 
@@ -219,6 +224,7 @@ STRATEGY_PRESETS: Dict[StrategyPreset, TradingStrategy] = {
             max_position_pct=0.15,
             min_cash_ratio=0.20,
             max_total_stock_pct=0.80,
+            max_trade_notional_pct=25.0,
         ),
     ),
 
@@ -260,6 +266,7 @@ STRATEGY_PRESETS: Dict[StrategyPreset, TradingStrategy] = {
         position_sizing=PositionSizingRules(
             max_position_pct=0.12,
             min_cash_ratio=0.25,
+            max_trade_notional_pct=15.0,
         ),
     ),
 
@@ -301,6 +308,7 @@ STRATEGY_PRESETS: Dict[StrategyPreset, TradingStrategy] = {
             max_position_pct=0.15,
             min_cash_ratio=0.25,
             max_positions=8,
+            max_trade_notional_pct=12.0,
         ),
     ),
 }
