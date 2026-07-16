@@ -94,6 +94,18 @@ async def run_eod_review(coordinator: Any, storage: Any, trade_date: str) -> boo
 
         if rid:
             await storage.backfill_regime_id(trade_date, rid)
+            if enriched and enriched.get("market_sentiment_label"):
+                sentiment_json = json.dumps({
+                    "label": enriched.get("market_sentiment_label"),
+                    "score": enriched.get("sentiment_score"),
+                })
+                flow_json = json.dumps({
+                    "foreign_net_amount": enriched.get("foreign_net_amount"),
+                    "institution_net_amount": enriched.get("institution_net_amount"),
+                })
+                await storage.backfill_market_context(
+                    trade_date, sentiment_json, flow_json
+                )
 
         return True
     except Exception as e:

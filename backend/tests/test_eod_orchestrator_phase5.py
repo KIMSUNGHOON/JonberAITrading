@@ -9,6 +9,7 @@ class _FakeStorage:
     async def save_regime_snapshot(self, rec): self.saved_regime = rec; return True
     async def save_eod_review(self, rec): return True
     async def backfill_regime_id(self, td, rid): pass
+    async def backfill_market_context(self, td, sentiment_json, flow_json): pass
     async def get_eod_reviews(self, limit=40): return []
 
 

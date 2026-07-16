@@ -2299,6 +2299,25 @@ class StorageService:
             )
             return
 
+    async def backfill_market_context(
+        self, trade_date: str, sentiment_json: str, flow_json: str
+    ) -> None:
+        """그날 모든 agent_chat_decisions의 예약 슬롯(market_sentiment/flow)에
+        시장전체 심리·수급 JSON을 박제(EOD 백필 — regime_snapshot_id와 동일 패턴).
+        Phase1이 write-time None으로 남긴 슬롯을 EOD가 채운다. 실패-무해."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE agent_chat_decisions "
+                    "SET market_sentiment = ?, flow = ? WHERE trade_date = ?",
+                    (sentiment_json, flow_json, trade_date),
+                )
+                await conn.commit()
+        except Exception as e:
+            logger.error("backfill_market_context_failed",
+                         trade_date=trade_date, error=str(e))
+
     # -------------------------------------------
     # Health Check
     # -------------------------------------------
