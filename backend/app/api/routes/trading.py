@@ -116,7 +116,7 @@ class RiskParamsUpdateRequest(BaseModel):
     # R3 autonomy safety rails (enforced by services/autonomy/gate.py)
     max_daily_loss_pct: Optional[float] = Field(None, ge=0.1, le=20.0)
     max_open_positions: Optional[int] = Field(None, ge=1, le=50)
-    max_trade_notional_krw: Optional[float] = Field(None, ge=10_000)
+    max_trade_notional_pct: Optional[float] = Field(None, ge=0.5, le=50.0)
     stop_loss_mode: Optional[str] = None
     take_profit_mode: Optional[str] = None
 
@@ -343,14 +343,19 @@ async def update_risk_params(
     if request.max_open_positions is not None:
         params.max_open_positions = request.max_open_positions
 
-    if request.max_trade_notional_krw is not None:
-        params.max_trade_notional_krw = request.max_trade_notional_krw
+    if request.max_trade_notional_pct is not None:
+        params.max_trade_notional_pct = request.max_trade_notional_pct
 
     if request.stop_loss_mode is not None:
         params.stop_loss_mode = StopLossMode(request.stop_loss_mode)
 
     if request.take_profit_mode is not None:
         params.take_profit_mode = StopLossMode(request.take_profit_mode)
+
+    try:
+        await coordinator._persist_state()
+    except Exception:
+        logger.warning("Failed to persist risk_params after update", exc_info=True)
 
     return {
         "status": "updated",

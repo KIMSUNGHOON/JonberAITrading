@@ -2066,7 +2066,11 @@ class TestApplyDecisionAddP2:
 
         monkeypatch.setattr(app_settings, "AUTONOMY_ENABLED", True)
 
-        tiny_cap_params = RiskParameters(max_trade_notional_krw=10_000)
+        # pct-based cap (T1): notional cap = equity x pct. 0.5% is the field's
+        # own lower bound, so a ~100M equity account still caps far below the
+        # ADD's notional (25 * 72500 = 1,812,500) -- same "tiny cap" intent as
+        # the old fixed-krw field, expressed in the new equity-relative unit.
+        tiny_cap_params = RiskParameters(max_trade_notional_pct=0.5)
 
         async def permissive_mode(market):
             return "autonomous"
@@ -2083,6 +2087,9 @@ class TestApplyDecisionAddP2:
         async def permissive_coordinator_active(market):
             return True
 
+        async def permissive_equity(market):
+            return 100_000_000
+
         async def gate_with_tiny_notional_cap(market, **kwargs):
             return await real_check_autonomy(
                 market,
@@ -2095,6 +2102,7 @@ class TestApplyDecisionAddP2:
                 positions_count_provider=permissive_positions,
                 risk_params_provider=lambda: tiny_cap_params,
                 coordinator_active_provider=permissive_coordinator_active,
+                account_equity_provider=permissive_equity,
             )
 
         monkeypatch.setattr(autonomy_pkg, "check_autonomy", gate_with_tiny_notional_cap)

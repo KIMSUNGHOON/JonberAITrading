@@ -1076,6 +1076,7 @@ class ExecutionCoordinator:
                     "daily_trades_count": self._state.daily_trades_count,
                     "daily_count_date": date.today().isoformat(),
                     "tracked_orders": self.fill_tracker.to_payload(),
+                    "risk_params": self.risk_params.model_dump(),
                 }
             )
             storage = await get_storage_service()
@@ -1154,6 +1155,16 @@ class ExecutionCoordinator:
                             f"[Coordinator] Expired {len(closed_out)} tracked "
                             f"orders on restore (market closed)"
                         )
+
+            # Risk params (T3): in-place setattr, NOT rebind — risk_params is
+            # reference-shared with PortfolioAgent/RiskMonitor/TradingState, so
+            # replacing the attribute would desync those holders from the
+            # coordinator's own copy.
+            rp = data.get("risk_params")
+            if rp:
+                for k, v in rp.items():
+                    if hasattr(self.risk_params, k):
+                        setattr(self.risk_params, k, v)
 
             logger.info(
                 f"[Coordinator] Restored {len(self._state.positions)} positions, "

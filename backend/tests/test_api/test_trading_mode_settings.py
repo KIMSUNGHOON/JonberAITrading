@@ -33,7 +33,7 @@ def test_risk_parameters_have_autonomy_limits():
     params = RiskParameters()
     assert params.max_daily_loss_pct == 3.0
     assert params.max_open_positions == 5
-    assert params.max_trade_notional_krw == 1_000_000
+    assert params.max_trade_notional_pct == 15.0
 
 
 def test_get_defaults_hitl_and_master_disabled(client: TestClient, isolated_storage):
