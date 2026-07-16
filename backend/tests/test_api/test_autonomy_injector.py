@@ -9,6 +9,7 @@ failure leaves the session awaiting (HITL fallback).
 
 import asyncio
 import os
+import types
 
 import pytest
 
@@ -515,3 +516,53 @@ async def test_rearm_covers_both_markets_gate_can_deny_coin_only(
 
     await _wait_for(lambda: len(submit_recorder) == 1)
     assert submit_recorder[0]["session_id"] == kr_id
+
+
+async def test_rearm_scans_sm_only(sm, monkeypatch, empty_legacy_dicts):
+    """P1-4: SESSION_SSOT_READS=True (default) -- rearm scans the
+    SessionManager alone. A session that exists only in a legacy dict (never
+    reached the SM) must NOT be rearmed; the "legacy wins" tie-break that
+    existed when both sources were scanned is obsolete once SM is the sole
+    source."""
+    scheduled: list[str] = []
+
+    async def fake_schedule(session_id, market, session):
+        scheduled.append(session_id)
+
+    monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", fake_schedule)
+
+    session_id = "ssot-p14"
+    await _seed_awaiting_sm(sm, session_id)
+
+    from app.api.routes.kr_stocks import get_kr_stock_sessions
+
+    get_kr_stock_sessions()["legacy-only-p14"] = _awaiting_session("legacy-only-p14")
+
+    await injector_module.rearm_awaiting_approvals()
+
+    assert session_id in scheduled
+    assert "legacy-only-p14" not in scheduled
+
+
+async def test_rearm_kill_switch_scans_legacy_when_false(
+    sm, fast_grace, gate_allow, submit_recorder, empty_legacy_dicts, monkeypatch
+):
+    """P1-4 kill switch: SESSION_SSOT_READS=False restores the pre-P1-4
+    fallback -- legacy dicts are scanned too, so a legacy-only session (never
+    reached the SM) still gets rearmed. get_settings() is @lru_cache, so the
+    name the target module imported is patched directly (test_approval_
+    pending_ssot.py precedent)."""
+    monkeypatch.setattr(
+        injector_module, "get_settings",
+        lambda: types.SimpleNamespace(SESSION_SSOT_READS=False),
+    )
+
+    from app.api.routes.kr_stocks import get_kr_stock_sessions
+
+    legacy_id = "legacy-only-p14-killswitch"
+    get_kr_stock_sessions()[legacy_id] = _awaiting_session(legacy_id)
+
+    await injector_module.rearm_awaiting_approvals()
+
+    await _wait_for(lambda: len(submit_recorder) == 1)
+    assert submit_recorder[0]["session_id"] == legacy_id
