@@ -210,7 +210,11 @@ async def test_coin_start_position_exists_true_for_held_market(
 
     assert response.duplicate is False
     assert response.position_exists is True
-    assert coin_sessions_fixture[response.session_id]["state"]["position_exists"] is True
+    # P2-4: the flag is threaded into the sm session's state (the sole
+    # store), so /status agrees too.
+    session = await sm.get_session(response.session_id)
+    assert session.state["position_exists"] is True
+    assert coin_sessions_fixture == {}
 
 
 async def test_coin_start_position_exists_false_for_unheld_market(
@@ -221,7 +225,9 @@ async def test_coin_start_position_exists_false_for_unheld_market(
     )
 
     assert response.position_exists is False
-    assert coin_sessions_fixture[response.session_id]["state"]["position_exists"] is False
+    session = await sm.get_session(response.session_id)
+    assert session.state["position_exists"] is False
+    assert coin_sessions_fixture == {}
 
 
 async def test_coin_start_position_exists_false_for_zero_quantity_position(

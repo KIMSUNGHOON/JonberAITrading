@@ -46,31 +46,19 @@ def get_coin_session(session_id: str) -> dict:
     return session
 
 
-# Statuses that make a session count as "in flight" for ticker-level dedup
-# (P4): a session still running or parked at a human/autonomy decision. Once
-# a session settles (completed/error/cancelled) it no longer blocks a fresh
-# analysis of the same market.
-_ACTIVE_STATUSES = ("running", "awaiting_approval")
-
-
 async def find_active_coin_session(market: str) -> Optional[dict]:
     """Return the first RUNNING/AWAITING_APPROVAL session for `market`, if any.
 
-    Same pattern as `kr_stocks.helpers.find_active_kr_session`: checks the
-    legacy in-process `coin_sessions` dict first (authoritative read path
-    within this process), then falls back to the SessionManager to also
-    catch a session that survived a restart (legacy dict wiped, but
-    reconciled into SessionManager as still AWAITING_APPROVAL).
-
-    Used to prevent `/analysis/start` from spawning a second concurrent
-    analysis for a market that already has one in progress (P4 dedup) —
-    ported from the `ticker in self._active_rooms` guard pattern in
-    `services/agent_chat/coordinator.py`.
+    P2-4: the coin producer (coin/analysis.py) writes ONLY to the
+    SessionManager now -- the legacy `coin_sessions` dict is never populated
+    by it -- so the SessionManager is the sole read source here too.
+    `/analysis/start` itself no longer calls this: its dedup check is now
+    folded into the atomic `SessionManager.create_session_if_no_active`
+    reservation, which closes the check-then-create race directly instead of
+    relying on a read here being followed by a separate synchronous write.
+    This helper remains for any other caller that needs a plain "is this
+    market active?" read (and for its own direct test coverage).
     """
-    for session in coin_sessions.values():
-        if session.get("market") == market and session.get("status") in _ACTIVE_STATUSES:
-            return session
-
     from services.session_manager import MarketType, SessionStatus, get_session_manager
 
     manager = await get_session_manager()

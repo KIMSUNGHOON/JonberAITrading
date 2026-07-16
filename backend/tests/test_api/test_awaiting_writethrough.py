@@ -164,8 +164,13 @@ async def test_awaiting_transition_success_path(monkeypatch):
 async def test_coin_awaiting_transition_failclosed_on_sm_failure(monkeypatch):
     """coin 쪽 _finalize_awaiting_transition 도 KR과 동일하게 1회 재시도 후
     fail-closed: 세션 error, awaiting_approval False, auto-approve 미호출.
-    (update_session_status 는 legacy analysis_limiter.active_sessions 를 건드리는
-    순수 no-op 라 이 테스트의 미등록 session_id 에 대해서는 페이크할 필요가 없다.)
+
+    P2-4: `_finalize_awaiting_transition` no longer takes a legacy-dict
+    `session` argument -- the coin producer writes to the SessionManager
+    only, so the helper re-fetches the SM row itself. A minimal fake
+    SessionManager (only `get_session`/`update_state`) stands in for the
+    real singleton, following this file's isolation principle (only names
+    the target module imported are faked).
     """
     from app.api.routes.coin import analysis as coin_analysis
 
@@ -191,18 +196,37 @@ async def test_coin_awaiting_transition_failclosed_on_sm_failure(monkeypatch):
 
     monkeypatch.setattr(coin_analysis, "mirror_session_status", fake_mirror_status)
 
-    session = {"session_id": "wt-coin-1", "status": "running", "error": None,
-               "state": {"awaiting_approval": True,
-                         "trade_proposal": {"action": "BUY"},
-                         "reasoning_log": []}}
+    fake_sm_session = SimpleNamespace(
+        state={"awaiting_approval": True,
+               "trade_proposal": {"action": "BUY"},
+               "reasoning_log": []},
+    )
+    state_updates_seen = []
 
-    await coin_analysis._finalize_awaiting_transition("wt-coin-1", session)
+    class _FakeSM:
+        async def get_session(self, session_id):
+            return fake_sm_session
 
-    assert calls["n"] == 2
-    assert session["status"] == "error"
-    assert session["state"]["awaiting_approval"] is False
-    assert scheduled == []
+        async def update_state(self, session_id, updates, **kw):
+            state_updates_seen.append(updates)
+            fake_sm_session.state.update(updates)
+
+    async def fake_get_session_manager():
+        return _FakeSM()
+
+    monkeypatch.setattr(coin_analysis, "get_session_manager", fake_get_session_manager)
+
+    await coin_analysis._finalize_awaiting_transition("wt-coin-1")
+
+    assert calls["n"] == 2                      # 1회 재시도 포함 2회 시도
+    assert scheduled == []                       # 보이지 않는 자동승인 금지
+    # The reasoning-log/awaiting_approval cleanup landed directly on the sm.
+    assert fake_sm_session.state["awaiting_approval"] is False
+    assert "safely terminated" in fake_sm_session.state["reasoning_log"][-1]
+    # Best-effort ERROR mirror to the sm still attempted exactly once.
     assert len(mirrored) == 1
+    assert mirrored[0][0] == "wt-coin-1"
+    assert mirrored[0][1] == SessionStatus.ERROR
 
 
 # -------------------------------------------

@@ -24,9 +24,8 @@ from app.api.schemas.coin import (
 from app.config import get_settings
 from app.core.analysis_limiter import (
     acquire_analysis_slot,
-    register_session,
+    get_active_analysis_count,
     release_analysis_slot,
-    update_session_status,
 )
 from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from services.session_manager import (
@@ -34,11 +33,10 @@ from services.session_manager import (
     SessionStatus,
     commit_session_status,
     get_session_manager,
-    mirror_session_state,
     mirror_session_status,
 )
-from .constants import coin_sessions, get_cached_markets
-from .helpers import find_active_coin_session, get_coin_session
+from .constants import get_cached_markets
+from .helpers import get_coin_session
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -62,48 +60,93 @@ async def start_coin_analysis(
         Session ID and initial status
     """
     market = request.market.upper()
-
-    # P4 dedup: refuse to spawn a second concurrent analysis for a market
-    # that already has one in progress (RUNNING/AWAITING_APPROVAL) — reuse
-    # the existing session instead of minting a new one. Completed/error/
-    # cancelled sessions never block; only a truly in-flight run does, so
-    # re-analysis after a prior run finished is always allowed.
-    existing = await find_active_coin_session(market)
-    if existing is not None:
-        logger.info(
-            "coin_analysis_dedup_hit",
-            existing_session_id=existing["session_id"],
-            market=market,
-            existing_status=existing.get("status"),
-        )
-        return CoinAnalysisResponse(
-            session_id=existing["session_id"],
-            market=existing.get("market") or market,
-            status=existing.get("status", "running"),
-            message="이미 진행중인 분석 세션이 있습니다 — 기존 세션을 재사용합니다.",
-            duplicate=True,
-            # P4 Task 2: best-effort, no extra storage lookup — reuse
-            # whatever this in-flight session already recorded, mirroring
-            # the KR dedup path's reasoning (a dedup hit returns immediately,
-            # without paying for a second lookup).
-            position_exists=bool((existing.get("state") or {}).get("position_exists", False)),
-        )
-
     session_id = str(uuid.uuid4())
 
-    logger.info(
-        "coin_analysis_started",
-        session_id=session_id,
-        market=market,
-    )
-
-    # Get market info for Korean name
+    # Get market info for Korean name -- a plain in-process cache lookup
+    # (get_cached_markets/set_cached_markets are populated by /markets, no
+    # network round-trip here), so it is safe to resolve BEFORE the atomic
+    # reservation below (unlike KR's stk_nm, which needs an actual Kiwoom
+    # API call and is therefore resolved AFTER reservation instead).
     korean_name = None
     cached_markets = get_cached_markets()
     if cached_markets:
         market_info = next((m for m in cached_markets if m.market == market), None)
         if market_info:
             korean_name = market_info.korean_name
+
+    # P2-4: SM direct-write conversion (coin's counterpart to P2-3's KR
+    # change). The old two-step dance -- a find_active_coin_session() dedup
+    # READ, followed by a synchronous legacy-dict placeholder WRITE -- is
+    # replaced by a SINGLE atomic call that holds the SessionManager's own
+    # lock across the whole check-then-create window. This must run before
+    # any network round-trip (the storage position lookup below): that await
+    # is exactly the gap two near-simultaneous starts for the SAME market
+    # could otherwise both slip through.
+    initial_state = {
+        "market": market,
+        "korean_name": korean_name,
+        "query": request.query,
+        "reasoning_log": [],
+        "current_stage": "data_collection",
+        "position_exists": False,
+    }
+
+    try:
+        session_manager = await get_session_manager()
+        created, existing = await session_manager.create_session_if_no_active(
+            session_id,
+            MarketType.COIN,
+            market,
+            korean_name or market,
+            market=market,
+            korean_name=korean_name,
+            state=initial_state,
+        )
+    except Exception as e:
+        # P1-5 fail-fast semantics preserved: with C-only reads a session the
+        # registry never even attempted to reserve is invisible everywhere --
+        # there is no legacy dict left to degrade to.
+        logger.error(
+            "session_manager_create_failed_failfast",
+            session_id=session_id,
+            market=market,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="session registry unavailable — retry",
+        )
+
+    if existing is not None:
+        existing_status = (
+            existing.status.value
+            if isinstance(existing.status, SessionStatus)
+            else existing.status
+        )
+        logger.info(
+            "coin_analysis_dedup_hit",
+            existing_session_id=existing.session_id,
+            market=market,
+            existing_status=existing_status,
+        )
+        return CoinAnalysisResponse(
+            session_id=existing.session_id,
+            market=existing.market or market,
+            status=existing_status,
+            message="이미 진행중인 분석 세션이 있습니다 — 기존 세션을 재사용합니다.",
+            duplicate=True,
+            # P4 Task 2: best-effort, no extra storage lookup — reuse
+            # whatever this in-flight session already recorded, mirroring
+            # the KR dedup path's reasoning (a dedup hit returns immediately,
+            # without paying for a second lookup).
+            position_exists=bool((existing.state or {}).get("position_exists", False)),
+        )
+
+    logger.info(
+        "coin_analysis_started",
+        session_id=session_id,
+        market=market,
+    )
 
     # P4 Task 2: surface whether this market is already held, from the SAME
     # storage-backed source /positions reads (storage.get_coin_position) —
@@ -120,59 +163,11 @@ async def start_coin_analysis(
     except Exception as e:
         logger.warning("coin_position_exists_check_failed", market=market, error=str(e))
 
-    # Create session record (legacy dict = read path for REST/WS)
-    initial_state = {
-        "market": market,
-        "korean_name": korean_name,
-        "query": request.query,
-        "reasoning_log": [],
-        "current_stage": "data_collection",
-        "position_exists": position_exists,
-    }
-    coin_sessions[session_id] = {
-        "session_id": session_id,
-        "market": market,
-        "korean_name": korean_name,
-        "status": "running",
-        "state": initial_state,
-        "created_at": datetime.now(timezone.utc),
-        "error": None,
-    }
-
-    # Also register in the SessionManager so its pub/sub can push updates to
-    # the session WebSocket. Best-effort: on failure the session degrades to
-    # the WS poll fallback, never a 500.
-    try:
-        session_manager = await get_session_manager()
-        await session_manager.create_session(
-            session_id=session_id,
-            market_type=MarketType.COIN,
-            ticker=market,
-            display_name=korean_name or market,
-            market=market,
-            korean_name=korean_name,
-            state={**initial_state, "reasoning_log": []},
-        )
-    except Exception as e:
-        # P1: with C-only reads a session that failed SM registration is
-        # invisible everywhere -- fail fast instead of running blind. No
-        # analysis slot was acquired yet at this point (that happens inside
-        # run_coin_analysis_task, which this failure prevents from ever
-        # being scheduled), so there is nothing to release here.
-        logger.error(
-            "session_manager_create_failed_failfast",
-            session_id=session_id,
-            error=str(e),
-        )
-        coin_sessions[session_id]["status"] = "error"
-        coin_sessions[session_id]["error"] = f"session registry create failed: {e}"
-        # P1-5 review fix (Minor): static client-facing detail -- the raw
-        # exception stays server-side (logger.error above + the legacy-dict
-        # session["error"]).
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="session registry unavailable — retry",
-        )
+    # Finalize the reservation now that the storage lookup above has
+    # resolved. `created` is the SAME AnalysisSession instance the
+    # SessionManager holds in `_sessions` (create_session_if_no_active
+    # returns the live object, not a copy).
+    await session_manager.update_state(session_id, {"position_exists": position_exists})
 
     # Run analysis in background
     background_tasks.add_task(
@@ -189,19 +184,19 @@ async def start_coin_analysis(
     )
 
 
-async def _finalize_awaiting_transition(session_id: str, session: dict) -> None:
+async def _finalize_awaiting_transition(session_id: str) -> None:
     """
-    Awaiting-critical write-through (P1, spec §P1): coin's counterpart to the
-    kr_stocks/analysis.py helper of the same name -- see that docstring for
-    the full rationale (C-only reads make an SM-invisible AWAITING_APPROVAL
-    transition a parked graph nobody can see or approve). One retry, then
-    fail closed: the session becomes ERROR in BOTH stores and no
-    auto-approve is scheduled.
+    Awaiting-critical write-through (P1, spec §P1): the AWAITING_APPROVAL
+    transition MUST land in the SessionManager -- with C-only reads a session
+    whose transition never reached the SM is an invisible interrupt (parked
+    graph nobody can see or approve). One retry, then fail closed: the
+    session becomes ERROR and no auto-approve is scheduled.
+
+    P2-4: SM-only -- there is no legacy dict left to keep in sync. The
+    caller (run_coin_analysis_task) holds no session dict of its own either;
+    this function re-fetches the SM row itself for the reasoning-log append
+    and for the legacy-shaped dict maybe_schedule_auto_approve expects.
     """
-    # P1-5 review fix (Minor): the retry loop wraps ONLY the commit -- see
-    # the kr_stocks/analysis.py counterpart for the full rationale (a
-    # schedule-step exception must not be treated as a persistence failure
-    # and fail-close a session whose write-through actually succeeded).
     last_error: Optional[Exception] = None
     for _attempt in range(2):
         try:
@@ -212,71 +207,103 @@ async def _finalize_awaiting_transition(session_id: str, session: dict) -> None:
             last_error = e
 
     if last_error is None:
-        session["status"] = "awaiting_approval"
-        update_session_status(session_id, "awaiting_approval")
         logger.info("coin_analysis_awaiting_approval", session_id=session_id)
-        # Outside the retry loop on purpose (see comment above).
-        await maybe_schedule_auto_approve(session_id, "coin", session)
+        # Outside the retry loop on purpose (see comment above) -- any
+        # exception here propagates to the caller unchanged (run_coin_
+        # analysis_task's own outer except marks the session error, same end
+        # state, without corrupting the SM status this function just
+        # correctly committed).
+        sm = await get_session_manager()
+        sm_session = await sm.get_session(session_id)
+        # sm_session.state is shared BY REFERENCE with the SessionManager's
+        # copy (to_legacy_dict() does not deep-copy state) -- any state
+        # mutation the injector makes (auto_approve_at, reasoning_log, ...)
+        # reaches the real SM row directly. Same known seam as the kr_stocks
+        # counterpart (its "status" key is a point-in-time snapshot, not
+        # live) accepted until P2-6 gives the injector a proper SM-native
+        # session handle.
+        legacy_session = sm_session.to_legacy_dict() if sm_session is not None else {
+            "session_id": session_id,
+            "status": "awaiting_approval",
+            "state": {},
+        }
+        await maybe_schedule_auto_approve(session_id, "coin", legacy_session)
         return
 
-    session["status"] = "error"
-    session["error"] = f"awaiting transition write-through failed: {last_error}"
-    session["state"]["awaiting_approval"] = False
-    session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
-        "[Error] Failed to persist awaiting-approval state -- session safely terminated."
-    ]
-    update_session_status(session_id, "error", session["error"])
     logger.critical(
         "awaiting_writethrough_failclosed",
         session_id=session_id,
         error=str(last_error),
     )
-    # Best-effort: try to land the ERROR in the SM too (same failure likely,
-    # but the reconcile pass will repair a stale AWAITING row on restart).
-    await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
+    # Best-effort: land ERROR (+ an explanatory reasoning-log entry) in the
+    # SM directly. Any failure here is swallowed -- this branch is already
+    # the fail-closed path; a second failure just means the reconcile pass
+    # repairs a stale AWAITING row on restart instead.
+    try:
+        sm = await get_session_manager()
+        sm_session = await sm.get_session(session_id)
+        if sm_session is not None:
+            reasoning_log = sm_session.state.get("reasoning_log", []) + [
+                "[Error] Failed to persist awaiting-approval state -- session safely terminated."
+            ]
+            await sm.update_state(
+                session_id,
+                {"awaiting_approval": False, "reasoning_log": reasoning_log},
+            )
+    except Exception as e:  # noqa: BLE001 -- best-effort, never escalate
+        logger.warning(
+            "awaiting_writethrough_failclosed_state_update_failed",
+            session_id=session_id,
+            error=str(e),
+        )
+    await mirror_session_status(
+        session_id,
+        SessionStatus.ERROR,
+        error=f"awaiting transition write-through failed: {last_error}",
+    )
 
 
 async def run_coin_analysis_task(session_id: str):
     """
     Background task to run coin analysis using LangGraph workflow.
+
+    P2-4: the SessionManager's AnalysisSession IS the working state object --
+    `sm_session` is fetched once and held for the life of this task.
+    SessionManager.get_session()/update_state()/update_status() never replace
+    the stored object, only mutate it in place (same dict/attribute
+    references), so `sm_session.status`/`sm_session.state` stay LIVE: a
+    concurrent cancel (which calls update_status/update_state on the same
+    session_id) is visible here without re-fetching.
     """
     from agents.graph.coin_trading_graph import get_coin_trading_graph
     from agents.graph.coin_state import create_coin_initial_state
 
-    session = coin_sessions.get(session_id)
-    if not session:
+    sm = await get_session_manager()
+    sm_session = await sm.get_session(session_id)
+    if sm_session is None:
         logger.error("coin_session_not_found", session_id=session_id)
         return
 
     # Acquire analysis slot (with timeout)
     slot_acquired = await acquire_analysis_slot(timeout=60.0)
     if not slot_acquired:
-        # Cancel-during-slot-wait: the terminal cancelled status wins.
-        if session["status"] != "cancelled":
-            session["status"] = "error"
-            session["error"] = "분석 대기열이 가득 찼습니다. 잠시 후 다시 시도해주세요."
-            session["state"]["reasoning_log"].append(
-                "[Error] 동시 분석 한도 초과 - 잠시 후 다시 시도해주세요."
-            )
-            update_session_status(session_id, "error", session["error"])
-            await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
         logger.warning(
             "coin_analysis_slot_timeout",
             session_id=session_id,
+            active_count=get_active_analysis_count(),
         )
+        # Cancel-during-slot-wait: the terminal cancelled status wins.
+        if sm_session.status != SessionStatus.CANCELLED:
+            await sm.update_status(
+                session_id,
+                SessionStatus.ERROR,
+                error="분석 대기열이 가득 찼습니다. 잠시 후 다시 시도해주세요.",
+            )
         return
 
     try:
-        market = session["market"]
-        korean_name = session.get("korean_name")
-
-        # Register with unified session tracker
-        register_session(
-            session_id=session_id,
-            market_type="coin",
-            ticker=market,
-            display_name=korean_name,
-        )
+        market = sm_session.market
+        korean_name = sm_session.korean_name
 
         # Get the coin trading graph
         graph = get_coin_trading_graph()
@@ -285,7 +312,7 @@ async def run_coin_analysis_task(session_id: str):
         initial_state = create_coin_initial_state(
             market=market,
             korean_name=korean_name,
-            user_query=session["state"].get("query"),
+            user_query=sm_session.state.get("query"),
         )
 
         config = {"configurable": {"thread_id": session_id}}
@@ -294,13 +321,11 @@ async def run_coin_analysis_task(session_id: str):
         async for event in graph.astream(initial_state, config):
             for node_name, node_output in event.items():
                 if node_name != "__end__":
-                    # Update session state with node output (legacy dict FIRST so
-                    # a pub/sub wake-up always reads a fresh snapshot, then the sm
-                    # mirror fires the WebSocket push notification)
+                    # SM direct write (P2-4): one call updates state AND
+                    # fires the WebSocket push notification -- no legacy dict
+                    # to keep in sync anymore.
                     if isinstance(node_output, dict):
-                        session["state"].update(node_output)
-                        await mirror_session_state(session_id, node_output, last_node=node_name)
-                    session["last_node"] = node_name
+                        await sm.update_state(session_id, node_output, last_node=node_name)
 
                     logger.debug(
                         "coin_graph_node_completed",
@@ -309,24 +334,19 @@ async def run_coin_analysis_task(session_id: str):
                     )
 
         # Check if we hit the approval interrupt
-        state = session["state"]
-        if session["status"] == "cancelled":
+        state = sm_session.state
+        if sm_session.status == SessionStatus.CANCELLED:
             # User cancelled mid-run (the graph kept streaming) — the terminal
             # cancelled status must not be overwritten by this final write.
             pass
         elif state.get("awaiting_approval"):
-            # P1-5: write-through -- fails closed to ERROR (both stores) if the
-            # SM commit doesn't land, instead of silently mirroring best-effort.
-            await _finalize_awaiting_transition(session_id, session)
+            # P1-5: write-through -- fails closed to ERROR if the SM commit
+            # doesn't land, instead of silently mirroring best-effort.
+            await _finalize_awaiting_transition(session_id)
         elif state.get("error"):
-            session["status"] = "error"
-            session["error"] = state.get("error")
-            update_session_status(session_id, "error", session["error"])
-            await mirror_session_status(session_id, SessionStatus.ERROR, error=session["error"])
+            await sm.update_status(session_id, SessionStatus.ERROR, error=state.get("error"))
         else:
-            session["status"] = "completed"
-            update_session_status(session_id, "completed")
-            await mirror_session_status(session_id, SessionStatus.COMPLETED)
+            await sm.update_status(session_id, SessionStatus.COMPLETED)
 
     except Exception as e:
         logger.error(
@@ -334,15 +354,20 @@ async def run_coin_analysis_task(session_id: str):
             session_id=session_id,
             error=str(e),
         )
-        session["state"]["reasoning_log"] = session["state"].get("reasoning_log", []) + [
-            f"[Error] Analysis failed: {str(e)}"
-        ]
+        try:
+            reasoning_log = sm_session.state.get("reasoning_log", []) + [
+                f"[Error] Analysis failed: {str(e)}"
+            ]
+            await sm.update_state(session_id, {"reasoning_log": reasoning_log})
+        except Exception as log_err:  # noqa: BLE001 -- never let logging mask the real failure
+            logger.warning(
+                "coin_analysis_failure_log_mirror_failed",
+                session_id=session_id,
+                error=str(log_err),
+            )
         # Cancel-mid-run: the terminal cancelled status wins over the error write.
-        if session["status"] != "cancelled":
-            session["status"] = "error"
-            session["error"] = str(e)
-            update_session_status(session_id, "error", str(e))
-            await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
+        if sm_session.status != SessionStatus.CANCELLED:
+            await sm.update_status(session_id, SessionStatus.ERROR, error=str(e))
 
     finally:
         # Always release the analysis slot
@@ -464,64 +489,72 @@ async def cancel_coin_analysis(session_id: str):
     # serializes against a concurrent reject/approve on the same session_id
     # (see the kr_stocks analog for the full defect writeup).
     async with _session_decision_lock(session_id):
-        session = get_coin_session(session_id)
+        sm = await get_session_manager()
+        sm_session = await sm.get_session(session_id)
+        if sm_session is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Coin session {session_id} not found",
+            )
 
         # I4: refuse a cancel of an already-settled session. completed/error
         # both mean the session already ran to its real outcome; "cancelled"
         # is folded into the same 409 (pre-existing behavior, previously a
         # 400) since a repeat-cancel has nothing left to do.
-        if session["status"] in ("completed", "error", "cancelled"):
+        if sm_session.status in (
+            SessionStatus.COMPLETED,
+            SessionStatus.ERROR,
+            SessionStatus.CANCELLED,
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Session already {session['status']} — cancel refused",
+                detail=f"Session already {sm_session.status.value} — cancel refused",
             )
 
-        session["status"] = "cancelled"
-        # F4b IMPORTANT-1: mirror the kr_stocks cancel route's state-clearing.
-        # Without this, awaiting_approval stays True and approval_status stays
-        # None/absent after this cancel — a stale system auto-approve racing
-        # in through the injector's grace-window timer (see
-        # _autonomy_injector._auto_approve_after_grace) checks the proposal-id
-        # pin (unaffected by a cancel, which never replaces the proposal) but
-        # NOT session["status"], so it falls straight through
-        # submit_decision's stale-flag checks into the live approve path:
-        # order placed, this cancelled status silently overwritten with
-        # "completed". Clearing both flags here makes the session look
-        # correctly "not awaiting" the same way kr_stocks does, and
-        # approval._submit_decision_locked's inside-lock guard (belt-and-
-        # braces) now also stands down on session["status"] alone.
-        session["state"]["awaiting_approval"] = False
-        session["state"]["approval_status"] = "cancelled"
-        session["state"]["reasoning_log"].append("[System] Analysis cancelled by user")
+        # P2-4: SM direct-write -- there is no legacy dict left to mutate
+        # locally first, so this is fail-loud (P1-5 pattern): one retry, then
+        # a 503 instead of a silently-swallowed "mirror_failed" 200. A
+        # zombie-resurrection guard still applies (see kr_stocks cancel route
+        # for the full writeup): if this write never lands, the SM row stays
+        # AWAITING_APPROVAL with awaiting_approval still True -- a restart
+        # would then resurrect this cancelled session as a visible-but-
+        # unapprovable zombie. F4b IMPORTANT-1: clearing both awaiting_approval
+        # and approval_status here is what prevents a stale system
+        # auto-approve racing in through the injector's grace-window timer
+        # from sailing through submit_decision's stale-flag checks and
+        # silently overwriting this cancelled status with "completed".
+        reasoning_log = sm_session.state.get("reasoning_log", []) + [
+            "[System] Analysis cancelled by user"
+        ]
 
-        # Mirror to sm — the notify wakes the WebSocket, which re-reads the fresh
-        # legacy snapshot (cancelled status + the appended log entry). Unified
-        # with the kr_stocks cancel route (P1-5): direct manager calls + one
-        # retry + mirror_failed surfaced to the caller instead of a swallowed
-        # best-effort mirror -- see that route's zombie-resurrection comment
-        # for the full rationale.
-        mirror_failed = False
         last_error: Optional[Exception] = None
         for _attempt in range(2):
             try:
-                manager = await get_session_manager()
-                await manager.update_status(session_id, SessionStatus.CANCELLED)
-                await manager.update_state(
+                await sm.update_status(session_id, SessionStatus.CANCELLED)
+                await sm.update_state(
                     session_id,
-                    {"awaiting_approval": False, "approval_status": "cancelled"},
+                    {
+                        "awaiting_approval": False,
+                        "approval_status": "cancelled",
+                        "reasoning_log": reasoning_log,
+                    },
                 )
                 last_error = None
                 break
             except Exception as e:
                 last_error = e
+
         if last_error is not None:
-            mirror_failed = True
             logger.error(
-                "coin_analysis_cancel_mirror_failed",
+                "coin_analysis_cancel_failed",
                 session_id=session_id,
                 error=str(last_error),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="cancel could not be persisted — retry",
             )
 
         logger.info("coin_analysis_cancelled", session_id=session_id)
 
-        return {"message": f"Session {session_id} cancelled", "mirror_failed": mirror_failed}
+        return {"message": f"Session {session_id} cancelled", "mirror_failed": False}

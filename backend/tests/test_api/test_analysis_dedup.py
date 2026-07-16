@@ -413,6 +413,9 @@ async def test_coin_start_dedup_returns_existing_session(
     sm, coin_sessions_fixture, blocking_status
 ):
     existing_id = "coin-existing-1"
+    # P2-4: the coin producer writes the SM only now -- this legacy-dict seed
+    # represents a pre-existing (test-planted) entry the route never touches;
+    # dedup itself is driven entirely by the SM seed below.
     _seed_coin_session(coin_sessions_fixture, existing_id, status=blocking_status)
     await _seed_coin_sm_session(
         sm,
@@ -428,6 +431,7 @@ async def test_coin_start_dedup_returns_existing_session(
     assert response.session_id == existing_id
     assert response.duplicate is True
     assert response.status == blocking_status
+    # No second session was created, and no second graph run was queued.
     assert len(coin_sessions_fixture) == 1
     assert bg.tasks == []
 
@@ -453,8 +457,14 @@ async def test_coin_start_allows_new_analysis_after_settled_session(
 
     assert response.session_id != prior_id
     assert response.duplicate is False
-    assert len(coin_sessions_fixture) == 2
-    assert len(bg.tasks) == 1
+    # P2-4: the producer writes the SM only -- `coin_sessions_fixture` here
+    # still has its ONE fixture-seeded entry (the settled prior session,
+    # planted directly by this test's own setup, not by the route) and gains
+    # no second entry from the fresh start.
+    assert len(coin_sessions_fixture) == 1
+    all_sessions = await sm.get_all_sessions(market_type=MarketType.COIN)
+    assert len(all_sessions) == 2  # the settled one + the freshly-started one
+    assert len(bg.tasks) == 1  # a new graph run WAS queued
 
 
 async def test_coin_start_dedup_falls_back_to_sm_when_legacy_dict_misses(
@@ -484,3 +494,77 @@ async def test_coin_start_ticker_isolation_different_market_not_blocked(
     assert response.duplicate is False
     assert response.session_id != existing_id
     assert len(bg.tasks) == 1
+
+
+# -------------------------------------------
+# coin: P2-4 TOCTOU fix — the check-then-record window itself, mirroring the
+# KR test above. Coin's post-reservation await is the storage position-exists
+# lookup (get_storage_service/get_coin_position) rather than a Kiwoom name
+# lookup, but the same atomic-reservation-before-any-await guarantee applies.
+# -------------------------------------------
+
+
+async def test_coin_start_concurrent_same_market_only_one_session_created(
+    sm, coin_sessions_fixture, monkeypatch
+):
+    """Two near-simultaneous starts for the SAME market, with NO prior
+    session: task A is parked mid-lookup (blocked inside the storage
+    position-exists check on `gate`) — by the time it parks there,
+    `sm.create_session_if_no_active` must already have reserved A's session
+    in the SessionManager. Task B's start, arriving while A is still parked,
+    must then see that reservation and dedup onto it instead of minting a
+    second session + a second graph run."""
+    gate = asyncio.Event()
+
+    class _BlockingStorage:
+        async def get_coin_position(self, market):
+            await gate.wait()
+            return None
+
+    async def _fake_get_storage_service():
+        return _BlockingStorage()
+
+    import services.storage_service as storage_service_module
+
+    monkeypatch.setattr(
+        storage_service_module, "get_storage_service", _fake_get_storage_service
+    )
+
+    bg_a = BackgroundTasks()
+    task_a = asyncio.create_task(
+        start_coin_analysis(CoinAnalysisRequest(market="KRW-BTC"), bg_a)
+    )
+
+    # Let task A run up to (and park inside) the gated storage lookup — by
+    # construction of the fix this is AFTER the atomic sm reservation and
+    # BEFORE the position-exists lookup resolves.
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if sm._sessions:
+            break
+    assert len(sm._sessions) == 1, "A's sm reservation must already be recorded"
+    existing_id = next(iter(sm._sessions))
+    assert sm._sessions[existing_id].status == SessionStatus.RUNNING
+    assert coin_sessions_fixture == {}, "P2-4: the legacy dict is never written"
+
+    # Task B "arrives" while A is still parked — same market, no gating on
+    # its own storage lookup needed since it must dedup before reaching it.
+    bg_b = BackgroundTasks()
+    response_b = await start_coin_analysis(
+        CoinAnalysisRequest(market="KRW-BTC"), bg_b
+    )
+
+    assert response_b.duplicate is True
+    assert response_b.session_id == existing_id
+    assert bg_b.tasks == []  # no second graph run queued for B
+    assert len(sm._sessions) == 1  # still exactly one session record
+
+    # Release A and let it finish.
+    gate.set()
+    response_a = await task_a
+
+    assert response_a.duplicate is False
+    assert response_a.session_id == existing_id
+    assert len(bg_a.tasks) == 1  # exactly one graph run total, from A
+    assert len(sm._sessions) == 1  # B never created a second entry
+    assert coin_sessions_fixture == {}
