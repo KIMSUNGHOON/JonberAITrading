@@ -673,6 +673,26 @@ class SessionManager:
                 if stale or not parked_ok:
                     s.status = SessionStatus.ERROR
                     s.error = "서버 재시작으로 분석 중단 (제안 만료/체크포인트 불일치)"
+                    # Final-review fix (Minor 2, session-ssot): clear the
+                    # awaiting flag alongside the status flip. Before this,
+                    # `st["awaiting_approval"]` (True, per this branch's own
+                    # `awaiting` guard above) survived the ERROR flip
+                    # untouched, and /approval/pending's predicate
+                    # (`state.get("awaiting_approval")` truthy -- see
+                    # app/api/routes/approval.py::list_pending_approvals,
+                    # deliberately status-blind, D3 semantics preserved
+                    # here) would keep listing this now-terminal session as
+                    # an actionable pending approval for up to
+                    # COMPLETED_SESSION_TTL (~5min, self-healing once
+                    # cleanup_expired_sessions reaps the row). Clearing the
+                    # flag here closes that ghost window at the source
+                    # instead of teaching every reader to also check status
+                    # -- consumers that already do both (e.g. websocket.py's
+                    # proposal-resend gate) are unaffected: the flag is now
+                    # simply False, same net effect for them, one fewer
+                    # stale-looking read for everyone else (e.g.
+                    # /approval/pending, /approval/pending/{id}).
+                    st["awaiting_approval"] = False
                     rep.errored.append(sid)
                     terminal_now = True
                 else:
@@ -1769,10 +1789,27 @@ async def run_session_cleanup_task() -> None:
 # -------------------------------------------
 # Best-effort Producer Mirrors
 # -------------------------------------------
-# Producers write the legacy per-market dicts FIRST (still the read path), then
-# mirror to the SessionManager so its pub/sub notifies WebSocket subscribers.
-# The mirror must never break the producer: any failure is logged and swallowed
-# (the WS degrades to its poll fallback). No-ops for sessions not tracked in sm.
+# Final-review fix (Minor 4, session-ssot): the paragraph this replaces
+# described a two-store world (a legacy per-market dict as "the read path"
+# + these helpers mirroring into the SM for pub/sub) that P3-1/P4 already
+# retired -- the SM (Store C) has been the SOLE session store and the sole
+# read path for a while now; there is no legacy dict left to write "FIRST".
+#
+# Current callers of `mirror_session_status` (the one of these three with
+# live call sites today) are the narrow set of best-effort error/
+# cancellation paths that want a swallowed-failure write rather than the
+# raise-on-failure write-through below: approval.py's cancel-zombie-
+# tolerance branch and its generic decision-processing error handler, and
+# kr_stocks/analysis.py + coin/analysis.py's awaiting-writethrough
+# fail-closed branch (best-effort ERROR landing after the write-through
+# itself already failed). `mirror_session_state` and `mirror_session_removal`
+# currently have no callers -- kept as the swallowed-failure counterpart to
+# `commit_session_state`/`commit_session_status` below for any future
+# best-effort site; most producer code (e.g. the discussion coordinator's
+# room lifecycle) writes the SM directly via `get_session_manager()` +
+# `update_state`/`update_status` instead of going through these wrappers.
+# Any failure here is logged and swallowed (the WS degrades to its poll
+# fallback). No-ops for sessions not tracked in sm.
 
 
 async def mirror_session_state(

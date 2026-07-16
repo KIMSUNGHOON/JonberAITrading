@@ -6,11 +6,8 @@ Loads settings from environment variables with sensible defaults.
 from functools import lru_cache
 from typing import Literal
 
-import structlog
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-_logger = structlog.get_logger()
 
 
 class Settings(BaseSettings):
@@ -217,8 +214,7 @@ def get_settings() -> Settings:
     Get cached settings instance.
     Settings are loaded once and cached for performance.
     """
-    instance = Settings()
-    return instance
+    return Settings()
 
 
 # Convenience alias for direct import

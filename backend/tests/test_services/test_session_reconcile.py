@@ -116,6 +116,30 @@ async def test_r1_buy_over_6h_errors(tmp_path, monkeypatch):
     assert mgr._sessions["r1b"].status == SessionStatus.ERROR
 
 
+async def test_r1b_stale_error_flip_clears_awaiting_approval_flag(tmp_path, monkeypatch):
+    """Final-review fix (Minor 2, session-ssot): the stale-proposal ERROR
+    flip must clear state["awaiting_approval"] alongside the status change.
+    Before this fix the flag (True, per this branch's own `awaiting` guard)
+    survived the flip untouched, and /approval/pending's predicate --
+    state.get("awaiting_approval") truthy, deliberately status-blind (D3
+    semantics, see app/api/routes/approval.py::list_pending_approvals and
+    tests/test_api/test_approval_pending_ssot.py) -- kept listing this
+    now-terminal session as an actionable pending approval until
+    cleanup_expired_sessions eventually reaped the row (~COMPLETED_SESSION_
+    TTL later). The predicate itself is intentionally untouched here; only
+    reconcile's own flip now leaves a consistent shape behind."""
+    old = NOW - timedelta(hours=7)
+    s = _sess("r1b2", SessionStatus.RUNNING, {
+        "awaiting_approval": True,
+        "trade_proposal": {"action": "BUY", "created_at": old.isoformat()}},
+        created=old)
+    mgr = await _mgr_with([s], tmp_path, monkeypatch)
+    rep = await mgr.reconcile_stranded_sessions(now=NOW)
+    assert "r1b2" in rep.errored
+    assert mgr._sessions["r1b2"].status == SessionStatus.ERROR
+    assert mgr._sessions["r1b2"].state.get("awaiting_approval") is False
+
+
 async def test_r1_buy_within_6h_flips(tmp_path, monkeypatch):
     recent = NOW - timedelta(hours=2)
     s = _sess("r1c", SessionStatus.RUNNING, {

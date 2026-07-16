@@ -17,14 +17,12 @@ Features:
 - Session cleanup for completed/expired sessions (delegates to SM)
 """
 
-import asyncio
-
 import structlog
 
 from services.session_manager import (
     get_session_manager,
+    run_session_cleanup_task,
     MAX_CONCURRENT_ANALYSES,
-    COMPLETED_SESSION_TTL,
 )
 
 logger = structlog.get_logger()
@@ -78,16 +76,22 @@ async def cleanup_old_sessions() -> None:
     Periodically clean up completed/expired sessions.
 
     Should be run as a background task on server startup (see app/main.py's
-    lifespan). Delegates entirely to the unified SessionManager's own
-    cleanup -- SM is the sole session store.
+    lifespan). Pure delegate to the unified SessionManager's own cleanup
+    LOOP -- `services.session_manager.run_session_cleanup_task` -- not just
+    its per-call cleanup method. SM is the sole session store AND the sole
+    owner of the cleanup cadence.
+
+    Final-review fix (session-ssot): this function used to run its OWN
+    standalone `while True: ... cleanup_expired_sessions() ... sleep(300)`
+    loop, duplicating (an older, stripped-down copy of) the cadence that
+    P5-2 later built into `run_session_cleanup_task` -- the orphan sweeps
+    (`_sweep_terminal_session_rows` / `_sweep_orphan_checkpoints`,
+    `_ORPHAN_SWEEP_CYCLE_INTERVAL`-th cycle) only ever lived in
+    `run_session_cleanup_task`, which nothing in production called: app/
+    main.py's lifespan only ever schedules THIS function. That left the
+    whole sweep backstop as dead code. Delegating here (rather than
+    pointing main.py directly at `run_session_cleanup_task`) keeps main.py's
+    import/wiring untouched and preserves this module's P3-2 pure-delegate
+    shape -- a single cadence loop now runs in production, not two.
     """
-    logger.info("session_cleanup_task_started", ttl_hours=COMPLETED_SESSION_TTL.total_seconds() / 3600)
-
-    while True:
-        try:
-            manager = await get_session_manager()
-            await manager.cleanup_expired_sessions()
-        except Exception as e:
-            logger.error("session_cleanup_error", error=str(e))
-
-        await asyncio.sleep(300)  # Run every 5 minutes
+    await run_session_cleanup_task()
