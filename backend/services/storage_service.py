@@ -798,6 +798,51 @@ class StorageService:
             logger.error("checkpoint_delete_failed", session_id=session_id, error=str(e))
             return False
 
+    async def get_checkpoint_session_ids(self) -> list[tuple[str, str]]:
+        """
+        List every distinct session_id that currently owns checkpoint rows,
+        paired with the most recent write time across all of that
+        session_id's (session_id, thread_id) rows.
+
+        Session-SSOT P5-2: backs the orphan-checkpoint sweep in
+        session_manager.py. That sweep needs a "how long has this
+        checkpoint gone untouched" signal to apply a grace period before
+        reclaiming a checkpoint whose owning session is missing or
+        terminal -- rather than adding a schema column for this, it reuses
+        `checkpoints.created_at`, which already behaves as a de facto
+        last-write timestamp with ZERO migration: `save_checkpoint` above
+        uses `INSERT OR REPLACE`, and SQLite's REPLACE conflict-resolution
+        algorithm deletes the pre-existing (session_id, thread_id) row and
+        inserts a brand new one on every write. `created_at` is not one of
+        the columns that INSERT's column list specifies, so the new row
+        always takes the column's DEFAULT (CURRENT_TIMESTAMP) -- on every
+        save, not just the first. (Verified empirically, not just inferred
+        from the CREATE TABLE text -- see the P5-2 task report.)
+
+        Returns:
+            List of (session_id, last_written_at) tuples. last_written_at
+            is the raw SQLite TIMESTAMP string (e.g. "2026-07-17
+            09:00:00"), parseable via datetime.fromisoformat. Empty list on
+            any failure (best-effort read, matching this module's other
+            list_* methods).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    """
+                    SELECT session_id, MAX(created_at)
+                    FROM checkpoints
+                    GROUP BY session_id
+                    """
+                )
+                rows = await cursor.fetchall()
+                return [(row[0], row[1]) for row in rows]
+        except Exception as e:
+            logger.error("checkpoint_session_ids_get_failed", error=str(e))
+            return []
+
     # -------------------------------------------
     # Cache Operations
     # -------------------------------------------

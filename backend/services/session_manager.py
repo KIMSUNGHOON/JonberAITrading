@@ -42,6 +42,19 @@ logger = structlog.get_logger()
 
 MAX_CONCURRENT_ANALYSES = 3
 COMPLETED_SESSION_TTL = timedelta(hours=1)
+# P5-2 (session-ssot): grace period for the orphan-checkpoint sweep
+# (SessionManager._sweep_orphan_checkpoints) -- a checkpoint whose owning
+# session_id is missing from sessions.db or terminal is only reclaimed once
+# its OWN last-write timestamp (checkpoints.created_at -- see
+# storage_service.get_checkpoint_session_ids' docstring for why that column
+# already tracks this with no schema change) is older than this window.
+# Deliberately longer than COMPLETED_SESSION_TTL: a checkpoint is the
+# graph's resume state, so this sweep is the more conservative of the two
+# P5-2 backstops -- it must never race a legitimate resume that a
+# transient failure (e.g. a delayed _on_terminal_transition retry, or a
+# brief storage.db lock contention) merely delayed the SM-side row update
+# for.
+CHECKPOINT_ORPHAN_GRACE = timedelta(hours=24)
 DB_PATH = "data/sessions.db"
 # Max buffered messages per WebSocket subscriber. On overflow the oldest is dropped
 # (realtime favors the latest state), so a slow/dead socket cannot grow unbounded.
@@ -1195,6 +1208,229 @@ class SessionManager:
         return len(expired)
 
     # -------------------------------------------
+    # P5-2: Orphan sweeps (progressive-leak backstop)
+    # -------------------------------------------
+    # cleanup_expired_sessions() above only ever walks self._sessions -- the
+    # in-memory dict. _load_active_sessions() (called once, from
+    # initialize()) only loads RUNNING/AWAITING_APPROVAL rows back into that
+    # dict on startup, by design (a terminal session has nothing left to
+    # resume). The consequence: a session that reaches COMPLETED/ERROR/
+    # CANCELLED and then the process restarts (or the row was written by a
+    # process that has since exited) is now a sessions.db row with NO
+    # in-memory representative in the new process -- cleanup_expired_
+    # sessions' walk can never see it, so it would sit in sessions.db
+    # forever. This is spec Sec.1.1-6's root cause for the 612MB terminal-
+    # row leak. The two sweeps below are independent, direct-SQL backstops
+    # that do not depend on self._sessions at all:
+    #   - _sweep_terminal_session_rows: reclaims the leaked sessions.db rows
+    #     themselves (same COMPLETED_SESSION_TTL boundary as the in-memory
+    #     walk above, applied via direct SQL instead).
+    #   - _sweep_orphan_checkpoints: reclaims storage.db checkpoint rows
+    #     P5-1's best-effort _on_terminal_transition hook missed (hook
+    #     failure, or a terminal transition that happened before P5-1
+    #     existed) -- keyed off checkpoints' OWN last-write time, not
+    #     sessions.db, so it also covers a checkpoint whose session_id row
+    #     was already reclaimed by the sweep just above (or was never
+    #     created in sessions.db at all).
+    # Both are called periodically (not every cycle) from
+    # run_session_cleanup_task -- see that function's docstring for cadence
+    # rationale.
+
+    async def _sweep_terminal_session_rows(
+        self, now: Optional[datetime] = None
+    ) -> List[str]:
+        """
+        Direct-SQL backstop for terminal sessions.db rows that
+        cleanup_expired_sessions' in-memory walk can never reach (see the
+        module comment above this method).
+
+        Runs independently of self._sessions: SELECTs every row whose
+        status is terminal, filters in Python (via `updated_at`, per spec
+        Sec.1.1-6 -- NOT `created_at`; a session that goes terminal long
+        after creation must get its own fresh TTL window measured from
+        when it actually became terminal) against the SAME
+        COMPLETED_SESSION_TTL boundary cleanup_expired_sessions uses, then
+        deletes exactly those rows. Filtering candidates in Python instead
+        of pushing the timestamp comparison into SQL avoids relying on
+        ISO-8601 string lexicographic ordering being exact for every stored
+        `updated_at` value (datetime.isoformat() omits the microsecond
+        field entirely when it is zero, which would otherwise make that
+        row's string sort earlier than a same-instant value that does have
+        microseconds) -- mirrors _parse_dt's existing tolerant-parsing
+        role elsewhere in this module.
+
+        Any session_id this deletes is also defensively dropped from
+        self._sessions/self._dirty/self._subscribers. Normally none of
+        the deleted rows ARE in memory (that is exactly why they leaked --
+        nothing in this process is tracking them) but a row can in
+        principle be deleted here in the same process that is concurrently
+        running cleanup_expired_sessions' own in-memory-tracked TTL sweep
+        for the identical session_id; guarding here means whichever runs
+        second is simply a no-op instead of leaving a dangling in-memory
+        entry pointed at a row that no longer exists in SQLite.
+
+        Returns the list of deleted session_ids so the caller can fire
+        _on_terminal_transition (checkpoint GC) for each -- ALWAYS after
+        releasing self._lock (P5-1 lock-safety pattern: storage.db I/O must
+        never run while the SM lock, which serializes the entire app-wide
+        session SSOT, is held).
+
+        Best-effort: any failure (including on a corrupt/unreachable
+        DB_PATH) is logged and swallowed, returning an empty list -- the
+        next periodic cycle retries.
+        """
+        now = now or datetime.now(timezone.utc)
+        cutoff = now - COMPLETED_SESSION_TTL
+        terminal_values = tuple(s.value for s in _TERMINAL_STATUSES)
+
+        deleted_ids: List[str] = []
+        try:
+            placeholders = ",".join("?" * len(terminal_values))
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    f"""
+                    SELECT session_id, updated_at FROM analysis_sessions
+                    WHERE status IN ({placeholders})
+                    """,
+                    terminal_values,
+                )
+                rows = await cursor.fetchall()
+                candidates = [
+                    sid
+                    for sid, updated_at_raw in rows
+                    if (_parse_dt(updated_at_raw) or now) < cutoff
+                ]
+
+                if candidates:
+                    del_placeholders = ",".join("?" * len(candidates))
+                    await db.execute(
+                        f"DELETE FROM analysis_sessions WHERE session_id IN ({del_placeholders})",
+                        candidates,
+                    )
+                    await db.commit()
+                deleted_ids = candidates
+        except Exception as e:
+            logger.warning("terminal_row_sweep_failed", error=str(e))
+            return []
+
+        if not deleted_ids:
+            return []
+
+        async with self._lock:
+            for sid in deleted_ids:
+                self._sessions.pop(sid, None)
+                self._dirty.discard(sid)
+                self._subscribers.pop(sid, None)
+
+        # P5-1 lock-safety pattern: fire only after self._lock is released.
+        for sid in deleted_ids:
+            await self._on_terminal_transition(sid)
+
+        logger.info("terminal_row_sweep_deleted", count=len(deleted_ids))
+        return deleted_ids
+
+    async def _sweep_orphan_checkpoints(
+        self, now: Optional[datetime] = None
+    ) -> int:
+        """
+        Direct-SQL backstop for storage.db checkpoint rows P5-1's
+        best-effort `_on_terminal_transition` hook missed -- a delete that
+        failed (storage.db locked, disk full, process died mid-call), or
+        any terminal transition that happened before P5-1 existed.
+
+        A checkpoint row's session_id is an orphan candidate when
+        sessions.db shows it is either:
+          (a) absent entirely (no analysis_sessions row -- SM never
+              created it, or the row was already reclaimed, e.g. by
+              _sweep_terminal_session_rows above or by remove_session), or
+          (b) present but in a terminal status (COMPLETED/ERROR/CANCELLED).
+
+        ABSOLUTE INVARIANT: a session_id whose analysis_sessions row is
+        RUNNING or AWAITING_APPROVAL is NEVER reclaimed, unconditionally --
+        checked via a fresh SQLite read (not self._sessions, which this
+        process may not have loaded that session_id into at all, e.g. a
+        session created and driven to completion entirely by a different
+        process instance).
+
+        Grace period: CHECKPOINT_ORPHAN_GRACE (24h), measured from the
+        checkpoint's OWN last-write timestamp (storage_service.
+        get_checkpoint_session_ids' MAX(created_at) per session_id -- see
+        that method's docstring for why checkpoints.created_at is already,
+        with no schema change, an accurate "last touched" signal). Using
+        the checkpoint's own activity timestamp -- not any sessions.db
+        timestamp -- means the grace period holds even for case (a), where
+        sessions.db has nothing to measure from at all. This was chosen
+        over the "observed twice across sweep cycles" alternative the task
+        brief floated (record an in-memory sighting on pass 1, delete only
+        if still orphaned on pass 2): that alternative's state resets on
+        every process restart, which would silently re-arm the grace period
+        for every orphan on every deploy; MAX(created_at) is already
+        durable in storage.db and needs no additional bookkeeping.
+        A session_id whose last-write timestamp can't be parsed is treated
+        as NOT past grace (skipped, conservative) rather than assumed
+        eligible.
+
+        Best-effort throughout: any failure (listing checkpoints, looking
+        up statuses, or an individual delete) is logged and swallowed --
+        the next periodic cycle retries. A per-session_id delete failure
+        does not abort the rest of the sweep.
+
+        Returns the count of session_ids whose checkpoints were deleted.
+        """
+        now = now or datetime.now(timezone.utc)
+
+        try:
+            storage = await get_storage_service()
+            checkpoint_rows = await storage.get_checkpoint_session_ids()
+        except Exception as e:
+            logger.warning("checkpoint_orphan_sweep_list_failed", error=str(e))
+            return 0
+
+        if not checkpoint_rows:
+            return 0
+
+        status_by_sid: Dict[str, str] = {}
+        try:
+            session_ids = [sid for sid, _ in checkpoint_rows]
+            placeholders = ",".join("?" * len(session_ids))
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    f"SELECT session_id, status FROM analysis_sessions WHERE session_id IN ({placeholders})",
+                    session_ids,
+                )
+                for sid, status in await cursor.fetchall():
+                    status_by_sid[sid] = status
+        except Exception as e:
+            logger.warning("checkpoint_orphan_sweep_status_lookup_failed", error=str(e))
+            return 0
+
+        deleted = 0
+        for session_id, last_written_raw in checkpoint_rows:
+            status = status_by_sid.get(session_id)
+            if status in (SessionStatus.RUNNING.value, SessionStatus.AWAITING_APPROVAL.value):
+                continue  # absolute invariant -- never touch a live session's checkpoint
+
+            last_written = _parse_dt(last_written_raw)
+            if last_written is None:
+                continue  # can't establish grace elapsed -- conservative skip
+            if (now - last_written) < CHECKPOINT_ORPHAN_GRACE:
+                continue  # within grace -- leave it even if orphaned/terminal
+
+            try:
+                await storage.delete_checkpoints(session_id)
+                deleted += 1
+            except Exception as e:
+                logger.warning(
+                    "checkpoint_orphan_sweep_delete_failed",
+                    session_id=session_id,
+                    error=str(e),
+                )
+
+        if deleted:
+            logger.info("checkpoint_orphan_sweep_deleted", count=deleted)
+        return deleted
+
+    # -------------------------------------------
     # Concurrency Control (Semaphore)
     # -------------------------------------------
 
@@ -1369,18 +1605,44 @@ async def get_session_manager() -> SessionManager:
 # Background Cleanup Task
 # -------------------------------------------
 
+# P5-2: cadence for the two orphan sweeps below, expressed as a multiple
+# of run_session_cleanup_task's 300s (5min) cycle -- i.e. ~1 hour. Lower
+# frequency than the per-cycle in-memory TTL walk in cleanup_expired_
+# sessions() on purpose: _sweep_orphan_checkpoints aggregates over the
+# ENTIRE checkpoints table (GROUP BY session_id -- no index makes that
+# free), so running it every 5 minutes against a live server buys nothing.
+# Both sweeps' own grace/TTL windows (CHECKPOINT_ORPHAN_GRACE=24h,
+# COMPLETED_SESSION_TTL=1h) already bound how stale a leaked row can get
+# before a pass reclaims it -- tightening the cadence below hourly would
+# not meaningfully shrink a leak's practical lifetime, only add I/O.
+_ORPHAN_SWEEP_CYCLE_INTERVAL = 12
+
+
 async def run_session_cleanup_task() -> None:
     """
     Run periodic session cleanup.
 
     Should be started as a background task on server startup.
+
+    P5-2: every _ORPHAN_SWEEP_CYCLE_INTERVAL-th cycle, also runs the two
+    orphan-reclaim sweeps (_sweep_terminal_session_rows /
+    _sweep_orphan_checkpoints) -- backstops for P5-1's best-effort
+    checkpoint-GC hook and for terminal sessions.db rows a restart
+    stranded outside cleanup_expired_sessions' in-memory-only TTL walk.
+    See _ORPHAN_SWEEP_CYCLE_INTERVAL and the sweep methods' own docstrings
+    for the full rationale.
     """
     logger.info("session_cleanup_task_started", ttl_hours=COMPLETED_SESSION_TTL.total_seconds() / 3600)
 
+    cycle = 0
     while True:
         try:
             manager = await get_session_manager()
             await manager.cleanup_expired_sessions()
+            cycle += 1
+            if cycle % _ORPHAN_SWEEP_CYCLE_INTERVAL == 0:
+                await manager._sweep_terminal_session_rows()
+                await manager._sweep_orphan_checkpoints()
         except Exception as e:
             logger.error("session_cleanup_error", error=str(e))
 
