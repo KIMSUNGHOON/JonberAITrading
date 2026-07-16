@@ -129,6 +129,13 @@ class Settings(BaseSettings):
     # 복합 시장심리 라벨 경계(EOD_REGIME_BREADTH_THRESHOLD 패턴).
     PHASE5_SENTIMENT_THRESHOLD: float = Field(default=0.1, ge=0)
 
+    # P1 (session-SSOT): read-unification kill switch. True = /approval/pending,
+    # /pending/{id}, WS snapshot, status routes, injector rearm read the
+    # SessionManager ONLY. False = legacy-first reads (pre-P1 behavior).
+    # VALID ONLY UNTIL P2 lands — P2 removes legacy writes, after which False
+    # would read empty dicts (documented in the spec §P2).
+    SESSION_SSOT_READS: bool = True
+
     # -------------------------------------------
     # Phase3: EOD strategy consensus (strategy_orchestrator.py). ENABLED
     # gates the market-close LLM panel (3 structured calls via the

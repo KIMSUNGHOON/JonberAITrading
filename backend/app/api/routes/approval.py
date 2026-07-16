@@ -23,6 +23,7 @@ from app.api.schemas.approval import (
     PendingApprovalsResponse,
     PendingProposalSummary,
 )
+from app.config import get_settings
 from app.dependencies import get_trading_coordinator
 from services.session_manager import (
     MarketType,
@@ -675,10 +676,19 @@ async def list_pending_approvals():
     Returns:
         List of pending approvals with trade proposal details
     """
-    # Combine all session types: coin and Korean stock
-    coin_sessions = get_coin_sessions()
-    kr_stock_sessions = get_kr_stock_sessions()
-    all_sessions = {**coin_sessions, **kr_stock_sessions}
+    # P1 (session-SSOT): SESSION_SSOT_READS=True (default) reads the
+    # SessionManager exclusively. False = legacy dict merge (pre-P1
+    # behavior) -- kill switch only, valid until P2 removes legacy writes.
+    if get_settings().SESSION_SSOT_READS:
+        sm = await get_session_manager()
+        sm_sessions = await sm.get_all_sessions()
+        all_sessions = {
+            sid: s.to_legacy_dict() for sid, s in sm_sessions.items()
+        }
+    else:
+        coin_sessions = get_coin_sessions()
+        kr_stock_sessions = get_kr_stock_sessions()
+        all_sessions = {**coin_sessions, **kr_stock_sessions}
     pending = []
 
     for session_id, session in all_sessions.items():
@@ -739,10 +749,15 @@ async def get_pending_approval(session_id: str):
     Returns:
         Detailed trade proposal and analyses
     """
-    # Search all session types: coin and Korean stock
-    coin_sessions = get_coin_sessions()
-    kr_stock_sessions = get_kr_stock_sessions()
-    session = coin_sessions.get(session_id) or kr_stock_sessions.get(session_id)
+    # P1 (session-SSOT): SM-only lookup (no legacy-dict fallback) when the
+    # flag is on -- see list_pending_approvals above for the same switch.
+    if get_settings().SESSION_SSOT_READS:
+        sm = await get_session_manager()
+        session = await sm.get_session_dict(session_id)
+    else:
+        coin_sessions = get_coin_sessions()
+        kr_stock_sessions = get_kr_stock_sessions()
+        session = coin_sessions.get(session_id) or kr_stock_sessions.get(session_id)
 
     if not session:
         raise HTTPException(
