@@ -39,7 +39,9 @@ _SCHEMA_INSTRUCTION = (
     "adjustments에는 조정을 제안하고 싶은 노브만 넣으십시오(강제 아님): "
     "max_position_pct(종목당 최대 비중, 소수분율), min_cash_ratio(최소 현금 비율), "
     "max_positions(최대 보유 종목 수, 정수), stop_loss_pct(손절, 소수분율 예 0.07=7%), "
-    "take_profit_pct(익절, 소수분율). 제안 값은 현행 값에서 크게 벗어나면 "
+    "take_profit_pct(익절, 소수분율), max_trade_notional_pct(1건당 명목 상한, "
+    "퍼센트 단위 5~30 — 위 소수분율 노브들과 달리 0.15가 아니라 15처럼 그대로 "
+    "퍼센트 숫자로 제안). 제안 값은 현행 값에서 크게 벗어나면 "
     "시스템이 안전 한도로 잘라냅니다."
 )
 

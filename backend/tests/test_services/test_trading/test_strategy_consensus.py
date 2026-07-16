@@ -202,3 +202,49 @@ def test_vote_schema_shape():
     assert set(STRATEGY_VOTE_SCHEMA["required"]) == {"stance", "confidence", "reasoning"}
     assert props["stance"]["enum"] == ["aggressive", "neutral", "defensive"]
     assert set(props["adjustments"]["properties"]) == set(KNOB_BOUNDS)
+
+
+# ---------- max_trade_notional_pct (Phase5 결정B) ----------
+
+def test_notional_knob_bound_is_percent_5_to_30():
+    """단위 회귀 가드: 다른 5개 노브(소수분율)와 달리 퍼센트 그대로 [5,30] —
+    strategy_apply.py STRATEGY_MAPPED_FIELDS와 동일 바운드로 정합."""
+    assert KNOB_BOUNDS["max_trade_notional_pct"] == (5.0, 30.0)
+
+
+def test_notional_knob_hard_bounds_clamp():
+    from services.trading.strategy_consensus import clamp_knob
+    assert clamp_knob("max_trade_notional_pct", 40.0) == 30.0
+    assert clamp_knob("max_trade_notional_pct", 2.0) == 5.0
+
+
+def test_notional_knob_writes_to_position_sizing():
+    """apply_consensus가 max_trade_notional_pct 제안을 median -> hard bound
+    -> 델타캡 순으로 클램프해 strategy.position_sizing.max_trade_notional_pct
+    에 실제로 반영하는지 (Task2가 심어둔 필드에 대한 배선 검증)."""
+    current = TradingStrategy()  # max_trade_notional_pct=15.0 (기본)
+    assert current.position_sizing.max_trade_notional_pct == pytest.approx(15.0)
+    votes = [_vote(adjustments={"max_trade_notional_pct": 40.0}, panelist="a"),
+             _vote(adjustments={"max_trade_notional_pct": 40.0}, panelist="b")]
+    out = apply_consensus(current, votes, "aggressive", 0.8, "2026-07-15", "rev-1")
+    # 40.0은 바운드(<=30) 밖이지만, 하드바운드 클램프 이후에도 델타캡:
+    # 15.0 * (1+0.25) = 18.75가 실제 상한이 된다.
+    assert out.position_sizing.max_trade_notional_pct == pytest.approx(
+        15.0 * (1 + MAX_RELATIVE_DELTA)
+    )
+    # 원본 불변
+    assert current.position_sizing.max_trade_notional_pct == pytest.approx(15.0)
+
+
+def test_notional_knob_low_suggestion_clamps_to_hard_bound():
+    """현재값을 바운드 하한 근처로 세팅해 델타캡이 아니라 하드바운드가
+    실제로 걸리는 경로도 확인 (40->30, 2->5 클램프 사양의 apply_consensus 경로)."""
+    current = TradingStrategy()
+    current.position_sizing.max_trade_notional_pct = 6.0
+    votes = [_vote(adjustments={"max_trade_notional_pct": 2.0}, panelist="a"),
+             _vote(adjustments={"max_trade_notional_pct": 2.0}, panelist="b")]
+    out = apply_consensus(current, votes, "defensive", 0.8, "2026-07-15", "rev-1")
+    lo, hi = KNOB_BOUNDS["max_trade_notional_pct"]
+    assert out.position_sizing.max_trade_notional_pct == pytest.approx(
+        max(lo, 6.0 * (1 - MAX_RELATIVE_DELTA))
+    )

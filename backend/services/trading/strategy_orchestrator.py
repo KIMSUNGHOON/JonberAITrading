@@ -68,6 +68,7 @@ def _current_knobs(strategy: Optional[TradingStrategy]) -> dict:
         "max_positions": strategy.position_sizing.max_positions,
         "stop_loss_pct": strategy.exit_conditions.stop_loss_pct,
         "take_profit_pct": strategy.exit_conditions.take_profit_pct,
+        "max_trade_notional_pct": strategy.position_sizing.max_trade_notional_pct,
     }
 
 

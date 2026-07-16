@@ -37,6 +37,10 @@ KNOB_BOUNDS: dict[str, tuple[float, float]] = {
     "max_positions": (1, 15),           # PositionSizingRules (1-50), int
     "stop_loss_pct": (0.03, 0.15),      # ExitConditions (0.01-0.50), 소수분율
     "take_profit_pct": (0.05, 0.30),    # ExitConditions (0.01-1.0), 소수분율
+    # PositionSizingRules (0.5-50.0), 퍼센트 단위(소수분율 아님) — 위 5개와
+    # 달리 ×100/÷100 변환 없이 그대로 클램프한다 (Phase5 결정B, strategy_apply.py
+    # STRATEGY_MAPPED_FIELDS와 동일 [5,30] 바운드로 정합).
+    "max_trade_notional_pct": (5.0, 30.0),
 }
 
 _INT_KNOBS = {"max_positions"}
@@ -80,6 +84,7 @@ STRATEGY_VOTE_SCHEMA: dict[str, Any] = {
                 "max_positions": {"type": ["integer", "null"]},
                 "stop_loss_pct": {"type": ["number", "null"]},
                 "take_profit_pct": {"type": ["number", "null"]},
+                "max_trade_notional_pct": {"type": ["number", "null"]},
             },
         },
     },
@@ -142,6 +147,7 @@ def semantic_fingerprint(strategy: TradingStrategy) -> tuple:
         strategy.position_sizing.max_positions,
         strategy.exit_conditions.stop_loss_pct,
         strategy.exit_conditions.take_profit_pct,
+        strategy.position_sizing.max_trade_notional_pct,
     )
 
 
@@ -194,6 +200,7 @@ def apply_consensus(
         "max_positions": (sizing, "max_positions"),
         "stop_loss_pct": (exits, "stop_loss_pct"),
         "take_profit_pct": (exits, "take_profit_pct"),
+        "max_trade_notional_pct": (sizing, "max_trade_notional_pct"),
     }
     for knob, (owner, attr) in knob_targets.items():
         target = _aggregate_knob(electorate, knob)
