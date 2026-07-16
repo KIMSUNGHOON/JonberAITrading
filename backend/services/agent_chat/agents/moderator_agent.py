@@ -323,7 +323,13 @@ class ModeratorAgent(BaseDiscussionAgent):
     ) -> TradeDecision:
         """Parse decision from moderator response."""
         # Parse action
-        action = self._parse_action(response, context.has_position)
+        # #1 (audit C-series, live 009150): derive the final action from the
+        # structured weighted vote consensus, NOT a free-text regex scan of the
+        # moderator prose — that scan matched substrings like '진입' inside
+        # '신규진입 시 고위험' and inverted an all-SELL consensus into BUY.
+        # vote_to_action encodes the feasible set: bearish + no position ->
+        # NO_ACTION (never BUY).
+        action = vote_to_action(session.get_majority_direction(), context.has_position)
 
         # --- Consensus safety gate ---
         # If agents did not reach the required agreement level, refuse to trade.
@@ -423,26 +429,6 @@ class ModeratorAgent(BaseDiscussionAgent):
             dissenting_opinions=dissenting,
             votes=vote_breakdown,
         )
-
-    def _parse_action(self, response: str, has_position: bool) -> DecisionAction:
-        """Parse decision action from response."""
-        response_lower = response.lower()
-
-        # Check for specific actions
-        if "add" in response_lower or "추가 매수" in response_lower:
-            return DecisionAction.ADD
-        elif "reduce" in response_lower or "일부 매도" in response_lower:
-            return DecisionAction.REDUCE
-        elif "buy" in response_lower or "매수" in response_lower or "진입" in response_lower:
-            return DecisionAction.BUY if not has_position else DecisionAction.ADD
-        elif "sell" in response_lower or "매도" in response_lower or "청산" in response_lower:
-            return DecisionAction.SELL if has_position else DecisionAction.NO_ACTION
-        elif "hold" in response_lower or "보유" in response_lower or "유지" in response_lower:
-            return DecisionAction.HOLD
-        elif "watch" in response_lower or "관망" in response_lower or "대기" in response_lower:
-            return DecisionAction.WATCH
-        else:
-            return DecisionAction.NO_ACTION
 
     def _is_opposite_direction(self, vote: VoteType, majority: VoteType) -> bool:
         """Check if a vote is opposite to majority direction."""
