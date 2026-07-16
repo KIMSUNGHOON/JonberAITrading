@@ -4,7 +4,7 @@ import type { DetailedAnalysisResults } from '@/types';
 // wsManager is the shared per-session WebSocket manager; spy on has()/connect().
 // vi.hoisted so the (hoisted) vi.mock factory can reference it without a TDZ.
 const { mockWsManager } = vi.hoisted(() => ({
-  mockWsManager: { has: vi.fn(), connect: vi.fn() },
+  mockWsManager: { has: vi.fn(), connect: vi.fn(), disconnect: vi.fn() },
 }));
 vi.mock('@/api/websocket', () => ({ wsManager: mockWsManager }));
 
@@ -713,5 +713,37 @@ describe('createKiwoomWebSocketHandlers — onComplete persists to history via c
       }),
       completedAt: expect.any(Date),
     });
+  });
+});
+
+describe('P0-1 complete-final: terminal complete 프레임은 소켓을 정상 종료한다', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockState = {
+      kiwoom: { sessions: [] },
+      updateKiwoomSessionStatus: vi.fn(),
+      completeKiwoomSession: vi.fn(),
+      setKiwoomSessionError: vi.fn(),
+      addKiwoomSessionReasoningBatch: vi.fn(),
+      updateKiwoomSessionStage: vi.fn(),
+      setKiwoomSessionAwaitingApproval: vi.fn(),
+      setKiwoomSessionAutoApproveAt: vi.fn(),
+      setKiwoomSessionProposal: vi.fn(),
+    };
+  });
+
+  it.each(['completed', 'cancelled', 'error'])(
+    'status=%s complete 프레임 수신 시 wsManager.disconnect 호출',
+    (status) => {
+      const handlers = createKiwoomWebSocketHandlers('sess-1');
+      handlers.onComplete!({ status } as never);
+      expect(mockWsManager.disconnect).toHaveBeenCalledWith('sess-1');
+    },
+  );
+
+  it('status 프레임(비terminal)은 disconnect하지 않는다', () => {
+    const handlers = createKiwoomWebSocketHandlers('sess-1');
+    handlers.onStatus!({ status: 'awaiting_approval', stage: 'x', awaiting_approval: true } as never);
+    expect(mockWsManager.disconnect).not.toHaveBeenCalled();
   });
 });

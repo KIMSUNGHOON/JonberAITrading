@@ -184,6 +184,13 @@ export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandl
         });
       }
       store().updateKiwoomSessionStatus(sessionId, data.status as SessionStatus);
+      // P0-1: terminal frame ends this session's stream for good. Tear the
+      // socket down as a CLEAN disconnect so the server's post-linger close
+      // (COMPLETE_LINGER_SECONDS) is not treated as a drop — which would
+      // reconnect every ~2s against a session that will never speak again
+      // (the storm mechanism: a successful reconnect resets the backoff
+      // budget in wsCore, so the loop never expires).
+      wsManager.disconnect(sessionId);
     },
     onError: () => {
       flushReasoningBuffer(sessionId);
