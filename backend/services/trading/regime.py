@@ -113,3 +113,84 @@ def compute_regime_snapshot(scanner_db_path: str, trade_date: str) -> Optional[d
             f"[Regime] compute_regime_snapshot failed for {trade_date}: {e}"
         )
         return None
+
+
+def _normalize_pct(pct: Optional[float], cap: float = 3.0) -> Optional[float]:
+    """등락률(%)을 [-1, 1]로 정규화(±cap% 포화)."""
+    if pct is None:
+        return None
+    return max(-1.0, min(1.0, pct / cap))
+
+
+def _sign(x: Optional[float]) -> Optional[float]:
+    if x is None:
+        return None
+    return 1.0 if x > 0 else (-1.0 if x < 0 else 0.0)
+
+
+def compute_market_regime(
+    breadth: Optional[dict],
+    index: Optional[dict],
+    flow: Optional[dict],
+    threshold: float,
+) -> Optional[dict]:
+    """breadth 스냅샷에 지수·수급을 병합하고 파생 시장심리를 산출.
+
+    sentiment_score = available한 신호들의 평균:
+      - breadth_ratio (이미 [-1,1] 범위)
+      - 지수 등락률 정규화 (KOSPI/KOSDAQ 평균, ±3% 포화)
+      - 수급 부호 (외국인/기관 순매매 부호 평균)
+    셋 다 None이면 None(저장 안 함, 현행과 동일).
+    market_sentiment_label = score를 threshold로 bullish/bearish/neutral 라벨링.
+    breadth 필드(id/trade_date/breadth_*/regime_label/source)는 보존(하위호환).
+    """
+    if breadth is None and index is None and flow is None:
+        return None
+
+    # 저장형 시작: breadth 필드 보존(없으면 신규 뼈대)
+    if breadth is not None:
+        out = dict(breadth)
+    else:
+        out = {
+            "id": str(uuid.uuid4()),
+            "trade_date": (index or flow or {}).get("trade_date"),
+            "breadth_buy": None, "breadth_sell": None, "breadth_hold": None,
+            "breadth_ratio": None, "regime_label": "neutral", "source": "market",
+        }
+
+    # 지수/수급 필드 병합(없으면 None)
+    idx = index or {}
+    flw = flow or {}
+    out["index_kospi"] = idx.get("index_kospi")
+    out["index_kospi_chg_pct"] = idx.get("index_kospi_chg_pct")
+    out["index_kosdaq"] = idx.get("index_kosdaq")
+    out["index_kosdaq_chg_pct"] = idx.get("index_kosdaq_chg_pct")
+    out["foreign_net_amount"] = flw.get("foreign_net_amount")
+    out["institution_net_amount"] = flw.get("institution_net_amount")
+
+    # sentiment_score = available 신호 평균
+    signals: list[float] = []
+    if breadth is not None and breadth.get("breadth_ratio") is not None:
+        signals.append(float(breadth["breadth_ratio"]))
+    idx_pcts = [
+        _normalize_pct(idx.get("index_kospi_chg_pct")),
+        _normalize_pct(idx.get("index_kosdaq_chg_pct")),
+    ]
+    idx_pcts = [p for p in idx_pcts if p is not None]
+    if idx_pcts:
+        signals.append(sum(idx_pcts) / len(idx_pcts))
+    flow_signs = [_sign(flw.get("foreign_net_amount")), _sign(flw.get("institution_net_amount"))]
+    flow_signs = [s for s in flow_signs if s is not None]
+    if flow_signs:
+        signals.append(sum(flow_signs) / len(flow_signs))
+
+    score = sum(signals) / len(signals) if signals else 0.0
+    out["sentiment_score"] = score
+    if score > threshold:
+        out["market_sentiment_label"] = "bullish"
+    elif score < -threshold:
+        out["market_sentiment_label"] = "bearish"
+    else:
+        out["market_sentiment_label"] = "neutral"
+    return out
+

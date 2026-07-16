@@ -123,6 +123,12 @@ class Settings(BaseSettings):
     # pattern as EOD_FLAT_THRESHOLD_KRW above.
     EOD_REGIME_BREADTH_THRESHOLD: float = Field(default=0.15, ge=0)
 
+    # Phase 5: 시장전체 레짐 심화(지수·수급·시장심리). False면 페처 전부 skip,
+    # 레짐 = 순수 breadth(레거시 byte-동일).
+    PHASE5_MARKET_DATA_ENABLED: bool = True
+    # 복합 시장심리 라벨 경계(EOD_REGIME_BREADTH_THRESHOLD 패턴).
+    PHASE5_SENTIMENT_THRESHOLD: float = Field(default=0.1, ge=0)
+
     # -------------------------------------------
     # Phase3: EOD strategy consensus (strategy_orchestrator.py). ENABLED
     # gates the market-close LLM panel (3 structured calls via the

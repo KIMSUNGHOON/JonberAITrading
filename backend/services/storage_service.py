@@ -392,6 +392,23 @@ class StorageService:
                     },
                 )
 
+                # Regime snapshot index/flow/sentiment 심화 (Phase5): breadth-only
+                # 로 만들어진 기존 db에 지수/수급/파생심리 컬럼을 ALTER로 추가.
+                await self._ensure_columns(
+                    conn,
+                    "regime_snapshot",
+                    {
+                        "index_kospi": "REAL",
+                        "index_kospi_chg_pct": "REAL",
+                        "index_kosdaq": "REAL",
+                        "index_kosdaq_chg_pct": "REAL",
+                        "foreign_net_amount": "REAL",
+                        "institution_net_amount": "REAL",
+                        "market_sentiment_label": "TEXT",
+                        "sentiment_score": "REAL",
+                    },
+                )
+
                 # Create indexes for better query performance
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
@@ -2015,18 +2032,23 @@ class StorageService:
                     """
                     INSERT INTO regime_snapshot
                     (id, trade_date, breadth_buy, breadth_sell, breadth_hold,
-                     breadth_ratio, regime_label, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     breadth_ratio, regime_label, source,
+                     index_kospi, index_kospi_chg_pct, index_kosdaq,
+                     index_kosdaq_chg_pct, foreign_net_amount,
+                     institution_net_amount, market_sentiment_label, sentiment_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        record["id"],
-                        record.get("trade_date"),
-                        record.get("breadth_buy"),
-                        record.get("breadth_sell"),
-                        record.get("breadth_hold"),
-                        record.get("breadth_ratio"),
-                        record.get("regime_label"),
-                        record.get("source", "scanner"),
+                        record["id"], record.get("trade_date"),
+                        record.get("breadth_buy"), record.get("breadth_sell"),
+                        record.get("breadth_hold"), record.get("breadth_ratio"),
+                        record.get("regime_label"), record.get("source", "scanner"),
+                        record.get("index_kospi"), record.get("index_kospi_chg_pct"),
+                        record.get("index_kosdaq"), record.get("index_kosdaq_chg_pct"),
+                        record.get("foreign_net_amount"),
+                        record.get("institution_net_amount"),
+                        record.get("market_sentiment_label"),
+                        record.get("sentiment_score"),
                     ),
                 )
                 await conn.commit()
