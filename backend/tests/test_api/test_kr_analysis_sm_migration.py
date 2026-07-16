@@ -9,8 +9,14 @@ ONLY, so `kr_stock_sessions` stays empty for the life of every session this
 file drives through the real routes. Tests that need a "session that already
 exists" fixture seed the SessionManager directly (`_seed_sm_session`); the
 `_seed_session`/`kr_stock_sessions` helpers below survive only for the
-approval.py-flow tests near the bottom of this file, which exercise
-approval.py's OWN (out of this task's scope) legacy-dict adoption path.
+approval.py-flow tests near the bottom of this file. P2-5 (session-SSOT)
+went further and deleted approval.py's own legacy-dict-adoption restart
+fallback (`_adopt_session_from_manager`) entirely: `/decide` now reads and
+writes the SessionManager exclusively and never touches `kr_stock_sessions`
+at all. Those tests still seed the legacy dict (`record`) alongside the SM
+row purely to PIN that non-interference -- `record` is asserted to stay
+exactly as seeded (never mutated by a decision), while the actual "did the
+transition durably land" assertions are all against the SM row.
 
 Headless: stubbed graph astream + a real SessionManager on a test SQLite db.
 """
@@ -677,9 +683,15 @@ async def _seed_awaiting_approval(sm, kr_sessions, session_id: str) -> dict:
 
 
 async def test_approval_approved_mirrors_completed_to_sm(sm, kr_sessions, monkeypatch):
-    """Without the mirror, decided sessions stay AWAITING_APPROVAL in sm forever
-    (never TTL-cleaned) and replay a stale proposal from the WS sm-fallback after
-    a backend restart."""
+    """Without a durable write, decided sessions stay AWAITING_APPROVAL in sm
+    forever (never TTL-cleaned) and replay a stale proposal from the WS
+    sm-fallback after a backend restart.
+
+    P2-5: /decide no longer touches the legacy dict at all (that mirroring
+    -- and the adoption fallback that read it back -- was removed entirely).
+    `record` is seeded alongside the SM row only to prove B stays inert; the
+    actual "did approved durably land" assertions are all against the SM.
+    """
     from app.api.routes.approval import submit_approval
     from app.api.schemas.approval import ApprovalRequest
 
@@ -696,17 +708,26 @@ async def test_approval_approved_mirrors_completed_to_sm(sm, kr_sessions, monkey
 
     await submit_approval(ApprovalRequest(session_id=session_id, decision="approved"))
 
-    assert record["status"] == "completed"  # legacy behavior unchanged
+    # B (legacy dict) is never written by /decide post-P2-5 -- stays exactly
+    # as seeded (still "awaiting_approval"), proving no B mutation happened.
+    assert record["status"] == "awaiting_approval"
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.COMPLETED
     assert session.state.get("awaiting_approval") is False
-    # resume-loop node outputs mirrored too (keeps sm state fresh for restart recovery)
+    # resume-loop node outputs land in the SM directly (sm.update_state,
+    # P2-5), keeping sm state fresh for restart recovery.
     assert session.state.get("execution_status") == "skipped"
 
 
 async def test_approval_records_actor(sm, kr_sessions, monkeypatch):
     """R3: every decision records WHO decided — 'user' via the route, 'system'
-    via the extracted submit_decision (the autonomy injector's entry point)."""
+    via the extracted submit_decision (the autonomy injector's entry point).
+
+    P2-5: the audit trail (approval_actor) and the auto_approve_at void are
+    both SM-only now -- state IS sm_session.state (a live reference), so the
+    countdown is seeded directly on the SM row, not the legacy dict (which
+    /decide never reads or writes at all anymore).
+    """
     from app.api.routes.approval import submit_decision
 
     session_id = "kr-actor-1"
@@ -714,28 +735,33 @@ async def test_approval_records_actor(sm, kr_sessions, monkeypatch):
     graph = FakeApprovalGraph([])
     monkeypatch.setattr("app.api.routes.approval.get_kr_stock_trading_graph", lambda: graph)
 
-    # A pending autonomous countdown must be voided by any decision
-    kr_sessions[session_id]["state"]["auto_approve_at"] = "2026-07-12T10:00:00+00:00"
+    # A pending autonomous countdown must be voided by any decision -- seeded
+    # on the SM row directly (the only place /decide reads state from).
+    await sm.update_state(session_id, {"auto_approve_at": "2026-07-12T10:00:00+00:00"})
 
     await submit_decision(session_id, "approved", actor="system")
 
     session = await sm.get_session(session_id)
     assert session.state.get("approval_actor") == "system"
     assert graph.state_update.get("approval_actor") == "system"  # audit trail in the checkpoint
-    assert "auto_approve_at" not in kr_sessions[session_id]["state"]
     assert session.state.get("auto_approve_at") is None
+    # B stays untouched throughout -- /decide never reads or writes it.
+    assert kr_sessions[session_id]["state"].get("auto_approve_at") is None
 
     # The route path records 'user'
     session_id2 = "kr-actor-2"
-    record2 = await _seed_awaiting_approval(sm, kr_sessions, session_id2)
+    await _seed_awaiting_approval(sm, kr_sessions, session_id2)
     from app.api.routes.approval import submit_approval
     from app.api.schemas.approval import ApprovalRequest
 
     await submit_approval(ApprovalRequest(session_id=session_id2, decision="approved"))
-    assert record2["state"].get("approval_actor") == "user"
+    session2 = await sm.get_session(session_id2)
+    assert session2.state.get("approval_actor") == "user"
 
 
 async def test_approval_rejected_mirrors_running_to_sm(sm, kr_sessions, monkeypatch):
+    """P2-5: the rejected -> RUNNING transition lands in the SM directly
+    (commit_session_status); B is seeded only to prove it stays inert."""
     from app.api.routes.approval import submit_approval
     from app.api.schemas.approval import ApprovalRequest
 
@@ -749,7 +775,8 @@ async def test_approval_rejected_mirrors_running_to_sm(sm, kr_sessions, monkeypa
         ApprovalRequest(session_id=session_id, decision="rejected", feedback="재분석")
     )
 
-    assert record["status"] == "running"
+    # B (legacy dict) is never written by /decide post-P2-5.
+    assert record["status"] == "awaiting_approval"
     session = await sm.get_session(session_id)
     assert session.status == SessionStatus.RUNNING
     assert session.state.get("awaiting_approval") is False
