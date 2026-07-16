@@ -878,6 +878,10 @@ async def test_cancel_while_genuinely_awaiting_still_200s(wired, monkeypatch):
         "stk_cd": "005930",
         "stk_nm": "삼성전자",
     }
+    # P2-2: graph selection now independently reads the SM row's market_type
+    # (no more B-membership fallback) even for a session found directly in
+    # the legacy dict -- wire a matching KIWOOM SM row so that lookup resolves.
+    wired["set_sm_session"](_sm_session(session_id))
     graph = _FakeGraph([{"finalize": {"awaiting_approval": False}}])
     wired["set_graph"](graph)
 

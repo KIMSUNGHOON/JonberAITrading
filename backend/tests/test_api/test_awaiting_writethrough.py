@@ -17,6 +17,9 @@ mirror_session_status). 실패 경로가 best-effort로 mirror_session_status를
 """
 import pytest
 from fastapi import HTTPException
+from types import SimpleNamespace
+
+from services.session_manager import MarketType
 
 
 # -------------------------------------------
@@ -248,6 +251,20 @@ async def test_approval_decision_entry_retry_succeeds_after_503(monkeypatch):
     monkeypatch.setattr(approval_module, "broadcast_trade_rejected", noop)
     monkeypatch.setattr(approval_module, "broadcast_watch_added", noop)
 
+    # P2-2: graph selection now independently reads the SM row's market_type
+    # (no more B-membership fallback). This file's isolation principle is to
+    # fake only functions the target module imported -- get_session_manager
+    # is one of those (approval.py imports it from services.session_manager)
+    # -- so fake it here too rather than touching the real SM singleton.
+    class _FakeSM:
+        async def get_session(self, sid):
+            return SimpleNamespace(market_type=MarketType.KIWOOM)
+
+    async def fake_get_session_manager():
+        return _FakeSM()
+
+    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
+
     async def fake_get_trading_coordinator():
         raise RuntimeError("no coordinator in unit test")
 
@@ -335,6 +352,18 @@ async def test_approval_rejected_rearm_failed_commit_never_schedules(monkeypatch
     monkeypatch.setattr(approval_module, "commit_session_state", commit_state_ok)
     monkeypatch.setattr(approval_module, "commit_session_status", commit_status_fails)
     monkeypatch.setattr(approval_module, "mirror_session_state", noop)
+
+    # P2-2: graph selection now independently reads the SM row's market_type
+    # (no more B-membership fallback). Fake it, same rationale as the retry
+    # test above -- get_session_manager is a name the target module imports.
+    class _FakeSM:
+        async def get_session(self, sid):
+            return SimpleNamespace(market_type=MarketType.KIWOOM)
+
+    async def fake_get_session_manager():
+        return _FakeSM()
+
+    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
 
     scheduled = []
 

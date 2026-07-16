@@ -340,11 +340,32 @@ async def _submit_decision_locked(
                         value=value,
                     )
 
-    # Resume graph execution - select appropriate graph based on session type
-    if session_id in kr_stock_sessions:
+    # Resume graph execution - select appropriate graph based on session type.
+    #
+    # P2 (spec §P2, review CRITICAL): market discrimination must come from the
+    # SM record's market_type, NOT legacy-dict (B) membership -- with B empty
+    # (immediately post-restart, before _adopt_session_from_manager registers
+    # this session, or after P2-5 removes B writes entirely) `session_id in
+    # kr_stock_sessions` is always False and every KR session would silently
+    # resume through the COIN graph. The SM row is guaranteed to exist here:
+    # any session that reached this point either lived in a legacy dict
+    # already (created with a synced SM row) or was just adopted via
+    # _adopt_session_from_manager above, which itself reads the SM row to
+    # adopt in the first place. Fail-closed (no B-membership fallback) rather
+    # than guess for any market_type this branch doesn't recognize.
+    sm = await get_session_manager()
+    sm_session = await sm.get_session(session_id)
+    if sm_session is None or sm_session.market_type not in (MarketType.KIWOOM, MarketType.COIN):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="unknown session market — refusing to resume",
+        )
+    if sm_session.market_type == MarketType.KIWOOM:
         graph = get_kr_stock_trading_graph()
+        market = "kiwoom"
     else:
         graph = get_coin_trading_graph()
+        market = "coin"
     config = {"configurable": {"thread_id": session_id}}
 
     execution_status = None
@@ -478,7 +499,8 @@ async def _submit_decision_locked(
                 # of the core invariant ("SM 기록 실패 시 schedule 절대
                 # 금지"), since a brief SM recovery could let the timer fire
                 # an autonomous order for a transition nobody could see.
-                market = "kiwoom" if session_id in kr_stock_sessions else "coin"
+                # market already resolved from sm_session.market_type at the
+                # graph-selection site above -- reused here, no re-derivation.
                 last_error: Optional[Exception] = None
                 for _attempt in range(2):
                     try:
