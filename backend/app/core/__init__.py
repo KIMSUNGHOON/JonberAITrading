@@ -11,7 +11,6 @@ from .analysis_limiter import (
     release_analysis_slot,
     get_active_analysis_count,
     cleanup_old_sessions,
-    active_sessions,
 )
 
 __all__ = [
@@ -20,5 +19,4 @@ __all__ = [
     "release_analysis_slot",
     "get_active_analysis_count",
     "cleanup_old_sessions",
-    "active_sessions",
 ]

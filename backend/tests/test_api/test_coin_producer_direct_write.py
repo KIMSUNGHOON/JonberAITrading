@@ -13,9 +13,9 @@
   2) awaiting_approval 세션이 3개의 읽기 표면(/approval/pending,
      GET /api/trading/operations, WS `_get_session_snapshot`)에서 동일하게
      보인다 — SM이 유일한 쓰기 대상이므로 셋 다 같은 진실을 읽는다.
-  3) analysis_limiter의 `active_sessions` dict(레거시 3번째 사본)도 전
-     과정 빈 상태 유지 — register_session/update_session_status 호출이
-     전부 삭제됐다는 핀.
+  3) analysis_limiter의 `active_sessions` dict(레거시 3번째 사본)는 P3-2에서
+     모듈째 삭제됐다 — 이 파일은 그 모듈이 세션 상태를 전혀 들고 있지 않다는
+     것(속성 자체가 없다는 것)을 회귀 핀으로 고정한다.
 
 awaiting-commit 실패 시 fail-closed(2회 시도 후 ERROR + schedule 금지)는
 `test_awaiting_writethrough.py`의 조정된 coin 테스트가 커버한다(새 시그니처
@@ -59,21 +59,6 @@ async def sm(monkeypatch):
     manager._sessions.clear()
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
-
-
-@pytest.fixture
-def limiter_active_sessions():
-    """Isolated view of analysis_limiter's legacy `active_sessions` dict (the
-    4th copy) -- must stay empty across the whole lifecycle once
-    register_session/update_session_status calls are removed from the coin
-    producer."""
-    from app.core.analysis_limiter import active_sessions
-
-    saved = dict(active_sessions)
-    active_sessions.clear()
-    yield active_sessions
-    active_sessions.clear()
-    active_sessions.update(saved)
 
 
 def _patch_graph(monkeypatch, graph):
@@ -123,7 +108,7 @@ class _AwaitingGraph:
 
 
 async def test_concurrent_starts_same_market_reserve_exactly_once(
-    sm, limiter_active_sessions, monkeypatch
+    sm, monkeypatch
 ):
     graph = _CountingCompletingGraph()
     _patch_graph(monkeypatch, graph)
@@ -169,7 +154,7 @@ async def test_concurrent_starts_same_market_reserve_exactly_once(
 
 
 async def test_awaiting_session_visible_on_pending_operations_and_ws_snapshot(
-    sm, limiter_active_sessions, monkeypatch
+    sm, monkeypatch
 ):
     _patch_graph(monkeypatch, _AwaitingGraph())
 
@@ -211,47 +196,53 @@ async def test_awaiting_session_visible_on_pending_operations_and_ws_snapshot(
 
 
 # -------------------------------------------
-# 3) The limiter's active_sessions dict (the legacy 3rd copy) stays empty
-#    across the ENTIRE lifecycle -- start, run-to-completion,
-#    run-to-awaiting, and cancel never write it.
+# 3) P3-2: the limiter's legacy `active_sessions` dict (the 3rd/4th copy,
+#    depending on how you count) is not just empty -- the module no longer
+#    HAS it. This pins the module against ever growing a local session-state
+#    copy again.
 # -------------------------------------------
 
 
-async def test_limiter_dict_stays_empty_through_completed_lifecycle(
-    sm, limiter_active_sessions, monkeypatch
-):
+def test_analysis_limiter_module_has_no_local_session_dict():
+    """P3-2 retired analysis_limiter's `active_sessions` dict (Store E)
+    entirely -- SessionManager is the sole session store. This is a durable
+    regression pin: the earlier version of this test only checked that the
+    dict stayed empty, which a future re-introduction of the dict could pass
+    trivially. Asserting the attribute is gone catches that."""
+    import app.core.analysis_limiter as limiter
+
+    assert not hasattr(limiter, "active_sessions")
+
+
+async def test_coin_lifecycle_completed_uses_sm_only(sm, monkeypatch):
+    """Coin analysis start -> run -> completed relies solely on SM state
+    (no legacy dict exists to fall back to or diverge from)."""
     _patch_graph(monkeypatch, _CountingCompletingGraph())
 
     bg = BackgroundTasks()
     response = await start_coin_analysis(CoinAnalysisRequest(market="KRW-BTC"), bg)
-    assert limiter_active_sessions == {}, "start must never write the limiter's active_sessions dict"
 
     await run_coin_analysis_task(response.session_id)
-    assert limiter_active_sessions == {}, (
-        "the background task must never write the limiter's active_sessions dict"
-    )
 
     session = await sm.get_session(response.session_id)
     assert session.status == SessionStatus.COMPLETED
 
 
-async def test_limiter_dict_stays_empty_through_awaiting_and_cancel_lifecycle(
-    sm, limiter_active_sessions, monkeypatch
-):
+async def test_coin_lifecycle_awaiting_and_cancel_uses_sm_only(sm, monkeypatch):
+    """Coin analysis start -> run -> awaiting_approval -> cancel relies
+    solely on SM state (no legacy dict exists to fall back to or diverge
+    from)."""
     _patch_graph(monkeypatch, _AwaitingGraph())
 
     bg = BackgroundTasks()
     response = await start_coin_analysis(CoinAnalysisRequest(market="KRW-BTC"), bg)
-    assert limiter_active_sessions == {}
 
     await run_coin_analysis_task(response.session_id)
-    assert limiter_active_sessions == {}
 
     session = await sm.get_session(response.session_id)
     assert session.status == SessionStatus.AWAITING_APPROVAL
 
     result = await cancel_coin_analysis(response.session_id)
-    assert limiter_active_sessions == {}
     assert result["mirror_failed"] is False
 
     session = await sm.get_session(response.session_id)
