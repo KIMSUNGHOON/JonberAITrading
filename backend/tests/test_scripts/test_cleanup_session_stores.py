@@ -550,3 +550,187 @@ def test_main_never_touches_default_real_db_paths(dbs):
     assert str(DEFAULT_SESSIONS_DB).endswith("data/sessions.db")
     assert str(DEFAULT_STORAGE_DB).endswith("data/storage.db")
     assert str(DEFAULT_GHOST_FILE).endswith("data/analysis_sessions.db")
+
+
+# -------------------------------------------
+# Review fix (P5-3): --vacuum guard pinning + invariant-protection tests.
+#
+# Reviewer's Important: the `if apply and vacuum:` gate in run_cleanup was
+# untested -- since this script is meant to eventually run against the real
+# 612MB/1GB backlog, a future edit that loosens that gate (e.g. `if vacuum:`
+# alone, accidentally running VACUUM on a dry-run) would only be discovered
+# on the day it actually runs. The two tests below spy on `vacuum_db` (via
+# monkeypatch on the module object, not a script-code change) to pin the
+# gate's exact truth table.
+#
+# Minor #1: `_status_lookup`'s per-batch failure isolation -- when the
+# sessions.db status query itself fails, the affected checkpoint session_ids
+# must be treated as unresolved (never deleted), not defaulted to "absent"
+# (which would incorrectly reclaim a checkpoint that might belong to a live
+# RUNNING/AWAITING_APPROVAL session this run simply failed to observe).
+#
+# Minor #2: constant-drift guard -- this script intentionally re-derives
+# TERMINAL_STATUSES/LIVE_STATUSES/CHECKPOINT_ORPHAN_GRACE as standalone
+# literals (see the module docstring) rather than importing them from
+# services/session_manager.py, so it can stay a sync-sqlite3-only tool. That
+# duplication is only safe as long as the values stay identical -- this test
+# asserts they do, so any future change to session_manager.py's values (or
+# this script's copies) that lets them drift apart fails loudly here instead
+# of silently reclaiming the wrong rows on the real backlog.
+# -------------------------------------------
+
+
+def test_vacuum_alone_without_apply_is_noop(dbs, monkeypatch):
+    """--vacuum with no --apply must never call vacuum_db -- VACUUM is only
+    ever meaningful/safe after an actual delete pass, and the review's
+    concern is exactly a future loosening of the `if apply and vacuum:`
+    gate that would run VACUUM even on a dry-run."""
+    sessions_db, storage_db, ghost_file = dbs
+    _insert_session(sessions_db, "t-completed", "completed")
+
+    import scripts.cleanup_session_stores as cleanup_mod
+
+    calls = []
+    monkeypatch.setattr(cleanup_mod, "vacuum_db", lambda path: calls.append(path))
+
+    summary = run_cleanup(
+        sessions_db=sessions_db,
+        storage_db=storage_db,
+        ghost_file=ghost_file,
+        apply=False,
+        vacuum=True,
+        now=NOW,
+    )
+
+    assert calls == []
+    assert summary.vacuumed is False
+    # Sanity: dry-run still didn't delete anything either -- vacuum=True
+    # alone must not smuggle in apply behavior.
+    assert _session_exists(sessions_db, "t-completed") is True
+
+
+def test_apply_and_vacuum_runs_vacuum_on_both_dbs(dbs, monkeypatch):
+    """--apply --vacuum together must call vacuum_db for BOTH sessions_db
+    and storage_db, in that order, exactly once each."""
+    sessions_db, storage_db, ghost_file = dbs
+    _insert_session(sessions_db, "t-completed", "completed")
+
+    import scripts.cleanup_session_stores as cleanup_mod
+
+    calls = []
+    monkeypatch.setattr(cleanup_mod, "vacuum_db", lambda path: calls.append(path))
+
+    summary = run_cleanup(
+        sessions_db=sessions_db,
+        storage_db=storage_db,
+        ghost_file=ghost_file,
+        apply=True,
+        vacuum=True,
+        now=NOW,
+    )
+
+    assert calls == [sessions_db, storage_db]
+    assert summary.vacuumed is True
+
+
+def test_apply_without_vacuum_flag_never_calls_vacuum_db(dbs, monkeypatch):
+    """Symmetric check: --apply alone (no --vacuum) must not run VACUUM --
+    pins the other half of the gate's truth table."""
+    sessions_db, storage_db, ghost_file = dbs
+    _insert_session(sessions_db, "t-completed", "completed")
+
+    import scripts.cleanup_session_stores as cleanup_mod
+
+    calls = []
+    monkeypatch.setattr(cleanup_mod, "vacuum_db", lambda path: calls.append(path))
+
+    summary = run_cleanup(
+        sessions_db=sessions_db,
+        storage_db=storage_db,
+        ghost_file=ghost_file,
+        apply=True,
+        vacuum=False,
+        now=NOW,
+    )
+
+    assert calls == []
+    assert summary.vacuumed is False
+
+
+def test_status_lookup_batch_failure_is_conservative_skip(dbs, monkeypatch):
+    """Minor #1: if the sessions.db status SELECT itself fails (e.g. lock
+    contention, disk hiccup), the checkpoint session_ids in that batch must
+    be treated as UNRESOLVED -- never deleted this run -- not defaulted to
+    "absent from sessions.db" (which would otherwise look identical to a
+    genuine orphan and get reclaimed). Simulated by wrapping the real
+    sqlite3 connection so only the exact status-lookup SQL raises; every
+    other query (including the checkpoints GROUP BY scan) passes through to
+    the real connection untouched."""
+    sessions_db, storage_db, ghost_file = dbs
+    old = NOW - CHECKPOINT_ORPHAN_GRACE - timedelta(hours=1)
+    _insert_checkpoint(storage_db, "would-be-orphan", "main", old)  # no SM row -- case (a) if resolved
+
+    import scripts.cleanup_session_stores as cleanup_mod
+
+    real_connect = cleanup_mod._connect
+
+    class _FailingStatusLookupConn:
+        def __init__(self, real_conn):
+            self._real = real_conn
+
+        def execute(self, sql, params=()):
+            if "SELECT session_id, status FROM analysis_sessions" in sql:
+                raise sqlite3.OperationalError("simulated status-lookup failure")
+            return self._real.execute(sql, params)
+
+        def commit(self):
+            return self._real.commit()
+
+        def close(self):
+            return self._real.close()
+
+    def _patched_connect(db_path):
+        return _FailingStatusLookupConn(real_connect(db_path))
+
+    monkeypatch.setattr(cleanup_mod, "_connect", _patched_connect)
+
+    report = analyze_checkpoints(sessions_db, storage_db, now=NOW)
+
+    # Conservative: the status lookup failed, so this candidate must NOT be
+    # classified as an orphan (even though, if resolved, it would have been
+    # one -- absent from sessions.db, past grace).
+    assert report.orphan_session_ids == []
+    assert report.total_checkpoint_sessions == 1  # the checkpoint scan itself still succeeded
+
+    # And the delete path (driven by orphan_session_ids) leaves it intact.
+    deleted = delete_orphan_checkpoints(storage_db, report.orphan_session_ids)
+    assert deleted == 0
+    assert _checkpoint_exists(storage_db, "would-be-orphan") is True
+
+
+def test_constants_match_session_manager_production_values():
+    """Minor #2: this script deliberately re-derives its own
+    TERMINAL_STATUSES/LIVE_STATUSES/CHECKPOINT_ORPHAN_GRACE literals instead
+    of importing services/session_manager.py (see the module docstring's
+    duplication-vs-coupling rationale) -- pin that the copies have not
+    drifted from the production values they mirror."""
+    from services.session_manager import (
+        CHECKPOINT_ORPHAN_GRACE as PROD_GRACE,
+        SessionStatus,
+        _TERMINAL_STATUSES as PROD_TERMINAL_STATUSES,
+    )
+
+    import scripts.cleanup_session_stores as cleanup_mod
+
+    assert set(cleanup_mod.TERMINAL_STATUSES) == {s.value for s in PROD_TERMINAL_STATUSES}
+    assert set(cleanup_mod.LIVE_STATUSES) == {
+        SessionStatus.RUNNING.value,
+        SessionStatus.AWAITING_APPROVAL.value,
+    }
+    # Every SessionStatus value is accounted for by exactly one of the two
+    # sets -- guards against a future SessionStatus addition that neither
+    # this script's TERMINAL_STATUSES/LIVE_STATUSES nor the production
+    # _TERMINAL_STATUSES set was updated to cover.
+    all_status_values = {s.value for s in SessionStatus}
+    assert set(cleanup_mod.TERMINAL_STATUSES) | set(cleanup_mod.LIVE_STATUSES) == all_status_values
+    assert cleanup_mod.CHECKPOINT_ORPHAN_GRACE == PROD_GRACE
