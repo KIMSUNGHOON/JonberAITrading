@@ -55,6 +55,18 @@ COMPLETED_SESSION_TTL = timedelta(hours=1)
 # brief storage.db lock contention) merely delayed the SM-side row update
 # for.
 CHECKPOINT_ORPHAN_GRACE = timedelta(hours=24)
+# P5-2 review fix: SQLite has a hard cap on host parameters per statement
+# (999 pre-3.32.0, 32766 from 3.32.0 on). Both P5-2 sweeps below build a
+# `session_id IN (...)` clause with one placeholder per candidate -- at the
+# backlog scale these sweeps exist to reclaim (612MB/1GB, potentially many
+# thousands of rows), an unbounded IN clause can exceed that cap, raise
+# "too many SQL variables", and get swallowed by the sweep's own best-effort
+# except -- turning "reclaim what's due" into a silent full no-op every
+# cycle. Both `_sweep_terminal_session_rows` and `_sweep_orphan_checkpoints`
+# chunk their IN-clause candidate lists to this size via `_chunked` below;
+# each chunk executes and fails independently (see both methods'
+# docstrings), so one oversized/unlucky batch can never block the rest.
+_SWEEP_IN_CLAUSE_CHUNK_SIZE = 500
 DB_PATH = "data/sessions.db"
 # Max buffered messages per WebSocket subscriber. On overflow the oldest is dropped
 # (realtime favors the latest state), so a slow/dead socket cannot grow unbounded.
@@ -228,6 +240,17 @@ def _parse_dt(value: Any) -> Optional[datetime]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _chunked(items: List[str], size: int) -> List[List[str]]:
+    """Split `items` into consecutive sub-lists of at most `size` each.
+
+    P5-2 review fix: backs the IN-clause batching in
+    `_sweep_terminal_session_rows`/`_sweep_orphan_checkpoints` (see
+    `_SWEEP_IN_CLAUSE_CHUNK_SIZE`'s module comment). Order-preserving,
+    no dedup -- a plain positional slice.
+    """
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 @dataclass
@@ -1237,7 +1260,9 @@ class SessionManager:
     # rationale.
 
     async def _sweep_terminal_session_rows(
-        self, now: Optional[datetime] = None
+        self,
+        now: Optional[datetime] = None,
+        chunk_size: int = _SWEEP_IN_CLAUSE_CHUNK_SIZE,
     ) -> List[str]:
         """
         Direct-SQL backstop for terminal sessions.db rows that
@@ -1245,19 +1270,42 @@ class SessionManager:
         module comment above this method).
 
         Runs independently of self._sessions: SELECTs every row whose
-        status is terminal, filters in Python (via `updated_at`, per spec
-        Sec.1.1-6 -- NOT `created_at`; a session that goes terminal long
-        after creation must get its own fresh TTL window measured from
-        when it actually became terminal) against the SAME
-        COMPLETED_SESSION_TTL boundary cleanup_expired_sessions uses, then
-        deletes exactly those rows. Filtering candidates in Python instead
-        of pushing the timestamp comparison into SQL avoids relying on
-        ISO-8601 string lexicographic ordering being exact for every stored
-        `updated_at` value (datetime.isoformat() omits the microsecond
-        field entirely when it is zero, which would otherwise make that
-        row's string sort earlier than a same-instant value that does have
-        microseconds) -- mirrors _parse_dt's existing tolerant-parsing
-        role elsewhere in this module.
+        status is terminal, filters in Python against the SAME
+        COMPLETED_SESSION_TTL *duration* cleanup_expired_sessions uses --
+        but anchored on `updated_at` (per spec Sec.1.1-6), NOT the SAME
+        COLUMN that method anchors on (cleanup_expired_sessions compares
+        `now - session.created_at`, see its body above). This is a
+        deliberate, more conservative divergence, not an inconsistency:
+        `updated_at >= created_at` always holds, so anchoring on
+        `updated_at` can only make a row survive at least as long as --
+        often longer than -- cleanup_expired_sessions' own created_at
+        -anchored check would keep it. That is exactly right for THIS
+        sweep's job: a session that goes terminal long after creation must
+        get its own fresh TTL window measured from when it actually became
+        terminal, not from when it was first created.
+        (cleanup_expired_sessions' `created_at` anchor is pre-existing
+        behavior, unrelated to this task and left unchanged.)
+
+        Filtering candidates in Python instead of pushing the timestamp
+        comparison into SQL avoids relying on ISO-8601 string lexicographic
+        ordering being exact for every stored `updated_at` value
+        (datetime.isoformat() omits the microsecond field entirely when it
+        is zero, which would otherwise make that row's string sort earlier
+        than a same-instant value that does have microseconds) -- mirrors
+        _parse_dt's existing tolerant-parsing role elsewhere in this
+        module.
+
+        The candidate DELETE is chunked to `chunk_size` (default
+        `_SWEEP_IN_CLAUSE_CHUNK_SIZE`, see its module comment for why an
+        unbounded `IN (...)` is unsafe at backlog scale). Each chunk
+        commits and fails independently -- a batch that raises is logged
+        and skipped; its rows are simply left in place for the next cycle
+        (a DELETE that never ran is always a safe no-op), and
+        `deleted_ids` only ever contains rows from batches that actually
+        committed, so the checkpoint-GC firing below stays accurate even
+        under a partial failure. `chunk_size` is a parameter (not baked in)
+        so tests can inject a small value and exercise multi-batch/
+        partial-failure behavior without inserting thousands of rows.
 
         Any session_id this deletes is also defensively dropped from
         self._sessions/self._dirty/self._subscribers. Normally none of
@@ -1275,9 +1323,11 @@ class SessionManager:
         never run while the SM lock, which serializes the entire app-wide
         session SSOT, is held).
 
-        Best-effort: any failure (including on a corrupt/unreachable
-        DB_PATH) is logged and swallowed, returning an empty list -- the
-        next periodic cycle retries.
+        Best-effort: any failure at the connection/SELECT level (including
+        a corrupt/unreachable DB_PATH) is logged and swallowed; whatever
+        `deleted_ids` had already accumulated from earlier successful
+        batches (if any) before such a failure is still processed below --
+        the next periodic cycle retries only what's left.
         """
         now = now or datetime.now(timezone.utc)
         cutoff = now - COMPLETED_SESSION_TTL
@@ -1301,17 +1351,26 @@ class SessionManager:
                     if (_parse_dt(updated_at_raw) or now) < cutoff
                 ]
 
-                if candidates:
-                    del_placeholders = ",".join("?" * len(candidates))
-                    await db.execute(
-                        f"DELETE FROM analysis_sessions WHERE session_id IN ({del_placeholders})",
-                        candidates,
-                    )
-                    await db.commit()
-                deleted_ids = candidates
+                for chunk in _chunked(candidates, chunk_size):
+                    try:
+                        del_placeholders = ",".join("?" * len(chunk))
+                        await db.execute(
+                            f"DELETE FROM analysis_sessions WHERE session_id IN ({del_placeholders})",
+                            chunk,
+                        )
+                        await db.commit()
+                        deleted_ids.extend(chunk)
+                    except Exception as e:
+                        logger.warning(
+                            "terminal_row_sweep_batch_failed",
+                            batch_size=len(chunk),
+                            error=str(e),
+                        )
         except Exception as e:
             logger.warning("terminal_row_sweep_failed", error=str(e))
-            return []
+            # Fall through with whatever `deleted_ids` accumulated before
+            # this outer-level failure -- their checkpoint-GC firing below
+            # must still happen for rows genuinely gone from SQLite.
 
         if not deleted_ids:
             return []
@@ -1330,7 +1389,9 @@ class SessionManager:
         return deleted_ids
 
     async def _sweep_orphan_checkpoints(
-        self, now: Optional[datetime] = None
+        self,
+        now: Optional[datetime] = None,
+        chunk_size: int = _SWEEP_IN_CLAUSE_CHUNK_SIZE,
     ) -> int:
         """
         Direct-SQL backstop for storage.db checkpoint rows P5-1's
@@ -1350,7 +1411,15 @@ class SessionManager:
         checked via a fresh SQLite read (not self._sessions, which this
         process may not have loaded that session_id into at all, e.g. a
         session created and driven to completion entirely by a different
-        process instance).
+        process instance). The status lookup is chunked (see `chunk_size`
+        below) to keep this invariant safe under batching: a session_id
+        whose STATUS LOOKUP failed this cycle (its batch raised) is treated
+        as UNRESOLVED, not as case (a) -- it is skipped entirely, never
+        deleted, because among an unresolved batch's session_ids could be
+        a genuinely live RUNNING/AWAITING_APPROVAL one that this sweep
+        simply failed to observe. Only a batch that resolves successfully
+        (whether it returns a row or zero rows for a given session_id) can
+        ever conclude "absent" (case a) or "terminal" (case b).
 
         Grace period: CHECKPOINT_ORPHAN_GRACE (24h), measured from the
         checkpoint's OWN last-write timestamp (storage_service.
@@ -1369,6 +1438,20 @@ class SessionManager:
         A session_id whose last-write timestamp can't be parsed is treated
         as NOT past grace (skipped, conservative) rather than assumed
         eligible.
+
+        The status-lookup `session_id IN (...)` clause is chunked to
+        `chunk_size` (default `_SWEEP_IN_CLAUSE_CHUNK_SIZE`, see its
+        module comment for why an unbounded IN clause is unsafe at
+        backlog scale). Each chunk resolves independently -- a batch that
+        raises is logged and its session_ids are recorded as unresolved
+        (see the invariant note above) rather than aborting the whole
+        sweep; a connection-level failure (e.g. DB_PATH itself unreachable,
+        raised before any chunk executes) still short-circuits the entire
+        sweep to 0, matching this method's original all-or-nothing
+        connection-failure behavior. `chunk_size` is a parameter (not
+        baked in) so tests can inject a small value and exercise
+        multi-batch/partial-failure behavior without inserting thousands
+        of rows.
 
         Best-effort throughout: any failure (listing checkpoints, looking
         up statuses, or an individual delete) is logged and swallowed --
@@ -1390,22 +1473,35 @@ class SessionManager:
             return 0
 
         status_by_sid: Dict[str, str] = {}
+        unresolved_sids: Set[str] = set()
         try:
             session_ids = [sid for sid, _ in checkpoint_rows]
-            placeholders = ",".join("?" * len(session_ids))
             async with aiosqlite.connect(DB_PATH) as db:
-                cursor = await db.execute(
-                    f"SELECT session_id, status FROM analysis_sessions WHERE session_id IN ({placeholders})",
-                    session_ids,
-                )
-                for sid, status in await cursor.fetchall():
-                    status_by_sid[sid] = status
+                for chunk in _chunked(session_ids, chunk_size):
+                    try:
+                        placeholders = ",".join("?" * len(chunk))
+                        cursor = await db.execute(
+                            f"SELECT session_id, status FROM analysis_sessions WHERE session_id IN ({placeholders})",
+                            chunk,
+                        )
+                        for sid, status in await cursor.fetchall():
+                            status_by_sid[sid] = status
+                    except Exception as e:
+                        logger.warning(
+                            "checkpoint_orphan_sweep_status_lookup_batch_failed",
+                            batch_size=len(chunk),
+                            error=str(e),
+                        )
+                        unresolved_sids.update(chunk)
         except Exception as e:
             logger.warning("checkpoint_orphan_sweep_status_lookup_failed", error=str(e))
             return 0
 
         deleted = 0
         for session_id, last_written_raw in checkpoint_rows:
+            if session_id in unresolved_sids:
+                continue  # status lookup failed this cycle -- conservative skip, retried next cycle
+
             status = status_by_sid.get(session_id)
             if status in (SessionStatus.RUNNING.value, SessionStatus.AWAITING_APPROVAL.value):
                 continue  # absolute invariant -- never touch a live session's checkpoint
@@ -1631,20 +1727,41 @@ async def run_session_cleanup_task() -> None:
     stranded outside cleanup_expired_sessions' in-memory-only TTL walk.
     See _ORPHAN_SWEEP_CYCLE_INTERVAL and the sweep methods' own docstrings
     for the full rationale.
+
+    P5-2 review fix (starvation): `cycle` increments BEFORE the fallible
+    `cleanup_expired_sessions()` call, and the orphan sweeps run in their
+    OWN try/except -- not nested inside cleanup's. Previously `cycle` only
+    advanced on a SUCCESSFUL cleanup_expired_sessions() call, AND the two
+    sweeps were reached only if that same call succeeded on that exact
+    iteration (they were downstream of it inside one try block). Under a
+    PERSISTENT cleanup_expired_sessions failure (not just an occasional
+    flaky one), those two facts compound: `cycle` would freeze forever at
+    whatever value it last reached, and even if it hadn't, the sweep calls
+    were unreachable code after the raised exception on every single
+    iteration -- i.e. permanent sweep starvation, not merely a delayed
+    cadence. Decoupling the two means the ~hourly sweep cadence tracks
+    wall-clock loop iterations unconditionally, and a broken
+    cleanup_expired_sessions can never block the sweeps' own (separately
+    best-effort) attempt.
     """
     logger.info("session_cleanup_task_started", ttl_hours=COMPLETED_SESSION_TTL.total_seconds() / 3600)
 
     cycle = 0
     while True:
+        cycle += 1
         try:
             manager = await get_session_manager()
             await manager.cleanup_expired_sessions()
-            cycle += 1
-            if cycle % _ORPHAN_SWEEP_CYCLE_INTERVAL == 0:
-                await manager._sweep_terminal_session_rows()
-                await manager._sweep_orphan_checkpoints()
         except Exception as e:
             logger.error("session_cleanup_error", error=str(e))
+
+        if cycle % _ORPHAN_SWEEP_CYCLE_INTERVAL == 0:
+            try:
+                manager = await get_session_manager()
+                await manager._sweep_terminal_session_rows()
+                await manager._sweep_orphan_checkpoints()
+            except Exception as e:
+                logger.error("session_orphan_sweep_error", error=str(e))
 
         await asyncio.sleep(300)  # Run every 5 minutes
 

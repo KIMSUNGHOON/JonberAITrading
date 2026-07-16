@@ -23,6 +23,15 @@ P5-1이 terminal 전이 시점에 체크포인트를 동기 삭제하는 best-ef
 
 절대 불변식: RUNNING/AWAITING_APPROVAL 세션의 행·체크포인트는 어떤 sweep도
 절대 건드리지 않는다 (grace 유예와 무관하게, 아무리 오래돼도).
+
+리뷰픽스(P5-2): 두 sweep의 `session_id IN (...)` 절은 후보 수만큼 placeholder를
+만든다 — 612MB/1GB 백로그 규모에서 SQLite 호스트 파라미터 캡(999/32766)을
+넘으면 "too many SQL variables"가 sweep 자체의 best-effort except에 삼켜져
+조용한 전면 no-op이 된다. 두 사이트 모두 `_SWEEP_IN_CLAUSE_CHUNK_SIZE`(500)
+단위로 배치 청킹 + 배치별 실패 격리(한 배치 실패가 나머지 중단 안 함)로
+수정했다. `chunk_size`가 두 sweep 메서드의 파라미터로 노출되어 있어, 테스트가
+수천 행을 실제로 삽입하지 않고도 작은 청크 크기를 주입해 다중 배치·부분 실패
+경로를 실제 SQL 실행 레벨에서 검증할 수 있다.
 """
 
 import asyncio
@@ -38,6 +47,7 @@ from services.session_manager import (
     MarketType,
     SessionManager,
     SessionStatus,
+    _chunked,
 )
 from services.storage_service import StorageService
 
@@ -445,3 +455,166 @@ async def test_get_checkpoint_session_ids_empty_db(tmp_path):
     storage = StorageService(db_path=str(tmp_path / "empty.db"))
     rows = await storage.get_checkpoint_session_ids()
     assert rows == []
+
+
+# -------------------------------------------
+# 4) P5-2 review fix: IN(...) clause batch chunking + failure isolation
+# -------------------------------------------
+# Reviewer finding: both sweeps' `session_id IN (...)` clauses build one
+# host parameter per candidate -- unbounded at the 612MB/1GB backlog scale
+# these sweeps exist to reclaim, risking SQLite's host-parameter cap
+# ("too many SQL variables") getting silently swallowed by the sweep's own
+# best-effort except, i.e. a quiet full no-op. Fixed by chunking both IN
+# clauses to `_SWEEP_IN_CLAUSE_CHUNK_SIZE` (500) with per-batch failure
+# isolation. The tests below pin: (a) `_chunked` itself is a correct,
+# order-preserving, boundary-exact splitter; (b) with a small injected
+# `chunk_size`, a real SQL-level failure on ONE batch does not prevent the
+# other batches (before AND after it) from committing/resolving.
+
+
+def test_chunked_splits_at_exact_boundary():
+    items = [str(i) for i in range(1001)]
+    chunks = _chunked(items, 500)
+    assert [len(c) for c in chunks] == [500, 500, 1]
+    assert sum(chunks, []) == items  # order-preserving, no loss/dup
+
+
+def test_chunked_empty_list():
+    assert _chunked([], 500) == []
+
+
+def test_chunked_smaller_than_chunk_size():
+    assert _chunked(["a", "b"], 500) == [["a", "b"]]
+
+
+def test_chunked_exact_multiple():
+    items = [str(i) for i in range(1000)]
+    chunks = _chunked(items, 500)
+    assert [len(c) for c in chunks] == [500, 500]
+
+
+class _NthCallFailsWrapper:
+    """Wraps a real aiosqlite Connection so the Nth `db.execute()` call
+    whose SQL contains `match_sql` raises; every other call (earlier,
+    later, or non-matching) passes through to the real connection
+    untouched. Used to pin P5-2's batch failure isolation at the actual
+    SQL-execution level -- a mock one layer up (e.g. patching
+    delete_checkpoints) couldn't distinguish "batch N's own DELETE/SELECT
+    failed" from "the whole method never got that far".
+
+    Attribute SETS (e.g. `conn.row_factory = aiosqlite.Row`, which
+    storage_service methods called later in the same test -- via
+    _checkpoint_exists/list_checkpoints -- do) are proxied to the real
+    connection via a custom __setattr__, not shadowed on this wrapper
+    instance; otherwise the real connection never observes the
+    row_factory change and a later `row["col"]` access on ITS cursors
+    breaks with "tuple indices must be integers or slices, not str".
+    """
+
+    def __init__(self, real_conn, match_sql: str, fail_on_call: int):
+        object.__setattr__(self, "_real", real_conn)
+        object.__setattr__(self, "_match_sql", match_sql)
+        object.__setattr__(self, "_fail_on_call", fail_on_call)
+        object.__setattr__(self, "_count", 0)
+
+    async def execute(self, sql, params=()):
+        if self._match_sql in sql:
+            object.__setattr__(self, "_count", self._count + 1)
+            if self._count == self._fail_on_call:
+                raise RuntimeError(f"boom: simulated failure on matching call {self._count}")
+        return await self._real.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._real, name, value)
+
+
+def _patch_nth_call_fails(monkeypatch, match_sql: str, fail_on_call: int):
+    """Monkeypatch services.session_manager.aiosqlite.connect so the
+    connection it returns fails on the Nth call matching `match_sql`.
+
+    NOTE: this patches the shared `aiosqlite` module object's `connect`
+    attribute (services.session_manager's `aiosqlite` name IS that module,
+    not a separate reference) -- scoped to the lifetime of the pytest
+    `monkeypatch` fixture (auto-reverted at test teardown), and harmless to
+    any call whose SQL doesn't contain `match_sql` (passed straight through
+    to the real connection), so it does not interfere with this test
+    file's other DB helpers (_session_row_exists, _checkpoint_exists, etc.)
+    called later in the same test.
+    """
+    import services.session_manager as sm_mod
+
+    real_connect = sm_mod.aiosqlite.connect
+
+    class _CM:
+        def __init__(self, real_cm):
+            self._real_cm = real_cm
+
+        async def __aenter__(self):
+            conn = await self._real_cm.__aenter__()
+            return _NthCallFailsWrapper(conn, match_sql, fail_on_call)
+
+        async def __aexit__(self, *exc):
+            return await self._real_cm.__aexit__(*exc)
+
+    def _connect(*args, **kwargs):
+        return _CM(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sm_mod.aiosqlite, "connect", _connect)
+
+
+async def test_sweep_terminal_rows_batch_failure_does_not_abort_other_batches(rig, monkeypatch):
+    """5 expired terminal rows, chunk_size=2 -> batches of [2, 2, 1]. The
+    2nd DELETE call (2nd batch) fails at the real SQL-execution level;
+    batches 1 and 3 (4 ids total) must still commit, and the checkpoint-GC
+    hook must fire ONLY for the ids that actually got deleted."""
+    manager, storage = rig
+    old = NOW - COMPLETED_SESSION_TTL - timedelta(minutes=5)
+    sids = [f"batch-{i}" for i in range(5)]
+    for sid in sids:
+        await manager._save_session(_sess(sid, SessionStatus.COMPLETED, created=old, updated=old))
+
+    _patch_nth_call_fails(monkeypatch, "DELETE FROM analysis_sessions", fail_on_call=2)
+
+    deleted = await manager._sweep_terminal_session_rows(now=NOW, chunk_size=2)
+
+    assert len(deleted) == 3  # batch1(2) + batch3(1); batch2(2) failed and was skipped
+    assert set(deleted).issubset(set(sids))
+    assert set(manager._delete_calls) == set(deleted)  # GC hook fired only for real deletes
+
+    from services import session_manager as sm_mod
+
+    remaining = [sid for sid in sids if await _session_row_exists(sm_mod.DB_PATH, sid)]
+    assert set(remaining) == set(sids) - set(deleted)  # failed batch's rows survive intact
+
+
+async def test_orphan_checkpoint_status_lookup_batch_failure_conservative_skip(rig, monkeypatch):
+    """4 checkpoints with no SM row at all (all would be eligible, case a,
+    past grace, if their status lookup succeeded), chunk_size=2 -> exactly
+    2 batches. The 2nd status-lookup SELECT (2nd batch) fails; those 2
+    session_ids must be treated as UNRESOLVED (never deleted this cycle),
+    not defaulted to case (a) -- pins the absolute-invariant-preserving
+    conservative-skip path, not just 'some things got deleted'."""
+    manager, storage = rig
+    old = NOW - CHECKPOINT_ORPHAN_GRACE - timedelta(hours=1)
+    sids = [f"batch-orphan-{i}" for i in range(4)]
+    for sid in sids:
+        await _insert_checkpoint(storage, sid, "main", old)
+
+    _patch_nth_call_fails(
+        monkeypatch, "SELECT session_id, status FROM analysis_sessions", fail_on_call=2
+    )
+
+    deleted_count = await manager._sweep_orphan_checkpoints(now=NOW, chunk_size=2)
+
+    # Exactly one batch (2 session_ids) resolved successfully as "no SM
+    # row, past grace" and was deleted; the other batch's lookup failed
+    # and its 2 session_ids were conservatively left untouched.
+    assert deleted_count == 2
+    assert len(manager._delete_calls) == 2
+
+    surviving = [sid for sid in sids if await _checkpoint_exists(storage, sid)]
+    assert len(surviving) == 2
+    assert set(surviving) | set(manager._delete_calls) == set(sids)
