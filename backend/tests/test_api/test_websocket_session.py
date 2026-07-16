@@ -138,33 +138,33 @@ def fast_poll(monkeypatch):
     monkeypatch.setattr(ws_module, "SAFETY_POLL_SECONDS", 0.1)
 
 
-def _legacy_kr_session(session_id: str, **state_extra) -> dict:
-    state = {
-        "stk_cd": "005930",
-        "stk_nm": "삼성전자",
-        "reasoning_log": [],
-        "current_stage": "data_collection",
-    }
+def _kr_state(**state_extra) -> dict:
+    """Build the `state` sub-dict for a KR-shaped SM session (P1-2: these
+    tests used to seed a legacy dict directly; now that legacy dicts are out
+    of the read path under SESSION_SSOT_READS=True, they seed the SM session
+    instead -- the state *shape* is unchanged, only where it lives)."""
+    state = {"reasoning_log": [], "current_stage": "data_collection"}
     state.update(state_extra)
-    return {
-        "session_id": session_id,
-        "stk_cd": "005930",
-        "stk_nm": "삼성전자",
-        "status": "running",
-        "state": state,
-        "created_at": None,
-        "error": None,
-    }
+    return state
 
 
 # -------------------------------------------
-# Poll fallback (legacy dict sessions) — existing contract preserved
+# Poll fallback (direct SM state writes, no notify) — existing contract
+# preserved. P1-2: legacy dicts are out of the read path under
+# SESSION_SSOT_READS=True, so what used to be "seed the legacy dict"
+# (the old un-migrated-producer stand-in) is now "mutate the live SM
+# session object without going through update_state()/update_status()",
+# which is the only way left to simulate a write with no pub/sub notify.
 # -------------------------------------------
 
 
-async def test_legacy_session_streams_reasoning_status_complete(sm, kr_sessions, fast_linger, fast_poll):
-    session = _legacy_kr_session("legacy-1", reasoning_log=["[t] 시작", "[t] 기술 분석"])
-    kr_sessions["legacy-1"] = session
+async def test_sm_session_streams_reasoning_status_complete_via_poll(sm, kr_sessions, fast_linger, fast_poll):
+    await sm.create_session(
+        "legacy-1", MarketType.KIWOOM, "005930", "삼성전자",
+        stk_cd="005930", stk_nm="삼성전자",
+        state=_kr_state(reasoning_log=["[t] 시작", "[t] 기술 분석"]),
+    )
+    session = sm._sessions["legacy-1"]
 
     ws = FakeWebSocket()
     async with running_ws(ws, "legacy-1") as task:
@@ -172,10 +172,11 @@ async def test_legacy_session_streams_reasoning_status_complete(sm, kr_sessions,
         status = await wait_for_frame(ws, lambda f: f.get("type") == "status")
         assert status["data"]["status"] == "running"
 
-        session["state"]["reasoning_log"] = session["state"]["reasoning_log"] + ["[t] 종합"]
+        # Un-notified write: mutate the live session object directly.
+        session.state["reasoning_log"] = session.state["reasoning_log"] + ["[t] 종합"]
         await wait_for_frame(ws, lambda f: f.get("type") == "reasoning" and f.get("data") == "[t] 종합")
 
-        session["status"] = "completed"
+        session.status = SessionStatus.COMPLETED
         complete = await wait_for_frame(ws, lambda f: f.get("type") == "complete", timeout=4.0)
         assert complete["data"]["status"] == "completed"
         await asyncio.wait_for(task, timeout=4.0)
@@ -184,8 +185,11 @@ async def test_legacy_session_streams_reasoning_status_complete(sm, kr_sessions,
     assert [f["data"] for f in reasoning_frames] == ["[t] 시작", "[t] 기술 분석", "[t] 종합"]
 
 
-async def test_legacy_ping_pong_and_on_demand_status(sm, kr_sessions, fast_linger, fast_poll):
-    kr_sessions["legacy-2"] = _legacy_kr_session("legacy-2")
+async def test_sm_ping_pong_and_on_demand_status(sm, kr_sessions, fast_linger, fast_poll):
+    await sm.create_session(
+        "legacy-2", MarketType.KIWOOM, "005930", "삼성전자",
+        stk_cd="005930", stk_nm="삼성전자", state=_kr_state(),
+    )
 
     ws = FakeWebSocket()
     async with running_ws(ws, "legacy-2"):
@@ -209,23 +213,25 @@ async def test_legacy_ping_pong_and_on_demand_status(sm, kr_sessions, fast_linge
         assert on_demand["data"]["awaiting_approval"] is False
 
 
-async def test_legacy_proposal_sent_once(sm, kr_sessions, fast_linger, fast_poll):
-    session = _legacy_kr_session(
-        "legacy-3",
-        awaiting_approval=True,
-        trade_proposal={
-            "id": "p1",
-            "stk_cd": "005930",
-            "stk_nm": "삼성전자",
-            "action": "BUY",
-            "quantity": 10,
-            "entry_price": 70000,
-            "risk_score": 0.4,
-            "rationale": "테스트",
-        },
+async def test_sm_proposal_sent_once(sm, kr_sessions, fast_linger, fast_poll):
+    await sm.create_session(
+        "legacy-3", MarketType.KIWOOM, "005930", "삼성전자",
+        stk_cd="005930", stk_nm="삼성전자",
+        state=_kr_state(
+            awaiting_approval=True,
+            trade_proposal={
+                "id": "p1",
+                "stk_cd": "005930",
+                "stk_nm": "삼성전자",
+                "action": "BUY",
+                "quantity": 10,
+                "entry_price": 70000,
+                "risk_score": 0.4,
+                "rationale": "테스트",
+            },
+        ),
     )
-    session["status"] = "awaiting_approval"
-    kr_sessions["legacy-3"] = session
+    sm._sessions["legacy-3"].status = SessionStatus.AWAITING_APPROVAL
 
     ws = FakeWebSocket()
     async with running_ws(ws, "legacy-3"):
@@ -238,16 +244,17 @@ async def test_legacy_proposal_sent_once(sm, kr_sessions, fast_linger, fast_poll
 
 
 async def test_position_frames_are_deduped(sm, kr_sessions, fast_linger, fast_poll):
-    session = _legacy_kr_session(
-        "pos-1",
-        active_position={
+    await sm.create_session(
+        "pos-1", MarketType.KIWOOM, "005930", "삼성전자",
+        stk_cd="005930", stk_nm="삼성전자",
+        state=_kr_state(active_position={
             "ticker": "005930",
             "entry_price": 70000,
             "current_price": 71000,
             "quantity": 10,
-        },
+        }),
     )
-    kr_sessions["pos-1"] = session
+    session = sm._sessions["pos-1"]
 
     ws = FakeWebSocket()
     async with running_ws(ws, "pos-1") as task:
@@ -256,14 +263,14 @@ async def test_position_frames_are_deduped(sm, kr_sessions, fast_linger, fast_po
         positions = [f for f in ws.sent if f.get("type") == "position"]
         assert len(positions) == 1, "unchanged position must not be re-sent every poll"
 
-        session["state"]["active_position"]["current_price"] = 72000
+        session.state["active_position"]["current_price"] = 72000
         await wait_for_frame(
             ws, lambda f: f.get("type") == "position" and f["data"]["current_price"] == 72000
         )
         positions = [f for f in ws.sent if f.get("type") == "position"]
         assert len(positions) == 2
 
-        session["status"] = "completed"
+        session.status = SessionStatus.COMPLETED
         await asyncio.wait_for(task, timeout=4.0)
 
 
@@ -326,13 +333,13 @@ async def test_push_mode_ping_pong(sm, kr_sessions, fast_linger, slow_polls):
         assert "pong" in ws.sent_text
 
 
-async def test_safety_poll_covers_legacy_only_updates_for_sm_session(sm, kr_sessions, fast_linger):
-    """The safety poll covers producers that write the legacy dict with NO sm
-    notification (e.g. an un-migrated path): frames must still arrive within
-    the poll interval. Disabling SAFETY_POLL_SECONDS would fail this test
-    (runs at the real 1.0s default — no patching)."""
-    session = _legacy_kr_session("safety-1")
-    kr_sessions["safety-1"] = session
+async def test_safety_poll_covers_unnotified_sm_writes(sm, kr_sessions, fast_linger):
+    """P1-2: the safety poll covers writes that mutate the SM session object
+    directly with NO pub/sub notification fired (the SM-only analogue of the
+    old un-migrated legacy-dict-write path, now that legacy dicts are out of
+    the read path): frames must still arrive within the poll interval.
+    Disabling SAFETY_POLL_SECONDS would fail this test (runs at the real 1.0s
+    default — no patching)."""
     await sm.create_session(
         "safety-1", MarketType.KIWOOM, "005930", "삼성전자", state={"reasoning_log": []}
     )
@@ -341,8 +348,9 @@ async def test_safety_poll_covers_legacy_only_updates_for_sm_session(sm, kr_sess
     async with running_ws(ws, "safety-1") as task:
         await wait_for_frame(ws, lambda f: f.get("type") == "status", timeout=1.0)
 
-        # Un-migrated producer: legacy-only write, NO sm notify fired.
-        session["status"] = "completed"
+        # Un-notified write: mutate the live session object directly,
+        # bypassing update_status()'s _notify_subscribers call.
+        sm._sessions["safety-1"].status = SessionStatus.COMPLETED
         complete = await wait_for_frame(ws, lambda f: f.get("type") == "complete", timeout=3.0)
         assert complete["data"]["status"] == "completed"
         await asyncio.wait_for(task, timeout=2.0)
@@ -617,3 +625,55 @@ async def test_ws_unknown_session_not_found_close(sm, kr_sessions, monkeypatch):
     assert len(not_found_frames) == 1
     assert not_found_frames[0]["data"]["session_id"] == "no-such-session-id"
     assert ws.closed_code == 4404
+
+
+# -------------------------------------------
+# Session-SSOT reads (P1-2): SM is the sole snapshot source
+# -------------------------------------------
+
+
+async def test_ws_snapshot_sm_only(sm, kr_sessions):
+    """SESSION_SSOT_READS=True (default): _get_session_snapshot reads the
+    SessionManager exclusively. A session that exists only in the legacy dict
+    is no longer served -- it now falls into P0-2's not-found path instead
+    of being served from the legacy dict fallback."""
+    await sm.create_session(
+        "ssot-p12", MarketType.KIWOOM, "005930", "삼성전자",
+        state={"reasoning_log": ["a"]},
+    )
+    snap = await ws_module._get_session_snapshot("ssot-p12")
+    assert snap is not None and snap["session_id"] == "ssot-p12"
+
+    # legacy-only 세션은 더 이상 서빙되지 않는다
+    kr_sessions["legacy-only-p12"] = {
+        "session_id": "legacy-only-p12", "status": "running",
+        "state": {"reasoning_log": []}, "created_at": None, "error": None,
+    }
+    assert await ws_module._get_session_snapshot("legacy-only-p12") is None
+
+
+async def test_ws_snapshot_kill_switch_reads_legacy_when_false(sm, kr_sessions, monkeypatch):
+    """SESSION_SSOT_READS=False: legacy-first behavior is fully restored --
+    a legacy-dict-only session is served again, and an sm-only session still
+    falls back to sm (kill-switch regression guard, same pattern as
+    tests/test_api/test_approval_pending_ssot.py's False-branch tests)."""
+    import types
+
+    monkeypatch.setattr(
+        ws_module, "get_settings",
+        lambda: types.SimpleNamespace(SESSION_SSOT_READS=False),
+    )
+
+    await sm.create_session(
+        "ssot-p12-ks-sm-only", MarketType.KIWOOM, "005930", "삼성전자",
+        state={"reasoning_log": []},
+    )
+    snap = await ws_module._get_session_snapshot("ssot-p12-ks-sm-only")
+    assert snap is not None and snap["session_id"] == "ssot-p12-ks-sm-only"
+
+    kr_sessions["ssot-p12-ks-legacy"] = {
+        "session_id": "ssot-p12-ks-legacy", "status": "running",
+        "state": {"reasoning_log": []}, "created_at": None, "error": None,
+    }
+    snap2 = await ws_module._get_session_snapshot("ssot-p12-ks-legacy")
+    assert snap2 is not None and snap2["session_id"] == "ssot-p12-ks-legacy"

@@ -20,6 +20,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.api.routes.coin import get_coin_sessions
 from app.api.routes.kr_stocks import get_kr_stock_sessions
+from app.config import get_settings
 from services.session_manager import get_session_manager
 
 logger = structlog.get_logger()
@@ -525,13 +526,17 @@ def _create_reasoning_summary(reasoning_log: list) -> str:
 
 async def _get_session_snapshot(session_id: str) -> Optional[dict]:
     """
-    Look up a session in legacy-dict format.
+    Look up a session snapshot.
 
-    The legacy per-market dicts stay the read path for existing producers; the
-    SessionManager is the fallback so sm-only sessions stream too. Producers
-    write BOTH (legacy first, then sm) so a pub/sub wake always observes a
-    fresh legacy snapshot.
+    P1 (session-SSOT): the SessionManager is the ONLY read source when
+    SESSION_SSOT_READS is on (default). The legacy-first path survives
+    solely as the kill-switch fallback until P2 removes legacy writes
+    entirely -- see app/api/routes/approval.py for the same switch.
     """
+    if get_settings().SESSION_SSOT_READS:
+        sm = await get_session_manager()
+        return await sm.get_session_dict(session_id)
+
     session = (
         get_coin_sessions().get(session_id)
         or get_kr_stock_sessions().get(session_id)
