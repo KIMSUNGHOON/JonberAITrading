@@ -53,9 +53,11 @@ PANELISTS: dict[str, str] = {
     ),
     "regime_strategist": (
         "당신은 시장 레짐 전략가입니다. 레짐 스냅샷 시계열(risk_on/risk_off/"
-        "neutral, breadth_ratio)의 추세와 오늘 레짐을 근거로, 현행 전략이 "
-        "레짐에 맞는지 판정하고 내일의 전략 스탠스와 노브 조정을 제안하십시오. "
-        "레짐 데이터가 부족하면 neutral 스탠스에 낮은 confidence로 답하십시오. "
+        "neutral, breadth_ratio)에 더해 KOSPI/KOSDAQ 지수 등락률, 외국인/기관 "
+        "수급(순매매액), 파생 시장심리(market_sentiment_label/sentiment_score)의 "
+        "추세를 근거로, 현행 전략이 레짐에 맞는지 판정하고 내일의 전략 스탠스와 "
+        "노브 조정을 제안하십시오. 지수·수급·심리 데이터가 없으면(과거 breadth만 "
+        "있는 날) breadth로만 판단하되 낮은 confidence로 답하십시오. "
         + _SCHEMA_INSTRUCTION
     ),
     "risk_officer": (
@@ -114,6 +116,12 @@ async def build_strategy_context(
                 "id": r.get("id"),
                 "regime_label": r.get("regime_label"),
                 "breadth_ratio": r.get("breadth_ratio"),
+                "market_sentiment_label": r.get("market_sentiment_label"),
+                "sentiment_score": r.get("sentiment_score"),
+                "index_kospi_chg_pct": r.get("index_kospi_chg_pct"),
+                "index_kosdaq_chg_pct": r.get("index_kosdaq_chg_pct"),
+                "foreign_net_amount": r.get("foreign_net_amount"),
+                "institution_net_amount": r.get("institution_net_amount"),
             }
             for r in regimes[:_REGIME_DAYS]
         ],
