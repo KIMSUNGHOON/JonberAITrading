@@ -32,7 +32,6 @@ from services.session_manager import (
     commit_session_state,
     commit_session_status,
     get_session_manager,
-    mirror_session_state,
     mirror_session_status,
 )
 from services.telegram import get_telegram_notifier
@@ -88,6 +87,43 @@ async def _session_decision_lock(session_id: str):
             _decision_locks.pop(session_id, None)
 
 
+class _SmSessionView:
+    """Minimal dict-style live view over an AnalysisSession, for callers
+    (the autonomy injector) that still expect ``session["state"]`` /
+    ``session.get("status")`` access.
+
+    P2-5 (session-SSOT): unlike ``sm_session.to_legacy_dict()``, which
+    snapshots "status" as a plain string at call time, this wraps the LIVE
+    AnalysisSession object -- ``.get("status")`` re-reads ``sm_session.status``
+    on every access, so a decision recorded by another caller (e.g. a manual
+    cancel arriving during the autonomy injector's 60s grace window) is
+    visible immediately instead of frozen at scheduling time. ``state`` is
+    the SessionManager's own dict (already live/shared), so mutations
+    through it reach the SM row directly, same as the pre-P2-5
+    to_legacy_dict() shape.
+
+    Scoped to exactly what ``_autonomy_injector.py`` reads today
+    (``session["state"]``, ``session.get("status")``); migrating the
+    injector itself to a native SM handle is P2-6's job.
+    """
+
+    def __init__(self, sm_session):
+        self._sm_session = sm_session
+
+    def __getitem__(self, key):
+        if key == "state":
+            return self._sm_session.state
+        if key == "status":
+            return self._sm_session.status.value
+        return getattr(self._sm_session, key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (KeyError, AttributeError):
+            return default
+
+
 async def submit_decision(
     session_id: str,
     decision: str,
@@ -132,36 +168,42 @@ async def _submit_decision_locked(
     actor: str = "user",
     expected_proposal_id: str | None = None,
 ):
-    # Search all session types: coin and Korean stock
-    coin_sessions = get_coin_sessions()
-    kr_stock_sessions = get_kr_stock_sessions()
-    session = coin_sessions.get(session_id) or kr_stock_sessions.get(session_id)
+    # P2-5 (session-SSOT): the SessionManager (SM / "C") is now the SOLE
+    # session store for /decide -- no legacy in-memory dict ("B") merged
+    # lookup, no restart-recovery adoption fallback (that helper function
+    # was deleted by this task). By the time P2-3/P2-4 landed, the KR/coin
+    # producers had already stopped writing to B on the awaiting-approval
+    # path, so B was empty on every single call here and this function
+    # silently fell through to the SM-backed fallback every time anyway --
+    # going SM-only just makes that the one and only path instead of a
+    # fallback.
+    sm = await get_session_manager()
+    sm_session = await sm.get_session(session_id)
 
-    if not session:
-        # These legacy dicts are process-local and empty after a restart. The
-        # session_manager SQLite row (and the LangGraph checkpoint, keyed by
-        # thread_id=session_id) both survive a restart — fall back to sm and
-        # re-adopt a legacy-shaped session into the correct dict so the rest
-        # of this function, and any subsequent lookups, work unchanged.
-        session = await _adopt_session_from_manager(
-            session_id, coin_sessions, kr_stock_sessions
-        )
-
-    if not session:
+    if sm_session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {session_id} not found",
         )
 
-    state = session["state"]
+    # Live reference, not a to_legacy_dict() snapshot: sm.get_session()
+    # returns the exact AnalysisSession object the SessionManager holds in
+    # its own _sessions dict, so mutating `state` here (or calling
+    # sm.update_state / commit_session_state) reaches the real SM row
+    # directly -- there is no separate copy left to fall out of sync.
+    # sm_session.status is read live throughout this function for the same
+    # reason: any commit_session_status/mirror_session_status call (here or
+    # from a concurrent caller sharing this same object) mutates
+    # sm_session.status in place.
+    state = sm_session.state
 
     # CRITICAL (F4b t1): re-validate the pinned proposal id INSIDE the lock.
-    # The injector's outside pre-check (see _autonomy_injector) can pass, then
-    # a reject -> re-analysis replaces state["trade_proposal"] with a NEW id
-    # before this stale timer actually acquires the per-session lock. Without
-    # this check, that timer would approve a proposal the user never saw.
-    # Scoped to actor=='system' only — user decisions never pin an id and
-    # this must never affect the user-facing /decide route.
+    # The injector's outside pre-check (see _autonomy_injector) can pass,
+    # then a reject -> re-analysis replaces state["trade_proposal"] with a
+    # NEW id before this stale timer actually acquires the per-session lock.
+    # Without this check, that timer would approve a proposal the user never
+    # saw. Scoped to actor=='system' only -- user decisions never pin an id
+    # and this must never affect the user-facing /decide route.
     if actor == "system" and expected_proposal_id is not None:
         current_proposal_id = (state.get("trade_proposal") or {}).get("id")
         if current_proposal_id != expected_proposal_id:
@@ -175,76 +217,99 @@ async def _submit_decision_locked(
             return {"status": "stood_down", "reason": "proposal_changed"}
 
         # F4b IMPORTANT-1 (belt-and-braces): the pin above only catches a
-        # REPLACED proposal (reject -> re-analysis). A route that mutates
-        # session["status"] without replacing the proposal or clearing
+        # REPLACED proposal (reject -> re-analysis). A route that flips the
+        # SM status without replacing the proposal or clearing
         # state["awaiting_approval"] (the coin cancel route's bug, fixed
-        # alongside this — see coin/analysis.py cancel route) would sail
-        # through the pin check unchanged and fall into the live approve path
-        # below, executing an order and overwriting the cancelled status.
-        # Checking session["status"] here closes the whole class for BOTH
-        # markets against ANY status-only mutation, present or future, not
-        # just the one bug this audit found.
-        if session.get("status") != "awaiting_approval":
+        # alongside this -- see coin/analysis.py cancel route) would sail
+        # through the pin check unchanged and fall into the live approve
+        # path below, executing an order and overwriting the cancelled
+        # status. Checking sm_session.status here closes the whole class for
+        # BOTH markets against ANY status-only mutation, present or future,
+        # not just the one bug this audit found.
+        if sm_session.status != SessionStatus.AWAITING_APPROVAL:
             logger.info(
                 "auto_approve_stood_down_inside_lock",
                 session_id=session_id,
                 scheduled_for=expected_proposal_id,
-                session_status=session.get("status"),
+                session_status=sm_session.status.value,
                 reason="not_awaiting",
             )
             return {"status": "stood_down", "reason": "not_awaiting"}
 
+    # General restart-adoption-equivalent guard: state["awaiting_approval"]
+    # can be stale-True even though the SM's own status has already moved
+    # past AWAITING_APPROVAL -- e.g. a cancel/other-terminal path that flips
+    # sm_session.status without clearing state (the "coin cancel route" bug
+    # F4b IMPORTANT-1 fixed above, present or future). Pre-P2-5, this exact
+    # shape was refused by the (now-deleted) restart-recovery adoption
+    # helper's own gate (actor-agnostic, ran for every /decide call since B
+    # was always empty) -- deleting that function does not remove the need
+    # for the check,
+    # since resuming the graph off a stale True flag here would replay a
+    # decision against a session the SM already considers settled. Placed
+    # AFTER the F4b block above so a matching system-actor pin still gets
+    # F4b's graceful stand-down dict instead of this hard 404 -- by the time
+    # we reach here, either F4b already returned (actor=='system' with a
+    # matching id) or this is the actor-agnostic fallback (chiefly the
+    # user-facing /decide route, which never pins an id).
+    if state.get("awaiting_approval") and sm_session.status != SessionStatus.AWAITING_APPROVAL:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {session_id} not found",
+        )
+
     if not state.get("awaiting_approval"):
         if decision == "cancelled":
-            # Masquerade guard (P0-4): if this session's last recorded decision
-            # was "approved", awaiting_approval=False does NOT mean "safely
-            # settled" the way it does for a plain stale-flag/reject/cancel
-            # zombie below — it can also mean approve resumed the graph, the
-            # execution node placed a broker order, and the process died (or
-            # a concurrent cancel raced in) before the final status mirror at
-            # the end of the resume ran. In that window a real broker position
-            # may already exist. Returning 200 "cancelled" here would tell the
-            # user a possibly-executed trade was cleanly cancelled. Refuse
-            # instead — no state mutation, no status mirror — and make the
-            # caller confirm the actual fill before treating it as dead.
+            # Masquerade guard (P0-4): if this session's last recorded
+            # decision was "approved", awaiting_approval=False does NOT mean
+            # "safely settled" the way it does for a plain
+            # stale-flag/reject/cancel zombie below -- it can also mean
+            # approve resumed the graph, the execution node placed a broker
+            # order, and the process died (or a concurrent cancel raced in)
+            # before the final status commit at the end of the resume ran.
+            # In that window a real broker position may already exist.
+            # Returning 200 "cancelled" here would tell the user a possibly-
+            # executed trade was cleanly cancelled. Refuse instead -- no
+            # state mutation, no status mirror -- and make the caller
+            # confirm the actual fill before treating it as dead.
             if state.get("approval_status") == "approved":
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="실행 중일 수 있어 취소 불가 — 체결 확인 필요",
                 )
             # I4 (F4b T4 extension): a session already TERMINAL (completed or
-            # error) has already run to its real outcome — regardless of
+            # error) has already run to its real outcome -- regardless of
             # which decision got it there (approved AND modified both leave
-            # session["status"] == "completed"; a re-analysis that blew up
-            # leaves "error"). A late cancel arriving after that (e.g. from a
+            # sm_session.status == COMPLETED; a re-analysis that blew up
+            # leaves ERROR). A late cancel arriving after that (e.g. from a
             # reloaded tab, or racing the I3 lock) must not flip a settled
-            # outcome back to CANCELLED — that would misreport an executed
+            # outcome back to CANCELLED -- that would misreport an executed
             # trade as never-happened, or erase a genuine failure record.
-            # Checked after the narrower approved-branch above (which has its
-            # own, more specific "확인 필요" message for the maybe-mid-flight
-            # shape); this one is a plain "already done" refusal. cancelled
-            # itself is intentionally NOT included here — re-cancelling an
-            # already-cancelled session is a harmless idempotent no-op,
-            # handled by the zombie-tolerance branch below.
-            if session.get("status") in ("completed", "error"):
+            # Checked after the narrower approved-branch above (which has
+            # its own, more specific "확인 필요" message for the maybe-
+            # mid-flight shape); this one is a plain "already done" refusal.
+            # cancelled itself is intentionally NOT included here --
+            # re-cancelling an already-cancelled session is a harmless
+            # idempotent no-op, handled by the zombie-tolerance branch
+            # below.
+            if sm_session.status in (SessionStatus.COMPLETED, SessionStatus.ERROR):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="이미 처리됨 — 취소 불가",
                 )
-            # Cancel-zombie tolerance: the operations board lists a session as
-            # actionable off the session_manager row (sm.status ==
-            # AWAITING_APPROVAL — checked above, in _adopt_session_from_manager,
-            # or already true for a legacy-dict hit), but state["awaiting_approval"]
-            # can be stale/False (reject -> re-analysis cycles and mirror races
-            # desync the flag from the sm truth). Approve/reject/modified must
-            # stay fail-closed (strictness pinned below), but cancel executes
-            # nothing — there is no unsafe resume to guard against — so it must
-            # always succeed for a session found by EITHER truth. This is a pure
-            # termination mark: no graph resume, no legacy-dict (re-)registration.
+            # Cancel-zombie tolerance: the operations board lists a session
+            # as actionable off the SM row (sm_session.status ==
+            # AWAITING_APPROVAL -- checked above), but
+            # state["awaiting_approval"] can be stale/False (reject ->
+            # re-analysis cycles and mirror races desync the flag from the
+            # sm truth). Approve/reject/modified must stay fail-closed
+            # (strictness pinned above/below), but cancel executes nothing
+            # -- there is no unsafe resume to guard against -- so it must
+            # always succeed. This is a pure termination mark: no graph
+            # resume.
             state["approval_status"] = "cancelled"
             state["awaiting_approval"] = False
             state.pop("auto_approve_at", None)
-            session["status"] = "cancelled"
             await mirror_session_status(session_id, SessionStatus.CANCELLED)
             logger.info(
                 "approval_cancel_stale_flag_tolerated",
@@ -253,7 +318,7 @@ async def _submit_decision_locked(
             return ApprovalResponse(
                 session_id=session_id,
                 decision=decision,
-                status=session["status"],
+                status=SessionStatus.CANCELLED.value,
                 message="Analysis cancelled by user.",
                 execution_status="cancelled",
             )
@@ -275,15 +340,18 @@ async def _submit_decision_locked(
     )
 
     # P1-5 review fix (Important A): commit-first ordering. The decision is
-    # committed to the SM (C) BEFORE any of it is applied to local state (B)
-    # -- previously B was mutated first, so a failed commit left the session
-    # wedged: state["awaiting_approval"] already False (B says decided) while
-    # the SM still showed AWAITING_APPROVAL (C never heard), and a retry of
-    # the same decision immediately hit the "not awaiting approval" 400 (or
-    # the zombie-cancel branch for decision='cancelled') instead of being
-    # cleanly retryable. Modifications are computed against a COPY of the
-    # proposal here so state["trade_proposal"] is only mutated in place once
-    # the commit has actually landed.
+    # committed to the SM BEFORE it is treated as applied -- previously a
+    # separate legacy-dict copy was mutated first, so a failed commit left
+    # the session wedged: the local copy already said "decided" while the SM
+    # still showed AWAITING_APPROVAL (the SM never heard), and a retry hit
+    # the "not awaiting approval" 400 instead of being cleanly retryable.
+    # P2-5: `state` IS sm_session.state (the SM's own live dict), so
+    # commit_session_state's update_state call is the ONLY write needed
+    # here -- there is no separate local copy left to re-apply
+    # decision_updates to afterward (the old "B mutation" block is gone).
+    # Modifications are computed against a COPY of the proposal so the
+    # commit is the single point where state["trade_proposal"] actually
+    # changes.
     updated_proposal = None
     if decision == "modified" and state.get("trade_proposal"):
         updated_proposal = dict(state["trade_proposal"])
@@ -297,6 +365,7 @@ async def _submit_decision_locked(
         "user_feedback": feedback,
         "awaiting_approval": False,
         "approval_actor": actor,
+        # A decision voids any pending autonomous-approval countdown (R3).
         "auto_approve_at": None,
     }
     if updated_proposal is not None:
@@ -316,46 +385,14 @@ async def _submit_decision_locked(
             detail="approval state could not be persisted — retry",
         )
 
-    # The SM write succeeded -- now apply the decision to local state (B), so
-    # B and C move together instead of B racing ahead of a commit that could
-    # still fail.
-    state["approval_status"] = decision
-    state["user_feedback"] = feedback
-    state["awaiting_approval"] = False
-    state["approval_actor"] = actor
-    # A decision voids any pending autonomous-approval countdown (R3).
-    state.pop("auto_approve_at", None)
-
-    # Apply modifications if provided (proposal is now a dict)
-    if decision == "modified" and modifications:
-        proposal = state.get("trade_proposal")
-        if proposal:
-            for key, value in modifications.items():
-                if key in proposal:
-                    proposal[key] = value
-                    logger.debug(
-                        "proposal_modified",
-                        session_id=session_id,
-                        field=key,
-                        value=value,
-                    )
-
     # Resume graph execution - select appropriate graph based on session type.
     #
     # P2 (spec §P2, review CRITICAL): market discrimination must come from the
-    # SM record's market_type, NOT legacy-dict (B) membership -- with B empty
-    # (immediately post-restart, before _adopt_session_from_manager registers
-    # this session, or after P2-5 removes B writes entirely) `session_id in
-    # kr_stock_sessions` is always False and every KR session would silently
-    # resume through the COIN graph. The SM row is guaranteed to exist here:
-    # any session that reached this point either lived in a legacy dict
-    # already (created with a synced SM row) or was just adopted via
-    # _adopt_session_from_manager above, which itself reads the SM row to
-    # adopt in the first place. Fail-closed (no B-membership fallback) rather
-    # than guess for any market_type this branch doesn't recognize.
-    sm = await get_session_manager()
-    sm_session = await sm.get_session(session_id)
-    if sm_session is None or sm_session.market_type not in (MarketType.KIWOOM, MarketType.COIN):
+    # SM record's market_type, NOT legacy-dict (B) membership. sm_session was
+    # already fetched above and is guaranteed non-None (the 404 branch
+    # returned earlier otherwise) -- fail-closed (no B-membership fallback,
+    # no guessing) for any market_type this branch doesn't recognize.
+    if sm_session.market_type not in (MarketType.KIWOOM, MarketType.COIN):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="unknown session market — refusing to resume",
@@ -385,24 +422,25 @@ async def _submit_decision_locked(
 
     try:
         await graph.aupdate_state(config, resume_update)
-        # Continue from the interrupt (decision already applied to graph state)
+        # Continue from the interrupt (decision already applied to graph
+        # state). `state` IS sm_session.state (live), so sm.update_state is
+        # the single write per node: it applies node_output to state,
+        # flushes to SQLite (sync for critical keys, debounced otherwise),
+        # and notifies WS subscribers all in one call (P2-5: replaces the
+        # old `state.update(node_output)` + `mirror_session_state(...)`
+        # pair -- there is no separate local copy left to update first).
         async for event in graph.astream(None, config):
             for node_name, node_output in event.items():
                 if node_name != "__end__":
-                    if isinstance(node_output, dict):
-                        state.update(node_output)
-                        # Legacy first, then sm mirror (fires the WS push notify)
-                        await mirror_session_state(
-                            session_id, node_output, last_node=node_name
-                        )
-                    session["last_node"] = node_name
+                    state_updates = node_output if isinstance(node_output, dict) else {}
+                    await sm.update_state(session_id, state_updates, last_node=node_name)
 
         # Track allocation result for response message
         allocation_rationale = None
 
         # Update session status based on decision
         if decision == "approved":
-            session["status"] = "completed"
+            final_status = SessionStatus.COMPLETED
             execution_status = state.get("execution_status", "completed")
 
             # Connect to auto-trading system
@@ -411,9 +449,12 @@ async def _submit_decision_locked(
                 try:
                     coordinator = await get_trading_coordinator()
 
-                    # Get ticker and stock name from session
-                    ticker = session.get("stk_cd") or session.get("ticker") or session.get("market")
-                    stock_name = session.get("stk_nm") or session.get("stock_name")
+                    # Ticker/display-name: sourced from the SM row's own
+                    # market-specific fields (only one of stk_cd/market is
+                    # populated depending on market_type; korean_name covers
+                    # the coin shape stk_nm never had).
+                    ticker = sm_session.stk_cd or sm_session.ticker or sm_session.market
+                    stock_name = sm_session.stk_nm or sm_session.korean_name
 
                     # Extract proposal data
                     action = proposal.get("action", "HOLD")
@@ -477,7 +518,8 @@ async def _submit_decision_locked(
 
         elif decision == "rejected":
             # Re-analysis requested. The resume above ran the graph back to
-            # either the approval interrupt (new proposal awaiting) or the end.
+            # either the approval interrupt (new proposal awaiting) or the
+            # end.
             new_proposal_awaiting = bool(
                 state.get("awaiting_approval") and not state.get("approval_status")
             )
@@ -487,20 +529,19 @@ async def _submit_decision_locked(
                 # 제안 ID 피닝이 이중 승인을 방지). 게이트 deny/hitl이면
                 # maybe_schedule_auto_approve가 아무것도 쓰지 않는다(plain HITL).
                 #
-                # P1-5 review fix (Important B): mirrors _finalize_awaiting_
-                # transition's commit-first ordering (kr_stocks/coin
-                # analysis.py) -- commit_session_status(AWAITING_APPROVAL)
-                # must land (1 retry) BEFORE session["status"] is set and
-                # BEFORE any schedule call. The pre-fix code scheduled the
-                # 60s auto-approve timer unconditionally, ahead of the
-                # shared final-status commit far below -- if THAT commit
-                # then failed, the timer was already armed against an SM row
-                # that never learned about this transition: a live violation
-                # of the core invariant ("SM 기록 실패 시 schedule 절대
-                # 금지"), since a brief SM recovery could let the timer fire
-                # an autonomous order for a transition nobody could see.
-                # market already resolved from sm_session.market_type at the
-                # graph-selection site above -- reused here, no re-derivation.
+                # P1-5 review fix (Important B): commit-first ordering --
+                # commit_session_status(AWAITING_APPROVAL) must land (1
+                # retry) BEFORE the timer is scheduled. The pre-fix code
+                # scheduled the 60s auto-approve timer unconditionally,
+                # ahead of the shared final-status commit far below -- if
+                # THAT commit then failed, the timer was already armed
+                # against an SM row that never learned about this
+                # transition: a live violation of the core invariant ("SM
+                # 기록 실패 시 schedule 절대 금지"), since a brief SM
+                # recovery could let the timer fire an autonomous order for
+                # a transition nobody could see. market already resolved
+                # from sm_session.market_type at the graph-selection site
+                # above -- reused here, no re-derivation.
                 last_error: Optional[Exception] = None
                 for _attempt in range(2):
                     try:
@@ -520,19 +561,29 @@ async def _submit_decision_locked(
                         detail="approval state could not be persisted — retry",
                     )
 
-                session["status"] = "awaiting_approval"
+                final_status = SessionStatus.AWAITING_APPROVAL
                 execution_status = "awaiting_approval"
-                await maybe_schedule_auto_approve(session_id, market, session)
+                # P2-5: the injector's `session` argument is no longer a
+                # to_legacy_dict() snapshot (its "status" key would freeze
+                # at schedule time) -- _SmSessionView is a thin live
+                # dict-style proxy over sm_session so _autonomy_injector's
+                # existing session["state"] / session.get("status") reads
+                # always see the current SM state/status, including any
+                # decision made by another caller during the grace window.
+                # Migrating the injector itself to a native SM handle is
+                # P2-6's job; this is the narrowest fix that keeps
+                # /decide's own call site honest in the meantime.
+                await maybe_schedule_auto_approve(session_id, market, _SmSessionView(sm_session))
             else:
-                session["status"] = "running"
+                final_status = SessionStatus.RUNNING
                 execution_status = "re_analyzing"
         elif decision == "cancelled":
             # User cancelled the workflow
-            session["status"] = "cancelled"
+            final_status = SessionStatus.CANCELLED
             execution_status = "cancelled"
         else:
             # modified
-            session["status"] = "completed"
+            final_status = SessionStatus.COMPLETED
             execution_status = state.get("execution_status", "completed")
 
         # Belt-and-braces on top of the per-session lock (which serializes
@@ -546,27 +597,21 @@ async def _submit_decision_locked(
                 session_id=session_id,
                 decision=decision,
             )
-            session["status"] = "cancelled"
+            final_status = SessionStatus.CANCELLED
             execution_status = "cancelled"
 
-        # Mirror the final status to the SessionManager (completed/running/
+        # Commit the final status to the SessionManager (completed/running/
         # cancelled). P1-5: write-through -- for a decision that may already
         # have executed a broker order (approved/modified), a silently
-        # swallowed mirror failure here would leave the SM showing a stale
+        # swallowed commit failure here would leave the SM showing a stale
         # AWAITING_APPROVAL status for a session that is actually done.
         try:
-            # commit_session_status is a strict (enum-only) write-through --
-            # session["status"] here is always a plain str value assigned a
-            # few lines above (completed/running/cancelled), so it must be
-            # coerced back to SessionStatus (unlike mirror_session_status,
-            # which does this conversion internally as a str-or-enum
-            # convenience for its best-effort callers).
-            await commit_session_status(session_id, SessionStatus(session["status"]))
+            await commit_session_status(session_id, final_status)
         except Exception as e:
             logger.critical(
                 "approval_final_status_writethrough_failed",
                 session_id=session_id,
-                status=session["status"],
+                status=final_status.value,
                 error=str(e),
             )
             raise HTTPException(
@@ -588,14 +633,14 @@ async def _submit_decision_locked(
         logger.info(
             "approval_processed",
             session_id=session_id,
-            final_status=session["status"],
+            final_status=final_status.value,
             execution_status=execution_status,
         )
 
         # Send notifications (Telegram + WebSocket)
         proposal = state.get("trade_proposal", {})
-        ticker = session.get("stk_cd") or session.get("ticker") or session.get("market", "")
-        stock_name = session.get("stk_nm") or session.get("stock_name", ticker)
+        ticker = sm_session.stk_cd or sm_session.ticker or sm_session.market or ""
+        stock_name = sm_session.stk_nm or sm_session.korean_name or ticker
         action = proposal.get("action", "BUY")
 
         # WebSocket broadcast for real-time UI updates
@@ -731,9 +776,7 @@ async def _submit_decision_locked(
             session_id=session_id,
             error=str(e),
         )
-        session["status"] = "error"
-        session["error"] = str(e)
-        await mirror_session_status(session_id, "error", error=str(e))
+        await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process approval: {str(e)}",
@@ -763,11 +806,10 @@ async def _submit_decision_locked(
     return ApprovalResponse(
         session_id=session_id,
         decision=decision,
-        status=session["status"],
+        status=final_status.value,
         message=message,
         execution_status=execution_status,
     )
-
 
 
 @router.post("/decide", response_model=ApprovalResponse)
@@ -924,106 +966,6 @@ async def get_pending_approval(session_id: str):
 # -------------------------------------------
 # Helper Functions
 # -------------------------------------------
-
-
-async def _adopt_session_from_manager(
-    session_id: str,
-    coin_sessions: dict,
-    kr_stock_sessions: dict,
-) -> dict | None:
-    """Re-adopt a session that survived a restart via session_manager.
-
-    The legacy in-memory dicts (coin/kr_stock) are process-local and lost on
-    restart, but the SessionManager's SQLite-backed row survives (as does the
-    LangGraph checkpoint keyed by thread_id=session_id — see P6 durable
-    persistence). On a legacy-dict miss, look the session up there and, if
-    found, convert it to the legacy-compatible shape (AnalysisSession.state
-    is shared by reference, so subsequent mutations here also reach the sm
-    row) and register it into the correct dict so the rest of submit_decision
-    — and any later lookups — work unchanged.
-
-    Fail-closed, validated BEFORE any registration (no zombie entries on
-    failed probes):
-    - only sm status == AWAITING_APPROVAL is adoptable. A settled session
-      (cancelled/completed/error/running) returns None so the caller 404s —
-      even if its state dict still says awaiting_approval=True (the cancel
-      path clears status but not state; if the CANCELLED mirror write failed
-      silently the row could survive the restart load filter, and adopting it
-      would let an approve resume a proposal the user already vetoed).
-    - only KIWOOM (kr stock) and COIN market types are adopted; anything else
-      returns None so the caller 404s.
-    - the state-level awaiting_approval check runs before registration too: a
-      status=AWAITING_APPROVAL row whose state says it is NOT awaiting (mirror
-      lag) is returned WITHOUT being registered, so the caller 400s and the
-      legacy dict stays clean.
-    """
-    try:
-        manager = await get_session_manager()
-        sm_session = await manager.get_session(session_id)
-    except Exception as e:
-        logger.warning(
-            "sm_session_adopt_lookup_failed",
-            session_id=session_id,
-            error=str(e),
-        )
-        return None
-
-    if sm_session is None:
-        return None
-
-    if sm_session.status != SessionStatus.AWAITING_APPROVAL:
-        logger.warning(
-            "sm_session_adopt_refused_not_awaiting_status",
-            session_id=session_id,
-            sm_status=str(sm_session.status),
-        )
-        return None
-
-    if sm_session.market_type == MarketType.KIWOOM:
-        target_dict = kr_stock_sessions
-    elif sm_session.market_type == MarketType.COIN:
-        target_dict = coin_sessions
-    else:
-        logger.warning(
-            "sm_session_adopt_unsupported_market_type",
-            session_id=session_id,
-            market_type=str(sm_session.market_type),
-        )
-        return None
-
-    legacy_session = sm_session.to_legacy_dict()
-
-    # I7: this adoption route is a SEPARATE restart-restore path from
-    # reconcile_stranded_sessions (which only clears auto_approve_at for
-    # sessions loaded at startup). A session adopted here can still be
-    # carrying a stale deadline from before the restart -- the in-process
-    # injector task that would have fired it is gone, so it can never
-    # legitimately elapse. Clear it defense-in-depth (never re-arm) and
-    # explain why, same wording as the reconcile path.
-    adopted_state = legacy_session["state"]
-    if adopted_state.pop("auto_approve_at", None) is not None:
-        adopted_state.setdefault("reasoning_log", []).append(
-            "재시작으로 자율 승인 타이머 해제 — 수동 승인 필요"
-        )
-
-    # State-level awaiting check BEFORE registering: return unregistered so
-    # the caller's own awaiting check raises 400 without leaving a zombie
-    # entry in the legacy dict.
-    if not legacy_session["state"].get("awaiting_approval"):
-        logger.warning(
-            "sm_session_adopt_refused_state_not_awaiting",
-            session_id=session_id,
-        )
-        return legacy_session
-
-    target_dict[session_id] = legacy_session
-
-    logger.info(
-        "sm_session_adopted",
-        session_id=session_id,
-        market_type=str(sm_session.market_type),
-    )
-    return legacy_session
 
 
 def _get_analysis_summary(analysis) -> str | None:

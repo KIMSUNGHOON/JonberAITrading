@@ -6,30 +6,65 @@ HITL로 남았다. submit_decision의 rejected 분기가 — 그래프 resume가
 awaiting_approval + 새 제안으로 끝났으면 — status를 'awaiting_approval'로
 정합시키고(injector 가드가 요구) maybe_schedule_auto_approve를 재호출해야
 한다. 기존 제안 ID 피닝이 이중 승인을 방지한다.
+
+P2-5 (session-SSOT): submit_decision now resolves the session and all its
+state/status entirely off the SessionManager (SM) -- there is no legacy
+dict ("B") lookup and no _adopt_session_from_manager fallback. This
+fixture's fake SessionManager is the SOLE source of truth; the legacy
+kr/coin session dicts are asserted to stay untouched.
 """
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from services.session_manager import AnalysisSession, MarketType, SessionStatus
 import app.api.routes.approval as approval_module
-from services.session_manager import MarketType
 
 
-def _kr_session(session_id: str) -> dict:
-    return {
-        "stk_cd": "005930",
-        "stk_nm": "삼성전자",
-        "status": "awaiting_approval",
-        "state": {
-            "awaiting_approval": True,
-            "approval_status": None,
-            "trade_proposal": {"id": "prop-old", "action": "BUY", "quantity": 1,
-                               "entry_price": 70000},
-            "reasoning_log": [],
-        },
+def _sm_session(
+    session_id: str,
+    *,
+    market_type: MarketType = MarketType.KIWOOM,
+    status: SessionStatus = SessionStatus.AWAITING_APPROVAL,
+) -> AnalysisSession:
+    if market_type == MarketType.KIWOOM:
+        kwargs = {"ticker": "005930", "display_name": "삼성전자",
+                  "stk_cd": "005930", "stk_nm": "삼성전자"}
+    else:
+        kwargs = {"ticker": "KRW-BTC", "display_name": "비트코인",
+                  "market": "KRW-BTC", "korean_name": "비트코인"}
+    state = {
+        "awaiting_approval": True,
+        "approval_status": None,
+        "trade_proposal": {"id": "prop-old", "action": "BUY", "quantity": 1,
+                           "entry_price": 70000},
+        "reasoning_log": [],
     }
+    return AnalysisSession(
+        session_id=session_id, market_type=market_type, status=status,
+        state=state, **kwargs,
+    )
+
+
+class _FakeSessionManager:
+    """Tracks ONE AnalysisSession; implements get_session + update_state
+    (the resume loop's sole per-node write, P2-5)."""
+
+    def __init__(self, session: AnalysisSession | None):
+        self._session = session
+
+    async def get_session(self, session_id: str):
+        if self._session is not None and self._session.session_id == session_id:
+            return self._session
+        return None
+
+    async def update_state(self, session_id: str, updates: dict, last_node=None):
+        if self._session is None or self._session.session_id != session_id:
+            raise KeyError(session_id)
+        self._session.state.update(updates)
+        if last_node:
+            self._session.last_node = last_node
 
 
 class _FakeGraph:
@@ -51,10 +86,11 @@ class _FakeGraph:
 
 @pytest.fixture
 def wired(monkeypatch):
-    """세션/그래프/알림/미러/재암 스파이 배선."""
-    sessions = {}
-    monkeypatch.setattr(approval_module, "get_kr_stock_sessions", lambda: sessions)
-    monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: {})
+    """SM-only session + no-op notification side channels + reschedule spy."""
+    coin_sessions: dict = {}
+    kr_stock_sessions: dict = {}
+    monkeypatch.setattr(approval_module, "get_kr_stock_sessions", lambda: kr_stock_sessions)
+    monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: coin_sessions)
 
     reschedule_calls = []
 
@@ -69,12 +105,6 @@ def wired(monkeypatch):
         return None
 
     for name in (
-        "mirror_session_state", "mirror_session_status",
-        # P1-5: write-through commit_* siblings of the mirror_* pair above --
-        # same no-op treatment (see test_approval_restart_resume.py for the
-        # full rationale: these resolve get_session_manager via their own
-        # defining module, not this fixture's approval_module patch).
-        "commit_session_state", "commit_session_status",
         "broadcast_trade_rejected", "broadcast_trade_executed",
         "broadcast_trade_queued", "broadcast_watch_added",
     ):
@@ -85,41 +115,67 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(approval_module, "get_telegram_notifier", lambda: _Telegram())
 
+    holder: dict = {"manager": _FakeSessionManager(None)}
+
+    async def fake_get_session_manager():
+        return holder["manager"]
+
+    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
+
+    def set_sm_session(sm_session):
+        holder["manager"] = _FakeSessionManager(sm_session)
+
+    # P2-5: commit_session_state/commit_session_status are the sole writers
+    # of state/status now -- fakes write through to the SAME AnalysisSession
+    # the fake manager tracks (services/session_manager.py's own module
+    # globals are untouched by this fixture's approval_module patch, so
+    # faking these names directly is this file's isolation principle).
+    async def fake_commit_session_state(session_id, updates, **kw):
+        session = holder["manager"]._session
+        if session is None or session.session_id != session_id:
+            raise KeyError(session_id)
+        session.state.update(updates)
+
+    async def fake_commit_session_status(session_id, new_status, **kw):
+        session = holder["manager"]._session
+        if session is None or session.session_id != session_id:
+            raise KeyError(session_id)
+        session.status = new_status
+
+    async def fake_mirror_session_status(session_id, new_status, error=None):
+        session = holder["manager"]._session
+        if session is not None and session.session_id == session_id:
+            session.status = new_status if isinstance(new_status, SessionStatus) else SessionStatus(new_status)
+
+    monkeypatch.setattr(approval_module, "commit_session_state", fake_commit_session_state)
+    monkeypatch.setattr(approval_module, "commit_session_status", fake_commit_session_status)
+    monkeypatch.setattr(approval_module, "mirror_session_status", fake_mirror_session_status)
+
     def set_graph(graph):
         monkeypatch.setattr(
             approval_module, "get_kr_stock_trading_graph", lambda: graph
         )
 
-    # P2-2 fast-follow: graph selection now independently reads the SM row's
-    # market_type (no B-membership fallback). This fixture's sessions dict IS
-    # the legacy dict (B) with no backing SM row, so resolve market_type from
-    # whichever legacy dict (kr vs coin -- both read fresh through
-    # approval_module so a test's own later monkeypatch override, e.g. the
-    # coin test below, is still picked up) currently contains the id.
-    class _FakeSM:
-        async def get_session(self, session_id):
-            kr = approval_module.get_kr_stock_sessions()
-            if session_id in kr:
-                return SimpleNamespace(market_type=MarketType.KIWOOM)
-            coin = approval_module.get_coin_sessions()
-            if session_id in coin:
-                return SimpleNamespace(market_type=MarketType.COIN)
-            return None
+    def set_coin_graph(graph):
+        monkeypatch.setattr(approval_module, "get_coin_trading_graph", lambda: graph)
 
-    async def fake_get_session_manager():
-        return _FakeSM()
-
-    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
-
-    return sessions, reschedule_calls, set_graph
+    return {
+        "holder": holder,
+        "reschedule_calls": reschedule_calls,
+        "set_sm_session": set_sm_session,
+        "set_graph": set_graph,
+        "set_coin_graph": set_coin_graph,
+        "coin_sessions": coin_sessions,
+        "kr_stock_sessions": kr_stock_sessions,
+    }
 
 
 @pytest.mark.asyncio
 async def test_reject_rearms_injector_when_new_proposal_awaits(wired):
-    sessions, reschedule_calls, set_graph = wired
-    sessions["s1"] = _kr_session("s1")
+    session_id = "s1"
+    wired["set_sm_session"](_sm_session(session_id))
     # 재분석이 새 제안으로 다시 인터럽트에 도달
-    set_graph(_FakeGraph([
+    wired["set_graph"](_FakeGraph([
         {"re_analyze": {"approval_status": None, "user_feedback": None}},
         {"decision": {
             "trade_proposal": {"id": "prop-new", "action": "BUY", "quantity": 1,
@@ -129,40 +185,42 @@ async def test_reject_rearms_injector_when_new_proposal_awaits(wired):
         }},
     ]))
 
-    await approval_module.submit_decision("s1", "rejected", feedback="너무 비쌈")
+    await approval_module.submit_decision(session_id, "rejected", feedback="너무 비쌈")
 
-    assert sessions["s1"]["status"] == "awaiting_approval"  # injector 가드 정합
-    assert reschedule_calls == [("s1", "kiwoom")]
+    assert wired["holder"]["manager"]._session.status == SessionStatus.AWAITING_APPROVAL
+    assert wired["reschedule_calls"] == [(session_id, "kiwoom")]
+    assert session_id not in wired["kr_stock_sessions"]
+    assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio
 async def test_reject_without_new_awaiting_does_not_rearm(wired):
-    sessions, reschedule_calls, set_graph = wired
-    sessions["s2"] = _kr_session("s2")
+    session_id = "s2"
+    wired["set_sm_session"](_sm_session(session_id))
     # 재분석이 제안 없이 종료 (awaiting 재진입 없음)
-    set_graph(_FakeGraph([
+    wired["set_graph"](_FakeGraph([
         {"re_analyze": {"approval_status": None}},
         {"finalize": {"awaiting_approval": False}},
     ]))
 
-    await approval_module.submit_decision("s2", "rejected")
+    await approval_module.submit_decision(session_id, "rejected")
 
-    assert sessions["s2"]["status"] == "running"
-    assert reschedule_calls == []
+    assert wired["holder"]["manager"]._session.status == SessionStatus.RUNNING
+    assert wired["reschedule_calls"] == []
 
 
 @pytest.mark.asyncio
 async def test_approved_never_rearms(wired):
-    sessions, reschedule_calls, set_graph = wired
-    sessions["s3"] = _kr_session("s3")
-    set_graph(_FakeGraph([
+    session_id = "s3"
+    wired["set_sm_session"](_sm_session(session_id))
+    wired["set_graph"](_FakeGraph([
         {"execution": {"execution_status": "completed", "awaiting_approval": False}},
     ]))
 
-    await approval_module.submit_decision("s3", "approved", actor="system")
+    await approval_module.submit_decision(session_id, "approved", actor="system")
 
-    assert sessions["s3"]["status"] == "completed"
-    assert reschedule_calls == []
+    assert wired["holder"]["manager"]._session.status == SessionStatus.COMPLETED
+    assert wired["reschedule_calls"] == []
 
 
 # --- Task 1 (F4b, CRITICAL): atomic proposal-ID pin -------------------------
@@ -180,66 +238,48 @@ async def test_system_approve_stands_down_when_proposal_replaced(wired):
     """TOCTOU: proposal replaced ("P1" -> "P2") between the injector's outside
     pin check and the lock being acquired -> stand down silently. No resume,
     no state mutation, no status change."""
-    sessions, reschedule_calls, set_graph = wired
-    sessions["s4"] = _kr_session("s4")
-    sessions["s4"]["state"]["trade_proposal"]["id"] = "P2"  # replaced while stale timer waited
+    session_id = "s4"
+    sm_session = _sm_session(session_id)
+    sm_session.state["trade_proposal"]["id"] = "P2"  # replaced while stale timer waited
+    wired["set_sm_session"](sm_session)
     graph = _FakeGraph([])
-    set_graph(graph)
+    wired["set_graph"](graph)
 
     result = await approval_module.submit_decision(
-        "s4", "approved", actor="system", expected_proposal_id="P1"
+        session_id, "approved", actor="system", expected_proposal_id="P1"
     )
 
     assert result == {"status": "stood_down", "reason": "proposal_changed"}
     graph.aupdate_state.assert_not_awaited()
-    assert sessions["s4"]["status"] == "awaiting_approval"
-    assert sessions["s4"]["state"]["approval_status"] is None
-    assert sessions["s4"]["state"]["awaiting_approval"] is True
-    assert reschedule_calls == []
+    assert sm_session.status == SessionStatus.AWAITING_APPROVAL
+    assert sm_session.state["approval_status"] is None
+    assert sm_session.state["awaiting_approval"] is True
+    assert wired["reschedule_calls"] == []
 
 
 @pytest.mark.asyncio
 async def test_system_approve_proceeds_when_id_matches(wired):
     """The pinned id still matches what's live -> normal approval proceeds."""
-    sessions, reschedule_calls, set_graph = wired
-    sessions["s5"] = _kr_session("s5")
-    sessions["s5"]["state"]["trade_proposal"]["id"] = "P1"
+    session_id = "s5"
+    sm_session = _sm_session(session_id)
+    sm_session.state["trade_proposal"]["id"] = "P1"
+    wired["set_sm_session"](sm_session)
     graph = _FakeGraph([
         {"execution": {"execution_status": "completed", "awaiting_approval": False}},
     ])
-    set_graph(graph)
+    wired["set_graph"](graph)
 
     result = await approval_module.submit_decision(
-        "s5", "approved", actor="system", expected_proposal_id="P1"
+        session_id, "approved", actor="system", expected_proposal_id="P1"
     )
 
     assert result.status == "completed"
     assert result.decision == "approved"
     graph.aupdate_state.assert_awaited_once()
-    assert sessions["s5"]["state"]["approval_status"] == "approved"
+    assert sm_session.state["approval_status"] == "approved"
 
 
-def _coin_session(session_id: str) -> dict:
-    """A coin session where the user's cancel already landed (route sets
-    session["status"] = "cancelled") but — pre-fix — left
-    state["awaiting_approval"] True and approval_status None behind, exactly
-    the shape the buggy coin cancel route used to produce (see coin/analysis.py
-    cancel route + F4b IMPORTANT-1)."""
-    return {
-        "market": "KRW-BTC",
-        "korean_name": "비트코인",
-        "status": "cancelled",
-        "state": {
-            "awaiting_approval": True,
-            "approval_status": None,
-            "trade_proposal": {"id": "P1", "action": "BUY", "quantity": 1,
-                               "entry_price": 50_000_000},
-            "reasoning_log": [],
-        },
-    }
-
-
-# --- Task 2 (F4b, IMPORTANT-1): inside-lock guard on session["status"] ------
+# --- Task 2 (F4b, IMPORTANT-1): inside-lock guard on sm_session.status ------
 #
 # The proposal-id pin only catches a REPLACED proposal (reject -> re-analysis).
 # A cancel never replaces the proposal, so on the coin market (whose cancel
@@ -247,36 +287,36 @@ def _coin_session(session_id: str) -> dict:
 # auto-approve raced straight through the pin check and the
 # `not state.get("awaiting_approval")` check into the live approve path —
 # executing the trade and overwriting the cancelled status. The inside-lock
-# guard must also stand down whenever session["status"] is no longer
-# "awaiting_approval", regardless of which market or which route caused the
+# guard must also stand down whenever sm_session.status is no longer
+# AWAITING_APPROVAL, regardless of which market or which route caused the
 # mutation.
 
 @pytest.mark.asyncio
-async def test_coin_system_approve_stands_down_when_status_not_awaiting(wired, monkeypatch):
+async def test_coin_system_approve_stands_down_when_status_not_awaiting(wired):
     """Coin analog of the stale-approve stand-down: cancel already flipped
-    session["status"] away from "awaiting_approval" while awaiting_approval/
+    sm_session.status away from AWAITING_APPROVAL while awaiting_approval/
     approval_status remained in their pre-cancel shape (the coin route bug
     this arc fixes) — the pin still matches (cancel didn't touch the
-    proposal), so only the session-status guard can catch this. No resume,
-    no state mutation beyond what cancel already did, no order."""
-    _sessions, reschedule_calls, _set_graph = wired
-    coin_sessions = {"c1": _coin_session("c1")}
-    monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: coin_sessions)
-    monkeypatch.setattr(approval_module, "get_kr_stock_sessions", lambda: {})
+    proposal), so only the status guard can catch this. No resume, no state
+    mutation beyond what cancel already did, no order."""
+    session_id = "c1"
+    sm_session = _sm_session(session_id, market_type=MarketType.COIN, status=SessionStatus.CANCELLED)
+    sm_session.state["trade_proposal"]["id"] = "P1"
+    wired["set_sm_session"](sm_session)
 
     graph = _FakeGraph([])
-    monkeypatch.setattr(approval_module, "get_coin_trading_graph", lambda: graph)
+    wired["set_coin_graph"](graph)
 
     result = await approval_module.submit_decision(
-        "c1", "approved", actor="system", expected_proposal_id="P1"
+        session_id, "approved", actor="system", expected_proposal_id="P1"
     )
 
     assert result == {"status": "stood_down", "reason": "not_awaiting"}
     graph.aupdate_state.assert_not_awaited()
-    assert coin_sessions["c1"]["status"] == "cancelled"
-    assert coin_sessions["c1"]["state"]["approval_status"] is None
-    assert coin_sessions["c1"]["state"]["awaiting_approval"] is True
-    assert reschedule_calls == []
+    assert sm_session.status == SessionStatus.CANCELLED
+    assert sm_session.state["approval_status"] is None
+    assert sm_session.state["awaiting_approval"] is True
+    assert wired["reschedule_calls"] == []
 
 
 async def test_user_decision_ignores_expected_id(wired):
@@ -284,18 +324,19 @@ async def test_user_decision_ignores_expected_id(wired):
     to actor=='system' only. Defense-in-depth: even a mismatched
     expected_proposal_id (never sent by the real user-facing route) must not
     change user-decision behavior."""
-    sessions, reschedule_calls, set_graph = wired
-    sessions["s6"] = _kr_session("s6")
-    sessions["s6"]["state"]["trade_proposal"]["id"] = "P1"
+    session_id = "s6"
+    sm_session = _sm_session(session_id)
+    sm_session.state["trade_proposal"]["id"] = "P1"
+    wired["set_sm_session"](sm_session)
     graph = _FakeGraph([
         {"execution": {"execution_status": "completed", "awaiting_approval": False}},
     ])
-    set_graph(graph)
+    wired["set_graph"](graph)
 
     result = await approval_module.submit_decision(
-        "s6", "approved", actor="user", expected_proposal_id="MISMATCH"
+        session_id, "approved", actor="user", expected_proposal_id="MISMATCH"
     )
 
     assert result.status == "completed"
     graph.aupdate_state.assert_awaited_once()
-    assert sessions["s6"]["state"]["approval_status"] == "approved"
+    assert sm_session.state["approval_status"] == "approved"

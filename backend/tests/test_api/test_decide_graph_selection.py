@@ -3,32 +3,24 @@ record's market_type, never legacy-dict (B) membership.
 
 CRITICAL (spec adversarial review, P2-2): the pre-fix code selected the
 resume graph via `if session_id in kr_stock_sessions: kr_graph else:
-coin_graph` (and re-derived `market` the same way at the reject/re-analysis
-site). That membership check is only satisfied TODAY because
-_adopt_session_from_manager (the restart fallback) happens to register the
+coin_graph`. That membership check was only satisfied because
+_adopt_session_from_manager (the restart fallback) happened to register the
 adopted session into the matching legacy dict as a side effect, BEFORE the
-graph-selection line runs -- but the graph-selection code has no business
-depending on that incidental side channel. Once P2-5 removes B writes from
-_adopt_session_from_manager entirely (per the session-SSOT roadmap), or in
-the narrow post-restart window before adoption runs, B stays empty straight
-through to graph selection and EVERY KR session would silently resume
-through the COIN graph (or vice versa).
+graph-selection line ran.
 
-To pin the fix independent of whatever adoption strategy happens to be wired
-today, these tests monkeypatch `_adopt_session_from_manager` itself to
-simulate the post-P2-5 shape: it "adopts" the session from the SM record
-(state carried over, decision can proceed) but never registers it into the
-legacy dict. B is empty when the caller looks it up AND stays empty all the
-way through graph selection -- exactly like B writes had been removed
-entirely. Graph selection must still resolve the correct market by reading
-sm_session.market_type directly (a fresh, independent get_session_manager()
-lookup), not by asking whether the legacy dict happens to contain the id.
+P2-5 (session-SSOT) removed _adopt_session_from_manager and every legacy
+dict lookup from submit_decision entirely: the session, its state, its
+market_type and its final status now all come from a single
+sm.get_session() call, held as `sm_session` for the whole function. This
+file now pins that reality directly (no legacy dict simulation needed at
+all -- B never enters the picture) rather than simulating "B empty after
+adoption" against the pre-P2-5 code.
 """
 
 import pytest
 
-import app.api.routes.approval as approval_module
 from services.session_manager import AnalysisSession, MarketType, SessionStatus
+import app.api.routes.approval as approval_module
 
 
 class _StopResume(Exception):
@@ -88,13 +80,17 @@ class _FakeSessionManager:
             return self._session
         return None
 
+    async def update_state(self, session_id: str, updates: dict, last_node=None):
+        if self._session is None or self._session.session_id != session_id:
+            raise KeyError(session_id)
+        self._session.state.update(updates)
+        if last_node:
+            self._session.last_node = last_node
+
 
 @pytest.fixture
 def wired(monkeypatch):
-    """Empty legacy dicts + no-op notification/mirror/commit side channels.
-
-    Mirrors the mocking approach in tests/test_api/test_approval_restart_resume.py.
-    """
+    """No-op notification/commit/mirror side channels + settable SM session."""
     coin_sessions: dict = {}
     kr_stock_sessions: dict = {}
     monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: coin_sessions)
@@ -104,7 +100,6 @@ def wired(monkeypatch):
         return None
 
     for name in (
-        "mirror_session_state",
         "mirror_session_status",
         "commit_session_state",
         "commit_session_status",
@@ -116,13 +111,15 @@ def wired(monkeypatch):
     ):
         monkeypatch.setattr(approval_module, name, noop)
 
+    holder: dict = {"manager": _FakeSessionManager(None)}
+
+    async def fake_get_session_manager():
+        return holder["manager"]
+
+    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
+
     def set_sm_session(sm_session):
-        fake_manager = _FakeSessionManager(sm_session)
-
-        async def fake_get_session_manager():
-            return fake_manager
-
-        monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
+        holder["manager"] = _FakeSessionManager(sm_session)
 
     def set_kr_graph(factory):
         monkeypatch.setattr(approval_module, "get_kr_stock_trading_graph", factory)
@@ -130,41 +127,22 @@ def wired(monkeypatch):
     def set_coin_graph(factory):
         monkeypatch.setattr(approval_module, "get_coin_trading_graph", factory)
 
-    def simulate_b_empty_adoption():
-        """Replace _adopt_session_from_manager with a fake that reads the SM
-        row (same as the real one) but never registers into the legacy dict
-        -- B stays empty through graph selection, mirroring the post-P2-5
-        shape (or the narrow pre-adoption restart window) regardless of
-        whatever the real adoption function does today.
-        """
-
-        async def fake_adopt(session_id, coin_sess, kr_sess):
-            manager = await approval_module.get_session_manager()
-            sm_session = await manager.get_session(session_id)
-            if sm_session is None:
-                return None
-            return sm_session.to_legacy_dict()
-
-        monkeypatch.setattr(approval_module, "_adopt_session_from_manager", fake_adopt)
-
     return {
         "coin_sessions": coin_sessions,
         "kr_stock_sessions": kr_stock_sessions,
         "set_sm_session": set_sm_session,
         "set_kr_graph": set_kr_graph,
         "set_coin_graph": set_coin_graph,
-        "simulate_b_empty_adoption": simulate_b_empty_adoption,
     }
 
 
 @pytest.mark.asyncio
-async def test_kr_session_decide_resumes_kr_graph_even_with_b_empty(wired):
-    """CRITICAL pin: B dict empty end-to-end (post-P2-5 shape) + a KIWOOM SM
-    session -> /decide must select the KR graph, never the COIN graph.
-    """
+async def test_kr_session_decide_resumes_kr_graph(wired):
+    """CRITICAL pin: a KIWOOM SM session -> /decide must select the KR graph,
+    never the COIN graph. B never participates at all (no legacy dict, no
+    adoption step)."""
     session_id = "b-empty-kr-1"
     wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.KIWOOM))
-    wired["simulate_b_empty_adoption"]()
 
     picked = {}
 
@@ -183,18 +161,15 @@ async def test_kr_session_decide_resumes_kr_graph_even_with_b_empty(wired):
         await approval_module.submit_decision(session_id, "approved")
 
     assert picked.get("graph") == "kr"
-    # B genuinely stayed empty the whole time -- the fix must not depend on
-    # adoption's (here absent) side effect of registering into the legacy dict.
     assert session_id not in wired["kr_stock_sessions"]
     assert session_id not in wired["coin_sessions"]
 
 
 @pytest.mark.asyncio
-async def test_coin_session_decide_resumes_coin_graph_even_with_b_empty(wired):
-    """Symmetric case: a COIN SM session with B empty -> COIN graph selected."""
+async def test_coin_session_decide_resumes_coin_graph(wired):
+    """Symmetric case: a COIN SM session -> COIN graph selected."""
     session_id = "b-empty-coin-1"
     wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.COIN))
-    wired["simulate_b_empty_adoption"]()
 
     picked = {}
 
@@ -226,7 +201,6 @@ async def test_unknown_market_type_fails_closed_400_at_graph_selection(wired):
 
     session_id = "b-empty-stock-1"
     wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.STOCK))
-    wired["simulate_b_empty_adoption"]()
 
     def boom():
         raise AssertionError("graph factory must not be called for an unknown market")

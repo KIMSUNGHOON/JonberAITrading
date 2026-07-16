@@ -19,7 +19,7 @@ import pytest
 from fastapi import HTTPException
 from types import SimpleNamespace
 
-from services.session_manager import MarketType, SessionStatus
+from services.session_manager import AnalysisSession, MarketType, SessionStatus
 
 
 # -------------------------------------------
@@ -232,82 +232,100 @@ async def test_coin_awaiting_transition_failclosed_on_sm_failure(monkeypatch):
 # -------------------------------------------
 # approval.py — 결정 진입 write-through 503 경로 1건
 # -------------------------------------------
+#
+# P2-5 (session-SSOT): submit_decision now resolves the session, its state
+# and its status entirely off the SessionManager (SM) -- there is no legacy
+# dict ("B") lookup and no _adopt_session_from_manager fallback, and the old
+# "apply decision_updates to local state AFTER the commit succeeds" block is
+# gone (state IS sm_session.state, a live reference -- commit_session_state
+# is the ONLY writer). The fakes below simulate that write-through contract
+# directly: on a successful (fake) commit they mutate the SAME AnalysisSession
+# object get_session_manager() hands back, exactly like the real
+# SessionManager.update_state/update_status would.
 
 
-@pytest.mark.asyncio
-async def test_approval_decision_entry_503_when_sm_commit_fails(monkeypatch):
-    """P1-5: 결정 진입 시점의 decision_updates 미러는 write-through다 -- SM
-    커밋이 실패하면 그래프를 재개(=주문 실행 가능)하지 않고 503으로 fail-loud
-    해야 한다. 결정이 SM에 반영되지 않은 채 200 을 돌려주는 것은 금지.
-    """
-    from app.api.routes import approval as approval_module
-    from app.api.routes.kr_stocks.constants import kr_stock_sessions
-
-    session_id = "wt-approval-1"
-    saved = dict(kr_stock_sessions)
-    kr_stock_sessions.clear()
-    kr_stock_sessions[session_id] = {
-        "session_id": session_id,
-        "status": "awaiting_approval",
-        "error": None,
-        "state": {
+def _wt_sm_session(session_id: str) -> AnalysisSession:
+    return AnalysisSession(
+        session_id=session_id,
+        market_type=MarketType.KIWOOM,
+        display_name="삼성전자",
+        ticker="005930",
+        stk_cd="005930",
+        stk_nm="삼성전자",
+        status=SessionStatus.AWAITING_APPROVAL,
+        state={
             "awaiting_approval": True,
             "trade_proposal": {"id": "p1", "action": "BUY"},
             "reasoning_log": [],
         },
-    }
+    )
+
+
+@pytest.mark.asyncio
+async def test_approval_decision_entry_503_when_sm_commit_fails(monkeypatch):
+    """P1-5: 결정 진입 시점의 decision_updates 커밋은 write-through다 -- SM
+    커밋이 실패하면 그래프를 재개(=주문 실행 가능)하지 않고 503으로 fail-loud
+    해야 한다. 결정이 SM에 반영되지 않은 채 200 을 돌려주는 것은 금지.
+    """
+    from app.api.routes import approval as approval_module
+
+    session_id = "wt-approval-1"
+    sm_session = _wt_sm_session(session_id)
+
+    class _FakeSM:
+        async def get_session(self, sid):
+            return sm_session if sid == session_id else None
+
+    async def fake_get_session_manager():
+        return _FakeSM()
+
+    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
 
     async def failing_commit_state(session_id, state_updates, **kw):
         raise RuntimeError("sqlite down")
 
     monkeypatch.setattr(approval_module, "commit_session_state", failing_commit_state)
 
-    try:
-        with pytest.raises(HTTPException) as exc_info:
-            await approval_module.submit_decision(session_id, "approved")
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "approved")
 
-        assert exc_info.value.status_code == 503
-        assert exc_info.value.detail == "approval state could not be persisted — retry"
-        # The decision must not have been applied as a silent success: the
-        # graph resume (and any order it could place) never ran.
-        assert kr_stock_sessions[session_id]["status"] == "awaiting_approval"
-        # P1-5 review fix (Important A) pin: B must not have raced ahead of
-        # the failed C commit -- state["awaiting_approval"] stays True so a
-        # retry of the same decision is not wedged behind a false "already
-        # decided" flag. See test_approval_decision_entry_retry_succeeds_
-        # after_503 below for the full retry-recovers assertion.
-        assert kr_stock_sessions[session_id]["state"]["awaiting_approval"] is True
-    finally:
-        kr_stock_sessions.clear()
-        kr_stock_sessions.update(saved)
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "approval state could not be persisted — retry"
+    # The decision must not have been applied as a silent success: the
+    # graph resume (and any order it could place) never ran.
+    assert sm_session.status == SessionStatus.AWAITING_APPROVAL
+    # P1-5 review fix (Important A) pin, P2-5-adapted: since state IS
+    # sm_session.state (no separate local copy to race ahead of a failed
+    # commit), state["awaiting_approval"] simply never gets touched here --
+    # a retry of the same decision is not wedged behind a false "already
+    # decided" flag. See test_approval_decision_entry_retry_succeeds_
+    # after_503 below for the full retry-recovers assertion.
+    assert sm_session.state["awaiting_approval"] is True
 
 
 @pytest.mark.asyncio
 async def test_approval_decision_entry_retry_succeeds_after_503(monkeypatch):
     """P1-5 review fix (Important A): a 503 from a failed decision-entry
-    commit must not wedge the session. Because B (local state) is only
-    mutated AFTER C (the SM commit) succeeds, state["awaiting_approval"]
+    commit must not wedge the session. Because state IS sm_session.state (a
+    live reference committed to only via commit_session_state -- P2-5
+    removed the old local-B reapplication block), state["awaiting_approval"]
     stays True across the failed attempt -- so retrying the exact same
     decision on the exact same session lands normally instead of 400ing
     as "Session is not awaiting approval".
     """
-    from fastapi import HTTPException
     from app.api.routes import approval as approval_module
-    from app.api.routes.kr_stocks.constants import kr_stock_sessions
 
     session_id = "wt-approval-retry-1"
-    saved = dict(kr_stock_sessions)
-    kr_stock_sessions.clear()
-    kr_stock_sessions[session_id] = {
-        "session_id": session_id,
-        "status": "awaiting_approval",
-        "error": None,
-        "state": {
-            "awaiting_approval": True,
-            "trade_proposal": {"id": "p1", "action": "BUY"},
-            "reasoning_log": [],
-        },
-    }
+    sm_session = _wt_sm_session(session_id)
+
+    class _FakeSM:
+        async def get_session(self, sid):
+            return sm_session if sid == session_id else None
+
+    async def fake_get_session_manager():
+        return _FakeSM()
+
+    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
 
     calls = {"n": 0}
 
@@ -315,35 +333,24 @@ async def test_approval_decision_entry_retry_succeeds_after_503(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("sqlite down")
-        return None  # second call onward: succeeds
+        # P2-5: commit_session_state is the SOLE writer now -- the fake must
+        # actually apply the update for the "retry succeeds" assertions
+        # below to mean anything (pre-P2-5 this was done by a separate local
+        # "B" reapplication block that no longer exists).
+        sm_session.state.update(state_updates)
 
-    async def ok_commit_status(sid, status, **kw):
-        return None
+    async def ok_commit_status(sid, new_status, **kw):
+        sm_session.status = new_status
 
     async def noop(*a, **k):
         return None
 
     monkeypatch.setattr(approval_module, "commit_session_state", flaky_commit_state)
     monkeypatch.setattr(approval_module, "commit_session_status", ok_commit_status)
-    monkeypatch.setattr(approval_module, "mirror_session_state", noop)
     monkeypatch.setattr(approval_module, "broadcast_trade_executed", noop)
     monkeypatch.setattr(approval_module, "broadcast_trade_queued", noop)
     monkeypatch.setattr(approval_module, "broadcast_trade_rejected", noop)
     monkeypatch.setattr(approval_module, "broadcast_watch_added", noop)
-
-    # P2-2: graph selection now independently reads the SM row's market_type
-    # (no more B-membership fallback). This file's isolation principle is to
-    # fake only functions the target module imported -- get_session_manager
-    # is one of those (approval.py imports it from services.session_manager)
-    # -- so fake it here too rather than touching the real SM singleton.
-    class _FakeSM:
-        async def get_session(self, sid):
-            return SimpleNamespace(market_type=MarketType.KIWOOM)
-
-    async def fake_get_session_manager():
-        return _FakeSM()
-
-    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
 
     async def fake_get_trading_coordinator():
         raise RuntimeError("no coordinator in unit test")
@@ -372,24 +379,20 @@ async def test_approval_decision_entry_retry_succeeds_after_503(monkeypatch):
 
     monkeypatch.setattr(approval_module, "get_kr_stock_trading_graph", lambda: _FakeGraph())
 
-    try:
-        with pytest.raises(HTTPException) as exc_info:
-            await approval_module.submit_decision(session_id, "approved")
-        assert exc_info.value.status_code == 503
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "approved")
+    assert exc_info.value.status_code == 503
 
-        # Not wedged: still awaiting, so the exact same decision is retryable.
-        assert kr_stock_sessions[session_id]["state"]["awaiting_approval"] is True
-        assert kr_stock_sessions[session_id]["status"] == "awaiting_approval"
+    # Not wedged: still awaiting, so the exact same decision is retryable.
+    assert sm_session.state["awaiting_approval"] is True
+    assert sm_session.status == SessionStatus.AWAITING_APPROVAL
 
-        result = await approval_module.submit_decision(session_id, "approved")
+    result = await approval_module.submit_decision(session_id, "approved")
 
-        assert result.session_id == session_id
-        assert result.decision == "approved"
-        assert kr_stock_sessions[session_id]["state"]["awaiting_approval"] is False
-        assert calls["n"] == 2
-    finally:
-        kr_stock_sessions.clear()
-        kr_stock_sessions.update(saved)
+    assert result.session_id == session_id
+    assert result.decision == "approved"
+    assert sm_session.state["awaiting_approval"] is False
+    assert calls["n"] == 2
 
 
 @pytest.mark.asyncio
@@ -399,51 +402,42 @@ async def test_approval_rejected_rearm_failed_commit_never_schedules(monkeypatch
     NEVER be scheduled against a transition the SM never recorded -- fail
     closed (503), mirroring _finalize_awaiting_transition's own invariant.
     """
-    from fastapi import HTTPException
     from app.api.routes import approval as approval_module
-    from app.api.routes.kr_stocks.constants import kr_stock_sessions
 
     session_id = "wt-approval-rearm-1"
-    saved = dict(kr_stock_sessions)
-    kr_stock_sessions.clear()
-    kr_stock_sessions[session_id] = {
-        "session_id": session_id,
-        "status": "awaiting_approval",
-        "error": None,
-        "state": {
-            "awaiting_approval": True,
-            "trade_proposal": {"id": "p1", "action": "BUY"},
-            "reasoning_log": [],
-        },
-    }
+    sm_session = _wt_sm_session(session_id)
 
-    async def commit_state_ok(sid, state_updates, **kw):
-        return None
-
-    calls = {"n": 0}
-
-    async def commit_status_fails(sid, status, **kw):
-        calls["n"] += 1
-        raise RuntimeError("sqlite down")
-
-    async def noop(*a, **k):
-        return None
-
-    monkeypatch.setattr(approval_module, "commit_session_state", commit_state_ok)
-    monkeypatch.setattr(approval_module, "commit_session_status", commit_status_fails)
-    monkeypatch.setattr(approval_module, "mirror_session_state", noop)
-
-    # P2-2: graph selection now independently reads the SM row's market_type
-    # (no more B-membership fallback). Fake it, same rationale as the retry
-    # test above -- get_session_manager is a name the target module imports.
     class _FakeSM:
         async def get_session(self, sid):
-            return SimpleNamespace(market_type=MarketType.KIWOOM)
+            return sm_session if sid == session_id else None
+
+        async def update_state(self, sid, updates, last_node=None):
+            # The resume loop below actually yields one node event (this is
+            # the only test in this file whose fake graph does), so the sm
+            # local variable's update_state gets a real call -- P2-5 made it
+            # the resume loop's sole per-node write.
+            if sid != session_id:
+                raise KeyError(sid)
+            sm_session.state.update(updates)
+            if last_node:
+                sm_session.last_node = last_node
 
     async def fake_get_session_manager():
         return _FakeSM()
 
     monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
+
+    async def commit_state_ok(sid, state_updates, **kw):
+        sm_session.state.update(state_updates)
+
+    calls = {"n": 0}
+
+    async def commit_status_fails(sid, new_status, **kw):
+        calls["n"] += 1
+        raise RuntimeError("sqlite down")
+
+    monkeypatch.setattr(approval_module, "commit_session_state", commit_state_ok)
+    monkeypatch.setattr(approval_module, "commit_session_status", commit_status_fails)
 
     scheduled = []
 
@@ -470,16 +464,12 @@ async def test_approval_rejected_rearm_failed_commit_never_schedules(monkeypatch
 
     monkeypatch.setattr(approval_module, "get_kr_stock_trading_graph", lambda: _FakeGraph())
 
-    try:
-        with pytest.raises(HTTPException) as exc_info:
-            await approval_module.submit_decision(session_id, "rejected", feedback="try again")
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "rejected", feedback="try again")
 
-        assert exc_info.value.status_code == 503
-        # The 1-retry loop attempted the commit twice, then gave up.
-        assert calls["n"] == 2
-        # Never armed against an SM row that doesn't know about this
-        # transition -- the core invariant this whole task exists to guard.
-        assert scheduled == []
-    finally:
-        kr_stock_sessions.clear()
-        kr_stock_sessions.update(saved)
+    assert exc_info.value.status_code == 503
+    # The 1-retry loop attempted the commit twice, then gave up.
+    assert calls["n"] == 2
+    # Never armed against an SM row that doesn't know about this
+    # transition -- the core invariant this whole task exists to guard.
+    assert scheduled == []

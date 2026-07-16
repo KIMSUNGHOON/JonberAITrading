@@ -21,32 +21,58 @@ Fix: branch on state["execution_status"] directly.
     claims a fill.
   - "failed" -> rejected/failed wording (broadcast_trade_rejected /
     telegram.send_trade_rejected) with the execution error as the reason.
+
+P2-5 (session-SSOT): submit_decision now resolves the session and all its
+state entirely off the SessionManager (SM) -- there is no legacy dict ("B")
+lookup and no _adopt_session_from_manager fallback. This fixture's fake
+SessionManager is the SOLE source of truth.
 """
 
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from services.session_manager import AnalysisSession, MarketType, SessionStatus
 import app.api.routes.approval as approval_module
-from services.session_manager import MarketType
 
 
-def _kr_session(session_id: str) -> dict:
-    return {
-        "stk_cd": "005930",
-        "stk_nm": "삼성전자",
-        "status": "awaiting_approval",
-        "state": {
-            "awaiting_approval": True,
-            "approval_status": None,
-            "trade_proposal": {
-                "id": "prop-1", "action": "BUY", "quantity": 10,
-                "entry_price": 70000,
-            },
-            "reasoning_log": [],
+def _sm_session(session_id: str) -> AnalysisSession:
+    state = {
+        "awaiting_approval": True,
+        "approval_status": None,
+        "trade_proposal": {
+            "id": "prop-1", "action": "BUY", "quantity": 10,
+            "entry_price": 70000,
         },
+        "reasoning_log": [],
     }
+    return AnalysisSession(
+        session_id=session_id,
+        market_type=MarketType.KIWOOM,
+        status=SessionStatus.AWAITING_APPROVAL,
+        state=state,
+        ticker="005930",
+        display_name="삼성전자",
+        stk_cd="005930",
+        stk_nm="삼성전자",
+    )
+
+
+class _FakeSessionManager:
+    def __init__(self, session: AnalysisSession | None):
+        self._session = session
+
+    async def get_session(self, session_id: str):
+        if self._session is not None and self._session.session_id == session_id:
+            return self._session
+        return None
+
+    async def update_state(self, session_id: str, updates: dict, last_node=None):
+        if self._session is None or self._session.session_id != session_id:
+            raise KeyError(session_id)
+        self._session.state.update(updates)
+        if last_node:
+            self._session.last_node = last_node
 
 
 class _FakeGraph:
@@ -89,21 +115,34 @@ class _FakeTelegram:
 
 @pytest.fixture
 def wired(monkeypatch):
-    sessions = {}
-    monkeypatch.setattr(approval_module, "get_kr_stock_sessions", lambda: sessions)
-    monkeypatch.setattr(approval_module, "get_coin_sessions", lambda: {})
+    holder: dict = {"manager": _FakeSessionManager(None)}
+
+    async def fake_get_session_manager():
+        return holder["manager"]
+
+    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
+
+    def set_sm_session(sm_session):
+        holder["manager"] = _FakeSessionManager(sm_session)
+
+    async def fake_commit_session_state(session_id, updates, **kw):
+        session = holder["manager"]._session
+        if session is None or session.session_id != session_id:
+            raise KeyError(session_id)
+        session.state.update(updates)
+
+    async def fake_commit_session_status(session_id, new_status, **kw):
+        session = holder["manager"]._session
+        if session is None or session.session_id != session_id:
+            raise KeyError(session_id)
+        session.status = new_status
 
     async def noop(*a, **k):
         return None
 
-    monkeypatch.setattr(approval_module, "mirror_session_state", noop)
+    monkeypatch.setattr(approval_module, "commit_session_state", fake_commit_session_state)
+    monkeypatch.setattr(approval_module, "commit_session_status", fake_commit_session_status)
     monkeypatch.setattr(approval_module, "mirror_session_status", noop)
-    # P1-5: the decision-entry + final-status sites now go through the
-    # write-through commit_* helpers instead of the best-effort mirror_*
-    # ones -- same no-op treatment, otherwise they'd hit the real
-    # (untracked-session) SessionManager singleton and fail loud with a 503.
-    monkeypatch.setattr(approval_module, "commit_session_state", noop)
-    monkeypatch.setattr(approval_module, "commit_session_status", noop)
     monkeypatch.setattr(approval_module, "broadcast_watch_added", noop)
 
     ws_calls = {"executed": [], "queued": [], "rejected": []}
@@ -136,34 +175,14 @@ def wired(monkeypatch):
     def set_graph(graph):
         monkeypatch.setattr(approval_module, "get_kr_stock_trading_graph", lambda: graph)
 
-    # P2-2 fast-follow: graph selection now independently reads the SM row's
-    # market_type (no B-membership fallback). This fixture's sessions dict IS
-    # the legacy dict (B) with no backing SM row -- resolve market_type from
-    # whichever legacy dict (kr vs coin, both read fresh through
-    # approval_module) currently contains the id.
-    class _FakeSM:
-        async def get_session(self, session_id):
-            kr = approval_module.get_kr_stock_sessions()
-            if session_id in kr:
-                return SimpleNamespace(market_type=MarketType.KIWOOM)
-            coin = approval_module.get_coin_sessions()
-            if session_id in coin:
-                return SimpleNamespace(market_type=MarketType.COIN)
-            return None
-
-    async def fake_get_session_manager():
-        return _FakeSM()
-
-    monkeypatch.setattr(approval_module, "get_session_manager", fake_get_session_manager)
-
-    return sessions, ws_calls, telegram, set_graph
+    return holder, ws_calls, telegram, set_sm_session, set_graph
 
 
 @pytest.mark.asyncio
 async def test_completed_fill_keeps_executed_wording(wired):
     """execution_status=='completed' -> unchanged 'executed' notification."""
-    sessions, ws_calls, telegram, set_graph = wired
-    sessions["s1"] = _kr_session("s1")
+    holder, ws_calls, telegram, set_sm_session, set_graph = wired
+    set_sm_session(_sm_session("s1"))
     set_graph(_FakeGraph([
         {"execution": {
             "execution_status": "completed",
@@ -188,8 +207,8 @@ async def test_completed_fill_keeps_executed_wording(wired):
 async def test_placed_pending_fill_sends_honest_pending_wording(wired):
     """execution_status=='placed_pending_fill' -> pending/queued wording,
     never the 'executed' notification, carrying ord_no through."""
-    sessions, ws_calls, telegram, set_graph = wired
-    sessions["s2"] = _kr_session("s2")
+    holder, ws_calls, telegram, set_sm_session, set_graph = wired
+    set_sm_session(_sm_session("s2"))
     set_graph(_FakeGraph([
         {"execution": {
             "execution_status": "placed_pending_fill",
@@ -221,8 +240,8 @@ async def test_placed_pending_fill_sends_honest_pending_wording(wired):
 async def test_failed_execution_sends_honest_failure_wording(wired):
     """execution_status=='failed' -> rejected/failed wording, never claims
     an execution."""
-    sessions, ws_calls, telegram, set_graph = wired
-    sessions["s3"] = _kr_session("s3")
+    holder, ws_calls, telegram, set_sm_session, set_graph = wired
+    set_sm_session(_sm_session("s3"))
     set_graph(_FakeGraph([
         {"execution": {
             "execution_status": "failed",
