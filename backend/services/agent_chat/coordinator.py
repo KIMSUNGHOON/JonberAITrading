@@ -29,6 +29,7 @@ from services.session_manager import (
     get_session_manager,
 )
 from services.storage_service import get_storage_service
+from services.trading.market_hours import is_krx_open_cached
 from services.trading.models import ActivityType
 
 # -------------------------------------------
@@ -404,6 +405,10 @@ class ChatCoordinator:
         # `_running=True` alone can't distinguish "still ticking" from "dead".
         self._last_tick: Optional[datetime] = None
 
+        # E2-1: market-gate last-known state, for the transition-only log
+        # helper below (None = not yet observed this process).
+        self._market_gate_closed: Optional[bool] = None
+
         # Callbacks
         self._on_decision_callbacks: List[Callable] = []
         self._on_session_complete_callbacks: List[Callable] = []
@@ -496,8 +501,27 @@ class ChatCoordinator:
         """Get position manager instance."""
         return self._position_manager
 
+    def _log_market_gate_once(self, closed: bool) -> None:
+        """Log a market-gate state transition once (E2-1) — never every
+        cycle. Small per-file helper (duplicated in position_manager.py by
+        design — YAGNI, not worth a shared util for two call sites)."""
+        if self._market_gate_closed == closed:
+            return
+        self._market_gate_closed = closed
+        if closed:
+            logger.info("market_gate_closed", component="chat_coordinator")
+        else:
+            logger.info("market_gate_reopened", component="chat_coordinator")
+
     async def _check_watch_list(self) -> None:
         """Check watch list for discussion opportunities."""
+        # E2: 장외에는 자동 토론/감시 사이클 전체를 쉬게 한다(완전 idle 결정).
+        # 수동 /discuss와 trading coordinator의 마감 엣지 체인은 게이트 밖.
+        if not is_krx_open_cached():
+            self._log_market_gate_once(closed=True)
+            return
+        self._log_market_gate_once(closed=False)
+
         if not self._running:
             return
 

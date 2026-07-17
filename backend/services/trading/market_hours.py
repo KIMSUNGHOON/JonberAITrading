@@ -554,3 +554,38 @@ def get_market_hours_service() -> MarketHoursService:
     if _market_hours_service is None:
         _market_hours_service = MarketHoursService()
     return _market_hours_service
+
+
+# -------------------------------------------
+# KRX open TTL cache (E2-1)
+# -------------------------------------------
+# Shared no-op-cycle gate consumed by services/agent_chat/coordinator.py
+# (_check_watch_list) and services/agent_chat/position_manager.py
+# (_check_strategic_reeval, _check_all_positions) — and, per E2-2, the
+# RiskMonitor 1s loop. Those call sites would otherwise re-derive market
+# state (weekday/holiday/session-time math) on every tick; a short
+# monotonic TTL keeps that cheap without ever going stale for more than
+# ttl_seconds.
+
+_krx_open_cache: dict = {"at": 0.0, "value": False}
+
+
+def is_krx_open_cached(ttl_seconds: float = 30.0) -> bool:
+    """KRX 개장 여부의 TTL 캐시 판정 (E2 no-op-cycle 게이트 공용).
+
+    RiskMonitor의 1s 루프까지 이 판정을 쓰므로 매 호출 공휴일 서비스를
+    재조회하지 않도록 monotonic TTL로 묶는다. 판정 소스는
+    get_market_hours_service().is_market_open(MarketType.KRX) 단일.
+    """
+    import time
+    now = time.monotonic()
+    if now - _krx_open_cache["at"] > ttl_seconds:
+        _krx_open_cache["value"] = get_market_hours_service().is_market_open(MarketType.KRX)
+        _krx_open_cache["at"] = now
+    return _krx_open_cache["value"]
+
+
+def _reset_krx_open_cache() -> None:
+    """테스트 전용: 캐시 무효화."""
+    _krx_open_cache["at"] = 0.0
+

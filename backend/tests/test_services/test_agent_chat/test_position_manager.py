@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta
 
 import services.storage_service as ss
+import services.agent_chat.position_manager as pm_mod
 from services.agent_chat.models import DecisionAction
 from services.agent_chat.position_manager import (
     PositionManager,
@@ -491,6 +492,15 @@ class TestEventDetection:
 class TestUpdatePricesStaleGuard:
     """Tests for _update_prices / _check_all_positions handling of a None
     (failed) price fetch."""
+
+    @pytest.fixture(autouse=True)
+    def _market_open(self, monkeypatch):
+        """E2-1: _check_all_positions is now gated on KRX hours (완전
+        idle). These tests exercise the defensive stop-loss logic
+        independent of real wall-clock market state, so pin the gate
+        open rather than depend on whatever time the suite happens to
+        run at."""
+        monkeypatch.setattr(pm_mod, "is_krx_open_cached", lambda: True)
 
     @pytest.mark.asyncio
     async def test_update_prices_none_leaves_current_price_unchanged(
@@ -2150,6 +2160,12 @@ class TestApplyDecisionAddP2:
 class TestStrategicReevalConfig:
     """PositionManagerConfig gets two new, conservative-by-default fields."""
 
+    @pytest.fixture(autouse=True)
+    def _market_open(self, monkeypatch):
+        """E2-1: _check_strategic_reeval is now gated on KRX hours. Pin
+        the gate open — see TestUpdatePricesStaleGuard._market_open."""
+        monkeypatch.setattr(pm_mod, "is_krx_open_cached", lambda: True)
+
     def test_defaults(self):
         cfg = PositionManagerConfig()
         assert cfg.reeval_interval_minutes == 30
@@ -2203,6 +2219,12 @@ class TestStrategicReevalConfig:
 class TestStrategicReevalTriggerP3:
     """_check_position: STRATEGIC_REEVAL fires the SAME discussion path as
     defensive events, but only when no defensive event fired this cycle."""
+
+    @pytest.fixture(autouse=True)
+    def _market_open(self, monkeypatch):
+        """E2-1: _check_strategic_reeval is now gated on KRX hours. Pin
+        the gate open — see TestUpdatePricesStaleGuard._market_open."""
+        monkeypatch.setattr(pm_mod, "is_krx_open_cached", lambda: True)
 
     @staticmethod
     def _position_manager(**config_overrides):

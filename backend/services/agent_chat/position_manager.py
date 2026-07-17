@@ -18,6 +18,7 @@ from services.agent_chat.models import (
     MarketContext,
     DecisionAction,
 )
+from services.trading.market_hours import is_krx_open_cached
 
 logger = structlog.get_logger()
 
@@ -339,6 +340,10 @@ class PositionManager:
         # Chat coordinator reference (set by coordinator)
         self._chat_coordinator = None
 
+        # E2-1: market-gate last-known state, for the transition-only log
+        # helper below (None = not yet observed this process).
+        self._market_gate_closed: Optional[bool] = None
+
         logger.info(
             "position_manager_initialized",
             check_interval=self.config.check_interval_seconds,
@@ -534,8 +539,28 @@ class PositionManager:
                 logger.error("position_monitor_error", error=str(e))
                 await asyncio.sleep(5)
 
+    def _log_market_gate_once(self, closed: bool) -> None:
+        """Log a market-gate state transition once (E2-1) — never every
+        cycle. Small per-file helper shared by this file's two gate points
+        (_check_all_positions, _check_strategic_reeval); duplicated in
+        coordinator.py by design — YAGNI, not worth a shared util."""
+        if self._market_gate_closed == closed:
+            return
+        self._market_gate_closed = closed
+        if closed:
+            logger.info("market_gate_closed", component="position_manager")
+        else:
+            logger.info("market_gate_reopened", component="position_manager")
+
     async def _check_all_positions(self) -> None:
         """Check all positions for events."""
+        # E2: 장외에는 자동 토론/감시 사이클 전체를 쉬게 한다(완전 idle 결정).
+        # 방어 감시(손절/익절 등) 포함 전체 skip — 장외엔 체결 불가라 안전.
+        if not is_krx_open_cached():
+            self._log_market_gate_once(closed=True)
+            return
+        self._log_market_gate_once(closed=False)
+
         if not self._positions:
             return
 
@@ -746,6 +771,12 @@ class PositionManager:
         `reeval_interval_minutes`/price-move, and burning the interval
         immediately rather than preserving it for the next attempt.
         """
+        # E2: 장외에는 자동 토론/감시 사이클 전체를 쉬게 한다(완전 idle 결정).
+        if not is_krx_open_cached():
+            self._log_market_gate_once(closed=True)
+            return None
+        self._log_market_gate_once(closed=False)
+
         now = datetime.now()
 
         interval_due = (
