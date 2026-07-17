@@ -325,7 +325,7 @@ async def test_add_zero_fill_leaves_existing_position_untouched(monkeypatch):
     coordinator.fill_tracker.register.assert_called_once()
 
 
-async def test_reduce_partial_fill_uses_confirmed_qty_no_buy_side_coordinator_calls(monkeypatch):
+async def test_reduce_partial_fill_uses_confirmed_qty_and_registers_sell_remainder(monkeypatch):
     monkeypatch.setattr("asyncio.sleep", _no_sleep)
     client = _FakeKiwoomClient(filled_orders=[_filled("ORD1", 12, 71000, buy_sell_tp="매도")])
     coordinator = _mock_coordinator()
@@ -343,13 +343,31 @@ async def test_reduce_partial_fill_uses_confirmed_qty_no_buy_side_coordinator_ca
     assert result["execution_status"] == "completed"
     # 100 existing - 12 CONFIRMED (not the requested 30) = 88
     assert result["active_position"]["quantity"] == 88
-    # Sell-side fills never go through the BUY-oriented registration helper,
-    # and unfilled SELL remainders are explicitly out of scope (R5-P4).
+    # Sell-side fills never go through the BUY-oriented registration helper
+    # (that would wrongly GROW a position from an exit) — but E1-3 closes
+    # the unfilled-remainder gap that used to be out of scope here (R5-P4):
+    # the remaining 18 (30 requested - 12 confirmed) is now tracked so the
+    # ka10076 poll can pick up the post-fill later.
     mock_register.assert_not_awaited()
-    coordinator.fill_tracker.register.assert_not_called()
+    coordinator.fill_tracker.register.assert_called_once()
+    tracked = coordinator.fill_tracker.register.call_args.args[0]
+    assert isinstance(tracked, TrackedOrder)
+    assert tracked.ord_no == "ORD1"
+    assert tracked.ticker == "005930"
+    assert tracked.side == "sell"
+    assert tracked.total_quantity == 30
+    assert tracked.filled_quantity == 12
+    # An exit carries no defense levels of its own forward.
+    assert tracked.stop_loss is None
+    assert tracked.take_profit is None
+    assert tracked.source_session_id == "sess-1"
+    assert tracked.risk_score == 6  # int(0.6 * 10)
+    coordinator._schedule_persist.assert_called_once()
 
 
-async def test_reduce_zero_fill_leaves_existing_position_untouched(monkeypatch):
+async def test_reduce_zero_fill_leaves_existing_position_untouched_but_registers_remainder(
+    monkeypatch,
+):
     monkeypatch.setattr("asyncio.sleep", _no_sleep)
     client = _FakeKiwoomClient(filled_orders=[])
     coordinator = _mock_coordinator()
@@ -367,7 +385,63 @@ async def test_reduce_zero_fill_leaves_existing_position_untouched(monkeypatch):
     assert result["execution_status"] == "placed_pending_fill"
     assert result.get("active_position") is None
     mock_register.assert_not_awaited()
+    # E1-3: the whole 30 remains unfilled — tracked so the poll can pick up
+    # the post-fill later, same as a zero-fill BUY already was.
+    coordinator.fill_tracker.register.assert_called_once()
+    tracked = coordinator.fill_tracker.register.call_args.args[0]
+    assert tracked.side == "sell"
+    assert tracked.total_quantity == 30
+    assert tracked.filled_quantity == 0
+    coordinator._schedule_persist.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Plain SELL (full exit, not REDUCE) — same E1-3 remainder registration,
+# with no existing_position needed (only ADD/REDUCE require one).
+# ---------------------------------------------------------------------------
+
+
+async def test_sell_partial_fill_registers_sell_remainder(monkeypatch):
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeKiwoomClient(
+        filled_orders=[_filled("ORD5", 4, 71000, buy_sell_tp="매도")], ord_no="ORD5"
+    )
+    coordinator = _mock_coordinator()
+    state = _state(action="SELL", quantity=10, entry_price=71000)
+    p1, p2, p3 = _patches(client, coordinator)
+    with p1, p2, p3 as mock_register:
+        result = await kr_stock_execution_node(state)
+
+    assert result["execution_status"] == "completed"
+    mock_register.assert_not_awaited()
+    coordinator.fill_tracker.register.assert_called_once()
+    tracked = coordinator.fill_tracker.register.call_args.args[0]
+    assert isinstance(tracked, TrackedOrder)
+    assert tracked.ord_no == "ORD5"
+    assert tracked.side == "sell"
+    assert tracked.total_quantity == 10
+    assert tracked.filled_quantity == 4
+    assert tracked.stop_loss is None
+    assert tracked.take_profit is None
+    assert tracked.source_session_id == "sess-1"
+    coordinator._schedule_persist.assert_called_once()
+
+
+async def test_sell_full_fill_does_not_register_remainder(monkeypatch):
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeKiwoomClient(
+        filled_orders=[_filled("ORD6", 10, 71000, buy_sell_tp="매도")], ord_no="ORD6"
+    )
+    coordinator = _mock_coordinator()
+    state = _state(action="SELL", quantity=10, entry_price=71000)
+    p1, p2, p3 = _patches(client, coordinator)
+    with p1, p2, p3 as mock_register:
+        result = await kr_stock_execution_node(state)
+
+    assert result["execution_status"] == "completed"
+    mock_register.assert_not_awaited()
     coordinator.fill_tracker.register.assert_not_called()
+    coordinator._schedule_persist.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

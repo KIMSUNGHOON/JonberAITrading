@@ -801,6 +801,51 @@ class ExecutionCoordinator:
             registered.append(f"{part.order_id}:{remaining}주")
         return registered
 
+    def _register_unfilled_sell(
+        self,
+        ticker: str,
+        position: Optional[ManagedPosition],
+        order: OrderRequest,
+        result: OrderResult,
+    ) -> List[str]:
+        """Register the unfilled/partial remainder of a defensive/monitor SELL
+        (`_close_position`/`_reduce_position`/`_execute_order_from_monitor`)
+        with the fill tracker — the SAME registration `on_trade_approved`'s
+        SELL/REDUCE path already gets via `_track_unfilled` (E1-1/E1-2), just
+        reached from a different call shape here (an already-placed
+        `OrderRequest`/`OrderResult` plus the coordinator's OWN
+        `ManagedPosition`, not the entry-side session context
+        `on_trade_approved` builds from). `position` may be None —
+        `_execute_order_from_monitor` looks it up defensively and can find
+        nothing if the local ledger no longer tracks the ticker — in which
+        case `source_session_id`/`risk_score` are simply omitted, same as
+        `_track_unfilled` already accepts `None` for both.
+
+        stop_loss/take_profit are always None here: every caller is an EXIT,
+        which has no defense levels of its own to carry forward (unlike an
+        entry BUY's stop/take).
+        """
+        stock_name = (position.stock_name if position else None) or order.stock_name or ticker
+        registered = self._track_unfilled(
+            "sell",
+            ticker,
+            stock_name,
+            result,
+            limit_price=order.price,
+            source_session_id=position.analysis_session_id if position else None,
+            risk_score=position.risk_score if position else None,
+        )
+        if registered:
+            self._schedule_persist()
+            self._log_activity(
+                ActivityType.ORDER_PLACED,
+                f"미체결 잔량 추적 등록: {stock_name} ({', '.join(registered)})",
+                agent="order",
+                ticker=ticker,
+                details={"tracked": registered},
+            )
+        return registered
+
     async def _execute_order(self, order: OrderRequest) -> OrderResult:
         """Execute an order and update state."""
         # Add to pending
@@ -894,6 +939,11 @@ class ExecutionCoordinator:
         result = await self._execute_order(order)
         # Track the ACTUAL fill: full → remove, partial → reduce, none → retain.
         self._apply_sell_fill(order.ticker, result.filled_quantity, order=order, result=result)
+        # E1-3: register any unfilled remainder of this AGENT_AUTO defensive
+        # sell (see _close_position's same call for the full rationale) — a
+        # stop-loss/take-profit trigger that only partially filled at the
+        # broker previously went unwatched by the ka10076 poll entirely.
+        self._register_unfilled_sell(order.ticker, position, order, result)
 
     async def _notify_monitor_gate_denied(self, order: OrderRequest, gate_reason: str) -> None:
         """Best-effort Telegram notice when the autonomy gate blocks an
@@ -1744,6 +1794,13 @@ class ExecutionCoordinator:
         # Only drop/reduce tracking by the ACTUAL fill — a rejected or unfilled
         # sell must keep the position under defense (A3).
         self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+        # E1-3: a partial/unfilled defensive close still has broker-side
+        # exposure nothing is watching yet — register the remainder with the
+        # fill tracker (same helper on_trade_approved's BUY/SELL entries use,
+        # E1-1/E1-2) so the ka10076 poll can pick up the post-fill later.
+        # stop_loss/take_profit are None: this is an exit, not an entry with
+        # defense levels of its own to carry forward.
+        self._register_unfilled_sell(ticker, position, order, result)
         return result
 
     async def _reduce_position(self, ticker: str, quantity: int) -> Optional[OrderResult]:
@@ -1807,6 +1864,11 @@ class ExecutionCoordinator:
         # choke point every other SELL path uses (full → remove, partial →
         # decrement, none → retain).
         self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+        # E1-3: register any unfilled remainder (see _close_position's same
+        # call for the full rationale) — the clamp-to-full-close branch above
+        # already gets this via the delegated _close_position call, so only
+        # this direct-partial branch needs its own call.
+        self._register_unfilled_sell(ticker, position, order, result)
         return result
 
     async def _add_to_position(self, ticker: str, quantity: int) -> Optional[OrderResult]:

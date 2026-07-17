@@ -1,4 +1,4 @@
-"""E1-1/E1-2: SELL/REDUCE post-fill handling — tracking through reconciliation.
+"""E1-1/E1-2/E1-3: SELL/REDUCE post-fill handling — tracking through reconciliation.
 
 Real incident: the ledger recorded 41 sold shares against a real 155-share
 broker sell (114주 missing) because fill-tracker registration was BUY-only
@@ -22,6 +22,15 @@ staying GREEN as the byte-equivalence evidence). `register_fill_as_position`
 stays BUY-only — a SELL delta must never flow through it (would double-count
 a sell as a buy growing a position); this is now pinned by tests 5-7 as the
 FULL post-fill behavior (record + reconcile + notify), not just a guard.
+
+E1-3 extends the SAME registration to the three SELL order sites OUTSIDE
+`on_trade_approved` — `_close_position` (defensive/user-initiated close),
+`_reduce_position` (partial reduce), and `_execute_order_from_monitor`
+(AGENT_AUTO stop-loss/take-profit) — via a new shared
+`ExecutionCoordinator._register_unfilled_sell` helper that wraps
+`_track_unfilled` (test section 8, below). The graph's independent
+registration path (`agents/graph/kr_stock_nodes/execution.py`) gets the
+symmetric SELL/REDUCE fix separately — see `test_kr_execution_fill_confirm.py`.
 """
 
 from datetime import date, datetime
@@ -29,7 +38,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import services.autonomy as autonomy_pkg
 import services.storage_service as ss
+from services.autonomy import GateDecision
 from services.kiwoom.models import FilledOrder
 from services.trading.coordinator import ExecutionCoordinator
 from services.trading.market_hours import MarketSession
@@ -39,6 +50,7 @@ from services.trading.models import (
     OrderRequest,
     OrderResult,
     OrderSide,
+    StopLossMode,
     TradingMode,
 )
 from services.trading.pending_order_tracker import TrackedOrder
@@ -496,3 +508,189 @@ async def test_poll_sell_delta_partial_reduce_keeps_watching_remainder(temp_stor
     assert len(pnl_rows) == 1
     assert pnl_rows[0]["quantity"] == 40
     assert pnl_rows[0]["entry_price"] == 250_000
+
+
+# -------------------------------------------
+# 8) E1-3 — the remaining SELL order sites (_close_position/_reduce_position/
+#    _execute_order_from_monitor) each register their own unfilled remainder
+#    too, via the shared `ExecutionCoordinator._register_unfilled_sell`
+#    helper — closing the SAME registration gap E1-1 closed for
+#    on_trade_approved's SELL/REDUCE path, but for the three sites that place
+#    a SELL order OUTSIDE that entry-point (a defensive close, a partial
+#    reduce, and an AGENT_AUTO stop-loss/take-profit trigger from
+#    RiskMonitor). stop_loss/take_profit are always None on these — every
+#    caller here is an EXIT, which carries no defense levels of its own
+#    forward (mirrors the graph node's own SELL registration, E1-3).
+# -------------------------------------------
+
+
+def _coordinator_with_position(
+    quantity=10,
+    session_id="s-entry",
+    risk_score=7,
+    stop_loss_mode=StopLossMode.USER_APPROVAL,
+):
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    position = ManagedPosition(
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=quantity,
+        avg_price=250_000,
+        current_price=260_000,
+        stop_loss_mode=stop_loss_mode,
+        analysis_session_id=session_id,
+        risk_score=risk_score,
+    )
+    coord._add_position(position)
+    return coord, position
+
+
+async def test_close_position_partial_fill_registers_sell_remainder(temp_storage):
+    coord, position = _coordinator_with_position(
+        quantity=8, session_id="s-close", risk_score=7
+    )
+    _stub_execute_order(coord, requested=8, filled=3, status="partial", order_id="CLOSE1")
+
+    result = await coord._close_position("005930")
+
+    assert result.filled_quantity == 3
+    tracking = coord.fill_tracker.tracking()
+    assert len(tracking) == 1
+    order = tracking[0]
+    assert order.side == "sell"
+    assert order.ord_no == "CLOSE1"
+    assert order.total_quantity == 8
+    assert order.filled_quantity == 3
+    assert order.source_session_id == "s-close"
+    assert order.risk_score == 7
+    assert order.stop_loss is None
+    assert order.take_profit is None
+
+
+async def test_close_position_full_fill_does_not_register(temp_storage):
+    coord, position = _coordinator_with_position(quantity=8)
+    _stub_execute_order(coord, requested=8, filled=8, status="filled", order_id="CLOSE2")
+
+    result = await coord._close_position("005930")
+
+    assert result.filled_quantity == 8
+    assert coord.fill_tracker.tracking() == []
+
+
+async def test_reduce_position_partial_fill_registers_sell_remainder(temp_storage):
+    coord, position = _coordinator_with_position(
+        quantity=50, session_id="s-reduce", risk_score=4
+    )
+    _stub_execute_order(coord, requested=20, filled=6, status="partial", order_id="REDUCE9")
+
+    result = await coord._reduce_position("005930", 20)
+
+    assert result.filled_quantity == 6
+    tracking = coord.fill_tracker.tracking()
+    assert len(tracking) == 1
+    order = tracking[0]
+    assert order.side == "sell"
+    assert order.ord_no == "REDUCE9"
+    assert order.total_quantity == 20
+    assert order.filled_quantity == 6
+    assert order.source_session_id == "s-reduce"
+    assert order.risk_score == 4
+
+
+async def test_reduce_position_delegated_full_close_registers_once_not_twice(temp_storage):
+    """When the oversell clamp collapses a reduce into a full close,
+    `_reduce_position` delegates to `_close_position` — which already
+    registers its own remainder. `_reduce_position` must NOT register a
+    second time for the same order."""
+    coord, position = _coordinator_with_position(quantity=10, session_id="s-collapse")
+    _stub_execute_order(coord, requested=10, filled=4, status="partial", order_id="COLLAPSE1")
+
+    result = await coord._reduce_position("005930", 999)  # clamps to 10 -> full close
+
+    assert result.filled_quantity == 4
+    tracking = coord.fill_tracker.tracking()
+    assert len(tracking) == 1
+    assert tracking[0].ord_no == "COLLAPSE1"
+
+
+def _stop_loss_order(quantity=10, price=68_000) -> OrderRequest:
+    return OrderRequest(
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.SELL,
+        quantity=quantity,
+        price=price,
+        reason="Stop-loss auto-execution",
+    )
+
+
+async def test_monitor_defensive_sell_partial_fill_registers_sell_remainder(
+    temp_storage, monkeypatch
+):
+    coord, position = _coordinator_with_position(
+        quantity=10,
+        session_id="s-monitor",
+        risk_score=5,
+        stop_loss_mode=StopLossMode.AGENT_AUTO,
+    )
+    _stub_execute_order(coord, requested=10, filled=4, status="partial", order_id="MON1")
+
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+    await coord._execute_order_from_monitor(_stop_loss_order())
+
+    tracking = coord.fill_tracker.tracking()
+    assert len(tracking) == 1
+    order = tracking[0]
+    assert order.side == "sell"
+    assert order.ord_no == "MON1"
+    assert order.total_quantity == 10
+    assert order.filled_quantity == 4
+    assert order.source_session_id == "s-monitor"
+    assert order.risk_score == 5
+    assert order.stop_loss is None
+    assert order.take_profit is None
+
+
+async def test_monitor_defensive_sell_full_fill_does_not_register(temp_storage, monkeypatch):
+    coord, position = _coordinator_with_position(
+        quantity=10, stop_loss_mode=StopLossMode.AGENT_AUTO
+    )
+    _stub_execute_order(coord, requested=10, filled=10, status="filled", order_id="MON2")
+
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+    await coord._execute_order_from_monitor(_stop_loss_order())
+
+    assert coord.fill_tracker.tracking() == []
+
+
+async def test_monitor_defensive_sell_gate_denied_does_not_register(temp_storage, monkeypatch):
+    """A gate-denied defensive sell places nothing at all — no order, so
+    nothing should be tracked either."""
+    coord, position = _coordinator_with_position(
+        quantity=10, stop_loss_mode=StopLossMode.AGENT_AUTO
+    )
+    captured = []
+
+    async def _exec(order):
+        captured.append(order)
+        raise AssertionError("gate-denied sell must not place an order")
+
+    coord._execute_order = _exec
+
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="denied", check="market_mode")
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
+
+    await coord._execute_order_from_monitor(_stop_loss_order())
+
+    assert captured == []
+    assert coord.fill_tracker.tracking() == []

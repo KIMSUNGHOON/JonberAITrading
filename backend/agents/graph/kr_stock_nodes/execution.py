@@ -410,8 +410,13 @@ async def kr_stock_execution_node(state: dict) -> dict:
         # coordinator's fill tracker so the scheduler's ka10076 poll can pick
         # up the post-fill later — otherwise a partial/zero fill at placement
         # time would go unwatched by every defense engine once this node
-        # returns. SELL/REDUCE unfilled remainders are explicitly out of
-        # scope here (mirrors coordinator.py's own R5-P4 scope boundary).
+        # returns. E1-3: a SELL/REDUCE order's unfilled remainder is now
+        # registered too (below) — previously out of scope (R5-P4), the same
+        # gap E1-1/E1-2 already closed for coordinator.py's own SELL paths.
+        # Unlike BUY, a SELL fill never flows through register_fill_as_position
+        # (that would wrongly GROW a position from an exit), and stop_loss/
+        # take_profit are always None (an exit carries no defense levels of
+        # its own forward).
         #
         # Best-effort: a coordinator failure must never crash the graph run,
         # so this entire block is exception-boxed and the execution_status
@@ -475,6 +480,51 @@ async def kr_stock_execution_node(state: dict) -> dict:
                     # coordinator's blob persistence (R5-P1 mechanism) so the
                     # tracked remainder survives a restart.
                     coordinator._schedule_persist()
+            except Exception as coord_err:
+                logger.warning(
+                    "kr_stock_fill_registration_failed",
+                    stk_cd=stk_cd,
+                    action=action.value,
+                    error=str(coord_err),
+                )
+        elif _is_sell_action(action) and remaining_qty > 0:
+            # E1-3: mirror the BUY-side unfilled-remainder registration above
+            # for SELL/REDUCE — a partial/zero SELL fill at placement time
+            # previously went unwatched by the ka10076 poll entirely. No
+            # register_fill_as_position call here: a SELL fill must never
+            # grow a position. stop_loss/take_profit are None: an exit has no
+            # defense levels of its own to carry forward.
+            try:
+                from app.dependencies import get_trading_coordinator
+                from services.trading.pending_order_tracker import TrackedOrder
+
+                coordinator = await get_trading_coordinator()
+
+                proposal_risk = proposal.get("risk_score")
+                risk_score_int = (
+                    int(float(proposal_risk) * 10) if proposal_risk is not None else None
+                )
+
+                coordinator.fill_tracker.register(
+                    TrackedOrder(
+                        ord_no=order_response.ord_no,
+                        ticker=stk_cd,
+                        stock_name=stk_nm,
+                        side="sell",
+                        total_quantity=quantity,
+                        filled_quantity=filled_qty,
+                        filled_amount=filled_qty * avg_fill_price,
+                        limit_price=entry_price,
+                        source_session_id=state.get("session_id"),
+                        risk_score=risk_score_int,
+                        trade_date=date.today().strftime("%Y%m%d"),
+                    )
+                )
+                # A memory-only TrackedOrder dies with the process — schedule
+                # the coordinator's blob persistence (R5-P1 mechanism) so the
+                # tracked remainder survives a restart (parity with the BUY
+                # branch above).
+                coordinator._schedule_persist()
             except Exception as coord_err:
                 logger.warning(
                     "kr_stock_fill_registration_failed",
