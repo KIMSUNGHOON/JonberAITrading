@@ -48,6 +48,7 @@ from services.session_manager import (
     SessionStatus,
     get_session_manager,
 )
+from services.telegram import get_telegram_notifier
 
 logger = structlog.get_logger()
 
@@ -74,14 +75,26 @@ async def maybe_schedule_auto_approve(session_id: str, market: str) -> None:
     """Called by a producer (or approval.py's reject->re-analysis rearm)
     right after it committed awaiting_approval to the SessionManager.
     Pre-checks the gate; if allowed, announces the countdown and schedules
-    the grace task. A deny here writes NOTHING — the session is ordinary
-    HITL.
+    the grace task. A deny writes nothing schedule-related — the session is
+    ordinary HITL — but the Telegram approval-request button (below) still
+    fires either way.
 
     P2-6: no `session` argument — the session is resolved here via a live
     `sm.get_session(session_id)` lookup. A session that has vanished from
     the SM by the time this runs (removed, or never existed — e.g. a
     kill-switch-only legacy-dict candidate, see rearm_awaiting_approvals) is
     a no-op: nothing to schedule against.
+
+    TG-3 (spec F1): this is also the de-facto dispatch point for the
+    Telegram approve/reject inline-keyboard message — every caller of this
+    function is a producer's awaiting-commit success path (kr_stocks/coin
+    `_finalize_awaiting_transition`) or approval.py's reject->re-analysis
+    rearm, i.e. exactly the point where session_id + the SM-persisted
+    trade_proposal.id are both confirmed and BOTH HITL and autonomous
+    sessions are covered. The notify call below fires unconditionally
+    (regardless of `decision.allowed`) — this replaces the old auto-only
+    `_notify_pending` text heads-up, which only ever fired inside the
+    gate-allowed branch and therefore never reached plain-HITL sessions.
     """
     try:
         sm = await get_session_manager()
@@ -96,7 +109,45 @@ async def maybe_schedule_auto_approve(session_id: str, market: str) -> None:
 
         fields = _proposal_fields(sm_session.state)
         decision = await check_autonomy(market, **fields)
-        if not decision.allowed:
+
+        auto_approve_at: str | None = None
+
+        if decision.allowed:
+            auto_approve_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=AUTONOMY_GRACE_SECONDS)
+            ).isoformat()
+            grace_secs = int(AUTONOMY_GRACE_SECONDS)
+
+            # Single write-through: sm.update_state applies both keys to the
+            # live SM row, flushes them (auto_approve_at is a critical key —
+            # see services/session_manager.py::_CRITICAL_STATE_KEYS), and
+            # notifies WS subscribers — replacing the old "mutate the shared
+            # dict directly, then best-effort mirror_session_state" pair.
+            reasoning_log = sm_session.state.get("reasoning_log", []) + [
+                f"[System] {grace_secs}초 후 자율 승인 예정 — REJECT로 거부 가능"
+            ]
+            await sm.update_state(
+                session_id,
+                {"auto_approve_at": auto_approve_at, "reasoning_log": reasoning_log},
+            )
+
+            # Pin the proposal identity: the grace task may only approve the
+            # exact proposal it announced. A reject→re-analyze cycle mutates
+            # the SAME SM row in place and can re-arm awaiting_approval with
+            # a NEW proposal — without this pin the stale timer could
+            # approve a proposal the user never saw (and with zero grace).
+            proposal_id = (sm_session.state.get("trade_proposal") or {}).get("id")
+
+            asyncio.create_task(
+                _auto_approve_after_grace(session_id, market, proposal_id)
+            )
+            logger.info(
+                "auto_approve_scheduled",
+                session_id=session_id,
+                market=market,
+                auto_approve_at=auto_approve_at,
+            )
+        else:
             logger.info(
                 "auto_approve_not_scheduled",
                 session_id=session_id,
@@ -104,43 +155,9 @@ async def maybe_schedule_auto_approve(session_id: str, market: str) -> None:
                 check=decision.check,
                 reason=decision.reason,
             )
-            return
 
-        auto_approve_at = (
-            datetime.now(timezone.utc) + timedelta(seconds=AUTONOMY_GRACE_SECONDS)
-        ).isoformat()
-        grace_secs = int(AUTONOMY_GRACE_SECONDS)
-
-        # Single write-through: sm.update_state applies both keys to the
-        # live SM row, flushes them (auto_approve_at is a critical key —
-        # see services/session_manager.py::_CRITICAL_STATE_KEYS), and
-        # notifies WS subscribers — replacing the old "mutate the shared
-        # dict directly, then best-effort mirror_session_state" pair.
-        reasoning_log = sm_session.state.get("reasoning_log", []) + [
-            f"[System] {grace_secs}초 후 자율 승인 예정 — REJECT로 거부 가능"
-        ]
-        await sm.update_state(
-            session_id,
-            {"auto_approve_at": auto_approve_at, "reasoning_log": reasoning_log},
-        )
-
-        await _notify_pending(session_id, market, fields, grace_secs)
-
-        # Pin the proposal identity: the grace task may only approve the exact
-        # proposal it announced. A reject→re-analyze cycle mutates the SAME
-        # SM row in place and can re-arm awaiting_approval with a NEW
-        # proposal — without this pin the stale timer could approve a proposal
-        # the user never saw (and with zero grace).
-        proposal_id = (sm_session.state.get("trade_proposal") or {}).get("id")
-
-        asyncio.create_task(
-            _auto_approve_after_grace(session_id, market, proposal_id)
-        )
-        logger.info(
-            "auto_approve_scheduled",
-            session_id=session_id,
-            market=market,
-            auto_approve_at=auto_approve_at,
+        await _send_approval_request_notification(
+            session_id, market, sm_session.state, auto_approve_at
         )
     except Exception as e:
         # Fail-closed: scheduling problems leave the session plain HITL.
@@ -239,19 +256,24 @@ async def _auto_approve_after_grace(
         logger.error("auto_approve_failed", session_id=session_id, error=str(e))
 
 
-async def _notify_pending(session_id: str, market: str, fields: dict, grace_secs: int) -> None:
-    """Best-effort Telegram heads-up for the pending autonomous approval."""
+async def _send_approval_request_notification(
+    session_id: str, market: str, state: dict, auto_approve_at: str | None
+) -> None:
+    """Best-effort Telegram approve/reject inline-keyboard request (TG-3,
+    spec F1) — replaces `_notify_pending`'s old auto-only text heads-up.
+    Fires unconditionally for both HITL (`auto_approve_at is None`) and
+    autonomous (`auto_approve_at` set) sessions; any failure here is
+    swallowed so it can never affect the awaiting-commit/scheduling
+    pipeline that already completed by the time this runs."""
     try:
-        from services.telegram import get_telegram_notifier
-
+        proposal = state.get("trade_proposal") or {}
+        if not proposal:
+            return
         notifier = await get_telegram_notifier()
         if notifier.is_ready:
-            await notifier.send_message(
-                f"🤖 자율 승인 예정 ({market}): {fields['action']} — {grace_secs}초 내 "
-                f"거부하지 않으면 자동 승인됩니다. (세션 {session_id[:8]})"
-            )
+            await notifier.send_approval_request(session_id, market, proposal, auto_approve_at)
     except Exception as e:
-        logger.warning("auto_approve_notify_failed", session_id=session_id, error=str(e))
+        logger.warning("approval_request_notify_failed", session_id=session_id, error=str(e))
 
 
 # -------------------------------------------

@@ -261,26 +261,69 @@ async def test_positions_reports_zero_holdings_distinctly_from_no_data(monkeypat
 # -------------------------------------------
 
 
-async def test_pending_reports_pending_count_when_source_succeeds(monkeypatch):
-    awaiting = [
-        SimpleNamespace(
-            session_id="abcd1234efgh", ticker="005930", name="삼성전자",
-            proposal={"action": "BUY"}, auto_approve_at="2026-07-17T10:05:00+09:00",
-            actionable=True,
-        ),
-    ]
+def _pending_item():
+    return SimpleNamespace(
+        session_id="abcd1234efgh", ticker="005930", name="삼성전자",
+        proposal={"id": "prop-abcd1234efgh", "action": "BUY"},
+        auto_approve_at="2026-07-17T10:05:00+09:00",
+        actionable=True,
+    )
+
+
+async def test_pending_reports_header_count_and_sends_a_button_per_item(monkeypatch):
+    """TG-3 F3: /pending's reply becomes a header + one approve/reject
+    inline-keyboard message per item (via `_send_pending_button`) instead of
+    a single text block carrying every item's detail."""
+    awaiting = [_pending_item()]
     monkeypatch.setattr(
         commands, "_fetch_operations", AsyncMock(return_value=_operations(awaiting=awaiting))
+    )
+    button_calls = []
+
+    async def fake_button(item):
+        button_calls.append(item)
+        return True
+
+    monkeypatch.setattr(commands, "_send_pending_button", fake_button)
+
+    update, message = _make_update()
+    await commands.handle_pending(update, MagicMock())
+
+    # Header only -- per-item detail moved to the button message, not this
+    # reply, and the send succeeded so no text fallback was needed.
+    message.reply_text.assert_awaited_once()
+    header = message.reply_text.await_args.args[0]
+    assert "1건" in header
+    assert button_calls == awaiting
+
+
+async def test_pending_falls_back_to_text_line_when_button_send_fails(monkeypatch):
+    awaiting = [_pending_item()]
+    monkeypatch.setattr(
+        commands, "_fetch_operations", AsyncMock(return_value=_operations(awaiting=awaiting))
+    )
+    monkeypatch.setattr(commands, "_send_pending_button", AsyncMock(return_value=False))
+
+    update, message = _make_update()
+    await commands.handle_pending(update, MagicMock())  # must not raise
+
+    assert message.reply_text.await_count == 2  # header + per-item text fallback
+    fallback_text = message.reply_text.await_args.args[0]
+    assert "삼성전자" in fallback_text
+    assert "BUY" in fallback_text
+
+
+async def test_pending_reports_zero_pending_distinctly_from_no_data(monkeypatch):
+    monkeypatch.setattr(
+        commands, "_fetch_operations", AsyncMock(return_value=_operations(awaiting=[]))
     )
 
     update, message = _make_update()
     await commands.handle_pending(update, MagicMock())
 
     text = await _reply_text(message)
-    assert "1건" in text
-    assert "삼성전자" in text
-    assert "BUY" in text
-    assert "2026-07-17T10:05:00+09:00" in text
+    assert "0건" in text
+    assert commands._NO_DATA not in text
 
 
 async def test_pending_falls_back_to_no_data_when_source_fails(monkeypatch):
@@ -296,8 +339,8 @@ async def test_pending_falls_back_to_no_data_when_source_fails(monkeypatch):
 
 
 async def test_format_pending_line_is_reusable_for_tg3(monkeypatch):
-    """Pin the standalone formatting function TG-3 is expected to reuse
-    verbatim when it upgrades /pending to per-item approve/reject buttons."""
+    """Pin the standalone formatting function `_send_pending_button` reuses
+    verbatim as its plain-text fallback caption."""
     item = SimpleNamespace(
         session_id="abcd1234efgh", ticker="005930", name="삼성전자",
         proposal={"action": "ADD"}, auto_approve_at="2026-07-17T10:05:00+09:00",
@@ -309,6 +352,36 @@ async def test_format_pending_line_is_reusable_for_tg3(monkeypatch):
     assert "abcd1234" in line
     assert "삼성전자" in line
     assert "ADD" in line
+
+
+async def test_send_pending_button_wires_to_notifier_send_approval_request(monkeypatch):
+    """Wiring pin: `_send_pending_button` must call the F1 notifier method
+    with this item's session_id/proposal/auto_approve_at, market="kiwoom"
+    (the only market /pending's source ever covers)."""
+    item = _pending_item()
+    fake_notifier = MagicMock()
+    fake_notifier.send_approval_request = AsyncMock(return_value=True)
+    monkeypatch.setattr(commands, "_fetch_notifier", AsyncMock(return_value=fake_notifier))
+
+    result = await commands._send_pending_button(item)
+
+    assert result is True
+    fake_notifier.send_approval_request.assert_awaited_once_with(
+        "abcd1234efgh", "kiwoom", item.proposal, item.auto_approve_at,
+    )
+
+
+async def test_send_pending_button_returns_false_on_exception(monkeypatch):
+    item = _pending_item()
+
+    async def boom():
+        raise RuntimeError("bot down")
+
+    monkeypatch.setattr(commands, "_fetch_notifier", boom)
+
+    result = await commands._send_pending_button(item)
+
+    assert result is False
 
 
 async def test_fetch_operations_wires_to_trading_route_and_coordinator_dep(monkeypatch):

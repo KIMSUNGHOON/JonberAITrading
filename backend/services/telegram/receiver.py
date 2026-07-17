@@ -287,6 +287,7 @@ async def start_telegram_receiver() -> Optional[Application]:
         # sys.modules) and safe to extend as TG-3/TG-4 add their own
         # modules.
         from . import commands  # noqa: F401 -- import for registration side effect
+        from . import callbacks  # noqa: F401 -- TG-3: registers "a:"/"r:" callback prefixes
 
         application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 

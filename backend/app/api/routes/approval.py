@@ -163,9 +163,17 @@ async def _submit_decision_locked(
     # then a reject -> re-analysis replaces state["trade_proposal"] with a
     # NEW id before this stale timer actually acquires the per-session lock.
     # Without this check, that timer would approve a proposal the user never
-    # saw. Scoped to actor=='system' only -- user decisions never pin an id
-    # and this must never affect the user-facing /decide route.
-    if actor == "system" and expected_proposal_id is not None:
+    # saw. Scoped to actor in ('system', 'telegram') only -- user decisions
+    # never pin an id and this must never affect the user-facing /decide
+    # route. 'telegram' (TG-3, spec F1) reuses this exact pin: a remote
+    # approve/reject button also only pins "the exact proposal it showed" --
+    # the callback handler (services/telegram/callbacks.py) does its own
+    # outside-the-lock live-id prefix check before calling submit_decision,
+    # and this is the same TOCTOU-closing re-check inside the lock the
+    # injector already relies on, now shared by both system and telegram
+    # actors. actor=='system' behavior is byte-for-byte unchanged (it's
+    # still in the tuple).
+    if actor in ("system", "telegram") and expected_proposal_id is not None:
         current_proposal_id = (state.get("trade_proposal") or {}).get("id")
         if current_proposal_id != expected_proposal_id:
             logger.info(

@@ -8,9 +8,11 @@ docs/superpowers/specs/2026-07-17-telegram-twoway-design.md F3):
                agent-chat heartbeat
   /positions — current KR holdings (reuses /operations' holdings collection)
   /pending   — sessions awaiting HITL approval (reuses /operations' awaiting
-               collection; TEXT ONLY here — TG-3 upgrades each item to carry
-               the same approve/reject inline buttons as F1, see
-               `_format_pending_line` below)
+               collection; each item is re-sent as an F1 approve/reject
+               inline-keyboard message via `TelegramNotifier.
+               send_approval_request` — TG-3 upgrade, see
+               `_send_pending_button` below — falling back to the plain-text
+               `_format_pending_line` caption only if that send fails)
   /report    — most recent EOD review row, reusing TelegramNotifier's
                existing daily-summary formatting (never its send path)
 
@@ -214,12 +216,12 @@ async def handle_positions(update: Update, context: "ContextTypes.DEFAULT_TYPE")
 def _format_pending_line(item) -> str:
     """Text-only formatting for one awaiting-approval item.
 
-    Deliberately factored out (rather than inlined in `_format_pending`) so
-    TG-3 can reuse it verbatim when it upgrades /pending's reply from plain
-    text to per-item approve/reject inline buttons (spec F3: "각 항목에 F1과
-    동일한 승인/거부 버튼 재발송") -- the item-line text stays the caption,
-    only the delivery mechanism (reply_text -> send_approval_request-style
-    per-item message) changes.
+    Deliberately factored out as its own function so `_send_pending_button`
+    (TG-3, spec F3: "각 항목에 F1과 동일한 승인/거부 버튼 재발송") can reuse it
+    verbatim as the plain-text fallback caption when the button send itself
+    fails -- the item-line text is the caption either way, only the primary
+    delivery mechanism (inline-keyboard message vs. plain reply_text)
+    differs.
     """
     short_id = (item.session_id or "")[:8]
     name = item.name or item.ticker
@@ -229,20 +231,54 @@ def _format_pending_line(item) -> str:
     return f"• [{short_id}] {name}({item.ticker}) {action} 자동승인예정 {auto_at}"
 
 
-def _format_pending(operations) -> str:
-    awaiting = operations.awaiting if operations is not None else None
-    if awaiting is None:
-        return f"[승인 대기]\n{_NO_DATA}"
-    if not awaiting:
-        return "[승인 대기] 0건"
-    lines = [f"[승인 대기] {len(awaiting)}건"]
-    lines.extend(_format_pending_line(item) for item in awaiting)
-    return "\n".join(lines)
+async def _fetch_notifier():
+    """Lazy import + fetch of the outbound TelegramNotifier singleton -- the
+    deliberate mock-injection seam for /pending's per-item button upgrade
+    (TG-3, spec F3), mirroring every other `_fetch_*` helper in this
+    module."""
+    from services.telegram import get_telegram_notifier
+
+    return await get_telegram_notifier()
+
+
+async def _send_pending_button(item) -> bool:
+    """Best-effort per-item approve/reject button send for one /pending
+    entry (TG-3 F3) -- reuses F1's `send_approval_request` verbatim rather
+    than building a bespoke keyboard here. Returns False (never raises) on
+    ANY failure so the caller falls back to `_format_pending_line`'s
+    plain-text caption, mirroring this module's own `_safe()`
+    degrade-not-fail contract. market is hardcoded "kiwoom" -- /pending's
+    only source, `_fetch_operations()`, already defaults to (and is only
+    ever called with) the kiwoom market."""
+    try:
+        notifier = await _fetch_notifier()
+        proposal = item.proposal or {}
+        return await notifier.send_approval_request(
+            item.session_id, "kiwoom", proposal, item.auto_approve_at,
+        )
+    except Exception as e:  # noqa: BLE001 -- per-item independent degrade
+        logger.warning(
+            "telegram_pending_button_failed", session_id=item.session_id, error=str(e)
+        )
+        return False
 
 
 async def handle_pending(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
     operations = await _safe("operations_pending", _fetch_operations())
-    await _reply(update, _format_pending(operations))
+    awaiting = operations.awaiting if operations is not None else None
+
+    if awaiting is None:
+        await _reply(update, f"[승인 대기]\n{_NO_DATA}")
+        return
+    if not awaiting:
+        await _reply(update, "[승인 대기] 0건")
+        return
+
+    await _reply(update, f"[승인 대기] {len(awaiting)}건")
+    for item in awaiting:
+        sent = await _send_pending_button(item)
+        if not sent:
+            await _reply(update, _format_pending_line(item))
 
 
 # -------------------------------------------

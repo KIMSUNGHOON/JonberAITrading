@@ -17,6 +17,7 @@ no local `session` object left to go stale relative to the SM.
 
 import asyncio
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +29,26 @@ import app.api.routes._autonomy_injector as injector_module
 from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 
 TEST_DB_PATH = "data/test_autonomy_injector.db"
+
+
+@pytest.fixture(autouse=True)
+def no_real_telegram(monkeypatch):
+    """TG-3: maybe_schedule_auto_approve now ALWAYS attempts a best-effort
+    Telegram approval-request send (previously `_notify_pending` only fired
+    inside the gate-allowed branch) -- neutralize the real
+    get_telegram_notifier() singleton for every test in this file so none
+    of them ever construct a real bot / touch the real .env credentials or
+    network (constraint: 실 네트워크 금지). A fake notifier with
+    is_ready=False is sufficient: maybe_schedule_auto_approve's notify call
+    checks `notifier.is_ready` before ever calling send_approval_request.
+    Tests exercising the notification content itself live in
+    test_telegram_approval_buttons.py (TG-3) instead."""
+    fake_notifier = SimpleNamespace(is_ready=False)
+
+    async def fake_get_notifier():
+        return fake_notifier
+
+    monkeypatch.setattr(injector_module, "get_telegram_notifier", fake_get_notifier)
 
 
 @pytest.fixture

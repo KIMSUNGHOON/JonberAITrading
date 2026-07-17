@@ -6,12 +6,12 @@ Uses polling mode - no external webhook required.
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Optional
 
 import structlog
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
 from services.telegram.config import get_telegram_config, TelegramConfig
@@ -95,8 +95,21 @@ class TelegramNotifier:
 
         return chunks
 
-    async def _send_message(self, text: str, parse_mode: str = "Markdown") -> bool:
-        """Send a message to the configured chat. Handles long messages by splitting."""
+    async def _send_message(
+        self,
+        text: str,
+        parse_mode: str = "Markdown",
+        reply_markup: Optional["InlineKeyboardMarkup"] = None,
+    ) -> bool:
+        """Send a message to the configured chat. Handles long messages by splitting.
+
+        `reply_markup` (TG-3): optional InlineKeyboardMarkup, attached only to
+        the FIRST chunk of a (possibly split) message so a long message never
+        ends up with the same keyboard duplicated across parts. Defaults to
+        None, which is byte-identical to every pre-TG-3 call site (none of
+        which pass this argument) -- PTB's own `send_message` already
+        defaults `reply_markup=None`.
+        """
         if not self._initialized or not self._bot:
             return False
 
@@ -118,6 +131,7 @@ class TelegramNotifier:
                     chat_id=self._config.TELEGRAM_CHAT_ID,
                     text=chunk,
                     parse_mode=parse_mode,
+                    reply_markup=reply_markup if i == 0 else None,
                 )
 
                 # Small delay between chunks to maintain order
@@ -137,6 +151,108 @@ class TelegramNotifier:
         Use this for notifications that don't fit other specific methods.
         """
         return await self._send_message(text, parse_mode)
+
+    # -------------------------------------------
+    # Approval/Reject Inline Buttons (TG-3, spec F1)
+    # -------------------------------------------
+
+    async def send_approval_request(
+        self,
+        session_id: str,
+        market: str,
+        proposal: dict,
+        auto_approve_at: Optional[str] = None,
+    ) -> bool:
+        """Send an approve/reject inline-keyboard request for a pending trade
+        proposal.
+
+        Fires for BOTH plain-HITL and autonomous sessions -- this is the
+        single dispatch point the producer's awaiting-commit success path
+        (via `_autonomy_injector.maybe_schedule_auto_approve`) always
+        reaches once a session lands in awaiting_approval, replacing the
+        injector's old auto-only `_notify_pending` text heads-up (spec F1).
+        `auto_approve_at` (an ISO datetime, or None for plain HITL) controls
+        whether the message includes the autonomous countdown line -- the
+        button pair itself is identical either way.
+
+        callback_data uses `a:{session_id}:{pid8}` / `r:{session_id}:{pid8}`
+        (pid8 = the first 8 chars of proposal["id"]) rather than the full
+        proposal id, to stay comfortably under Telegram's 64-byte
+        callback_data limit (2 + 36 + 1 + 8 = 47B for a uuid4 session_id).
+        This is a fast filter, not the security boundary -- the callback
+        handler (services/telegram/callbacks.py) re-validates the prefix
+        against the LIVE proposal id before acting, and `approval.
+        submit_decision`'s actor='telegram' pin (approval.py, F1) closes the
+        TOCTOU window inside the per-session lock.
+
+        Best-effort like every other send_* method here: gated on
+        TELEGRAM_NOTIFY_TRADE_ALERTS, and any send failure is absorbed by
+        `_send_message`'s own bool-returning contract -- callers must never
+        let this failure affect the approval pipeline that already
+        committed by the time this runs.
+        """
+        if not self._config.TELEGRAM_NOTIFY_TRADE_ALERTS:
+            return False
+
+        action = str(proposal.get("action") or "-").upper()
+        emoji = self._get_action_emoji(action)
+        proposal_id = str(proposal.get("id") or "")
+        pid8 = proposal_id[:8]
+
+        quantity = proposal.get("quantity")
+        entry_price = proposal.get("entry_price")
+
+        lines = [
+            f"{emoji} *승인 요청* ({market})",
+            "",
+            f"*행동:* {action}",
+        ]
+        if quantity is not None:
+            try:
+                lines.append(f"*수량:* {quantity:,}")
+            except (TypeError, ValueError):
+                lines.append(f"*수량:* {quantity}")
+        if entry_price is not None:
+            try:
+                lines.append(f"*가격:* ₩{float(entry_price):,.0f}")
+            except (TypeError, ValueError):
+                lines.append(f"*가격:* {entry_price}")
+
+        countdown = self._format_auto_approve_countdown(auto_approve_at)
+        if countdown:
+            lines.append("")
+            lines.append(countdown)
+
+        lines.append("")
+        lines.append(f"_세션 {session_id[:8]}_")
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ 승인", callback_data=f"a:{session_id}:{pid8}"),
+                    InlineKeyboardButton("❌ 거부", callback_data=f"r:{session_id}:{pid8}"),
+                ]
+            ]
+        )
+
+        return await self._send_message("\n".join(lines), reply_markup=keyboard)
+
+    @staticmethod
+    def _format_auto_approve_countdown(auto_approve_at: Optional[str]) -> Optional[str]:
+        """`None`/blank -> no countdown line (plain HITL). A present value is
+        parsed as an ISO datetime and rendered as remaining whole seconds --
+        falls back to a countdown-free autonomous phrase if parsing fails
+        rather than dropping the autonomy notice entirely."""
+        if not auto_approve_at:
+            return None
+        try:
+            target = datetime.fromisoformat(auto_approve_at)
+        except (TypeError, ValueError):
+            return "⏳ _자동승인 예정 — 거부하려면 지금 누르세요_"
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        remaining = max(0, int((target - datetime.now(timezone.utc)).total_seconds()))
+        return f"⏳ _{remaining}초 후 자동승인 — 거부하려면 지금 누르세요_"
 
     # -------------------------------------------
     # Trade Alerts
