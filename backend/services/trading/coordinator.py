@@ -2332,7 +2332,7 @@ class ExecutionCoordinator:
             await self._notify_eod_summary(datetime.now().strftime("%Y-%m-%d"))  # E3-3: 장마감 요약 통지(Telegram+WS) — run_eod_review가 저장한 digest/narrative 재조회
         self._market_was_open = is_open
 
-    async def _notify_eod_summary(self, trade_date: str) -> None:
+    async def _notify_eod_summary(self, trade_date: str) -> bool:
         """E3-3: best-effort Telegram + WS notification of the day's EOD
         digest/narrative, appended after the market-close chain's other
         steps (write_daily_snapshot -> run_eod_review -> run_strategy_
@@ -2367,12 +2367,24 @@ class ExecutionCoordinator:
         relabeled as today's. Comparing the row's own `trade_date` to the
         `trade_date` this call was invoked with catches that mismatch and
         skips the send entirely rather than notifying with stale content.
+
+        Returns (E3-4 review fix): True once delivery is actually attempted
+        (past every guard above, WS broadcast reached -- Telegram too, if
+        `notifier.is_ready`), False when a guard skipped the send (no row
+        yet / stale row / no digest) or the whole step raised. This is
+        purely additive: the market-close edge
+        (`_check_queue_on_market_open`) still calls this fire-and-forget
+        and ignores the return value entirely (see
+        tests/test_services/test_f3_fill_tracking.py's E3-3 section, which
+        pins that call site and never inspects a return value) -- the new
+        bool exists so `POST /trading/eod-report/run` (E3-4) can report
+        whether its manual re-notify actually went out.
         """
         try:
             storage = await get_storage_service()
             reviews = await storage.get_eod_reviews(limit=1)
             if not reviews:
-                return
+                return False
 
             row_trade_date = reviews[0].get("trade_date")
             if row_trade_date != trade_date:
@@ -2380,12 +2392,12 @@ class ExecutionCoordinator:
                     f"[Coordinator] eod_summary_stale_skipped — requested "
                     f"trade_date={trade_date} latest_row_trade_date={row_trade_date}"
                 )
-                return
+                return False
 
             report = json.loads(reviews[0].get("report_json") or "{}")
             digest = report.get("digest")
             if not digest:
-                return
+                return False
             narrative = report.get("narrative")
 
             from services.telegram import get_telegram_notifier
@@ -2397,8 +2409,10 @@ class ExecutionCoordinator:
             from app.api.routes.websocket import broadcast_eod_summary
 
             await broadcast_eod_summary(digest, narrative)
+            return True
         except Exception as e:
             logger.warning(f"[Coordinator] EOD summary notification failed: {e}")
+            return False
 
     async def _expire_tracked_orders_on_market_close(self) -> None:
         """F3: expire every still-TRACKING order on the open→closed edge and

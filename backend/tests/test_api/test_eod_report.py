@@ -21,6 +21,18 @@ Convention notes (verified against neighboring tests before writing this):
   global "실 LLM 금지" constraint. ``build_eod_digest`` itself does NOT call
   an LLM (pure aggregation) and is left real, exercising the actual
   digest-reassembly path against the stub coordinator + tmp storage.
+
+Review-fix update (E3-4 리뷰픽스, this file's second pass):
+- ``staleness_note`` lives ONLY at ``digest["staleness_note"]`` now, in both
+  GET and POST responses (the POST route used to also mirror it as a
+  top-level sidecar key -- removed, single exposure depth).
+- ``_compute_staleness_note`` (route module) now checks regime_snapshot
+  staleness independently from strategy_revisions staleness, not just
+  strategy -- see the two new tests near the end of the POST section.
+- ``stub_coordinator._notify_eod_summary`` must have an explicit
+  ``return_value`` now that the route surfaces it as response field
+  ``notified`` (a bare ``AsyncMock()`` awaits to a ``MagicMock``, which
+  isn't JSON-serializable and would 500 every POST test).
 """
 
 import asyncio
@@ -79,7 +91,9 @@ def stub_coordinator():
         "total_equity": 50_000_000,
         "positions": [],
     }
-    coordinator._notify_eod_summary = AsyncMock()
+    # Must be JSON-serializable -- the route now forwards this call's
+    # return value verbatim as response field "notified" (E3-4 리뷰픽스).
+    coordinator._notify_eod_summary = AsyncMock(return_value=True)
     app.dependency_overrides[get_trading_coordinator] = lambda: coordinator
     yield coordinator
     app.dependency_overrides.clear()
@@ -126,6 +140,22 @@ def _save_strategy_revision(tmp_storage, revision_id, trade_date):
                 "rationale": "r",
                 "votes_json": None,
                 "regime_snapshot_id": None,
+            }
+        )
+    )
+
+
+def _save_regime_snapshot(tmp_storage, snapshot_id, trade_date):
+    _run(
+        tmp_storage.save_regime_snapshot(
+            {
+                "id": snapshot_id,
+                "trade_date": trade_date,
+                "breadth_buy": 100,
+                "breadth_sell": 50,
+                "breadth_hold": 10,
+                "breadth_ratio": 0.6,
+                "regime_label": "risk_on",
             }
         )
     )
@@ -225,6 +255,7 @@ def test_post_eod_report_run_explicit_past_date_saves_and_notifies(
     assert body["trade_date"] == trade_date
     assert body["digest"]["trade_date"] == trade_date
     assert body["narrative"] == "과거 브리핑"
+    assert body["notified"] is True  # stub_coordinator default return_value=True
     stub_coordinator._notify_eod_summary.assert_awaited_once_with(trade_date)
 
     rows = _run(tmp_storage.get_eod_reviews(limit=10))
@@ -233,6 +264,25 @@ def test_post_eod_report_run_explicit_past_date_saves_and_notifies(
     assert saved["digest"]["trade_date"] == trade_date
     assert saved["narrative"] == "과거 브리핑"
     assert "staleness_note" in saved["digest"]
+
+
+def test_post_eod_report_run_notified_false_when_notify_skips(
+    client, stub_coordinator, tmp_storage
+):
+    """_notify_eod_summary가 자체 stale 가드 등으로 스킵하면 False를 반환하고
+    (E3-4 리뷰픽스), 이 라우트는 그 값을 response["notified"]에 그대로
+    실어 보낸다."""
+    stub_coordinator._notify_eod_summary = AsyncMock(return_value=False)
+    trade_date = "2026-07-10"
+    with patch(
+        "app.api.routes.trading.get_storage_service", new=AsyncMock(return_value=tmp_storage)
+    ), patch(
+        "app.api.routes.trading.narrate_eod_digest", new=AsyncMock(return_value="x")
+    ):
+        response = client.post("/api/trading/eod-report/run", json={"date": trade_date})
+
+    assert response.status_code == 200
+    assert response.json()["notified"] is False
 
 
 def test_post_eod_report_run_reuses_existing_row_other_sections(
@@ -265,8 +315,8 @@ def test_post_eod_report_run_reuses_existing_row_other_sections(
 def test_post_eod_report_run_staleness_note_set_for_past_date(
     client, stub_coordinator, tmp_storage
 ):
-    """strategy_revisions 최신 행이 요청 date보다 최신이면 staleness_note가
-    채워진다."""
+    """strategy_revisions 최신 행이 요청 date보다 최신이면 digest.staleness_note가
+    채워지고 "strategy"를 언급한다."""
     _save_strategy_revision(tmp_storage, "rev-latest", "2026-07-16")
     trade_date = "2026-07-10"
 
@@ -277,17 +327,22 @@ def test_post_eod_report_run_staleness_note_set_for_past_date(
     ):
         response = client.post("/api/trading/eod-report/run", json={"date": trade_date})
 
-    body = response.json()
-    assert body["staleness_note"] is not None
-    assert "2026-07-16" in body["staleness_note"]
-    assert body["digest"]["staleness_note"] == body["staleness_note"]
+    note = response.json()["digest"]["staleness_note"]
+    assert note is not None
+    assert "strategy" in note
+    assert "2026-07-16" in note
+    assert "regime" not in note  # regime 쪽은 리비전이 없어 stale 판정 대상 아님
 
 
-def test_post_eod_report_run_staleness_note_none_when_dates_match(
+def test_post_eod_report_run_staleness_note_regime_only(
     client, stub_coordinator, tmp_storage
 ):
+    """regime_snapshot 최신 행만 요청 date보다 최신인 경우(전략 합의는 정상,
+    레짐 파이프라인만 정체된 시나리오) -- digest.staleness_note가 "regime"을
+    언급하고 "strategy"는 언급하지 않는다 (리뷰픽스: 최초 구현은 regime을
+    검사하지 않아 이 케이스를 오판(None)했다)."""
+    _save_regime_snapshot(tmp_storage, "regime-latest", "2026-07-16")
     trade_date = "2026-07-10"
-    _save_strategy_revision(tmp_storage, "rev-match", trade_date)
 
     with patch(
         "app.api.routes.trading.get_storage_service", new=AsyncMock(return_value=tmp_storage)
@@ -296,13 +351,55 @@ def test_post_eod_report_run_staleness_note_none_when_dates_match(
     ):
         response = client.post("/api/trading/eod-report/run", json={"date": trade_date})
 
-    assert response.json()["staleness_note"] is None
+    note = response.json()["digest"]["staleness_note"]
+    assert note is not None
+    assert "regime" in note
+    assert "2026-07-16" in note
+    assert "strategy" not in note
+
+
+def test_post_eod_report_run_staleness_note_both_stale(
+    client, stub_coordinator, tmp_storage
+):
+    """strategy/regime 둘 다 요청 date보다 최신이면 둘 다 개별 언급한다."""
+    _save_strategy_revision(tmp_storage, "rev-latest", "2026-07-15")
+    _save_regime_snapshot(tmp_storage, "regime-latest", "2026-07-16")
+    trade_date = "2026-07-10"
+
+    with patch(
+        "app.api.routes.trading.get_storage_service", new=AsyncMock(return_value=tmp_storage)
+    ), patch(
+        "app.api.routes.trading.narrate_eod_digest", new=AsyncMock(return_value="x")
+    ):
+        response = client.post("/api/trading/eod-report/run", json={"date": trade_date})
+
+    note = response.json()["digest"]["staleness_note"]
+    assert note is not None
+    assert "strategy" in note and "2026-07-15" in note
+    assert "regime" in note and "2026-07-16" in note
+
+
+def test_post_eod_report_run_staleness_note_none_when_dates_match(
+    client, stub_coordinator, tmp_storage
+):
+    trade_date = "2026-07-10"
+    _save_strategy_revision(tmp_storage, "rev-match", trade_date)
+    _save_regime_snapshot(tmp_storage, "regime-match", trade_date)
+
+    with patch(
+        "app.api.routes.trading.get_storage_service", new=AsyncMock(return_value=tmp_storage)
+    ), patch(
+        "app.api.routes.trading.narrate_eod_digest", new=AsyncMock(return_value="x")
+    ):
+        response = client.post("/api/trading/eod-report/run", json={"date": trade_date})
+
+    assert response.json()["digest"]["staleness_note"] is None
 
 
 def test_post_eod_report_run_staleness_note_none_when_no_revisions(
     client, stub_coordinator, tmp_storage
 ):
-    """판단 불가(리비전 无) -> None."""
+    """판단 불가(strategy_revisions도 regime_snapshot도 无) -> None."""
     with patch(
         "app.api.routes.trading.get_storage_service", new=AsyncMock(return_value=tmp_storage)
     ), patch(
@@ -310,7 +407,7 @@ def test_post_eod_report_run_staleness_note_none_when_no_revisions(
     ):
         response = client.post("/api/trading/eod-report/run", json={"date": "2026-07-10"})
 
-    assert response.json()["staleness_note"] is None
+    assert response.json()["digest"]["staleness_note"] is None
 
 
 def test_post_eod_report_run_llm_failure_returns_200_with_none_narrative(

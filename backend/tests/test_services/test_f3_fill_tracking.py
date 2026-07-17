@@ -1487,8 +1487,55 @@ async def test_notify_eod_summary_skips_stale_review_row(temp_storage, monkeypat
     monkeypatch.setattr(ws_module, "broadcast_eod_summary", _fake_broadcast)
 
     with caplog.at_level(logging.WARNING):
-        await coord._notify_eod_summary(today)
+        result = await coord._notify_eod_summary(today)
 
     assert telegram_calls == []
     assert ws_calls == []
     assert any("eod_summary_stale_skipped" in rec.message for rec in caplog.records)
+    # E3-4 리뷰픽스: bool 반환 계약 -- 가드에 걸려 스킵되면 False.
+    assert result is False
+
+
+# E3-4 리뷰픽스: _notify_eod_summary가 bool을 반환하도록 확장됐다 (POST
+# /trading/eod-report/run이 그 값을 response["notified"]로 실어 보내야 하기
+# 때문 -- see app/api/routes/trading.py::run_eod_report_now). 이 테스트는 그
+# 확장의 "성공 시 True" 절반을 직접 호출로 핀한다(위 스킵 테스트가 "실패/스킵
+# 시 False" 절반을 이미 커버). 기존 마감 체인 호출부
+# (_check_queue_on_market_open)는 반환값을 그냥 버리므로 이 변경으로 깨지지
+# 않는다 -- test_close_edge_invokes_eod_summary_notify_with_trade_date /
+# test_close_edge_survives_eod_summary_notify_failure 둘 다 위에서 이미
+# 반환값을 검사하지 않는 채로 통과한다.
+async def test_notify_eod_summary_returns_true_on_success(temp_storage, monkeypatch):
+    import json
+
+    import app.api.routes.websocket as ws_module
+    import services.telegram as telegram_module
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    today = date.today().strftime("%Y-%m-%d")
+
+    await temp_storage.save_eod_review({
+        "trade_date": today,
+        "report_json": json.dumps(
+            {"digest": {"trade_date": today}, "narrative": "오늘 요약"}
+        ),
+    })
+
+    class _NotReadyNotifier:
+        is_ready = False
+
+    async def _fake_get_telegram_notifier():
+        return _NotReadyNotifier()
+
+    ws_calls = []
+
+    async def _fake_broadcast(digest, narrative=None):
+        ws_calls.append((digest, narrative))
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+    monkeypatch.setattr(ws_module, "broadcast_eod_summary", _fake_broadcast)
+
+    result = await coord._notify_eod_summary(today)
+
+    assert result is True
+    assert ws_calls == [({"trade_date": today}, "오늘 요약")]

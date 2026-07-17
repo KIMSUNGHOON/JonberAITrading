@@ -982,31 +982,54 @@ def _parse_report_json(report_json: Optional[str]) -> Dict[str, Any]:
         return {}
 
 
-async def _compute_staleness_note(storage: Any, requested_date: str) -> Optional[str]:
-    """digest.strategy(/regime)는 build_eod_digest 자체가 문서화하듯
-    trade_date로 스코프되지 않은 '테이블 진짜 최신' 행이다(E3-1 설계) — 오늘이
-    아닌 date로 POST /run을 돌리면 digest에 실린 strategy 섹션이 요청 date
-    이후에 결정된 리비전일 수 있다(E3-1 리뷰 Important #2). strategy_revisions
-    최신 행의 trade_date(없으면 created_at 앞 10자)를 requested_date와 비교해
-    다르면 사람이 읽을 문자열을, 같거나 판단 불가(리비전 없음/읽기 실패)면
-    None을 반환한다 — never-raise, 이 라우트의 200 계약을 절대 깨지 않는다."""
+async def _latest_row_date(getter: Any, label: str) -> Optional[str]:
+    """`getter(limit=1)`의 최신 행에서 trade_date(없으면 created_at 앞 10자)를
+    뽑아낸다 — get_strategy_revisions/get_regime_snapshots 모두 이미
+    created_at DESC 정렬이라 limit=1이면 충분(eod_digest.py의 "테이블 진짜
+    최신" 관용구와 동일). 행이 없거나 읽기 자체가 실패하면 None(판단 불가로
+    강등, never-raise)."""
     try:
-        rows = await storage.get_strategy_revisions(limit=1)
+        rows = await getter(limit=1)
     except Exception as e:  # noqa: BLE001 — 판단 불가로 강등
-        logger.warning(f"[EODReportAPI] get_strategy_revisions failed: {e}")
+        logger.warning(f"[EODReportAPI] {label} staleness check failed: {e}")
         return None
     if not rows:
         return None
 
-    revision_date = rows[0].get("trade_date")
-    if not revision_date:
+    row_date = rows[0].get("trade_date")
+    if not row_date:
         created_at = rows[0].get("created_at")
-        revision_date = str(created_at)[:10] if created_at else None
-    if not revision_date or revision_date == requested_date:
+        row_date = str(created_at)[:10] if created_at else None
+    return row_date
+
+
+async def _compute_staleness_note(storage: Any, requested_date: str) -> Optional[str]:
+    """digest.strategy/regime은 둘 다 build_eod_digest 자체가 문서화하듯
+    trade_date로 스코프되지 않은 '테이블 진짜 최신' 행이다(E3-1 설계) — 오늘이
+    아닌 date로 POST /run을 돌리면 digest에 실린 strategy/regime 섹션이 요청
+    date 이후에 결정된 리비전/스냅샷일 수 있다(E3-1 리뷰 Important #2, 그리고
+    이 함수 자체의 리뷰픽스: 최초 구현이 strategy만 검사하고 regime을
+    누락했었다 — 전략 합의는 정상적으로 돌았지만 레짐 파이프라인만 며칠
+    정체된 시나리오에서 오판(None)했을 것).
+
+    strategy_revisions와 regime_snapshot 각각의 최신 행 날짜를 독립적으로
+    requested_date와 비교한다 — 한쪽만 stale이어도 다른 한쪽까지 stale로
+    싸잡아 말하지 않도록, 노트 문자열은 stale한 쪽만 개별 언급한다. 둘 다
+    정합(또는 판단 불가)이면 None."""
+    strategy_date = await _latest_row_date(storage.get_strategy_revisions, "strategy_revisions")
+    regime_date = await _latest_row_date(storage.get_regime_snapshots, "regime_snapshots")
+
+    stale_parts = []
+    if strategy_date and strategy_date != requested_date:
+        stale_parts.append(f"strategy는 {strategy_date}")
+    if regime_date and regime_date != requested_date:
+        stale_parts.append(f"regime은 {regime_date}")
+
+    if not stale_parts:
         return None
 
     return (
-        f"digest.strategy/regime은 {revision_date} 기준 최신 리비전이며, "
+        f"digest의 {', '.join(stale_parts)} 기준 최신 리비전/스냅샷이며, "
         f"요청한 {requested_date}와 다를 수 있습니다."
     )
 
@@ -1064,6 +1087,14 @@ async def run_eod_report_now(
     재발송한다 — 그 함수 자신의 stale 가드(get_eod_reviews(limit=1)로 읽은
     최신 행의 trade_date가 요청 date와 다르면 스킵)가 date 정합을 보장하므로,
     과거 date를 재실행해도 더 최신 날짜의 요약이 잘못 재발송되는 일은 없다.
+    응답의 `notified`는 그 호출의 반환값을 그대로 실어 보낸다(E3-4 리뷰픽스
+    — _notify_eod_summary가 bool을 반환하도록 확장됨: 가드에 걸려 스킵되거나
+    예외가 나면 False, 실제로 WS/Telegram 발송까지 도달하면 True — 기존
+    마감 체인 호출부는 이 반환값을 그대로 무시하므로 그쪽은 무영향).
+
+    staleness_note는 응답·저장 양쪽 모두 `digest.staleness_note` 한 자리에만
+    싣는다(GET 응답과 노출 깊이 통일 — 이전 리뷰픽스 전에는 이 라우트가
+    top-level에도 사이드카로 중복 노출했었다).
     """
     trade_date = request.date or datetime.now(KST).strftime("%Y-%m-%d")
     storage = await get_storage_service()
@@ -1082,14 +1113,14 @@ async def run_eod_report_now(
         {"trade_date": trade_date, "report_json": json.dumps(report)}
     )
 
-    await coordinator._notify_eod_summary(trade_date)
+    notified = await coordinator._notify_eod_summary(trade_date)
 
     return {
         "ok": True,
         "trade_date": trade_date,
         "digest": digest,
         "narrative": narrative,
-        "staleness_note": digest.get("staleness_note"),
+        "notified": notified,
     }
 
 
