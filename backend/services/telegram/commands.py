@@ -61,14 +61,26 @@ TG-4 adds two mode-switch commands at the bottom of this module (see the
 one-step fail-safe emergency stop (kiwoom autonomous -> hitl, no
 confirmation); `/auto` is the 2-step reverse (hitl -> autonomous) whose
 step-2 confirm button is handled in `services/telegram/callbacks.py`
-(`AUTO_CONFIRM_CALLBACK_DATA` / `handle_auto_confirm_callback`) rather than
-here, mirroring how F1's approve/reject buttons live in callbacks.py while
-their originating notification lives elsewhere.
+(`AUTO_CONFIRM_CALLBACK_PREFIX` / `handle_auto_confirm_callback`) rather
+than here, mirroring how F1's approve/reject buttons live in callbacks.py
+while their originating notification lives elsewhere.
+
+TG-4 review fix (Important): /auto's confirm button used to carry a FIXED
+callback_data literal with no TTL/one-time-use, so a stale never-tapped
+button stayed valid forever -- including across an intervening `/halt`
+emergency stop, which could then be silently undone by a late tap. The
+button now carries a fresh single-use nonce with a 5-minute TTL
+(`AUTO_CONFIRM_CALLBACK_PREFIX` / `_issue_auto_confirm_nonce` /
+`consume_auto_confirm_nonce` below), and `/halt` explicitly invalidates any
+outstanding nonce (`invalidate_auto_confirm_nonce`) so that exact scenario
+now replies "만료" instead of re-arming autonomous mode.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Optional, TypeVar
 
 import structlog
@@ -366,17 +378,86 @@ async def handle_report(update: Update, context: "ContextTypes.DEFAULT_TYPE") ->
 # instead of the 60s auto-approve countdown.
 # -------------------------------------------
 
-AUTO_CONFIRM_CALLBACK_DATA = "auto_confirm"
-"""callback_data for /auto's step-2 confirm button. A fixed literal --
-unlike F1's `a:{session_id}:{pid8}` / `r:{session_id}:{pid8}` buttons, this
-action is market/mode-scoped (kiwoom's Autonomous|HITL setting), not
-proposal-scoped, so there is no session_id to pin. services/telegram/
-callbacks.py registers a handler for this exact string
-(`register_callback("auto_confirm", ...)`) and re-declares the same
-literal as `callbacks.AUTO_CONFIRM_CALLBACK_DATA` -- the two modules
-intentionally agree by string convention rather than a shared import,
-mirroring how service.py's `a:`/`r:` prefixes and callbacks.py's own
-registrations already agree without one."""
+AUTO_CONFIRM_CALLBACK_PREFIX = "auto_confirm:"
+"""callback_data PREFIX for /auto's step-2 confirm button (TG-4 review
+fix). Unlike F1's `a:{session_id}:{pid8}` / `r:{session_id}:{pid8}`
+buttons, this action is market/mode-scoped (kiwoom's Autonomous|HITL
+setting), not proposal-scoped, so there is no session_id to pin --
+instead each button carries a single-use NONCE:
+`f"{AUTO_CONFIRM_CALLBACK_PREFIX}{nonce}"` (well under Telegram's 64-byte
+callback_data budget: prefix 13 bytes + a 12-hex-char nonce = 25 bytes).
+services/telegram/callbacks.py registers a handler for this exact prefix
+(`register_callback(AUTO_CONFIRM_CALLBACK_PREFIX, ...)`) and imports this
+module directly (`from services.telegram import commands`) to call
+`consume_auto_confirm_nonce` below -- unlike the old fixed-literal design,
+the two files must now actually share nonce STATE, not just agree on a
+string by convention, so a real import replaces that convention (no
+cycle: this module never imports callbacks.py)."""
+
+AUTO_CONFIRM_TTL_SECONDS: float = 300.0
+"""5 minutes. Long enough for a human to notice and tap the confirm
+button; short enough that a truly stale button (the review scenario --
+issued, never tapped, /halt used as an emergency stop, THEN tapped) reads
+as obviously expired rather than staying live indefinitely."""
+
+# Process-local nonce state for /auto's step-2 confirm button. Deliberately
+# NOT persisted anywhere durable (SQLite/app_settings/...): a server
+# restart naturally invalidates any outstanding confirm, which is the
+# fail-safe direction (forces a fresh /auto rather than resurrecting a
+# half-confirmed one after a restart), so in-memory-only is the correct
+# choice here, not merely the convenient one.
+_auto_confirm_nonce: Optional[str] = None
+_auto_confirm_issued_at: Optional[datetime] = None
+
+
+def _issue_auto_confirm_nonce() -> str:
+    """Mint+store a fresh single-use nonce for /auto's confirm button,
+    discarding whatever nonce (if any) was previously outstanding -- only
+    the LATEST /auto's button is ever valid ("새 /auto 실행은 이전 논스를
+    자연 대체" per the review fix's design)."""
+    global _auto_confirm_nonce, _auto_confirm_issued_at
+    _auto_confirm_nonce = uuid.uuid4().hex[:12]
+    _auto_confirm_issued_at = datetime.now(timezone.utc)
+    return _auto_confirm_nonce
+
+
+def invalidate_auto_confirm_nonce() -> None:
+    """Clear any outstanding /auto confirm nonce. Called from `handle_halt`
+    below so an emergency stop can never be silently undone later by a
+    stale confirm button issued before the halt and never tapped -- the
+    exact scenario this review fix closes."""
+    global _auto_confirm_nonce, _auto_confirm_issued_at
+    _auto_confirm_nonce = None
+    _auto_confirm_issued_at = None
+
+
+def consume_auto_confirm_nonce(nonce: str) -> bool:
+    """Validate+consume a /auto confirm nonce (called from
+    `services.telegram.callbacks.handle_auto_confirm_callback`).
+
+    Returns True only if `nonce` matches the single latest-issued nonce AND
+    is still within `AUTO_CONFIRM_TTL_SECONDS`. On a MATCH (whether or not
+    the TTL check itself passes) the stored nonce is cleared immediately --
+    one-time use, so a second tap of the very same button (successful or
+    already-expired) always falls through to "expired" on retry, never
+    silently retries the same slot.
+
+    On a MISMATCH (a different or no nonce is currently stored -- e.g. a
+    stale/superseded nonce from a previous /auto, or `/halt` already
+    cleared the slot) nothing is cleared: a stale replay must never be able
+    to invalidate a DIFFERENT, still-legitimately-pending nonce that a real
+    user might still tap.
+    """
+    global _auto_confirm_nonce, _auto_confirm_issued_at
+    if _auto_confirm_nonce is None or _auto_confirm_issued_at is None:
+        return False
+    if nonce != _auto_confirm_nonce:
+        return False
+    issued_at = _auto_confirm_issued_at
+    _auto_confirm_nonce = None
+    _auto_confirm_issued_at = None
+    age_seconds = (datetime.now(timezone.utc) - issued_at).total_seconds()
+    return age_seconds <= AUTO_CONFIRM_TTL_SECONDS
 
 
 async def _set_trading_mode(market: str, mode: str):
@@ -410,7 +491,14 @@ async def handle_halt(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> N
     `trading_mode:kiwoom`이 더 이상 'autonomous'가 아님을 보고 스스로
     stood-down 처리한다 (기존 동작, 이 커맨드는 그 앞단의 모드 전환만
     담당).
+
+    TG-4 review fix (Important): also invalidates any outstanding /auto
+    confirm nonce (`invalidate_auto_confirm_nonce`) BEFORE attempting the
+    mode write, so a halt always clears the slot even if the mode write
+    itself later fails -- an old, never-tapped confirm button can no longer
+    silently re-arm autonomous mode after an emergency stop.
     """
+    invalidate_auto_confirm_nonce()
     await _set_trading_mode("kiwoom", "hitl")
     await _reply(
         update,
@@ -428,10 +516,15 @@ async def handle_auto(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> N
     AUTONOMY_ENABLED`를 다시 읽지 않는다) 상태만 확인한다:
     - OFF: 정직하게 "재시작 필요"를 답장하고 버튼 없이 종료한다 -- env는
       텔레그램으로 켤 수 없다.
-    - ON: `[⚠️ 자율 재개 확인]` 버튼을 보낸다. 실제 모드 전환 +
-      `rearm_awaiting_approvals()` 재호출은 여기서 하지 않고
-      `services.telegram.callbacks.handle_auto_confirm_callback`이 콜백에서
-      수행한다 (spec F2 리스크 표: "/auto 오발 -> 2-스텝 확인 버튼").
+    - ON: 새 논스를 발급(`_issue_auto_confirm_nonce`, 이전 미소모 논스는
+      자연 대체)하고 `[⚠️ 자율 재개 확인]` 버튼을 그 논스가 실린
+      callback_data(`f"{AUTO_CONFIRM_CALLBACK_PREFIX}{nonce}"`)로 보낸다.
+      실제 모드 전환 + `rearm_awaiting_approvals()` 재호출은 여기서 하지
+      않고 `services.telegram.callbacks.handle_auto_confirm_callback`이
+      콜백에서 논스를 검증·소모(`consume_auto_confirm_nonce`)한 뒤에만
+      수행한다 (spec F2 리스크 표: "/auto 오발 -> 2-스텝 확인 버튼"; TG-4
+      review fix: 논스+TTL 5분+`/halt` 무효화로 "오래된 확인 버튼 오클릭"도
+      막는다).
 
     이름 충돌 주의: 기존 `POST /trading/pause`·`/resume`과 무관
     (`handle_halt`의 docstring 참고).
@@ -441,13 +534,17 @@ async def handle_auto(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> N
         await _reply(update, "env AUTONOMY_ENABLED=false — 재시작 필요")
         return
 
+    nonce = _issue_auto_confirm_nonce()
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⚠️ 자율 재개 확인", callback_data=AUTO_CONFIRM_CALLBACK_DATA)]]
+        [[InlineKeyboardButton(
+            "⚠️ 자율 재개 확인",
+            callback_data=f"{AUTO_CONFIRM_CALLBACK_PREFIX}{nonce}",
+        )]]
     )
     message = getattr(update, "effective_message", None) or getattr(update, "message", None)
     if message is not None:
         await message.reply_text(
-            "kiwoom 자율 매매를 재개할까요? (버튼을 눌러 확인)",
+            "kiwoom 자율 매매를 재개할까요? (버튼을 눌러 확인, 5분 내)",
             reply_markup=keyboard,
         )
 

@@ -597,7 +597,35 @@ async def test_set_trading_mode_wires_to_settings_put_handler(monkeypatch):
 
 # -------------------------------------------
 # TG-4: /auto step 1 -- master-gate check, confirm button
+#
+# TG-4 review fix (Important): /auto's confirm button now carries a
+# single-use nonce with a 5-minute TTL instead of a fixed callback_data
+# literal (`commands.AUTO_CONFIRM_CALLBACK_PREFIX` + `_issue_auto_confirm_
+# nonce`/`consume_auto_confirm_nonce`/`invalidate_auto_confirm_nonce`), and
+# `/halt` invalidates any outstanding nonce -- closing the scenario where a
+# stale never-tapped confirm button, tapped AFTER an emergency /halt, could
+# silently re-arm autonomous mode with no further confirmation. See
+# commands.py's module docstring for the full defect writeup.
 # -------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_auto_confirm_nonce():
+    """Test isolation for the process-local nonce globals in commands.py
+    (`_auto_confirm_nonce`/`_auto_confirm_issued_at`) -- deliberately NOT
+    persisted anywhere durable by design (see commands.py's docstring), so
+    without an explicit reset one test's issued nonce could leak into the
+    next test's assertions. Autouse + file-wide: harmless no-op for tests
+    that never touch /auto."""
+    commands.invalidate_auto_confirm_nonce()
+    yield
+    commands.invalidate_auto_confirm_nonce()
+
+
+def _auto_button_data(message) -> str:
+    """Pulls the callback_data off the single reply_text call's
+    reply_markup -- the button /auto's handler just sent."""
+    return message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data
 
 
 async def test_auto_master_gate_off_replies_honestly_with_no_button(monkeypatch):
@@ -625,8 +653,55 @@ async def test_auto_master_gate_on_sends_confirm_button(monkeypatch):
     args, kwargs = message.reply_text.await_args
     keyboard = kwargs["reply_markup"]
     btn = keyboard.inline_keyboard[0][0]
-    assert btn.callback_data == commands.AUTO_CONFIRM_CALLBACK_DATA
-    assert btn.callback_data == callbacks.AUTO_CONFIRM_CALLBACK_DATA  # same literal, both files
+    # TG-4 review fix: callback_data is now PREFIX + single-use nonce, not
+    # a fixed literal -- pin the shape (prefix match + non-empty nonce
+    # suffix, and both files' prefix constants agree) rather than an exact
+    # fixed string.
+    assert btn.callback_data.startswith(commands.AUTO_CONFIRM_CALLBACK_PREFIX)
+    assert btn.callback_data.startswith(callbacks.AUTO_CONFIRM_CALLBACK_PREFIX)
+    nonce = btn.callback_data[len(commands.AUTO_CONFIRM_CALLBACK_PREFIX):]
+    assert nonce
+    assert nonce == commands._auto_confirm_nonce  # the one just issued/stored
+
+
+async def test_auto_issues_a_fresh_nonce_every_call_rotating_out_the_previous(monkeypatch):
+    """TDD ①: /auto 2회 -> 두 버튼의 callback_data 상이(논스 회전), 이전
+    논스 콜백=만료 처리(모드 무변경·rearm 미호출)."""
+    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=True)
+    monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
+
+    update1, message1 = _make_update()
+    await commands.handle_auto(update1, MagicMock())
+    first_data = _auto_button_data(message1)
+
+    update2, message2 = _make_update()
+    await commands.handle_auto(update2, MagicMock())
+    second_data = _auto_button_data(message2)
+
+    assert first_data != second_data
+
+    set_calls = []
+
+    async def fake_set_mode():
+        set_calls.append(True)
+
+    monkeypatch.setattr(callbacks, "_set_kiwoom_autonomous", fake_set_mode)
+
+    rearm_calls = []
+
+    async def fake_rearm():
+        rearm_calls.append(True)
+
+    monkeypatch.setattr(callbacks, "_rearm_awaiting_approvals", fake_rearm)
+
+    stale_update, stale_query = _make_callback_update(12345, first_data)
+    await callbacks.handle_auto_confirm_callback(stale_update, MagicMock())
+
+    assert set_calls == []
+    assert rearm_calls == []
+    args, kwargs = stale_query.edit_message_text.await_args
+    assert "만료" in args[0]
+    assert kwargs["reply_markup"] is None
 
 
 # -------------------------------------------
@@ -657,6 +732,13 @@ def _tg_config(chat_id: str = "12345") -> TelegramConfig:
 
 
 async def test_auto_confirm_callback_saves_autonomous_mode_and_rearms_and_edits(monkeypatch):
+    """TDD ④ (정상 경로): 발급 -> TTL 내 일치 콜백 -> 모드 저장+rearm+편집."""
+    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=True)
+    monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
+    update0, message0 = _make_update()
+    await commands.handle_auto(update0, MagicMock())
+    data = _auto_button_data(message0)
+
     set_calls = []
 
     async def fake_set_mode():
@@ -671,7 +753,7 @@ async def test_auto_confirm_callback_saves_autonomous_mode_and_rearms_and_edits(
 
     monkeypatch.setattr(callbacks, "_rearm_awaiting_approvals", fake_rearm)
 
-    update, query = _make_callback_update(12345, callbacks.AUTO_CONFIRM_CALLBACK_DATA)
+    update, query = _make_callback_update(12345, data)
     await callbacks.handle_auto_confirm_callback(update, MagicMock())
 
     query.answer.assert_awaited_once()
@@ -680,6 +762,153 @@ async def test_auto_confirm_callback_saves_autonomous_mode_and_rearms_and_edits(
     args, kwargs = query.edit_message_text.await_args
     assert "✅" in args[0]
     assert "재무장" in args[0]
+    assert kwargs["reply_markup"] is None
+
+
+async def test_auto_confirm_callback_replay_after_success_is_expired(monkeypatch):
+    """TDD ④ 후반부: 성공 소모 후 재클릭 = 만료 (1회성 -- 같은 버튼을 두 번
+    눌러도 두 번째 자율 재전환은 일어나지 않는다)."""
+    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=True)
+    monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
+    update0, message0 = _make_update()
+    await commands.handle_auto(update0, MagicMock())
+    data = _auto_button_data(message0)
+
+    async def noop():
+        pass
+
+    monkeypatch.setattr(callbacks, "_set_kiwoom_autonomous", noop)
+    monkeypatch.setattr(callbacks, "_rearm_awaiting_approvals", noop)
+
+    first_update, first_query = _make_callback_update(12345, data)
+    await callbacks.handle_auto_confirm_callback(first_update, MagicMock())
+    first_args, _ = first_query.edit_message_text.await_args
+    assert "✅" in first_args[0]
+
+    set_calls = []
+    rearm_calls = []
+
+    async def fake_set_mode():
+        set_calls.append(True)
+
+    async def fake_rearm():
+        rearm_calls.append(True)
+
+    monkeypatch.setattr(callbacks, "_set_kiwoom_autonomous", fake_set_mode)
+    monkeypatch.setattr(callbacks, "_rearm_awaiting_approvals", fake_rearm)
+
+    second_update, second_query = _make_callback_update(12345, data)
+    await callbacks.handle_auto_confirm_callback(second_update, MagicMock())
+
+    assert set_calls == []
+    assert rearm_calls == []
+    second_args, second_kwargs = second_query.edit_message_text.await_args
+    assert "만료" in second_args[0]
+    assert second_kwargs["reply_markup"] is None
+
+
+async def test_auto_confirm_callback_expired_after_ttl(monkeypatch):
+    """TDD ②: TTL 경과(monkeypatch) 후 콜백 = 만료 처리."""
+    monkeypatch.setattr(commands, "AUTO_CONFIRM_TTL_SECONDS", 0.05)
+    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=True)
+    monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
+
+    update0, message0 = _make_update()
+    await commands.handle_auto(update0, MagicMock())
+    data = _auto_button_data(message0)
+
+    await asyncio.sleep(0.1)
+
+    set_calls = []
+    rearm_calls = []
+
+    async def fake_set_mode():
+        set_calls.append(True)
+
+    async def fake_rearm():
+        rearm_calls.append(True)
+
+    monkeypatch.setattr(callbacks, "_set_kiwoom_autonomous", fake_set_mode)
+    monkeypatch.setattr(callbacks, "_rearm_awaiting_approvals", fake_rearm)
+
+    update, query = _make_callback_update(12345, data)
+    await callbacks.handle_auto_confirm_callback(update, MagicMock())
+
+    assert set_calls == []
+    assert rearm_calls == []
+    args, kwargs = query.edit_message_text.await_args
+    assert "만료" in args[0]
+    assert kwargs["reply_markup"] is None
+
+
+async def test_auto_confirm_callback_never_issued_nonce_is_expired(monkeypatch):
+    """방어적 경계: 논스가 아예 발급된 적 없어도(콜백 데이터 위조 등) 동일하게
+    만료 처리 -- 어떤 특권 액션도 수행하지 않는다."""
+    set_calls = []
+    rearm_calls = []
+
+    async def fake_set_mode():
+        set_calls.append(True)
+
+    async def fake_rearm():
+        rearm_calls.append(True)
+
+    monkeypatch.setattr(callbacks, "_set_kiwoom_autonomous", fake_set_mode)
+    monkeypatch.setattr(callbacks, "_rearm_awaiting_approvals", fake_rearm)
+
+    update, query = _make_callback_update(
+        12345, callbacks.AUTO_CONFIRM_CALLBACK_PREFIX + "neverissued0"
+    )
+    await callbacks.handle_auto_confirm_callback(update, MagicMock())
+
+    assert set_calls == []
+    assert rearm_calls == []
+    args, kwargs = query.edit_message_text.await_args
+    assert "만료" in args[0]
+    assert kwargs["reply_markup"] is None
+
+
+async def test_halt_invalidates_outstanding_auto_confirm_nonce_then_stale_callback_is_expired(
+    monkeypatch,
+):
+    """TDD ③ (핵심 시나리오): /auto로 버튼 수신 -> 누르지 않음 -> 이상 징후로
+    /halt(긴급 정지) -> 나중에 그 오래된 확인 버튼을 오클릭 -> 아무 재확인
+    없이 autonomous 재전환+rearm이 일어나서는 안 된다 (리뷰 결함이 직격하는
+    시나리오)."""
+    mode = SimpleNamespace(kiwoom="autonomous", coin="hitl", master_enabled=True)
+    monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
+
+    update0, message0 = _make_update()
+    await commands.handle_auto(update0, MagicMock())
+    stale_data = _auto_button_data(message0)
+
+    async def fake_set_trading_mode(market, mode_):
+        pass
+
+    monkeypatch.setattr(commands, "_set_trading_mode", fake_set_trading_mode)
+
+    halt_update, halt_message = _make_update()
+    await commands.handle_halt(halt_update, MagicMock())
+
+    set_calls = []
+    rearm_calls = []
+
+    async def fake_set_mode():
+        set_calls.append(True)
+
+    async def fake_rearm():
+        rearm_calls.append(True)
+
+    monkeypatch.setattr(callbacks, "_set_kiwoom_autonomous", fake_set_mode)
+    monkeypatch.setattr(callbacks, "_rearm_awaiting_approvals", fake_rearm)
+
+    late_update, late_query = _make_callback_update(12345, stale_data)
+    await callbacks.handle_auto_confirm_callback(late_update, MagicMock())
+
+    assert set_calls == [], "halt 이후 오래된 confirm 버튼이 autonomous 모드를 재전환해서는 안 된다"
+    assert rearm_calls == [], "halt 이후 오래된 confirm 버튼이 rearm을 트리거해서는 안 된다"
+    args, kwargs = late_query.edit_message_text.await_args
+    assert "만료" in args[0]
     assert kwargs["reply_markup"] is None
 
 
@@ -717,7 +946,10 @@ async def test_auto_confirm_callback_unauthorized_chat_is_silent_and_warns(monke
     """④ 확인 없이 콜백 위조(타 chat) = 무응답 -- dispatched through the REAL
     receiver._dispatch_callback (mirrors TG-3's unauthorized-chat test),
     proving the shared security wrapper covers this new callback prefix too
-    without either handler re-checking chat_id itself."""
+    without either handler re-checking chat_id itself. The nonce suffix is
+    arbitrary/never-issued here -- irrelevant, since the wrapper must block
+    BEFORE the handler (and therefore before any nonce validation) ever
+    runs."""
     monkeypatch.setattr(receiver, "get_telegram_config", lambda: _tg_config(chat_id="12345"))
 
     set_calls = []
@@ -734,7 +966,9 @@ async def test_auto_confirm_callback_unauthorized_chat_is_silent_and_warns(monke
 
     monkeypatch.setattr(callbacks, "_rearm_awaiting_approvals", fake_rearm)
 
-    update, query = _make_callback_update(99999, callbacks.AUTO_CONFIRM_CALLBACK_DATA)
+    update, query = _make_callback_update(
+        99999, callbacks.AUTO_CONFIRM_CALLBACK_PREFIX + "arbitrary123"
+    )
 
     with structlog.testing.capture_logs() as logs:
         await receiver._dispatch_callback(update, MagicMock())
@@ -751,9 +985,12 @@ async def test_auto_confirm_callback_unauthorized_chat_is_silent_and_warns(monke
 async def test_auto_confirm_callback_authorized_chat_reaches_handler_via_real_dispatch(monkeypatch):
     """Positive counterpart -- proves the registry/prefix-match/wrapper chain
     actually reaches callbacks.handle_auto_confirm_callback (not just that
-    unauthorized is silent), and that "auto_confirm" doesn't collide with
-    the "a:" approve-button prefix in the longest-prefix-first match."""
+    unauthorized is silent), and that "auto_confirm:" doesn't collide with
+    the "a:" approve-button prefix in the longest-prefix-first match. Uses a
+    REAL nonce (`commands._issue_auto_confirm_nonce`) so the handler's own
+    nonce check also passes end-to-end, not just the dispatch routing."""
     monkeypatch.setattr(receiver, "get_telegram_config", lambda: _tg_config(chat_id="12345"))
+    nonce = commands._issue_auto_confirm_nonce()
 
     async def fake_set_mode():
         pass
@@ -767,7 +1004,7 @@ async def test_auto_confirm_callback_authorized_chat_reaches_handler_via_real_di
 
     monkeypatch.setattr(callbacks, "_rearm_awaiting_approvals", fake_rearm)
 
-    update, query = _make_callback_update(12345, callbacks.AUTO_CONFIRM_CALLBACK_DATA)
+    update, query = _make_callback_update(12345, callbacks.AUTO_CONFIRM_CALLBACK_PREFIX + nonce)
 
     await receiver._dispatch_callback(update, MagicMock())
 
@@ -861,13 +1098,15 @@ async def test_auto_confirm_rearm_transitions_dedup_marker_deny_to_allow(sm, fas
     assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p1:0"
 
     # /auto confirm: mode-set is mocked (covered by its own wiring test
-    # above) -- rearm is the REAL rearm_awaiting_approvals.
+    # above) -- rearm is the REAL rearm_awaiting_approvals. Issues+consumes
+    # a REAL nonce (TG-4 review fix) rather than the old fixed literal.
     async def fake_set_mode():
         pass
 
     monkeypatch.setattr(callbacks, "_set_kiwoom_autonomous", fake_set_mode)
 
-    update, query = _make_callback_update(12345, callbacks.AUTO_CONFIRM_CALLBACK_DATA)
+    nonce = commands._issue_auto_confirm_nonce()
+    update, query = _make_callback_update(12345, callbacks.AUTO_CONFIRM_CALLBACK_PREFIX + nonce)
     await callbacks.handle_auto_confirm_callback(update, MagicMock())
 
     assert fake_notifier.send_approval_request.await_count == 2, (

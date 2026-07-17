@@ -6,10 +6,11 @@ Handles the two callback_data prefixes `send_approval_request` (service.py)
 attaches to every pending-approval message: `a:{session_id}:{pid8}`
 (approve) and `r:{session_id}:{pid8}` (reject) -- see
 docs/superpowers/specs/2026-07-17-telegram-twoway-design.md F1. Also
-handles the fixed-literal `auto_confirm` callback_data commands.py's
+handles the `auto_confirm:{nonce}` callback_data prefix commands.py's
 `handle_auto` attaches to /auto's step-2 confirm button -- see the
 "/auto step-2 confirm callback (TG-4)" section near the bottom of this
-file (spec F2).
+file (spec F2; nonce+TTL is a later review fix, see commands.py's
+module docstring for the scenario it closes).
 
 Registered into services.telegram.receiver's callback registry at IMPORT
 TIME via `register_callback(prefix, handler)`, mirroring commands.py's
@@ -59,12 +60,14 @@ from fastapi import HTTPException
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from services.telegram import commands
 from services.telegram.receiver import register_callback
 
 logger = structlog.get_logger()
 
 _STALE_PROPOSAL_TEXT = "제안이 변경되어 처리할 수 없습니다."
 _INVALID_REQUEST_TEXT = "잘못된 요청입니다."
+_AUTO_CONFIRM_EXPIRED_TEXT = "확인이 만료되었습니다. /auto를 다시 실행하세요."
 
 
 async def _fetch_live_session(session_id: str):
@@ -172,23 +175,28 @@ async def handle_reject_callback(update: Update, context: "ContextTypes.DEFAULT_
 # confirm.
 # -------------------------------------------
 
-AUTO_CONFIRM_CALLBACK_DATA = "auto_confirm"
-"""Same literal as `commands.AUTO_CONFIRM_CALLBACK_DATA` -- see that
-module's docstring for why the two files agree by string convention
-rather than a shared import (mirrors the existing `a:`/`r:` convention
-between service.py and this module). No session_id/proposal to pin here:
-/auto resumes kiwoom's Autonomous|HITL *mode*, not one proposal, so
-there is nothing proposal-shaped to re-validate against a live session
-the way `a:`/`r:` do."""
+AUTO_CONFIRM_CALLBACK_PREFIX = commands.AUTO_CONFIRM_CALLBACK_PREFIX
+"""Re-exported from `commands.py` (single source of truth) rather than a
+second independent literal -- TG-4 review fix: the two files used to only
+agree by string convention (`"auto_confirm"` declared separately in both
+files), which was fine while the value was a dumb literal but stopped
+being safe once real nonce STATE needed sharing (see this module's import
+of `services.telegram.commands` above). No session_id/proposal to pin
+here beyond the nonce itself: /auto resumes kiwoom's Autonomous|HITL
+*mode*, not one proposal, so there is nothing proposal-shaped to
+re-validate against a live session the way `a:`/`r:` do."""
 
 
 async def _set_kiwoom_autonomous():
     """Direct call into settings.py's PUT handler -- mirrors commands.py's
     `_set_trading_mode` (same underlying storage write, same
-    `TradingModeUpdate` validation); duplicated rather than imported from
-    commands.py to keep this module's only sibling-module dependency the
-    existing lazy `app.api.routes.*` imports, not a second telegram
-    submodule."""
+    `TradingModeUpdate` validation). Kept as its own small duplicate rather
+    than delegating to `commands._set_trading_mode` -- this module already
+    imports `services.telegram.commands` at module level now (for the
+    nonce functions, TG-4 review fix), so the import itself is no longer
+    the reason to duplicate; it's simply that this call is a one-line,
+    argument-free specialization ("kiwoom" + "autonomous" are always the
+    values here) and not worth threading two extra literals through."""
     from app.api.routes.settings import TradingModeUpdate, set_trading_mode
 
     return await set_trading_mode(TradingModeUpdate(market="kiwoom", mode="autonomous"))
@@ -211,26 +219,51 @@ async def _rearm_awaiting_approvals():
     await rearm_awaiting_approvals()
 
 
+def _parse_auto_confirm_nonce(data: str) -> Optional[str]:
+    """`auto_confirm:{nonce}` -> nonce, or None if `data` doesn't carry the
+    prefix or the nonce part is blank (mirrors `_parse`'s own blank-part
+    refusal above for the `a:`/`r:` buttons -- a blank nonce must never be
+    treated as "no nonce to check", it must fail the match explicitly)."""
+    if not data.startswith(AUTO_CONFIRM_CALLBACK_PREFIX):
+        return None
+    nonce = data[len(AUTO_CONFIRM_CALLBACK_PREFIX):]
+    return nonce or None
+
+
 async def handle_auto_confirm_callback(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
-    """/auto's step-2 confirm button (TG-4, spec F2) -- flips
-    `trading_mode:kiwoom` to autonomous, then re-arms every session already
-    sitting in awaiting_approval so one tap covers both future proposals
+    """/auto's step-2 confirm button (TG-4, spec F2; nonce+TTL TG-4 review
+    fix) -- validates+consumes the button's single-use nonce FIRST
+    (`commands.consume_auto_confirm_nonce`); only on success does it flip
+    `trading_mode:kiwoom` to autonomous and re-arm every session already
+    sitting in awaiting_approval, so one tap covers both future proposals
     and proposals that were already waiting when `/auto` was typed.
 
-    TG-3 x TG-4 interaction (intentional, per spec): a session that only
-    ever received a plain-HITL button (gate denied while kiwoom was hitl)
-    has `TELEGRAM_NOTIFIED_PROPOSAL_KEY` set to `"{proposal_id}:0"`. Once
-    `_rearm_awaiting_approvals()` re-schedules it under the now-autonomous
-    mode, the gate verdict flips to allow and the composite dedup marker
-    (`_autonomy_injector._notified_marker_value`) becomes
-    `"{proposal_id}:1"` -- a mismatch against the stored `:0` value, so
-    `maybe_schedule_auto_approve` sends a FRESH Telegram approval-request
-    message with the live countdown rather than silently deduping it away.
-    The operator who only ever saw a plain-HITL button for this proposal is
-    told, correctly, that a 60s auto-approve countdown just started.
+    A missing/mismatched/expired nonce -- stale button, superseded by a
+    later /auto, or invalidated by an intervening /halt (the review's core
+    scenario) -- edits the message to say the confirmation expired and
+    performs NEITHER the mode write NOR the rearm: mode stays exactly
+    whatever it already was.
+
+    TG-3 x TG-4 interaction (intentional, per spec, on the SUCCESS path
+    only): a session that only ever received a plain-HITL button (gate
+    denied while kiwoom was hitl) has `TELEGRAM_NOTIFIED_PROPOSAL_KEY` set
+    to `"{proposal_id}:0"`. Once `_rearm_awaiting_approvals()` re-schedules
+    it under the now-autonomous mode, the gate verdict flips to allow and
+    the composite dedup marker (`_autonomy_injector._notified_marker_value`)
+    becomes `"{proposal_id}:1"` -- a mismatch against the stored `:0`
+    value, so `maybe_schedule_auto_approve` sends a FRESH Telegram
+    approval-request message with the live countdown rather than silently
+    deduping it away. The operator who only ever saw a plain-HITL button
+    for this proposal is told, correctly, that a 60s auto-approve
+    countdown just started.
     """
     query = update.callback_query
     await query.answer()
+
+    nonce = _parse_auto_confirm_nonce(query.data or "")
+    if nonce is None or not commands.consume_auto_confirm_nonce(nonce):
+        await _edit(update, _AUTO_CONFIRM_EXPIRED_TEXT)
+        return
 
     await _set_kiwoom_autonomous()
     await _rearm_awaiting_approvals()
@@ -244,4 +277,4 @@ async def handle_auto_confirm_callback(update: Update, context: "ContextTypes.DE
 
 register_callback("a:", handle_approve_callback)
 register_callback("r:", handle_reject_callback)
-register_callback("auto_confirm", handle_auto_confirm_callback)
+register_callback(AUTO_CONFIRM_CALLBACK_PREFIX, handle_auto_confirm_callback)
