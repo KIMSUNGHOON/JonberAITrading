@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useState, useCallback } from 'react';
-import { X, TrendingUp, TrendingDown, Clock, Eye, AlertTriangle, CheckCircle, Wifi, WifiOff } from 'lucide-react';
+import { X, TrendingUp, TrendingDown, Clock, Eye, AlertTriangle, CheckCircle, Wifi, WifiOff, FileText } from 'lucide-react';
 import {
   useTradeNotifications,
   formatNotificationMessage,
@@ -44,6 +44,7 @@ const iconMap: Record<TradeNotificationType, typeof TrendingUp> = {
   watch_added: Eye,
   stop_loss_triggered: TrendingDown,
   take_profit_triggered: TrendingUp,
+  eod_summary: FileText,
 };
 
 const severityStyles: Record<'success' | 'warning' | 'error' | 'info', string> = {

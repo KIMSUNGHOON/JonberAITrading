@@ -1568,3 +1568,83 @@ export interface PerformanceResponse {
   asset: PerformanceAssetSummary | null;
   errors: Record<string, string>;
 }
+
+// -------------------------------------------
+// EOD Report (E3-1..E3-5 -- 장마감 요약)
+// -------------------------------------------
+// Mirrors services/trading/eod_digest.py's build_eod_digest section
+// shapes exactly (each section is independently failure-harmless server
+// side: a broken source degrades only its own section to null/[], never
+// raises) plus the GET /api/trading/eod-report response envelope from
+// app/api/routes/trading.py's get_eod_report handler.
+
+export interface EodDigestWatchItem {
+  ticker: string | null;
+  stock_name: string | null;
+  signal: string | null;
+  confidence: number | null;
+  current_price: number | null;
+  target_entry_price: number | null;
+  gap_pct: number | null;
+}
+
+export interface EodDigestAccount {
+  deposit: number | null;
+  total_equity: number | null;
+  daily_realized_pnl: number | null;
+  cumulative_return_pct: number | null;
+}
+
+export interface EodDigestHolding {
+  ticker: string | null;
+  stock_name: string | null;
+  quantity: number | null;
+  avg_price: number | null;
+  current_price: number | null;
+  unrealized_pnl: number | null;
+  unrealized_pnl_pct: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+}
+
+export interface EodDigestStrategyKnobs {
+  stop_loss_pct: number | null;
+  take_profit_pct: number | null;
+  max_position_pct: number | null;
+  max_trade_notional_pct: number | null;
+}
+
+export interface EodDigestStrategy {
+  stance: string | null;
+  rationale_excerpt: string | null;
+  key_knobs: EodDigestStrategyKnobs;
+  changed: boolean;
+}
+
+export interface EodDigestRegime {
+  label: string | null;
+  index_kospi_chg_pct: number | null;
+  index_kosdaq_chg_pct: number | null;
+}
+
+export interface EodDigest {
+  trade_date: string | null;
+  watch: EodDigestWatchItem[];
+  account: EodDigestAccount;
+  holdings: EodDigestHolding[];
+  strategy: EodDigestStrategy | null;
+  regime: EodDigestRegime | null;
+  // Only present when GET /eod-report's manual POST /run path computed it
+  // (_compute_staleness_note) -- absent on the normal market-close chain's
+  // digest, and always absent/null when strategy+regime are both current.
+  staleness_note?: string | null;
+  error?: string;
+}
+
+export interface EodReportResponse {
+  trade_date: string;
+  created_at: string;
+  // Absent on report rows saved before E3-2 landed (pre-digest schema).
+  digest?: EodDigest | null;
+  narrative?: string | null;
+}

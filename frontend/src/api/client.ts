@@ -59,6 +59,8 @@ import type {
   OperationsResponse,
   // Performance Types
   PerformanceResponse,
+  // EOD Report Types (E3-5)
+  EodReportResponse,
   // Scanner Types
   ScanProgressResponse,
   ScanResultsResponse,
@@ -1481,6 +1483,37 @@ class ApiClient {
   }
 
   /**
+   * Get the latest (or a specific date's) EOD report -- digest + optional
+   * LLM narrative (E3-4's GET /trading/eod-report). `date` omitted means
+   * "the newest row in the table" (backend default).
+   *
+   * A 404 ("no report for this date / empty table yet") is an expected,
+   * quiet empty state -- NOT a load failure -- so it resolves to `null`
+   * instead of throwing. This mirrors the exact `detail` text the backend
+   * always sends for this route (get_eod_report in
+   * app/api/routes/trading.py: `"eod_review not found for date=..."` or
+   * `"eod_review not found"`), which is all that's left to inspect here:
+   * the shared response interceptor above already collapses every
+   * AxiosError into a plain `Error(message)` before it reaches this
+   * method, so `error.response.status` is no longer available -- matching
+   * on the known message text is the only way left to distinguish
+   * "not found" from a genuine failure (network/500), which still throws.
+   */
+  async getEodReport(date?: string): Promise<EodReportResponse | null> {
+    try {
+      const response = await this.client.get<EodReportResponse>('/trading/eod-report', {
+        params: date ? { date } : undefined,
+      });
+      return response.data;
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('eod_review not found')) {
+        return null;
+      }
+      throw e;
+    }
+  }
+
+  /**
    * Add a stock to watch list.
    */
   async addToWatchList(request: AddToWatchListRequest): Promise<AddToWatchListResponse> {
@@ -2101,6 +2134,9 @@ export const getOperations = (market: 'kiwoom' | 'coin' = 'kiwoom') =>
 // Performance API
 export const getPerformance = (params?: { base?: number; start?: string; end?: string }) =>
   apiClient.getPerformance(params);
+
+// EOD Report API (E3-5)
+export const getEodReport = (date?: string) => apiClient.getEodReport(date);
 
 // Background Scanner API
 export const startScan = (request?: StartScanRequest) =>

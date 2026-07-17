@@ -18,13 +18,18 @@ export type TradeNotificationType =
   | 'trade_rejected'
   | 'watch_added'
   | 'stop_loss_triggered'
-  | 'take_profit_triggered';
+  | 'take_profit_triggered'
+  | 'eod_summary';
 
 export interface TradeNotification {
   type: TradeNotificationType;
   data: {
-    ticker: string;
-    stock_name: string;
+    // eod_summary (E3-5) carries no ticker/position -- it's an account-wide
+    // broadcast (see broadcast_eod_summary in app/api/routes/websocket.py),
+    // so these two are optional rather than the historical "always present"
+    // assumption of the other 6 types.
+    ticker?: string;
+    stock_name?: string;
     action?: string;
     quantity?: number;
     price?: number;
@@ -40,6 +45,11 @@ export interface TradeNotification {
     pnl?: number;
     pnl_percent?: number;
     session_id?: string;
+    // eod_summary-only fields (E3-5). See broadcast_eod_summary's FE
+    // contract docstring for the exact shape.
+    trade_date?: string;
+    headline?: string;
+    has_narrative?: boolean;
     timestamp: string;
   };
 }
@@ -107,6 +117,7 @@ export function useTradeNotifications(
         'watch_added',
         'stop_loss_triggered',
         'take_profit_triggered',
+        'eod_summary',
       ];
 
       if (notificationTypes.includes(message.type)) {
@@ -213,6 +224,11 @@ export function formatNotificationMessage(notification: TradeNotification): stri
     case 'take_profit_triggered':
       return `${name} 익절 발동 @ ${data.trigger_price?.toLocaleString()}원 (수익: ${data.pnl_percent?.toFixed(1)}%)`;
 
+    case 'eod_summary':
+      // 계정 단위 브로드캐스트 -- ticker/stock_name이 없으므로 위 `name`은
+      // 쓰지 않는다. 제목("장마감 요약")+본문(headline)을 한 줄로 합성.
+      return `장마감 요약${data.trade_date ? ` (${data.trade_date})` : ''}: ${data.headline ?? '데이터 없음'}`;
+
     default:
       return `${name}: 알림`;
   }
@@ -233,6 +249,9 @@ export function getNotificationSeverity(
     case 'stop_loss_triggered':
     case 'trade_rejected':
       return 'warning';
+
+    case 'eod_summary':
+      return 'info';
 
     default:
       return 'info';
