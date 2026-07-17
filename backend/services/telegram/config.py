@@ -52,6 +52,10 @@ class TelegramConfig(BaseSettings):
         default=True,
         description="Send system start/stop/error notifications"
     )
+    TELEGRAM_NOTIFY_DAILY_SUMMARY: bool = Field(
+        default=True,
+        description="Send end-of-day summary (digest+narrative) notifications (E3-3)"
+    )
 
     @property
     def is_configured(self) -> bool:

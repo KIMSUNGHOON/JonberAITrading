@@ -1282,3 +1282,68 @@ async def broadcast_position_event(
         ticker=ticker,
         trigger_price=trigger_price,
     )
+
+
+def _build_eod_summary_headline(digest: dict) -> str:
+    """Compact one-line key-figures summary of an EOD digest, shared by the
+    WS broadcast (below) and usable as a quick-glance FE fallback when
+    `has_narrative` is False. Mirrors telegram/service.py's
+    `_fmt_krw`/`_fmt_pct` number formatting so the WS headline and the
+    Telegram key-figures header read the same way."""
+    account = digest.get("account") or {}
+    parts = []
+
+    daily_pnl = account.get("daily_realized_pnl")
+    if daily_pnl is not None:
+        sign = "+" if daily_pnl >= 0 else ""
+        parts.append(f"당일 실현손익 {sign}{daily_pnl:,.0f}원")
+
+    total_equity = account.get("total_equity")
+    if total_equity is not None:
+        parts.append(f"총평가 {total_equity:,.0f}원")
+
+    regime = digest.get("regime") or {}
+    if regime.get("label"):
+        parts.append(f"시장 {regime['label']}")
+
+    return " · ".join(parts) if parts else "데이터 없음"
+
+
+async def broadcast_eod_summary(digest: dict, narrative: str | None = None):
+    """E3-3: broadcast the day's EOD digest/narrative to trade-notification
+    subscribers -- the FE consumes this (E3-5) to render/refresh an EOD
+    summary panel without polling. Mirrors broadcast_trade_executed et
+    al.'s TradeNotificationManager convention exactly: fire-and-forget over
+    the existing manager (no-op if there are no subscribers), same
+    type/data/timestamp shape.
+
+    FE contract (data fields):
+      - trade_date: str | None -- digest["trade_date"].
+      - headline: str -- compact key-figures summary (see
+        _build_eod_summary_headline above); always a non-empty string
+        ("데이터 없음" when the digest carries no usable numbers).
+      - has_narrative: bool -- whether an LLM narrative was generated for
+        this day (narrate_eod_digest didn't return None/blank). The FULL
+        digest/narrative body is intentionally NOT pushed over this
+        broadcast (mirrors every other broadcast_* helper here staying
+        summary-sized) -- a client wanting the full text fetches it via
+        the EOD review report endpoint/storage.get_eod_reviews.
+      - timestamp: str -- broadcast time (UTC ISO), not trade_date.
+    """
+    trade_date = digest.get("trade_date")
+    headline = _build_eod_summary_headline(digest)
+
+    await trade_notification_manager.broadcast({
+        "type": "eod_summary",
+        "data": {
+            "trade_date": trade_date,
+            "headline": headline,
+            "has_narrative": bool(narrative and narrative.strip()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    })
+    logger.info(
+        "eod_summary_broadcast",
+        trade_date=trade_date,
+        has_narrative=bool(narrative and narrative.strip()),
+    )

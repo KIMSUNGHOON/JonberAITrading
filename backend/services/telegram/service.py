@@ -510,6 +510,166 @@ _모니터링 중..._
         return await self._send_message(message.strip())
 
     # -------------------------------------------
+    # Daily Summary (E3-3)
+    # -------------------------------------------
+
+    async def send_daily_summary(
+        self,
+        digest: dict,
+        narrative: Optional[str] = None,
+    ) -> bool:
+        """Send the end-of-day summary notification.
+
+        Reuses the digest/narrative E3-1/E3-2 already computed and
+        persisted (services/trading/eod_digest.py::build_eod_digest /
+        narrate_eod_digest) -- this method never recomputes either or
+        calls the LLM itself, it only formats what it's handed:
+
+          - `narrative` present (and non-blank) -> the narrative body plus
+            a compact key-figures header pulled straight from
+            `digest["account"]` (total_equity/daily_realized_pnl).
+          - `narrative` None/blank (LLM failure or timeout, per
+            narrate_eod_digest's never-raise contract) -> a DETERMINISTIC
+            4-block Markdown template (watch/account/holdings/strategy)
+            built purely from `digest`'s fields. Each block independently
+            degrades to a "no data" placeholder rather than raising or
+            omitting the section, mirroring build_eod_digest's own
+            failure-harmless contract -- a caller can pass a
+            partially-degraded digest (e.g. strategy=None) and still get
+            a well-formed message.
+
+        Delegates to the existing `_send_message` (and its `_split_message`
+        4000-char chunking) exactly like every other send_* method here --
+        no bespoke chunking added for what can be a long narrative or a
+        long watch/holdings list.
+
+        Gate: TELEGRAM_NOTIFY_DAILY_SUMMARY (new category flag, default
+        True) mirrors every other TELEGRAM_NOTIFY_* category gate above.
+        The `is_configured` master gate is enforced by the untouched
+        `_send_message` initialized/bot check, same as every other method.
+        """
+        if not self._config.TELEGRAM_NOTIFY_DAILY_SUMMARY:
+            return False
+
+        trade_date = digest.get("trade_date") or "-"
+
+        if narrative and narrative.strip():
+            message = self._format_daily_summary_narrative(trade_date, digest, narrative)
+        else:
+            message = self._format_daily_summary_template(trade_date, digest)
+
+        return await self._send_message(message.strip())
+
+    def _format_daily_summary_narrative(
+        self, trade_date: str, digest: dict, narrative: str
+    ) -> str:
+        account = digest.get("account") or {}
+        regime = digest.get("regime") or {}
+        regime_line = f"\n시장: {regime['label']}" if regime.get("label") else ""
+
+        return f"""
+📋 *장마감 요약 ({trade_date})*
+
+{narrative.strip()}
+
+*핵심 수치*
+총평가: {self._fmt_krw(account.get("total_equity"))}
+당일 실현손익: {self._fmt_krw(account.get("daily_realized_pnl"))}{regime_line}
+
+⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+"""
+
+    def _format_daily_summary_template(self, trade_date: str, digest: dict) -> str:
+        regime = digest.get("regime") or {}
+        regime_line = f"\n🌐 시장: {regime['label']}" if regime.get("label") else ""
+
+        return f"""
+📋 *장마감 요약 ({trade_date})*{regime_line}
+
+*👁️ 워치리스트*
+{self._format_watch_block(digest.get("watch") or [])}
+
+*💰 계좌*
+{self._format_account_block(digest.get("account"))}
+
+*📦 보유 종목*
+{self._format_holdings_block(digest.get("holdings") or [])}
+
+*🧭 전략*
+{self._format_strategy_block(digest.get("strategy"))}
+
+⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+"""
+
+    def _format_watch_block(self, watch: list) -> str:
+        if not watch:
+            return "데이터 없음"
+        lines = []
+        for w in watch[:10]:
+            ticker = w.get("ticker") or "-"
+            name = w.get("stock_name") or ticker
+            signal = str(w.get("signal") or "-").upper()
+            gap = self._fmt_pct(w.get("gap_pct"))
+            lines.append(f"• {name}({ticker}) {signal} 갭 {gap}")
+        return "\n".join(lines)
+
+    def _format_account_block(self, account: Optional[dict]) -> str:
+        if not account:
+            return "데이터 없음"
+        return (
+            f"예수금: {self._fmt_krw(account.get('deposit'))}\n"
+            f"총평가: {self._fmt_krw(account.get('total_equity'))}\n"
+            f"당일 실현손익: {self._fmt_krw(account.get('daily_realized_pnl'))}\n"
+            f"누적 수익률: {self._fmt_pct(account.get('cumulative_return_pct'))}"
+        )
+
+    def _format_holdings_block(self, holdings: list) -> str:
+        if not holdings:
+            return "보유 종목 없음"
+        lines = []
+        for h in holdings[:10]:
+            ticker = h.get("ticker") or "-"
+            name = h.get("stock_name") or ticker
+            qty = h.get("quantity") or 0
+            pnl = self._fmt_krw(h.get("unrealized_pnl"))
+            pnl_pct = self._fmt_pct(h.get("unrealized_pnl_pct"))
+            lines.append(f"• {name}({ticker}) {qty:,}주 손익 {pnl} ({pnl_pct})")
+        return "\n".join(lines)
+
+    def _format_strategy_block(self, strategy: Optional[dict]) -> str:
+        if not strategy:
+            return "데이터 없음"
+        stance = strategy.get("stance") or "-"
+        changed = "변경됨" if strategy.get("changed") else "유지"
+        rationale = (strategy.get("rationale_excerpt") or "").strip()
+        text = f"스탠스: {stance} ({changed})"
+        if rationale:
+            text += f"\n{rationale[:300]}"
+        return text
+
+    @staticmethod
+    def _fmt_krw(value) -> str:
+        if value is None:
+            return "―"
+        try:
+            if value < 0:
+                return f"-₩{abs(value):,.0f}"
+            sign = "+" if value > 0 else ""
+            return f"{sign}₩{value:,.0f}"
+        except (TypeError, ValueError):
+            return "―"
+
+    @staticmethod
+    def _fmt_pct(value) -> str:
+        if value is None:
+            return "―"
+        try:
+            sign = "+" if value >= 0 else ""
+            return f"{sign}{value:.2f}%"
+        except (TypeError, ValueError):
+            return "―"
+
+    # -------------------------------------------
     # Helpers
     # -------------------------------------------
 

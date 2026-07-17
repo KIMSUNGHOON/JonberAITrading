@@ -2329,7 +2329,57 @@ class ExecutionCoordinator:
             await run_eod_review(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase2 T4: EOD 리뷰(레짐/캘리브레이션/리포트+FK 백필)
             await run_strategy_consensus(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase3: EOD 전략 합의(리뷰 소비→TradingStrategy 갱신+버전 영속; 타임아웃/실패는 내부 소유)
             await reconcile_trade_ledger(self._kiwoom, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # E1-5: EOD 원장 대사 백스톱(ka10076 vs kr_stock_trades diff upsert; never-raise, 포지션 미변경)
+            await self._notify_eod_summary(datetime.now().strftime("%Y-%m-%d"))  # E3-3: 장마감 요약 통지(Telegram+WS) — run_eod_review가 저장한 digest/narrative 재조회
         self._market_was_open = is_open
+
+    async def _notify_eod_summary(self, trade_date: str) -> None:
+        """E3-3: best-effort Telegram + WS notification of the day's EOD
+        digest/narrative, appended after the market-close chain's other
+        steps (write_daily_snapshot -> run_eod_review -> run_strategy_
+        consensus -> reconcile_trade_ledger, all untouched/unreordered
+        above this call in `_check_queue_on_market_open`).
+
+        Re-reads the digest/narrative that run_eod_review's own E3-1/E3-2
+        steps just computed and persisted (report_json's "digest"/
+        "narrative" keys, via `storage.get_eod_reviews(limit=1)`) rather
+        than recomputing either. This is deliberate: `run_eod_review`'s
+        own return contract is a bare bool ("chain completed"), not the
+        report dict -- changing that contract would touch its own
+        docstring/every existing caller and test that already depends on
+        the bool shape, which is more invasive than one extra read of a
+        row this same market-close tick just wrote.
+
+        Never-raise (one try/except for the whole step), mirroring every
+        other EOD chain step above it (write_daily_snapshot/
+        run_eod_review/run_strategy_consensus/reconcile_trade_ledger all
+        document the same contract): a Telegram/WS delivery failure must
+        never break the market-close scheduler tick, especially not after
+        reconcile_trade_ledger already completed its ledger backstop work
+        this same tick.
+        """
+        try:
+            storage = await get_storage_service()
+            reviews = await storage.get_eod_reviews(limit=1)
+            if not reviews:
+                return
+
+            report = json.loads(reviews[0].get("report_json") or "{}")
+            digest = report.get("digest")
+            if not digest:
+                return
+            narrative = report.get("narrative")
+
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_daily_summary(digest, narrative)
+
+            from app.api.routes.websocket import broadcast_eod_summary
+
+            await broadcast_eod_summary(digest, narrative)
+        except Exception as e:
+            logger.warning(f"[Coordinator] EOD summary notification failed: {e}")
 
     async def _expire_tracked_orders_on_market_close(self) -> None:
         """F3: expire every still-TRACKING order on the open→closed edge and

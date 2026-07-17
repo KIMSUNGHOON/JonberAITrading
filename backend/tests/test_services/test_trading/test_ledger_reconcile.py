@@ -297,3 +297,19 @@ def test_coordinator_close_edge_calls_ledger_reconcile_after_strategy_consensus(
     source = inspect.getsource(ExecutionCoordinator._check_queue_on_market_open)
     assert "reconcile_trade_ledger(" in source
     assert source.index("run_strategy_consensus(") < source.index("reconcile_trade_ledger(")
+
+
+# ---------------------------------------------------------------------------
+# 배선 핀: E3-3 통지 스텝(_notify_eod_summary)은 마감 엣지에서
+# reconcile_trade_ledger 직후(맨 뒤)에 호출된다 -- 위 주석이 예고한 자리.
+# 기존 스텝 순서는 절대 재배열하지 않는다(append-only), 같은
+# inspect.getsource 관례로 이를 고정한다.
+# ---------------------------------------------------------------------------
+
+
+def test_coordinator_close_edge_calls_eod_summary_notify_after_ledger_reconcile():
+    from services.trading.coordinator import ExecutionCoordinator
+
+    source = inspect.getsource(ExecutionCoordinator._check_queue_on_market_open)
+    assert "_notify_eod_summary(" in source
+    assert source.index("reconcile_trade_ledger(") < source.index("_notify_eod_summary(")

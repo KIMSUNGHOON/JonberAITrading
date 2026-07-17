@@ -54,6 +54,26 @@ async def temp_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(ss, "_storage_service", None)
 
 
+@pytest.fixture(autouse=True)
+def _stub_telegram_notifier(monkeypatch):
+    """E3-3: ExecutionCoordinator._notify_eod_summary (now part of the
+    market-close edge every test in this file may exercise) calls
+    services.telegram.get_telegram_notifier(). Stub it to a never-ready
+    fake so nothing here can ever reach the real Telegram API -- this
+    repo's real .env has live bot credentials. Tests that specifically
+    want to observe the notify step (see the E3-3 section near the end of
+    this file) override this via their own monkeypatch/spy as needed."""
+    import services.telegram as telegram_module
+
+    class _NotReadyNotifier:
+        is_ready = False
+
+    async def _fake_get_telegram_notifier():
+        return _NotReadyNotifier()
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+
+
 def _stub_market(coord, is_open):
     coord._market_hours.get_market_session = lambda market: SimpleNamespace(
         is_open=is_open, message=""
@@ -1362,3 +1382,59 @@ async def test_reconcile_quantity_fix_refreshes_price_and_risk_monitor(temp_stor
     assert config.last_price == 270_000
     assert config.stop_loss == 246_560  # stops preserved through the re-register
     assert config.take_profit == 289_440
+
+
+
+# -------------------------------------------
+# E3-3: market-close edge appends _notify_eod_summary after
+# reconcile_trade_ledger. Source ordering itself is pinned via
+# inspect.getsource in test_ledger_reconcile.py (mirrors the
+# run_eod_review/run_strategy_consensus/reconcile_trade_ledger ordering
+# pins already there); these two tests pin RUNTIME behavior instead: the
+# step is actually invoked with today's trade_date on the close edge, and
+# a Telegram/WS delivery failure never breaks the rest of the close-edge
+# chain that already ran above it (never-raise, mirroring every other EOD
+# chain step's contract).
+# -------------------------------------------
+
+
+async def test_close_edge_invokes_eod_summary_notify_with_trade_date(temp_storage):
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    coord._market_was_open = True
+    _stub_market(coord, is_open=False)
+
+    calls = []
+
+    async def _spy_notify(trade_date):
+        calls.append(trade_date)
+
+    coord._notify_eod_summary = _spy_notify
+
+    with patch.object(eod_orchestrator, "narrate_eod_digest", AsyncMock(return_value=None)):
+        await coord._check_queue_on_market_open()
+
+    assert len(calls) == 1
+    assert calls[0] == date.today().strftime("%Y-%m-%d")
+
+
+async def test_close_edge_survives_eod_summary_notify_failure(temp_storage, monkeypatch):
+    """Telegram/WS delivery failing (e.g. broadcast_eod_summary raising)
+    must not break the market-close edge -- the whole notify step is one
+    never-raise try, mirroring every other EOD chain step's contract."""
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    coord.fill_tracker.register(_tracked_order(ord_no="A"))
+    coord._market_was_open = True
+    _stub_market(coord, is_open=False)
+
+    async def _boom(digest, narrative=None):
+        raise RuntimeError("ws broadcast boom")
+
+    monkeypatch.setattr("app.api.routes.websocket.broadcast_eod_summary", _boom)
+
+    with patch.object(eod_orchestrator, "narrate_eod_digest", AsyncMock(return_value=None)):
+        await coord._check_queue_on_market_open()  # must not raise
+
+    # The rest of the close-edge chain (which ran BEFORE the notify step)
+    # completed normally.
+    assert coord.fill_tracker.tracking() == []
+    assert coord._market_was_open is False
