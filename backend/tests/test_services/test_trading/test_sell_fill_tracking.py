@@ -1,22 +1,27 @@
-"""E1-1: SELL/REDUCE unfilled-remainder registration via `_track_unfilled`.
+"""E1-1/E1-2: SELL/REDUCE post-fill handling — tracking through reconciliation.
 
 Real incident: the ledger recorded 41 sold shares against a real 155-share
 broker sell (114주 missing) because fill-tracker registration was BUY-only
 (F3 gate `if side == OrderSide.BUY and result.status in ("pending",
 "partial")`) — the 30s ka10076 poll never learned about SELL remainders.
 
-This closes that gap: the F3 BUY block is generalized into
+E1-1 closed the registration gap: the F3 BUY block is generalized into
 `ExecutionCoordinator._track_unfilled`, a side-agnostic helper that
 `on_trade_approved` now calls for BOTH the BUY path and the SELL/REDUCE
 order-result. BUY behavior must stay byte-identical through the helper —
 pinned here (test 4) AND by the pre-existing `test_f3_fill_tracking.py`
 suite staying GREEN (the real evidence, per the task brief).
 
-`_poll_tracked_fills`'s sell POST-fill handling (closing/reducing a managed
-position) is E1-2's job. This file only pins the temporary safety guard
-that keeps a newly-tracked sell fill from flowing into
-`register_fill_as_position` — which increases a position and would double-
-count a sell as a buy if left unguarded (test 5).
+E1-2 closes the reconciliation gap: `_poll_tracked_fills`'s SELL delta branch
+now reconciles the LOCAL position (decrement/remove) and records realized
+P&L via `ExecutionCoordinator._apply_sell_position_delta` — the same helper
+`_apply_sell_fill` composes onto (extracted from it, no behavior change
+there; see the pre-existing `_apply_sell_fill` test coverage in
+`test_trades_recording_wiring.py` / `test_r5_p1_execution_reliability.py`
+staying GREEN as the byte-equivalence evidence). `register_fill_as_position`
+stays BUY-only — a SELL delta must never flow through it (would double-count
+a sell as a buy growing a position); this is now pinned by tests 5-7 as the
+FULL post-fill behavior (record + reconcile + notify), not just a guard.
 """
 
 from datetime import date, datetime
@@ -30,6 +35,8 @@ from services.trading.coordinator import ExecutionCoordinator
 from services.trading.market_hours import MarketSession
 from services.trading.models import (
     AllocationPlan,
+    ManagedPosition,
+    OrderRequest,
     OrderResult,
     OrderSide,
     TradingMode,
@@ -218,11 +225,13 @@ async def test_partial_buy_still_registers_with_buy_side(temp_storage):
 
 
 # -------------------------------------------
-# 5) _poll_tracked_fills temporary safety guard: a tracked SELL's fill delta
-#    must NOT flow into register_fill_as_position (would wrongly GROW a
-#    position from a sell fill). Full sell post-fill handling is E1-2's job —
-#    this guard only prevents the E1-1 registration from silently creating a
-#    double-count bug in the meantime.
+# 5) _poll_tracked_fills SELL delta with NO local position to reconcile
+#    (e.g. cleared by the reconciler, or a source that never locally tracked
+#    it) — the position decrement is a no-op (warned), but everything else
+#    (ledger record already happened above in the loop; notification here)
+#    still fires, same as any other post-fill discovery. `sell` must still
+#    NEVER flow into register_fill_as_position (would wrongly GROW a
+#    position from a sell fill).
 # -------------------------------------------
 
 
@@ -250,8 +259,8 @@ def _filled(ord_no, qty, price, buy_sell_tp="매도"):
     )
 
 
-def _tracked_sell_order(ord_no="SELL1", total=144, filled=0):
-    return TrackedOrder(
+def _tracked_sell_order(ord_no="SELL1", total=144, filled=0, **kw):
+    base = dict(
         ord_no=ord_no,
         ticker="005930",
         stock_name="삼성전자",
@@ -261,9 +270,19 @@ def _tracked_sell_order(ord_no="SELL1", total=144, filled=0):
         filled_amount=filled * 260_000,
         trade_date=date.today().strftime("%Y%m%d"),
     )
+    base.update(kw)
+    return TrackedOrder(**base)
 
 
-async def test_poll_guard_skips_position_registration_for_sell_fill(temp_storage):
+def _active_coordinator(kiwoom_client=None) -> ExecutionCoordinator:
+    """A coordinator with persistence active, as a real start()ed session
+    would have — mirrors test_trades_recording_wiring.py's helper."""
+    coord = ExecutionCoordinator(kiwoom_client=kiwoom_client)
+    coord._persistence_active = True
+    return coord
+
+
+async def test_poll_sell_delta_with_no_local_position_is_noop_but_still_notifies(temp_storage):
     coord = ExecutionCoordinator(
         kiwoom_client=_FakeKiwoomClient(filled_orders=[_filled("SELL1", 37, 260_000)])
     )
@@ -278,18 +297,27 @@ async def test_poll_guard_skips_position_registration_for_sell_fill(temp_storage
 
     await coord._poll_tracked_fills()
 
-    # No position was opened/grown from the sell fill (E1-2's job).
+    # No local position existed, so nothing was opened/grown — the sell
+    # fill did NOT flow into register_fill_as_position, and the decrement
+    # was a no-op (no position to decrement).
     assert coord._state.positions == []
-    # No fill notification either — belongs to E1-2's full handling.
-    assert alerts == []
-    # But the delta WAS applied to the tracked order itself — apply_fills
-    # already advanced filled_quantity before the guard short-circuits.
+    # But the fill was still discovered and notified — E1-2's full handling
+    # fires the same as a BUY post-fill would, regardless of whether a local
+    # position existed to reconcile.
+    assert len(alerts) == 1
+    assert alerts[0].ticker == "005930"
+    assert "매도" in alerts[0].message
+    assert any(
+        "사후 매도 체결" in a.message for a in coord._state.activity_log
+    )
+    # The delta WAS applied to the tracked order itself — apply_fills
+    # already advanced filled_quantity regardless of local position state.
     order = coord.fill_tracker._orders["SELL1"]
     assert order.filled_quantity == 37
 
 
 async def test_poll_guard_still_registers_buy_fill_as_position(temp_storage):
-    """Guard regression check: the new sell-only guard must not swallow BUY
+    """Guard regression check: the sell-only branch must not swallow BUY
     fills — they still flow through register_fill_as_position as before."""
     coord = ExecutionCoordinator(
         kiwoom_client=_FakeKiwoomClient(filled_orders=[_filled("BUY1", 48, 260_000, buy_sell_tp="매수")])
@@ -310,3 +338,161 @@ async def test_poll_guard_still_registers_buy_fill_as_position(temp_storage):
 
     assert len(coord._state.positions) == 1
     assert coord._state.positions[0].quantity == 48
+
+
+# -------------------------------------------
+# 6) _poll_tracked_fills SELL delta WITH a local position — full E1-2
+#    reconciliation: decrement/remove + realized P&L, on top of the ledger
+#    record. Real-incident shape: 37 shares were already recorded/decremented
+#    at order-placement time (via `_apply_sell_fill`, the existing SELL
+#    choke point), the remaining 107 were tracked as a remainder, and this
+#    poll tick discovers them — 37+107=144 must be the TRUE total, with no
+#    double count (idempotent apply_fills diffing, already proven for BUY).
+# -------------------------------------------
+
+
+def _sell_order_request(session_id="s-exit", price=260_000) -> OrderRequest:
+    return OrderRequest(
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.SELL,
+        quantity=144,
+        price=price,
+        session_id=session_id,
+    )
+
+
+def _sell_order_result(order_id="SELL1", filled=37, avg_price=260_000) -> OrderResult:
+    return OrderResult(
+        order_id=order_id,
+        ticker="005930",
+        side=OrderSide.SELL,
+        requested_quantity=144,
+        filled_quantity=filled,
+        avg_price=avg_price,
+        status="partial",
+    )
+
+
+async def test_poll_sell_delta_full_removal_sums_with_placement_fill_and_records_pnl(
+    temp_storage,
+):
+    coord = _active_coordinator(
+        kiwoom_client=_FakeKiwoomClient(filled_orders=[_filled("SELL1", 144, 260_000)])
+    )
+    coord._add_position(
+        ManagedPosition(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=144,
+            avg_price=250_000,
+            current_price=260_000,
+            analysis_session_id="s-entry",
+        )
+    )
+
+    # Order-placement time: 37 of 144 filled immediately — the REAL choke
+    # point (`_apply_sell_fill`) records the ledger row AND decrements the
+    # local position (144 -> 107), exactly like every other SELL caller.
+    coord._apply_sell_fill(
+        "005930", 37, order=_sell_order_request(), result=_sell_order_result(filled=37)
+    )
+    assert coord._state.positions[0].quantity == 107
+
+    # The remainder (107) is what E1-1's _track_unfilled would have
+    # registered — reproduced directly here since this test targets
+    # _poll_tracked_fills's reconciliation in isolation.
+    coord.fill_tracker.register(
+        _tracked_sell_order(
+            ord_no="SELL1", total=144, filled=37, source_session_id="s-exit"
+        )
+    )
+
+    alerts = []
+
+    async def _capture_alert(alert):
+        alerts.append(alert)
+
+    coord.set_alert_callback(_capture_alert)
+
+    from services.trading import trade_log
+
+    await coord._poll_tracked_fills()
+    await trade_log.wait_for_pending_trade_fill_writes()
+
+    # Full position removal: 107 (remaining) - 107 (poll delta) = 0.
+    assert coord._state.positions == []
+    assert "005930" not in coord.risk_monitor._watching
+
+    # SUM check — the placement-time fill (37) and the poll delta (107) are
+    # two SEPARATE ledger rows that together equal the TRUE total (144), not
+    # a double count of either portion.
+    rows = await temp_storage.get_kr_stock_trades()
+    assert len(rows) == 2
+    assert sum(r["executed_quantity"] for r in rows) == 144
+
+    # Realized P&L recorded for BOTH portions (37 then 107), same 37+107=144.
+    pnl_rows = await temp_storage.get_kr_realized_pnl(stk_cd="005930")
+    assert len(pnl_rows) == 2
+    assert sum(r["quantity"] for r in pnl_rows) == 144
+    for r in pnl_rows:
+        assert r["entry_price"] == 250_000
+
+    assert len(alerts) == 1
+    assert "매도" in alerts[0].message
+
+    # Idempotent re-poll: the tracked order already transitioned to FILLED
+    # (144/144), so a same-tick re-run must not re-call the broker, re-
+    # record, or re-notify — apply_fills's diff semantics apply to sell
+    # exactly like they already do for buy.
+    kiwoom_calls = coord._kiwoom.calls
+    await coord._poll_tracked_fills()
+    assert coord._kiwoom.calls == kiwoom_calls
+    rows_after = await temp_storage.get_kr_stock_trades()
+    assert len(rows_after) == 2
+    assert len(alerts) == 1
+
+
+async def test_poll_sell_delta_partial_reduce_keeps_watching_remainder(temp_storage):
+    coord = _active_coordinator(
+        kiwoom_client=_FakeKiwoomClient(filled_orders=[_filled("SELL2", 40, 260_000)])
+    )
+    coord._add_position(
+        ManagedPosition(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=200,
+            avg_price=250_000,
+            current_price=260_000,
+            analysis_session_id="s-entry",
+        )
+    )
+    coord.fill_tracker.register(
+        _tracked_sell_order(ord_no="SELL2", total=100, filled=0, source_session_id="s-exit")
+    )
+
+    from services.trading import trade_log
+
+    await coord._poll_tracked_fills()
+    await trade_log.wait_for_pending_trade_fill_writes()
+
+    # Partial reduce, not a full close — 200 - 40 = 160, still monitored.
+    assert len(coord._state.positions) == 1
+    assert coord._state.positions[0].quantity == 160
+    assert "005930" in coord.risk_monitor._watching
+
+    # The tracked order itself stays TRACKING — only 40 of its own 100 have
+    # filled so far.
+    order = coord.fill_tracker._orders["SELL2"]
+    assert order.filled_quantity == 40
+    assert coord.fill_tracker.tracking() != []
+
+    rows = await temp_storage.get_kr_stock_trades()
+    assert len(rows) == 1
+    assert rows[0]["quantity"] == 100  # order.total_quantity
+    assert rows[0]["executed_quantity"] == 40
+
+    pnl_rows = await temp_storage.get_kr_realized_pnl(stk_cd="005930")
+    assert len(pnl_rows) == 1
+    assert pnl_rows[0]["quantity"] == 40
+    assert pnl_rows[0]["entry_price"] == 250_000

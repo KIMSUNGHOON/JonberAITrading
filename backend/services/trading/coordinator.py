@@ -1026,6 +1026,14 @@ class ExecutionCoordinator:
         but every current call site passes both — this is the single choke
         point for recording a SELL fill (/trades, P1-1), independent of
         whether we still have a locally tracked position for `ticker`.
+
+        Composition (E1-2): the ledger write (record_trade_fill, above) stays
+        here — its fields (order_type/status/etc.) come from `order`/`result`,
+        which this method has but the shared delta helper below does not. The
+        position reconciliation (decrement/remove + realized P&L) is extracted
+        into `_apply_sell_position_delta` so `_poll_tracked_fills`'s post-fill
+        SELL delta branch — which only has a `TrackedOrder`/`FillDelta`, never
+        an `OrderRequest`/`OrderResult` — can reuse the exact same logic.
         """
         if filled_quantity <= 0:
             logger.warning(
@@ -1053,21 +1061,63 @@ class ExecutionCoordinator:
                 entry_or_exit="exit",
             )
 
+        # `avg_price=None` (order/result missing) tells the delta helper below
+        # there is no known exit price for this fill, so it must skip realized
+        # P&L (matching the pre-extraction behavior: that block was gated on
+        # `order is not None and result is not None` too) while STILL
+        # reconciling the local position quantity, which was unconditional.
+        _exit_price: Optional[float] = None
+        _session_id: Optional[str] = None
+        if order is not None and result is not None:
+            _exit_price = result.avg_price or order.price or 0
+            _session_id = order.session_id
+
+        self._apply_sell_position_delta(ticker, filled_quantity, _exit_price, _session_id)
+
+    def _apply_sell_position_delta(
+        self,
+        ticker: str,
+        quantity: int,
+        avg_price: Optional[float],
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Decrement/remove the LOCAL position for a SELL fill and record
+        realized P&L — no ledger write here (callers own `record_trade_fill`
+        separately, since its fields differ per call site).
+
+        Full fill → remove; partial → reduce and keep monitoring the
+        remainder (unchanged from `_apply_sell_fill`'s pre-extraction
+        behavior). No local position found for `ticker` (e.g. the reconciler
+        already cleared it, or — for a fill-tracker SELL delta — the order's
+        earlier partial fill was recorded through a path that never touched
+        `_state.positions`) → warn and no-op; decrement is meaningless
+        without a position to decrement.
+
+        `avg_price=None` means the caller has no known exit price for this
+        fill (only `_apply_sell_fill`'s bare-caller fallback does this) —
+        realized P&L needs an exit price to match against the position's
+        entry price, so it is skipped in that case (mirrors
+        `_apply_sell_fill`'s pre-extraction behavior of skipping
+        `record_kr_realized_pnl` whenever `order`/`result` were absent).
+        """
         position = next(
             (p for p in self._state.positions if p.ticker == ticker), None
         )
         if position is None:
+            logger.warning(
+                f"[Coordinator] SELL fill for {ticker} ({quantity}주) has no "
+                "local position to reconcile — skipping decrement/realized P&L"
+            )
             return
 
         # T4: matched realized P&L — entry avg_price+analysis_session_id and exit fill both in scope here
-        if self._persistence_active and order is not None and result is not None:
-            _matched = min(filled_quantity, position.quantity)
-            _exit = result.avg_price or order.price or 0
+        if self._persistence_active and avg_price is not None:
+            _matched = min(quantity, position.quantity)
             _now = datetime.now()
             record_kr_realized_pnl(
-                stk_cd=ticker, entry_price=position.avg_price, exit_price=_exit,
-                quantity=_matched, realized_amount=(_exit - position.avg_price) * _matched,
-                entry_decision_id=position.analysis_session_id, exit_decision_id=order.session_id,
+                stk_cd=ticker, entry_price=position.avg_price, exit_price=avg_price,
+                quantity=_matched, realized_amount=(avg_price - position.avg_price) * _matched,
+                entry_decision_id=position.analysis_session_id, exit_decision_id=session_id,
                 entry_at=position.entry_time,
                 exit_at=_now,
                 holding_period_seconds=(
@@ -1076,17 +1126,17 @@ class ExecutionCoordinator:
                 ),
             )
 
-        if filled_quantity >= position.quantity:
+        if quantity >= position.quantity:
             self._remove_position(ticker)
         else:
-            position.quantity -= filled_quantity
+            position.quantity -= quantity
             position.last_updated = datetime.now()
             # Re-register so the monitor watches the reduced size (keeps stops).
             self.risk_monitor.remove_position(ticker)
             self.risk_monitor.add_position(position)
             self._schedule_persist()
             logger.info(
-                f"[Coordinator] Position {ticker} reduced by {filled_quantity}; "
+                f"[Coordinator] Position {ticker} reduced by {quantity}; "
                 f"{position.quantity} remaining"
             )
 
@@ -2245,70 +2295,106 @@ class ExecutionCoordinator:
                     entry_or_exit="entry" if order.side == "buy" else "exit",
                 )
 
-            # E1-1 temporary safety guard: a SELL's fill delta must NOT flow
-            # into register_fill_as_position below — that call only ever
-            # GROWS a position, so an unguarded sell fill here would double-
-            # count it as a buy. Full sell post-fill handling (closing or
-            # reducing the managed position, notifying, queue annotation) is
-            # E1-2's job; until that lands, a tracked sell fill is recorded
-            # above (record_trade_fill, side-aware) and nothing else.
+            # E1-2: a SELL's fill delta must NOT flow into
+            # register_fill_as_position below — that call only ever GROWS a
+            # position, so an unguarded sell fill here would double-count it
+            # as a buy. Instead, reconcile the local position via the same
+            # helper `_apply_sell_fill` uses (decrement/remove + realized
+            # P&L; the ledger row was already recorded above, side-aware).
             if order.side == "sell":
-                continue
+                self._apply_sell_position_delta(
+                    order.ticker,
+                    delta.new_fill_qty,
+                    delta.avg_fill_price,
+                    order.source_session_id,
+                )
 
-            await register_fill_as_position(
-                self,
-                ticker=order.ticker,
-                stock_name=order.stock_name or order.ticker,
-                quantity=delta.new_fill_qty,
-                avg_price=delta.avg_fill_price,
-                stop_loss=order.stop_loss,
-                take_profit=order.take_profit,
-                session_id=order.source_session_id,
-                source="fill_tracker",
-                # Match the placement-fill path's position semantics
-                # (stop_loss_mode from risk params, risk from the proposal).
-                stop_loss_mode=self.risk_params.stop_loss_mode,
-                risk_score=order.risk_score,
-            )
-
-            self._log_activity(
-                ActivityType.POSITION_OPENED,
-                f"사후 체결: {order.stock_name or order.ticker} {delta.new_fill_qty}주 "
-                f"@ ₩{delta.avg_fill_price:,.0f}",
-                agent="order",
-                ticker=order.ticker,
-                details={
-                    "ord_no": order.ord_no,
-                    "new_fill_qty": delta.new_fill_qty,
-                    "avg_fill_price": delta.avg_fill_price,
-                    "stop_loss": order.stop_loss,
-                },
-            )
-
-            stop_note = (
-                f" — 손절 ₩{order.stop_loss:,.0f} 감시 시작" if order.stop_loss else ""
-            )
-            await self._on_alert(
-                TradingAlert(
-                    id=str(uuid.uuid4())[:8],
-                    alert_type=AlertType.ORDER_FILLED,
+                self._log_activity(
+                    ActivityType.POSITION_CLOSED,
+                    f"사후 매도 체결: {order.stock_name or order.ticker} "
+                    f"{delta.new_fill_qty}주 @ ₩{delta.avg_fill_price:,.0f}",
+                    agent="order",
                     ticker=order.ticker,
-                    title="사후 체결 감지",
-                    message=(
-                        f"{order.stock_name or order.ticker} {delta.new_fill_qty}주 "
-                        f"@ ₩{delta.avg_fill_price:,.0f} 체결 확인{stop_note}"
-                    ),
-                    data={
+                    details={
                         "ord_no": order.ord_no,
                         "new_fill_qty": delta.new_fill_qty,
                         "avg_fill_price": delta.avg_fill_price,
                     },
                 )
-            )
+
+                await self._on_alert(
+                    TradingAlert(
+                        id=str(uuid.uuid4())[:8],
+                        alert_type=AlertType.ORDER_FILLED,
+                        ticker=order.ticker,
+                        title="사후 매도 체결 감지",
+                        message=(
+                            f"{order.stock_name or order.ticker} "
+                            f"{delta.new_fill_qty}주 @ ₩{delta.avg_fill_price:,.0f} "
+                            "매도 체결 확인"
+                        ),
+                        data={
+                            "ord_no": order.ord_no,
+                            "new_fill_qty": delta.new_fill_qty,
+                            "avg_fill_price": delta.avg_fill_price,
+                        },
+                    )
+                )
+            else:
+                await register_fill_as_position(
+                    self,
+                    ticker=order.ticker,
+                    stock_name=order.stock_name or order.ticker,
+                    quantity=delta.new_fill_qty,
+                    avg_price=delta.avg_fill_price,
+                    stop_loss=order.stop_loss,
+                    take_profit=order.take_profit,
+                    session_id=order.source_session_id,
+                    source="fill_tracker",
+                    # Match the placement-fill path's position semantics
+                    # (stop_loss_mode from risk params, risk from the proposal).
+                    stop_loss_mode=self.risk_params.stop_loss_mode,
+                    risk_score=order.risk_score,
+                )
+
+                self._log_activity(
+                    ActivityType.POSITION_OPENED,
+                    f"사후 체결: {order.stock_name or order.ticker} {delta.new_fill_qty}주 "
+                    f"@ ₩{delta.avg_fill_price:,.0f}",
+                    agent="order",
+                    ticker=order.ticker,
+                    details={
+                        "ord_no": order.ord_no,
+                        "new_fill_qty": delta.new_fill_qty,
+                        "avg_fill_price": delta.avg_fill_price,
+                        "stop_loss": order.stop_loss,
+                    },
+                )
+
+                stop_note = (
+                    f" — 손절 ₩{order.stop_loss:,.0f} 감시 시작" if order.stop_loss else ""
+                )
+                await self._on_alert(
+                    TradingAlert(
+                        id=str(uuid.uuid4())[:8],
+                        alert_type=AlertType.ORDER_FILLED,
+                        ticker=order.ticker,
+                        title="사후 체결 감지",
+                        message=(
+                            f"{order.stock_name or order.ticker} {delta.new_fill_qty}주 "
+                            f"@ ₩{delta.avg_fill_price:,.0f} 체결 확인{stop_note}"
+                        ),
+                        data={
+                            "ord_no": order.ord_no,
+                            "new_fill_qty": delta.new_fill_qty,
+                            "avg_fill_price": delta.avg_fill_price,
+                        },
+                    )
+                )
 
             # Post-fill queue annotation: the queue item that originated this
             # order (if any) gets a note appended — its status vocabulary is
-            # unchanged (design spec §4.1/§7).
+            # unchanged (design spec §4.1/§7). Shared by both sides.
             if order.source_queue_id:
                 queued = next(
                     (
