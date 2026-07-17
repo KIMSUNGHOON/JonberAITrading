@@ -620,3 +620,176 @@ async def test_send_message_reply_markup_defaults_to_none_for_existing_callers()
 
     kwargs = notifier._bot.send_message.await_args.kwargs
     assert kwargs["reply_markup"] is None
+
+
+
+# -------------------------------------------
+# 9: TG-3 review fix (Critical-2) -- Telegram notify dedup marker
+#
+# Repro (review): reconcile_stranded_sessions() always clears auto_approve_at
+# on every session it loads (session_manager.py), which defeats rearm's
+# `_has_future_auto_approve_at` skip -- so every restart used to re-send a
+# brand new approval button for every still-AWAITING session ("rearm 3회→
+# send 3회"). The fix: `maybe_schedule_auto_approve` now reads/writes a
+# `telegram_notified_proposal_id` marker on the SM session state and skips
+# the actual Telegram send (never the scheduling) when the marker already
+# matches the CURRENT proposal id.
+# -------------------------------------------
+
+
+async def test_dedup_skips_resend_when_same_proposal_scheduled_twice(sm, monkeypatch):
+    session_id = "inj-tg3-dedup-1"
+    await sm.create_session(
+        session_id=session_id, market_type=MarketType.KIWOOM, ticker="005930",
+        display_name="삼성전자",
+        state={"trade_proposal": {"id": "p1", "action": "BUY", "quantity": 10, "entry_price": 50000},
+               "reasoning_log": []},
+    )
+
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="hitl mode", check="market_mode")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", deny_gate)
+
+    fake_notifier = _fake_notifier_recorder()
+
+    async def fake_get_notifier():
+        return fake_notifier
+
+    monkeypatch.setattr(injector_module, "get_telegram_notifier", fake_get_notifier)
+
+    await injector_module.maybe_schedule_auto_approve(session_id, "kiwoom")
+    await injector_module.maybe_schedule_auto_approve(session_id, "kiwoom")
+
+    fake_notifier.send_approval_request.assert_awaited_once()
+
+    session = await sm.get_session(session_id)
+    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p1"
+
+
+async def test_dedup_resends_when_reanalysis_changes_proposal_id(sm, monkeypatch):
+    session_id = "inj-tg3-dedup-2"
+    await sm.create_session(
+        session_id=session_id, market_type=MarketType.KIWOOM, ticker="005930",
+        display_name="삼성전자",
+        state={"trade_proposal": {"id": "p1", "action": "BUY", "quantity": 10, "entry_price": 50000},
+               "reasoning_log": []},
+    )
+
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="hitl mode", check="market_mode")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", deny_gate)
+
+    fake_notifier = _fake_notifier_recorder()
+
+    async def fake_get_notifier():
+        return fake_notifier
+
+    monkeypatch.setattr(injector_module, "get_telegram_notifier", fake_get_notifier)
+
+    await injector_module.maybe_schedule_auto_approve(session_id, "kiwoom")
+    fake_notifier.send_approval_request.assert_awaited_once()
+
+    # Reject -> re-analysis produced a brand NEW proposal on the same row.
+    await sm.update_state(
+        session_id,
+        {"trade_proposal": {"id": "p2", "action": "BUY", "quantity": 5, "entry_price": 51000}},
+    )
+
+    await injector_module.maybe_schedule_auto_approve(session_id, "kiwoom")
+
+    assert fake_notifier.send_approval_request.await_count == 2
+    second_call_args = fake_notifier.send_approval_request.await_args_list[1].args
+    assert second_call_args[2]["id"] == "p2"
+
+    session = await sm.get_session(session_id)
+    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p2"
+
+
+async def test_marker_persist_failure_never_blocks_send_or_schedule(sm, monkeypatch, fast_grace):
+    session_id = "inj-tg3-dedup-persist-fail"
+    await sm.create_session(
+        session_id=session_id, market_type=MarketType.KIWOOM, ticker="005930",
+        display_name="삼성전자",
+        state={"trade_proposal": {"id": "p1", "action": "BUY", "quantity": 10, "entry_price": 50000},
+               "reasoning_log": []},
+    )
+    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", allow_gate)
+
+    async def noop_submit(*a, **k):
+        return None
+
+    monkeypatch.setattr("app.api.routes.approval.submit_decision", noop_submit)
+
+    fake_notifier = _fake_notifier_recorder()
+
+    async def fake_get_notifier():
+        return fake_notifier
+
+    monkeypatch.setattr(injector_module, "get_telegram_notifier", fake_get_notifier)
+
+    real_update_state = sm.update_state
+
+    async def flaky_update_state(sid, updates, *a, **k):
+        if injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY in updates:
+            raise RuntimeError("sm write down (simulated)")
+        return await real_update_state(sid, updates, *a, **k)
+
+    monkeypatch.setattr(sm, "update_state", flaky_update_state)
+
+    await injector_module.maybe_schedule_auto_approve(session_id, "kiwoom")
+
+    # Send happened, scheduling happened -- the marker write's own failure
+    # never propagated into either.
+    fake_notifier.send_approval_request.assert_awaited_once()
+    session = await sm.get_session(session_id)
+    assert session.state.get("auto_approve_at") is not None
+    # And the marker itself was NOT persisted (its write raised) -- proving
+    # this assertion isn't vacuously true because the write silently no-oped.
+    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) is None
+
+    await asyncio.sleep(0.1)  # let the fast-grace background task settle
+
+
+async def test_rearm_dedup_skips_resend_across_repeated_restart_simulations(sm, monkeypatch):
+    """The literal review repro: rearm_awaiting_approvals() runs on every
+    app startup, and reconcile_stranded_sessions() always clears
+    auto_approve_at first -- so a bare repeated rearm call already
+    reproduces "restart N times while still awaiting" without needing to
+    fake a second OS process. Before the Critical-2 fix this sent N
+    messages for N rearm calls ("rearm 3회→send 3회")."""
+    session_id = "inj-tg3-rearm-dedup"
+    await sm.create_session(
+        session_id=session_id, market_type=MarketType.KIWOOM, ticker="005930",
+        display_name="삼성전자",
+        state={
+            "awaiting_approval": True,
+            "trade_proposal": {"id": "p1", "action": "BUY", "quantity": 10, "entry_price": 50000},
+            "reasoning_log": [],
+        },
+    )
+    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="hitl mode", check="market_mode")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", deny_gate)
+
+    fake_notifier = _fake_notifier_recorder()
+
+    async def fake_get_notifier():
+        return fake_notifier
+
+    monkeypatch.setattr(injector_module, "get_telegram_notifier", fake_get_notifier)
+
+    await injector_module.rearm_awaiting_approvals()
+    await injector_module.rearm_awaiting_approvals()
+    await injector_module.rearm_awaiting_approvals()
+
+    fake_notifier.send_approval_request.assert_awaited_once()

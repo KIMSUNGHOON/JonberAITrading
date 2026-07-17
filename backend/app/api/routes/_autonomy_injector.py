@@ -55,6 +55,17 @@ logger = structlog.get_logger()
 # Fixed 60s grace window (user decision). Module constant so tests can patch it.
 AUTONOMY_GRACE_SECONDS = 60.0
 
+# TG-3 review fix (Critical-2): session-state key recording the proposal id a
+# Telegram approval-request message was last actually SENT for. See
+# `_send_approval_request_notification` / `rearm_awaiting_approvals` below --
+# without this, every rearm_awaiting_approvals() pass (which runs on every
+# app startup, AFTER reconcile_stranded_sessions() has already unconditionally
+# cleared auto_approve_at -- see session_manager.py's reconcile -- and so can
+# never rely on `_has_future_auto_approve_at` to skip a still-awaiting
+# session) would re-send a brand new button message for every AWAITING
+# session on every restart.
+TELEGRAM_NOTIFIED_PROPOSAL_KEY = "telegram_notified_proposal_id"
+
 
 def _proposal_fields(state: dict) -> dict:
     """P2-6: operates on a session's `state` dict directly (a live
@@ -110,6 +121,13 @@ async def maybe_schedule_auto_approve(session_id: str, market: str) -> None:
         fields = _proposal_fields(sm_session.state)
         decision = await check_autonomy(market, **fields)
 
+        # Pin the proposal identity up front: used both by the grace task
+        # below (approve only the exact proposal announced) and by the
+        # Telegram dedup marker (Critical-2 fix, see
+        # TELEGRAM_NOTIFIED_PROPOSAL_KEY) -- a single read instead of two
+        # independent ones of the same field.
+        proposal_id = (sm_session.state.get("trade_proposal") or {}).get("id")
+
         auto_approve_at: str | None = None
 
         if decision.allowed:
@@ -131,13 +149,6 @@ async def maybe_schedule_auto_approve(session_id: str, market: str) -> None:
                 {"auto_approve_at": auto_approve_at, "reasoning_log": reasoning_log},
             )
 
-            # Pin the proposal identity: the grace task may only approve the
-            # exact proposal it announced. A reject→re-analyze cycle mutates
-            # the SAME SM row in place and can re-arm awaiting_approval with
-            # a NEW proposal — without this pin the stale timer could
-            # approve a proposal the user never saw (and with zero grace).
-            proposal_id = (sm_session.state.get("trade_proposal") or {}).get("id")
-
             asyncio.create_task(
                 _auto_approve_after_grace(session_id, market, proposal_id)
             )
@@ -157,7 +168,7 @@ async def maybe_schedule_auto_approve(session_id: str, market: str) -> None:
             )
 
         await _send_approval_request_notification(
-            session_id, market, sm_session.state, auto_approve_at
+            session_id, market, sm_session.state, proposal_id, auto_approve_at
         )
     except Exception as e:
         # Fail-closed: scheduling problems leave the session plain HITL.
@@ -257,23 +268,66 @@ async def _auto_approve_after_grace(
 
 
 async def _send_approval_request_notification(
-    session_id: str, market: str, state: dict, auto_approve_at: str | None
+    session_id: str, market: str, state: dict, proposal_id: str | None,
+    auto_approve_at: str | None,
 ) -> None:
     """Best-effort Telegram approve/reject inline-keyboard request (TG-3,
     spec F1) — replaces `_notify_pending`'s old auto-only text heads-up.
     Fires unconditionally for both HITL (`auto_approve_at is None`) and
     autonomous (`auto_approve_at` set) sessions; any failure here is
     swallowed so it can never affect the awaiting-commit/scheduling
-    pipeline that already completed by the time this runs."""
+    pipeline that already completed by the time this runs.
+
+    TG-3 review fix (Critical-2): dedups on `proposal_id` before sending.
+    `maybe_schedule_auto_approve` is called far more than once per proposal
+    in practice -- most notably `rearm_awaiting_approvals()` re-scanning
+    every still-AWAITING session on EVERY app startup, since
+    reconcile_stranded_sessions() always clears auto_approve_at first (see
+    TELEGRAM_NOTIFIED_PROPOSAL_KEY's module-level comment), which defeats
+    the `_has_future_auto_approve_at` skip in rearm. `state` here is the
+    live SM session state (whatever the caller already resolved), so a
+    marker written earlier in THIS process is visible immediately even
+    before its debounced SQLite flush lands; a marker written by an EARLIER
+    process is visible because it's part of the state_json a restart
+    reloads. A session whose proposal has no `id` (defensive only -- every
+    real trade_proposal carries one) always sends, since there is no safe
+    identity to dedup on."""
     try:
         proposal = state.get("trade_proposal") or {}
         if not proposal:
             return
+        if proposal_id is not None and state.get(TELEGRAM_NOTIFIED_PROPOSAL_KEY) == proposal_id:
+            logger.info(
+                "approval_request_notify_skipped_duplicate",
+                session_id=session_id,
+                proposal_id=proposal_id,
+            )
+            return
         notifier = await get_telegram_notifier()
         if notifier.is_ready:
             await notifier.send_approval_request(session_id, market, proposal, auto_approve_at)
+            await _persist_notified_marker(session_id, proposal_id)
     except Exception as e:
         logger.warning("approval_request_notify_failed", session_id=session_id, error=str(e))
+
+
+async def _persist_notified_marker(session_id: str, proposal_id: str | None) -> None:
+    """Best-effort dedup-marker write (Critical-2 fix). Deliberately its own
+    try/except, separate from the send call above: a failure here must never
+    be mistaken for (or interfere with) a send failure, and must never
+    propagate -- the awaiting/scheduling flow this runs after has already
+    completed. Worst case on a persist failure is exactly one further
+    duplicate notification the next time this proposal is (re-)scheduled,
+    never a missed one, which the task brief accepts explicitly."""
+    if proposal_id is None:
+        return
+    try:
+        sm = await get_session_manager()
+        await sm.update_state(session_id, {TELEGRAM_NOTIFIED_PROPOSAL_KEY: proposal_id})
+    except Exception as e:
+        logger.warning(
+            "telegram_notified_marker_persist_failed", session_id=session_id, error=str(e)
+        )
 
 
 # -------------------------------------------
@@ -325,6 +379,22 @@ async def rearm_awaiting_approvals() -> None:
     - any error scanning or scheduling a single session is logged and that
       session is skipped — never raised — so one bad session can't block
       startup or the rest of the pass.
+
+    TG-3 review fix (Critical-2): this pass runs on EVERY startup, and
+    reconcile_stranded_sessions() (called from inside SessionManager's own
+    initialize(), which app/main.py's lifespan awaits via get_session_manager()
+    BEFORE calling this function) unconditionally clears auto_approve_at on
+    every session it loads — so the FUTURE-auto_approve_at skip above never
+    actually fires for a session that survived a restart, and every prior
+    restart used to re-send a brand new Telegram button for every AWAITING
+    session. maybe_schedule_auto_approve()'s own TELEGRAM_NOTIFIED_PROPOSAL_KEY
+    dedup (see its docstring) is what now makes repeated rearm passes for the
+    SAME proposal safe. One accepted side effect: a session reconcile flipped
+    BACK to AWAITING_APPROVAL from a stranded RUNNING shape (an unclean-exit
+    recovery, not a normal restart of an already-awaiting session) never had
+    a marker written for it in the first place, so it still gets a fresh
+    button on this rearm pass — which is desirable, since that session's
+    operator-facing state materially changed across the restart.
     """
     candidates: dict[str, str] = {}  # session_id -> market
 

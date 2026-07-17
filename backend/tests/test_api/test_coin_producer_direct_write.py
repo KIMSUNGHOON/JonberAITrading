@@ -28,11 +28,13 @@ Headless: 스텁 그래프 astream + 테스트 SQLite db 위의 실제 SessionMa
 
 import asyncio
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi import BackgroundTasks
 
+import app.api.routes._autonomy_injector as injector_module
 import services.session_manager as sm_module
 from services.session_manager import MarketType, SessionManager, SessionStatus
 
@@ -44,6 +46,27 @@ from app.api.routes.coin.analysis import (
 )
 
 TEST_DB_PATH = "data/test_coin_producer_direct_write.db"
+
+
+@pytest.fixture(autouse=True)
+def no_real_telegram(monkeypatch):
+    """TG-3 review fix (Critical-1): the awaiting-approval graph path in this
+    file (`_AwaitingGraph`, used by several tests below) runs all the way
+    through `_finalize_awaiting_transition` -> `maybe_schedule_auto_approve`,
+    which always attempts a best-effort Telegram send (TG-3). Without this,
+    running this file with a real `.env` (TELEGRAM_ENABLED=true) sends a
+    real Telegram message on every awaiting-approval test (실증됨:
+    `telegram_send_failed ... Event loop is closed` in this file's own
+    output) -- constraint: 실 네트워크 금지. Mirrors the identical fixture
+    in test_autonomy_injector.py / test_telegram_approval_buttons.py; a fake
+    notifier with is_ready=False is sufficient since the send call always
+    checks that first."""
+    fake_notifier = SimpleNamespace(is_ready=False)
+
+    async def fake_get_notifier():
+        return fake_notifier
+
+    monkeypatch.setattr(injector_module, "get_telegram_notifier", fake_get_notifier)
 
 
 @pytest.fixture
