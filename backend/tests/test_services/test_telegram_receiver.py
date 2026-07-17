@@ -239,3 +239,54 @@ async def test_start_receiver_shutdown_failure_after_initialize_failure_still_re
 
     assert result is None
     mock_application.shutdown.assert_awaited_once()
+
+
+# -------------------------------------------
+# 8. start_telegram_receiver — explicitly imports commands.py so TG-2's
+#    /status /positions /pending /report register even if nothing else in
+#    the import graph happened to import services.telegram.commands first
+#    (TG-1 carryover finding: register_command is an import-time side
+#    effect -- a module that never gets imported never registers).
+# -------------------------------------------
+
+
+async def test_start_receiver_wires_tg2_commands_via_explicit_import(monkeypatch):
+    import sys
+
+    monkeypatch.setattr(receiver, "get_telegram_config", lambda: _config())
+
+    # Force a REAL re-import: drop the cached module AND the attribute the
+    # import system stashed on the parent package (services.telegram) --
+    # `from . import commands` resolves via `hasattr(package, "commands")`
+    # BEFORE consulting sys.modules, so removing it from sys.modules alone
+    # is not enough to force re-execution of commands.py's top-level
+    # register_command(...) calls. Then reset the registry to only the
+    # built-in "help", simulating a process where commands.py was never
+    # imported by anything else. If the explicit `from . import commands`
+    # inside start_telegram_receiver were ever removed, this would fail
+    # (_COMMAND_REGISTRY would stay help-only).
+    import services.telegram as telegram_pkg
+
+    monkeypatch.delitem(sys.modules, "services.telegram.commands", raising=False)
+    monkeypatch.delattr(telegram_pkg, "commands", raising=False)
+    monkeypatch.setattr(receiver, "_COMMAND_REGISTRY", {"help": receiver._COMMAND_REGISTRY["help"]})
+
+    mock_updater = MagicMock()
+    mock_updater.start_polling = AsyncMock(return_value=None)
+    mock_updater.stop = AsyncMock(return_value=None)
+
+    mock_application = MagicMock()
+    mock_application.updater = mock_updater
+    mock_application.initialize = AsyncMock(return_value=None)
+    mock_application.start = AsyncMock(return_value=None)
+    mock_application.add_handler = MagicMock()
+
+    mock_builder = MagicMock()
+    mock_builder.token.return_value.build.return_value = mock_application
+    monkeypatch.setattr(receiver.Application, "builder", lambda: mock_builder)
+
+    result = await receiver.start_telegram_receiver()
+
+    assert result is mock_application
+    for name in ("status", "positions", "pending", "report"):
+        assert name in receiver._COMMAND_REGISTRY

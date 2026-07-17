@@ -27,12 +27,16 @@ This module owns:
     value.
   - `register_command(name, handler)` / `register_callback(pattern_prefix,
     handler)`: module-level registries populated at IMPORT time by later
-    tasks (TG-2 approval buttons, TG-3 /halt+/auto, TG-4 read-only
-    queries). `start_telegram_receiver()` wires every registered entry
-    into a CommandHandler/CallbackQueryHandler and applies the shared
-    security wrapper (`_wrap_command`/`_wrap_callback`) so no individual
-    handler can forget the chat_id check or the never-raise contract --
-    the security invariants live in exactly one place.
+    tasks (TG-2 read-only queries, TG-3 approval buttons, TG-4 /halt+/auto).
+    `start_telegram_receiver()` explicitly imports each task's module (see
+    the `from . import commands` line inside it) so registration is
+    structurally guaranteed rather than depending on some other module
+    having imported it first -- see `commands.py`'s module docstring for
+    the TG-1 carryover finding this fixes -- and then wires every
+    registered entry into a CommandHandler/CallbackQueryHandler, applying
+    the shared security wrapper (`_wrap_command`/`_wrap_callback`) so no
+    individual handler can forget the chat_id check or the never-raise
+    contract -- the security invariants live in exactly one place.
   - `_authorized(update)`: `effective_chat.id == TELEGRAM_CHAT_ID`
     (normalized to str on both sides -- the wire value is always an int,
     the configured value may be entered as either str or int).
@@ -272,6 +276,18 @@ async def start_telegram_receiver() -> Optional[Application]:
 
     application: Optional[Application] = None
     try:
+        # TG-2 carryover fix: `register_command` populates _COMMAND_REGISTRY
+        # as an IMPORT-TIME side effect (see commands.py's module docstring)
+        # -- relying on "main.py imports every route module before this
+        # runs" to guarantee that side effect fired is fragile (a module
+        # that never gets imported never registers). Explicitly importing
+        # each task's command module here, right before the registry is
+        # drained, makes the guarantee structural instead of incidental.
+        # Idempotent/cheap if already imported (Python caches in
+        # sys.modules) and safe to extend as TG-3/TG-4 add their own
+        # modules.
+        from . import commands  # noqa: F401 -- import for registration side effect
+
         application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
         for cmd_name, handler in _COMMAND_REGISTRY.items():
