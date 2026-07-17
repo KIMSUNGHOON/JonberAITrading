@@ -1,5 +1,6 @@
 """
-Telegram Read-Only Query Commands (TG-2)
+Telegram Read-Only Query Commands (TG-2) + /halt·/auto Emergency Mode
+Switches (TG-4)
 
 Implements the four read-only commands of the two-way Telegram arc (see
 docs/superpowers/specs/2026-07-17-telegram-twoway-design.md F3):
@@ -54,6 +55,15 @@ upstream data (ticker names, rationale text, ...) can never trigger a
 Telegram parse error — this holds even for /report, whose reused format
 strings contain literal `*bold*` markers: without `parse_mode`, Telegram
 sends them back verbatim rather than parsing (and failing on) them.
+
+TG-4 adds two mode-switch commands at the bottom of this module (see the
+"/halt and /auto" section below for the full contract): `/halt` is a
+one-step fail-safe emergency stop (kiwoom autonomous -> hitl, no
+confirmation); `/auto` is the 2-step reverse (hitl -> autonomous) whose
+step-2 confirm button is handled in `services/telegram/callbacks.py`
+(`AUTO_CONFIRM_CALLBACK_DATA` / `handle_auto_confirm_callback`) rather than
+here, mirroring how F1's approve/reject buttons live in callbacks.py while
+their originating notification lives elsewhere.
 """
 
 from __future__ import annotations
@@ -62,7 +72,7 @@ import json
 from typing import Any, Awaitable, Optional, TypeVar
 
 import structlog
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from services.telegram.receiver import register_command
@@ -343,6 +353,106 @@ async def handle_report(update: Update, context: "ContextTypes.DEFAULT_TYPE") ->
 
 
 # -------------------------------------------
+# /halt and /auto -- emergency stop + 2-step resume (TG-4)
+#
+# Spec: docs/superpowers/specs/2026-07-17-telegram-twoway-design.md F2.
+# Both are Autonomous|HITL *mode* switches for kiwoom (settings.py's
+# trading_mode:kiwoom setting the shared autonomy gate re-reads on every
+# request, see services/autonomy/gate.py) -- NEITHER has anything to do
+# with the existing `POST /trading/pause` / `POST /trading/resume`
+# (trading.py:186-222), which pause/resume the trading COORDINATOR's own
+# session scheduler. A halted kiwoom mode still lets the coordinator run;
+# it only forces every future proposal through manual HITL approval
+# instead of the 60s auto-approve countdown.
+# -------------------------------------------
+
+AUTO_CONFIRM_CALLBACK_DATA = "auto_confirm"
+"""callback_data for /auto's step-2 confirm button. A fixed literal --
+unlike F1's `a:{session_id}:{pid8}` / `r:{session_id}:{pid8}` buttons, this
+action is market/mode-scoped (kiwoom's Autonomous|HITL setting), not
+proposal-scoped, so there is no session_id to pin. services/telegram/
+callbacks.py registers a handler for this exact string
+(`register_callback("auto_confirm", ...)`) and re-declares the same
+literal as `callbacks.AUTO_CONFIRM_CALLBACK_DATA` -- the two modules
+intentionally agree by string convention rather than a shared import,
+mirroring how service.py's `a:`/`r:` prefixes and callbacks.py's own
+registrations already agree without one."""
+
+
+async def _set_trading_mode(market: str, mode: str):
+    """settings.py:143 `PUT /api/settings/trading-mode` handler -- an
+    ordinary async function (FastAPI's `@router.put` only registers it, per
+    this module's own docstring), called directly exactly like
+    `_fetch_trading_mode` above reuses `_trading_mode_response`. Runs the
+    SAME `storage_service.set_app_setting` write + `TradingModeUpdate`
+    validation the HTTP route uses -- there is no second write path to
+    keep in sync, and the shared autonomy gate re-reads SQLite on every
+    request, so the effect is immediate."""
+    from app.api.routes.settings import TradingModeUpdate, set_trading_mode
+
+    return await set_trading_mode(TradingModeUpdate(market=market, mode=mode))
+
+
+async def handle_halt(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+    """/halt -- kiwoom 자율 매매 긴급 정지 (autonomous -> hitl). Fail-safe
+    방향(자율에서 더 안전한 수동 승인 쪽으로 전환)이라 확인 스텝 없이
+    즉시 실행한다 (spec F2 리스크 표: "이상 징후 시 폰에서 즉시 자율 차단").
+
+    이름 충돌 주의: 기존 `POST /trading/pause`·`/resume`
+    (trading.py:186-222, 트레이딩 코디네이터/세션 스케줄러 자체의
+    일시정지·재개)와는 **무관**하다 -- /halt는 kiwoom의 Autonomous|HITL
+    모드만 hitl로 되돌릴 뿐, 코디네이터는 계속 돌아가고 이후 제안은
+    자동승인 대신 수동 승인을 거친다.
+
+    이미 진행 중인 60초 자동승인 카운트다운은 여기서 직접 취소하지
+    않는다 -- 유예 만료 시 게이트 재검
+    (`app.api.routes._autonomy_injector._auto_approve_after_grace`)이
+    `trading_mode:kiwoom`이 더 이상 'autonomous'가 아님을 보고 스스로
+    stood-down 처리한다 (기존 동작, 이 커맨드는 그 앞단의 모드 전환만
+    담당).
+    """
+    await _set_trading_mode("kiwoom", "hitl")
+    await _reply(
+        update,
+        "⛔ 자율 매매 정지(kiwoom→HITL). 진행 중 카운트다운은 유예 만료 시 "
+        "게이트 재검으로 자동 취소됩니다",
+    )
+
+
+async def handle_auto(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+    """/auto -- kiwoom HITL -> autonomous 재개, **2-스텝**.
+
+    1차 명령 응답에서는 master 게이트(env `AUTONOMY_ENABLED` -- 이 모듈이
+    이미 재사용하는 `_fetch_trading_mode()`/`_trading_mode_response()`가
+    유일한 공식 판독 경로, settings.py:132; 직접 `settings.
+    AUTONOMY_ENABLED`를 다시 읽지 않는다) 상태만 확인한다:
+    - OFF: 정직하게 "재시작 필요"를 답장하고 버튼 없이 종료한다 -- env는
+      텔레그램으로 켤 수 없다.
+    - ON: `[⚠️ 자율 재개 확인]` 버튼을 보낸다. 실제 모드 전환 +
+      `rearm_awaiting_approvals()` 재호출은 여기서 하지 않고
+      `services.telegram.callbacks.handle_auto_confirm_callback`이 콜백에서
+      수행한다 (spec F2 리스크 표: "/auto 오발 -> 2-스텝 확인 버튼").
+
+    이름 충돌 주의: 기존 `POST /trading/pause`·`/resume`과 무관
+    (`handle_halt`의 docstring 참고).
+    """
+    mode = await _fetch_trading_mode()
+    if not mode.master_enabled:
+        await _reply(update, "env AUTONOMY_ENABLED=false — 재시작 필요")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⚠️ 자율 재개 확인", callback_data=AUTO_CONFIRM_CALLBACK_DATA)]]
+    )
+    message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+    if message is not None:
+        await message.reply_text(
+            "kiwoom 자율 매매를 재개할까요? (버튼을 눌러 확인)",
+            reply_markup=keyboard,
+        )
+
+
+# -------------------------------------------
 # Registration (import-time side effect -- see module docstring)
 # -------------------------------------------
 
@@ -350,3 +460,5 @@ register_command("status", handle_status)
 register_command("positions", handle_positions)
 register_command("pending", handle_pending)
 register_command("report", handle_report)
+register_command("halt", handle_halt)
+register_command("auto", handle_auto)

@@ -1,10 +1,15 @@
 """
-Telegram Approval/Reject Inline Buttons -- Callback Dispatch (TG-3)
+Telegram Approval/Reject Inline Buttons -- Callback Dispatch (TG-3) +
+/auto Step-2 Confirm Callback (TG-4)
 
 Handles the two callback_data prefixes `send_approval_request` (service.py)
 attaches to every pending-approval message: `a:{session_id}:{pid8}`
 (approve) and `r:{session_id}:{pid8}` (reject) -- see
-docs/superpowers/specs/2026-07-17-telegram-twoway-design.md F1.
+docs/superpowers/specs/2026-07-17-telegram-twoway-design.md F1. Also
+handles the fixed-literal `auto_confirm` callback_data commands.py's
+`handle_auto` attaches to /auto's step-2 confirm button -- see the
+"/auto step-2 confirm callback (TG-4)" section near the bottom of this
+file (spec F2).
 
 Registered into services.telegram.receiver's callback registry at IMPORT
 TIME via `register_callback(prefix, handler)`, mirroring commands.py's
@@ -158,8 +163,85 @@ async def handle_reject_callback(update: Update, context: "ContextTypes.DEFAULT_
 
 
 # -------------------------------------------
+# /auto step-2 confirm callback (TG-4)
+#
+# Spec: docs/superpowers/specs/2026-07-17-telegram-twoway-design.md F2.
+# Pairs with commands.py's `handle_auto`, which sends the confirm button
+# after checking the master gate is ON but performs neither the mode write
+# nor the rearm itself -- both happen here, only after the user taps
+# confirm.
+# -------------------------------------------
+
+AUTO_CONFIRM_CALLBACK_DATA = "auto_confirm"
+"""Same literal as `commands.AUTO_CONFIRM_CALLBACK_DATA` -- see that
+module's docstring for why the two files agree by string convention
+rather than a shared import (mirrors the existing `a:`/`r:` convention
+between service.py and this module). No session_id/proposal to pin here:
+/auto resumes kiwoom's Autonomous|HITL *mode*, not one proposal, so
+there is nothing proposal-shaped to re-validate against a live session
+the way `a:`/`r:` do."""
+
+
+async def _set_kiwoom_autonomous():
+    """Direct call into settings.py's PUT handler -- mirrors commands.py's
+    `_set_trading_mode` (same underlying storage write, same
+    `TradingModeUpdate` validation); duplicated rather than imported from
+    commands.py to keep this module's only sibling-module dependency the
+    existing lazy `app.api.routes.*` imports, not a second telegram
+    submodule."""
+    from app.api.routes.settings import TradingModeUpdate, set_trading_mode
+
+    return await set_trading_mode(TradingModeUpdate(market="kiwoom", mode="autonomous"))
+
+
+async def _rearm_awaiting_approvals():
+    """Lazy import -- same import-cycle rationale as `_submit` above.
+    Re-invokes the startup-only rearm pass so a session that reached
+    awaiting_approval while HITL was in effect (and so never got a
+    countdown scheduled by anyone -- producers only call
+    `maybe_schedule_auto_approve` at the moment a session FIRST becomes
+    awaiting) gets one now, without a server restart (spec F2 discovery
+    finding: "startup 전용이라 이미 awaiting 세션에 카운트다운이 안
+    걸림"). Idempotent/fail-closed exactly like a startup call -- see
+    `rearm_awaiting_approvals`'s own docstring: a session already counting
+    down is skipped, and any single-session error is logged, never
+    raised."""
+    from app.api.routes._autonomy_injector import rearm_awaiting_approvals
+
+    await rearm_awaiting_approvals()
+
+
+async def handle_auto_confirm_callback(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+    """/auto's step-2 confirm button (TG-4, spec F2) -- flips
+    `trading_mode:kiwoom` to autonomous, then re-arms every session already
+    sitting in awaiting_approval so one tap covers both future proposals
+    and proposals that were already waiting when `/auto` was typed.
+
+    TG-3 x TG-4 interaction (intentional, per spec): a session that only
+    ever received a plain-HITL button (gate denied while kiwoom was hitl)
+    has `TELEGRAM_NOTIFIED_PROPOSAL_KEY` set to `"{proposal_id}:0"`. Once
+    `_rearm_awaiting_approvals()` re-schedules it under the now-autonomous
+    mode, the gate verdict flips to allow and the composite dedup marker
+    (`_autonomy_injector._notified_marker_value`) becomes
+    `"{proposal_id}:1"` -- a mismatch against the stored `:0` value, so
+    `maybe_schedule_auto_approve` sends a FRESH Telegram approval-request
+    message with the live countdown rather than silently deduping it away.
+    The operator who only ever saw a plain-HITL button for this proposal is
+    told, correctly, that a 60s auto-approve countdown just started.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    await _set_kiwoom_autonomous()
+    await _rearm_awaiting_approvals()
+
+    await _edit(update, "✅ 자율 재개+대기 세션 재무장")
+
+
+# -------------------------------------------
 # Registration (import-time side effect -- see module docstring)
 # -------------------------------------------
 
 register_callback("a:", handle_approve_callback)
 register_callback("r:", handle_reject_callback)
+register_callback("auto_confirm", handle_auto_confirm_callback)
