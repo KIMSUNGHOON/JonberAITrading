@@ -55,16 +55,44 @@ logger = structlog.get_logger()
 # Fixed 60s grace window (user decision). Module constant so tests can patch it.
 AUTONOMY_GRACE_SECONDS = 60.0
 
-# TG-3 review fix (Critical-2): session-state key recording the proposal id a
-# Telegram approval-request message was last actually SENT for. See
-# `_send_approval_request_notification` / `rearm_awaiting_approvals` below --
-# without this, every rearm_awaiting_approvals() pass (which runs on every
-# app startup, AFTER reconcile_stranded_sessions() has already unconditionally
-# cleared auto_approve_at -- see session_manager.py's reconcile -- and so can
-# never rely on `_has_future_auto_approve_at` to skip a still-awaiting
-# session) would re-send a brand new button message for every AWAITING
-# session on every restart.
+# TG-3 review fix (Critical-2, widened by review-fix-2): session-state key
+# recording what a Telegram approval-request message last actually SENT for
+# this session communicated. See `_send_approval_request_notification` /
+# `rearm_awaiting_approvals` below -- without this, every
+# rearm_awaiting_approvals() pass (which runs on every app startup, AFTER
+# reconcile_stranded_sessions() has already unconditionally cleared
+# auto_approve_at -- see session_manager.py's reconcile -- and so can never
+# rely on `_has_future_auto_approve_at` to skip a still-awaiting session)
+# would re-send a brand new button message for every AWAITING session on
+# every restart.
+#
+# review-fix-2: the stored value is NOT the bare proposal id. It is a
+# composite of (proposal_id, whether THAT send carried a countdown) via
+# `_notified_marker_value` below. A bare proposal-id key was a second latent
+# bug: an operator who received a plain-HITL button (gate denied, no
+# countdown) for proposal p1, then flips AUTONOMY_ENABLED on and restarts
+# (rearm's entire reason to exist), gets a gate-ALLOW re-schedule for the
+# SAME p1 -- the 60s auto-approve grace task genuinely starts counting down
+# -- but a proposal-id-only marker would still match and silently swallow
+# the notification the operator needed to see the countdown (or hit
+# REJECT) at all. Composing in `bool(auto_approve_at)` makes a HITL<->
+# autonomous transition for the same proposal look like a change worth
+# re-notifying for, while a restart with the SAME gate verdict for the SAME
+# proposal still dedups exactly as before.
 TELEGRAM_NOTIFIED_PROPOSAL_KEY = "telegram_notified_proposal_id"
+
+
+def _notified_marker_value(proposal_id: str | None, auto_approve_at: str | None) -> str | None:
+    """Composite dedup-marker value (review-fix-2): `None` when there is no
+    proposal id to key on (caller must then always send, never dedup).
+    Otherwise `"{proposal_id}:{0|1}"` -- the second field is whether THIS
+    send carries a live countdown, so a gate-verdict flip (deny<->allow) for
+    the exact same proposal always compares unequal to a previously-stored
+    marker and triggers a fresh send, while a repeat with the identical
+    verdict compares equal and dedups."""
+    if proposal_id is None:
+        return None
+    return f"{proposal_id}:{int(bool(auto_approve_at))}"
 
 
 def _proposal_fields(state: dict) -> dict:
@@ -278,7 +306,14 @@ async def _send_approval_request_notification(
     swallowed so it can never affect the awaiting-commit/scheduling
     pipeline that already completed by the time this runs.
 
-    TG-3 review fix (Critical-2): dedups on `proposal_id` before sending.
+    TG-3 review fix (Critical-2, widened by review-fix-2): dedups on the
+    composite `_notified_marker_value(proposal_id, auto_approve_at)` before
+    sending -- NOT on the bare proposal id (see TELEGRAM_NOTIFIED_PROPOSAL_KEY's
+    module comment for why a bare-id marker silently swallowed the one
+    notification an operator most needs: the deny->allow transition on
+    restart that starts a live 60s auto-approve countdown for a proposal
+    they'd only ever seen as plain HITL).
+
     `maybe_schedule_auto_approve` is called far more than once per proposal
     in practice -- most notably `rearm_awaiting_approvals()` re-scanning
     every still-AWAITING session on EVERY app startup, since
@@ -296,34 +331,37 @@ async def _send_approval_request_notification(
         proposal = state.get("trade_proposal") or {}
         if not proposal:
             return
-        if proposal_id is not None and state.get(TELEGRAM_NOTIFIED_PROPOSAL_KEY) == proposal_id:
+        marker_value = _notified_marker_value(proposal_id, auto_approve_at)
+        if marker_value is not None and state.get(TELEGRAM_NOTIFIED_PROPOSAL_KEY) == marker_value:
             logger.info(
                 "approval_request_notify_skipped_duplicate",
                 session_id=session_id,
                 proposal_id=proposal_id,
+                marker_value=marker_value,
             )
             return
         notifier = await get_telegram_notifier()
         if notifier.is_ready:
             await notifier.send_approval_request(session_id, market, proposal, auto_approve_at)
-            await _persist_notified_marker(session_id, proposal_id)
+            await _persist_notified_marker(session_id, marker_value)
     except Exception as e:
         logger.warning("approval_request_notify_failed", session_id=session_id, error=str(e))
 
 
-async def _persist_notified_marker(session_id: str, proposal_id: str | None) -> None:
-    """Best-effort dedup-marker write (Critical-2 fix). Deliberately its own
+async def _persist_notified_marker(session_id: str, marker_value: str | None) -> None:
+    """Best-effort dedup-marker write (Critical-2 fix; value format widened
+    by review-fix-2, see `_notified_marker_value`). Deliberately its own
     try/except, separate from the send call above: a failure here must never
     be mistaken for (or interfere with) a send failure, and must never
     propagate -- the awaiting/scheduling flow this runs after has already
     completed. Worst case on a persist failure is exactly one further
     duplicate notification the next time this proposal is (re-)scheduled,
     never a missed one, which the task brief accepts explicitly."""
-    if proposal_id is None:
+    if marker_value is None:
         return
     try:
         sm = await get_session_manager()
-        await sm.update_state(session_id, {TELEGRAM_NOTIFIED_PROPOSAL_KEY: proposal_id})
+        await sm.update_state(session_id, {TELEGRAM_NOTIFIED_PROPOSAL_KEY: marker_value})
     except Exception as e:
         logger.warning(
             "telegram_notified_marker_persist_failed", session_id=session_id, error=str(e)

@@ -664,7 +664,9 @@ async def test_dedup_skips_resend_when_same_proposal_scheduled_twice(sm, monkeyp
     fake_notifier.send_approval_request.assert_awaited_once()
 
     session = await sm.get_session(session_id)
-    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p1"
+    # review-fix-2: composite marker "{proposal_id}:{has_countdown}" -- both
+    # sends here were gate-deny (no countdown), so the suffix is "0".
+    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p1:0"
 
 
 async def test_dedup_resends_when_reanalysis_changes_proposal_id(sm, monkeypatch):
@@ -704,7 +706,7 @@ async def test_dedup_resends_when_reanalysis_changes_proposal_id(sm, monkeypatch
     assert second_call_args[2]["id"] == "p2"
 
     session = await sm.get_session(session_id)
-    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p2"
+    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p2:0"
 
 
 async def test_marker_persist_failure_never_blocks_send_or_schedule(sm, monkeypatch, fast_grace):
@@ -793,3 +795,140 @@ async def test_rearm_dedup_skips_resend_across_repeated_restart_simulations(sm, 
     await injector_module.rearm_awaiting_approvals()
 
     fake_notifier.send_approval_request.assert_awaited_once()
+# -------------------------------------------
+# 10: review-fix-2 -- dedup marker must include the gate verdict, not just
+# the proposal id.
+#
+# Repro (re-review of 451646b): a bare proposal-id marker meant that a
+# session which received a plain-HITL button for p1 (gate denied), then had
+# an operator flip AUTONOMY_ENABLED on and restart -- rearm's entire reason
+# to exist -- got a gate-ALLOW re-schedule for the SAME p1 (a live 60s
+# auto-approve grace task genuinely starts counting down) but the stale
+# marker matched and swallowed the notification the operator most needed:
+# "your countdown just started, REJECT if you don't want this." The fix
+# widens the marker to a composite of (proposal_id, bool(auto_approve_at))
+# via `_notified_marker_value` -- a verdict flip for the same proposal now
+# always compares unequal and re-sends; a restart with the SAME verdict for
+# the SAME proposal still dedups exactly as before.
+# -------------------------------------------
+
+
+async def test_dedup_resends_when_gate_verdict_transitions_deny_to_allow(sm, monkeypatch, fast_grace):
+    session_id = "inj-tg3-dedup-verdict-flip-1"
+    await sm.create_session(
+        session_id=session_id, market_type=MarketType.KIWOOM, ticker="005930",
+        display_name="삼성전자",
+        state={
+            "awaiting_approval": True,
+            "trade_proposal": {"id": "p1", "action": "BUY", "quantity": 10, "entry_price": 50000},
+            "reasoning_log": [],
+        },
+    )
+    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="hitl mode", check="market_mode")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", deny_gate)
+
+    fake_notifier = _fake_notifier_recorder()
+
+    async def fake_get_notifier():
+        return fake_notifier
+
+    monkeypatch.setattr(injector_module, "get_telegram_notifier", fake_get_notifier)
+
+    # Restart #1: autonomy still off -- plain HITL button, no countdown.
+    await injector_module.rearm_awaiting_approvals()
+
+    fake_notifier.send_approval_request.assert_awaited_once()
+    first_args = fake_notifier.send_approval_request.await_args.args
+    assert first_args[3] is None
+
+    # Operator flips AUTONOMY_ENABLED on and restarts -- restart #2 sees the
+    # SAME p1, but the gate now allows: a live grace task is genuinely
+    # scheduled and the operator must be told.
+    async def noop_submit(*a, **k):
+        return None
+
+    monkeypatch.setattr("app.api.routes.approval.submit_decision", noop_submit)
+
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", allow_gate)
+
+    await injector_module.rearm_awaiting_approvals()
+
+    assert fake_notifier.send_approval_request.await_count == 2, (
+        "deny->allow verdict flip for the SAME proposal must re-notify -- "
+        "this is the exact restart scenario rearm exists for"
+    )
+    second_args = fake_notifier.send_approval_request.await_args_list[1].args
+    assert second_args[3] is not None  # a live countdown now exists
+
+    session = await sm.get_session(session_id)
+    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p1:1"
+
+    await asyncio.sleep(0.1)  # let the fast-grace background task settle
+
+
+async def test_dedup_resends_when_gate_verdict_transitions_allow_to_deny(sm, monkeypatch, fast_grace):
+    session_id = "inj-tg3-dedup-verdict-flip-2"
+    await sm.create_session(
+        session_id=session_id, market_type=MarketType.KIWOOM, ticker="005930",
+        display_name="삼성전자",
+        state={
+            "awaiting_approval": True,
+            "trade_proposal": {"id": "p1", "action": "BUY", "quantity": 10, "entry_price": 50000},
+            "reasoning_log": [],
+        },
+    )
+    await sm.update_status(session_id, SessionStatus.AWAITING_APPROVAL)
+
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", allow_gate)
+
+    async def noop_submit(*a, **k):
+        return None
+
+    monkeypatch.setattr("app.api.routes.approval.submit_decision", noop_submit)
+
+    fake_notifier = _fake_notifier_recorder()
+
+    async def fake_get_notifier():
+        return fake_notifier
+
+    monkeypatch.setattr(injector_module, "get_telegram_notifier", fake_get_notifier)
+
+    # Restart #1: autonomy on -- live countdown button.
+    await injector_module.rearm_awaiting_approvals()
+
+    fake_notifier.send_approval_request.assert_awaited_once()
+    first_args = fake_notifier.send_approval_request.await_args.args
+    assert first_args[3] is not None
+
+    await asyncio.sleep(0.1)  # let restart #1's fast-grace task settle first
+
+    # Autonomy gets disabled again (or a limit trips) before restart #2 --
+    # the operator needs to know the countdown is gone and manual approval
+    # is required again. Low frequency (a verdict reversal, not every
+    # restart), so this is not spam.
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="hitl mode", check="market_mode")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", deny_gate)
+
+    await injector_module.rearm_awaiting_approvals()
+
+    assert fake_notifier.send_approval_request.await_count == 2, (
+        "allow->deny verdict flip for the SAME proposal must re-notify -- "
+        "the operator needs to know the countdown is gone"
+    )
+    second_args = fake_notifier.send_approval_request.await_args_list[1].args
+    assert second_args[3] is None
+
+    session = await sm.get_session(session_id)
+    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p1:0"
