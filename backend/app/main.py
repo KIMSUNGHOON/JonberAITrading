@@ -24,6 +24,7 @@ from app.logging_config import configure_logging, RequestLoggingMiddleware
 from services.realtime_service import close_realtime_service, get_realtime_service
 from services.storage_service import close_storage_service, get_storage_service
 from services.telegram import get_telegram_notifier
+from services.telegram.receiver import start_telegram_receiver, stop_telegram_receiver
 from services.krx_holiday import get_holiday_service
 from services.session_manager import get_session_manager
 
@@ -143,6 +144,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("telegram_init_failed", error=str(e))
 
+    # Start the Telegram receiver (TG-1) -- inbound PTB Application, separate
+    # instance from the notifier above (services/telegram/receiver.py).
+    # Best-effort: never raises, returns None when unconfigured/failed --
+    # receiver state doesn't affect notifier readiness or server startup.
+    try:
+        await start_telegram_receiver()
+    except Exception as e:
+        logger.warning("telegram_receiver_init_failed", error=str(e))
+
     # Initialize KRX Holiday Service
     try:
         holiday_service = await get_holiday_service()
@@ -172,6 +182,15 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("application_shutdown")
+
+    # Stop the Telegram receiver first (reverse of its late startup position,
+    # and it may still be dispatching handlers that call into services torn
+    # down below -- best-effort, no-op if never started).
+    try:
+        await stop_telegram_receiver()
+    except Exception:
+        pass
+
     await close_realtime_service()
     await llm.close()
     reset_llm_provider()

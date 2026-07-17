@@ -59,7 +59,7 @@ dependencies:
       - PyJWT>=2.8.0
 
       # Notifications
-      - python-telegram-bot>=20.0
+      - python-telegram-bot~=22.5
 
       # Utilities
       - python-dotenv>=1.0.0
