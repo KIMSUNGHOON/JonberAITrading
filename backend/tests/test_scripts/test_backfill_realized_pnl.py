@@ -16,7 +16,10 @@ import sqlite3
 
 import pytest
 
+from datetime import datetime, timedelta
+
 from scripts.backfill_realized_pnl import (
+    KST,
     BACKFILL_STK_CD_SENTINEL,
     BackfillPlan,
     compute_backfill_plan,
@@ -24,7 +27,9 @@ from scripts.backfill_realized_pnl import (
     run_backfill,
     upsert_backfill_rows,
     _backfill_id,
+    _is_valid_yyyymmdd,
     _iso_to_yyyymmdd,
+    _reject_same_day_or_future,
     _yyyymmdd_to_iso,
 )
 from services.kiwoom.models import DailyRealizedPnlRow, RealizedPnl
@@ -163,6 +168,17 @@ def test_yyyymmdd_to_iso_unparseable_passthrough():
     assert _yyyymmdd_to_iso("") == ""
 
 
+def test_is_valid_yyyymmdd_rejects_shape_only_matches():
+    """E1-6 리뷰픽스 (Minor): 8 numeric chars alone isn't enough -- must be
+    a genuine calendar date."""
+    assert _is_valid_yyyymmdd("20260601") is True
+    assert _is_valid_yyyymmdd("20261332") is False  # month 13
+    assert _is_valid_yyyymmdd("20260231") is False  # Feb 31
+    assert _is_valid_yyyymmdd("00000000") is False  # month/day 0
+    assert _is_valid_yyyymmdd("bad-date") is False  # wrong shape entirely
+    assert _is_valid_yyyymmdd(None) is False  # never crash on non-str
+
+
 def test_backfill_id_deterministic():
     assert _backfill_id("20260601") == _backfill_id("20260601")
     assert _backfill_id("20260601") != _backfill_id("20260602")
@@ -173,6 +189,12 @@ def test_compute_backfill_plan_skips_existing_and_unparseable():
         _daily("20260601", 1000),
         _daily("20260602", -500),
         _daily("bad-date", 999),
+        # E1-6 리뷰픽스 (Minor): a shape-only check (len==8 and isdigit())
+        # would have wrongly accepted this as "parseable" -- 8 numeric
+        # chars, but month 13 doesn't exist. Must route to
+        # skipped_unparseable exactly like the non-numeric "bad-date" case,
+        # not silently become a garbage exit_at candidate.
+        _daily("20261332", 777),
     ]
     plan = compute_backfill_plan(daily, existing_dates={"2026-06-01"})
 
@@ -181,7 +203,7 @@ def test_compute_backfill_plan_skips_existing_and_unparseable():
     assert plan.candidate_rows[0].realized_amount == -500.0
     assert plan.candidate_rows[0].exit_at == "2026-06-02"
     assert plan.skipped_existing == ["20260601"]
-    assert plan.skipped_unparseable == ["bad-date"]
+    assert plan.skipped_unparseable == ["bad-date", "20261332"]
 
 
 def test_read_existing_backfill_dates_missing_file_returns_empty(tmp_path):
@@ -215,6 +237,86 @@ def test_read_existing_backfill_dates_filters_by_sentinel(tmp_path):
         entry_decision_id="dec-1",
     )
     assert read_existing_backfill_dates(db) == {"2026-06-01"}
+
+
+# -------------------------------------------
+# (a2) source guard -- reject same-day/future --to (E1-6 리뷰픽스, Critical)
+# -------------------------------------------
+
+
+def test_reject_same_day_or_future_pure_helper():
+    now = datetime(2026, 7, 17, 15, 0, tzinfo=KST)
+
+    today_reason = _reject_same_day_or_future("2026-07-17", now_kst=now)
+    assert today_reason is not None
+    assert "2026-07-17" in today_reason
+
+    future_reason = _reject_same_day_or_future("2026-07-18", now_kst=now)
+    assert future_reason is not None
+
+    assert _reject_same_day_or_future("2026-07-16", now_kst=now) is None
+
+
+@pytest.mark.asyncio
+async def test_run_backfill_rejects_same_day_to_date_never_calls_kiwoom_or_writes(
+    tmp_path,
+):
+    """The review's reachability scenario: an operator runs the script with
+    `--to 오늘` (today) at/around the market-close edge. This must be
+    rejected BEFORE even attempting the ka10074 call — a same-day backfill
+    would inject a stk_cd='ALL' aggregate row on the very day the EOD
+    consumers (eod_snapshot/eod_review) read for that trade_date, in a
+    single, un-retryable window. Consumer-side sentinel filters (see
+    test_eod_snapshot.py/test_eod_review.py) are defense-in-depth, not a
+    substitute for blocking it at the source."""
+    db = str(tmp_path / "t.db")
+    client = _FakeKiwoomClient(daily=[_daily("20260601", 1000)])
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+
+    for apply in (False, True):  # rejection applies to dry-run too
+        plan = await run_backfill(
+            kiwoom_client=client, db_path=db, from_date="2020-01-01", to_date=today, apply=apply
+        )
+        assert plan.rejected is True
+        assert plan.rejection_reason is not None
+        assert plan.candidate_rows == []
+        assert plan.inserted == 0
+
+    assert client.calls == []  # ka10074 was never even attempted
+    import os
+
+    assert not os.path.exists(db)  # DB was never touched either
+
+
+@pytest.mark.asyncio
+async def test_run_backfill_rejects_future_to_date(tmp_path):
+    db = str(tmp_path / "t.db")
+    client = _FakeKiwoomClient(daily=[])
+    tomorrow = (datetime.now(KST) + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    plan = await run_backfill(
+        kiwoom_client=client, db_path=db, from_date="2020-01-01", to_date=tomorrow, apply=True
+    )
+
+    assert plan.rejected is True
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_backfill_accepts_past_to_date_unaffected_by_guard(tmp_path):
+    """Sanity check: the guard must not falsely reject a genuinely past
+    date (regression pin against an off-by-one in the >= comparison)."""
+    db = str(tmp_path / "t.db")
+    client = _FakeKiwoomClient(daily=[_daily("20260601", 1000)])
+    yesterday = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    plan = await run_backfill(
+        kiwoom_client=client, db_path=db, from_date="2026-06-01", to_date=yesterday, apply=False
+    )
+
+    assert plan.rejected is False
+    assert plan.rejection_reason is None
+    assert client.calls == [("20260601", _iso_to_yyyymmdd(yesterday))]
 
 
 # -------------------------------------------

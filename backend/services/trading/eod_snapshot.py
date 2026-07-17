@@ -40,6 +40,17 @@ _DEFAULT_BASE_ASSET_KRW = 500_000_000
 # newest-first — comfortably above any plausible single-day trade count.
 _KR_REALIZED_PNL_SCAN_LIMIT = 500
 
+# Mirrors scripts/backfill_realized_pnl.py's BACKFILL_STK_CD_SENTINEL (not
+# imported — same reasoning as _DEFAULT_BASE_ASSET_KRW above: this module
+# only ever receives `storage` as a duck-typed Any, and scripts/ is a
+# one-shot tool outside the app that imports FROM services/, never the
+# reverse). E1-6 리뷰픽스: that script backfills account-wide daily
+# aggregates into kr_realized_pnl (ka10074 has no per-stock breakdown) using
+# this sentinel stk_cd because a real matched-close trade never has one — a
+# backfill row is NOT a "matched-close trade" (no entry/exit price/quantity
+# at all) and must never be counted as a win or loss here.
+_BACKFILL_STK_CD_SENTINEL = "ALL"
+
 
 async def write_daily_snapshot(coordinator: Any, storage: Any, trade_date: str) -> bool:
     """Compute and persist one end-of-day performance snapshot row.
@@ -118,6 +129,8 @@ async def _count_win_loss_trades(storage: Any, trade_date: str) -> tuple[int, in
     win_trades = 0
     loss_trades = 0
     for row in rows:
+        if row.get("stk_cd") == _BACKFILL_STK_CD_SENTINEL:
+            continue  # account-wide backfill aggregate, not a matched trade
         stamp = str(row.get("exit_at") or row.get("created_at") or "")
         if not stamp.startswith(trade_date):
             continue

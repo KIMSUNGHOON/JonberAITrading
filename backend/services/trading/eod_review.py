@@ -42,6 +42,18 @@ _DECISION_SCAN_LIMIT = 1000
 _DAILY_PERF_SNAPSHOT_SCAN_LIMIT = 60
 _REGIME_SNAPSHOT_SCAN_LIMIT = 60
 
+# Mirrors scripts/backfill_realized_pnl.py's BACKFILL_STK_CD_SENTINEL (not
+# imported — this module only ever receives `storage` as a duck-typed Any,
+# mirroring eod_snapshot.py's own not-imported convention; scripts/ is a
+# one-shot tool outside the app that imports FROM services/, never the
+# reverse). E1-6 리뷰픽스: that script backfills account-wide daily
+# aggregates into kr_realized_pnl (ka10074 has no per-stock breakdown) using
+# this sentinel stk_cd. A per_stock section entry must be about an actual
+# stock — a backfill row must never appear here (it would surface as a
+# phantom "ALL" ticker, which strategy_panel then injects verbatim into the
+# LLM prompt for next-day knob adjustment).
+_BACKFILL_STK_CD_SENTINEL = "ALL"
+
 
 def _portfolio_exposure_concentration(
     summary: Any,
@@ -193,7 +205,8 @@ async def _build_per_stock_section(
     day_rows = [
         r
         for r in realized_rows
-        if str(r.get("exit_at") or r.get("created_at") or "").startswith(trade_date)
+        if r.get("stk_cd") != _BACKFILL_STK_CD_SENTINEL
+        and str(r.get("exit_at") or r.get("created_at") or "").startswith(trade_date)
     ]
     if not day_rows:
         return []

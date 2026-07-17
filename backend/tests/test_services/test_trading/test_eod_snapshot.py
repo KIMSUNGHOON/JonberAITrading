@@ -20,7 +20,7 @@ import pytest
 
 from services.kiwoom.models import AccountBalance, DailyRealizedPnlRow, RealizedPnl
 from services.storage_service import StorageService
-from services.trading.eod_snapshot import write_daily_snapshot
+from services.trading.eod_snapshot import _BACKFILL_STK_CD_SENTINEL, write_daily_snapshot
 
 pytestmark = pytest.mark.asyncio
 
@@ -184,3 +184,42 @@ async def test_write_daily_snapshot_returns_false_when_coordinator_has_no_client
 
     ok = await write_daily_snapshot(_NoClientCoordinator(), storage, trade_date)
     assert ok is False
+
+
+async def test_write_daily_snapshot_ignores_backfill_all_sentinel_in_win_loss_count(
+    tmp_path,
+):
+    """E1-6 리뷰픽스 (Critical): scripts/backfill_realized_pnl.py writes
+    account-wide aggregate rows with stk_cd="ALL" (ka10074 has no per-stock
+    breakdown) into kr_realized_pnl for historical dates. Such a row is NOT
+    a matched-close trade (no entry/exit price/quantity at all) and must
+    never be counted as an extra win or loss here — otherwise an operator
+    backfilling the past would silently skew every future day's win/loss
+    ratio the moment that data enters the scan window.
+    """
+    trade_date = "2026-07-15"
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    await _seed_kr_realized_pnl(storage, trade_date)  # baseline: 1 win, 1 loss
+
+    # A backfill aggregate row for the SAME trade_date, with a realized
+    # amount that would flip the count (positive → would count as an extra
+    # win) if the sentinel filter were missing.
+    await storage.save_kr_realized_pnl(
+        {
+            "id": "backfill-20260715",
+            "stk_cd": _BACKFILL_STK_CD_SENTINEL,
+            "realized_amount": 999999.0,
+            "created_at": f"{trade_date} 00:00:00",
+        }
+    )
+
+    coordinator = _StubCoordinator(_StubClient(_pnl(), _balance()))
+    ok = await write_daily_snapshot(coordinator, storage, trade_date)
+    assert ok is True
+
+    rows = await storage.get_daily_perf_snapshots()
+    assert len(rows) == 1
+    # Unchanged from the plain baseline (test_write_daily_snapshot_writes_
+    # one_row) — the "ALL" row must not have been counted as a win.
+    assert rows[0]["win_trades"] == 1
+    assert rows[0]["loss_trades"] == 1

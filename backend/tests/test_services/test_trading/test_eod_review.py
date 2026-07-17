@@ -22,7 +22,7 @@ import uuid
 import pytest
 
 from services.storage_service import StorageService
-from services.trading.eod_review import build_eod_review
+from services.trading.eod_review import _BACKFILL_STK_CD_SENTINEL, build_eod_review
 
 pytestmark = pytest.mark.asyncio
 
@@ -322,3 +322,39 @@ async def test_save_and_get_eod_review_roundtrip_and_replace(tmp_path):
     rows2 = await storage.get_eod_reviews()
     assert len(rows2) == 1
     assert json.loads(rows2[0]["report_json"])["portfolio"]["equity"] == 600_000_000
+
+
+async def test_build_eod_review_excludes_backfill_all_sentinel_from_per_stock(tmp_path):
+    """E1-6 리뷰픽스 (Critical): scripts/backfill_realized_pnl.py writes
+    account-wide aggregate rows with stk_cd="ALL" (ka10074 has no per-stock
+    breakdown) into kr_realized_pnl for historical dates. Such a row must
+    never surface in `per_stock` — it isn't about any actual stock, and
+    strategy_panel injects `per_stock` verbatim into the LLM prompt that
+    drives next-day knob adjustment. A phantom "ALL" ticker there would
+    silently corrupt that adjustment.
+    """
+    trade_date = "2026-07-15"
+    regime_id = str(uuid.uuid4())
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    await _seed(storage, trade_date, regime_id)  # baseline: 2 real per-stock rows
+
+    # A backfill aggregate row for the SAME trade_date.
+    await storage.save_kr_realized_pnl(
+        {
+            "id": "backfill-20260715",
+            "stk_cd": _BACKFILL_STK_CD_SENTINEL,
+            "realized_amount": 999999.0,
+            "created_at": f"{trade_date} 00:00:00",
+        }
+    )
+    coordinator = _StubCoordinator(_portfolio_summary())
+
+    report = await build_eod_review(storage, coordinator, trade_date, regime_id)
+
+    per_stock = report["per_stock"]
+    # Unchanged from the plain baseline (test_build_eod_review_assembles_
+    # all_sections) — the "ALL" row must not appear.
+    assert len(per_stock) == 2
+    stk_cds = {row["stk_cd"] for row in per_stock}
+    assert _BACKFILL_STK_CD_SENTINEL not in stk_cds
+    assert stk_cds == {"005930", "000660"}
