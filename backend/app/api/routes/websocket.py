@@ -1295,7 +1295,11 @@ def _build_eod_summary_headline(digest: dict) -> str:
 
     daily_pnl = account.get("daily_realized_pnl")
     if daily_pnl is not None:
-        sign = "+" if daily_pnl >= 0 else ""
+        # Sign convention matches telegram/service.py::_fmt_krw exactly
+        # (review fix: the two previously diverged on 0 -- _fmt_krw omits
+        # the "+" for 0, this used to add it) -- "+" only for STRICTLY
+        # positive values, never for 0.
+        sign = "+" if daily_pnl > 0 else ""
         parts.append(f"당일 실현손익 {sign}{daily_pnl:,.0f}원")
 
     total_equity = account.get("total_equity")

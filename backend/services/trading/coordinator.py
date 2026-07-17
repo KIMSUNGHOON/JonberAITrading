@@ -2356,11 +2356,30 @@ class ExecutionCoordinator:
         never break the market-close scheduler tick, especially not after
         reconcile_trade_ledger already completed its ledger backstop work
         this same tick.
+
+        Stale guard (review fix): `get_eod_reviews(limit=1)` returns the
+        newest row by trade_date regardless of whether TODAY's
+        run_eod_review actually wrote one this tick. If run_eod_review
+        failed before reaching `save_eod_review` (its own try/except
+        swallows the failure and returns False -- see its docstring), the
+        newest row on disk is still YESTERDAY's, and without this check
+        this step would silently re-send yesterday's digest/narrative
+        relabeled as today's. Comparing the row's own `trade_date` to the
+        `trade_date` this call was invoked with catches that mismatch and
+        skips the send entirely rather than notifying with stale content.
         """
         try:
             storage = await get_storage_service()
             reviews = await storage.get_eod_reviews(limit=1)
             if not reviews:
+                return
+
+            row_trade_date = reviews[0].get("trade_date")
+            if row_trade_date != trade_date:
+                logger.warning(
+                    f"[Coordinator] eod_summary_stale_skipped — requested "
+                    f"trade_date={trade_date} latest_row_trade_date={row_trade_date}"
+                )
                 return
 
             report = json.loads(reviews[0].get("report_json") or "{}")

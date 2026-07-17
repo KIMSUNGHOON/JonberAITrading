@@ -1438,3 +1438,57 @@ async def test_close_edge_survives_eod_summary_notify_failure(temp_storage, monk
     # completed normally.
     assert coord.fill_tracker.tracking() == []
     assert coord._market_was_open is False
+
+
+# Review fix: get_eod_reviews(limit=1) returns the newest row on disk
+# regardless of whether TODAY's run_eod_review actually wrote one this
+# tick (its own try/except can fail before reaching save_eod_review and
+# just return False -- see its docstring). Without a trade_date match
+# check, _notify_eod_summary would silently re-send YESTERDAY's
+# digest/narrative relabeled as today's. Exercises _notify_eod_summary
+# directly (not through the full close edge) -- faster and isolates the
+# guard from run_eod_review/run_strategy_consensus's own real-LLM cost.
+async def test_notify_eod_summary_skips_stale_review_row(temp_storage, monkeypatch, caplog):
+    import json
+    import logging
+
+    import app.api.routes.websocket as ws_module
+    import services.telegram as telegram_module
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+
+    yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = date.today().strftime("%Y-%m-%d")
+
+    await temp_storage.save_eod_review({
+        "trade_date": yesterday,
+        "report_json": json.dumps(
+            {"digest": {"trade_date": yesterday}, "narrative": "어제 요약"}
+        ),
+    })
+
+    telegram_calls = []
+    ws_calls = []
+
+    class _ReadyNotifier:
+        is_ready = True
+
+        async def send_daily_summary(self, digest, narrative=None):
+            telegram_calls.append((digest, narrative))
+            return True
+
+    async def _fake_get_telegram_notifier():
+        return _ReadyNotifier()
+
+    async def _fake_broadcast(digest, narrative=None):
+        ws_calls.append((digest, narrative))
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+    monkeypatch.setattr(ws_module, "broadcast_eod_summary", _fake_broadcast)
+
+    with caplog.at_level(logging.WARNING):
+        await coord._notify_eod_summary(today)
+
+    assert telegram_calls == []
+    assert ws_calls == []
+    assert any("eod_summary_stale_skipped" in rec.message for rec in caplog.records)
