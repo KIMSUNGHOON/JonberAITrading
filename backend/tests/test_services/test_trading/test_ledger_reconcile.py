@@ -205,6 +205,84 @@ async def test_rerun_is_idempotent(temp_storage):
     assert sum(r["executed_quantity"] for r in ord_d_rows) == 60
     assert len(ord_d_rows) == 2  # original 10 + one 50 delta, never re-appended
 
+    # No entry row exists anywhere for this stock in this test — realized
+    # P&L must be skipped entirely (E1-2's absence-handling convention),
+    # not just the ledger append.
+    pnl_rows = await temp_storage.get_kr_realized_pnl(stk_cd="005930", limit=50)
+    assert pnl_rows == []
+
+
+# ---------------------------------------------------------------------------
+# 리뷰 픽스 ①: (ord_no, stk_cd) 복합키 — 동일 ord_no·다른 종목 교차오염 방지
+# ---------------------------------------------------------------------------
+
+
+async def test_same_ord_no_different_stocks_diff_independently(temp_storage):
+    """브로커는 ord_no를 재사용할 수 있다(F3 M1a와 동일 전제) — 같은
+    ORD-X가 005930과 000660 양쪽의 체결을 가리켜도 각 종목은 독립적으로
+    diff되어야 한다. ord_no 단독 집계였다면 수량/금액이 합쳐져 최소 한
+    쪽의 avg_price/missing_qty가 오염된다."""
+    # 005930 쪽만 부분 기록(20/50), 000660 쪽은 원장에 전혀 없음(전량 부족).
+    await _seed_ledger_row(
+        order_id="ORD-X", quantity=20, price=70_000,
+        side="buy", entry_or_exit="entry", stk_cd="005930", stk_nm="삼성전자",
+    )
+
+    kiwoom = _FakeKiwoom([
+        _filled("ORD-X", 50, 70_000, stk_cd="005930", stk_nm="삼성전자", buy_sell_tp="1"),
+        _filled("ORD-X", 30, 140_000, stk_cd="000660", stk_nm="SK하이닉스", buy_sell_tp="1"),
+    ])
+    result = await reconcile_trade_ledger(kiwoom, temp_storage, TRADE_DATE)
+
+    assert result == {"checked": 2, "missing_orders": 2, "upserted_qty": 60}
+
+    rows_005930 = await temp_storage.get_kr_stock_trades(stk_cd="005930", limit=50)
+    new_005930 = [r for r in rows_005930 if r["order_id"] == "ORD-X" and r["executed_quantity"] == 30]
+    assert len(new_005930) == 1
+    assert new_005930[0]["price"] == 70_000  # not polluted by 000660's 140,000
+
+    rows_000660 = await temp_storage.get_kr_stock_trades(stk_cd="000660", limit=50)
+    new_000660 = [r for r in rows_000660 if r["order_id"] == "ORD-X"]
+    assert len(new_000660) == 1
+    assert new_000660[0]["quantity"] == 30  # full amount, not merged with 005930's 20
+    assert new_000660[0]["executed_quantity"] == 30
+    assert new_000660[0]["price"] == 140_000
+
+
+# ---------------------------------------------------------------------------
+# 리뷰 픽스 ②: 진입가 = entry 행 전체의 수량가중평균 (멀티랏 근사)
+# ---------------------------------------------------------------------------
+
+
+async def test_realized_pnl_uses_quantity_weighted_average_entry_price(temp_storage):
+    """멀티랏 시나리오: 100주@200,000 + 50주@210,000 진입 후 80주 매도
+    백스톱. 단일 최신 entry 행만 썼다면 210,000으로 계산되어 오차가
+    컸을 것 — 가중평균 (100*200,000 + 50*210,000) / 150 = 203,333.33...
+    을 써야 한다."""
+    await _seed_ledger_row(
+        order_id="ORD-ENTRY-1", quantity=100, price=200_000,
+        side="buy", entry_or_exit="entry",
+    )
+    await _seed_ledger_row(
+        order_id="ORD-ENTRY-2", quantity=50, price=210_000,
+        side="buy", entry_or_exit="entry",
+    )
+    kiwoom = _FakeKiwoom([_filled("ORD-Y", 80, 215_000, buy_sell_tp="2")])
+
+    result = await reconcile_trade_ledger(kiwoom, temp_storage, TRADE_DATE)
+    assert result == {"checked": 1, "missing_orders": 1, "upserted_qty": 80}
+
+    expected_entry_price = (100 * 200_000 + 50 * 210_000) / 150
+
+    pnl_rows = await temp_storage.get_kr_realized_pnl(stk_cd="005930", limit=50)
+    assert len(pnl_rows) == 1
+    assert pnl_rows[0]["entry_price"] == pytest.approx(expected_entry_price)
+    assert pnl_rows[0]["exit_price"] == 215_000
+    assert pnl_rows[0]["quantity"] == 80
+    assert pnl_rows[0]["realized_amount"] == pytest.approx(
+        (215_000 - expected_entry_price) * 80
+    )
+
 
 # ---------------------------------------------------------------------------
 # 배선 핀: reconcile_trade_ledger는 마감 엣지에서 run_strategy_consensus
