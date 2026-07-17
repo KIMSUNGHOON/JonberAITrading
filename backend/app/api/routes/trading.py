@@ -55,6 +55,9 @@ from services.trading.strategy_orchestrator import (
     ACTIVE_STRATEGY_REVISION_KEY,
     run_strategy_consensus,
 )
+# E3-4: EOD 리포트 API -- digest 재조립기 + LLM 내러티브(narrate_eod_digest는
+# 이 모듈의 유일한 LLM 호출, 실패는 항상 None로 흡수됨 -- eod_digest.py 참고).
+from services.trading.eod_digest import build_eod_digest, narrate_eod_digest
 
 logger = logging.getLogger(__name__)
 
@@ -949,6 +952,145 @@ async def run_consensus_now(
     trade_date = request.trade_date or datetime.now().strftime("%Y-%m-%d")
     storage = await get_storage_service()
     return await run_strategy_consensus(coordinator, storage, trade_date, force=True)
+
+
+# -------------------------------------------
+# EOD Report (E3-4)
+# -------------------------------------------
+
+# eod_review.trade_date is the PK and storage.get_eod_reviews has no
+# server-side date filter (mirrors eod_digest.py/eod_review.py's own
+# scan-then-match idiom, see e.g. eod_digest.py's
+# _DAILY_PERF_SNAPSHOT_SCAN_LIMIT) -- this bounds how many recent rows we
+# scan in Python to find an exact trade_date match. ~2 years of trading
+# days, comfortably more than any date a human would ever request here.
+_EOD_REVIEW_SCAN_LIMIT = 500
+
+
+async def _find_eod_review_row(storage: Any, trade_date: str) -> Optional[Dict[str, Any]]:
+    rows = await storage.get_eod_reviews(limit=_EOD_REVIEW_SCAN_LIMIT)
+    for row in rows:
+        if row.get("trade_date") == trade_date:
+            return row
+    return None
+
+
+def _parse_report_json(report_json: Optional[str]) -> Dict[str, Any]:
+    try:
+        return json.loads(report_json) if report_json else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+async def _compute_staleness_note(storage: Any, requested_date: str) -> Optional[str]:
+    """digest.strategy(/regime)는 build_eod_digest 자체가 문서화하듯
+    trade_date로 스코프되지 않은 '테이블 진짜 최신' 행이다(E3-1 설계) — 오늘이
+    아닌 date로 POST /run을 돌리면 digest에 실린 strategy 섹션이 요청 date
+    이후에 결정된 리비전일 수 있다(E3-1 리뷰 Important #2). strategy_revisions
+    최신 행의 trade_date(없으면 created_at 앞 10자)를 requested_date와 비교해
+    다르면 사람이 읽을 문자열을, 같거나 판단 불가(리비전 없음/읽기 실패)면
+    None을 반환한다 — never-raise, 이 라우트의 200 계약을 절대 깨지 않는다."""
+    try:
+        rows = await storage.get_strategy_revisions(limit=1)
+    except Exception as e:  # noqa: BLE001 — 판단 불가로 강등
+        logger.warning(f"[EODReportAPI] get_strategy_revisions failed: {e}")
+        return None
+    if not rows:
+        return None
+
+    revision_date = rows[0].get("trade_date")
+    if not revision_date:
+        created_at = rows[0].get("created_at")
+        revision_date = str(created_at)[:10] if created_at else None
+    if not revision_date or revision_date == requested_date:
+        return None
+
+    return (
+        f"digest.strategy/regime은 {revision_date} 기준 최신 리비전이며, "
+        f"요청한 {requested_date}와 다를 수 있습니다."
+    )
+
+
+@router.get("/eod-report")
+async def get_eod_report(date: Optional[str] = None):
+    """E3-4: EOD 리포트 조회. date(YYYY-MM-DD) 생략 시 테이블 최신 행.
+    report_json 전체(digest·narrative·staleness_note 포함, 저장 시점 값
+    그대로)를 파싱해 trade_date·created_at와 함께 반환한다. 해당 날짜(또는
+    빈 테이블)에 행이 없으면 404."""
+    storage = await get_storage_service()
+
+    if date:
+        row = await _find_eod_review_row(storage, date)
+    else:
+        rows = await storage.get_eod_reviews(limit=1)
+        row = rows[0] if rows else None
+
+    if row is None:
+        raise HTTPException(
+            404,
+            f"eod_review not found for date={date}" if date else "eod_review not found",
+        )
+
+    report = _parse_report_json(row.get("report_json"))
+    report["trade_date"] = row.get("trade_date")
+    report["created_at"] = row.get("created_at")
+    return report
+
+
+class EodReportRunRequest(BaseModel):
+    date: Optional[str] = None  # 생략 시 오늘(KST)
+
+
+@router.post("/eod-report/run")
+async def run_eod_report_now(
+    request: EodReportRunRequest,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """E3-4: 수동 EOD 리포트 재생성 + 재통지 — 마감 엣지를 놓친 날(재시작/
+    장애로 coordinator._check_queue_on_market_open의 EOD 체인이 못 돈 날)
+    대비 수동 트리거. /strategy/consensus/run과 동일한 형태(요청 바디로
+    date 지정, force성 재실행).
+
+    digest를 build_eod_digest로 재조립하고(순수 집계, LLM 아님) narrate_
+    eod_digest로 내러티브를 재생성한다(이 라우트가 거치는 유일한 LLM 호출 —
+    실패/타임아웃은 narrate_eod_digest 자체가 절대 raise하지 않고 None을
+    반환하므로 이 라우트도 항상 200을 반환한다). 기존 eod_review 행이 있으면
+    그 report_json의 digest/narrative 키만 갱신하고 나머지 섹션(portfolio/
+    per_stock/agents/regime — build_eod_review가 채우는 것들)은 보존한다;
+    없으면 digest/narrative만으로 최소 report를 저장한다(INSERT OR REPLACE로
+    trade_date PK 재사용, eod_review.py 관용구와 동일).
+
+    저장 후 coordinator._notify_eod_summary(date)를 재호출해 Telegram/WS를
+    재발송한다 — 그 함수 자신의 stale 가드(get_eod_reviews(limit=1)로 읽은
+    최신 행의 trade_date가 요청 date와 다르면 스킵)가 date 정합을 보장하므로,
+    과거 date를 재실행해도 더 최신 날짜의 요약이 잘못 재발송되는 일은 없다.
+    """
+    trade_date = request.date or datetime.now(KST).strftime("%Y-%m-%d")
+    storage = await get_storage_service()
+
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
+    digest["staleness_note"] = await _compute_staleness_note(storage, trade_date)
+    narrative = await narrate_eod_digest(digest)
+
+    existing_row = await _find_eod_review_row(storage, trade_date)
+    report = _parse_report_json(existing_row.get("report_json")) if existing_row else {}
+    report["trade_date"] = trade_date
+    report["digest"] = digest
+    report["narrative"] = narrative
+
+    await storage.save_eod_review(
+        {"trade_date": trade_date, "report_json": json.dumps(report)}
+    )
+
+    await coordinator._notify_eod_summary(trade_date)
+
+    return {
+        "ok": True,
+        "trade_date": trade_date,
+        "digest": digest,
+        "narrative": narrative,
+        "staleness_note": digest.get("staleness_note"),
+    }
 
 
 # -------------------------------------------
