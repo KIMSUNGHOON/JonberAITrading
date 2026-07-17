@@ -515,6 +515,19 @@ class ChatCoordinator:
 
     async def _check_watch_list(self) -> None:
         """Check watch list for discussion opportunities."""
+        # FIX NOW Minor (final review): the heartbeat must be set BEFORE the
+        # E2 market-closed gate below, not after it — `_last_tick`'s own
+        # field docstring promises "set at the top of every executed tick"
+        # precisely so a genuinely-idle (market closed) loop can be told
+        # apart from a dead one, but the gate used to `return` before this
+        # line ever ran, so `_last_tick` froze the instant the market
+        # closed and stayed frozen for the entire off-hours stretch — FE's
+        # useLoopLiveness read that as a false "LOOP STALE" alarm all
+        # night, every night, not just when the loop actually died. A
+        # skipped (market-closed) cycle is still proof the scheduler is
+        # alive, so it must tick too.
+        self._last_tick = datetime.now()
+
         # E2: 장외에는 자동 토론/감시 사이클 전체를 쉬게 한다(완전 idle 결정).
         # 수동 /discuss와 trading coordinator의 마감 엣지 체인은 게이트 밖.
         if not is_krx_open_cached():
@@ -525,7 +538,6 @@ class ChatCoordinator:
         if not self._running:
             return
 
-        self._last_tick = datetime.now()
         logger.debug("checking_watch_list")
 
         try:

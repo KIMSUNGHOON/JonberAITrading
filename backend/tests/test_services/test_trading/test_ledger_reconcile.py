@@ -313,3 +313,26 @@ def test_coordinator_close_edge_calls_eod_summary_notify_after_ledger_reconcile(
     source = inspect.getsource(ExecutionCoordinator._check_queue_on_market_open)
     assert "_notify_eod_summary(" in source
     assert source.index("reconcile_trade_ledger(") < source.index("_notify_eod_summary(")
+
+
+# ---------------------------------------------------------------------------
+# Minor 2 (final review): a write/read barrier between the placement-time
+# fire-and-forget ledger writes (record_trade_fill, scheduled by
+# _poll_tracked_fills/_apply_sell_fill earlier in this same tick) and
+# reconcile_trade_ledger's read of kr_stock_trades -- without it, a write
+# still in flight when the reconciler reads looks "missing" from the diff's
+# point of view and gets spuriously re-appended (a race, not exercised by a
+# synchronous unit test, so this pins the wiring instead).
+# ---------------------------------------------------------------------------
+
+
+def test_coordinator_close_edge_awaits_pending_trade_fill_writes_before_reconcile():
+    from services.trading.coordinator import ExecutionCoordinator
+
+    source = inspect.getsource(ExecutionCoordinator._check_queue_on_market_open)
+    assert "wait_for_pending_trade_fill_writes(" in source
+    assert (
+        source.index("run_strategy_consensus(")
+        < source.index("wait_for_pending_trade_fill_writes(")
+        < source.index("reconcile_trade_ledger(")
+    )

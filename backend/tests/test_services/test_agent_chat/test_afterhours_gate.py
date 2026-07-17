@@ -12,6 +12,7 @@ Plus a small unit-test class for the shared cache helper
 (``market_hours.is_krx_open_cached`` / ``_reset_krx_open_cache``) that the
 three gate points above (and E2-2's 1s loop) all consume.
 """
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -157,6 +158,29 @@ async def test_open_market_unchanged(monkeypatch, coordinator_with_watch):
     coord = coordinator_with_watch
     await coord._check_watch_list()
     assert len(coord._detect_opportunity_calls) >= 1
+
+
+@pytest.mark.asyncio
+async def test_watch_check_still_ticks_heartbeat_when_closed(closed_market, coordinator_with_watch):
+    """FIX NOW Minor (final review): `_last_tick` must update even on a
+    market-closed (skipped) cycle -- its own field docstring promises "set
+    at the top of every executed tick" precisely so FE's useLoopLiveness can
+    tell a genuinely-idle loop (market closed) apart from a dead one. Before
+    the fix, the E2 gate `return`ed before the `_last_tick = datetime.now()`
+    line ever ran, so the heartbeat froze for the entire off-hours stretch
+    and useLoopLiveness raised a false LOOP STALE alarm all night."""
+    coord = coordinator_with_watch
+    assert coord._last_tick is None  # nothing has ticked yet
+
+    before = datetime.now()
+    await coord._check_watch_list()
+    after = datetime.now()
+
+    assert coord._last_tick is not None
+    assert before <= coord._last_tick <= after
+    # The gate itself is unaffected -- still a genuine no-op past the tick.
+    assert coord._detect_opportunity_calls == []
+    assert coord._active_rooms == {}
 
 
 # -------------------------------------------

@@ -647,3 +647,193 @@ async def test_on_trade_approved_buy_not_double_recorded(temp_storage):
     rows = await temp_storage.get_kr_stock_trades()
     assert len(rows) == 1
     assert rows[0]["side"] == "buy"
+
+
+# ---------------------------------------------------------------------------
+# Critical 1 (final review): split orders must record ONE ledger row PER
+# PART (its own broker order_id/quantity/executed_quantity), not one
+# aggregate row under part0's order_id. The pre-fix aggregate recording made
+# `reconcile_trade_ledger`'s per-(order_id, stk_cd) EOD diff see every OTHER
+# part's ord_no as entirely missing from the ledger and re-append it at
+# EOD, double-counting both the ledger and its realized P&L (reviewer repro:
+# a split SELL's placement-time fill recorded as one row, then the EOD
+# reconciler treating the other broker order as "never recorded" — the
+# review's 200->300 finding). These tests pin the fix end-to-end: per-part
+# rows at placement time, and a subsequent `reconcile_trade_ledger` run
+# against a broker snapshot that matches those parts exactly stays a true
+# no-op (diff 0) instead of re-appending anything.
+# ---------------------------------------------------------------------------
+
+
+def _split_result(parts, *, total_quantity, side: OrderSide) -> OrderResult:
+    total_filled = sum(p.filled_quantity for p in parts)
+    status = (
+        "filled" if total_filled >= total_quantity
+        else "partial" if total_filled > 0
+        else "pending"
+    )
+    return OrderResult(
+        order_id=parts[0].order_id,
+        ticker="005930",
+        side=side,
+        requested_quantity=total_quantity,
+        filled_quantity=total_filled,
+        avg_price=parts[0].avg_price,
+        status=status,
+        parts=parts,
+    )
+
+
+async def test_apply_sell_fill_split_records_one_row_per_part_and_reconcile_is_noop(
+    temp_storage,
+):
+    coord = _active_coordinator()
+    order = OrderRequest(
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.SELL,
+        quantity=200,
+        price=250_000,
+        session_id="sess-split-sell",
+    )
+    parts = [
+        OrderResult(
+            order_id="SPLIT-SELL-A", ticker="005930", side=OrderSide.SELL,
+            requested_quantity=100, filled_quantity=100, avg_price=250_000,
+            status="filled",
+        ),
+        OrderResult(
+            order_id="SPLIT-SELL-B", ticker="005930", side=OrderSide.SELL,
+            requested_quantity=100, filled_quantity=60, avg_price=250_000,
+            status="partial",
+        ),
+    ]
+    result = _split_result(parts, total_quantity=200, side=OrderSide.SELL)
+    assert result.filled_quantity == 160  # sanity: matches the review's shape
+
+    coord._apply_sell_fill("005930", result.filled_quantity, order=order, result=result)
+    await _flush()
+
+    rows = await temp_storage.get_kr_stock_trades(stk_cd="005930")
+    assert len(rows) == 2
+    by_order_id = {r["order_id"]: r for r in rows}
+    assert by_order_id["SPLIT-SELL-A"]["quantity"] == 100
+    assert by_order_id["SPLIT-SELL-A"]["executed_quantity"] == 100
+    assert by_order_id["SPLIT-SELL-A"]["status"] == "completed"
+    assert by_order_id["SPLIT-SELL-B"]["quantity"] == 100
+    assert by_order_id["SPLIT-SELL-B"]["executed_quantity"] == 60
+    assert by_order_id["SPLIT-SELL-B"]["status"] == "partial"
+    assert sum(r["executed_quantity"] for r in rows) == 160
+
+    # EOD: the broker's cumulative daily snapshot for the day exactly matches
+    # what each part already filled (no further intraday fills beyond
+    # placement) -> reconcile must be a genuine no-op, not a re-append.
+    from datetime import date
+
+    from services.kiwoom.models import FilledOrder
+    from services.trading.ledger_reconcile import reconcile_trade_ledger
+
+    class _EodKiwoom:
+        async def get_filled_orders(self, use_cache=True):
+            return [
+                FilledOrder(
+                    ord_no="SPLIT-SELL-A", stk_cd="005930", stk_nm="삼성전자",
+                    ccld_qty=100, ccld_uv=250_000, ccld_amt=100 * 250_000,
+                    ccld_dt="", ccld_tm="", buy_sell_tp="2",
+                ),
+                FilledOrder(
+                    ord_no="SPLIT-SELL-B", stk_cd="005930", stk_nm="삼성전자",
+                    ccld_qty=60, ccld_uv=250_000, ccld_amt=60 * 250_000,
+                    ccld_dt="", ccld_tm="", buy_sell_tp="2",
+                ),
+            ]
+
+    trade_date = date.today().strftime("%Y-%m-%d")
+    reconcile_result = await reconcile_trade_ledger(_EodKiwoom(), temp_storage, trade_date)
+
+    assert reconcile_result == {"checked": 2, "missing_orders": 0, "upserted_qty": 0}
+
+    rows_after = await temp_storage.get_kr_stock_trades(stk_cd="005930")
+    assert len(rows_after) == 2  # nothing re-appended
+    assert sum(r["executed_quantity"] for r in rows_after) == 160  # stays 160, never 220
+
+
+async def test_execute_order_buy_split_records_one_row_per_part(temp_storage):
+    """BUY counterpart, exercised through the REAL `_execute_order` body
+    (only `order_agent.execute_order` is stubbed) — unlike
+    test_f3_fill_tracking.py's split-registration tests, which stub
+    `_execute_order` itself and so never reach its ledger-write branch."""
+    coord = _active_coordinator()
+    parts = [
+        OrderResult(
+            order_id="SPLIT-BUY-A", ticker="005930", side=OrderSide.BUY,
+            requested_quantity=100, filled_quantity=100, avg_price=250_000,
+            status="filled",
+        ),
+        OrderResult(
+            order_id="SPLIT-BUY-B", ticker="005930", side=OrderSide.BUY,
+            requested_quantity=100, filled_quantity=75, avg_price=250_000,
+            status="partial",
+        ),
+    ]
+    result = _split_result(parts, total_quantity=200, side=OrderSide.BUY)
+
+    async def _exec(order):
+        return result
+
+    coord.order_agent.execute_order = _exec
+
+    order = OrderRequest(
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.BUY,
+        quantity=200,
+        price=250_000,
+        session_id="sess-split-buy",
+    )
+    await coord._execute_order(order)
+    await _flush()
+
+    rows = await temp_storage.get_kr_stock_trades(stk_cd="005930")
+    assert len(rows) == 2
+    by_order_id = {r["order_id"]: r for r in rows}
+    assert by_order_id["SPLIT-BUY-A"]["quantity"] == 100
+    assert by_order_id["SPLIT-BUY-A"]["executed_quantity"] == 100
+    assert by_order_id["SPLIT-BUY-A"]["status"] == "completed"
+    assert by_order_id["SPLIT-BUY-B"]["quantity"] == 100
+    assert by_order_id["SPLIT-BUY-B"]["executed_quantity"] == 75
+    assert by_order_id["SPLIT-BUY-B"]["status"] == "partial"
+    assert sum(r["executed_quantity"] for r in rows) == 175
+
+
+async def test_apply_sell_fill_split_skips_zero_filled_parts(temp_storage):
+    """A part that placed but filled 0 (still pending at the broker) must
+    not get a ledger row yet — only parts with filled_quantity > 0 record;
+    the zero-fill part is picked up later by the fill tracker/poll path."""
+    coord = _active_coordinator()
+    order = OrderRequest(
+        ticker="005930", side=OrderSide.SELL, quantity=200, price=250_000,
+        session_id="sess-split-zero",
+    )
+    parts = [
+        OrderResult(
+            order_id="SPLIT-Z-A", ticker="005930", side=OrderSide.SELL,
+            requested_quantity=100, filled_quantity=40, avg_price=250_000,
+            status="partial",
+        ),
+        OrderResult(
+            order_id="SPLIT-Z-B", ticker="005930", side=OrderSide.SELL,
+            requested_quantity=100, filled_quantity=0, avg_price=0,
+            status="pending",
+        ),
+    ]
+    result = _split_result(parts, total_quantity=200, side=OrderSide.SELL)
+
+    coord._apply_sell_fill("005930", result.filled_quantity, order=order, result=result)
+    await _flush()
+
+    rows = await temp_storage.get_kr_stock_trades(stk_cd="005930")
+    assert len(rows) == 1
+    assert rows[0]["order_id"] == "SPLIT-Z-A"
+    assert rows[0]["executed_quantity"] == 40
+

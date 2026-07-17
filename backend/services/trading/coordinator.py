@@ -43,12 +43,13 @@ from .strategy_apply import apply_strategy_to_risk_params
 from .pending_order_tracker import PendingOrderTracker, TrackedOrder
 from .position_registration import register_fill_as_position
 from .reconciler import reconcile
-from .trade_log import record_trade_fill, record_kr_realized_pnl
+from .trade_log import record_trade_fill, record_kr_realized_pnl, wait_for_pending_trade_fill_writes
 from .cadence import compute_watch_ttl
 from .eod_snapshot import write_daily_snapshot
 from .eod_orchestrator import run_eod_review
 from .strategy_orchestrator import run_strategy_consensus
 from .ledger_reconcile import reconcile_trade_ledger
+from .eod_digest import _build_strategy_section
 from services.storage_service import get_storage_service
 
 logger = logging.getLogger(__name__)
@@ -899,6 +900,68 @@ class ExecutionCoordinator:
             )
         return registered
 
+    def _record_fill_ledger(
+        self,
+        order: OrderRequest,
+        result: OrderResult,
+        *,
+        side: str,
+        entry_or_exit: str,
+    ) -> None:
+        """Shared ledger-write half of both fill choke points (BUY in
+        `_execute_order`, SELL in `_apply_sell_fill`) — split-order aware
+        (Critical 1, final whole-branch review).
+
+        A split order places SEVERAL broker orders, each with its own
+        ord_no, surfaced as `result.parts`. Recording the AGGREGATE as one
+        row (part0's order_id + the summed filled_quantity, the pre-fix
+        behavior) made `reconcile_trade_ledger`'s per-(order_id, stk_cd) EOD
+        diff see every OTHER part's ord_no as entirely absent from the
+        ledger — it re-appended them at EOD as "missing", double-counting
+        both the ledger row and its realized P&L (reviewer repro: a split
+        SELL's placement-time fill recorded as one aggregate row, then the
+        EOD reconciler re-appending the other parts' broker fills as if
+        they were never recorded, inflating both the ledger and realized
+        P&L on every EOD run instead of settling at diff 0).
+
+        Recording one row PER PART (its own order_id/quantity=
+        requested_quantity/executed_quantity=filled_quantity/avg_price)
+        makes each part's ledger key match its broker (ord_no, stk_cd) key
+        exactly, so the EOD diff lands at 0 — the same per-part contract
+        `_track_unfilled` (above) already uses for the fill TRACKER side of
+        the same split. `result.parts is None` (single/non-split order)
+        degrades to `[result]`, keeping the previous single-row behavior
+        byte-for-byte.
+
+        Only the ledger WRITE is split here — position decrement and
+        realized P&L stay total-based in `_apply_sell_position_delta` (the
+        existing semantics: one matched exit against the position's
+        blended average, not a per-part breakdown).
+        """
+        if not self._persistence_active:
+            return
+        for part in (result.parts or [result]):
+            if part.filled_quantity <= 0:
+                continue
+            record_trade_fill(
+                stk_cd=order.ticker,
+                stk_nm=order.stock_name,
+                side=side,
+                order_type=getattr(order.order_type, "value", order.order_type),
+                price=part.avg_price or order.price or 0,
+                quantity=part.requested_quantity,
+                executed_quantity=part.filled_quantity,
+                status=(
+                    "completed"
+                    if part.filled_quantity >= part.requested_quantity
+                    else "partial"
+                ),
+                order_id=part.order_id,
+                session_id=order.session_id,
+                decision_id=order.session_id,
+                entry_or_exit=entry_or_exit,
+            )
+
     async def _execute_order(self, order: OrderRequest) -> OrderResult:
         """Execute an order and update state."""
         # Add to pending
@@ -925,24 +988,11 @@ class ExecutionCoordinator:
             # side-agnostic record here would double-count those. Gated by
             # _persistence_active (same rule as _schedule_persist) so a
             # coordinator built in a unit test never writes to real storage.
-            if self._persistence_active and order.side in (OrderSide.BUY, "buy"):
-                record_trade_fill(
-                    stk_cd=order.ticker,
-                    stk_nm=order.stock_name,
-                    side="buy",
-                    order_type=getattr(order.order_type, "value", order.order_type),
-                    price=result.avg_price or order.price or 0,
-                    quantity=result.requested_quantity,
-                    executed_quantity=result.filled_quantity,
-                    status=(
-                        "completed"
-                        if result.filled_quantity >= result.requested_quantity
-                        else "partial"
-                    ),
-                    order_id=result.order_id,
-                    session_id=order.session_id,
-                    decision_id=order.session_id,
-                    entry_or_exit="entry",
+            if order.side in (OrderSide.BUY, "buy"):
+                # Critical 1 (final review): per-part ledger rows for split
+                # orders — see `_record_fill_ledger` docstring.
+                self._record_fill_ledger(
+                    order, result, side="buy", entry_or_exit="entry"
                 )
 
         await self._notify_state_change()
@@ -1144,24 +1194,15 @@ class ExecutionCoordinator:
             )
             return
 
-        if self._persistence_active and order is not None and result is not None:
-            record_trade_fill(
-                stk_cd=ticker,
-                stk_nm=order.stock_name,
-                side="sell",
-                order_type=getattr(order.order_type, "value", order.order_type),
-                price=result.avg_price or order.price or 0,
-                quantity=result.requested_quantity,
-                executed_quantity=filled_quantity,
-                status=(
-                    "completed"
-                    if filled_quantity >= result.requested_quantity
-                    else "partial"
-                ),
-                order_id=result.order_id,
-                session_id=order.session_id,
-                decision_id=order.session_id,
-                entry_or_exit="exit",
+        if order is not None and result is not None:
+            # Critical 1 (final review): per-part ledger rows for split
+            # orders — see `_record_fill_ledger` docstring. `filled_quantity`
+            # (the caller-supplied aggregate) is intentionally unused here;
+            # every current call site passes `result.filled_quantity`, and
+            # the per-part loop derives each row's executed_quantity from
+            # `result.parts` directly.
+            self._record_fill_ledger(
+                order, result, side="sell", entry_or_exit="exit"
             )
 
         # `avg_price=None` (order/result missing) tells the delta helper below
@@ -2328,6 +2369,7 @@ class ExecutionCoordinator:
             await write_daily_snapshot(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # T5c: 마감 1회
             await run_eod_review(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase2 T4: EOD 리뷰(레짐/캘리브레이션/리포트+FK 백필)
             await run_strategy_consensus(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase3: EOD 전략 합의(리뷰 소비→TradingStrategy 갱신+버전 영속; 타임아웃/실패는 내부 소유)
+            await wait_for_pending_trade_fill_writes()  # Minor 2 (final review): drain in-flight fire-and-forget record_trade_fill tasks (placement-time fills scheduled just above via _poll_tracked_fills/_apply_sell_fill) before the EOD reconciler reads kr_stock_trades — otherwise a write still in flight looks "missing" to the diff and gets spuriously re-appended.
             await reconcile_trade_ledger(self._kiwoom, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # E1-5: EOD 원장 대사 백스톱(ka10076 vs kr_stock_trades diff upsert; never-raise, 포지션 미변경)
             await self._notify_eod_summary(datetime.now().strftime("%Y-%m-%d"))  # E3-3: 장마감 요약 통지(Telegram+WS) — run_eod_review가 저장한 digest/narrative 재조회
         self._market_was_open = is_open
@@ -2356,6 +2398,33 @@ class ExecutionCoordinator:
         never break the market-close scheduler tick, especially not after
         reconcile_trade_ledger already completed its ledger backstop work
         this same tick.
+
+        Important 1 (final review) — strategy-section freshness: `digest`
+        is assembled INSIDE `run_eod_review` (its E3-2 step), which runs
+        BEFORE `run_strategy_consensus` in `_check_queue_on_market_open`'s
+        chain. So the `digest["strategy"]` section `run_eod_review` computed
+        and persisted always reflects the PRIOR revision, never the new one
+        `run_strategy_consensus` just wrote this same tick — every automatic
+        close-of-day notification and the persisted `eod_review` row itself
+        was permanently one revision stale (spec §3 T8 wants the strategy
+        section to reflect the SAME-DAY consensus). Since this function is
+        the chain's LAST step (called after `run_strategy_consensus` AND
+        `reconcile_trade_ledger`), it re-fetches the digest's strategy
+        section here — via the same `eod_digest._build_strategy_section`
+        helper `run_eod_review` itself calls, so the shape is identical —
+        and, if it changed, patches `report["digest"]["strategy"]` and
+        re-persists via `save_eod_review` (INSERT OR REPLACE on trade_date,
+        so this updates the SAME row in place rather than accreting a
+        duplicate). Deliberately NOT re-running `narrate_eod_digest`
+        (no second LLM call this tick): the narrative's prose may reference
+        the prior stance, but it is already framed as "익일 적용 전략(EOD
+        합의)" rather than "오늘의 전략", so a one-revision-old narrative
+        text remains factually harmless even though the structured
+        `strategy` section it will be templated/broadcast alongside is now
+        current — this residual gap is intentionally out of scope here.
+        Best-effort: a failure in this refresh (storage read/write) is
+        logged and the ORIGINAL (possibly stale) digest is still sent
+        rather than dropping the notification entirely.
 
         Stale guard (review fix): `get_eod_reviews(limit=1)` returns the
         newest row by trade_date regardless of whether TODAY's
@@ -2399,6 +2468,24 @@ class ExecutionCoordinator:
             if not digest:
                 return False
             narrative = report.get("narrative")
+
+            # Important 1 (final review): refresh the strategy section AFTER
+            # run_strategy_consensus has had a chance to write a new
+            # revision this same tick — see docstring above. Best-effort:
+            # any failure here falls back to the (possibly stale) digest
+            # already loaded, never blocks the notification.
+            try:
+                fresh_strategy = await _build_strategy_section(storage)
+                if fresh_strategy is not None and fresh_strategy != digest.get("strategy"):
+                    digest["strategy"] = fresh_strategy
+                    report["digest"] = digest
+                    await storage.save_eod_review(
+                        {"trade_date": trade_date, "report_json": json.dumps(report)}
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[Coordinator] EOD digest strategy refresh failed: {e}"
+                )
 
             from services.telegram import get_telegram_notifier
 

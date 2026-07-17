@@ -1539,3 +1539,149 @@ async def test_notify_eod_summary_returns_true_on_success(temp_storage, monkeypa
 
     assert result is True
     assert ws_calls == [({"trade_date": today}, "오늘 요약")]
+
+
+# ---------------------------------------------------------------------------
+# Important 1 (final review): `digest["strategy"]` is assembled INSIDE
+# run_eod_review, which runs BEFORE run_strategy_consensus in the
+# market-close chain (`_check_queue_on_market_open`) -- so the persisted
+# digest's strategy section is always one revision stale for a market day
+# that actually recomputed the strategy (spec §3 T8 wants same-day
+# freshness). `_notify_eod_summary`, the chain's LAST step, refreshes just
+# that section from the newest `strategy_revisions` row (the same
+# `eod_digest._build_strategy_section` helper run_eod_review itself uses)
+# and re-persists the row -- no second LLM call, no other section touched.
+# ---------------------------------------------------------------------------
+
+
+async def test_notify_eod_summary_refreshes_strategy_section_after_consensus(
+    temp_storage, monkeypatch
+):
+    import json
+
+    import app.api.routes.websocket as ws_module
+    import services.telegram as telegram_module
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    today = date.today().strftime("%Y-%m-%d")
+
+    # run_eod_review's digest -- built BEFORE consensus ran this tick, so it
+    # still carries the PRIOR stance.
+    await temp_storage.save_eod_review({
+        "trade_date": today,
+        "report_json": json.dumps({
+            "digest": {
+                "trade_date": today,
+                "strategy": {
+                    "stance": "NEUTRAL",
+                    "rationale_excerpt": "어제 합의",
+                    "key_knobs": {
+                        "stop_loss_pct": -3.0,
+                        "take_profit_pct": 5.0,
+                        "max_position_pct": 10.0,
+                        "max_trade_notional_pct": 5.0,
+                    },
+                    "changed": False,
+                },
+            },
+            "narrative": "어제 요약",
+        }),
+    })
+
+    # run_strategy_consensus's new revision -- written AFTER the digest above
+    # but BEFORE _notify_eod_summary runs, matching the real chain order.
+    await temp_storage.save_strategy_revision({
+        "id": "rev-new",
+        "trade_date": today,
+        "source": "eod_consensus",
+        "stance": "AGGRESSIVE",
+        "consensus_level": "STRONG",
+        "changed": True,
+        "strategy_json": json.dumps({
+            "exit_conditions": {"stop_loss_pct": -4.0, "take_profit_pct": 8.0},
+            "position_sizing": {"max_position_pct": 15.0, "max_trade_notional_pct": 8.0},
+        }),
+        "rationale": "오늘 신규 합의",
+    })
+
+    telegram_calls = []
+    ws_calls = []
+
+    class _ReadyNotifier:
+        is_ready = True
+
+        async def send_daily_summary(self, digest, narrative=None):
+            telegram_calls.append((digest, narrative))
+            return True
+
+    async def _fake_get_telegram_notifier():
+        return _ReadyNotifier()
+
+    async def _fake_broadcast(digest, narrative=None):
+        ws_calls.append((digest, narrative))
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+    monkeypatch.setattr(ws_module, "broadcast_eod_summary", _fake_broadcast)
+
+    result = await coord._notify_eod_summary(today)
+
+    assert result is True
+    assert len(ws_calls) == 1
+    broadcast_digest, broadcast_narrative = ws_calls[0]
+    assert broadcast_digest["strategy"]["stance"] == "AGGRESSIVE"
+    assert broadcast_digest["strategy"]["changed"] is True
+    assert broadcast_digest["strategy"]["key_knobs"]["stop_loss_pct"] == -4.0
+    # No second LLM call -- narrative stays whatever run_eod_review wrote.
+    assert broadcast_narrative == "어제 요약"
+    # Telegram got the SAME refreshed digest too.
+    assert telegram_calls[0][0]["strategy"]["stance"] == "AGGRESSIVE"
+
+    # The persisted row itself is updated, not just the notification
+    # payload -- a later manual re-notify (POST /trading/eod-report/run)
+    # must not re-surface the stale stance.
+    reviews = await temp_storage.get_eod_reviews(limit=1)
+    saved_report = json.loads(reviews[0]["report_json"])
+    assert saved_report["digest"]["strategy"]["stance"] == "AGGRESSIVE"
+
+
+async def test_notify_eod_summary_no_strategy_revisions_keeps_original_digest(
+    temp_storage, monkeypatch
+):
+    """No `strategy_revisions` row exists at all (e.g. consensus hasn't ever
+    run) -> `_build_strategy_section` returns None -> the refresh is a no-op,
+    the original digest (whatever run_eod_review saved, "strategy": None or
+    absent) is sent unchanged. Guards the `fresh_strategy is not None` check
+    -- without it, a None would clobber a real prior "strategy" section."""
+    import json
+
+    import app.api.routes.websocket as ws_module
+    import services.telegram as telegram_module
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    today = date.today().strftime("%Y-%m-%d")
+
+    await temp_storage.save_eod_review({
+        "trade_date": today,
+        "report_json": json.dumps(
+            {"digest": {"trade_date": today, "strategy": None}, "narrative": "오늘 요약"}
+        ),
+    })
+
+    class _NotReadyNotifier:
+        is_ready = False
+
+    async def _fake_get_telegram_notifier():
+        return _NotReadyNotifier()
+
+    ws_calls = []
+
+    async def _fake_broadcast(digest, narrative=None):
+        ws_calls.append((digest, narrative))
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+    monkeypatch.setattr(ws_module, "broadcast_eod_summary", _fake_broadcast)
+
+    result = await coord._notify_eod_summary(today)
+
+    assert result is True
+    assert ws_calls == [({"trade_date": today, "strategy": None}, "오늘 요약")]
