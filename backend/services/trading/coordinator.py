@@ -707,55 +707,99 @@ class ExecutionCoordinator:
                 },
             )
 
-        # F3: an unfilled/partial BUY still has (or may soon have) broker-side
-        # exposure that nothing is watching yet — track the remainder so the
-        # scheduler's ka10076 poll can pick up the post-fill later. SELL
-        # unfilled remainders are out of scope (R5-P4).
-        #
-        # Split orders (F3 review CRITICAL): the aggregate carries per-part
-        # results in `result.parts`, each with its OWN broker ord_no. ka10076
-        # matches by ord_no, so every unfilled/partial part is tracked as its
-        # own TrackedOrder — one aggregate entry would poison the diff
-        # arithmetic (several broker orders summed against one total).
-        if side == OrderSide.BUY and result.status in ("pending", "partial"):
-            registered: List[str] = []
-            for part in (result.parts or [result]):
-                if part.status not in ("pending", "partial"):
-                    continue
-                remaining = part.requested_quantity - part.filled_quantity
-                if remaining <= 0:
-                    continue
-                self.fill_tracker.register(
-                    TrackedOrder(
-                        ord_no=part.order_id,
-                        ticker=ticker,
-                        stock_name=stock_name or ticker,
-                        side="buy",
-                        total_quantity=part.requested_quantity,
-                        filled_quantity=part.filled_quantity,
-                        filled_amount=part.filled_quantity * part.avg_price,
-                        limit_price=entry_price,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit,
-                        source_queue_id=queue_id,
-                        source_session_id=session_id,
-                        risk_score=risk_score,
-                        trade_date=date.today().strftime("%Y%m%d"),
-                    )
-                )
-                registered.append(f"{part.order_id}:{remaining}주")
-            if registered:
-                self._schedule_persist()
-                self._log_activity(
-                    ActivityType.ORDER_PLACED,
-                    f"미체결 잔량 추적 등록: {stock_name or ticker} "
-                    f"({', '.join(registered)})",
-                    agent="order",
-                    ticker=ticker,
-                    details={"tracked": registered},
-                )
+        # F3/E1-1: an unfilled/partial order (either side) still has (or may
+        # soon have) broker-side exposure that nothing is watching yet —
+        # track the remainder so the scheduler's ka10076 poll can pick up
+        # the post-fill later. `_track_unfilled` is side-agnostic (E1-1
+        # generalized the original BUY-only F3 block, since a SELL/REDUCE
+        # remainder going untracked is exactly how a real ledger under-
+        # recorded a 155-share broker sell as 41 shares).
+        registered = self._track_unfilled(
+            side.value,
+            ticker,
+            stock_name or ticker,
+            result,
+            limit_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            source_queue_id=queue_id,
+            source_session_id=session_id,
+            risk_score=risk_score,
+        )
+        if registered:
+            self._schedule_persist()
+            self._log_activity(
+                ActivityType.ORDER_PLACED,
+                f"미체결 잔량 추적 등록: {stock_name or ticker} "
+                f"({', '.join(registered)})",
+                agent="order",
+                ticker=ticker,
+                details={"tracked": registered},
+            )
 
         return allocation
+
+    def _track_unfilled(
+        self,
+        order_side: str,
+        ticker: str,
+        stock_name: str,
+        result: OrderResult,
+        *,
+        limit_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        source_queue_id: Optional[str] = None,
+        source_session_id: Optional[str] = None,
+        risk_score: Optional[int] = None,
+    ) -> List[str]:
+        """Register every pending/partial part of an order result with the
+        fill tracker, so the 30s ka10076 poll (`_poll_tracked_fills`) can
+        pick up its post-fill later.
+
+        Extracted from the original F3 BUY-only block (E1-1) — `order_side`
+        is now threaded through instead of the block being gated on
+        `OrderSide.BUY`, so the exact same registration applies to a SELL or
+        REDUCE order's unfilled remainder. Returns [] (no registration) when
+        the aggregate result itself is not pending/partial (e.g. fully
+        filled or rejected) — same short-circuit as the original gate.
+
+        Split orders (F3 review CRITICAL): the aggregate carries per-part
+        results in `result.parts`, each with its OWN broker ord_no. ka10076
+        matches by ord_no, so every unfilled/partial part is tracked as its
+        own TrackedOrder — one aggregate entry would poison the diff
+        arithmetic (several broker orders summed against one total).
+        """
+        if result.status not in ("pending", "partial"):
+            return []
+
+        registered: List[str] = []
+        for part in (result.parts or [result]):
+            if part.status not in ("pending", "partial"):
+                continue
+            remaining = part.requested_quantity - part.filled_quantity
+            if remaining <= 0:
+                continue
+            self.fill_tracker.register(
+                TrackedOrder(
+                    ord_no=part.order_id,
+                    ticker=ticker,
+                    stock_name=stock_name or ticker,
+                    side=order_side,
+                    total_quantity=part.requested_quantity,
+                    filled_quantity=part.filled_quantity,
+                    filled_amount=part.filled_quantity * part.avg_price,
+                    limit_price=limit_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    source_queue_id=source_queue_id,
+                    source_session_id=source_session_id,
+                    risk_score=risk_score,
+                    trade_date=date.today().strftime("%Y%m%d"),
+                )
+            )
+            registered.append(f"{part.order_id}:{remaining}주")
+        return registered
 
     async def _execute_order(self, order: OrderRequest) -> OrderResult:
         """Execute an order and update state."""
@@ -2200,6 +2244,16 @@ class ExecutionCoordinator:
                     decision_id=order.source_session_id,
                     entry_or_exit="entry" if order.side == "buy" else "exit",
                 )
+
+            # E1-1 temporary safety guard: a SELL's fill delta must NOT flow
+            # into register_fill_as_position below — that call only ever
+            # GROWS a position, so an unguarded sell fill here would double-
+            # count it as a buy. Full sell post-fill handling (closing or
+            # reducing the managed position, notifying, queue annotation) is
+            # E1-2's job; until that lands, a tracked sell fill is recorded
+            # above (record_trade_fill, side-aware) and nothing else.
+            if order.side == "sell":
+                continue
 
             await register_fill_as_position(
                 self,
