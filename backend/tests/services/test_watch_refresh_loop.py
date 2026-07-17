@@ -54,6 +54,23 @@ def _position(ticker="005930", quantity=10, avg_price=70_000.0, **kw) -> Managed
 # -------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _market_open_default(monkeypatch):
+    """E2-2: `_refresh_watch_prices` now gates on `is_krx_open_cached`
+    (장외 완전 idle). Every pre-existing test below this point calls
+    `_refresh_watch_prices()` directly and asserts on its price-fetch
+    behavior, with no opinion on market hours — pin the gate open by
+    default so they stay independent of real wall-clock KRX hours (same
+    regression-fragility fix E2-1 applied to `PositionManager.
+    _check_all_positions`'s pre-existing callers). The `closed_market`/
+    `open_market` fixtures below (Test B2) explicitly request this same
+    monkeypatch target afterward and win, since fixture teardown/override
+    follows request order within a test — they are the ones actually
+    exercising the gate."""
+    import services.trading.coordinator as trading_coord_mod
+    monkeypatch.setattr(trading_coord_mod, "is_krx_open_cached", lambda: True)
+
+
 async def test_refresh_watch_prices_updates_active_entries():
     """Both ACTIVE entries get their current_price bumped to the fresh quote."""
     coord = ExecutionCoordinator(kiwoom_client=None)
@@ -183,6 +200,81 @@ async def test_refresh_watch_prices_noop_on_empty_watch_list():
     await coord._refresh_watch_prices()
 
     coord._get_current_price.assert_not_awaited()
+
+
+# -------------------------------------------
+# Test B2 — E2-2 after-hours gate (장외 완전 idle)
+# -------------------------------------------
+#
+# `_watch_refresh_loop`/`_refresh_watch_prices` live here in
+# `ExecutionCoordinator` (services/trading/coordinator.py) — NOT in
+# `services/agent_chat/coordinator.py` as task-E2-2-brief.md's file list
+# states (that module has no `_watch_refresh_loop`/`_refresh_watch_prices`
+# symbol at all; verified by grep). These tests therefore live in THIS file
+# (the existing convention/"관례" file for `_refresh_watch_prices`, per the
+# brief's own Step 1 instruction to follow it) rather than in E2-1's
+# test_afterhours_gate.py, which only imports agent_chat modules. Same
+# no-op-cycle + transition-only-log pattern as E2-1
+# (services/agent_chat/coordinator.py::_check_watch_list,
+# services/agent_chat/position_manager.py) and E2-2's RiskMonitor gate: a
+# monotonic-TTL cache (market_hours.is_krx_open_cached) gates the cycle's
+# work at the head of `_refresh_watch_prices`, with a transition-only log
+# helper (`_log_market_gate_once`) duplicated per-file by design (YAGNI).
+
+
+@pytest.fixture
+def closed_market(monkeypatch):
+    import services.trading.coordinator as trading_coord_mod
+    monkeypatch.setattr(trading_coord_mod, "is_krx_open_cached", lambda: False)
+
+
+@pytest.fixture
+def open_market(monkeypatch):
+    import services.trading.coordinator as trading_coord_mod
+    monkeypatch.setattr(trading_coord_mod, "is_krx_open_cached", lambda: True)
+
+
+async def test_refresh_watch_prices_noop_when_closed(closed_market):
+    """장 닫힘이면 _refresh_watch_prices가 어떤 가격도 조회하지 않고 조기
+    반환한다."""
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    coord._get_current_price = AsyncMock(return_value=80_000.0)
+    coord._state.watch_list.append(_watched(ticker="005930", current_price=71_000.0))
+
+    await coord._refresh_watch_prices()
+
+    coord._get_current_price.assert_not_awaited()
+    assert coord._state.watch_list[0].current_price == 71_000.0
+    assert coord._state.watch_list[0].last_checked is None
+
+
+async def test_refresh_watch_prices_unchanged_when_open(open_market):
+    """열림이면 기존 경로 그대로 진입 — ACTIVE 워치 종목 가격이 갱신된다(회귀)."""
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    coord._get_current_price = AsyncMock(return_value=80_000.0)
+    coord._state.watch_list.append(_watched(ticker="005930", current_price=71_000.0))
+
+    await coord._refresh_watch_prices()
+
+    coord._get_current_price.assert_awaited()
+    assert coord._state.watch_list[0].current_price == 80_000.0
+
+
+async def test_gate_transition_logged_once_not_every_sweep(closed_market, caplog):
+    """상태 전이 시에만 1회 로그 — 워치 갱신 사이클마다 로그 스팸 방지."""
+    import logging
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    coord._get_current_price = AsyncMock(return_value=80_000.0)
+    coord._state.watch_list.append(_watched(ticker="005930"))
+
+    with caplog.at_level(logging.INFO, logger="services.trading.coordinator"):
+        await coord._refresh_watch_prices()
+        await coord._refresh_watch_prices()
+        await coord._refresh_watch_prices()
+
+    gate_logs = [r for r in caplog.records if "market_gate" in r.getMessage()]
+    assert len(gate_logs) == 1
 
 
 # -------------------------------------------

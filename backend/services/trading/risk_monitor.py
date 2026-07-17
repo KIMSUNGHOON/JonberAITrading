@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Optional, Dict, List, Callable, Awaitable
 
 from .cadence import compute_held_ttl
+from .market_hours import is_krx_open_cached
 from .models import (
     ManagedPosition,
     StopLossMode,
@@ -93,6 +94,14 @@ class RiskMonitor:
         # Alert history
         self._alerts: List[TradingAlert] = []
         self._pending_alerts: List[TradingAlert] = []
+
+        # E2-2: market-gate last-known state, for the transition-only log
+        # helper below (None = not yet observed this process). Same
+        # no-op-cycle pattern as E2-1 (agent_chat coordinator/
+        # position_manager) — market_hours.is_krx_open_cached() is a 30s
+        # monotonic-TTL cache, so gating this 1s loop's per-cycle work is a
+        # dict lookup, not a re-derivation of market state every tick.
+        self._market_gate_closed: Optional[bool] = None
 
     async def start(self):
         """Start the risk monitoring loop."""
@@ -227,8 +236,31 @@ class RiskMonitor:
                 logger.exception(f"[RiskMonitor] Error in monitor loop: {e}")
                 await asyncio.sleep(5)
 
+    def _log_market_gate_once(self, closed: bool) -> None:
+        """Log a market-gate state transition once (E2-2) — never every
+        tick of the 1s monitor loop. Small per-file helper, duplicated
+        across E2-1's gate points (agent_chat coordinator/position_manager)
+        by design — YAGNI, not worth a shared util for a handful of call
+        sites."""
+        if self._market_gate_closed == closed:
+            return
+        self._market_gate_closed = closed
+        if closed:
+            logger.info("[RiskMonitor] market_gate_closed")
+        else:
+            logger.info("[RiskMonitor] market_gate_reopened")
+
     async def _check_all_positions(self):
         """Check all watched positions."""
+        # E2-2: 장외에는 1s 감시 사이클 전체를 쉬게 한다(완전 idle 결정, E2-1
+        # 과 동일 패턴). 방어 감시(손절/익절/급변동) 포함 전체 skip — 장외엔
+        # 체결 불가라 안전. `while self._running` / `asyncio.sleep(1)` /
+        # CancelledError 루프 구조 자체는 무변경, 사이클 작업부만 게이트.
+        if not is_krx_open_cached():
+            self._log_market_gate_once(closed=True)
+            return
+        self._log_market_gate_once(closed=False)
+
         if not self._watching:
             return
 

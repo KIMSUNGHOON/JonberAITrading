@@ -168,6 +168,17 @@ class TestIsKrxOpenCachedTTL:
     """market_hours.is_krx_open_cached — monotonic TTL cache over
     get_market_hours_service().is_market_open(MarketType.KRX)."""
 
+    @pytest.fixture(autouse=True)
+    def _reset_cache_after(self):
+        """E2-2 cleanup (review note from E2-1): `_krx_open_cache` is a
+        MODULE-LEVEL global — leaving a real/live TTL entry behind after
+        these tests would leak up to 30s of stale cache state into whatever
+        runs next in the same process. Setup already resets per-test; this
+        also resets on teardown."""
+        yield
+        from services.trading import market_hours
+        market_hours._reset_krx_open_cache()
+
     def test_repeated_calls_within_ttl_hit_real_service_once(self, monkeypatch):
         from services.trading import market_hours
 

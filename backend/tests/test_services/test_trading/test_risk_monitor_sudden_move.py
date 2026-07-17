@@ -59,6 +59,19 @@ def _monitor(**risk_kwargs):
     return RiskMonitor(risk_params=RiskParameters(**defaults))
 
 
+@pytest.fixture(autouse=True)
+def _market_open(monkeypatch):
+    """E2-2: `_check_all_positions` now gates on `is_krx_open_cached` (장외
+    완전 idle). This suite's one direct `_check_all_positions()` call
+    (below) would otherwise silently depend on real wall-clock KRX market
+    hours instead of the sudden-move logic under test — the exact
+    regression-fragility class E2-1 found and fixed for
+    `PositionManager._check_all_positions`. Pin open so this file's
+    semantics stay independent of when it happens to run."""
+    import services.trading.risk_monitor as rm_mod
+    monkeypatch.setattr(rm_mod, "is_krx_open_cached", lambda: True)
+
+
 @pytest.mark.asyncio
 async def test_sudden_move_pauses_only_that_ticker_other_still_fires():
     """(a) + M4: sudden move on AAAA must not block BBBB's stop-loss, and

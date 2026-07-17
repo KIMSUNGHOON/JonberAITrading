@@ -37,7 +37,7 @@ from .models import (
 from .portfolio_agent import PortfolioAgent
 from .order_agent import OrderAgent, KiwoomRateLimiter
 from .risk_monitor import RiskMonitor
-from .market_hours import MarketType, get_market_hours_service
+from .market_hours import MarketType, get_market_hours_service, is_krx_open_cached
 from .strategy import TradingStrategy
 from .strategy_apply import apply_strategy_to_risk_params
 from .pending_order_tracker import PendingOrderTracker, TrackedOrder
@@ -140,6 +140,14 @@ class ExecutionCoordinator:
         # entry-candidate prices went stale for the whole session. Same
         # lifecycle shape as _queue_scheduler_task above.
         self._watch_refresh_task: Optional[asyncio.Task] = None
+
+        # E2-2: market-gate last-known state for _refresh_watch_prices, for
+        # the transition-only log helper below (None = not yet observed
+        # this process). Same no-op-cycle pattern as E2-1 (agent_chat
+        # coordinator/position_manager) and RiskMonitor's E2-2 gate. Does
+        # NOT touch the queue scheduler / close-edge / fill-polling /
+        # reconciler loops below (out of scope for this gate).
+        self._market_gate_closed: Optional[bool] = None
         # Re-entrancy guard: process_trade_queue is now reachable from start(),
         # the scheduler, and manual API calls — concurrent runs would double-
         # execute PENDING/PROCESSING trades (review #6).
@@ -1300,6 +1308,20 @@ class ExecutionCoordinator:
             watched.current_price = price
             watched.last_checked = datetime.now()
 
+    def _log_market_gate_once(self, closed: bool) -> None:
+        """Log a market-gate state transition once (E2-2) — never every
+        sweep. Small per-file helper, duplicated across E2-1's gate points
+        (agent_chat coordinator/position_manager) and RiskMonitor's E2-2
+        gate by design — YAGNI, not worth a shared util for a handful of
+        call sites."""
+        if self._market_gate_closed == closed:
+            return
+        self._market_gate_closed = closed
+        if closed:
+            logger.info("[Coordinator] market_gate_closed")
+        else:
+            logger.info("[Coordinator] market_gate_reopened")
+
     async def _refresh_watch_prices(self) -> None:
         """Periodic, WATCH-only price sweep (monitoring-cadence-tuning arc,
         MAIN BODY).
@@ -1337,6 +1359,16 @@ class ExecutionCoordinator:
         (i.e. what this sweep actually fetches), not the raw ACTIVE count,
         so the cadence reflects the real request load.
         """
+        # E2-2: 장외에는 워치 가격 갱신 사이클 전체를 쉬게 한다(완전 idle
+        # 결정, E2-1/RiskMonitor와 동일 패턴). 장외엔 신규 진입/기회판정
+        # 자체가 무의미하므로 전체 skip이 안전. 큐 스케줄러/마감 엣지/체결
+        # 폴링/reconciler는 게이트 밖(요건대로 미변경) — 이 함수
+        # (_refresh_watch_prices)만 게이트.
+        if not is_krx_open_cached():
+            self._log_market_gate_once(closed=True)
+            return
+        self._log_market_gate_once(closed=False)
+
         held_tickers = {p.ticker for p in self._state.positions}
         active = [
             w
