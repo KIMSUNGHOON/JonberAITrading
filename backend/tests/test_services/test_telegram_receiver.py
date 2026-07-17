@@ -145,3 +145,97 @@ async def test_start_receiver_builder_failure_returns_none_without_raising(monke
 async def test_stop_receiver_never_started_is_noop():
     # _reset_application_singleton fixture already guarantees _application is None.
     await receiver.stop_telegram_receiver()  # must not raise
+
+
+# -------------------------------------------
+# 6. start_telegram_receiver — polling error_callback observability
+#    (TG-1 리뷰픽스 Finding 1)
+# -------------------------------------------
+
+
+async def test_start_receiver_wires_error_callback_that_logs_polling_errors(monkeypatch):
+    """`updater.start_polling()` returns before the first get_updates completes
+    (PTB 22.5), so a 409 Conflict from a second poller never reaches the
+    try/except around start_telegram_receiver -- it can only be observed via
+    `error_callback`. Assert the callback is actually wired and that invoking
+    it (as PTB would on a polling error) logs `telegram_receiver_polling_error`."""
+    monkeypatch.setattr(receiver, "get_telegram_config", lambda: _config())
+
+    mock_updater = MagicMock()
+    mock_updater.start_polling = AsyncMock(return_value=None)
+    mock_updater.stop = AsyncMock(return_value=None)
+
+    mock_application = MagicMock()
+    mock_application.updater = mock_updater
+    mock_application.initialize = AsyncMock(return_value=None)
+    mock_application.start = AsyncMock(return_value=None)
+    mock_application.add_handler = MagicMock()
+
+    mock_builder = MagicMock()
+    mock_builder.token.return_value.build.return_value = mock_application
+    monkeypatch.setattr(receiver.Application, "builder", lambda: mock_builder)
+
+    result = await receiver.start_telegram_receiver()
+
+    assert result is mock_application
+    mock_updater.start_polling.assert_awaited_once()
+    _, kwargs = mock_updater.start_polling.await_args
+    assert "error_callback" in kwargs
+    error_callback = kwargs["error_callback"]
+
+    with structlog.testing.capture_logs() as logs:
+        error_callback(RuntimeError("Conflict: terminated by other getUpdates request"))
+
+    events = [log for log in logs if log.get("event") == "telegram_receiver_polling_error"]
+    assert len(events) == 1
+    assert "Conflict" in events[0]["error"]
+
+
+# -------------------------------------------
+# 7. start_telegram_receiver — start failure shuts down a partially-initialized
+#    Application (TG-1 리뷰픽스 Finding 2)
+# -------------------------------------------
+
+
+async def test_start_receiver_initialize_failure_shuts_down_application(monkeypatch):
+    """`Bot.initialize()` opens the httpx connection pool BEFORE token
+    validation (get_me()) -- on InvalidToken (or any initialize failure) the
+    Application must be shut down (best-effort) rather than abandoned, or the
+    pool leaks. Returns None either way (never-raise contract preserved)."""
+    monkeypatch.setattr(receiver, "get_telegram_config", lambda: _config())
+
+    mock_application = MagicMock()
+    mock_application.initialize = AsyncMock(side_effect=RuntimeError("invalid token"))
+    mock_application.shutdown = AsyncMock(return_value=None)
+    mock_application.add_handler = MagicMock()
+
+    mock_builder = MagicMock()
+    mock_builder.token.return_value.build.return_value = mock_application
+    monkeypatch.setattr(receiver.Application, "builder", lambda: mock_builder)
+
+    result = await receiver.start_telegram_receiver()
+
+    assert result is None
+    mock_application.shutdown.assert_awaited_once()
+
+
+async def test_start_receiver_shutdown_failure_after_initialize_failure_still_returns_none(
+    monkeypatch,
+):
+    """Even if the best-effort shutdown() itself raises, start_telegram_receiver
+    must still return None without propagating (never-raise contract)."""
+    monkeypatch.setattr(receiver, "get_telegram_config", lambda: _config())
+
+    mock_application = MagicMock()
+    mock_application.initialize = AsyncMock(side_effect=RuntimeError("invalid token"))
+    mock_application.shutdown = AsyncMock(side_effect=RuntimeError("shutdown also failed"))
+    mock_application.add_handler = MagicMock()
+
+    mock_builder = MagicMock()
+    mock_builder.token.return_value.build.return_value = mock_application
+    monkeypatch.setattr(receiver.Application, "builder", lambda: mock_builder)
+
+    result = await receiver.start_telegram_receiver()
+
+    assert result is None
+    mock_application.shutdown.assert_awaited_once()

@@ -13,9 +13,18 @@ This module owns:
 
   - `start_telegram_receiver()` / `stop_telegram_receiver()`: FastAPI
     lifespan hooks. Both are best-effort and NEVER raise -- a receiver
-    failure (missing config, bad token, 409 Conflict from a second
-    poller, etc.) must never block server startup, outbound
-    notifications, or the HITL approval pipeline.
+    failure (missing config, bad token, etc.) must never block server
+    startup, outbound notifications, or the HITL approval pipeline. Note
+    the failure modes are asymmetric: SYNCHRONOUS failures during startup
+    (builder/`initialize()`, e.g. InvalidToken) surface here as `None`.
+    PTB 22.5's `updater.start_polling()` returns as soon as the background
+    polling task is *scheduled*, without waiting for the first
+    `get_updates` to complete -- so a 409 Conflict (a second poller already
+    running) happens AFTER `start_telegram_receiver()` has already returned
+    a live Application. That class of error can only be observed via the
+    `error_callback` passed to `start_polling()` (logged as
+    `telegram_receiver_polling_error`), never via this function's return
+    value.
   - `register_command(name, handler)` / `register_callback(pattern_prefix,
     handler)`: module-level registries populated at IMPORT time by later
     tasks (TG-2 approval buttons, TG-3 /halt+/auto, TG-4 read-only
@@ -220,14 +229,36 @@ async def _handle_help(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> 
 register_command("help", _handle_help)
 
 
+def _on_polling_error(error: Exception) -> None:
+    """`error_callback` passed to `updater.start_polling()`.
+
+    PTB 22.5's `start_polling()` schedules the polling loop as a background
+    task and returns immediately -- it does NOT await the first
+    `get_updates` call. Any error surfacing after that point (most notably
+    409 Conflict from a second consumer of getUpdates) therefore never
+    reaches the try/except in `start_telegram_receiver()`; PTB calls this
+    callback instead (synchronously, on every polling-loop exception) and
+    then retries on its own. This is a pure observability hook -- it must
+    never raise, and it does not stop or restart anything itself.
+    """
+    logger.error("telegram_receiver_polling_error", error=str(error))
+
+
 async def start_telegram_receiver() -> Optional[Application]:
     """Build and start the inbound PTB Application (best-effort).
 
     Returns the running Application, or None if Telegram isn't configured
     (mirrors the existing `TelegramNotifier` enabled+token+chat_id gate) or
-    if startup failed for any reason (bad token, 409 Conflict from a
-    second poller, network error, ...). Never raises -- callers (FastAPI
-    lifespan) can call this unconditionally without a try/except.
+    if a SYNCHRONOUS startup step failed (bad token / InvalidToken during
+    `initialize()`, network error building the Application, ...). A 409
+    Conflict from a second poller happens *after* `start_polling()` returns
+    (PTB schedules the polling loop as a background task and does not await
+    its first iteration) -- it is never raised here and never turns this
+    function's result into None. It is instead observed via the
+    `error_callback` wired into `start_polling()` below, which logs
+    `telegram_receiver_polling_error` and lets PTB's own retry loop keep
+    running. Never raises -- callers (FastAPI lifespan) can call this
+    unconditionally without a try/except.
     """
     global _application
 
@@ -239,6 +270,7 @@ async def start_telegram_receiver() -> Optional[Application]:
         )
         return None
 
+    application: Optional[Application] = None
     try:
         application = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
@@ -252,7 +284,7 @@ async def start_telegram_receiver() -> Optional[Application]:
         application.add_handler(CallbackQueryHandler(_dispatch_callback))
 
         await application.initialize()
-        await application.updater.start_polling()
+        await application.updater.start_polling(error_callback=_on_polling_error)
         await application.start()
 
         _application = application
@@ -260,6 +292,11 @@ async def start_telegram_receiver() -> Optional[Application]:
         return application
     except Exception as e:
         logger.error("telegram_receiver_start_failed", error=str(e))
+        if application is not None:
+            try:
+                await application.shutdown()
+            except Exception:
+                pass
         return None
 
 
