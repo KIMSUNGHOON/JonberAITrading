@@ -139,13 +139,16 @@ async def test_approve_callback_success_pins_actor_telegram_and_live_proposal_id
 
     update, query = _make_callback_update(12345, f"a:sess-1:{PID8}")
     await callbacks.handle_approve_callback(update, MagicMock())
+    await callbacks._flush_pending_callback_tasks()  # N2: submit+edit is detached
 
     query.answer.assert_awaited_once()
     assert calls == [{
         "session_id": "sess-1", "decision": "approved",
         "actor": "telegram", "expected_proposal_id": PROPOSAL_ID,
     }]
-    query.edit_message_text.assert_awaited_once()
+    # N2: two edits now -- the synchronous "처리 중" placeholder (keyboard
+    # removed immediately) followed by the detached task's result edit.
+    assert query.edit_message_text.await_count == 2
     args, kwargs = query.edit_message_text.await_args
     assert "승인" in args[0]
     assert kwargs["reply_markup"] is None
@@ -157,12 +160,14 @@ async def test_reject_callback_success_pins_actor_telegram_and_live_proposal_id(
 
     update, query = _make_callback_update(12345, f"r:sess-2:{PID8}")
     await callbacks.handle_reject_callback(update, MagicMock())
+    await callbacks._flush_pending_callback_tasks()  # N2: submit+edit is detached
 
     query.answer.assert_awaited_once()
     assert calls == [{
         "session_id": "sess-2", "decision": "rejected",
         "actor": "telegram", "expected_proposal_id": PROPOSAL_ID,
     }]
+    assert query.edit_message_text.await_count == 2
     args, kwargs = query.edit_message_text.await_args
     assert "거부" in args[0]
     assert kwargs["reply_markup"] is None
@@ -205,7 +210,9 @@ async def test_httpexception_from_submit_decision_edits_detail_into_message(monk
 
     update, query = _make_callback_update(12345, f"a:sess-4:{PID8}")
     await callbacks.handle_approve_callback(update, MagicMock())
+    await callbacks._flush_pending_callback_tasks()  # N2: submit+edit is detached
 
+    assert query.edit_message_text.await_count == 2
     args, kwargs = query.edit_message_text.await_args
     assert args[0] == "오류: 이미 처리됨 — 취소 불가"
     assert kwargs["reply_markup"] is None
@@ -220,7 +227,9 @@ async def test_stood_down_result_edits_stale_text(monkeypatch):
 
     update, query = _make_callback_update(12345, f"a:sess-5:{PID8}")
     await callbacks.handle_approve_callback(update, MagicMock())
+    await callbacks._flush_pending_callback_tasks()  # N2: submit+edit is detached
 
+    assert query.edit_message_text.await_count == 2
     args, _ = query.edit_message_text.await_args
     assert "제안이 변경되어 처리할 수 없습니다" in args[0]
 
@@ -279,6 +288,7 @@ async def test_authorized_chat_reaches_the_handler_via_real_dispatch(monkeypatch
     update, query = _make_callback_update(12345, f"a:sess-8:{PID8}")
 
     await receiver._dispatch_callback(update, MagicMock())
+    await callbacks._flush_pending_callback_tasks()  # N2: submit+edit is detached
 
     query.answer.assert_awaited_once()
     assert calls == [{
@@ -759,6 +769,66 @@ async def test_marker_persist_failure_never_blocks_send_or_schedule(sm, monkeypa
     await asyncio.sleep(0.1)  # let the fast-grace background task settle
 
 
+# -------------------------------------------
+# N1 (TG 최종리뷰픽스): a FAILED send must never persist the dedup marker.
+#
+# Repro (review): send_approval_request returns bool False on a Telegram-side
+# failure (NetworkError/RetryAfter 429/... -- see service.py's _send_message,
+# which catches TelegramError and returns False rather than raising). The
+# caller here used to persist the dedup marker unconditionally regardless of
+# that return value -- a transient 429 during a startup rearm burst would
+# still mark the proposal "notified", and every later call for the SAME
+# (proposal_id, auto_approve_at) would then dedup-skip forever. The operator
+# never gets a retry; the notification (and their REJECT window) is lost for
+# good. Fix: persist the marker ONLY when send_approval_request returns True.
+# -------------------------------------------
+
+
+async def test_send_failure_does_not_persist_marker_and_retries_next_time(sm, monkeypatch):
+    session_id = "inj-tg-n1-send-fail"
+    await sm.create_session(
+        session_id=session_id, market_type=MarketType.KIWOOM, ticker="005930",
+        display_name="삼성전자",
+        state={"trade_proposal": {"id": "p1", "action": "BUY", "quantity": 10, "entry_price": 50000},
+               "reasoning_log": []},
+    )
+
+    async def deny_gate(market, **kwargs):
+        return GateDecision(allowed=False, reason="hitl mode", check="market_mode")
+
+    monkeypatch.setattr(injector_module, "check_autonomy", deny_gate)
+
+    # send_approval_request reports failure (False), NOT an exception -- the
+    # exact contract TelegramNotifier._send_message honors on a caught
+    # TelegramError.
+    fake_notifier = SimpleNamespace(
+        is_ready=True, send_approval_request=AsyncMock(return_value=False)
+    )
+
+    async def fake_get_notifier():
+        return fake_notifier
+
+    monkeypatch.setattr(injector_module, "get_telegram_notifier", fake_get_notifier)
+
+    await injector_module.maybe_schedule_auto_approve(session_id, "kiwoom")
+
+    fake_notifier.send_approval_request.assert_awaited_once()
+    session = await sm.get_session(session_id)
+    assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) is None, (
+        "a failed send must never persist the dedup marker"
+    )
+
+    # A later schedule attempt for the SAME proposal (e.g. the next producer
+    # commit, or a rearm pass) must retry the send -- not dedup it away --
+    # because the operator never actually received the earlier notification.
+    await injector_module.maybe_schedule_auto_approve(session_id, "kiwoom")
+
+    assert fake_notifier.send_approval_request.await_count == 2, (
+        "no marker was persisted after the failed send, so the retry must "
+        "not be deduped"
+    )
+
+
 async def test_rearm_dedup_skips_resend_across_repeated_restart_simulations(sm, monkeypatch):
     """The literal review repro: rearm_awaiting_approvals() runs on every
     app startup, and reconcile_stranded_sessions() always clears
@@ -932,3 +1002,95 @@ async def test_dedup_resends_when_gate_verdict_transitions_allow_to_deny(sm, mon
 
     session = await sm.get_session(session_id)
     assert session.state.get(injector_module.TELEGRAM_NOTIFIED_PROPOSAL_KEY) == "p1:0"
+
+
+# -------------------------------------------
+# N2 (TG 최종리뷰픽스): reject/approve callbacks must not block PTB's
+# single-update sequential loop (max_concurrent_updates=1) while
+# submit_decision (a reject -> re-analysis resume, real LLM, can take
+# minutes) is in flight -- otherwise /halt and other sessions' buttons queue
+# behind it, starving the remote veto the whole arc exists for. Fix:
+# _handle validates + removes the keyboard synchronously, then detaches
+# submit_decision + the final result edit into a background asyncio.Task
+# (services/telegram/callbacks.py::_submit_and_edit) and returns immediately.
+# -------------------------------------------
+
+
+async def test_handle_returns_before_submit_completes_and_removes_keyboard_first(monkeypatch):
+    """① The handler must return (freeing PTB's loop for the next update)
+    WITHOUT waiting for submit_decision -- proven here by blocking submit on
+    an asyncio.Event the test controls. The synchronous "처리 중" placeholder
+    edit must already have removed the keyboard by the time the handler
+    returns, even though the final result edit hasn't happened yet."""
+    _seed_live_session(monkeypatch)
+
+    release = asyncio.Event()
+    calls = []
+
+    async def slow_submit(
+        session_id, decision, feedback=None, modifications=None,
+        actor="user", expected_proposal_id=None,
+    ):
+        calls.append((session_id, decision))
+        await release.wait()
+        return None
+
+    monkeypatch.setattr("app.api.routes.approval.submit_decision", slow_submit)
+
+    update, query = _make_callback_update(12345, f"a:sess-slow:{PID8}")
+
+    # The handler itself must complete promptly even though submit_decision
+    # is blocked indefinitely on `release` -- a hang here means the fix
+    # regressed back to awaiting submit inline.
+    await asyncio.wait_for(callbacks.handle_approve_callback(update, MagicMock()), timeout=1.0)
+
+    # The handler already returned control to us -- but `asyncio.create_task`
+    # only SCHEDULES the detached task, it doesn't run it yet. Yield once so
+    # the task actually starts and reaches its `await release.wait()` block
+    # (this is the same "let the background task get a turn" pattern the
+    # rest of this file uses via `await asyncio.sleep(...)` for the grace
+    # task -- here 0 is enough since we only need one scheduling round-trip,
+    # not a real time delay).
+    await asyncio.sleep(0)
+
+    assert calls == [("sess-slow", "approved")]  # submit WAS started...
+    # ...but the handler already returned with only the placeholder edit done.
+    query.edit_message_text.assert_awaited_once()
+    args, kwargs = query.edit_message_text.await_args
+    assert kwargs["reply_markup"] is None
+    assert args[0] == callbacks._PROCESSING_TEXT
+
+    # Release the blocked submit and let the detached task finish.
+    release.set()
+    await callbacks._flush_pending_callback_tasks()
+
+    assert query.edit_message_text.await_count == 2
+    final_args, final_kwargs = query.edit_message_text.await_args
+    assert "승인" in final_args[0]
+    assert final_kwargs["reply_markup"] is None
+
+
+async def test_task_exception_never_propagates_and_edits_error_message(monkeypatch):
+    """④ An unexpected (non-HTTPException) error inside the detached task
+    must never propagate as an unretrieved-task-exception -- it is caught,
+    logged, and turned into a best-effort error edit."""
+    _seed_live_session(monkeypatch)
+
+    async def boom_submit(
+        session_id, decision, feedback=None, modifications=None,
+        actor="user", expected_proposal_id=None,
+    ):
+        raise RuntimeError("resume blew up")
+
+    monkeypatch.setattr("app.api.routes.approval.submit_decision", boom_submit)
+
+    update, query = _make_callback_update(12345, f"a:sess-boom:{PID8}")
+
+    await callbacks.handle_approve_callback(update, MagicMock())
+    await callbacks._flush_pending_callback_tasks()  # must not raise
+
+    assert query.edit_message_text.await_count == 2
+    args, kwargs = query.edit_message_text.await_args
+    assert "오류" in args[0]
+    assert "resume blew up" in args[0]
+    assert kwargs["reply_markup"] is None

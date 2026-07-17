@@ -342,8 +342,28 @@ async def _send_approval_request_notification(
             return
         notifier = await get_telegram_notifier()
         if notifier.is_ready:
-            await notifier.send_approval_request(session_id, market, proposal, auto_approve_at)
-            await _persist_notified_marker(session_id, marker_value)
+            sent = await notifier.send_approval_request(session_id, market, proposal, auto_approve_at)
+            # N1 review fix: only persist the dedup marker when the send
+            # actually succeeded. `send_approval_request` never raises on a
+            # Telegram-side failure (NetworkError/RetryAfter 429/...) -- it
+            # returns `False` (service.py's `_send_message` swallows
+            # TelegramError into a bool). Persisting the marker unconditionally
+            # here meant a transient send failure (e.g. a 429 during a
+            # startup rearm burst) still wrote the marker, and every later
+            # `_send_approval_request_notification` call for the SAME
+            # (proposal_id, auto_approve_at) then deduped on it forever --
+            # the operator never gets a retry, the notification is lost for
+            # good. Leaving the marker unwritten on failure means the next
+            # call with the same marker_value (a later rearm pass, or the
+            # next producer commit) is NOT deduped and retries the send.
+            if sent:
+                await _persist_notified_marker(session_id, marker_value)
+            else:
+                logger.warning(
+                    "approval_request_notify_send_failed_marker_not_persisted",
+                    session_id=session_id,
+                    proposal_id=proposal_id,
+                )
     except Exception as e:
         logger.warning("approval_request_notify_failed", session_id=session_id, error=str(e))
 

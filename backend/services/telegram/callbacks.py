@@ -44,15 +44,46 @@ wrapper by the time a handler here runs):
      actor=='system' to actor in ('system','telegram') for exactly this
      caller) -- closing the TOCTOU window between this step's outside
      check and the lock actually being acquired.
-  5. Edit the original message with the result (success wording, the
-     stood-down/stale wording, or an HTTPException's `.detail`) and DROP
-     the keyboard (`reply_markup=None`) -- an edited message with no
-     buttons can't be double-clicked into approving (or rejecting) the same
-     proposal twice.
+  5. Edit the message to a "처리 중" placeholder (dropping the keyboard,
+     `reply_markup=None`) -- SYNCHRONOUSLY, before any submit call -- so an
+     edited message with no buttons can't be double-clicked into approving
+     (or rejecting) the same proposal twice.
+  6. Spawn `submit_decision` + the final result edit (success wording, the
+     stood-down/stale wording, or an HTTPException's `.detail`) as a
+     DETACHED `asyncio.create_task` and return immediately.
+
+N2 review fix (기아 방지): PTB's receiver Application runs with the default
+`max_concurrent_updates=1` -- every inbound update (button tap, `/halt`,
+...) is processed ONE AT A TIME, sequentially, inline inside the update
+loop. `submit_decision("rejected", ...)` resumes the re-analysis graph with
+a REAL LLM call that can take minutes. Before this fix, step 4 above
+awaited that call directly inside the handler -- which meant the entire
+receiver was blocked for that whole duration: `/halt`, a DIFFERENT
+session's reject tap, everything queued behind it. In the worst case a
+second session's 60s auto-approve grace window expired and auto-approved
+(placing a live order) *before* the queued human reject for THAT session
+ever got processed -- the remote reject button, the whole point of this
+arc, made itself powerless by being slow.
+
+The fix: keep steps 1-3 (answer/parse/live-id validation) synchronous --
+they're cheap SessionManager reads -- but detach the submit+edit into a
+background task (`_submit_and_edit`, precedent: `_autonomy_injector.py`'s
+own grace-window `asyncio.create_task`). The handler returns as soon as the
+task is spawned, freeing PTB's single-update loop to process the next
+update immediately. The synchronous placeholder edit (step 5) still closes
+the double-click window that the old single final edit used to close, so
+removing the keyboard promptly is preserved even though the actual
+decision now completes asynchronously. The task runs entirely outside
+`receiver._wrap_callback`'s try/except (that wrapper has already returned
+by the time the task's body executes), so `_submit_and_edit` is its own
+fully self-contained never-raise boundary -- any exception it doesn't
+expect is caught, logged, and turned into a best-effort error edit rather
+than becoming an unretrieved-task-exception warning that nobody sees.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 import structlog
@@ -68,6 +99,16 @@ logger = structlog.get_logger()
 _STALE_PROPOSAL_TEXT = "제안이 변경되어 처리할 수 없습니다."
 _INVALID_REQUEST_TEXT = "잘못된 요청입니다."
 _AUTO_CONFIRM_EXPIRED_TEXT = "확인이 만료되었습니다. /auto를 다시 실행하세요."
+_PROCESSING_TEXT = "⏳ 처리 중…"
+
+# N2 review fix: module-level reference set for detached
+# submit_decision+edit tasks spawned by `_handle` (see its docstring and the
+# module docstring's "N2 review fix" section). Without a strong reference an
+# asyncio.Task can be garbage-collected mid-flight (a well-known asyncio
+# footgun -- "Task was destroyed but it is pending"); each task's own
+# done-callback discards it from this set once it finishes, mirroring the
+# standard asyncio background-task idiom.
+_PENDING_TASKS: set[asyncio.Task] = set()
 
 
 async def _fetch_live_session(session_id: str):
@@ -143,10 +184,49 @@ async def _handle(update: Update, context: "ContextTypes.DEFAULT_TYPE", decision
         await _edit(update, _STALE_PROPOSAL_TEXT)
         return
 
+    # N2 review fix: remove the keyboard SYNCHRONOUSLY right here, before
+    # the (possibly minutes-long) submit is even spawned. The final result
+    # edit below also drops the keyboard, but that edit now happens inside
+    # a detached task -- without this placeholder edit there would be a
+    # window, between this handler returning and the task's own edit
+    # landing, where the original message still shows live buttons and a
+    # double-tap could spawn a second submit_decision for the same
+    # proposal.
+    await _edit(update, _PROCESSING_TEXT)
+
+    task = asyncio.create_task(_submit_and_edit(update, session_id, decision, live_proposal_id))
+    _PENDING_TASKS.add(task)
+    task.add_done_callback(_PENDING_TASKS.discard)
+    # Return immediately -- PTB's single-update sequential loop
+    # (max_concurrent_updates=1) is now free to process the next update
+    # (another session's button, /halt, ...) without waiting for this
+    # session's submit_decision to finish.
+
+
+async def _submit_and_edit(
+    update: Update, session_id: str, decision: str, live_proposal_id: str
+) -> None:
+    """Detached task body spawned by `_handle` (N2 review fix, see module
+    docstring). Runs entirely outside `receiver._wrap_callback`'s
+    try/except -- that wrapper has already returned by the time this task's
+    body executes -- so this function is its own fully self-contained
+    never-raise boundary: nothing here may propagate out uncaught, or it
+    becomes a silent "Task exception was never retrieved" asyncio warning
+    that no user-facing edit ever reflects.
+    """
     try:
         result = await _submit(session_id, decision, live_proposal_id)
     except HTTPException as e:
         await _edit(update, f"오류: {e.detail}")
+        return
+    except Exception as e:  # noqa: BLE001 -- never let a detached task die unlogged/unreported
+        logger.error(
+            "telegram_callback_submit_task_failed",
+            session_id=session_id,
+            decision=decision,
+            error=str(e),
+        )
+        await _edit(update, f"오류: {e}")
         return
 
     if isinstance(result, dict) and result.get("status") == "stood_down":
@@ -155,6 +235,19 @@ async def _handle(update: Update, context: "ContextTypes.DEFAULT_TYPE", decision
 
     label = "승인" if decision == "approved" else "거부"
     await _edit(update, f"{label} 처리되었습니다.")
+
+
+async def _flush_pending_callback_tasks() -> None:
+    """Test-only helper: await every currently in-flight `_submit_and_edit`
+    task spawned by `_handle`. Production code never calls this -- PTB's
+    own event loop simply lets these tasks run to completion on their own
+    schedule, which is the entire point of detaching them (N2 review fix).
+    Tests that assert on the FINAL edit/submit outcome (rather than just
+    the fact that the handler returned early) need a deterministic point to
+    await, since the task is not awaited by `_handle` itself."""
+    pending = list(_PENDING_TASKS)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def handle_approve_callback(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
