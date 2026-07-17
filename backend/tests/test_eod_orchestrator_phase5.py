@@ -32,6 +32,10 @@ async def test_enriches_regime_when_enabled_and_kiwoom_present(monkeypatch):
     monkeypatch.setattr(eod_orchestrator, "fetch_market_flow", _flow)
     monkeypatch.setattr(eod_orchestrator, "label_and_calibrate", AsyncMock())
     monkeypatch.setattr(eod_orchestrator, "build_eod_review", AsyncMock(return_value={}))
+    # E3-2: run_eod_review now makes one LLM call (narrate_eod_digest) —
+    # stub it so this file (which predates E3-2) never touches a real
+    # backend; build_eod_digest itself is real (deterministic, no LLM).
+    monkeypatch.setattr(eod_orchestrator, "narrate_eod_digest", AsyncMock(return_value=None))
 
     ok = await eod_orchestrator.run_eod_review(coord, storage, "2026-07-16")
     assert ok is True
@@ -51,6 +55,10 @@ async def test_breadth_only_when_kiwoom_none(monkeypatch):
                                        "regime_label": "neutral", "source": "scanner"})
     monkeypatch.setattr(eod_orchestrator, "label_and_calibrate", AsyncMock())
     monkeypatch.setattr(eod_orchestrator, "build_eod_review", AsyncMock(return_value={}))
+    # E3-2: run_eod_review now makes one LLM call (narrate_eod_digest) —
+    # stub it so this file (which predates E3-2) never touches a real
+    # backend; build_eod_digest itself is real (deterministic, no LLM).
+    monkeypatch.setattr(eod_orchestrator, "narrate_eod_digest", AsyncMock(return_value=None))
 
     ok = await eod_orchestrator.run_eod_review(coord, storage, "2026-07-16")
     assert ok is True
@@ -73,6 +81,10 @@ async def test_never_raises_when_fetch_errors(monkeypatch):
     monkeypatch.setattr(eod_orchestrator, "fetch_market_flow", _boom)
     monkeypatch.setattr(eod_orchestrator, "label_and_calibrate", AsyncMock())
     monkeypatch.setattr(eod_orchestrator, "build_eod_review", AsyncMock(return_value={}))
+    # E3-2: run_eod_review now makes one LLM call (narrate_eod_digest) —
+    # stub it so this file (which predates E3-2) never touches a real
+    # backend; build_eod_digest itself is real (deterministic, no LLM).
+    monkeypatch.setattr(eod_orchestrator, "narrate_eod_digest", AsyncMock(return_value=None))
 
     ok = await eod_orchestrator.run_eod_review(coord, storage, "2026-07-16")
     assert ok is True  # never-raise; enrich 실패해도 EOD 완주
@@ -109,6 +121,10 @@ async def test_flag_off_saves_bare_breadth_no_backfill(monkeypatch):
     monkeypatch.setattr(eod_orchestrator, "fetch_market_flow", _flow_should_not_run)
     monkeypatch.setattr(eod_orchestrator, "label_and_calibrate", AsyncMock())
     monkeypatch.setattr(eod_orchestrator, "build_eod_review", AsyncMock(return_value={}))
+    # E3-2: run_eod_review now makes one LLM call (narrate_eod_digest) —
+    # stub it so this file (which predates E3-2) never touches a real
+    # backend; build_eod_digest itself is real (deterministic, no LLM).
+    monkeypatch.setattr(eod_orchestrator, "narrate_eod_digest", AsyncMock(return_value=None))
 
     ok = await eod_orchestrator.run_eod_review(coord, storage, "2026-07-16")
 

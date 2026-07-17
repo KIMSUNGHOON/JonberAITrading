@@ -7,8 +7,10 @@ the `regime_snapshot_id` FK that Phase1/Task2 left nullable onto both
 market-close edge calls
 (services/trading/coordinator.py::_check_queue_on_market_open, immediately
 after `.eod_snapshot.write_daily_snapshot` — this MUST run after that row
-exists since `build_eod_review` reads `daily_perf_snapshot`). NO LLM
-anywhere in this chain.
+exists since `build_eod_review` reads `daily_perf_snapshot`). Steps 1-3
+are pure/rule-based (no LLM); E3-2 added ONE LLM call (step 4,
+`narrate_eod_digest`) — see that step's note below for why an inline,
+never-raise, timeout-bounded await is safe here.
 
 Steps, in order:
   1. `compute_regime_snapshot` (pure, SYNCHRONOUS stdlib-sqlite3 — run off
@@ -18,15 +20,37 @@ Steps, in order:
   2. `label_and_calibrate` — labels every closed decision's outcome and
      recomputes per-agent calibration over the trailing window.
   3. `build_eod_review` — assembles the day's portfolio/per-stock/agent/
-     regime sections, then persists it via `save_eod_review`.
-  4. `backfill_regime_id` — attaches the freshly-saved regime_snapshot_id
+     regime sections.
+  4. E3-2: `build_eod_digest` (watch/account/holdings/strategy/regime,
+     itself failure-harmless — see eod_digest.py) then
+     `narrate_eod_digest(digest)` (LLM, never-raise, up to 120s via
+     `asyncio.wait_for` — see eod_digest.py's own docstring for why this
+     is safe to await inline here rather than split into a second save/
+     UPDATE step: `run_eod_review`'s only caller,
+     coordinator.py::_check_queue_on_market_open, awaits this from a
+     30s-interval scheduler tick with NO surrounding timeout of its own,
+     and this call fires at most once/day at market close when no new
+     fills are expected — a slow/timed-out LLM delays that one tick's
+     `_poll_tracked_fills`/`reconcile` by at most 120s, once a day, never
+     drops them). Both `digest` and `narrative` (None on failure) are
+     merged into the SAME `review` dict as new keys before the single
+     existing `save_eod_review` call below — report_json's SCHEMA is
+     unchanged (still one JSON blob via INSERT OR REPLACE), only its
+     CONTENT grows two keys. Every pre-existing key/step is untouched.
+  5. `save_eod_review` — persists the (now digest/narrative-augmented)
+     report.
+  6. `backfill_regime_id` — attaches the freshly-saved regime_snapshot_id
      onto `daily_perf_snapshot` + `agent_chat_decisions` for `trade_date`.
 
 Failure-harmless by design, mirroring every other Phase1/Phase2 EOD step
 (`eod_snapshot.write_daily_snapshot`/`calibration.label_and_calibrate`/
 `eod_review.build_eod_review`): the WHOLE body is one try/except ->
 logger.warning -> return False. This runs off the LIVE market-close
-scheduler tick and must never break it.
+scheduler tick and must never break it. `build_eod_digest`/
+`narrate_eod_digest` are each independently never-raise too (defense in
+depth — see their own docstrings), so a digest/LLM failure degrades only
+`report["digest"]`/`report["narrative"]` to None/None, never the rest of
+`report` or this function's own True/False contract.
 """
 
 from __future__ import annotations
@@ -39,6 +63,7 @@ from typing import Any
 from app.config import get_settings
 
 from .calibration import label_and_calibrate
+from .eod_digest import build_eod_digest, narrate_eod_digest
 from .eod_review import build_eod_review
 from .market_data import fetch_index_snapshot, fetch_market_flow
 from .regime import SCANNER_DB_PATH, compute_regime_snapshot, compute_market_regime
@@ -93,6 +118,15 @@ async def run_eod_review(coordinator: Any, storage: Any, trade_date: str) -> boo
         await label_and_calibrate(storage, trade_date)
 
         review = await build_eod_review(storage, coordinator, trade_date, rid)
+
+        # E3-2: LLM 내러티브 + digest 병합 저장 (기존 review 키·순서·
+        # failure-harmless 무변경 — 실패 시 각각 None으로 저장, 체인 진행).
+        digest = await build_eod_digest(
+            coordinator=coordinator, storage=storage, trade_date=trade_date
+        )
+        review["digest"] = digest
+        review["narrative"] = await narrate_eod_digest(digest)
+
         await storage.save_eod_review(
             {"trade_date": trade_date, "report_json": json.dumps(review)}
         )

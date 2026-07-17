@@ -18,13 +18,14 @@ wires an isolated SQLite into the `get_storage_service()` singleton;
 import asyncio
 from datetime import date, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 import services.storage_service as ss
 from services.agent_chat.position_manager import MonitoredPosition
 from services.kiwoom.models import AccountBalance, FilledOrder, Holding, OrderResponse
+from services.trading import eod_orchestrator
 from services.trading.coordinator import ExecutionCoordinator
 from services.trading.models import (
     ManagedPosition,
@@ -331,14 +332,19 @@ async def test_market_close_edge_expires_tracking_and_notifies(temp_storage):
     coord.set_alert_callback(_capture_alert)
     _stub_market(coord, is_open=False)
 
-    await coord._check_queue_on_market_open()
+    # E3-2: the open->closed edge now runs run_eod_review's one LLM call
+    # (narrate_eod_digest) — stub it so this F3 fill-tracking test (which
+    # predates E3-2 and only cares about expiry/notification behavior)
+    # doesn't touch a real backend.
+    with patch.object(eod_orchestrator, "narrate_eod_digest", AsyncMock(return_value=None)):
+        await coord._check_queue_on_market_open()
 
-    assert coord.fill_tracker.tracking() == []
-    assert len(alerts) == 2  # one per expired order
-    assert coord._market_was_open is False
+        assert coord.fill_tracker.tracking() == []
+        assert len(alerts) == 2  # one per expired order
+        assert coord._market_was_open is False
 
-    # Closed stays closed on the next tick — no re-notification.
-    await coord._check_queue_on_market_open()
+        # Closed stays closed on the next tick — no re-notification.
+        await coord._check_queue_on_market_open()
     assert len(alerts) == 2
 
 
@@ -647,7 +653,11 @@ async def test_close_edge_polls_fills_before_expiring(temp_storage):
 
     coord.set_alert_callback(_capture_alert)
 
-    await coord._check_queue_on_market_open()
+    # E3-2: stub the one LLM call the open->closed edge now makes
+    # (narrate_eod_digest via run_eod_review) — see the note on
+    # test_market_close_edge_expires_tracking_and_notifies above.
+    with patch.object(eod_orchestrator, "narrate_eod_digest", AsyncMock(return_value=None)):
+        await coord._check_queue_on_market_open()
 
     # ORD1's closing-auction fill was registered as a position…
     assert len(coord._state.positions) == 1

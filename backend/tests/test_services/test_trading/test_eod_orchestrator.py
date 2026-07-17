@@ -9,24 +9,56 @@ services/trading/coordinator.py::_check_queue_on_market_open, right after
 `.eod_snapshot.write_daily_snapshot` — build_eod_review reads
 daily_perf_snapshot, so this must run after that row exists). Steps, in
 order: compute_regime_snapshot (+save) -> label_and_calibrate ->
-build_eod_review (+save) -> backfill_regime_id. NO LLM anywhere in this
-chain. Failure-harmless by design, mirroring every other Phase1/Phase2 EOD
+build_eod_review -> E3-2 build_eod_digest+narrate_eod_digest (LLM,
+never-raise) merged into the same report (+save) -> backfill_regime_id.
+Failure-harmless by design, mirroring every other Phase1/Phase2 EOD
 step: the WHOLE body is one try/except -> logger.warning -> return False,
 since this runs off the live scheduler tick and must never break it.
+
+E3-2 note: `run_eod_review` now makes exactly ONE LLM call
+(`narrate_eod_digest`, via `services.trading.eod_digest.get_llm_provider`).
+The autouse `_stub_llm_provider` fixture below patches that to a fast stub
+for EVERY test in this file — including the pre-existing tests above the
+E3-2 section, which predate the LLM call and must keep running at their
+original (sub-second) speed rather than hitting a real backend. Tests that
+care about narrative content layer their own `patch.object(...)` on top,
+inside their body.
 """
 
 import inspect
 import json
 import sqlite3
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from services.storage_service import StorageService
 from services.trading import coordinator as coordinator_module
+from services.trading import eod_digest as eod_digest_module
 from services.trading import eod_orchestrator
 from services.trading.eod_orchestrator import run_eod_review
 
+import pytest
+
 TRADE_DATE = "2026-07-15"
+
+
+@pytest.fixture(autouse=True)
+def _stub_llm_provider():
+    """E3-2 added ONE LLM call into run_eod_review's chain
+    (narrate_eod_digest). This project's binding constraints forbid real
+    LLM calls in tests, and this file's tests historically ran with no LLM
+    involved at all — autouse-patch a fast stub so every test here
+    (including the pre-existing ones that predate E3-2 and don't know
+    narrate_eod_digest exists) completes near-instantly instead of
+    blocking on a real backend. Tests that DO care about narrative content
+    apply their own nested `patch.object(eod_digest_module,
+    "get_llm_provider", ...)`, which overrides this for its `with` block
+    and reverts back to this stub afterwards.
+    """
+    provider = MagicMock()
+    provider.generate = AsyncMock(return_value="stub narrative")
+    with patch.object(eod_digest_module, "get_llm_provider", return_value=provider):
+        yield
 
 
 class _StubCoordinator:
@@ -242,3 +274,90 @@ def test_coordinator_triggers_run_eod_review_immediately_after_write_daily_snaps
     assert "from .eod_orchestrator import run_eod_review" in inspect.getsource(
         coordinator_module
     )
+
+
+# -------------------------------------------
+# E3-2: digest/narrative merged into eod_review.report_json
+# -------------------------------------------
+
+
+class _StubCoordinatorWithWatch(_StubCoordinator):
+    """Adds `.get_watch_list()` so build_eod_digest's watch section has
+    something to work with too (still no `.state` — degrades stop_loss/
+    take_profit to None, exercised elsewhere in test_eod_digest.py)."""
+
+    def get_watch_list(self):
+        return []
+
+
+async def test_run_eod_review_merges_digest_and_narrative_into_report_json(
+    tmp_path, monkeypatch
+):
+    scanner_db_path = _make_scanner_db(tmp_path)
+    monkeypatch.setattr(eod_orchestrator, "SCANNER_DB_PATH", scanner_db_path)
+
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    await _seed_daily_perf_snapshot(storage)
+
+    coordinator = _StubCoordinatorWithWatch()
+
+    provider = MagicMock()
+    provider.generate = AsyncMock(return_value="오늘 EOD 브리핑 본문입니다.")
+
+    with patch.object(eod_digest_module, "get_llm_provider", return_value=provider):
+        ok = await run_eod_review(coordinator, storage, TRADE_DATE)
+    assert ok is True
+
+    review_rows = await storage.get_eod_reviews()
+    assert len(review_rows) == 1
+    report = json.loads(review_rows[0]["report_json"])
+
+    # Pre-existing keys/shape (build_eod_review's own contract) are
+    # untouched — this is the "무회귀" contract E3-2 must not break.
+    assert report["trade_date"] == TRADE_DATE
+    assert "portfolio" in report
+    assert "per_stock" in report
+    assert "agents" in report
+    assert "regime" in report
+
+    # New: digest + narrative are merged in as additional keys.
+    assert report["digest"]["trade_date"] == TRADE_DATE
+    assert set(report["digest"].keys()) == {
+        "trade_date", "watch", "account", "holdings", "strategy", "regime",
+    }
+    assert report["narrative"] == "오늘 EOD 브리핑 본문입니다."
+
+
+async def test_run_eod_review_llm_failure_still_saves_full_report(
+    tmp_path, monkeypatch
+):
+    """narrate_eod_digest failing (never-raise -> None) must not drop or
+    corrupt any of build_eod_review's pre-existing keys — only
+    report["narrative"] degrades to None, per E3-D2."""
+    scanner_db_path = _make_scanner_db(tmp_path)
+    monkeypatch.setattr(eod_orchestrator, "SCANNER_DB_PATH", scanner_db_path)
+
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    await _seed_daily_perf_snapshot(storage)
+    await _seed_scorable_decision(storage)
+
+    coordinator = _StubCoordinatorWithWatch()
+
+    provider = MagicMock()
+    provider.generate = AsyncMock(side_effect=RuntimeError("all backends down"))
+
+    with patch.object(eod_digest_module, "get_llm_provider", return_value=provider):
+        ok = await run_eod_review(coordinator, storage, TRADE_DATE)
+    assert ok is True
+
+    review_rows = await storage.get_eod_reviews()
+    report = json.loads(review_rows[0]["report_json"])
+
+    assert report["trade_date"] == TRADE_DATE
+    assert "portfolio" in report
+    assert "per_stock" in report
+    assert "agents" in report
+    assert "regime" in report
+    assert report["digest"] is not None
+    assert report["digest"]["trade_date"] == TRADE_DATE
+    assert report["narrative"] is None

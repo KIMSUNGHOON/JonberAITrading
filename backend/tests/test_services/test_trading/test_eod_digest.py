@@ -22,11 +22,13 @@ keys — every consumer can rely on the 5 keys always existing.
 import json
 import uuid
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from services.storage_service import StorageService
-from services.trading.eod_digest import build_eod_digest
+from services.trading import eod_digest as eod_digest_module
+from services.trading.eod_digest import build_eod_digest, narrate_eod_digest
 from services.trading.models import ManagedPosition, WatchedStock
 
 pytestmark = pytest.mark.asyncio
@@ -490,3 +492,138 @@ async def test_build_eod_digest_rejects_positional_arguments(tmp_path):
 
     with pytest.raises(TypeError):
         await build_eod_digest(coordinator, storage, trade_date)
+
+
+# -------------------------------------------
+# narrate_eod_digest (E3-2: LLM 내러티브, LLM 라우터 재사용)
+# -------------------------------------------
+
+
+def _sample_digest(trade_date="2026-07-17"):
+    return {
+        "trade_date": trade_date,
+        "watch": [
+            {
+                "ticker": "005930",
+                "stock_name": "삼성전자",
+                "signal": "hold",
+                "confidence": 0.62,
+                "current_price": 68000,
+                "target_entry_price": 70000,
+                "gap_pct": -2.857142857142857,
+            }
+        ],
+        "account": {
+            "deposit": 400_000_000,
+            "total_equity": 500_000_000,
+            "daily_realized_pnl": 120_000,
+            "cumulative_return_pct": 0.021,
+        },
+        "holdings": [
+            {
+                "ticker": "005930",
+                "stock_name": "삼성전자",
+                "quantity": 10,
+                "avg_price": 68000,
+                "current_price": 70000,
+                "unrealized_pnl": 20000,
+                "unrealized_pnl_pct": 2.94,
+                "stop_loss": 63240,
+                "take_profit": 78200,
+            }
+        ],
+        "strategy": {
+            "stance": "cautious_bullish",
+            "rationale_excerpt": "야간 선물 강세, 공격적 진입 유지.",
+            "key_knobs": {
+                "stop_loss_pct": 0.07,
+                "take_profit_pct": 0.15,
+                "max_position_pct": 0.10,
+                "max_trade_notional_pct": 15.0,
+            },
+            "changed": True,
+        },
+        "regime": {
+            "label": "risk_on",
+            "index_kospi_chg_pct": 0.8,
+            "index_kosdaq_chg_pct": 1.2,
+        },
+    }
+
+
+async def test_narrate_eod_digest_success_returns_stripped_text():
+    digest = _sample_digest()
+    provider = MagicMock()
+    provider.generate = AsyncMock(
+        return_value="  오늘 삼성전자 보유 종목은 2.94% 평가익을 기록했습니다.  "
+    )
+
+    with patch.object(eod_digest_module, "get_llm_provider", return_value=provider):
+        narrative = await narrate_eod_digest(digest)
+
+    assert narrative == "오늘 삼성전자 보유 종목은 2.94% 평가익을 기록했습니다."
+    assert provider.generate.await_count == 1
+    _, kwargs = provider.generate.await_args
+    # digest content must actually reach the prompt (source-of-truth per
+    # module docstring — the model must not hallucinate numbers).
+    messages = provider.generate.await_args.args[0]
+    joined = " ".join(m.content for m in messages)
+    assert "005930" in joined
+    assert "cautious_bullish" in joined
+    # E3-1 review Important #2: strategy section must be framed as
+    # "익일 적용 전략(EOD 합의)", never asserted as *today's* strategy,
+    # since digest["strategy"] is the latest revision regardless of date.
+    assert "익일 적용 전략" in joined
+
+
+async def test_narrate_eod_digest_timeout_returns_none(monkeypatch):
+    digest = _sample_digest()
+    monkeypatch.setattr(eod_digest_module, "_NARRATE_TIMEOUT_SECONDS", 0.05)
+
+    async def _slow_generate(*_a, **_kw):
+        await asyncio.sleep(1.0)
+        return "too late"
+
+    provider = MagicMock()
+    provider.generate = AsyncMock(side_effect=_slow_generate)
+
+    with patch.object(eod_digest_module, "get_llm_provider", return_value=provider):
+        narrative = await narrate_eod_digest(digest)
+
+    assert narrative is None
+
+
+async def test_narrate_eod_digest_exception_returns_none():
+    digest = _sample_digest()
+    provider = MagicMock()
+    provider.generate = AsyncMock(side_effect=RuntimeError("all backends failed"))
+
+    with patch.object(eod_digest_module, "get_llm_provider", return_value=provider):
+        narrative = await narrate_eod_digest(digest)
+
+    assert narrative is None
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
+async def test_narrate_eod_digest_blank_response_returns_none(blank):
+    digest = _sample_digest()
+    provider = MagicMock()
+    provider.generate = AsyncMock(return_value=blank)
+
+    with patch.object(eod_digest_module, "get_llm_provider", return_value=provider):
+        narrative = await narrate_eod_digest(digest)
+
+    assert narrative is None
+
+
+async def test_narrate_eod_digest_never_raises_on_none_generate_result():
+    """A backend that returns None outright (not just blank string) must
+    also degrade to None rather than raising in .strip()."""
+    digest = _sample_digest()
+    provider = MagicMock()
+    provider.generate = AsyncMock(return_value=None)
+
+    with patch.object(eod_digest_module, "get_llm_provider", return_value=provider):
+        narrative = await narrate_eod_digest(digest)
+
+    assert narrative is None

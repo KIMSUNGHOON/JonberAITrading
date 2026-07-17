@@ -1,4 +1,5 @@
-"""Phase E3 Task 1: eod_digest 조립기 (aggregation, NO LLM).
+"""Phase E3 Task 1: eod_digest 조립기 (aggregation, NO LLM) + Task E3-2:
+narrate_eod_digest (the module's one deliberate LLM call — see below).
 
 The end-of-day digest joins four otherwise-siloed live/durable sources into
 ONE dict that downstream tasks treat as a fixed contract: E3-2's LLM
@@ -40,15 +41,34 @@ never the whole digest. The whole body is additionally wrapped so a truly
 unexpected failure still returns a dict shaped exactly like the happy path
 (all 5 keys present, degraded to None/[]) rather than raising or omitting
 keys — every consumer can rely on the 5 keys always existing.
+
+E3-2 adds `narrate_eod_digest(digest) -> Optional[str]` to this same
+module: a Korean LLM briefing generated FROM the digest this module
+builds. It reuses the shared LLM router exactly like strategy_panel.py's
+plain-text call convention (`get_llm_provider().generate(...)`), but with
+`TaskType.GENERAL` since this is free-text narration, not a structured
+decision. Never-raise like every other function here: any exception,
+`asyncio.wait_for` timeout, or blank response returns None, and per
+E3-D2 every consumer (Telegram/FE) falls back to a deterministic template
+render when narrate returns None.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, Optional
 
+from agents.llm.tasks import TaskType
+from agents.llm_provider import get_llm_provider
+
 logger = logging.getLogger(__name__)
+
+# E3-2: LLM 내러티브 호출 상한 — 느린/멈춘 백엔드가 EOD 체인을 무한정 붙잡지
+# 않도록 asyncio.wait_for로 강제 상한. 테스트가 monkeypatch로 낮춰 wait_for
+# 배선 자체를 검증한다.
+_NARRATE_TIMEOUT_SECONDS = 120.0
 
 # Upper bound on how many recent daily_perf_snapshot rows we scan to find
 # trade_date's row in Python — there's no server-side date filter on
@@ -311,3 +331,56 @@ async def _build_regime_section(storage: Any) -> Optional[dict[str, Any]]:
         "index_kospi_chg_pct": row.get("index_kospi_chg_pct"),
         "index_kosdaq_chg_pct": row.get("index_kosdaq_chg_pct"),
     }
+
+
+_NARRATE_SYSTEM_PROMPT = (
+    "당신은 한국 주식 자동매매 시스템의 장마감 브리핑 작성자입니다. "
+    "아래 장마감 데이터(JSON)를 근거로 오늘 하루를 요약하는 한국어 브리핑을 "
+    "정확히 한 편 작성하십시오. 길이는 400~800자. 과장된 표현이나 투자 권유성 "
+    "문구를 쓰지 마십시오. 수치는 데이터에 있는 값을 그대로 인용하고 새로운 "
+    "수치를 만들어내지 마십시오. strategy 섹션은 데이터의 가장 최근 전략 "
+    "리비전이며 오늘(trade_date)이 아닌 다른 날짜에 결정되었을 수 있습니다 — "
+    "이를 '오늘의 전략'처럼 단정하지 말고 '익일 적용 전략(EOD 합의)'으로 "
+    "서술하십시오. 브리핑 본문만 출력하고 다른 설명은 덧붙이지 마십시오."
+)
+
+
+async def narrate_eod_digest(digest: dict[str, Any]) -> Optional[str]:
+    """`digest` (a `build_eod_digest` result) -> a Korean EOD briefing, or
+    None on any failure/timeout/blank response.
+
+    Reuses the shared LLM router exactly like strategy_panel.py's plain-
+    text convention (`get_llm_provider().generate(...)`); `TaskType.GENERAL`
+    since this is a descriptive briefing, not a structured decision (no
+    `generate_structured`/schema here). Never-raise by design: every
+    exception (backend failure, malformed response, etc.) AND
+    `asyncio.wait_for`'s timeout are both funneled into a plain `None`
+    return, and per E3-D2, callers (Telegram/FE) fall back to a
+    deterministic template render when this returns None — narrate must
+    never be able to stall or break the EOD chain that calls it.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    user_prompt = (
+        "다음은 오늘의 장마감 데이터입니다. 이를 근거로 브리핑을 작성하십시오.\n\n"
+        + json.dumps(digest, ensure_ascii=False, default=str)
+    )
+
+    try:
+        raw = await asyncio.wait_for(
+            get_llm_provider().generate(
+                [
+                    SystemMessage(content=_NARRATE_SYSTEM_PROMPT),
+                    HumanMessage(content=user_prompt),
+                ],
+                task=TaskType.GENERAL,
+            ),
+            timeout=_NARRATE_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.warning(f"[EODDigest] narrate_eod_digest failed: {e}")
+        return None
+
+    if not raw or not raw.strip():
+        return None
+    return raw.strip()
