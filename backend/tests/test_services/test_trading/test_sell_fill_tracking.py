@@ -694,3 +694,168 @@ async def test_monitor_defensive_sell_gate_denied_does_not_register(temp_storage
 
     assert captured == []
     assert coord.fill_tracker.tracking() == []
+
+# -------------------------------------------
+# 9) E1-4 (scope 2) — on_trade_approved's SELL/REDUCE branch now decrements
+#    the LOCAL position too, not just the ledger. Previously this branch
+#    (the P1-1 PART 2 fix) called `record_trade_fill` directly and stopped
+#    there — `_state.positions` was never touched, so a fill placed through
+#    THIS entry point (agent-chat direct decisions + queue replays) left a
+#    phantom leftover position exactly the size of the fill; only a LATER
+#    poll delta (E1-2, section 6/7 above) would shave anything off, never the
+#    placement-time fill itself. It now routes through `_apply_sell_fill`
+#    (the SAME choke point every other SELL site already uses), which
+#    records the ledger row AND reconciles the position (decrement/remove +
+#    realized P&L) in one call — replacing the direct `record_trade_fill`
+#    call rather than adding a second one (double-recording the same fill).
+# -------------------------------------------
+
+
+def _entry_position(quantity=30) -> ManagedPosition:
+    return ManagedPosition(
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=quantity,
+        avg_price=250_000,
+        current_price=260_000,
+        analysis_session_id="s-entry",
+        risk_score=6,
+    )
+
+
+async def test_on_trade_approved_sell_decrements_local_position(temp_storage):
+    coord = _live_coordinator(OrderSide.SELL, quantity=10)
+    coord._add_position(_entry_position(quantity=30))
+    _stub_execute_order(coord, requested=10, filled=10, status="filled", order_id="SELL-DEC1")
+
+    await coord.on_trade_approved(
+        session_id="s1",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="SELL",
+        entry_price=260_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+    )
+
+    position = next((p for p in coord._state.positions if p.ticker == "005930"), None)
+    assert position is not None
+    assert position.quantity == 20  # 30 - 10
+
+
+async def test_on_trade_approved_reduce_partial_fill_decrements_by_actual_fill(temp_storage):
+    """A REDUCE that only partially fills at the broker must decrement by the
+    ACTUAL filled amount, not the requested one."""
+    coord = _live_coordinator(OrderSide.SELL, quantity=10)
+    coord._add_position(_entry_position(quantity=30))
+    _stub_execute_order(coord, requested=10, filled=4, status="partial", order_id="SELL-DEC2")
+
+    await coord.on_trade_approved(
+        session_id="s2",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="REDUCE",
+        entry_price=260_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+    )
+
+    position = next((p for p in coord._state.positions if p.ticker == "005930"), None)
+    assert position is not None
+    assert position.quantity == 26  # 30 - 4
+
+
+async def test_on_trade_approved_sell_full_fill_removes_position_entirely(temp_storage):
+    coord = _live_coordinator(OrderSide.SELL, quantity=15)
+    coord._add_position(_entry_position(quantity=15))
+    _stub_execute_order(coord, requested=15, filled=15, status="filled", order_id="SELL-DEC3")
+
+    await coord.on_trade_approved(
+        session_id="s3",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="SELL",
+        entry_price=260_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+    )
+
+    assert all(p.ticker != "005930" for p in coord._state.positions)
+    assert "005930" not in coord.risk_monitor._watching
+
+
+async def test_on_trade_approved_sell_records_realized_pnl_when_persistence_active(
+    temp_storage,
+):
+    """Realized P&L, gated by `_persistence_active` like the ledger write,
+    is now recorded too — previously the direct `record_trade_fill` call
+    never touched `record_kr_realized_pnl` at all."""
+    coord = _live_coordinator(OrderSide.SELL, quantity=10)
+    coord._persistence_active = True
+    coord._add_position(_entry_position(quantity=30))
+    _stub_execute_order(
+        coord, requested=10, filled=10, status="filled", order_id="SELL-DEC4", avg_price=260_000
+    )
+
+    await coord.on_trade_approved(
+        session_id="s4",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="SELL",
+        entry_price=260_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+    )
+
+    from services.trading import trade_log
+
+    await trade_log.wait_for_pending_trade_fill_writes()
+
+    pnl_rows = await temp_storage.get_kr_realized_pnl(stk_cd="005930")
+    assert len(pnl_rows) == 1
+    assert pnl_rows[0]["quantity"] == 10
+    assert pnl_rows[0]["entry_price"] == 250_000
+    assert pnl_rows[0]["exit_price"] == 260_000
+
+    # Ledger row is STILL recorded exactly once (no double-count from routing
+    # through _apply_sell_fill instead of the old direct record_trade_fill).
+    rows = await temp_storage.get_kr_stock_trades()
+    assert len(rows) == 1
+    assert rows[0]["side"] == "sell"
+    assert rows[0]["executed_quantity"] == 10
+
+
+async def test_on_trade_approved_sell_no_local_position_still_records_ledger_only(
+    temp_storage,
+):
+    """No pre-existing local position (e.g. a stray SELL for a ticker this
+    coordinator never tracked) must still record the ledger row — same as
+    before this change — but skip the decrement/P&L as a no-op, not raise."""
+    coord = _live_coordinator(OrderSide.SELL, quantity=10)
+    coord._persistence_active = True
+    _stub_execute_order(coord, requested=10, filled=10, status="filled", order_id="SELL-DEC5")
+
+    await coord.on_trade_approved(
+        session_id="s5",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="SELL",
+        entry_price=260_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+    )
+
+    from services.trading import trade_log
+
+    await trade_log.wait_for_pending_trade_fill_writes()
+
+    assert coord._state.positions == []
+    rows = await temp_storage.get_kr_stock_trades()
+    assert len(rows) == 1
+    assert rows[0]["executed_quantity"] == 10
+

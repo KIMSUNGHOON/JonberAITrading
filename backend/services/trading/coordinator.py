@@ -536,14 +536,79 @@ class ExecutionCoordinator:
             return allocation
 
         # Execute rebalancing orders first
+        #
+        # E1-4: a rebalance order is a SYSTEM-computed SELL of an UNRELATED
+        # position (`portfolio_agent._check_rebalancing_needed` decided it, to
+        # free up room for the trade that WAS approved) — the human approved
+        # the PRIMARY trade, not trimming a different position. That makes it
+        # the same category as a defensive stop-loss/take-profit trigger
+        # (`_execute_order_from_monitor`) or an autonomous full close
+        # (PositionManager._execute_close_position, R5-P0 A2): it must pass
+        # the shared autonomy gate UNCONDITIONALLY, regardless of whether
+        # THIS trade's own `autonomous` flag is set. A denial skips only that
+        # one rebalance item and logs it — the primary order below still
+        # proceeds (mirrors A2's "skip, don't abort" shape), and the fill is
+        # then reconciled through the same `_apply_sell_fill`/
+        # `_register_unfilled_sell` choke points every other SELL site uses
+        # (previously this loop only placed the order and never recorded the
+        # ledger row or decremented the local position for it at all).
+        from services.autonomy import check_autonomy
+
         for rebalance_order in allocation.rebalance_orders:
+            gate = await check_autonomy(
+                "kiwoom",
+                action="SELL",
+                quantity=rebalance_order.quantity,
+                entry_price=rebalance_order.price,
+            )
+            if not gate.allowed:
+                logger.warning(
+                    f"[Coordinator] Rebalance sell blocked by gate: "
+                    f"{rebalance_order.ticker} check={gate.check} reason={gate.reason}"
+                )
+                self._log_activity(
+                    ActivityType.TRADE_REJECTED,
+                    f"Rebalance order blocked by autonomy gate: {rebalance_order.ticker} "
+                    f"({gate.reason})",
+                    agent="system",
+                    ticker=rebalance_order.ticker,
+                )
+                continue
+
+            # NOTE (pre-existing bug, fixed in passing): OrderRequest has
+            # `use_enum_values=True`, so `.side` is already a plain str
+            # ("sell") by validation time, not an OrderSide member — the old
+            # `.side.value` here raised AttributeError the moment this line
+            # actually ran (every other `.side` use in this file already
+            # compares against the plain string, e.g. line ~2411
+            # `order.side == "sell"`).
             self._log_activity(
                 ActivityType.ORDER_PLACED,
-                f"Rebalance order: {rebalance_order.side.value} {rebalance_order.quantity} shares",
+                f"Rebalance order: {rebalance_order.side} {rebalance_order.quantity} shares",
                 agent="order",
                 ticker=rebalance_order.ticker,
             )
-            await self._execute_order(rebalance_order)
+            # Capture the position BEFORE the fill reconciles it (matches
+            # _execute_order_from_monitor's pattern) — _apply_sell_fill may
+            # reduce/remove it from _state.positions, but
+            # _register_unfilled_sell only needs stock_name/
+            # analysis_session_id/risk_score off the (still-valid) reference.
+            rebalance_position = next(
+                (p for p in self._state.positions if p.ticker == rebalance_order.ticker),
+                None,
+            )
+            rebalance_result = await self._execute_order(rebalance_order)
+            self._apply_sell_fill(
+                rebalance_order.ticker,
+                rebalance_result.filled_quantity,
+                order=rebalance_order,
+                result=rebalance_result,
+            )
+            # A partial/unfilled remainder still has broker-side exposure —
+            # track it the same way every other SELL site does (E1-1/E1-3).
+            self._register_unfilled_sell(
+                rebalance_order.ticker, rebalance_position, rebalance_order, rebalance_result
+            )
 
         # Execute main order
         order = OrderRequest(
@@ -625,36 +690,23 @@ class ExecutionCoordinator:
             )
             self._complete_agent_task("order", success=True)
 
-            # P1-1 gap (PART 2, 2026-07-13): `_execute_order` only records BUY
-            # fills — its SELL branch defers to `_apply_sell_fill`, the choke
-            # point every OTHER SELL caller (RiskMonitor triggers,
-            # _execute_order_from_monitor) invokes right after. This
-            # on_trade_approved path (agent-chat direct decisions + queue
-            # replays) never calls `_apply_sell_fill`, so its SELL/REDUCE
-            # fills recorded nothing. Record them here with the same
-            # fire-and-forget helper, gated by `_persistence_active` like
-            # every other call site — and only for SELL, so a BUY approval
-            # (already recorded inside `_execute_order` above) is never
-            # double-counted.
-            if self._persistence_active and side == OrderSide.SELL:
-                record_trade_fill(
-                    stk_cd=ticker,
-                    stk_nm=stock_name,
-                    side="sell",
-                    order_type=getattr(order.order_type, "value", order.order_type),
-                    price=result.avg_price or entry_price or 0,
-                    quantity=result.requested_quantity,
-                    executed_quantity=result.filled_quantity,
-                    status=(
-                        "completed"
-                        if result.filled_quantity >= result.requested_quantity
-                        else "partial"
-                    ),
-                    order_id=result.order_id,
-                    session_id=session_id,
-                    decision_id=session_id,
-                    entry_or_exit="exit",
-                )
+            # E1-4 (scope 2, PART 2 gap follow-up): this branch used to ONLY
+            # write the ledger row (see the now-superseded comment this
+            # replaces) — it never decremented `_state.positions`, so a fill
+            # placed through THIS entry point (agent-chat direct decisions +
+            # queue replays) left a phantom leftover position exactly the
+            # size of the fill; only a LATER poll delta (E1-2) would shave
+            # anything off, never the placement-time fill itself.
+            # `_apply_sell_fill` is the shared choke point every OTHER SELL
+            # caller (RiskMonitor triggers, _execute_order_from_monitor,
+            # rebalance orders above) already uses — it performs the SAME
+            # ledger write this block used to do directly (record_trade_fill,
+            # still gated on `_persistence_active` internally) AND reconciles
+            # the local position (decrement/remove + realized P&L), so
+            # routing through it here REPLACES the direct call rather than
+            # adding a second one (which would double-record the same fill).
+            if side == OrderSide.SELL:
+                self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
         else:
             self._log_activity(
                 ActivityType.ORDER_FAILED,
