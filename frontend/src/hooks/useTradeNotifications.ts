@@ -54,6 +54,49 @@ export interface TradeNotification {
   };
 }
 
+/**
+ * Single source of truth for "every known TradeNotificationType" — the WS
+ * dispatch allowlist in `handleMessage` below consumes this array instead of
+ * hardcoding a second, independently-maintained list. Before this fix the
+ * two lists could silently drift apart: the type union type-checks on its
+ * own, so adding an 8th type to `TradeNotificationType` without also
+ * remembering to touch the allowlist compiled cleanly while silently
+ * dropping every real WS frame of the new type (exactly what happened with
+ * `eod_summary` during E3-5 review).
+ *
+ * `as const satisfies readonly TradeNotificationType[]` keeps each element's
+ * literal type (needed for the exhaustiveness check right below) while still
+ * verifying every element is a valid TradeNotificationType.
+ */
+export const ALL_NOTIFICATION_TYPES = [
+  'trade_executed',
+  'trade_queued',
+  'trade_rejected',
+  'watch_added',
+  'stop_loss_triggered',
+  'take_profit_triggered',
+  'eod_summary',
+] as const satisfies readonly TradeNotificationType[];
+
+// Compile-time drift guard, the OTHER direction from the `satisfies` above:
+// catches a new TradeNotificationType member that was never added to
+// ALL_NOTIFICATION_TYPES. `_MissingTypes` is `never` iff every union member
+// is covered; the `[X] extends [never]` tuple wrapping avoids TS's
+// distributive-conditional-over-never special case (a naked
+// `X extends never ? ... : ...` always collapses to `never` when X IS
+// `never`, which would defeat this check). If a type ever goes missing,
+// `_ExhaustivenessCheck` resolves to a descriptive tuple instead of `true`,
+// and the `const` assignment below fails to compile.
+type _MissingNotificationTypes = Exclude<TradeNotificationType, (typeof ALL_NOTIFICATION_TYPES)[number]>;
+type _ExhaustivenessCheck = [_MissingNotificationTypes] extends [never]
+  ? true
+  : ['ALL_NOTIFICATION_TYPES is missing member(s) of TradeNotificationType:', _MissingNotificationTypes];
+// Exported (not just a bare local) so tsc's noUnusedLocals doesn't flag this
+// compile-time-only assertion as dead code — the value is always literally
+// `true` at runtime; its only job is to fail `tsc --noEmit` if the type
+// above ever resolves to the "missing member" branch.
+export const ALL_NOTIFICATION_TYPES_ARE_EXHAUSTIVE: _ExhaustivenessCheck = true;
+
 export interface UseTradeNotificationsOptions {
   onNotification?: (notification: TradeNotification) => void;
   onConnect?: () => void;
@@ -109,18 +152,11 @@ export function useTradeNotifications(
         return;
       }
 
-      // Handle trade notification types
-      const notificationTypes: TradeNotificationType[] = [
-        'trade_executed',
-        'trade_queued',
-        'trade_rejected',
-        'watch_added',
-        'stop_loss_triggered',
-        'take_profit_triggered',
-        'eod_summary',
-      ];
-
-      if (notificationTypes.includes(message.type)) {
+      // Handle trade notification types — consumes the shared
+      // ALL_NOTIFICATION_TYPES constant (see its docstring above) rather
+      // than a second hardcoded list, so this allowlist can't drift out of
+      // sync with TradeNotificationType again.
+      if (ALL_NOTIFICATION_TYPES.includes(message.type)) {
         const notification: TradeNotification = {
           type: message.type,
           data: message.data,

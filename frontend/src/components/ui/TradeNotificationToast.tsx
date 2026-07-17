@@ -159,7 +159,10 @@ export function TradeNotificationToast({
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   const handleNotification = useCallback((notification: TradeNotification) => {
-    const id = `${notification.type}-${notification.data.ticker}-${Date.now()}`;
+    // ticker is absent on account-wide types (eod_summary) -- fall back to
+    // trade_date, then '', so the key never embeds a literal "undefined".
+    const idSubject = notification.data.ticker ?? notification.data.trade_date ?? '';
+    const id = `${notification.type}-${idSubject}-${Date.now()}`;
 
     setToasts((prev) => {
       // Add new toast at the beginning
