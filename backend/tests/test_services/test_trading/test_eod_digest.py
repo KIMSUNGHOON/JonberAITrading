@@ -1,6 +1,7 @@
 """Phase E3 Task 1: eod_digest 조립기 (aggregation, NO LLM).
 
-`build_eod_digest(coordinator, storage, trade_date)` joins the watch list,
+`build_eod_digest(*, coordinator, storage, trade_date)` (keyword-only —
+see module docstring's NOTE) joins the watch list,
 account/holdings snapshot, latest strategy revision, and latest market
 regime into ONE digest dict that downstream tasks depend on as a fixed
 contract: E3-2 (LLM narrative) reads it as the source-of-truth for a
@@ -212,7 +213,7 @@ async def test_build_eod_digest_assembles_all_sections(tmp_path):
         state_positions=[_managed_position()],
     )
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     assert digest["trade_date"] == trade_date
 
@@ -275,7 +276,7 @@ async def test_build_eod_digest_holdings_degrade_when_state_unavailable(tmp_path
         summary=_portfolio_summary(),
     )
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     holdings = digest["holdings"]
     assert len(holdings) == 1
@@ -294,7 +295,7 @@ async def test_build_eod_digest_watch_list_failure_degrades_to_empty(tmp_path):
 
     coordinator = _ExplodingWatchCoordinator(summary=_portfolio_summary())
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     assert "error" not in digest
     assert digest["watch"] == []
@@ -325,7 +326,7 @@ async def test_build_eod_digest_portfolio_summary_failure_degrades_holdings_and_
 
     coordinator = _ExplodingSummaryCoordinator(watch_list=[_watch_item()])
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     assert "error" not in digest
     assert digest["holdings"] == []
@@ -347,7 +348,7 @@ async def test_build_eod_digest_daily_perf_snapshot_failure_degrades_account_onl
     storage = _ExplodingMethodStorage(real_storage, "get_daily_perf_snapshots")
     coordinator = _StubCoordinator(summary=_portfolio_summary())
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     assert "error" not in digest
     assert digest["account"]["daily_realized_pnl"] is None
@@ -366,7 +367,7 @@ async def test_build_eod_digest_strategy_revisions_failure_degrades_to_none(tmp_
     storage = _ExplodingMethodStorage(real_storage, "get_strategy_revisions")
     coordinator = _StubCoordinator(summary=_portfolio_summary())
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     assert "error" not in digest
     assert digest["strategy"] is None
@@ -381,7 +382,7 @@ async def test_build_eod_digest_regime_snapshot_failure_degrades_to_none(tmp_pat
     storage = _ExplodingMethodStorage(real_storage, "get_regime_snapshots")
     coordinator = _StubCoordinator(summary=_portfolio_summary())
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     assert "error" not in digest
     assert digest["regime"] is None
@@ -395,7 +396,7 @@ async def test_build_eod_digest_empty_watch_and_missing_regime_degrade(tmp_path)
     storage = StorageService(db_path=str(tmp_path / "t.db"))
     coordinator = _StubCoordinator(watch_list=[], summary={})
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     assert digest["watch"] == []
     assert digest["regime"] is None
@@ -410,7 +411,7 @@ async def test_build_eod_digest_rationale_excerpt_truncated_to_300_chars(tmp_pat
     await _seed_strategy_revision(storage, trade_date, rationale=long_rationale, changed=False)
     coordinator = _StubCoordinator(summary={})
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     excerpt = digest["strategy"]["rationale_excerpt"]
     assert len(excerpt) == 300
@@ -432,7 +433,7 @@ async def test_build_eod_digest_gap_pct_is_none_when_target_missing(tmp_path):
     )
     coordinator = _StubCoordinator(watch_list=[watch], summary={})
 
-    digest = await build_eod_digest(coordinator, storage, trade_date)
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
 
     assert digest["watch"][0]["gap_pct"] is None
 
@@ -457,7 +458,9 @@ async def test_build_eod_digest_never_raises_when_everything_explodes(tmp_path):
         def get_portfolio_summary(self):
             raise RuntimeError("boom")
 
-    digest = await build_eod_digest(_ExplodingCoordinator(), _ExplodingStorage(), trade_date)
+    digest = await build_eod_digest(
+        coordinator=_ExplodingCoordinator(), storage=_ExplodingStorage(), trade_date=trade_date
+    )
 
     assert digest["trade_date"] == trade_date
     assert digest["watch"] == []
@@ -470,3 +473,20 @@ async def test_build_eod_digest_never_raises_when_everything_explodes(tmp_path):
         "daily_realized_pnl": None,
         "cumulative_return_pct": None,
     }
+
+
+async def test_build_eod_digest_rejects_positional_arguments(tmp_path):
+    """리뷰 Important 픽스: coordinator/storage are duck-typed `Any`, so a
+    transposed positional call (e.g. `build_eod_digest(storage,
+    coordinator, trade_date)`) would previously degrade every section to
+    empty/None without ever raising — a caller bug masquerading as a
+    structurally valid, silently-corrupted digest. The signature is now
+    keyword-only specifically to turn that mistake into an immediate
+    TypeError at the call site instead of quiet data corruption.
+    """
+    trade_date = "2026-07-17"
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    coordinator = _StubCoordinator(summary=_portfolio_summary())
+
+    with pytest.raises(TypeError):
+        await build_eod_digest(coordinator, storage, trade_date)

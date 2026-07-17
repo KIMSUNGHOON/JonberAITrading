@@ -73,8 +73,20 @@ _EMPTY_ACCOUNT: dict[str, Any] = {
 }
 
 
-async def build_eod_digest(coordinator: Any, storage: Any, trade_date: str) -> dict[str, Any]:
+async def build_eod_digest(
+    *, coordinator: Any, storage: Any, trade_date: str
+) -> dict[str, Any]:
     """Assemble the end-of-day digest for `trade_date`.
+
+    NOTE: keyword-only (the leading `*`) is deliberate -- `coordinator`/
+    `storage` are both duck-typed `Any` with no structural type to catch a
+    transposed call at import/type-check time. Before this fix, a
+    positional-argument swap (`build_eod_digest(storage, coordinator,
+    trade_date)`) would silently degrade EVERY section to empty/None
+    (each section's own try/except swallows the resulting AttributeError)
+    rather than raising -- i.e. a caller bug produces a quietly-corrupted
+    but structurally valid digest instead of a loud failure. Keyword-only
+    turns that swap into an immediate `TypeError` at the call site.
 
     Args:
         coordinator: ExecutionCoordinator (or any stand-in exposing
