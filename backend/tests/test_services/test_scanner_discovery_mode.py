@@ -56,6 +56,24 @@ def _make_chart_df(n: int, start: float = 50_000.0) -> pd.DataFrame:
     )
 
 
+def _chart_df_with_last_move(direction: str, n: int = 65, start: float = 50_000.0) -> pd.DataFrame:
+    """`_make_chart_df` 기반이되 마지막 종가만 원하는 등락 방향으로
+    오버라이드한다 — breadth 판정(마지막 2개 종가 비교)의 advance/decline/
+    flat 픽스처. `_make_chart_df`는 기본적으로 계속 상승(advance)하므로
+    decline/flat만 실제로 값을 바꾼다."""
+    df = _make_chart_df(n, start=start)
+    prev_close = df["close"].iloc[-2]
+    if direction == "advance":
+        pass  # 기본 상승 계열 그대로 사용
+    elif direction == "decline":
+        df.loc[df.index[-1], "close"] = prev_close * 0.99
+    elif direction == "flat":
+        df.loc[df.index[-1], "close"] = prev_close
+    else:
+        raise ValueError(f"unknown direction: {direction}")
+    return df
+
+
 def _stock_info(
     stk_cd: str,
     stk_nm: str = "테스트종목",
@@ -468,3 +486,198 @@ async def test_discovery_mode_never_auto_promotes(monkeypatch):
     result = scanner.get_results()[0]
     assert result.action == "WATCH"
     assert coordinator.get_watch_list() == [], "discovery 모드는 승격을 절대 발화시키면 안 된다"
+
+
+# ---------------------------------------------------------------------------
+# ⑦ discovery 세션 buy/sell/hold_count = advance/decline/flat breadth
+#    (DS-2 리뷰픽스: action='WATCH' 고정이라 세션 카운트가 전부 watch_count로
+#    몰려 regime.py의 breadth가 항상 0.0/neutral로 오염되던 결함 봉합)
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_session_counts_reflect_advance_decline_flat_breadth(monkeypatch):
+    """세션 buy/sell/hold_count는 discovery 종목의 등락 방향(advance/decline/
+    flat, chart_df 마지막 2개 종가 비교)을 반영해야 한다 — 종전처럼
+    action='WATCH' 고정 매핑(watch_count에만 집계)이면 buy/sell/hold가 전부
+    0이 돼 regime.py의 breadth가 오염된다. 행 수준 action='WATCH'는
+    유지되어야 한다(행 수준 의미 무변경 — 세션 집계만 유의미화)."""
+    advancing_1 = _make_chart_df(65)
+    advancing_2 = _make_chart_df(65, start=30_000.0)
+    declining = _chart_df_with_last_move("decline")
+    flat = _chart_df_with_last_move("flat")
+
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "AdvA"),
+            "000660": _stock_info("000660", "AdvB"),
+            "035420": _stock_info("035420", "Decl"),
+            "005380": _stock_info("005380", "Flat"),
+        },
+        chart_dfs={
+            "005930": advancing_1,
+            "000660": advancing_2,
+            "035420": declining,
+            "005380": flat,
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "AdvA", "코스피"),
+            ("000660", "AdvB", "코스피"),
+            ("035420", "Decl", "코스피"),
+            ("005380", "Flat", "코스피"),
+        ],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["buy_count"] == 2
+    assert session["sell_count"] == 1
+    assert session["hold_count"] == 1
+
+    # 행 수준 action은 여전히 WATCH 고정(회귀 고정 — 세션 집계만 유의미화).
+    rows = await _fetch_rows(scanner_module.DB_PATH, session["id"])
+    assert len(rows) == 4
+    assert all(r["action"] == "WATCH" for r in rows)
+
+
+async def test_discovery_session_counts_include_quality_filter_rejects(monkeypatch):
+    """품질 필터에서 탈락(예: 시총 미달)해도 차트 수집에 성공했다면 breadth
+    카운트에는 포함돼야 한다 — breadth는 시장 전체 내부 지표이지 필터 통과
+    종목만의 지표가 아니다."""
+    client = FakeKiwoomClient(
+        stock_infos={
+            # 시총 10억 — DEFAULT_MIN_MARKET_CAP(500억) 미달 -> 품질 필터 탈락
+            "005930": _stock_info("005930", "SmallCap", mrkt_tot_amt=1_000_000_000),
+        },
+        chart_dfs={"005930": _make_chart_df(65)},  # 상승 계열
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "SmallCap", "코스피")],
+        mode="discovery",
+    )
+
+    # 사전조건: 실제로 품질 필터에서 탈락했는지 확인.
+    rows = await _fetch_rows(scanner_module.DB_PATH)
+    assert len(rows) == 1
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is False
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    # 상승(advance) 종목이므로 필터 탈락과 무관하게 buy_count에 집계된다.
+    assert sessions[0]["buy_count"] == 1
+    assert sessions[0]["sell_count"] == 0
+    assert sessions[0]["hold_count"] == 0
+
+
+async def test_discovery_session_counts_exclude_collection_failures(monkeypatch):
+    """수집 자체가 실패(예외/가격 파싱 불가)한 종목은 breadth 카운트에도
+    포함되면 안 된다 — 성공 2종목(상승1·하락1) + 실패 1종목 혼합 시
+    buy=1, sell=1, hold=0이어야 하고 실패 종목의 흔적이 카운트에 없어야
+    한다."""
+    declining = _chart_df_with_last_move("decline")
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "Adv"),
+            "035420": _stock_info("035420", "Decl"),
+            "000660": Exception("kiwoom timeout (ka10001)"),  # 수집 실패
+        },
+        chart_dfs={
+            "005930": _make_chart_df(65),
+            "035420": declining,
+            "000660": _make_chart_df(65),
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "Adv", "코스피"),
+            ("035420", "Decl", "코스피"),
+            ("000660", "Fail", "코스피"),
+        ],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["buy_count"] == 1
+    assert session["sell_count"] == 1
+    assert session["hold_count"] == 0
+    assert session["failed"] == 1
+
+    rows = await _fetch_rows(scanner_module.DB_PATH, session["id"])
+    assert len(rows) == 2  # 실패 종목 행 없음(가짜 HOLD 금지, 기존 불변식)
+
+
+async def test_regime_snapshot_consumes_discovery_breadth_end_to_end(monkeypatch):
+    """통합-lite: discovery 세션이 tmp scanner DB에 저장된 뒤
+    regime.compute_regime_snapshot이 그 buy/sell/hold_count를 읽어
+    breadth_ratio를 유의미하게 산출해야 한다 — 수정 전에는 discovery
+    세션의 action이 전부 'WATCH'라 buy/sell/hold=0 고정 -> breadth_ratio는
+    항상 0.0/regime_label은 항상 'neutral'로 강제됐다."""
+    from services.trading.regime import compute_regime_snapshot
+
+    advancing_1 = _make_chart_df(65)
+    advancing_2 = _make_chart_df(65, start=30_000.0)
+    declining = _chart_df_with_last_move("decline")
+    flat = _chart_df_with_last_move("flat")
+
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "AdvA"),
+            "000660": _stock_info("000660", "AdvB"),
+            "035420": _stock_info("035420", "Decl"),
+            "005380": _stock_info("005380", "Flat"),
+        },
+        chart_dfs={
+            "005930": advancing_1,
+            "000660": advancing_2,
+            "035420": declining,
+            "005380": flat,
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "AdvA", "코스피"),
+            ("000660", "AdvB", "코스피"),
+            ("035420", "Decl", "코스피"),
+            ("005380", "Flat", "코스피"),
+        ],
+        mode="discovery",
+    )
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    record = compute_regime_snapshot(str(scanner_module.DB_PATH), today)
+
+    assert record is not None
+    assert record["breadth_buy"] == 2
+    assert record["breadth_sell"] == 1
+    assert record["breadth_hold"] == 1
+    # (buy - sell) / (buy + sell + hold) = (2 - 1) / 4 = 0.25
+    assert record["breadth_ratio"] == pytest.approx(0.25)
+
+    # 실코드 임계값(EOD_REGIME_BREADTH_THRESHOLD, 기본 0.15)을 직접 읽어
+    # 레이블 경계를 하드코딩하지 않고 단언한다.
+    from app.config import get_settings
+
+    threshold = get_settings().EOD_REGIME_BREADTH_THRESHOLD
+    assert record["breadth_ratio"] > threshold, (
+        "테스트 픽스처(0.25)가 임계값보다 커야 non-neutral 레이블을 검증할 수 있다"
+    )
+    assert record["regime_label"] == "risk_on"

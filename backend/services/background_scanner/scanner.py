@@ -865,6 +865,30 @@ class BackgroundScanner:
             chart_df=chart_df,
         )
 
+    @staticmethod
+    def _classify_breadth_direction(chart_df) -> str:
+        """discovery breadth 판정: chart_df 마지막 2개 종가를 비교해
+        advance(마지막 close > 직전 close)/decline(<)/flat(==거나 판정
+        불가·데이터 부족)을 반환한다. 호출자가 이를 세션 buy/sell/hold_count
+        에 매핑 — regime.py가 소비하는 breadth_ratio가 이제 처음으로
+        유의미해진다(DS-2 리뷰픽스, 스펙 §3).
+        """
+        try:
+            closes = chart_df["close"]
+            if len(closes) < 2:
+                return "flat"
+            last = float(closes.iloc[-1])
+            prev = float(closes.iloc[-2])
+        except Exception:
+            return "flat"
+        if last != last or prev != prev:  # NaN 체크 (pandas import 없이)
+            return "flat"
+        if last > prev:
+            return "advance"
+        if last < prev:
+            return "decline"
+        return "flat"
+
     async def _scan_stock_discovery(
         self,
         stk_cd: str,
@@ -879,10 +903,16 @@ class BackgroundScanner:
 
         수집 자체가 실패(예외/가격 파싱 불가)하면 None을 반환해 호출자가
         행을 드롭하게 한다. 수집은 성공했지만 품질 필터를 통과하지 못한
-        종목은 (ScanResult, factor_json) 쌍을 반환하되 factor_json에
-        skip_reason만 담는다(스코어 계산은 필터 통과 종목에 한정 — DS-1
-        리뷰 이월: 필터→스코어 순서 엄수, len<60 ma_alignment 가변 분모
-        함정 방어선).
+        종목은 (ScanResult, factor_json, breadth_direction) 3튜플을
+        반환하되 factor_json에 skip_reason만 담는다(스코어 계산은 필터
+        통과 종목에 한정 — DS-1 리뷰 이월: 필터→스코어 순서 엄수, len<60
+        ma_alignment 가변 분모 함정 방어선).
+
+        breadth_direction(advance/decline/flat, chart_df 마지막 2개 종가로
+        판정)은 품질 필터 통과 여부와 무관하게(차트만 수집됐으면) 계산돼
+        호출자가 세션 buy/sell/hold_count(=regime.py가 소비하는 breadth)에
+        반영한다 — DS-2 리뷰픽스: scan_results 행의 action='WATCH' 고정은
+        무변경(행 수준 의미 무변경, 세션 집계만 유의미화).
         """
         async with self._semaphore:
             self._progress.in_progress += 1
@@ -890,6 +920,7 @@ class BackgroundScanner:
 
             try:
                 snap = await self._fetch_discovery_snapshot(stk_cd, stk_nm, client)
+                breadth_direction = self._classify_breadth_direction(snap.chart_df)
                 passed, reason = passes_quality_filter(snap)
 
                 if passed:
@@ -930,7 +961,7 @@ class BackgroundScanner:
                 self._progress.completed += 1
                 self._update_eta()
 
-                return result, factor_json
+                return result, factor_json, breadth_direction
 
             except Exception as e:
                 logger.warning("discovery_stock_collection_failed", stk_cd=stk_cd, error=str(e))
@@ -1005,6 +1036,10 @@ class BackgroundScanner:
         선조회해(`_build_flow_map`) 전체 스캔이 재사용한다. LLM 호출 없음
         (룰 전용). 기존 자동 승격 배관은 `_promote_results_to_watch_list`
         자체의 mode 가드로 비활성 — 이 메서드는 그 호출부를 건드리지 않는다.
+
+        세션 buy/sell/hold_count는 종목별 advance/decline/flat breadth
+        판정(`_classify_breadth_direction`)으로 집계된다 — action='WATCH'
+        고정인 행 자체의 의미는 무변경(DS-2 리뷰픽스: 세션 집계만 유의미화).
         """
         from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 
@@ -1048,10 +1083,10 @@ class BackgroundScanner:
                 elif result is None:
                     self._progress.failed += 1
                 else:
-                    scan_result, factor_json = result
+                    scan_result, factor_json, breadth_direction = result
                     valid_pairs.append((scan_result, factor_json))
                     self._results.append(scan_result)
-                    self._update_action_count(scan_result.action)
+                    self._update_breadth_count(breadth_direction)
 
             if valid_pairs:
                 await self._save_discovery_results_batch(valid_pairs, session_id)
@@ -1676,6 +1711,21 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
             "REDUCE": "sell_count",
         }
         attr = action_map.get(action, "hold_count")
+        setattr(self._progress, attr, getattr(self._progress, attr) + 1)
+
+    def _update_breadth_count(self, direction: str):
+        """Discovery 모드 전용 세션 카운트 (DS-2 리뷰픽스): chart_df 마지막
+        2개 종가로 판정한 일간 등락 방향(advance/decline/flat)을
+        buy/sell/hold_count에 매핑한다. scan_results 행의 action='WATCH'
+        고정(행 수준 의미 무변경)과는 별개로, regime.py가 소비하는 세션
+        집계(breadth)만 advance/decline로 유의미화한다 — quick/llm 모드의
+        `_update_action_count`는 무변경."""
+        direction_map = {
+            "advance": "buy_count",
+            "decline": "sell_count",
+            "flat": "hold_count",
+        }
+        attr = direction_map.get(direction, "hold_count")
         setattr(self._progress, attr, getattr(self._progress, attr) + 1)
 
     def _update_eta(self):
