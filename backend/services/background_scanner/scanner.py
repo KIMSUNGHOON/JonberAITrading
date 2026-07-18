@@ -1783,6 +1783,21 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
         """Get current scan progress."""
         return self._progress
 
+    @property
+    def is_running(self) -> bool:
+        """DS-5 review fix: public mirror of the internal `_running` flag.
+
+        `start_scan()` itself gates on this flag and silently no-ops when a
+        scan (of ANY mode -- manual or discovery) is already in flight
+        (`if self._running: ... return`, above). Callers that need to know
+        BEFORE calling `start_scan()` whether it would actually start a new
+        scan -- as opposed to `get_progress().status == RUNNING`, which stays
+        RUNNING for the no-op'd caller's own already-running scan too and so
+        cannot distinguish "my scan is running" from "someone else's scan is
+        running and mine never started" -- should check this property first.
+        """
+        return self._running
+
     def get_results(self, action_filter: Optional[str] = None) -> List[ScanResult]:
         """
         Get scan results with optional action filter.

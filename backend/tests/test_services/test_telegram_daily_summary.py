@@ -260,3 +260,89 @@ async def test_long_narrative_delegates_to_existing_split(monkeypatch):
     assert result is True
     assert len(split_calls) == 1  # send_daily_summary doesn't chunk itself...
     assert notifier._bot.send_message.call_count > 1  # ...but _send_message did.
+
+
+# -------------------------------------------
+# Minor (DS-5 review fix): optional discovery block in the deterministic
+# fallback template -- digest.get("discovery") present -> append a
+# 승격(promoted) 종목 요약; absent (every fixture above) -> output stays
+# byte-for-byte the same as before this fix. Existing 4-block
+# format/order must remain untouched either way.
+# -------------------------------------------
+
+_DISCOVERY_DIGEST = {
+    **_DIGEST,
+    "discovery": {
+        "promoted": [
+            {
+                "ticker": "005930",
+                "name": "삼성전자",
+                "composite_score": 87.5,
+                "top_strategy_tag": "momentum",
+            },
+            {
+                "ticker": "000660",
+                "name": "SK하이닉스",
+                "composite_score": 81.2,
+                "top_strategy_tag": "value",
+            },
+        ],
+        "skip_counts": {"quality_filter": 12},
+        "total_candidates": 20,
+        "prev_day": {
+            "trade_date": "2026-07-16",
+            "candidate_count": 18,
+            "fwd_1d_filled_count": 18,
+            "avg_fwd_1d": 1.2,
+        },
+    },
+}
+
+
+async def test_template_fallback_with_discovery_includes_promoted_stocks():
+    notifier = _configured_notifier()
+
+    result = await notifier.send_daily_summary(_DISCOVERY_DIGEST, narrative=None)
+
+    assert result is True
+    sent_text = notifier._bot.send_message.call_args.kwargs["text"]
+
+    assert "발굴" in sent_text
+    assert "삼성전자" in sent_text
+    assert "005930" in sent_text
+    assert "87.5" in sent_text
+    assert "SK하이닉스" in sent_text
+
+    # Existing 4 blocks still present, same relative order.
+    assert (
+        sent_text.index("워치리스트")
+        < sent_text.index("계좌")
+        < sent_text.index("보유")
+        < sent_text.index("전략")
+        < sent_text.index("발굴")
+    )
+
+
+async def test_template_fallback_discovery_absent_output_unchanged():
+    """digest에 "discovery" 키가 없으면(이 파일의 기존 모든 픽스처가 그렇듯)
+    폴백 출력에 발굴 블록이 전혀 추가되지 않는다 -- 키 부재 안전."""
+    notifier = _configured_notifier()
+    assert "discovery" not in _DIGEST
+
+    result = await notifier.send_daily_summary(_DIGEST, narrative=None)
+
+    assert result is True
+    sent_text = notifier._bot.send_message.call_args.kwargs["text"]
+    assert "발굴" not in sent_text
+
+
+async def test_template_fallback_discovery_present_but_empty_promoted_no_crash():
+    notifier = _configured_notifier()
+    digest = {**_DIGEST, "discovery": {"promoted": [], "skip_counts": {}, "total_candidates": 0, "prev_day": None}}
+
+    result = await notifier.send_daily_summary(digest, narrative=None)
+
+    assert result is True
+    sent_text = notifier._bot.send_message.call_args.kwargs["text"]
+    assert "발굴" in sent_text
+    assert "승격 없음" in sent_text

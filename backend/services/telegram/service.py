@@ -647,12 +647,16 @@ _모니터링 중..._
           - `narrative` None/blank (LLM failure or timeout, per
             narrate_eod_digest's never-raise contract) -> a DETERMINISTIC
             4-block Markdown template (watch/account/holdings/strategy)
-            built purely from `digest`'s fields. Each block independently
-            degrades to a "no data" placeholder rather than raising or
-            omitting the section, mirroring build_eod_digest's own
-            failure-harmless contract -- a caller can pass a
-            partially-degraded digest (e.g. strategy=None) and still get
-            a well-formed message.
+            built purely from `digest`'s fields, plus an OPTIONAL 5th
+            discovery block appended only when `digest["discovery"]` is
+            present (DS-5 review fix) -- absent for every digest that
+            predates the discovery feature or ran with DISCOVERY_ENABLED
+            off, in which case the output is unchanged from before this
+            block existed. Each block independently degrades to a "no
+            data" placeholder rather than raising or omitting the section,
+            mirroring build_eod_digest's own failure-harmless contract --
+            a caller can pass a partially-degraded digest (e.g.
+            strategy=None) and still get a well-formed message.
 
         Delegates to the existing `_send_message` (and its `_split_message`
         4000-char chunking) exactly like every other send_* method here --
@@ -699,6 +703,18 @@ _모니터링 중..._
         regime = digest.get("regime") or {}
         regime_line = f"\n🌐 시장: {regime['label']}" if regime.get("label") else ""
 
+        # Minor (DS-5 review fix): discovery block appended AFTER the
+        # existing 4 blocks, only when `digest` actually carries a
+        # "discovery" key -- most digests never do (DISCOVERY_ENABLED off,
+        # or a digest built before this feature existed at all), and for
+        # those `discovery_section` is simply "" so the rendered message is
+        # byte-identical to before this fix (key-absent-safe via `.get`,
+        # existing 4-block format/order untouched).
+        discovery = digest.get("discovery")
+        discovery_section = (
+            f"\n\n*🔍 발굴*\n{self._format_discovery_block(discovery)}" if discovery else ""
+        )
+
         return f"""
 📋 *장마감 요약 ({trade_date})*{regime_line}
 
@@ -712,7 +728,7 @@ _모니터링 중..._
 {self._format_holdings_block(digest.get("holdings") or [])}
 
 *🧭 전략*
-{self._format_strategy_block(digest.get("strategy"))}
+{self._format_strategy_block(digest.get("strategy"))}{discovery_section}
 
 ⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 """
@@ -762,6 +778,24 @@ _모니터링 중..._
         if rationale:
             text += f"\n{rationale[:300]}"
         return text
+
+    def _format_discovery_block(self, discovery: dict) -> str:
+        """Minor (DS-5 review fix): compact 승격 종목 요약 -- 티커/이름/
+        composite 스코어. `digest["discovery"]` shape is
+        `eod_digest._build_discovery_section`'s return dict
+        (promoted/skip_counts/total_candidates/prev_day); only `promoted`
+        is rendered here, mirroring the other blocks' "몇 줄 요약" brevity."""
+        promoted = discovery.get("promoted") or []
+        if not promoted:
+            return "승격 없음"
+        lines = []
+        for p in promoted[:10]:
+            ticker = p.get("ticker") or "-"
+            name = p.get("name") or ticker
+            score = p.get("composite_score")
+            score_text = f"{score:.1f}" if isinstance(score, (int, float)) else "―"
+            lines.append(f"• {name}({ticker}) 스코어 {score_text}")
+        return "\n".join(lines)
 
     @staticmethod
     def _fmt_krw(value) -> str:

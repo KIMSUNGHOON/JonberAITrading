@@ -2374,6 +2374,27 @@ class ExecutionCoordinator:
         """
         scanner = await get_background_scanner()
 
+        # Important (DS-5 review fix): `start_scan()` is a silent no-op when
+        # a scan of ANY mode is already in flight (scanner.py:371-373 --
+        # `if self._running: logger.warning(...); return`, no exception, no
+        # signal). The OLD guard below (`get_progress().status != RUNNING`)
+        # ran only AFTER calling start_scan, so it could not tell "my scan
+        # just started" apart from "someone else's manual scan was already
+        # RUNNING and start_scan() silently no-op'd" -- both look like
+        # status==RUNNING, and the old code would go on to poll a manual
+        # scan it never started to completion and report scan_ok=True for
+        # today's discovery, even though nothing discovery-specific ever
+        # ran. Checking the scanner's own `is_running` BEFORE calling
+        # start_scan at all closes that gap: a busy scanner (manual or
+        # otherwise) skips the trigger entirely rather than being mistaken
+        # for this call's own scan.
+        if scanner.is_running:
+            logger.warning(
+                "[Coordinator] discovery_scan_skipped_scanner_busy — a scan "
+                "is already running; skipping today's discovery scan trigger"
+            )
+            return False
+
         try:
             await scanner.start_scan(mode="discovery", notify_progress=False)
         except Exception as e:
@@ -2618,22 +2639,30 @@ class ExecutionCoordinator:
             # predates today's actual discovery results entirely (nothing
             # promoted/backfilled yet at that point in the same tick).
             # Best-effort, same contract: any failure here falls back to the
-            # digest already loaded, never blocks the notification. A no-op
-            # (and harmless) refresh when DISCOVERY_ENABLED is off — the
-            # section is already None from build_eod_digest's own null-
-            # tolerant fallback and this refresh will find the same.
-            try:
-                fresh_discovery = await _build_discovery_section(storage, trade_date)
-                if fresh_discovery is not None and fresh_discovery != digest.get("discovery"):
-                    digest["discovery"] = fresh_discovery
-                    report["digest"] = digest
-                    await storage.save_eod_review(
-                        {"trade_date": trade_date, "report_json": json.dumps(report)}
+            # digest already loaded, never blocks the notification.
+            #
+            # Critical (DS-5 review fix): explicitly gated on
+            # DISCOVERY_ENABLED, matching every other discovery call site in
+            # this file (the scan trigger above and the pipeline invocation
+            # below). Before this fix the block ran unconditionally every
+            # day — off happened to stay harmless only because the ledger
+            # table is empty (build_eod_digest's null-tolerant fallback), an
+            # accident of data state, not a contract: "off" must mean this
+            # code path is never entered at all, not "entered but its
+            # output happens to be a no-op today".
+            if get_settings().DISCOVERY_ENABLED:
+                try:
+                    fresh_discovery = await _build_discovery_section(storage, trade_date)
+                    if fresh_discovery is not None and fresh_discovery != digest.get("discovery"):
+                        digest["discovery"] = fresh_discovery
+                        report["digest"] = digest
+                        await storage.save_eod_review(
+                            {"trade_date": trade_date, "report_json": json.dumps(report)}
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[Coordinator] EOD digest discovery refresh failed: {e}"
                     )
-            except Exception as e:
-                logger.warning(
-                    f"[Coordinator] EOD digest discovery refresh failed: {e}"
-                )
 
             from services.telegram import get_telegram_notifier
 

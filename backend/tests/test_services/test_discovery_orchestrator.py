@@ -525,14 +525,21 @@ def _wire_existing_chain(monkeypatch, coord, calls):
 class _InstantCompleteScanner:
     """get_progress() reports RUNNING exactly once (the post-start_scan
     'did it actually start' guard) then COMPLETED forever after -- the poll
-    loop's very first check exits immediately, no real sleeping needed."""
+    loop's very first check exits immediately, no real sleeping needed.
+
+    `is_running` starts False (nothing running yet -- the coordinator's own
+    pre-start busy check, DS-5 review fix, must pass through to start_scan)
+    and flips True once `start_scan` is actually called, mirroring the real
+    scanner's own `_running` flag."""
 
     def __init__(self, calls):
         self._calls = calls
         self._get_progress_calls = 0
+        self.is_running = False
 
     async def start_scan(self, **kwargs):
         self._calls.append(("scanner.start_scan", kwargs))
+        self.is_running = True
 
     def get_progress(self):
         self._get_progress_calls += 1
@@ -547,10 +554,48 @@ class _InstantCompleteScanner:
 
 
 class _AlwaysRunningScanner:
-    """Never transitions off RUNNING -- exercises the timeout branch."""
+    """Never transitions off RUNNING -- exercises the timeout branch.
+
+    `is_running` starts False (nothing running yet, same convention as
+    `_InstantCompleteScanner`) and flips True once `start_scan` is called."""
 
     def __init__(self, calls):
         self._calls = calls
+        self.is_running = False
+
+    async def start_scan(self, **kwargs):
+        self._calls.append(("scanner.start_scan", kwargs))
+        self.is_running = True
+
+    def get_progress(self):
+        return SimpleNamespace(status=ScanStatus.RUNNING)
+
+    async def stop_scan(self):
+        self._calls.append(("scanner.stop_scan", {}))
+
+    def get_results(self):
+        return []
+
+
+class _BusyScanner:
+    """Important review fix: a scan (manual or otherwise) is ALREADY
+    running when the coordinator's own discovery trigger fires.
+    `start_scan()` on the real scanner is a silent no-op in this state
+    (scanner.py:371-373 -- `if self._running: logger.warning(...); return`)
+    and `get_progress().status` still reports RUNNING throughout (it's
+    someone else's scan, not "not started") -- exactly the state that used
+    to fool the old post-start_scan guard into polling a scan the
+    coordinator never triggered and reporting scan_ok=True. `is_running`
+    is True from construction and NEVER flips (unlike
+    `_InstantCompleteScanner`/`_AlwaysRunningScanner`, whose `is_running`
+    starts False and flips True on their own `start_scan`) -- this fake
+    intentionally never lets `start_scan` change it, so a test can assert
+    the busy guard alone (checked BEFORE calling `start_scan`) is what
+    produced the skip, not a side effect of `start_scan` having run."""
+
+    def __init__(self, calls):
+        self._calls = calls
+        self.is_running = True
 
     async def start_scan(self, **kwargs):
         self._calls.append(("scanner.start_scan", kwargs))
@@ -769,3 +814,190 @@ async def test_close_edge_discovery_pipeline_exception_is_harmless_chain_still_n
         "notify_eod_summary",
     ]
     assert coord._market_was_open is False
+
+
+# ---------------------------------------------------------------------------
+# ⑥ Important 리뷰픽스: 수동 스캔 충돌 오판 — _run_discovery_scan은 이미
+#    RUNNING인 스캐너(수동 스캔 등)를 자신이 막 시작한 스캔으로 착각해서는 안
+#    된다. 옛 가드는 start_scan() 호출 *이후* get_progress().status로만
+#    판단했는데, start_scan()은 이미 실행 중이면 조용히 no-op(예외도, 시그널
+#    도 없음)이라 "내 스캔이 시작됨"과 "남의 스캔이 이미 돌고 있어서 내
+#    start_scan이 no-op됨"을 구분하지 못했다 -- 둘 다 status==RUNNING으로
+#    보였고, 결과적으로 수동 스캔을 끝까지 폴링한 뒤 scan_ok=True로
+#    오판했다. 수정: start_scan 호출 *전에* scanner.is_running을 확인한다.
+# ---------------------------------------------------------------------------
+
+
+async def test_run_discovery_scan_busy_scanner_returns_false_without_starting(monkeypatch, caplog):
+    """직접 단위 테스트: 이미 실행 중인 스캐너 목 -> start_scan은 아예
+    호출되지 않고(단순 no-op 확인이 아니라 호출 자체가 없음을 핀), False를
+    반환하며, discovery_scan_skipped_scanner_busy 경고 로그를 남긴다."""
+    import logging
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    calls: list = []
+    scanner = _BusyScanner(calls)
+
+    async def _fake_get_background_scanner():
+        return scanner
+
+    monkeypatch.setattr(coordinator_module, "get_background_scanner", _fake_get_background_scanner)
+
+    with caplog.at_level(logging.WARNING):
+        result = await coord._run_discovery_scan()
+
+    assert result is False
+    assert calls == []  # start_scan (and stop_scan) never called
+    assert any("discovery_scan_skipped_scanner_busy" in rec.message for rec in caplog.records)
+
+
+async def test_close_edge_discovery_scan_skips_when_scanner_already_busy_chain_completes(
+    temp_storage, monkeypatch
+):
+    """통합 테스트: 마감 엣지 전체(_check_queue_on_market_open)를 실행해도
+    바쁜 스캐너 앞에서 start_scan이 호출되지 않고, scan_ok=False가
+    run_discovery_pipeline에 전달되며, 나머지 체인(백필 포함)은 끝까지
+    완주한다."""
+    monkeypatch.setattr(get_settings(), "DISCOVERY_ENABLED", True)
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    _stub_market_closed_edge(coord)
+    calls: list[tuple[str, dict]] = []
+    _wire_existing_chain(monkeypatch, coord, calls)
+
+    scanner = _BusyScanner(calls)
+
+    async def _fake_get_background_scanner():
+        return scanner
+
+    monkeypatch.setattr(coordinator_module, "get_background_scanner", _fake_get_background_scanner)
+
+    pipeline_calls = []
+
+    async def _fake_pipeline(**kwargs):
+        pipeline_calls.append(kwargs)
+        calls.append(("discovery_pipeline", kwargs))
+        return {"promoted": []}
+
+    monkeypatch.setattr(coordinator_module, "run_discovery_pipeline", _fake_pipeline)
+
+    await coord._check_queue_on_market_open()  # must not raise / must not hang
+
+    call_names = [name for name, _ in calls]
+    assert "scanner.start_scan" not in call_names  # busy guard skipped it entirely
+    assert call_names == [
+        "poll_tracked_fills",
+        "expire_tracked_orders",
+        "write_daily_snapshot",
+        "run_eod_review",
+        "run_strategy_consensus",
+        "wait_for_pending_trade_fill_writes",
+        "reconcile_trade_ledger",
+        "discovery_pipeline",
+        "notify_eod_summary",
+    ]
+    assert len(pipeline_calls) == 1
+    assert pipeline_calls[0]["scan_ok"] is False  # promotion skipped, backfill still proceeds
+
+
+# ---------------------------------------------------------------------------
+# ⑦ Critical 리뷰픽스: _notify_eod_summary 내부의 discovery 섹션 freshness
+#    미러 블록이 DISCOVERY_ENABLED 게이트 없이 매일 실행되고 있었다 -- off
+#    일 때 신규 코드(≒ _build_discovery_section 호출)가 전혀 진입하지 않아야
+#    한다는 계약 위반. 지금까지 빈 테이블 불변식 덕에 우연히 무해했을 뿐이다.
+#
+#    이 두 테스트는 `_notify_eod_summary`를 **실호출**한다 -- 위 섹션의
+#    `_wire_existing_chain`처럼 `_notify_eod_summary` 자체를 스텁으로 갈아
+#    끼우면 이 메서드 내부의 버그를 절대 잡을 수 없다는 것이 바로 리뷰가
+#    지적한 테스트 갭이므로, 이 두 테스트에서는 그 방식을 쓰지 않는다.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_minimal_eod_review(storage, trade_date: str) -> None:
+    import json as _json
+
+    await storage.save_eod_review({
+        "trade_date": trade_date,
+        "report_json": _json.dumps(
+            {"digest": {"trade_date": trade_date}, "narrative": "오늘 요약"}
+        ),
+    })
+
+
+def _stub_notify_transports(monkeypatch):
+    """Telegram/WS transports stubbed to no-network fakes -- mirrors
+    test_f3_fill_tracking.py's own direct _notify_eod_summary tests. Real
+    network/DB calls are forbidden; this keeps the test hermetic while still
+    exercising the REAL _notify_eod_summary method body."""
+    import app.api.routes.websocket as ws_module
+    import services.telegram as telegram_module
+
+    class _NotReadyNotifier:
+        is_ready = False
+
+    async def _fake_get_telegram_notifier():
+        return _NotReadyNotifier()
+
+    async def _fake_broadcast(digest, narrative=None):
+        pass
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+    monkeypatch.setattr(ws_module, "broadcast_eod_summary", _fake_broadcast)
+
+
+async def test_notify_eod_summary_discovery_refresh_off_never_calls_build_section(
+    temp_storage, monkeypatch
+):
+    """DISCOVERY_ENABLED=False(기본값) -- _notify_eod_summary를 실호출해도
+    _build_discovery_section은 단 한 번도 호출되지 않아야 한다."""
+    assert get_settings().DISCOVERY_ENABLED is False  # 기본값 확인(명시 monkeypatch 없음)
+
+    today = "2026-07-18"
+    await _seed_minimal_eod_review(temp_storage, today)
+    _stub_notify_transports(monkeypatch)
+
+    build_calls: list = []
+
+    async def _spy_build_discovery_section(*args, **kwargs):
+        build_calls.append((args, kwargs))
+        return None
+
+    monkeypatch.setattr(
+        coordinator_module, "_build_discovery_section", _spy_build_discovery_section
+    )
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    result = await coord._notify_eod_summary(today)  # REAL call -- no stub replacement
+
+    assert result is True
+    assert build_calls == []
+
+
+async def test_notify_eod_summary_discovery_refresh_on_calls_build_section(
+    temp_storage, monkeypatch
+):
+    """DISCOVERY_ENABLED=True -- _notify_eod_summary를 실호출하면
+    _build_discovery_section이 정확히 한 번, (storage, trade_date)로
+    호출된다."""
+    monkeypatch.setattr(get_settings(), "DISCOVERY_ENABLED", True)
+
+    today = "2026-07-18"
+    await _seed_minimal_eod_review(temp_storage, today)
+    _stub_notify_transports(monkeypatch)
+
+    build_calls: list = []
+
+    async def _spy_build_discovery_section(storage, trade_date):
+        build_calls.append((storage, trade_date))
+        return None
+
+    monkeypatch.setattr(
+        coordinator_module, "_build_discovery_section", _spy_build_discovery_section
+    )
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    result = await coord._notify_eod_summary(today)  # REAL call -- no stub replacement
+
+    assert result is True
+    assert len(build_calls) == 1
+    assert build_calls[0][1] == today
