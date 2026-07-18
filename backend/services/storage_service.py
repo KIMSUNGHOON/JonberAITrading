@@ -229,6 +229,39 @@ class StorageService:
                     )
                 """)
 
+                # Discovery candidate ledger (DS-3): one row per ticker the
+                # discovery scan (DS-2) + regime-weighted ranking (DS-4)
+                # surfaced on a given trade_date, plus the durable slots
+                # this module backfills once enough trading days have
+                # elapsed (fwd_1d/5d/20d — see backfill_forward_returns in
+                # services/discovery/ledger.py). Accrete-style (id uuid PK,
+                # NOT trade_date) like regime_snapshot: re-running the same
+                # day's scan appends rather than overwrites. llm_verdict_json/
+                # skip_reason/fwd_1d/fwd_5d/fwd_20d are nullable — a fresh
+                # candidate row starts with all four NULL and gets filled in
+                # later (LLM verdict same-day; forward returns over the
+                # following trading days).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS discovery_candidates (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT,
+                        ticker TEXT,
+                        name TEXT,
+                        composite_score REAL,
+                        strategy_scores_json TEXT,
+                        regime_label TEXT,
+                        rank INTEGER,
+                        llm_verdict_json TEXT,
+                        promoted INTEGER,
+                        skip_reason TEXT,
+                        close_price REAL,
+                        fwd_1d REAL,
+                        fwd_5d REAL,
+                        fwd_20d REAL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # App settings table (generic key-value; e.g. trading_mode:kiwoom)
                 # — runtime settings that must survive restarts (R3).
                 await conn.execute("""
@@ -534,6 +567,16 @@ class StorageService:
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_strategy_revisions_trade_date"
                     " ON strategy_revisions(trade_date)"
+                )
+
+                # Discovery candidate ledger indexes (DS-3)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_discovery_candidates_trade_date"
+                    " ON discovery_candidates(trade_date)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_discovery_candidates_ticker"
+                    " ON discovery_candidates(ticker)"
                 )
 
                 await conn.commit()
@@ -2432,6 +2475,192 @@ class StorageService:
                 "strategy_revision_get_failed", revision_id=revision_id, error=str(e)
             )
             return None
+
+    # -------------------------------------------
+    # Discovery Candidate Ledger (DS-3)
+    # -------------------------------------------
+
+    async def save_discovery_candidates(self, rows: list[dict[str, Any]]) -> bool:
+        """
+        Persist one batch of discovery-scan candidate rows (one day's
+        regime-weighted ranking output from DS-4).
+
+        Each row is assigned a fresh uuid PK if it doesn't already carry
+        an "id" (mutates the dict in place so the caller can see which id
+        landed where). Accrete-style like regime_snapshot: trade_date is
+        NOT unique, so re-running the same day's scan appends rather than
+        overwrites. strategy_scores_json/llm_verdict_json may be passed
+        as either a dict (auto-serialized here) or an already-JSON string.
+
+        Args:
+            rows: list of dicts with keys trade_date, ticker, name,
+                composite_score, strategy_scores_json, regime_label, rank,
+                llm_verdict_json (optional), promoted, skip_reason
+                (optional), close_price. fwd_1d/fwd_5d/fwd_20d are never
+                set here — see update_discovery_forward_returns /
+                services/discovery/ledger.py::backfill_forward_returns.
+
+        Returns:
+            True if the batch was saved successfully (or rows was empty).
+        """
+        if not rows:
+            return True
+
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                data = []
+                for row in rows:
+                    row_id = row.get("id") or str(uuid.uuid4())
+                    row["id"] = row_id
+
+                    strategy_scores = row.get("strategy_scores_json")
+                    if strategy_scores is not None and not isinstance(strategy_scores, str):
+                        strategy_scores = json.dumps(strategy_scores, ensure_ascii=False)
+
+                    llm_verdict = row.get("llm_verdict_json")
+                    if llm_verdict is not None and not isinstance(llm_verdict, str):
+                        llm_verdict = json.dumps(llm_verdict, ensure_ascii=False)
+
+                    data.append((
+                        row_id,
+                        row.get("trade_date"),
+                        row.get("ticker"),
+                        row.get("name"),
+                        row.get("composite_score"),
+                        strategy_scores,
+                        row.get("regime_label"),
+                        row.get("rank"),
+                        llm_verdict,
+                        row.get("promoted"),
+                        row.get("skip_reason"),
+                        row.get("close_price"),
+                    ))
+
+                await conn.executemany(
+                    """
+                    INSERT INTO discovery_candidates
+                    (id, trade_date, ticker, name, composite_score,
+                     strategy_scores_json, regime_label, rank, llm_verdict_json,
+                     promoted, skip_reason, close_price)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    data,
+                )
+                await conn.commit()
+                logger.debug("discovery_candidates_saved", count=len(rows))
+                return True
+        except Exception as e:
+            logger.error("discovery_candidates_save_failed", error=str(e))
+            return False
+
+    async def get_discovery_candidates(
+        self,
+        trade_date: Optional[str] = None,
+        ticker: Optional[str] = None,
+        unfilled_fwd_only: bool = False,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """
+        Query discovery_candidates rows, newest first, optionally filtered.
+
+        Args:
+            trade_date: exact "YYYY-MM-DD" match, if given.
+            ticker: exact ticker match, if given.
+            unfilled_fwd_only: if True, restrict to rows where at least
+                one of fwd_1d/fwd_5d/fwd_20d is still NULL — the feed
+                services/discovery/ledger.py::backfill_forward_returns
+                consumes.
+            limit: max rows to return.
+
+        Returns:
+            List of row dicts (empty on any storage error).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                clauses = []
+                params: list[Any] = []
+                if trade_date:
+                    clauses.append("trade_date = ?")
+                    params.append(trade_date)
+                if ticker:
+                    clauses.append("ticker = ?")
+                    params.append(ticker)
+                if unfilled_fwd_only:
+                    clauses.append("(fwd_1d IS NULL OR fwd_5d IS NULL OR fwd_20d IS NULL)")
+
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                params.append(limit)
+
+                cursor = await conn.execute(
+                    f"""
+                    SELECT * FROM discovery_candidates
+                    {where}
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    params,
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("discovery_candidates_get_failed", error=str(e))
+            return []
+
+    async def update_discovery_forward_returns(
+        self,
+        id: str,
+        fwd_1d: Optional[float] = None,
+        fwd_5d: Optional[float] = None,
+        fwd_20d: Optional[float] = None,
+    ) -> bool:
+        """
+        Backfill one candidate's forward-return slot(s).
+
+        A None argument leaves that column untouched. COALESCE also
+        refuses to overwrite a slot that's already non-NULL — a slot,
+        once filled, keeps its first recorded value forever. Callers are
+        expected to only pass a value for a slot they've just determined
+        is newly-elapsed (services/discovery/ledger.py::
+        backfill_forward_returns already checks this before calling), so
+        this is a defensive no-clobber guarantee, not the primary guard.
+
+        Args:
+            id: discovery_candidates.id to update.
+            fwd_1d/fwd_5d/fwd_20d: forward-return values to record, or
+                None to leave that slot alone.
+
+        Returns:
+            True if the UPDATE executed successfully (including when no
+            row matched id, or none of the three args were given).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    UPDATE discovery_candidates
+                    SET fwd_1d = COALESCE(fwd_1d, ?),
+                        fwd_5d = COALESCE(fwd_5d, ?),
+                        fwd_20d = COALESCE(fwd_20d, ?)
+                    WHERE id = ?
+                    """,
+                    (fwd_1d, fwd_5d, fwd_20d, id),
+                )
+                await conn.commit()
+                logger.debug("discovery_forward_returns_updated", id=id)
+                return True
+        except Exception as e:
+            logger.error(
+                "discovery_forward_returns_update_failed", id=id, error=str(e)
+            )
+            return False
 
     # -------------------------------------------
     # Regime FK Backfill (Phase2 Task 4)
