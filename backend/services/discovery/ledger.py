@@ -148,7 +148,7 @@ async def backfill_forward_returns(
     ]
 
     candidates = await storage.get_discovery_candidates(
-        trade_dates=scoped_dates, unfilled_fwd_only=True, limit=5000
+        trade_dates=scoped_dates, unfilled_fwd_only=True, limit=20_000
     )
 
     filled = 0
@@ -239,7 +239,7 @@ async def get_discovery_performance(storage, days: int = 14) -> dict[str, Any]:
 
     try:
         candidates = await storage.get_discovery_candidates(
-            since_trade_date=cutoff.isoformat(), limit=5000
+            since_trade_date=cutoff.isoformat(), limit=100_000
         )
     except Exception as e:
         logger.error("discovery_performance_fetch_failed", error=str(e))
