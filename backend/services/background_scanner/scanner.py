@@ -849,7 +849,13 @@ class BackgroundScanner:
         # float() 캐스팅이 실패하면 ValueError/TypeError가 호출자까지
         # 그대로 전파돼 드롭된다.
         price = float(stock_info.cur_prc)
-        market_cap = float(stock_info.mrkt_tot_amt) if stock_info.mrkt_tot_amt is not None else 0.0
+        # ka10001 mrkt_tot_amt 단위=억원 (라이브 실측 2026-07-18: 005930
+        # -> 14,908,010억 ≈ 1,490조). 팩터 엔진 필터는 원 단위 비교라 환산.
+        market_cap = (
+            float(stock_info.mrkt_tot_amt) * 100_000_000
+            if stock_info.mrkt_tot_amt is not None
+            else 0.0
+        )
         per = float(stock_info.per) if stock_info.per is not None else 0.0
         pbr = float(stock_info.pbr) if stock_info.pbr is not None else 0.0
         volume = float(stock_info.acml_vol) if stock_info.acml_vol is not None else 0.0

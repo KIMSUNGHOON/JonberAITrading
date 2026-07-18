@@ -78,7 +78,7 @@ def _stock_info(
     stk_cd: str,
     stk_nm: str = "테스트종목",
     cur_prc: int = 70_000,
-    mrkt_tot_amt: Optional[int] = 100_000_000_000,  # 1000억 — 500억 하한 통과
+    mrkt_tot_amt: Optional[int] = 1_000,  # ka10001 단위=억원 → 1,000억 — 500억 하한 통과
     per: Optional[float] = 10.0,
     pbr: Optional[float] = 1.2,
     acml_vol: int = 500_000,
@@ -103,7 +103,7 @@ class _FakeStockInfoUnparsablePrice:
         self.stk_cd = stk_cd
         self.stk_nm = "파싱불가"
         self.cur_prc = "N/A"  # float() 캐스팅이 ValueError를 던짐
-        self.mrkt_tot_amt = 100_000_000_000
+        self.mrkt_tot_amt = 1_000  # 억원 단위
         self.per = 10.0
         self.pbr = 1.0
         self.acml_vol = 100_000
@@ -553,7 +553,7 @@ async def test_discovery_session_counts_include_quality_filter_rejects(monkeypat
     client = FakeKiwoomClient(
         stock_infos={
             # 시총 10억 — DEFAULT_MIN_MARKET_CAP(500억) 미달 -> 품질 필터 탈락
-            "005930": _stock_info("005930", "SmallCap", mrkt_tot_amt=1_000_000_000),
+            "005930": _stock_info("005930", "SmallCap", mrkt_tot_amt=100),
         },
         chart_dfs={"005930": _make_chart_df(65)},  # 상승 계열
     )
