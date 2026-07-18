@@ -1,0 +1,26 @@
+"""
+Discovery Package (DS 아크)
+
+레짐 적응형 종목 발굴 — 팩터/전략 엔진(DS-1), 스캐너 수집(DS-2), 레짐 랭킹(DS-4).
+DS-1은 순수 함수만 노출한다: I/O·네트워크·DB 없음.
+"""
+
+from services.discovery.factors import (
+    STRATEGIES,
+    DEFAULT_MIN_HISTORY,
+    DEFAULT_MIN_MARKET_CAP,
+    FlowRank,
+    StockSnapshot,
+    compute_strategy_scores,
+    passes_quality_filter,
+)
+
+__all__ = [
+    "STRATEGIES",
+    "DEFAULT_MIN_HISTORY",
+    "DEFAULT_MIN_MARKET_CAP",
+    "FlowRank",
+    "StockSnapshot",
+    "compute_strategy_scores",
+    "passes_quality_filter",
+]
