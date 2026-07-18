@@ -440,6 +440,138 @@ async def test_build_eod_digest_gap_pct_is_none_when_target_missing(tmp_path):
     assert digest["watch"][0]["gap_pct"] is None
 
 
+# -------------------------------------------
+# DS-5: discovery 섹션 (spec §6 폐루프 배선)
+# -------------------------------------------
+
+
+async def _seed_discovery_candidate(
+    storage,
+    *,
+    trade_date,
+    ticker="005930",
+    name="삼성전자",
+    composite_score=0.72,
+    promoted=1,
+    skip_reason=None,
+    strategy_scores=None,
+    fwd_1d=None,
+):
+    strategy_scores = strategy_scores or {
+        "momentum": 0.8, "pullback": 0.2, "flow": 0.1, "meanrev": 0.05,
+    }
+    await storage.save_discovery_candidates(
+        [
+            {
+                "trade_date": trade_date,
+                "ticker": ticker,
+                "name": name,
+                "composite_score": composite_score,
+                "strategy_scores_json": strategy_scores,
+                "regime_label": "neutral",
+                "rank": 1,
+                "llm_verdict_json": {"suitable": bool(promoted)},
+                "promoted": promoted,
+                "skip_reason": skip_reason,
+                "close_price": 70_000.0,
+            }
+        ]
+    )
+    if fwd_1d is not None:
+        rows = await storage.get_discovery_candidates(trade_date=trade_date, ticker=ticker)
+        await storage.update_discovery_forward_returns(rows[0]["id"], fwd_1d=fwd_1d)
+
+
+async def test_build_eod_digest_discovery_section_promoted_and_skip_counts(tmp_path):
+    trade_date = "2026-07-18"
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    coordinator = _StubCoordinator(summary=_portfolio_summary())
+
+    await _seed_discovery_candidate(
+        storage, trade_date=trade_date, ticker="005930", name="삼성전자",
+        composite_score=0.72, promoted=1,
+        strategy_scores={"momentum": 0.9, "pullback": 0.1, "flow": 0.05, "meanrev": 0.0},
+    )
+    await _seed_discovery_candidate(
+        storage, trade_date=trade_date, ticker="000660", name="SK하이닉스",
+        composite_score=0.40, promoted=0, skip_reason="below_threshold",
+    )
+    await _seed_discovery_candidate(
+        storage, trade_date=trade_date, ticker="035420", name="NAVER",
+        composite_score=0.35, promoted=0, skip_reason="below_threshold",
+    )
+
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
+
+    discovery = digest["discovery"]
+    assert discovery is not None
+    assert discovery["total_candidates"] == 3
+    assert len(discovery["promoted"]) == 1
+    promoted = discovery["promoted"][0]
+    assert promoted["ticker"] == "005930"
+    assert promoted["name"] == "삼성전자"
+    assert promoted["composite_score"] == 0.72
+    assert promoted["top_strategy_tag"] == "momentum"
+    assert discovery["skip_counts"] == {"below_threshold": 2}
+
+
+async def test_build_eod_digest_discovery_section_includes_prev_day_fwd_1d_summary(tmp_path):
+    trade_date = "2026-07-18"
+    prev_date = "2026-07-17"
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    coordinator = _StubCoordinator(summary=_portfolio_summary())
+
+    await _seed_discovery_candidate(
+        storage, trade_date=prev_date, ticker="005930", promoted=1, fwd_1d=0.02,
+    )
+    await _seed_discovery_candidate(
+        storage, trade_date=prev_date, ticker="000660", promoted=0,
+        skip_reason="below_threshold", fwd_1d=-0.01,
+    )
+    # 오늘은 아직 후보가 없다(발굴 파이프라인이 이 digest 조립 시점 이후에
+    # 도는 실제 마감 체인 순서를 반영 -- run_eod_review가 먼저, discovery
+    # 후처리는 나중).
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
+
+    discovery = digest["discovery"]
+    assert discovery is not None
+    assert discovery["total_candidates"] == 0
+    assert discovery["promoted"] == []
+    assert discovery["skip_counts"] == {}
+    prev_day = discovery["prev_day"]
+    assert prev_day["trade_date"] == prev_date
+    assert prev_day["candidate_count"] == 2
+    assert prev_day["fwd_1d_filled_count"] == 2
+    assert prev_day["avg_fwd_1d"] == pytest.approx((0.02 + -0.01) / 2)
+
+
+async def test_build_eod_digest_discovery_section_none_when_ledger_never_used(tmp_path):
+    trade_date = "2026-07-18"
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    coordinator = _StubCoordinator(summary=_portfolio_summary())
+
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
+
+    assert digest["discovery"] is None
+    # 다른 섹션은 영향받지 않는다.
+    assert digest["holdings"][0]["ticker"] == "005930"
+
+
+async def test_build_eod_digest_discovery_section_failure_degrades_to_none(tmp_path):
+    trade_date = "2026-07-18"
+    real_storage = StorageService(db_path=str(tmp_path / "t.db"))
+    await _seed_strategy_revision(real_storage, trade_date)
+    storage = _ExplodingMethodStorage(real_storage, "get_discovery_candidates")
+    coordinator = _StubCoordinator(summary=_portfolio_summary())
+
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
+
+    assert "error" not in digest
+    assert digest["discovery"] is None
+    # 무관 섹션은 영향받지 않는다.
+    assert digest["strategy"]["stance"] == "cautious_bullish"
+
+
 async def test_build_eod_digest_never_raises_when_everything_explodes(tmp_path):
     trade_date = "2026-07-17"
 

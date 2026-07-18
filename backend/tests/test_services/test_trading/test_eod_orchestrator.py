@@ -324,6 +324,7 @@ async def test_run_eod_review_merges_digest_and_narrative_into_report_json(
     assert report["digest"]["trade_date"] == TRADE_DATE
     assert set(report["digest"].keys()) == {
         "trade_date", "watch", "account", "holdings", "strategy", "regime",
+        "discovery",  # DS-5: null-tolerant section, see test_eod_digest.py
     }
     assert report["narrative"] == "오늘 EOD 브리핑 본문입니다."
 

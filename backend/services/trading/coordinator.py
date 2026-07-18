@@ -49,10 +49,26 @@ from .eod_snapshot import write_daily_snapshot
 from .eod_orchestrator import run_eod_review
 from .strategy_orchestrator import run_strategy_consensus
 from .ledger_reconcile import reconcile_trade_ledger
-from .eod_digest import _build_strategy_section
+from .eod_digest import _build_strategy_section, _build_discovery_section
 from services.storage_service import get_storage_service
+from app.config import get_settings
+from services.background_scanner.scanner import ScanStatus, get_background_scanner
+from services.discovery.orchestrator import run_discovery_pipeline
 
 logger = logging.getLogger(__name__)
+
+
+# DS-5: discovery EOD-chain scan-trigger wait, behind the DISCOVERY_ENABLED
+# kill switch (app/config.py). Cap mirrors spec §3/§8 (90 min scan window;
+# past this a timeout is logged and the rest of the chain proceeds with
+# promotion skipped for the day, never blocking the market-close scheduler
+# tick). Poll interval mirrors the brief's "실코드 수단이 폴링이면 5s
+# 간격" instruction — BackgroundScanner exposes no completion event/future
+# to await directly, only ScanStatus via the existing get_progress() (the
+# same public surface app/api/routes/scanner.py's own status polling
+# already uses).
+_DISCOVERY_SCAN_TIMEOUT_SECONDS = 5400.0
+_DISCOVERY_SCAN_POLL_INTERVAL_SECONDS = 5.0
 
 
 # Actions that grow exposure map to a BUY order; everything else reduces it and
@@ -2333,6 +2349,76 @@ class ExecutionCoordinator:
             await self._persist_state()
         await self._notify_state_change()
 
+    async def _run_discovery_scan(self) -> bool:
+        """DS-5: trigger a discovery-mode background scan and wait for it to
+        finish, capped at `_DISCOVERY_SCAN_TIMEOUT_SECONDS` (spec §3/§8:
+        90 min). Only ever called from `_check_queue_on_market_open` behind
+        the `settings.DISCOVERY_ENABLED` kill switch.
+
+        Never raises — every branch below is defensive and returns False on
+        anything but a clean scan-session status of ScanStatus.COMPLETED, so
+        a stuck/erroring/never-started scan degrades to "skip promotion for
+        today" rather than breaking the market-close scheduler tick.
+
+        Completion detection is polling-based (`get_progress().status`,
+        `_DISCOVERY_SCAN_POLL_INTERVAL_SECONDS` apart) because
+        BackgroundScanner exposes no awaitable completion signal — this is
+        the same public surface (`get_progress()`/`start_scan()`/
+        `stop_scan()`) app/api/routes/scanner.py's own status endpoints
+        already use, no reach into scanner internals.
+
+        On timeout, `stop_scan()` is called so the scanner doesn't keep
+        chewing through the universe (and holding the shared Kiwoom rate
+        budget) long after the EOD chain has moved on without it (spec §3:
+        "스캔 태스크는 stop 시도").
+        """
+        scanner = await get_background_scanner()
+
+        try:
+            await scanner.start_scan(mode="discovery", notify_progress=False)
+        except Exception as e:
+            logger.warning(f"[Coordinator] Discovery scan failed to start: {e}")
+            return False
+
+        if scanner.get_progress().status != ScanStatus.RUNNING:
+            logger.warning(
+                "[Coordinator] Discovery scan did not start (scanner busy?) "
+                "— skipping today's discovery"
+            )
+            return False
+
+        async def _poll_until_not_running() -> None:
+            while scanner.get_progress().status == ScanStatus.RUNNING:
+                await asyncio.sleep(_DISCOVERY_SCAN_POLL_INTERVAL_SECONDS)
+
+        try:
+            await asyncio.wait_for(
+                _poll_until_not_running(), timeout=_DISCOVERY_SCAN_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[Coordinator] Discovery scan timed out after "
+                f"{_DISCOVERY_SCAN_TIMEOUT_SECONDS}s — proceeding with EOD "
+                "chain, promotion skipped for today"
+            )
+            try:
+                await scanner.stop_scan()
+            except Exception as e:
+                logger.warning(f"[Coordinator] Discovery scan stop_scan cleanup failed: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"[Coordinator] Discovery scan wait failed: {e}")
+            return False
+
+        status = scanner.get_progress().status
+        if status != ScanStatus.COMPLETED:
+            logger.warning(
+                f"[Coordinator] Discovery scan ended with status={status} "
+                "— promotion skipped for today"
+            )
+            return False
+        return True
+
     async def _check_queue_on_market_open(self) -> None:
         """One scheduler tick: process the queue on a KRX closed→open transition,
         and expire tracked orders on the inverse open→closed transition (F3).
@@ -2366,11 +2452,46 @@ class ExecutionCoordinator:
             # first would drop a fill that landed on this very edge.
             await self._poll_tracked_fills()
             await self._expire_tracked_orders_on_market_close()
+
+            # DS-5: discovery scan trigger, behind the DISCOVERY_ENABLED
+            # kill switch — spec §3 chain order. off (default) means this
+            # whole block, AND the run_discovery_pipeline block below, are
+            # never entered at all: the remaining 8-step chain immediately
+            # below is byte-identical to before this feature existed.
+            # Whole-block try/except mirrors every other EOD step's
+            # never-raise contract even though `_run_discovery_scan` is
+            # already internally never-raise — defense in depth per spec.
+            discovery_scan_ok = False
+            if get_settings().DISCOVERY_ENABLED:
+                try:
+                    discovery_scan_ok = await self._run_discovery_scan()
+                except Exception as e:
+                    logger.warning(f"[Coordinator] Discovery scan step failed: {e}")
+
             await write_daily_snapshot(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # T5c: 마감 1회
             await run_eod_review(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase2 T4: EOD 리뷰(레짐/캘리브레이션/리포트+FK 백필)
             await run_strategy_consensus(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase3: EOD 전략 합의(리뷰 소비→TradingStrategy 갱신+버전 영속; 타임아웃/실패는 내부 소유)
             await wait_for_pending_trade_fill_writes()  # Minor 2 (final review): drain in-flight fire-and-forget record_trade_fill tasks (placement-time fills scheduled just above via _poll_tracked_fills/_apply_sell_fill) before the EOD reconciler reads kr_stock_trades — otherwise a write still in flight looks "missing" to the diff and gets spuriously re-appended.
             await reconcile_trade_ledger(self._kiwoom, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # E1-5: EOD 원장 대사 백스톱(ka10076 vs kr_stock_trades diff upsert; never-raise, 포지션 미변경)
+
+            # DS-5: discovery post-processing (backfill -> rank -> LLM
+            # review -> promote -> ledger, DS-3/DS-4 batched by
+            # run_discovery_pipeline), AFTER reconcile_trade_ledger and
+            # BEFORE the final notify step so _notify_eod_summary can pick
+            # up today's freshly-promoted candidates (mirrors the existing
+            # Important-1 strategy-section freshness refresh below).
+            if get_settings().DISCOVERY_ENABLED:
+                try:
+                    await run_discovery_pipeline(
+                        coordinator=self,
+                        storage=await get_storage_service(),
+                        scanner=await get_background_scanner(),
+                        trade_date=datetime.now().strftime("%Y-%m-%d"),
+                        scan_ok=discovery_scan_ok,
+                    )
+                except Exception as e:
+                    logger.warning(f"[Coordinator] Discovery pipeline invocation failed: {e}")
+
             await self._notify_eod_summary(datetime.now().strftime("%Y-%m-%d"))  # E3-3: 장마감 요약 통지(Telegram+WS) — run_eod_review가 저장한 digest/narrative 재조회
         self._market_was_open = is_open
 
@@ -2485,6 +2606,33 @@ class ExecutionCoordinator:
             except Exception as e:
                 logger.warning(
                     f"[Coordinator] EOD digest strategy refresh failed: {e}"
+                )
+
+            # DS-5: same freshness fix as the strategy-section refresh just
+            # above, for the `discovery` section — run_discovery_pipeline
+            # (services/discovery/orchestrator.py, DS-3/DS-4 backfill/rank/
+            # LLM-review/promote batch) runs even LATER in the market-close
+            # chain than run_strategy_consensus does (after
+            # reconcile_trade_ledger, right before this notify step), so the
+            # digest run_eod_review originally built above almost always
+            # predates today's actual discovery results entirely (nothing
+            # promoted/backfilled yet at that point in the same tick).
+            # Best-effort, same contract: any failure here falls back to the
+            # digest already loaded, never blocks the notification. A no-op
+            # (and harmless) refresh when DISCOVERY_ENABLED is off — the
+            # section is already None from build_eod_digest's own null-
+            # tolerant fallback and this refresh will find the same.
+            try:
+                fresh_discovery = await _build_discovery_section(storage, trade_date)
+                if fresh_discovery is not None and fresh_discovery != digest.get("discovery"):
+                    digest["discovery"] = fresh_discovery
+                    report["digest"] = digest
+                    await storage.save_eod_review(
+                        {"trade_date": trade_date, "report_json": json.dumps(report)}
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[Coordinator] EOD digest discovery refresh failed: {e}"
                 )
 
             from services.telegram import get_telegram_notifier

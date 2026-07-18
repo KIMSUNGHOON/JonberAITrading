@@ -596,7 +596,17 @@ async def promote_candidates(coordinator, storage, candidates: list[Candidate]) 
             continue
 
         if c.llm_verdict is None or not c.llm_verdict.get("suitable"):
-            reason = c.skip_reason if c.skip_reason == "llm_parse_failed" else "llm_not_suitable"
+            # DS-4 리뷰 이월(DS-5): top_n 밖이라 llm_review_top이 아예 손대지
+            # 않은 후보(llm_verdict is None, skip_reason은 아직 None)는
+            # "LLM이 부적합 판정했다"(llm_not_suitable)가 아니라 "애초에
+            # 검토조차 안 됐다"(not_reviewed)로 구분 기록한다 — 파싱 실패
+            # (llm_parse_failed)와도 다른, 별개의 원장 사유.
+            if c.skip_reason == "llm_parse_failed":
+                reason = "llm_parse_failed"
+            elif c.llm_verdict is None:
+                reason = "not_reviewed"
+            else:
+                reason = "llm_not_suitable"
             c.skip_reason = reason
             summary.skipped[c.ticker] = reason
             continue

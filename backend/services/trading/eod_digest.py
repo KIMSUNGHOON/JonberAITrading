@@ -4,7 +4,8 @@ narrate_eod_digest (the module's one deliberate LLM call — see below).
 The end-of-day digest joins four otherwise-siloed live/durable sources into
 ONE dict that downstream tasks treat as a fixed contract: E3-2's LLM
 narrative reads it as the source-of-truth for a Korean briefing, E3-3's
-Telegram template and E3-5's FE render both render its 5 sections verbatim.
+Telegram template and E3-5's FE render both render its sections
+verbatim. DS-5 added a 6th (`discovery`).
 See docs/superpowers/specs/2026-07-17-three-issues-design.md §3 (Task
 E3-1/T6) and docs/superpowers/plans/2026-07-17-three-issues.md's Task E3-1
 for the authoritative schema this module implements.
@@ -39,8 +40,8 @@ section is built by its own independently try/except-guarded helper, so
 one broken/missing source degrades only that section (to None or []),
 never the whole digest. The whole body is additionally wrapped so a truly
 unexpected failure still returns a dict shaped exactly like the happy path
-(all 5 keys present, degraded to None/[]) rather than raising or omitting
-keys — every consumer can rely on the 5 keys always existing.
+(all 6 keys present, degraded to None/[]) rather than raising or omitting
+keys — every consumer can rely on the 6 keys always existing.
 
 E3-2 adds `narrate_eod_digest(digest) -> Optional[str]` to this same
 module: a Korean LLM briefing generated FROM the digest this module
@@ -62,6 +63,7 @@ from typing import Any, Optional
 
 from agents.llm.tasks import TaskType
 from agents.llm_provider import get_llm_provider
+from services.discovery.ledger import _top_strategy_tag
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +86,24 @@ _LATEST_ROW_LIMIT = 1
 # rationale is free-form Korean text (can run to several KB); the digest
 # only ever needs a short excerpt for a briefing.
 _RATIONALE_EXCERPT_CHARS = 300
+
+# DS-5: today's discovery_candidates rows are queried exact-scoped
+# (trade_date=trade_date) with a generous limit mirroring
+# ledger.backfill_forward_returns/get_discovery_performance's own
+# limit=5000 idiom -- a single day's full-universe discovery sweep can
+# ledger-record ~2,500 rows (promoted AND skipped AND quality-excluded
+# alike, see ranker.promote_candidates), so this must cover one whole
+# day, not just the promoted handful.
+_DISCOVERY_TODAY_LIMIT = 5000
+
+# "어제 후보" (the most recent trade_date strictly before today) is found
+# by scanning the newest rows and bucketing by trade_date -- a scan-then-
+# match idiom (mirrors _DAILY_PERF_SNAPSHOT_SCAN_LIMIT above), not an
+# exact previous-trading-day lookup (which would need krx_holiday, a
+# dependency this module deliberately stays free of). Best-effort: if a
+# day's universe exceeds this window the prev-day summary may under-count,
+# acceptable for an informational digest section, not the ledger itself.
+_DISCOVERY_RECENT_SCAN_LIMIT = 6000
 
 _EMPTY_ACCOUNT: dict[str, Any] = {
     "deposit": None,
@@ -114,16 +134,26 @@ async def build_eod_digest(
             and optionally `.state.positions`).
         storage: StorageService (or compatible) — reads
             get_daily_perf_snapshots/get_strategy_revisions/
-            get_regime_snapshots. Never writes.
+            get_regime_snapshots/get_discovery_candidates. Never writes.
         trade_date: "YYYY-MM-DD" — the day this digest is attributed to
-            (scopes only the `account` section; `strategy`/`regime` are
-            each the single latest row regardless of date).
+            (scopes the `account` and `discovery` sections; `strategy`/
+            `regime` are each the single latest row regardless of date).
 
     Returns:
         {"trade_date", "watch": [...], "account": {...}, "holdings": [...],
-        "strategy": {...} | None, "regime": {...} | None}. Failure-harmless:
-        a broken/missing individual source degrades only its section
-        (to None or []); this function itself never raises.
+        "strategy": {...} | None, "regime": {...} | None,
+        "discovery": {...} | None}. Failure-harmless: a broken/missing
+        individual source degrades only its section (to None or []); this
+        function itself never raises. NOTE (DS-5): at the time
+        run_eod_review's own build_eod_digest call actually runs (this
+        module's usual caller), `discovery` will typically still show
+        YESTERDAY's/no data — the coordinator's discovery post-processing
+        (services/discovery/orchestrator.py::run_discovery_pipeline) only
+        runs LATER in the same market-close tick, after run_eod_review.
+        _notify_eod_summary (coordinator.py, the chain's true last step)
+        re-fetches just this section afterward and patches the persisted
+        row, mirroring the same freshness fix already in place for
+        `strategy` (see that function's "Important 1" docstring note).
     """
     try:
         watch = _build_watch_section(coordinator)
@@ -131,6 +161,7 @@ async def build_eod_digest(
         holdings = _build_holdings_section(coordinator)
         strategy = await _build_strategy_section(storage)
         regime = await _build_regime_section(storage)
+        discovery = await _build_discovery_section(storage, trade_date)
 
         return {
             "trade_date": trade_date,
@@ -139,12 +170,13 @@ async def build_eod_digest(
             "holdings": holdings,
             "strategy": strategy,
             "regime": regime,
+            "discovery": discovery,
         }
     except Exception as e:
         # Each section builder above is already independently
         # try/except-guarded, so this branch should be unreachable in
         # practice — it exists purely as defense-in-depth so the contract
-        # ("always a dict with all 5 keys") holds even against a bug in
+        # ("always a dict with all 6 keys") holds even against a bug in
         # the assembly code itself, not just in a data source.
         logger.warning(f"[EODDigest] build_eod_digest failed for {trade_date}: {e}")
         return {
@@ -154,6 +186,7 @@ async def build_eod_digest(
             "holdings": [],
             "strategy": None,
             "regime": None,
+            "discovery": None,
             "error": str(e),
         }
 
@@ -330,6 +363,91 @@ async def _build_regime_section(storage: Any) -> Optional[dict[str, Any]]:
         "label": row.get("market_sentiment_label"),
         "index_kospi_chg_pct": row.get("index_kospi_chg_pct"),
         "index_kosdaq_chg_pct": row.get("index_kosdaq_chg_pct"),
+    }
+
+
+async def _build_discovery_section(
+    storage: Any, trade_date: str
+) -> Optional[dict[str, Any]]:
+    """DS-5 폐루프(spec §6): 오늘 승격 종목(티커·이름·composite·최고 기여
+    전략 태그) + 스킵 통계(사유별 카운트) + 어제 후보 fwd_1d 요약.
+
+    None (null 내성, strategy/regime 섹션과 동일 관례) when the discovery
+    ledger has never been written to at all (storage error, or the table
+    is simply empty because DISCOVERY_ENABLED has never been on) — there
+    is nothing meaningful to show. Once the ledger has ANY history,
+    degrades to an all-empty-but-present dict for a day discovery simply
+    didn't run/promote anything, rather than None, so a caller can
+    distinguish "feature never used" from "ran today, nothing to report".
+    """
+    try:
+        today_rows = await storage.get_discovery_candidates(
+            trade_date=trade_date, limit=_DISCOVERY_TODAY_LIMIT
+        )
+    except Exception as e:
+        logger.warning(f"[EODDigest] get_discovery_candidates(today) failed: {e}")
+        return None
+
+    try:
+        recent_rows = await storage.get_discovery_candidates(
+            limit=_DISCOVERY_RECENT_SCAN_LIMIT
+        )
+    except Exception as e:
+        logger.warning(f"[EODDigest] get_discovery_candidates(recent) failed: {e}")
+        recent_rows = []
+
+    if not today_rows and not recent_rows:
+        return None
+
+    promoted: list[dict[str, Any]] = []
+    skip_counts: dict[str, int] = {}
+    for row in today_rows:
+        try:
+            if row.get("promoted"):
+                promoted.append(
+                    {
+                        "ticker": row.get("ticker"),
+                        "name": row.get("name"),
+                        "composite_score": row.get("composite_score"),
+                        "top_strategy_tag": _top_strategy_tag(
+                            row.get("strategy_scores_json")
+                        ),
+                    }
+                )
+            else:
+                reason = row.get("skip_reason") or "unknown"
+                skip_counts[reason] = skip_counts.get(reason, 0) + 1
+        except Exception as e:
+            logger.warning(f"[EODDigest] discovery candidate row skipped: {e}")
+
+    prev_day: Optional[dict[str, Any]] = None
+    try:
+        prev_dates = sorted(
+            {
+                r.get("trade_date")
+                for r in recent_rows
+                if r.get("trade_date") and r.get("trade_date") < trade_date
+            },
+            reverse=True,
+        )
+        if prev_dates:
+            prev_trade_date = prev_dates[0]
+            prev_rows = [r for r in recent_rows if r.get("trade_date") == prev_trade_date]
+            fwd_values = [r["fwd_1d"] for r in prev_rows if r.get("fwd_1d") is not None]
+            prev_day = {
+                "trade_date": prev_trade_date,
+                "candidate_count": len(prev_rows),
+                "fwd_1d_filled_count": len(fwd_values),
+                "avg_fwd_1d": (sum(fwd_values) / len(fwd_values)) if fwd_values else None,
+            }
+    except Exception as e:
+        logger.warning(f"[EODDigest] discovery prev-day fwd_1d summary failed: {e}")
+
+    return {
+        "promoted": promoted,
+        "skip_counts": skip_counts,
+        "total_candidates": len(today_rows),
+        "prev_day": prev_day,
     }
 
 

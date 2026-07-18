@@ -465,6 +465,27 @@ async def test_promote_llm_not_suitable_is_skipped(storage, coordinator):
     assert c.skip_reason == "llm_not_suitable"
 
 
+async def test_promote_never_reviewed_candidate_is_not_reviewed_not_llm_not_suitable(
+    storage, coordinator
+):
+    """DS-4 리뷰 이월(DS-5): top_n 밖이라 llm_review_top이 손대지 않은 후보
+    (llm_verdict=None, skip_reason=None -- test_llm_review_top_never_calls_
+    beyond_top_n의 계약)는 'llm_not_suitable'(LLM이 부적합 판정)이 아니라
+    'not_reviewed'(애초에 검토 자체가 없었음)로 구분 기록돼야 한다."""
+    c = _candidate("005930", composite=0.9, threshold=0.55, llm_suitable=None)
+    assert c.llm_verdict is None
+    assert c.skip_reason is None
+
+    summary = await promote_candidates(coordinator, storage, [c])
+
+    assert summary.promoted == []
+    assert c.skip_reason == "not_reviewed"
+    assert summary.skipped["005930"] == "not_reviewed"
+
+    ledger = await storage.get_discovery_candidates(trade_date=c.trade_date)
+    assert ledger[0]["skip_reason"] == "not_reviewed"
+
+
 async def test_promote_daily_cap_bearish_limits_to_two(storage, coordinator):
     candidates = [
         _candidate(

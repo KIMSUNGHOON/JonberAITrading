@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from services.storage_service import StorageService
+from services.trading import strategy_panel as strategy_panel_module
 from services.trading.strategy_panel import (
     PANELISTS,
     build_strategy_context,
@@ -84,6 +85,47 @@ async def test_context_assembles_all_sections(tmp_path):
     assert len(regime_rows) == 1 and regime_rows[0]["id"] == "r-new"
     assert context["perf_history"][0]["net_pnl"] == -120_000
     assert isinstance(context["calibration"], list)
+    # DS-5 폐루프: 발굴 성과가 없을 때는 빈 요약({})이지 예외/None이 아니다
+    # (get_discovery_performance 자체의 no-data 계약).
+    assert context["discovery_performance"] == {}
+
+
+async def test_context_includes_discovery_performance_summary(tmp_path):
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    await _seed_eod_review(storage)
+    await storage.save_discovery_candidates([
+        {
+            "trade_date": _TRADE_DATE, "ticker": "005930", "name": "삼성전자",
+            "composite_score": 0.8,
+            "strategy_scores_json": {"momentum": 0.8, "pullback": 0.1, "flow": 0.1, "meanrev": 0.0},
+            "regime_label": "neutral", "rank": 1,
+            "llm_verdict_json": {"suitable": True}, "promoted": 1,
+            "skip_reason": None, "close_price": 70000.0,
+        }
+    ])
+
+    context = await build_strategy_context(storage, _TRADE_DATE, _KNOBS)
+
+    assert "momentum" in context["discovery_performance"]
+    assert context["discovery_performance"]["momentum"]["candidates"] == 1
+    assert context["discovery_performance"]["momentum"]["promoted"] == 1
+
+
+async def test_context_discovery_performance_failure_degrades_to_none(tmp_path, monkeypatch):
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    await _seed_eod_review(storage)
+
+    async def _boom(*_a, **_kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(strategy_panel_module, "get_discovery_performance", _boom)
+
+    context = await build_strategy_context(storage, _TRADE_DATE, _KNOBS)
+
+    assert context is not None
+    assert context["discovery_performance"] is None
+    # 패널의 나머지 기존 거동은 불변.
+    assert context["eod_review"]["portfolio"]["net_pnl"] == -120_000
 
 
 async def test_panel_returns_three_votes(tmp_path):

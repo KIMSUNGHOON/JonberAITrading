@@ -25,6 +25,8 @@ from typing import Any, Optional
 from agents.llm.tasks import TaskType
 from agents.llm_provider import get_llm_provider
 
+from services.discovery.ledger import get_discovery_performance
+
 from .strategy_consensus import STRATEGY_VOTE_SCHEMA
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,10 @@ logger = logging.getLogger(__name__)
 # 최근 N일 시계열 창 (컨텍스트 크기 통제)
 _REGIME_DAYS = 14
 _PERF_ROWS = 30
+
+# DS-5 폐루프(spec §6): get_discovery_performance의 lookback 창 — DS-3의
+# 자체 기본값(14)과 동일하게 맞춘다.
+_DISCOVERY_PERFORMANCE_DAYS = 14
 
 _SCHEMA_INSTRUCTION = (
     "반드시 아래 JSON 스키마에 맞는 JSON 객체 하나만 출력하십시오. "
@@ -109,6 +115,18 @@ async def build_strategy_context(
         await storage.get_agent_calibration(as_of_date=trade_date), "agent_type"
     )
 
+    # DS-5 폐루프(spec §6): 전략별 발굴 성과(승격/미승격·평균 fwd 수익률·
+    # 적중률)를 패널 근거에 추가 — 패널리스트가 발굴이 실제로 통했는지를
+    # 참고해 스탠스/노브를 조정할 수 있게 한다. 조회 실패는 패널 자체를
+    # 죽이지 않고 그냥 None(패널의 나머지 기존 거동은 불변).
+    try:
+        discovery_performance = await get_discovery_performance(
+            storage, days=_DISCOVERY_PERFORMANCE_DAYS
+        )
+    except Exception as e:
+        logger.warning(f"[StrategyPanel] get_discovery_performance failed: {e}")
+        discovery_performance = None
+
     return {
         "trade_date": trade_date,
         "eod_review": report,
@@ -148,6 +166,7 @@ async def build_strategy_context(
             for c in calibration
         ],
         "current_strategy": current_strategy_knobs,
+        "discovery_performance": discovery_performance,
     }
 
 

@@ -147,6 +147,15 @@ class Settings(BaseSettings):
     STRATEGY_CONSENSUS_THRESHOLD: float = Field(default=0.5, ge=0, le=1.0)
 
     # -------------------------------------------
+    # Discovery (DS 아크): 레짐 적응형 종목 발굴 — EOD 체인 킬스위치.
+    # False(기본)면 마감 엣지가 discovery 스캔을 트리거하지도, 후처리
+    # (백필/랭킹/LLM검토/승격)를 실행하지도 않는다 — 기존 8단계 마감 체인
+    # 호출 시퀀스가 byte-동일하게 유지된다(spec §3/§7). 라이브 검증을 거쳐
+    # on으로 전환하는 것을 전제로 기본 off로 배포.
+    # -------------------------------------------
+    DISCOVERY_ENABLED: bool = False
+
+    # -------------------------------------------
     # Naver API Configuration (News Search)
     # https://developers.naver.com/apps
     # -------------------------------------------
