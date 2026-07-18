@@ -2732,6 +2732,7 @@ class ExecutionCoordinator:
         analysis_summary: str = "",
         key_factors: Optional[List[str]] = None,
         risk_score: int = 5,
+        source: str = "manual",
     ) -> WatchedStock:
         """
         Add a stock to the watch list for monitoring.
@@ -2749,6 +2750,11 @@ class ExecutionCoordinator:
             analysis_summary: Brief summary of analysis
             key_factors: Key factors from analysis
             risk_score: Risk score (1-10)
+            source: Provenance tag (DS-4) — 'manual' (default, every
+                pre-existing call site) or 'discovery' (regime-weighted
+                ranking auto-promotion, services/discovery/ranker.py). Drives
+                the watch-total-cap eviction gate: only 'discovery' entries
+                are ever auto-evicted.
 
         Returns:
             WatchedStock object
@@ -2771,6 +2777,7 @@ class ExecutionCoordinator:
             existing.analysis_summary = analysis_summary
             existing.key_factors = key_factors or []
             existing.risk_score = risk_score
+            existing.source = source
             existing.last_checked = datetime.now()
 
             logger.info(f"[Coordinator] Watch list updated: {ticker}")
@@ -2791,6 +2798,7 @@ class ExecutionCoordinator:
             analysis_summary=analysis_summary,
             key_factors=key_factors or [],
             risk_score=risk_score,
+            source=source,
         )
 
         self._state.watch_list.append(watched)
@@ -2835,6 +2843,35 @@ class ExecutionCoordinator:
                 self._schedule_persist()
                 return True
         return False
+
+    def remove_discovery_watch(self, ticker: str) -> bool:
+        """Remove the ACTIVE discovery-sourced (`source == 'discovery'`) watch
+        entry for `ticker`, if any (DS-4 watch-total-cap eviction gate).
+
+        Manual entries (`source != 'discovery'`, the default for every
+        pre-DS-4 call site) are never touched even if `ticker` matches —
+        `services/discovery/ranker.py::promote_candidates` relies on this to
+        protect user-added names when evicting the lowest-scoring discovery
+        candidate to stay under the 30-item watch-total cap. Reuses
+        `remove_from_watch_list`'s status-flip + activity-log + persist path
+        rather than duplicating it.
+
+        Returns:
+            True if a matching discovery-sourced ACTIVE entry was found and
+            removed, False otherwise (no match, or the only match is manual).
+        """
+        watched = next(
+            (
+                w for w in self._state.watch_list
+                if w.ticker == ticker
+                and w.status == WatchStatus.ACTIVE
+                and getattr(w, "source", "manual") == "discovery"
+            ),
+            None,
+        )
+        if watched is None:
+            return False
+        return self.remove_from_watch_list(watched.id)
 
     def convert_watch_to_queue(
         self,

@@ -464,6 +464,16 @@ class WatchedStock(BaseModel):
     # Metadata
     risk_score: int = 5  # 1-10
 
+    # Provenance (DS-4): 'manual' (user/analysis-flow add, the historical
+    # default) vs 'discovery' (regime-weighted ranking auto-promotion). Drives
+    # the watch-total-cap eviction gate in services/discovery/ranker.py — only
+    # 'discovery' entries are ever auto-evicted, manual entries are always
+    # protected. A field default (not a migration) gives backward
+    # compatibility for free: existing persisted blobs written before this
+    # field existed simply lack the key, and `WatchedStock.model_validate(...)`
+    # falls back to 'manual' for them.
+    source: str = "manual"
+
     model_config = ConfigDict(use_enum_values=True)
 
 

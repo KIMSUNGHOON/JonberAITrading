@@ -14,6 +14,15 @@ from services.discovery.factors import (
     compute_strategy_scores,
     passes_quality_filter,
 )
+from services.discovery.ranker import (
+    DEFAULT_REGIME_WEIGHTS,
+    WATCH_TOTAL_CAP,
+    Candidate,
+    PromoteSummary,
+    llm_review_top,
+    promote_candidates,
+    rank_candidates,
+)
 
 __all__ = [
     "STRATEGIES",
@@ -23,4 +32,11 @@ __all__ = [
     "StockSnapshot",
     "compute_strategy_scores",
     "passes_quality_filter",
+    "DEFAULT_REGIME_WEIGHTS",
+    "WATCH_TOTAL_CAP",
+    "Candidate",
+    "PromoteSummary",
+    "llm_review_top",
+    "promote_candidates",
+    "rank_candidates",
 ]

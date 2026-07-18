@@ -1,0 +1,727 @@
+"""
+Discovery ranker tests (DS-4): regime-weighted composite ranking, LLM
+structured review, and the conservative promotion gate chain.
+
+Real DB schema via tmp-path StorageService (mirrors test_discovery_ledger.py)
+plus a hand-seeded tmp scanner_results.db (scan_sessions/scan_results —
+mirrors test_scanner_discovery_mode.py's factor_json shape, but seeded
+directly via SQL rather than running a full BackgroundScanner scan, since
+this module only ever *reads* those two tables). Coordinator is a REAL
+`ExecutionCoordinator(kiwoom_client=None)` (no network — mirrors
+test_watch_list_promotion.py/test_watch_list_persistence.py's convention;
+"mock" here means no Kiwoom client, not a hand-rolled fake coordinator). LLM
+is always a fake provider — real network/LLM calls are forbidden
+(ds-global-constraints.md).
+"""
+
+import json
+import uuid
+
+import aiosqlite
+import pytest
+
+from services.discovery import ranker
+from services.discovery.ranker import (
+    DEFAULT_REGIME_WEIGHTS,
+    Candidate,
+    llm_review_top,
+    promote_candidates,
+    rank_candidates,
+)
+from services.storage_service import StorageService
+from services.trading.coordinator import ExecutionCoordinator
+from services.trading.models import ManagedPosition
+
+pytestmark = pytest.mark.asyncio
+
+
+# ---------------------------------------------------------------------------
+# tmp scanner_results.db seeding (scan_sessions + scan_results only — the two
+# tables ranker.py reads via aiosqlite direct, per regime.py's cross-db
+# precedent)
+# ---------------------------------------------------------------------------
+
+_SCAN_SESSIONS_SCHEMA = """
+CREATE TABLE scan_sessions (
+    id TEXT PRIMARY KEY,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    total_stocks INTEGER,
+    completed INTEGER,
+    failed INTEGER,
+    buy_count INTEGER,
+    sell_count INTEGER,
+    hold_count INTEGER,
+    watch_count INTEGER,
+    avoid_count INTEGER,
+    status TEXT,
+    universe_fallback INTEGER,
+    scan_mode TEXT
+)
+"""
+
+_SCAN_RESULTS_SCHEMA = """
+CREATE TABLE scan_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stk_cd TEXT NOT NULL,
+    stk_nm TEXT NOT NULL,
+    action TEXT NOT NULL,
+    signal TEXT,
+    confidence REAL,
+    summary TEXT,
+    key_factors TEXT,
+    current_price INTEGER,
+    market_type TEXT,
+    scanned_at TIMESTAMP,
+    scan_session_id TEXT,
+    factor_json TEXT
+)
+"""
+
+
+async def _seed_scanner_db(
+    db_path,
+    trade_date: str,
+    results: list[dict],
+    *,
+    session_id: str = "sess-1",
+    universe_fallback: bool = False,
+    status: str = "completed",
+    scan_mode: str = "discovery",
+) -> str:
+    """Seed a tmp scanner db with one scan_sessions row + its scan_results
+    rows. Each item in `results`: {"stk_cd", "stk_nm", "factor_json": dict}.
+    """
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.execute(_SCAN_SESSIONS_SCHEMA)
+        await db.execute(_SCAN_RESULTS_SCHEMA)
+        await db.execute(
+            """
+            INSERT INTO scan_sessions
+            (id, started_at, completed_at, total_stocks, completed, failed,
+             buy_count, sell_count, hold_count, watch_count, avoid_count,
+             status, universe_fallback, scan_mode)
+            VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, ?, 0, ?, ?, ?)
+            """,
+            (
+                session_id,
+                f"{trade_date} 15:40:00",
+                f"{trade_date} 16:10:00",
+                len(results),
+                len(results),
+                len(results),
+                status,
+                1 if universe_fallback else 0,
+                scan_mode,
+            ),
+        )
+        for r in results:
+            fj = r["factor_json"]
+            await db.execute(
+                """
+                INSERT INTO scan_results
+                (stk_cd, stk_nm, action, signal, confidence, summary,
+                 key_factors, current_price, market_type, scanned_at,
+                 scan_session_id, factor_json)
+                VALUES (?, ?, 'WATCH', 'discovery', 0.0, '', '', ?, '', ?, ?, ?)
+                """,
+                (
+                    r["stk_cd"],
+                    r["stk_nm"],
+                    int(fj.get("close_price") or 0),
+                    f"{trade_date} 15:41:00",
+                    session_id,
+                    json.dumps(fj, ensure_ascii=False),
+                ),
+            )
+        await db.commit()
+    return session_id
+
+
+def _passing_factor(
+    momentum: float = 0.0,
+    pullback: float = 0.0,
+    flow: float = 0.0,
+    meanrev: float = 0.0,
+    close_price: float = 50_000.0,
+    market_cap: float = 100_000_000_000.0,
+) -> dict:
+    return {
+        "quality_filter_passed": True,
+        "skip_reason": None,
+        "scores": {
+            "momentum": momentum, "pullback": pullback,
+            "flow": flow, "meanrev": meanrev,
+        },
+        "atoms": {},
+        "close_price": close_price,
+        "market_cap": market_cap,
+    }
+
+
+def _failing_factor(reason: str = "insufficient_history") -> dict:
+    return {"quality_filter_passed": False, "skip_reason": reason}
+
+
+async def _seed_regime_snapshot(storage: StorageService, trade_date: str, label: str) -> None:
+    await storage.save_regime_snapshot(
+        {"id": str(uuid.uuid4()), "trade_date": trade_date, "market_sentiment_label": label}
+    )
+
+
+def _candidate(
+    ticker: str,
+    *,
+    trade_date: str = "2026-07-20",
+    regime_label: str = "neutral",
+    threshold: float = 0.55,
+    daily_cap: int = 5,
+    composite: float = 0.7,
+    rank: int = 1,
+    close_price: float = 50_000.0,
+    universe_fallback: bool = False,
+    quality_filter_passed: bool = True,
+    llm_suitable: bool | None = True,
+) -> Candidate:
+    """Hand-built Candidate for gate-level unit tests that don't need the
+    full rank_candidates() pipeline."""
+    c = Candidate(
+        ticker=ticker,
+        name=f"종목{ticker}",
+        trade_date=trade_date,
+        regime_label=regime_label,
+        threshold=threshold,
+        daily_cap=daily_cap,
+        weights={"momentum": 0.25, "pullback": 0.25, "flow": 0.25, "meanrev": 0.25},
+        universe_fallback=universe_fallback,
+        quality_filter_passed=quality_filter_passed,
+        raw_scores=(
+            {"momentum": 0.6, "pullback": 0.6, "flow": 0.6, "meanrev": 0.6}
+            if quality_filter_passed else None
+        ),
+        composite=composite if quality_filter_passed else None,
+        rank=rank if quality_filter_passed else None,
+        close_price=close_price,
+    )
+    if llm_suitable is not None:
+        c.llm_verdict = {
+            "suitable": llm_suitable, "confidence": composite, "rationale": "r", "risks": "x",
+        }
+    return c
+
+
+class _FakeLLMProvider:
+    """Ticker is looked up by substring match against the HumanMessage
+    content (`_build_llm_messages` always embeds `(ticker)`), so callers
+    don't need to know call order."""
+
+    def __init__(self, responses: dict[str, str] | None = None, raise_for: frozenset[str] = frozenset()):
+        self.responses = responses or {}
+        self.raise_for = raise_for
+        self.calls: list[str | None] = []
+
+    async def generate(self, messages, task=None, **kwargs):
+        content = messages[-1].content
+        candidates = set(self.responses) | set(self.raise_for)
+        ticker = next((t for t in candidates if f"({t})" in content), None)
+        self.calls.append(ticker)
+        if ticker in self.raise_for:
+            raise RuntimeError(f"llm boom for {ticker}")
+        return self.responses.get(
+            ticker, '{"suitable": false, "confidence": 0.1, "rationale": "", "risks": ""}'
+        )
+
+
+@pytest.fixture
+def storage(tmp_path):
+    return StorageService(db_path=str(tmp_path / "storage.db"))
+
+
+@pytest.fixture
+def coordinator():
+    return ExecutionCoordinator(kiwoom_client=None)
+
+
+# ---------------------------------------------------------------------------
+# ① 레짐별 composite 가중 정확 (수기 계산 대조)
+# ---------------------------------------------------------------------------
+
+
+async def test_rank_candidates_composite_matches_manual_calculation(tmp_path, storage):
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "bullish")
+
+    factor_a = _passing_factor(momentum=0.8, pullback=0.4, flow=0.2, meanrev=0.1, close_price=70_000.0)
+    # Deliberately NOT a near-tie with factor_a under bullish weights (momentum
+    # .40/pullback .25/flow .25/meanrev .10) -- factor_a's composite is 0.48;
+    # this one computes to 0.60, so rank ordering is unambiguous.
+    factor_b = _passing_factor(momentum=0.0, pullback=1.0, flow=1.0, meanrev=1.0, close_price=30_000.0)
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [
+            {"stk_cd": "005930", "stk_nm": "A", "factor_json": factor_a},
+            {"stk_cd": "000660", "stk_nm": "B", "factor_json": factor_b},
+        ],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    by_ticker = {c.ticker: c for c in candidates}
+
+    w = DEFAULT_REGIME_WEIGHTS["bullish"]
+    expected_a = 0.8 * w["momentum"] + 0.4 * w["pullback"] + 0.2 * w["flow"] + 0.1 * w["meanrev"]
+    expected_b = 0.0 * w["momentum"] + 1.0 * w["pullback"] + 1.0 * w["flow"] + 1.0 * w["meanrev"]
+
+    assert by_ticker["005930"].composite == pytest.approx(expected_a)
+    assert by_ticker["000660"].composite == pytest.approx(expected_b)
+    assert by_ticker["005930"].regime_label == "bullish"
+    assert by_ticker["005930"].threshold == pytest.approx(w["threshold"])
+    assert by_ticker["005930"].daily_cap == w["daily_cap"]
+
+    # B's composite is higher -> rank 1.
+    assert by_ticker["000660"].rank == 1
+    assert by_ticker["005930"].rank == 2
+
+
+async def test_rank_candidates_excludes_quality_filter_failures_from_ranking(tmp_path, storage):
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [
+            {"stk_cd": "005930", "stk_nm": "Good", "factor_json": _passing_factor(momentum=0.5)},
+            {"stk_cd": "000660", "stk_nm": "Bad", "factor_json": _failing_factor("market_cap_low")},
+        ],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    by_ticker = {c.ticker: c for c in candidates}
+
+    assert by_ticker["005930"].rank == 1
+    assert by_ticker["005930"].composite is not None
+
+    assert by_ticker["000660"].composite is None
+    assert by_ticker["000660"].rank is None
+    assert by_ticker["000660"].skip_reason == "market_cap_low"
+    assert by_ticker["000660"].quality_filter_passed is False
+
+
+async def test_rank_candidates_returns_empty_when_no_session_for_date(tmp_path, storage):
+    scanner_db = tmp_path / "scanner.db"
+    # No session seeded at all -> DB file doesn't even exist with the tables.
+    async with aiosqlite.connect(str(scanner_db)) as db:
+        await db.execute(_SCAN_SESSIONS_SCHEMA)
+        await db.execute(_SCAN_RESULTS_SCHEMA)
+        await db.commit()
+
+    candidates = await rank_candidates(storage, str(scanner_db), "2026-07-20")
+    assert candidates == []
+
+
+# ---------------------------------------------------------------------------
+# ② 가중치 app_settings 왕복 + 미존재 시 시드
+# ---------------------------------------------------------------------------
+
+
+async def test_regime_weights_seed_on_first_read(storage):
+    weights = await ranker._load_regime_weights(storage)
+    assert weights == DEFAULT_REGIME_WEIGHTS
+
+    stored_raw = await storage.get_app_setting(ranker.REGIME_WEIGHTS_SETTING_KEY)
+    assert stored_raw is not None
+    assert json.loads(stored_raw) == DEFAULT_REGIME_WEIGHTS
+
+
+async def test_regime_weights_roundtrip_uses_stored_value_not_reseed(storage):
+    await ranker._load_regime_weights(storage)  # seeds
+
+    custom = json.loads(await storage.get_app_setting(ranker.REGIME_WEIGHTS_SETTING_KEY))
+    custom["bullish"]["threshold"] = 0.99
+    await storage.set_app_setting(ranker.REGIME_WEIGHTS_SETTING_KEY, json.dumps(custom))
+
+    weights2 = await ranker._load_regime_weights(storage)
+    assert weights2["bullish"]["threshold"] == 0.99
+    # Untouched regimes still round-trip intact.
+    assert weights2["bearish"] == DEFAULT_REGIME_WEIGHTS["bearish"]
+
+
+async def test_regime_weights_corrupt_value_falls_back_to_default(storage):
+    await storage.set_app_setting(ranker.REGIME_WEIGHTS_SETTING_KEY, "not valid json{{{")
+    weights = await ranker._load_regime_weights(storage)
+    assert weights == DEFAULT_REGIME_WEIGHTS
+
+
+# ---------------------------------------------------------------------------
+# ③ LLM JSON 성공/파싱 실패 = 보류 (+top_n 밖 후보는 절대 호출 안 됨)
+# ---------------------------------------------------------------------------
+
+
+async def test_llm_review_top_parses_success_and_marks_parse_failure(monkeypatch):
+    good = _candidate("005930", composite=0.6, rank=1, llm_suitable=None)
+    bad = _candidate("000660", composite=0.5, rank=2, llm_suitable=None)
+
+    fake = _FakeLLMProvider(
+        responses={
+            "005930": '{"suitable": true, "confidence": 0.8, "rationale": "돌파", "risks": "변동성"}',
+            "000660": "이건 JSON이 아닙니다 — 그냥 자유서술입니다.",
+        }
+    )
+    monkeypatch.setattr(ranker, "get_llm_provider", lambda: fake)
+
+    await llm_review_top([good, bad], top_n=25)
+
+    assert good.llm_verdict == {
+        "suitable": True, "confidence": 0.8, "rationale": "돌파", "risks": "변동성",
+    }
+    assert good.skip_reason is None
+
+    assert bad.llm_verdict is None
+    assert bad.skip_reason == "llm_parse_failed"
+
+
+async def test_llm_review_top_tolerates_markdown_fence(monkeypatch):
+    c = _candidate("005930", composite=0.6, rank=1, llm_suitable=None)
+    fenced = '```json\n{"suitable": true, "confidence": 0.7, "rationale": "ok", "risks": "-"}\n```'
+    fake = _FakeLLMProvider(responses={"005930": fenced})
+    monkeypatch.setattr(ranker, "get_llm_provider", lambda: fake)
+
+    await llm_review_top([c], top_n=25)
+
+    assert c.llm_verdict is not None
+    assert c.llm_verdict["suitable"] is True
+
+
+async def test_llm_review_top_exception_never_raises(monkeypatch):
+    c = _candidate("005930", composite=0.6, rank=1, llm_suitable=None)
+
+    class _BoomProvider:
+        async def generate(self, *a, **k):
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr(ranker, "get_llm_provider", lambda: _BoomProvider())
+
+    await llm_review_top([c], top_n=25)  # must not raise
+
+    assert c.llm_verdict is None
+    assert c.skip_reason == "llm_parse_failed"
+
+
+async def test_llm_review_top_never_calls_beyond_top_n(monkeypatch):
+    reviewed = _candidate("005930", composite=0.9, rank=1, llm_suitable=None)
+    unreviewed = _candidate("000660", composite=0.8, rank=2, llm_suitable=None)
+
+    fake = _FakeLLMProvider(
+        responses={"005930": '{"suitable": true, "confidence": 0.9, "rationale": "r", "risks": "x"}'}
+    )
+    monkeypatch.setattr(ranker, "get_llm_provider", lambda: fake)
+
+    await llm_review_top([reviewed, unreviewed], top_n=1)
+
+    assert reviewed.llm_verdict is not None
+    assert unreviewed.llm_verdict is None
+    assert unreviewed.skip_reason is None  # never touched, not marked parse-failed
+    assert fake.calls == ["005930"]
+
+
+async def test_llm_review_top_skips_quality_filter_excluded_candidates(monkeypatch):
+    excluded = _candidate("005930", quality_filter_passed=False, llm_suitable=None)
+    fake = _FakeLLMProvider()
+    monkeypatch.setattr(ranker, "get_llm_provider", lambda: fake)
+
+    await llm_review_top([excluded], top_n=25)
+
+    assert fake.calls == []
+    assert excluded.llm_verdict is None
+
+
+# ---------------------------------------------------------------------------
+# ④ 게이트 각각: 문턱 · 일 캡(bearish 2) · 쿨다운 · 기보유 제외 · 폴백 전면 스킵
+# ---------------------------------------------------------------------------
+
+
+async def test_promote_below_regime_threshold_is_skipped(storage, coordinator):
+    c = _candidate("005930", composite=0.40, threshold=0.55)
+
+    summary = await promote_candidates(coordinator, storage, [c])
+
+    assert summary.promoted == []
+    assert c.skip_reason == "below_threshold"
+    assert coordinator.get_watch_list() == []
+
+    ledger = await storage.get_discovery_candidates(trade_date=c.trade_date)
+    assert len(ledger) == 1
+    assert ledger[0]["skip_reason"] == "below_threshold"
+    assert ledger[0]["promoted"] == 0
+
+
+async def test_promote_llm_not_suitable_is_skipped(storage, coordinator):
+    c = _candidate("005930", composite=0.9, threshold=0.55, llm_suitable=False)
+
+    summary = await promote_candidates(coordinator, storage, [c])
+
+    assert summary.promoted == []
+    assert c.skip_reason == "llm_not_suitable"
+
+
+async def test_promote_daily_cap_bearish_limits_to_two(storage, coordinator):
+    candidates = [
+        _candidate(
+            f"00000{i}", composite=0.90 - i * 0.01, rank=i + 1,
+            threshold=0.65, daily_cap=2, regime_label="bearish",
+        )
+        for i in range(3)
+    ]
+
+    summary = await promote_candidates(coordinator, storage, candidates)
+
+    assert len(summary.promoted) == 2
+    assert candidates[0].skip_reason is None
+    assert candidates[1].skip_reason is None
+    assert candidates[2].skip_reason == "daily_cap"
+
+
+async def test_promote_cooldown_blocks_repromotion_within_7_days(storage, coordinator):
+    trade_date = "2026-07-20"
+    past_date = "2026-07-17"  # 3 calendar days before trade_date -> within cooldown
+    await storage.save_discovery_candidates(
+        [
+            {
+                "trade_date": past_date, "ticker": "005930", "name": "삼성전자",
+                "composite_score": 0.8,
+                "strategy_scores_json": {"momentum": 0.8, "pullback": 0.1, "flow": 0.1, "meanrev": 0.0},
+                "regime_label": "neutral", "rank": 1,
+                "llm_verdict_json": {"suitable": True}, "promoted": 1,
+                "skip_reason": None, "close_price": 70000.0,
+            }
+        ]
+    )
+
+    c = _candidate("005930", trade_date=trade_date, composite=0.9, threshold=0.55)
+    summary = await promote_candidates(coordinator, storage, [c])
+
+    assert summary.promoted == []
+    assert c.skip_reason == "cooldown"
+
+
+async def test_promote_allows_repromotion_after_cooldown_elapsed(storage, coordinator):
+    trade_date = "2026-07-20"
+    past_date = "2026-07-10"  # 10 calendar days before -> cooldown elapsed
+    await storage.save_discovery_candidates(
+        [
+            {
+                "trade_date": past_date, "ticker": "005930", "name": "삼성전자",
+                "composite_score": 0.8,
+                "strategy_scores_json": {"momentum": 0.8, "pullback": 0.1, "flow": 0.1, "meanrev": 0.0},
+                "regime_label": "neutral", "rank": 1,
+                "llm_verdict_json": {"suitable": True}, "promoted": 1,
+                "skip_reason": None, "close_price": 70000.0,
+            }
+        ]
+    )
+
+    c = _candidate("005930", trade_date=trade_date, composite=0.9, threshold=0.55)
+    summary = await promote_candidates(coordinator, storage, [c])
+
+    assert summary.promoted == ["005930"]
+    assert c.skip_reason is None
+
+
+async def test_promote_skips_already_held_position(storage, coordinator):
+    coordinator.state.positions.append(
+        ManagedPosition(ticker="005930", stock_name="삼성전자", quantity=10, avg_price=70_000.0)
+    )
+    c = _candidate("005930", composite=0.9, threshold=0.55)
+
+    summary = await promote_candidates(coordinator, storage, [c])
+
+    assert summary.promoted == []
+    assert c.skip_reason == "already_held_or_watched"
+
+
+async def test_promote_skips_already_watched_ticker(storage, coordinator):
+    coordinator.add_to_watch_list(
+        session_id="manual-s", ticker="005930", stock_name="삼성전자",
+        signal="hold", confidence=0.5, current_price=70_000, source="manual",
+    )
+    c = _candidate("005930", composite=0.9, threshold=0.55)
+
+    summary = await promote_candidates(coordinator, storage, [c])
+
+    assert summary.promoted == []
+    assert c.skip_reason == "already_held_or_watched"
+
+
+async def test_promote_universe_fallback_skips_all_candidates(storage, coordinator):
+    c1 = _candidate("005930", composite=0.9, threshold=0.1, universe_fallback=True)
+    c2 = _candidate("000660", composite=0.9, threshold=0.1, universe_fallback=True)
+
+    summary = await promote_candidates(coordinator, storage, [c1, c2])
+
+    assert summary.promoted == []
+    assert c1.skip_reason == "universe_fallback"
+    assert c2.skip_reason == "universe_fallback"
+    assert coordinator.get_watch_list() == []
+
+    ledger = await storage.get_discovery_candidates(trade_date=c1.trade_date)
+    assert {r["skip_reason"] for r in ledger} == {"universe_fallback"}
+
+
+async def test_promote_no_candidates_is_a_noop(storage, coordinator):
+    summary = await promote_candidates(coordinator, storage, [])
+    assert summary.promoted == []
+    assert summary.skipped == {}
+    assert summary.total_candidates == 0
+
+
+# ---------------------------------------------------------------------------
+# ⑤ 워치 총량 캡 30: 31번째 승격 시 열위 discovery 제거 + manual 보호
+# ---------------------------------------------------------------------------
+
+
+async def test_watch_cap_evicts_worst_scoring_discovery_entry_when_full(storage, coordinator):
+    for i in range(29):
+        coordinator.add_to_watch_list(
+            session_id="s", ticker=f"D{i:03d}", stock_name=f"D{i}",
+            signal="discovery", confidence=0.50 + i * 0.001, current_price=10_000,
+            source="discovery",
+        )
+    coordinator.add_to_watch_list(
+        session_id="s", ticker="MANUAL1", stock_name="Manual",
+        signal="hold", confidence=0.99, current_price=10_000, source="manual",
+    )
+    assert len(coordinator.get_watch_list()) == 30
+
+    new_candidate = _candidate("NEW001", composite=0.95, threshold=0.1)
+    summary = await promote_candidates(coordinator, storage, [new_candidate])
+
+    assert summary.promoted == ["NEW001"]
+    watch = coordinator.get_watch_list()
+    assert len(watch) == 30
+    tickers = {w.ticker for w in watch}
+    assert "D000" not in tickers, "가장 낮은 confidence(0.50)의 discovery 항목이 제거돼야 한다"
+    assert "MANUAL1" in tickers, "manual 항목은 절대 자동 제거되면 안 된다"
+    assert "NEW001" in tickers
+    assert "D001" in tickers  # 두 번째로 낮은 항목은 유지
+
+
+async def test_watch_cap_skips_promotion_when_all_entries_manual(storage, coordinator):
+    for i in range(30):
+        coordinator.add_to_watch_list(
+            session_id="s", ticker=f"M{i:03d}", stock_name=f"M{i}",
+            signal="hold", confidence=0.5, current_price=10_000, source="manual",
+        )
+    assert len(coordinator.get_watch_list()) == 30
+
+    new_candidate = _candidate("NEW002", composite=0.95, threshold=0.1)
+    summary = await promote_candidates(coordinator, storage, [new_candidate])
+
+    assert summary.promoted == []
+    assert new_candidate.skip_reason == "watch_cap"
+    assert len(coordinator.get_watch_list()) == 30
+
+
+# ---------------------------------------------------------------------------
+# ⑥ 원장에 전 후보 기록 (승격/스킵/품질필터 탈락 전부, skip_reason 포함)
+# ---------------------------------------------------------------------------
+
+
+async def test_full_pipeline_ledger_records_every_candidate(tmp_path, storage, coordinator, monkeypatch):
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    good = _passing_factor(momentum=0.9, pullback=0.9, flow=0.9, meanrev=0.9, close_price=70_000.0)
+    bad_quality = _failing_factor("market_cap_low")
+    low_score = _passing_factor(momentum=0.05, pullback=0.05, flow=0.05, meanrev=0.05, close_price=5_000.0)
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [
+            {"stk_cd": "005930", "stk_nm": "Good", "factor_json": good},
+            {"stk_cd": "000660", "stk_nm": "Bad", "factor_json": bad_quality},
+            {"stk_cd": "035420", "stk_nm": "Low", "factor_json": low_score},
+        ],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    assert len(candidates) == 3
+
+    fake = _FakeLLMProvider(
+        responses={"005930": '{"suitable": true, "confidence": 0.9, "rationale": "ok", "risks": "-"}'}
+    )
+    monkeypatch.setattr(ranker, "get_llm_provider", lambda: fake)
+    await llm_review_top(candidates, top_n=25)
+
+    summary = await promote_candidates(coordinator, storage, candidates)
+    assert summary.promoted == ["005930"]
+
+    ledger = await storage.get_discovery_candidates(trade_date=trade_date)
+    assert len(ledger) == 3
+    by_ticker = {r["ticker"]: r for r in ledger}
+
+    assert by_ticker["005930"]["promoted"] == 1
+    assert by_ticker["005930"]["skip_reason"] is None
+    assert by_ticker["005930"]["rank"] == 1
+    scores_json = json.loads(by_ticker["005930"]["strategy_scores_json"])
+    assert scores_json["momentum"] == pytest.approx(0.9)
+    assert "_weights" in scores_json
+    assert scores_json["_weights"]["flow"] == pytest.approx(DEFAULT_REGIME_WEIGHTS["neutral"]["flow"])
+
+    assert by_ticker["000660"]["promoted"] == 0
+    assert by_ticker["000660"]["skip_reason"] == "market_cap_low"
+    assert by_ticker["000660"]["rank"] is None
+
+    assert by_ticker["035420"]["promoted"] == 0
+    assert by_ticker["035420"]["skip_reason"] == "below_threshold"
+
+
+# ---------------------------------------------------------------------------
+# ⑦ WatchedStock.source 하위호환 복원 (pre-DS-4 blob에는 source 키 자체가 없음)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def temp_storage(tmp_path, monkeypatch):
+    """Isolated SQLite storage wired into the get_storage_service() singleton
+    (mirrors test_watch_list_persistence.py's fixture — _persist_state /
+    _restore_state go through the module-level singleton, not the injected
+    `storage` param)."""
+    import services.storage_service as ss
+
+    st = ss.StorageService(db_path=tmp_path / "test_storage.db")
+    await st.initialize()
+    monkeypatch.setattr(ss, "_storage_service", st)
+    yield st
+    monkeypatch.setattr(ss, "_storage_service", None)
+
+
+async def test_watched_stock_source_backward_compat_restore(temp_storage):
+    coord1 = ExecutionCoordinator(kiwoom_client=None)
+    coord1.add_to_watch_list(
+        session_id="s", ticker="005930", stock_name="A", signal="discovery",
+        confidence=0.7, current_price=70_000, source="discovery",
+    )
+    await coord1._persist_state()
+
+    # Splice in a pre-DS-4 persisted watch entry that has NO "source" key at
+    # all (the literal shape written before this field existed).
+    blob = json.loads(await temp_storage.get_app_setting(coord1._STATE_KEY))
+    blob["watch_list"].append(
+        {
+            "id": "watch_legacy1", "session_id": "s", "ticker": "000660",
+            "stock_name": "Legacy", "action": "WATCH", "signal": "hold",
+            "confidence": 0.5, "current_price": 50_000,
+            "analysis_summary": "", "key_factors": [], "status": "active",
+            "added_at": "2026-07-01T00:00:00", "risk_score": 5,
+        }
+    )
+    await temp_storage.set_app_setting(coord1._STATE_KEY, json.dumps(blob))
+
+    coord2 = ExecutionCoordinator(kiwoom_client=None)
+    await coord2._restore_state()
+
+    restored = {w.ticker: w for w in coord2.get_watch_list()}
+    assert restored["005930"].source == "discovery"
+    assert restored["000660"].source == "manual"
