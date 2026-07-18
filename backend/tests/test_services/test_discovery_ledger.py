@@ -330,3 +330,195 @@ class TestGetDiscoveryPerformance:
         summary = await get_discovery_performance(st, days=14)
         assert "unknown" in summary
         assert summary["unknown"]["candidates"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 5) DS final-review fix: ledger-scale vs the 5000-row query budget.
+#
+# Root cause (spec): _persist_ledger writes the WHOLE universe every
+# trading day (~2,500 rows, quality-dropped included), and
+# backfill_forward_returns / get_discovery_performance both queried
+# `get_discovery_candidates(..., limit=5000)` with NO date scoping,
+# ORDER BY created_at DESC. At real ledger volume that query only ever
+# sees the most recent ~2 days -- a candidate from 5+ trading days ago
+# silently falls out of the query window forever, so its fwd_5d/fwd_20d
+# never gets backfilled and it never shows up in a 14-day performance
+# window either. The fix pushes exact-date (backfill) / lower-bound
+# (performance) scoping down into SQL so `limit` is a safety net, not
+# the operative bound.
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillSurvivesLedgerScale:
+    @pytest.mark.asyncio
+    async def test_five_trading_day_old_candidate_survives_limit_5000_pollution(
+        self, tmp_path, holiday_svc
+    ):
+        """Reviewer-specified repro: a large multi-day ledger (quality-
+        dropped NULL-close-price rows included) inserted AFTER a 5-
+        trading-day-old candidate must not push that candidate's fwd_5d
+        backfill out of reach. Pre-fix (unscoped, limit=5000,
+        created_at DESC) this is RED: the 5400 filler rows -- all with a
+        higher rowid/created_at than the target -- fill the entire
+        limit-5000 window, and the target (lowest rowid) never appears in
+        `candidates`, so fwd_5d stays NULL forever.
+        """
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+
+        start = date(2026, 6, 8)  # Monday, clear of the seeded 6/3 holiday
+        end_date = _nth_trading_day_after(holiday_svc, start, 5)
+
+        target = _candidate_row(
+            trade_date=start.isoformat(), ticker="005930", close_price=70000.0,
+        )
+        await st.save_discovery_candidates([target])  # lowest rowid
+
+        # Simulate several subsequent days' full-universe scan output
+        # landing AFTER the target (higher rowid/created_at): a mix of
+        # quality-dropped (close_price NULL, permanently unfillable) and
+        # quality-passed-but-not-yet-due rows. Dated well away from the
+        # target/scoped dates so they can never be mistaken for a real
+        # match -- this is purely about query-budget pollution.
+        filler = [
+            _candidate_row(
+                trade_date="2020-01-01",
+                ticker=f"F{i:05d}",
+                name=f"filler{i}",
+                close_price=None if i % 2 == 0 else 12345.0,
+            )
+            for i in range(5400)
+        ]
+        await st.save_discovery_candidates(filler)
+
+        filled = await backfill_forward_returns(
+            st, {"005930": 72100.0}, end_date.isoformat(), holiday_service=holiday_svc
+        )
+        assert filled == 1
+
+        got = (await st.get_discovery_candidates(ticker="005930"))[0]
+        assert got["fwd_5d"] == pytest.approx(72100.0 / 70000.0 - 1.0)
+
+
+class TestDateScopedStorageParams:
+    """trade_dates / since_trade_date round-trip on StorageService.
+    get_discovery_candidates, plus regression on the pre-existing
+    trade_date/ticker/unfilled_fwd_only params when the new ones are
+    omitted."""
+
+    @pytest.mark.asyncio
+    async def test_trade_dates_exact_in_match(self, tmp_path):
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        rows = [
+            _candidate_row(trade_date="2026-06-01", ticker="A", name="A"),
+            _candidate_row(trade_date="2026-06-05", ticker="B", name="B"),
+            _candidate_row(trade_date="2026-06-10", ticker="C", name="C"),
+        ]
+        await st.save_discovery_candidates(rows)
+
+        got = await st.get_discovery_candidates(
+            trade_dates=["2026-06-01", "2026-06-10"]
+        )
+        assert {r["ticker"] for r in got} == {"A", "C"}
+
+    @pytest.mark.asyncio
+    async def test_since_trade_date_lower_bound(self, tmp_path):
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        rows = [
+            _candidate_row(trade_date="2026-06-01", ticker="A", name="A"),
+            _candidate_row(trade_date="2026-06-05", ticker="B", name="B"),
+            _candidate_row(trade_date="2026-06-10", ticker="C", name="C"),
+        ]
+        await st.save_discovery_candidates(rows)
+
+        got = await st.get_discovery_candidates(since_trade_date="2026-06-05")
+        assert {r["ticker"] for r in got} == {"B", "C"}
+
+    @pytest.mark.asyncio
+    async def test_trade_dates_combined_with_ticker(self, tmp_path):
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        rows = [
+            _candidate_row(trade_date="2026-06-01", ticker="A", name="A"),
+            _candidate_row(trade_date="2026-06-01", ticker="B", name="B"),
+            _candidate_row(trade_date="2026-06-10", ticker="A", name="A"),
+        ]
+        await st.save_discovery_candidates(rows)
+
+        got = await st.get_discovery_candidates(
+            trade_dates=["2026-06-01", "2026-06-10"], ticker="A"
+        )
+        assert {(r["trade_date"], r["ticker"]) for r in got} == {
+            ("2026-06-01", "A"),
+            ("2026-06-10", "A"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_existing_params_unchanged_when_new_params_omitted(self, tmp_path):
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        rows = [
+            _candidate_row(trade_date="2026-06-01", ticker="A", name="A"),
+            _candidate_row(trade_date="2026-06-01", ticker="B", name="B"),
+        ]
+        await st.save_discovery_candidates(rows)
+
+        got_by_date = await st.get_discovery_candidates(trade_date="2026-06-01")
+        assert {r["ticker"] for r in got_by_date} == {"A", "B"}
+
+        got_by_ticker = await st.get_discovery_candidates(ticker="A")
+        assert len(got_by_ticker) == 1 and got_by_ticker[0]["ticker"] == "A"
+
+        got_limited = await st.get_discovery_candidates(
+            trade_date="2026-06-01", limit=1
+        )
+        assert len(got_limited) == 1
+
+
+class TestUnfilledFwdOnlyExcludesNullClosePrice:
+    @pytest.mark.asyncio
+    async def test_null_close_price_rows_excluded_from_unfilled(self, tmp_path):
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        rows = [
+            _candidate_row(
+                trade_date="2026-06-01", ticker="QUALIFIED", close_price=70000.0
+            ),
+            _candidate_row(
+                trade_date="2026-06-01", ticker="DROPPED", close_price=None
+            ),
+        ]
+        await st.save_discovery_candidates(rows)
+
+        got = await st.get_discovery_candidates(unfilled_fwd_only=True)
+        assert {r["ticker"] for r in got} == {"QUALIFIED"}
+
+
+class TestPerformanceSinceTradeDatePushdown:
+    @pytest.mark.asyncio
+    async def test_days_window_survives_large_older_ledger(self, tmp_path):
+        """A candidate 10 days old (within the 14-day window) must not be
+        pushed out of the performance summary by a much larger batch of
+        rows dated OUTSIDE the window (simulating a ledger that's been
+        accreting for months) landing after it in insertion order.
+        Pre-fix (unscoped limit=5000, created_at DESC, Python-side cutoff
+        filter applied only AFTER truncation) this is RED.
+        """
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+
+        target_date = (date.today() - timedelta(days=10)).isoformat()
+        target = _candidate_row(
+            trade_date=target_date, ticker="OLD1", name="OLD1", rank=1,
+            strategy_scores_json={
+                "momentum": 0.0, "pullback": 0.0, "flow": 0.0, "meanrev": 0.9,
+            },
+        )
+        await st.save_discovery_candidates([target])  # lowest rowid
+
+        stale_date = (date.today() - timedelta(days=100)).isoformat()
+        filler = [
+            _candidate_row(trade_date=stale_date, ticker=f"F{i:05d}", name=f"f{i}", rank=i)
+            for i in range(5400)
+        ]
+        await st.save_discovery_candidates(filler)
+
+        summary = await get_discovery_performance(st, days=14)
+
+        assert "meanrev" in summary
+        assert summary["meanrev"]["candidates"] == 1

@@ -2559,6 +2559,8 @@ class StorageService:
         self,
         trade_date: Optional[str] = None,
         ticker: Optional[str] = None,
+        trade_dates: Optional[list[str]] = None,
+        since_trade_date: Optional[str] = None,
         unfilled_fwd_only: bool = False,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
@@ -2568,10 +2570,21 @@ class StorageService:
         Args:
             trade_date: exact "YYYY-MM-DD" match, if given.
             ticker: exact ticker match, if given.
+            trade_dates: exact "YYYY-MM-DD" IN-match against a set of
+                dates, if given (e.g. services/discovery/ledger.py::
+                backfill_forward_returns scoping to exactly the 1/5/20-
+                trading-day-ago dates — pushed down to SQL so `limit`
+                below is a safety net, not the primary bound).
+            since_trade_date: "YYYY-MM-DD" lower bound (inclusive), if
+                given — trade_date >= this value.
             unfilled_fwd_only: if True, restrict to rows where at least
-                one of fwd_1d/fwd_5d/fwd_20d is still NULL — the feed
-                services/discovery/ledger.py::backfill_forward_returns
-                consumes.
+                one of fwd_1d/fwd_5d/fwd_20d is still NULL AND
+                close_price IS NOT NULL — a NULL close_price row (quality-
+                filter-excluded at scan time) can never be backfilled (see
+                backfill_forward_returns' own `if not close_price: continue`
+                skip) so it isn't a real "unfilled" candidate; including it
+                here only wastes the query's `limit` budget on rows that
+                will forever stay NULL.
             limit: max rows to return.
 
         Returns:
@@ -2588,11 +2601,21 @@ class StorageService:
                 if trade_date:
                     clauses.append("trade_date = ?")
                     params.append(trade_date)
+                if trade_dates:
+                    placeholders = ",".join("?" * len(trade_dates))
+                    clauses.append(f"trade_date IN ({placeholders})")
+                    params.extend(trade_dates)
+                if since_trade_date:
+                    clauses.append("trade_date >= ?")
+                    params.append(since_trade_date)
                 if ticker:
                     clauses.append("ticker = ?")
                     params.append(ticker)
                 if unfilled_fwd_only:
-                    clauses.append("(fwd_1d IS NULL OR fwd_5d IS NULL OR fwd_20d IS NULL)")
+                    clauses.append(
+                        "((fwd_1d IS NULL OR fwd_5d IS NULL OR fwd_20d IS NULL)"
+                        " AND close_price IS NOT NULL)"
+                    )
 
                 where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
                 params.append(limit)

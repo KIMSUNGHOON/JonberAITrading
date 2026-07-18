@@ -27,6 +27,7 @@ from services.discovery import ledger as ledger_module
 from services.discovery import orchestrator as orchestrator_module
 from services.discovery import ranker as ranker_module
 from services.discovery.orchestrator import _build_price_lookup, run_discovery_pipeline
+from services.krx_holiday.service import KRXHolidayService
 from services.storage_service import StorageService
 from services.trading.coordinator import ExecutionCoordinator
 
@@ -285,7 +286,16 @@ async def test_pipeline_scan_ok_backfills_past_candidate_using_price_lookup(
     to today is exactly 1 (DS-3 exact-slot semantics). Exercises the REAL
     `backfill_forward_returns` (not a spy) end-to-end -- only the default
     (production/network-backed) holiday-service singleton is stubbed out,
-    via ledger.py's own `_get_default_holiday_service` lazy-import seam."""
+    via ledger.py's own `_get_default_holiday_service` lazy-import seam.
+
+    Uses a real (tmp-path, no-holidays-seeded, never-initialized -- so the
+    network-hitting fetcher is never touched) KRXHolidayService rather than
+    a hand-rolled stub: the DS final-review date-scoping fix has
+    backfill_forward_returns call get_previous_trading_day (via
+    ledger._trading_day_n_before) in addition to get_trading_days_in_range,
+    so the double needs to support both. past_date (2026-07-17, Friday) ->
+    trade_date (2026-07-20, Monday) is exactly 1 trading day apart via
+    plain weekend-skipping -- no seeded holiday needed."""
     trade_date = "2026-07-20"
     past_date = "2026-07-17"
     scanner_db = tmp_path / "scanner.db"
@@ -308,13 +318,9 @@ async def test_pipeline_scan_ok_backfills_past_candidate_using_price_lookup(
 
     scanner = _FakeScanner([_scan_result("000660", 110_000)])
 
-    class _StubHolidayService:
-        def get_trading_days_in_range(self, start, end):
-            # past_date -> trade_date 사이 정확히 1거래일 경과로 취급.
-            return [start, end]
-
+    holiday_svc = KRXHolidayService(db_path=str(tmp_path / "holidays.db"))
     monkeypatch.setattr(
-        ledger_module, "_get_default_holiday_service", lambda: _StubHolidayService()
+        ledger_module, "_get_default_holiday_service", lambda: holiday_svc
     )
 
     summary = await run_discovery_pipeline(

@@ -77,6 +77,28 @@ def _trading_days_elapsed(holiday_service, start: date, end: date) -> int:
     return len(trading_days)
 
 
+def _trading_day_n_before(holiday_service, end: date, n: int) -> date:
+    """The date exactly `n` trading days before `end`, walking backward one
+    trading day at a time via the holiday service's own
+    get_previous_trading_day (an independent primitive from
+    get_trading_days_in_range/_trading_days_elapsed above, but consistent
+    with it: for d = _trading_day_n_before(svc, end, n),
+    _trading_days_elapsed(svc, d, end) == n whenever `end` is itself a
+    trading day -- which it always is here, since callers only ever pass
+    an EOD run's own trade_date).
+
+    Used to scope backfill_forward_returns' candidate query to exactly the
+    three dates whose fwd_1d/fwd_5d/fwd_20d slot could possibly become
+    newly-elapsed today, instead of pulling an unbounded (and, at
+    real-world ledger volume, budget-exhausting -- see module docstring
+    and the DS final-review fix) slice of the whole table.
+    """
+    d = end
+    for _ in range(n):
+        d = holiday_service.get_previous_trading_day(d)
+    return d
+
+
 async def backfill_forward_returns(
     storage,
     price_lookup: dict[str, float],
@@ -112,8 +134,21 @@ async def backfill_forward_returns(
 
     end_date = _parse_date(trade_date)
 
+    # Scope the query to exactly the three dates that could possibly have
+    # a newly-elapsed 1/5/20-trading-day slot today, pushed down as SQL
+    # trade_date IN (...) -- see _trading_day_n_before. This is what makes
+    # `limit` below a pure safety net rather than the operative bound: at
+    # real-world ledger volume (~2,500 rows/day across the whole
+    # universe, quality-dropped rows included), an unscoped
+    # created_at-DESC/limit=5000 query only ever sees the most recent ~2
+    # days, silently starving fwd_5d/fwd_20d forever (the bug this fixes).
+    scoped_dates = [
+        _trading_day_n_before(holiday_service, end_date, n).isoformat()
+        for n in (1, 5, 20)
+    ]
+
     candidates = await storage.get_discovery_candidates(
-        unfilled_fwd_only=True, limit=5000
+        trade_dates=scoped_dates, unfilled_fwd_only=True, limit=5000
     )
 
     filled = 0
@@ -200,8 +235,12 @@ async def get_discovery_performance(storage, days: int = 14) -> dict[str, Any]:
         already backfilled (None if none are). Empty ledger (or nothing
         in the window) returns {} -- never raises.
     """
+    cutoff = date.today() - timedelta(days=days)
+
     try:
-        candidates = await storage.get_discovery_candidates(limit=5000)
+        candidates = await storage.get_discovery_candidates(
+            since_trade_date=cutoff.isoformat(), limit=5000
+        )
     except Exception as e:
         logger.error("discovery_performance_fetch_failed", error=str(e))
         return {}
@@ -209,18 +248,10 @@ async def get_discovery_performance(storage, days: int = 14) -> dict[str, Any]:
     if not candidates:
         return {}
 
-    cutoff = date.today() - timedelta(days=days)
     buckets: dict[str, dict[str, Any]] = {}
 
     for row in candidates:
-        row_trade_date = row.get("trade_date")
-        if not row_trade_date:
-            continue
-        try:
-            row_date = _parse_date(row_trade_date)
-        except ValueError:
-            continue
-        if row_date < cutoff:
+        if not row.get("trade_date"):
             continue
 
         tag = _top_strategy_tag(row.get("strategy_scores_json"))

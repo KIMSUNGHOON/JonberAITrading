@@ -25,6 +25,7 @@ class TaskType(str, Enum):
     CHAT = "chat"
     UTILITY = "utility"
     GENERAL = "general"
+    DISCOVERY = "discovery"
 
 
 class BackendName(str, Enum):
@@ -50,6 +51,12 @@ ROUTING_POLICY: dict[TaskType, list[BackendName]] = {
     TaskType.TRANSLATION: [BackendName.OPENROUTER, BackendName.CLAUDE_CLI],
     TaskType.CHAT: [BackendName.OPENROUTER],
     TaskType.GENERAL: [BackendName.OPENROUTER, BackendName.CLAUDE_CLI],
+    # Same routing as GENERAL -- discovery's LLM suitability review (DS-4,
+    # services/discovery/ranker.py::llm_review_top) is not a strategic/
+    # high-stakes call, it just lacked an explicit TaskType entry (fell
+    # through coerce_task's unknown-task warning path -> GENERAL fallback,
+    # ~25x/day log spam). No behavior change, only the warning goes away.
+    TaskType.DISCOVERY: [BackendName.OPENROUTER, BackendName.CLAUDE_CLI],
 }
 
 # Highest-stakes tasks get the strongest Claude model (settings.CLAUDE_STRATEGIC_MODEL,
