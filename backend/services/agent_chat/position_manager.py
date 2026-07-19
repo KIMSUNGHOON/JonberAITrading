@@ -244,8 +244,22 @@ class PositionManagerConfig(BaseModel):
     # Holding period
     long_holding_days: int = 30
 
-    # Auto-execution settings
-    auto_execute_stop_loss: bool = False
+    # Auto-execution settings.
+    #
+    # S-2 (survival discipline, spec docs/superpowers/specs/
+    # 2026-07-19-survival-discipline-design.md §2, decision D1):
+    # auto_execute_stop_loss now defaults to True — a stop-loss is never
+    # optional risk reduction, so an AUTONOMOUS account must not silently
+    # sit at a breached stop waiting for a human click. This is safe for a
+    # HITL account too: the autonomy gate re-checked inside
+    # `_execute_close_position`/`_execute_reduce_position` denies with
+    # check="market_mode" whenever the account isn't actually autonomous,
+    # and that specific denial now falls back to the SAME agent-discussion
+    # path pre-S-2 HITL behavior used (see `_execute_close_position`'s deny
+    # branch) — so HITL accounts keep getting a debate + notification, not
+    # silence. auto_execute_take_profit stays False (decision D2 —
+    # profit-taking remains discussion-gated, unchanged).
+    auto_execute_stop_loss: bool = True
     auto_execute_take_profit: bool = False
     auto_update_trailing: bool = True
 
@@ -1080,6 +1094,11 @@ class PositionManager:
                 if not position.close_gate_denied_notified:
                     position.close_gate_denied_notified = True
                     await self._notify_close_gate_denied(position, reason, gate.reason)
+                # S-2 HITL fallback: a market_mode denial (account not
+                # actually autonomous) escalates to the same discussion path
+                # any other position event uses — see
+                # `_fallback_to_discussion_on_hitl_deny`.
+                await self._fallback_to_discussion_on_hitl_deny(position, reason, gate)
                 return
 
             # Gate allowed: clear the denied-notice latch so a future denial for
@@ -1128,6 +1147,71 @@ class PositionManager:
                 ticker=position.ticker,
                 error=str(e),
             )
+
+    async def _fallback_to_discussion_on_hitl_deny(
+        self,
+        position: MonitoredPosition,
+        reason: str,
+        gate,
+    ) -> None:
+        """S-2 HITL fallback (spec docs/superpowers/specs/2026-07-19-
+        survival-discipline-design.md §2, decision D1).
+
+        `auto_execute_stop_loss` now defaults to True (autonomous mode must
+        never sit at a breached stop), but a HITL account's autonomous
+        defensive SELL/REDUCE is still correctly denied by the autonomy gate
+        on every monitor tick (check_autonomy re-reads the live mode — see
+        `_execute_close_position`/`_execute_reduce_position`). Before this
+        fix that denial was notify-only: a HITL account would never again
+        see the pre-S-2 discussion/notification UX for a stopped-out
+        position, just a repeated (latched-once) Telegram notice with no
+        path to act. This restores it by escalating to the SAME
+        agent-discussion path any other position event uses
+        (`_trigger_discussion`), so a human still gets a debate + a real
+        chance to decide.
+
+        Deliberately scoped to `gate.check == "market_mode"` only:
+        paper-only / daily-loss-breaker / master-gate denials are hard stops
+        the existing notify-only branch already covers correctly — those are
+        not "ask a human" situations, escalating them would just be noise.
+
+        Reuses the EXISTING discussion throttle
+        (`_should_trigger_discussion` — max_discussions_per_position /
+        min_discussion_interval_minutes) unconditionally, so this is not a
+        new spam vector: a position stuck at its stop price still gets at
+        most one discussion per interval, exactly like any other event
+        (independent of the caller's own once-per-episode notify latch).
+        This also bounds the recursion risk from a discussion re-deciding
+        SELL/REDUCE (which routes back through `_apply_decision` into this
+        SAME close/reduce path, and could re-deny with the SAME
+        `market_mode` check): `_trigger_discussion` sets
+        `position.last_discussion` to "now" BEFORE `_apply_decision` even
+        runs, so any same-tick re-entry into this method is blocked by
+        `_should_trigger_discussion`'s interval check, not by call depth —
+        no infinite loop.
+        """
+        if gate.check != "market_mode":
+            return
+        if not self._should_trigger_discussion(position):
+            return
+
+        event_type = (
+            PositionEventType.TAKE_PROFIT_HIT
+            if reason == "take_profit"
+            else PositionEventType.STOP_LOSS_HIT
+        )
+        event = self._create_event(
+            position,
+            event_type,
+            position.current_price,
+            f"자율 매도 게이트 거부(HITL 모드, {reason}) — 토론 재개: {gate.reason}",
+        )
+        logger.info(
+            "hitl_deny_discussion_fallback",
+            ticker=position.ticker,
+            reason=reason,
+        )
+        await self._trigger_discussion(event, position)
 
     @staticmethod
     def _stops_sane(
@@ -1352,6 +1436,8 @@ class PositionManager:
                 await self._notify_reduce_gate_denied(
                     position, clamped_quantity, gate.reason
                 )
+                # S-2 HITL fallback (mirrors _execute_close_position's).
+                await self._fallback_to_discussion_on_hitl_deny(position, reason, gate)
                 return
 
             from app.dependencies import get_trading_coordinator

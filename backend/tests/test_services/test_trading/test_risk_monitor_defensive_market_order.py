@@ -17,7 +17,7 @@ test_risk_monitor_sudden_move.py (no full ExecutionCoordinator needed).
 
 import pytest
 
-from services.trading.models import ManagedPosition, OrderType, RiskParameters, StopLossMode
+from services.trading.models import AlertType, ManagedPosition, OrderType, RiskParameters, StopLossMode
 from services.trading.risk_monitor import RiskMonitor
 
 pytestmark = pytest.mark.asyncio
@@ -134,3 +134,67 @@ async def test_take_profit_fires_as_market_order_through_check_position():
 
     assert "order" in captured
     assert captured["order"].order_type == OrderType.MARKET
+
+
+# -------------------------------------------
+# S-2: stop_loss_mode live-read symmetry (survival discipline, 2026-07-19)
+# -------------------------------------------
+#
+# Before this fix, _handle_stop_loss branched on config.stop_loss_mode -- a
+# WatchConfig snapshot frozen once at add_position() time -- while
+# _handle_take_profit already branched on the LIVE self.risk_params.
+# take_profit_mode. A runtime mode change (e.g. PUT /trading/risk-params)
+# therefore reached newly-added positions but never ones already being
+# watched. This test pins the fix: flipping risk_params.stop_loss_mode
+# AFTER a position is already watched must change ITS very next
+# stop-loss-hit outcome, with no re-registration.
+#
+# Spec: docs/superpowers/specs/2026-07-19-survival-discipline-design.md §1/§2 S-2
+
+
+async def test_stop_loss_mode_runtime_change_reaches_already_watched_position():
+    """A position added while risk_params.stop_loss_mode is USER_APPROVAL
+    (so its WatchConfig snapshot is frozen at USER_APPROVAL) must start
+    auto-executing on its NEXT stop-loss hit the moment risk_params.
+    stop_loss_mode flips to AGENT_AUTO at runtime -- without ever touching
+    the position's own WatchConfig.stop_loss_mode snapshot."""
+    monitor = _monitor(stop_loss_mode=StopLossMode.USER_APPROVAL)
+    captured = {}
+
+    async def executor(order):
+        captured["order"] = order
+
+    monitor._execute_order = executor
+    # Explicit USER_APPROVAL at the position level too, isolating this test
+    # from the (separate, position-level) stop_loss_mode override -- only
+    # the RiskMonitor-level runtime read is under test here.
+    position = _position(stop_loss=65_000, stop_loss_mode=StopLossMode.USER_APPROVAL)
+    monitor.add_position(position)
+    config = monitor._watching["005930"]
+    assert config.stop_loss_mode == StopLossMode.USER_APPROVAL, (
+        "sanity: the WatchConfig snapshot must reflect the mode at "
+        "add_position time"
+    )
+
+    # First hit, BEFORE the runtime flip: must alert, not execute.
+    await monitor._handle_stop_loss("005930", config, 64_000)
+    assert "order" not in captured, (
+        "USER_APPROVAL must alert, not auto-execute"
+    )
+    assert any(a.alert_type == AlertType.STOP_LOSS_TRIGGERED for a in monitor._alerts)
+
+    # Runtime change AFTER the position is already watched -- the
+    # WatchConfig snapshot itself is deliberately left untouched.
+    monitor.risk_params.stop_loss_mode = StopLossMode.AGENT_AUTO
+    assert config.stop_loss_mode == StopLossMode.USER_APPROVAL, (
+        "the snapshot must stay frozen -- only the live read changes"
+    )
+
+    # Second hit, AFTER the runtime flip: must now auto-execute, proving
+    # _handle_stop_loss reads self.risk_params.stop_loss_mode live, not the
+    # frozen WatchConfig snapshot (RED before the fix: this would still alert).
+    await monitor._handle_stop_loss("005930", config, 64_000)
+    assert "order" in captured
+    assert captured["order"].order_type == OrderType.MARKET
+    assert captured["order"].side == "sell"
+

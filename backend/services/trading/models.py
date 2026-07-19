@@ -241,8 +241,18 @@ class RiskParameters(BaseModel):
         description="Maximum trades per day"
     )
 
-    # Stop-loss/Take-profit modes
-    stop_loss_mode: StopLossMode = StopLossMode.USER_APPROVAL
+    # Stop-loss/Take-profit modes.
+    #
+    # S-2 (survival discipline, spec docs/superpowers/specs/
+    # 2026-07-19-survival-discipline-design.md §2, decision D1): stop-loss
+    # defaults to AGENT_AUTO — a stop-loss is never optional risk reduction,
+    # so an autonomous account must not silently sit at a breached stop
+    # waiting for a human click. take_profit_mode stays USER_APPROVAL
+    # (decision D2 — profit-taking remains discussion-gated, unchanged).
+    # This field is GATE_PROTECTED (strategy_apply.py) — a strategy
+    # consensus can never move it; only a manual PUT /risk-params edit or
+    # this model default can.
+    stop_loss_mode: StopLossMode = StopLossMode.AGENT_AUTO
     take_profit_mode: StopLossMode = StopLossMode.USER_APPROVAL
 
     # Default stop/take levels applied to a newly tracked order when the

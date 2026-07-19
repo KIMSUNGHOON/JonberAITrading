@@ -2643,3 +2643,198 @@ class TestDecisionIdLineageL3:
         )
         pm.update_position("005930", current_price=73000)
         assert pm.get_position("005930").entry_decision_id == "dec-entry-1"
+
+
+# -------------------------------------------
+# S-2: Autonomous Stop-Loss Default ON + HITL Discussion Fallback
+# (survival discipline, 2026-07-19)
+# -------------------------------------------
+#
+# auto_execute_stop_loss now defaults to True (D1) -- an autonomous account
+# must never sit at a breached stop waiting for a human click. This is safe
+# for a HITL account too because the autonomy gate is re-checked inside
+# _execute_close_position/_execute_reduce_position on every attempt: a
+# market_mode denial (account not actually autonomous) now falls back to
+# the SAME agent-discussion path any other position event uses, instead of
+# silently leaving the position monitored with only a one-time notice.
+#
+# Spec: docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2 S-2
+# Brief: .superpowers/sdd/task-S-2-brief.md
+
+
+class TestS2AutoStopLossDefaultAndHitlFallback:
+    @staticmethod
+    def _position_manager(**config_overrides):
+        cfg = PositionManagerConfig(
+            check_interval_seconds=30,
+            stop_loss_warning_pct=2.0,
+            take_profit_warning_pct=2.0,
+            significant_gain_pct=10.0,
+            significant_loss_pct=5.0,
+            **config_overrides,
+        )  # auto_execute_stop_loss intentionally left at the model DEFAULT
+        return PositionManager(config=cfg)
+
+    @staticmethod
+    def _stopped_out_position(pm):
+        """A position whose current_price is already at/through its
+        stop-loss -- the very next _check_position must detect STOP_LOSS_HIT
+        -- and ONLY STOP_LOSS_HIT (isolating the event under test): -3.4%
+        unrealized P&L stays well clear of the config's 5.0%
+        significant_loss_pct threshold, so no second SIGNIFICANT_LOSS event
+        fires in the same tick and confounds the discussion-call
+        assertions below."""
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=70000,  # <= stop_loss below, -3.4% P&L
+            stop_loss=71000,
+        )
+        return pm.get_position("005930")
+
+    @staticmethod
+    def _notifier():
+        notifier = MagicMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock()
+        return notifier
+
+    # ---- ① Default ON pin (new config, no override) ----
+
+    def test_default_config_auto_execute_stop_loss_is_true(self):
+        cfg = PositionManagerConfig()
+        assert cfg.auto_execute_stop_loss is True
+
+    # ---- ⑥ Take-profit auto-execution remains OFF ----
+
+    def test_default_config_auto_execute_take_profit_still_false(self):
+        cfg = PositionManagerConfig()
+        assert cfg.auto_execute_take_profit is False
+
+    # ---- ② STOP_LOSS_HIT + gate allow (autonomous) = immediate execution,
+    # discussion never fires ----
+
+    @pytest.mark.asyncio
+    async def test_stop_loss_hit_gate_allowed_executes_immediately_no_discussion(
+        self, monkeypatch
+    ):
+        pm = self._position_manager()
+        position = self._stopped_out_position(pm)
+
+        closed = []
+        fake_coord = MagicMock()
+
+        async def _close(ticker, decision_id=None):
+            closed.append(ticker)
+
+        fake_coord._close_position = _close
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        pm._trigger_discussion = AsyncMock()
+
+        await pm._check_position(position)
+
+        assert closed == ["005930"], (
+            "auto_execute_stop_loss defaults to True -- a gate-allowed "
+            "STOP_LOSS_HIT must close immediately without a discussion"
+        )
+        pm._trigger_discussion.assert_not_awaited()
+        assert pm.get_position("005930") is None
+
+    # ---- ③ Same event + gate deny(market_mode) = discussion fallback
+    # fires, zero orders placed ----
+
+    @pytest.mark.asyncio
+    async def test_stop_loss_hit_market_mode_deny_falls_back_to_discussion(
+        self, monkeypatch
+    ):
+        pm = self._position_manager()
+        position = self._stopped_out_position(pm)
+
+        closed = []
+        fake_coord = MagicMock()
+
+        async def _close(ticker, decision_id=None):
+            closed.append(ticker)
+
+        fake_coord._close_position = _close
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def deny_gate(market, **kwargs):
+            return GateDecision(
+                allowed=False, reason="trading_mode:kiwoom is 'hitl'", check="market_mode"
+            )
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
+
+        pm._trigger_discussion = AsyncMock()
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._check_position(position)
+
+        assert closed == [], "a market_mode-denied close must not place an order"
+        pm._trigger_discussion.assert_awaited_once()
+        fired_event = pm._trigger_discussion.await_args.args[0]
+        assert fired_event.event_type == PositionEventType.STOP_LOSS_HIT
+        assert position.ticker in pm._positions, (
+            "the position must remain monitored while denied/under discussion"
+        )
+
+    # ---- ④ gate deny(paper) = no fallback (notify-only, unchanged) ----
+
+    @pytest.mark.asyncio
+    async def test_stop_loss_hit_paper_only_deny_does_not_fall_back(
+        self, monkeypatch
+    ):
+        pm = self._position_manager()
+        position = self._stopped_out_position(pm)
+
+        closed = []
+        fake_coord = MagicMock()
+
+        async def _close(ticker, decision_id=None):
+            closed.append(ticker)
+
+        fake_coord._close_position = _close
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def deny_gate(market, **kwargs):
+            return GateDecision(allowed=False, reason="paper mode only", check="paper_only")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
+
+        pm._trigger_discussion = AsyncMock()
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._check_position(position)
+
+        assert closed == []
+        # a non-market_mode denial (paper_only here) must NOT escalate to a
+        # discussion -- notify-only, unchanged pre-S-2 behavior.
+        pm._trigger_discussion.assert_not_awaited()
+        notifier.send_message.assert_awaited_once()
+

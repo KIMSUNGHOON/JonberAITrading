@@ -107,7 +107,13 @@ def test_gate_protected_fields_never_move():
     apply_strategy_to_risk_params(strategy, rp)
     for field, value in before.items():
         assert getattr(rp, field) == value, f"{field} moved!"
-    assert rp.stop_loss_mode == StopLossMode.USER_APPROVAL
+    # S-2 (survival discipline): RiskParameters.stop_loss_mode's model
+    # default flipped USER_APPROVAL -> AGENT_AUTO (decision D1). The real
+    # seal invariant is the loop above (nothing in GATE_PROTECTED_FIELDS
+    # moves when a strategy is applied) — this assertion only additionally
+    # pins the CURRENT default value so a future default change is a
+    # deliberate, visible edit here too.
+    assert rp.stop_loss_mode == StopLossMode.AGENT_AUTO
 
 
 def test_none_strategy_resets_mapped_fields_to_defaults():

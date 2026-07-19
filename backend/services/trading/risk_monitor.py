@@ -462,7 +462,19 @@ class RiskMonitor:
             f"{loss_pct:.1f}% loss ({current_price} <= {config.stop_loss})"
         )
 
-        if config.stop_loss_mode == StopLossMode.AGENT_AUTO:
+        # S-2 (survival discipline, spec docs/superpowers/specs/
+        # 2026-07-19-survival-discipline-design.md §1/§2): read the LIVE
+        # risk_params.stop_loss_mode, NOT config.stop_loss_mode (a
+        # per-position snapshot taken once at add_position time — see
+        # WatchConfig below). Before this fix a runtime mode change (PUT
+        # /trading/risk-params) never reached ALREADY-watched positions,
+        # only newly-added ones — an asymmetry _handle_take_profit below did
+        # NOT have (it already read self.risk_params.take_profit_mode
+        # live). config.stop_loss_mode itself is kept for backward
+        # compatibility (add_position's per-position override param,
+        # restore/reconciler snapshots) — it is simply no longer the
+        # execute-vs-alert source of truth.
+        if self.risk_params.stop_loss_mode == StopLossMode.AGENT_AUTO:
             # Auto-execute
             await self._execute_stop_loss(ticker, config, current_price)
         else:
