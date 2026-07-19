@@ -27,6 +27,19 @@ def _no_real_trade_log(monkeypatch):
     monkeypatch.setattr("services.trading.trade_log.record_trade_fill", MagicMock())
 
 
+@pytest.fixture(autouse=True)
+def _no_real_decision_ledger(monkeypatch):
+    """L2: same real-storage.db hazard as record_trade_fill above, for the
+    node's new pre-placement decision-ledger persist (also lazy-imported) —
+    part of the incident this file (along with test_kr_execution_fill_
+    confirm.py) caused before this fixture existed: a full run wrote stray
+    decision_source='analysis' rows into the live backend/data/storage.db."""
+    monkeypatch.setattr(
+        "services.trading.decision_ledger.persist_analysis_decision",
+        AsyncMock(return_value=None),
+    )
+
+
 ROUTERS = [
     should_continue_kr_stock_execution,
     should_continue_coin_execution,

@@ -248,6 +248,40 @@ async def kr_stock_execution_node(state: dict) -> dict:
                 "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
             }
 
+        # L2 (decision lineage restoration, spec D1/D5): persist a durable
+        # decision-ledger row (L1's persist_analysis_decision) just before
+        # order placement, so kr_stock_trades.decision_id and
+        # ManagedPosition.analysis_session_id below can carry an id that
+        # survives this SessionManager session's eventual GC (P5) instead of
+        # state.get("session_id") -- a dangling pointer once that session is
+        # cleaned up. Best-effort and entirely exception-boxed on top of
+        # persist_analysis_decision's own never-raise contract: any failure
+        # here (including get_storage_service itself) degrades to
+        # decision_id=None and order placement proceeds exactly as before
+        # this wiring existed -- a lineage gap, never an execution gap.
+        decision_id: Optional[str] = None
+        try:
+            from services.storage_service import get_storage_service
+            from services.trading.decision_ledger import persist_analysis_decision
+
+            synthesis = state.get("synthesis") or {}
+            storage = await get_storage_service()
+            decision_id = await persist_analysis_decision(
+                storage,
+                session_id=state.get("session_id"),
+                ticker=stk_cd,
+                action=action.value,
+                confidence=synthesis.get("average_confidence"),
+                rationale=synthesis.get("decision_rationale") or proposal.get("rationale"),
+            )
+        except Exception as decision_ledger_err:
+            logger.warning(
+                "kr_stock_decision_ledger_persist_failed",
+                stk_cd=stk_cd,
+                action=action.value,
+                error=str(decision_ledger_err),
+            )
+
         result = await adapter.place(
             ticker=stk_cd,
             side=exec_side,
@@ -395,6 +429,12 @@ async def kr_stock_execution_node(state: dict) -> dict:
                     status="completed" if filled_qty >= quantity else "partial",
                     order_id=order_response.ord_no,
                     session_id=state.get("session_id"),
+                    # L2: durable decision-ledger id (None if the persist
+                    # step above failed or produced no id) + entry/exit
+                    # derived from the same buy/sell split the `side` field
+                    # just above already uses.
+                    decision_id=decision_id,
+                    entry_or_exit="entry" if _is_buy_action(action) else "exit",
                 )
             except Exception as trade_log_err:
                 logger.warning(
@@ -449,7 +489,16 @@ async def kr_stock_execution_node(state: dict) -> dict:
                         avg_price=avg_fill_price,
                         stop_loss=proposal.get("stop_loss"),
                         take_profit=proposal.get("take_profit"),
-                        session_id=state.get("session_id"),
+                        # L2 (spec D1): the durable decision-ledger id, NOT
+                        # state.get("session_id") -- ManagedPosition.
+                        # analysis_session_id is meant to survive the
+                        # originating SessionManager session's GC (P5), so it
+                        # must hold an id that outlives that session, not the
+                        # session's own id. None (persist failed/no id) is
+                        # threaded through as-is -- this is a deliberate spec
+                        # change from the prior state.get("session_id")
+                        # behavior, pinned by test.
+                        session_id=decision_id,
                         source="kr_graph_execution",
                         # Parity with the poll path (coordinator.py:1560-1561):
                         # stop_loss_mode from risk params, risk from the proposal.

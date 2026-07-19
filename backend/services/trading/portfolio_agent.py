@@ -331,6 +331,10 @@ class PortfolioAgent:
                 sell_qty = int(sell_value / pos.current_price)
 
                 if sell_qty > 0:
+                    # L2 (spec D2): decision_id/session_id left unset (NULL)
+                    # on purpose — a portfolio-rebalance liquidation has no
+                    # upstream decision record to thread; NULL is the
+                    # correct lineage state here, not a gap to wire.
                     rebalance_orders.append(OrderRequest(
                         ticker=pos.ticker,
                         stock_name=pos.stock_name,
@@ -394,6 +398,8 @@ class PortfolioAgent:
                 sell_qty = int(excess_value / position.current_price)
 
                 if sell_qty > 0:
+                    # L2 (spec D2): decision_id/session_id left unset (NULL)
+                    # — same rationale as the rebalance SELL above.
                     rebalance_orders.append(OrderRequest(
                         ticker=position.ticker,
                         stock_name=position.stock_name,

@@ -859,3 +859,115 @@ async def test_on_trade_approved_sell_no_local_position_still_records_ledger_onl
     assert len(rows) == 1
     assert rows[0]["executed_quantity"] == 10
 
+
+
+# -------------------------------------------
+# 10) L2 (decision lineage restoration) — an optional decision_id parameter
+#     threads into OrderRequest.session_id for the three bare-OrderRequest
+#     sites named in the L2 brief (spec "끊김 A"): _close_position,
+#     _reduce_position, and _add_to_position. Default None keeps every
+#     EXISTING call site above (all of section 8/9, none of which pass
+#     decision_id) byte-for-byte unchanged — pinned directly here by
+#     capturing the actual OrderRequest _execute_order receives and
+#     asserting .session_id is None when the parameter is omitted.
+#     risk_monitor._execute_stop_loss/_execute_take_profit,
+#     handle_alert_action, and portfolio_agent's rebalance orders are
+#     UNCHANGED (spec D2 — mechanical/user/system exits stay NULL,
+#     commented in place at each OrderRequest construction).
+# -------------------------------------------
+
+
+def _stub_execute_order_capturing(coord, filled, status, order_id, avg_price=260_000):
+    """Like `_stub_execute_order`, but also returns the list of OrderRequest
+    objects `_execute_order` was actually invoked with, so a test can assert
+    on request-side fields (e.g. `session_id`) the returned OrderResult
+    doesn't carry."""
+    captured: list = []
+
+    async def _exec(order):
+        captured.append(order)
+        return OrderResult(
+            order_id=order_id,
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=filled,
+            avg_price=avg_price,
+            status=status,
+        )
+
+    coord._execute_order = _exec
+    return captured
+
+
+async def test_close_position_threads_decision_id_into_order_session_id(temp_storage):
+    coord, position = _coordinator_with_position(quantity=8)
+    captured = _stub_execute_order_capturing(coord, filled=8, status="filled", order_id="CLOSE-D1")
+
+    await coord._close_position("005930", decision_id="dec-close-1")
+
+    assert captured[0].session_id == "dec-close-1"
+
+
+async def test_close_position_decision_id_defaults_to_none(temp_storage):
+    """Step 1 test 4: the existing call shape (no decision_id argument) is
+    byte-for-byte unchanged — session_id stays None."""
+    coord, position = _coordinator_with_position(quantity=8)
+    captured = _stub_execute_order_capturing(coord, filled=8, status="filled", order_id="CLOSE-D2")
+
+    await coord._close_position("005930")
+
+    assert captured[0].session_id is None
+
+
+async def test_reduce_position_threads_decision_id_into_order_session_id(temp_storage):
+    coord, position = _coordinator_with_position(quantity=50)
+    captured = _stub_execute_order_capturing(coord, filled=6, status="partial", order_id="REDUCE-D1")
+
+    await coord._reduce_position("005930", 20, decision_id="dec-reduce-1")
+
+    assert captured[0].session_id == "dec-reduce-1"
+
+
+async def test_reduce_position_decision_id_defaults_to_none(temp_storage):
+    coord, position = _coordinator_with_position(quantity=50)
+    captured = _stub_execute_order_capturing(coord, filled=6, status="partial", order_id="REDUCE-D2")
+
+    await coord._reduce_position("005930", 20)
+
+    assert captured[0].session_id is None
+
+
+async def test_reduce_position_delegated_full_close_threads_decision_id(temp_storage):
+    """The oversell-clamp delegation to `_close_position` must forward
+    `decision_id` too, not silently drop it on the collapsed-to-full-close
+    path."""
+    coord, position = _coordinator_with_position(quantity=10)
+    captured = _stub_execute_order_capturing(
+        coord, filled=4, status="partial", order_id="COLLAPSE-D1"
+    )
+
+    await coord._reduce_position("005930", 999, decision_id="dec-collapse-1")  # clamps to full close
+
+    assert captured[0].session_id == "dec-collapse-1"
+
+
+async def test_add_to_position_threads_decision_id_into_order_session_id(temp_storage):
+    coord, position = _coordinator_with_position(quantity=20)
+    captured = _stub_execute_order_capturing(coord, filled=5, status="filled", order_id="ADD-D1")
+
+    await coord._add_to_position("005930", 5, decision_id="dec-add-1")
+
+    assert captured[0].session_id == "dec-add-1"
+
+
+async def test_add_to_position_decision_id_defaults_to_none(temp_storage):
+    """Existing caller (PositionManager._execute_add_position) calls
+    `_add_to_position(ticker, quantity)` positionally with no decision_id —
+    must stay session_id=None."""
+    coord, position = _coordinator_with_position(quantity=20)
+    captured = _stub_execute_order_capturing(coord, filled=5, status="filled", order_id="ADD-D2")
+
+    await coord._add_to_position("005930", 5)
+
+    assert captured[0].session_id is None

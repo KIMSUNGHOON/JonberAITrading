@@ -1817,6 +1817,10 @@ class ExecutionCoordinator:
                 )
 
                 price = config.last_price or config.entry_price
+                # L2 (spec D2): decision_id/session_id left unset (NULL) on
+                # purpose — a user-confirmed alert action has no upstream
+                # decision record to thread; NULL is the correct lineage
+                # state here, not a gap to wire.
                 order = OrderRequest(
                     ticker=alert.ticker,
                     stock_name=config.stock_name,
@@ -1850,6 +1854,8 @@ class ExecutionCoordinator:
                 )
 
                 price = config.last_price or config.take_profit
+                # L2 (spec D2): decision_id/session_id left unset (NULL) —
+                # same rationale as EXECUTE_STOP_LOSS above.
                 order = OrderRequest(
                     ticker=alert.ticker,
                     stock_name=config.stock_name,
@@ -1871,7 +1877,9 @@ class ExecutionCoordinator:
 
         await self._notify_state_change()
 
-    async def _close_position(self, ticker: str) -> Optional[OrderResult]:
+    async def _close_position(
+        self, ticker: str, decision_id: Optional[str] = None
+    ) -> Optional[OrderResult]:
         """Close a position at market price.
 
         Returns the OrderResult of the placed SELL (or None if there was no
@@ -1881,6 +1889,14 @@ class ExecutionCoordinator:
         ACTUAL filled quantity. Existing callers that ignore the return value
         (`handle_alert_action`'s CLOSE_POSITION, PositionManager's
         `_execute_close_position`) are unaffected.
+
+        `decision_id` (L2, spec D2): optional durable decision-ledger id
+        threaded into OrderRequest.session_id when the caller has one (e.g.
+        an agent-chat-discussed exit) — defaults to None, so every existing
+        call site (a user-initiated close via handle_alert_action, or a
+        `_reduce_position` delegation with no id of its own) is byte-for-byte
+        unchanged. NULL here is correct, not a gap, for callers with no
+        upstream decision to cite.
         """
         position = next(
             (p for p in self._state.positions if p.ticker == ticker),
@@ -1898,6 +1914,7 @@ class ExecutionCoordinator:
             quantity=position.quantity,
             price=position.current_price,
             reason="User-initiated close",
+            session_id=decision_id,
         )
 
         result = await self._execute_order(order)
@@ -1913,7 +1930,9 @@ class ExecutionCoordinator:
         self._register_unfilled_sell(ticker, position, order, result)
         return result
 
-    async def _reduce_position(self, ticker: str, quantity: int) -> Optional[OrderResult]:
+    async def _reduce_position(
+        self, ticker: str, quantity: int, decision_id: Optional[str] = None
+    ) -> Optional[OrderResult]:
         """Place a SELL order for a SPECIFIC quantity — a partial reduce, not
         a full close (P1, 2026-07-15,
         docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
@@ -1933,6 +1952,11 @@ class ExecutionCoordinator:
         request into a full close (requested >= held), delegates to the
         existing `_close_position` instead of duplicating its
         position-removal/risk-monitor-stop cleanup.
+
+        `decision_id` (L2, spec D2): optional durable decision-ledger id,
+        threaded into OrderRequest.session_id (and passed through to the
+        delegated `_close_position` call below) — defaults to None so every
+        existing call site is byte-for-byte unchanged.
 
         Returns the OrderResult of whichever order was actually placed (the
         partial sell, or the delegated full close) so the caller can react to
@@ -1958,7 +1982,7 @@ class ExecutionCoordinator:
         if sell_qty >= position.quantity:
             # Clamp collapses this into a full close — delegate rather than
             # duplicate _close_position's removal/stop-cleanup logic.
-            return await self._close_position(ticker)
+            return await self._close_position(ticker, decision_id=decision_id)
 
         order = OrderRequest(
             ticker=ticker,
@@ -1967,6 +1991,7 @@ class ExecutionCoordinator:
             quantity=sell_qty,
             price=position.current_price,
             reason="Autonomous partial reduce",
+            session_id=decision_id,
         )
 
         result = await self._execute_order(order)
@@ -1981,7 +2006,9 @@ class ExecutionCoordinator:
         self._register_unfilled_sell(ticker, position, order, result)
         return result
 
-    async def _add_to_position(self, ticker: str, quantity: int) -> Optional[OrderResult]:
+    async def _add_to_position(
+        self, ticker: str, quantity: int, decision_id: Optional[str] = None
+    ) -> Optional[OrderResult]:
         """Place a BUY order for a SPECIFIC quantity to increase an existing
         position — the opposite side of `_reduce_position` (P2, 2026-07-15,
         docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
@@ -2006,6 +2033,10 @@ class ExecutionCoordinator:
         average) — the exact same code path an entry BUY's
         `on_trade_approved` already exercises, so this doesn't duplicate
         that arithmetic.
+
+        `decision_id` (L2, spec D2): optional durable decision-ledger id,
+        threaded into OrderRequest.session_id — defaults to None so every
+        existing call site is byte-for-byte unchanged.
 
         Returns the OrderResult of the placed order (or None if there's no
         matching position to add to, or the requested quantity is
@@ -2033,6 +2064,7 @@ class ExecutionCoordinator:
             quantity=quantity,
             price=position.current_price,
             reason="Autonomous add-to-position",
+            session_id=decision_id,
         )
 
         result = await self._execute_order(order)

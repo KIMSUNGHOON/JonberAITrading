@@ -38,6 +38,22 @@ def _no_real_trade_log(monkeypatch):
     monkeypatch.setattr("services.trading.trade_log.record_trade_fill", MagicMock())
 
 
+@pytest.fixture(autouse=True)
+def _no_real_decision_ledger(monkeypatch):
+    """L2: the node now persists a decision-ledger row (also lazy-imported)
+    just before every order placement — same real-storage.db hazard as
+    record_trade_fill above, and this file's incident: before this fixture
+    existed, a full test run here wrote 13 stray decision_source='analysis'
+    rows into the live backend/data/storage.db (caught in L2 review, rows
+    manually purged). Neutralized to a no-op that returns None (decision_id
+    absent), matching this node's own best-effort contract on a real
+    persist failure."""
+    monkeypatch.setattr(
+        "services.trading.decision_ledger.persist_analysis_decision",
+        AsyncMock(return_value=None),
+    )
+
+
 async def _no_sleep(_seconds):
     return None
 
@@ -188,7 +204,14 @@ async def test_full_fill_registers_position_and_completes(monkeypatch):
     kwargs = mock_register.call_args.kwargs
     assert kwargs["ticker"] == "005930"
     assert kwargs["quantity"] == 10
-    assert kwargs["session_id"] == "sess-1"
+    # L2 (spec-change pin): session_id is now the durable decision-ledger id
+    # persist_analysis_decision returns, NOT state["session_id"] ("sess-1")
+    # -- this file's autouse _no_real_decision_ledger fixture neutralizes
+    # that persist call to return None, so it surfaces here as None rather
+    # than a fresh uuid (decision-lineage id generation itself is covered by
+    # tests/test_agents/test_kr_execution_trade_log.py, which uses real tmp
+    # storage instead of mocking this call away).
+    assert kwargs["session_id"] is None
     # Parity with coordinator.py:1560-1561 (_poll_tracked_fills): position
     # registers with the coordinator's stop_loss_mode + the proposal's risk.
     assert kwargs["stop_loss_mode"] == StopLossMode.AGENT_AUTO

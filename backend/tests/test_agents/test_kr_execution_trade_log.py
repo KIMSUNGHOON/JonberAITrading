@@ -189,3 +189,193 @@ async def test_zero_fill_records_nothing(monkeypatch, temp_storage):
     await trade_log.wait_for_pending_trade_fill_writes()
 
     assert await temp_storage.get_kr_stock_trades() == []
+
+
+# -------------------------------------------
+# L2 (decision lineage restoration): the graph execution node persists a
+# durable decision-ledger row (L1's persist_analysis_decision) just before
+# order placement and threads its id into BOTH record_trade_fill's
+# decision_id/entry_or_exit AND register_fill_as_position's session_id
+# (-> ManagedPosition.analysis_session_id). Previously record_trade_fill was
+# called here with neither decision_id nor entry_or_exit at all (a bare
+# keyword-omission bug — both columns landed NULL for every graph-approved
+# trade), and register_fill_as_position received state["session_id"] (the
+# SessionManager id, a dangling pointer once that session is GC'd) instead
+# of a durable id.
+# -------------------------------------------
+
+
+async def test_buy_records_decision_id_and_entry_or_exit(monkeypatch, temp_storage):
+    """Step 1 test 1 (BUY leg): a successful BUY fill's kr_stock_trades row
+    carries a freshly-issued decision_id (a uuid, not the SessionManager
+    session_id) and entry_or_exit='entry'."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeKiwoomClient([_filled("ORD1", 10, 70000)])
+    coordinator = _mock_coordinator()
+
+    with patch(
+        "agents.graph.kr_stock_nodes.execution.get_shared_kiwoom_client_async",
+        AsyncMock(return_value=client),
+    ), patch(
+        "app.dependencies.get_trading_coordinator",
+        AsyncMock(return_value=coordinator),
+    ), patch(
+        "services.trading.position_registration.register_fill_as_position",
+        new_callable=AsyncMock,
+    ):
+        result = await kr_stock_execution_node(_state())
+
+    assert result["execution_status"] == "completed"
+    await trade_log.wait_for_pending_trade_fill_writes()
+
+    rows = await temp_storage.get_kr_stock_trades()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["entry_or_exit"] == "entry"
+    assert row["decision_id"] is not None
+    assert row["decision_id"] != "sess-graph-1"  # NOT the SessionManager session id
+
+    import uuid
+
+    uuid.UUID(row["decision_id"])  # a real uuid4, not a placeholder string
+
+    decisions = await temp_storage.get_agent_chat_decisions(limit=10)
+    matching = [d for d in decisions if d["id"] == row["decision_id"]]
+    assert len(matching) == 1
+    assert matching[0]["decision_source"] == "analysis"
+    assert matching[0]["session_ref"] == "sess-graph-1"
+
+
+async def test_sell_records_decision_id_and_entry_or_exit(monkeypatch, temp_storage):
+    """Step 1 test 1 (SELL leg): entry_or_exit='exit' for a SELL/REDUCE
+    fill, mirroring the BUY leg's 'entry'."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeKiwoomClient(
+        [_filled("ORD2", 12, 71000, buy_sell_tp="매도")], ord_no="ORD2"
+    )
+    coordinator = _mock_coordinator()
+    existing = {
+        "quantity": 100,
+        "entry_price": 65000,
+        "stop_loss": 60000,
+        "take_profit": 75000,
+    }
+
+    with patch(
+        "agents.graph.kr_stock_nodes.execution.get_shared_kiwoom_client_async",
+        AsyncMock(return_value=client),
+    ), patch(
+        "app.dependencies.get_trading_coordinator",
+        AsyncMock(return_value=coordinator),
+    ):
+        result = await kr_stock_execution_node(
+            _state(
+                action="REDUCE",
+                quantity=30,
+                entry_price=71000,
+                existing_position=existing,
+            )
+        )
+
+    assert result["execution_status"] == "completed"
+    await trade_log.wait_for_pending_trade_fill_writes()
+
+    rows = await temp_storage.get_kr_stock_trades()
+    assert len(rows) == 1
+    assert rows[0]["entry_or_exit"] == "exit"
+    assert rows[0]["decision_id"] is not None
+
+
+async def test_decision_ledger_persist_failure_does_not_block_order_or_fill_recording(
+    monkeypatch, temp_storage
+):
+    """Step 1 test 2: persist_analysis_decision raising must never block
+    order placement or fill recording (spec D5, best-effort) — the trade
+    still records, just with decision_id=NULL (today's status quo, not a
+    regression)."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeKiwoomClient([_filled("ORD1", 10, 70000)])
+    coordinator = _mock_coordinator()
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("storage unavailable")
+
+    with patch(
+        "agents.graph.kr_stock_nodes.execution.get_shared_kiwoom_client_async",
+        AsyncMock(return_value=client),
+    ), patch(
+        "app.dependencies.get_trading_coordinator",
+        AsyncMock(return_value=coordinator),
+    ), patch(
+        "services.trading.position_registration.register_fill_as_position",
+        new_callable=AsyncMock,
+    ), patch(
+        "services.trading.decision_ledger.persist_analysis_decision",
+        AsyncMock(side_effect=_boom),
+    ):
+        result = await kr_stock_execution_node(_state())
+
+    assert result["execution_status"] == "completed"
+    await trade_log.wait_for_pending_trade_fill_writes()
+
+    rows = await temp_storage.get_kr_stock_trades()
+    assert len(rows) == 1
+    assert rows[0]["decision_id"] is None
+    assert rows[0]["entry_or_exit"] == "entry"
+
+
+async def test_buy_decision_id_survives_into_position_and_subsequent_close(
+    monkeypatch, temp_storage
+):
+    """Step 1 test 5 (chain): the decision_id persisted for a graph BUY is
+    threaded into ManagedPosition.analysis_session_id (NOT
+    state["session_id"], the SessionManager id) via register_fill_as_
+    position's session_id kwarg, using a REAL ExecutionCoordinator so the
+    position is actually recorded. That same id then survives as
+    kr_realized_pnl.entry_decision_id when the SAME coordinator later closes
+    the position — proving the durable id, not the ephemeral session id,
+    is what lineage consumers (calibration, EOD review) will see."""
+    from services.trading.coordinator import ExecutionCoordinator
+    from services.trading.models import OrderResult, OrderSide
+
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeKiwoomClient([_filled("ORD1", 10, 70000)])
+    coordinator = ExecutionCoordinator(kiwoom_client=None)
+    coordinator._persistence_active = True
+
+    with patch(
+        "agents.graph.kr_stock_nodes.execution.get_shared_kiwoom_client_async",
+        AsyncMock(return_value=client),
+    ), patch(
+        "app.dependencies.get_trading_coordinator",
+        AsyncMock(return_value=coordinator),
+    ):
+        result = await kr_stock_execution_node(_state())
+
+    assert result["execution_status"] == "completed"
+    await trade_log.wait_for_pending_trade_fill_writes()
+
+    positions = coordinator._state.positions
+    assert len(positions) == 1
+    decision_id = positions[0].analysis_session_id
+    assert decision_id is not None
+    assert decision_id != "sess-graph-1"  # spec-change pin: NOT the session id
+
+    async def _exec_close(order):
+        return OrderResult(
+            order_id="CLOSE1",
+            ticker=order.ticker,
+            side=OrderSide.SELL,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=71000,
+            status="filled",
+        )
+
+    coordinator._execute_order = _exec_close
+    await coordinator._close_position("005930")
+    await trade_log.wait_for_pending_trade_fill_writes()
+
+    pnl_rows = await temp_storage.get_kr_realized_pnl(stk_cd="005930")
+    assert len(pnl_rows) == 1
+    assert pnl_rows[0]["entry_decision_id"] == decision_id

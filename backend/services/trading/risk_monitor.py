@@ -558,6 +558,10 @@ class RiskMonitor:
             # order-construction fix, correct in live too, not a sim).
             order_type=OrderType.MARKET,
             reason="Stop-loss auto-execution",
+            # L2 (spec D2): decision_id/session_id left unset (NULL) on
+            # purpose — a mechanical stop-loss has no upstream decision
+            # record to thread; NULL is the correct lineage state here, not
+            # a gap to wire.
         )
 
         try:
@@ -612,6 +616,8 @@ class RiskMonitor:
             # reports the true fill instead of the (favorable) trigger price.
             order_type=OrderType.MARKET,
             reason="Take-profit auto-execution",
+            # L2 (spec D2): decision_id/session_id left unset (NULL) on
+            # purpose — same rationale as _execute_stop_loss above.
         )
 
         try:
