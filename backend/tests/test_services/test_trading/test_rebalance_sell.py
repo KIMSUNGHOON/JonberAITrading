@@ -436,3 +436,160 @@ async def test_no_rebalance_orders_never_calls_gate(temp_storage, monkeypatch):
     await _approve_main_buy(coord)
 
     assert gate_calls == []
+
+
+
+# -------------------------------------------
+# N1 (final-review fix, S final): rebalance-sell in-flight guard — the 6th
+# SELL entry point. `on_trade_approved`'s rebalance loop above places a
+# SYSTEM-computed SELL of an UNRELATED position to free up room for the
+# trade actually approved. S-2/S-3 wired `_acquire_defensive_exit_guard`/
+# `_release_defensive_exit_guard` into 5 other SELL entry points
+# (`_execute_order_from_monitor`/`_close_position`/`_reduce_position`/
+# `on_trade_approved`'s own SELL/REDUCE main path/`handle_alert_action`'s
+# EXECUTE_STOP_LOSS/EXECUTE_TAKE_PROFIT) but never this rebalance loop —
+# a BUY approval that triggers a rebalance sell of ticker X can race a
+# concurrent defensive exit (RiskMonitor/PositionManager) of the SAME
+# ticker X, producing a real double full-liquidation exactly like the
+# race the other 5 sites already guard against (see `_close_position`'s
+# docstring for the full dual-engine race rationale).
+# -------------------------------------------
+
+
+async def test_rebalance_sell_skipped_while_target_ticker_inflight(
+    temp_storage, monkeypatch
+):
+    """(1) The rebalance ticker already has a defensive exit in flight (e.g.
+    RiskMonitor mid-stop-loss for 000660) at the moment a BUY approval's
+    rebalance loop reaches it. Pre-fix (no guard on this loop): the
+    rebalance sell places a SECOND full-size order for the same ticker — a
+    real double-liquidation. Post-fix: this rebalance item is skipped as a
+    no-op (zero orders for 000660), logged as
+    `rebalance_sell_skipped_inflight`, while the primary BUY and any OTHER
+    rebalance item still proceed untouched."""
+    coord = _coordinator_with_rebalance([_rebalance_order(quantity=20)])
+    _add_position(coord, "000660", "SK하이닉스", quantity=50, session_id="s-rebal")
+
+    placed = []
+
+    async def _exec(order):
+        placed.append(order.ticker)
+        return OrderResult(
+            order_id="MAIN-N1",
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=70_000,
+            status="filled",
+        )
+
+    coord.order_agent.execute_order = _exec
+    _allow_gate(monkeypatch)
+
+    # Simulate a concurrent defensive exit (e.g. RiskMonitor's AGENT_AUTO
+    # tick) already owning 000660's SELL exit.
+    coord._defensive_exit_inflight.add("000660")
+
+    await _approve_main_buy(coord)
+
+    # The rebalance sell for the in-flight ticker must NEVER reach the
+    # broker -- a duplicate full liquidation is exactly what this guards.
+    assert "000660" not in placed
+    # The primary (human-approved) trade still executes -- the in-flight
+    # guard denial on an UNRELATED rebalance item must not abort it.
+    assert placed == ["005930"]
+    # Position untouched by this (skipped) rebalance sell.
+    position = next(p for p in coord._state.positions if p.ticker == "000660")
+    assert position.quantity == 50
+    # Skip logged against the rebalance ticker specifically.
+    rejections = [
+        a
+        for a in coord._state.activity_log
+        if a.activity_type == ActivityType.TRADE_REJECTED and a.ticker == "000660"
+    ]
+    assert len(rejections) == 1
+    assert "in flight" in rejections[0].message.lower()
+
+
+async def test_rebalance_sell_not_inflight_executes_and_releases_guard(
+    temp_storage, monkeypatch
+):
+    """(2) Not in flight: the rebalance sell executes normally (unchanged
+    behavior) AND the guard is released afterward -- a later, independent
+    rebalance/defensive exit for the SAME ticker must not be permanently
+    blocked by a stale guard entry (mirrors the S-2 release-allows-retry
+    contract for the other 5 guarded sites)."""
+    coord = _coordinator_with_rebalance([_rebalance_order(quantity=20)])
+    _add_position(coord, "000660", "SK하이닉스", quantity=50, session_id="s-rebal")
+
+    async def _exec(order):
+        if order.ticker == "000660":
+            return OrderResult(
+                order_id="REBAL-N1",
+                ticker=order.ticker,
+                side=order.side,
+                requested_quantity=20,
+                filled_quantity=20,
+                avg_price=105_000,
+                status="filled",
+            )
+        return OrderResult(
+            order_id="MAIN-N1b",
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=70_000,
+            status="filled",
+        )
+
+    coord.order_agent.execute_order = _exec
+    _allow_gate(monkeypatch)
+
+    await _approve_main_buy(coord)
+    await _flush()
+
+    # The rebalance sell actually executed (unaffected by the new guard
+    # when nothing else holds it).
+    position = next(p for p in coord._state.positions if p.ticker == "000660")
+    assert position.quantity == 30  # 50 - 20
+
+    # Guard released -- re-entrant for a future rebalance/defensive exit.
+    assert "000660" not in coord._defensive_exit_inflight
+    assert coord._acquire_defensive_exit_guard("000660") is True
+    coord._defensive_exit_inflight.discard("000660")  # cleanup
+
+
+async def test_rebalance_sell_releases_guard_on_exception(temp_storage, monkeypatch):
+    """(3) An exception during the rebalance order's own execution must
+    still release the in-flight guard via `finally` -- a raised exception
+    can never leave a ticker permanently stuck as "in flight" (same
+    contract `_release_defensive_exit_guard`'s docstring promises for
+    every other guarded SELL site)."""
+    coord = _coordinator_with_rebalance([_rebalance_order(quantity=20)])
+    _add_position(coord, "000660", "SK하이닉스", quantity=50, session_id="s-rebal")
+
+    async def _exec(order):
+        if order.ticker == "000660":
+            raise RuntimeError("simulated broker failure")
+        return OrderResult(
+            order_id="MAIN-N1c",
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=70_000,
+            status="filled",
+        )
+
+    coord.order_agent.execute_order = _exec
+    _allow_gate(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="simulated broker failure"):
+        await _approve_main_buy(coord)
+
+    assert "000660" not in coord._defensive_exit_inflight, (
+        "the guard must be released even when the rebalance order's own "
+        "execution raises"
+    )

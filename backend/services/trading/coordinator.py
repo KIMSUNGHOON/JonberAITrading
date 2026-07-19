@@ -631,60 +631,96 @@ class ExecutionCoordinator:
         from services.autonomy import check_autonomy
 
         for rebalance_order in allocation.rebalance_orders:
-            gate = await check_autonomy(
-                "kiwoom",
-                action="SELL",
-                quantity=rebalance_order.quantity,
-                entry_price=rebalance_order.price,
-            )
-            if not gate.allowed:
+            # N1 review fix (survival discipline, 6th SELL entry point): this
+            # rebalance-sell loop is a SIXTH source of SELL orders for a
+            # ticker — an UNRELATED position trimmed to free room for the
+            # trade actually approved — and can race a defensive exit
+            # (RiskMonitor/PositionManager) for the SAME ticker exactly like
+            # the other 5 guarded SELL sites (`_execute_order_from_monitor`/
+            # `_close_position`/`_reduce_position`/`on_trade_approved`'s own
+            # SELL/REDUCE main path below/`handle_alert_action`'s
+            # EXECUTE_STOP_LOSS/EXECUTE_TAKE_PROFIT) — see `_close_position`'s
+            # docstring for the full dual-engine race rationale. Acquired
+            # BEFORE the `await check_autonomy` below (not after) so the
+            # in-flight claim closes the race window from the earliest
+            # possible point, same as `_execute_order_from_monitor`'s
+            # acquire-then-gate-check ordering. Guard-denied: skip ONLY this
+            # rebalance item (the loop continues to the next rebalance order,
+            # and the primary approved order below still proceeds untouched)
+            # — the other engine's exit already owns this ticker's exit.
+            if not self._acquire_defensive_exit_guard(rebalance_order.ticker):
                 logger.warning(
-                    f"[Coordinator] Rebalance sell blocked by gate: "
-                    f"{rebalance_order.ticker} check={gate.check} reason={gate.reason}"
+                    f"[Coordinator] rebalance_sell_skipped_inflight: "
+                    f"{rebalance_order.ticker} already has a SELL exit in "
+                    f"flight — skipping this rebalance order (primary trade "
+                    f"unaffected)"
                 )
                 self._log_activity(
                     ActivityType.TRADE_REJECTED,
-                    f"Rebalance order blocked by autonomy gate: {rebalance_order.ticker} "
-                    f"({gate.reason})",
+                    f"Rebalance order skipped — defensive exit already in "
+                    f"flight for {rebalance_order.ticker}",
                     agent="system",
                     ticker=rebalance_order.ticker,
                 )
                 continue
 
-            # NOTE (pre-existing bug, fixed in passing): OrderRequest has
-            # `use_enum_values=True`, so `.side` is already a plain str
-            # ("sell") by validation time, not an OrderSide member — the old
-            # `.side.value` here raised AttributeError the moment this line
-            # actually ran (every other `.side` use in this file already
-            # compares against the plain string, e.g. line ~2411
-            # `order.side == "sell"`).
-            self._log_activity(
-                ActivityType.ORDER_PLACED,
-                f"Rebalance order: {rebalance_order.side} {rebalance_order.quantity} shares",
-                agent="order",
-                ticker=rebalance_order.ticker,
-            )
-            # Capture the position BEFORE the fill reconciles it (matches
-            # _execute_order_from_monitor's pattern) — _apply_sell_fill may
-            # reduce/remove it from _state.positions, but
-            # _register_unfilled_sell only needs stock_name/
-            # analysis_session_id/risk_score off the (still-valid) reference.
-            rebalance_position = next(
-                (p for p in self._state.positions if p.ticker == rebalance_order.ticker),
-                None,
-            )
-            rebalance_result = await self._execute_order(rebalance_order)
-            self._apply_sell_fill(
-                rebalance_order.ticker,
-                rebalance_result.filled_quantity,
-                order=rebalance_order,
-                result=rebalance_result,
-            )
-            # A partial/unfilled remainder still has broker-side exposure —
-            # track it the same way every other SELL site does (E1-1/E1-3).
-            self._register_unfilled_sell(
-                rebalance_order.ticker, rebalance_position, rebalance_order, rebalance_result
-            )
+            try:
+                gate = await check_autonomy(
+                    "kiwoom",
+                    action="SELL",
+                    quantity=rebalance_order.quantity,
+                    entry_price=rebalance_order.price,
+                )
+                if not gate.allowed:
+                    logger.warning(
+                        f"[Coordinator] Rebalance sell blocked by gate: "
+                        f"{rebalance_order.ticker} check={gate.check} reason={gate.reason}"
+                    )
+                    self._log_activity(
+                        ActivityType.TRADE_REJECTED,
+                        f"Rebalance order blocked by autonomy gate: {rebalance_order.ticker} "
+                        f"({gate.reason})",
+                        agent="system",
+                        ticker=rebalance_order.ticker,
+                    )
+                    continue
+
+                # NOTE (pre-existing bug, fixed in passing): OrderRequest has
+                # `use_enum_values=True`, so `.side` is already a plain str
+                # ("sell") by validation time, not an OrderSide member — the old
+                # `.side.value` here raised AttributeError the moment this line
+                # actually ran (every other `.side` use in this file already
+                # compares against the plain string, e.g. line ~2411
+                # `order.side == "sell"`).
+                self._log_activity(
+                    ActivityType.ORDER_PLACED,
+                    f"Rebalance order: {rebalance_order.side} {rebalance_order.quantity} shares",
+                    agent="order",
+                    ticker=rebalance_order.ticker,
+                )
+                # Capture the position BEFORE the fill reconciles it (matches
+                # _execute_order_from_monitor's pattern) — _apply_sell_fill may
+                # reduce/remove it from _state.positions, but
+                # _register_unfilled_sell only needs stock_name/
+                # analysis_session_id/risk_score off the (still-valid) reference.
+                rebalance_position = next(
+                    (p for p in self._state.positions if p.ticker == rebalance_order.ticker),
+                    None,
+                )
+                rebalance_result = await self._execute_order(rebalance_order)
+                self._apply_sell_fill(
+                    rebalance_order.ticker,
+                    rebalance_result.filled_quantity,
+                    order=rebalance_order,
+                    result=rebalance_result,
+                )
+                # A partial/unfilled remainder still has broker-side exposure —
+                # track it the same way every other SELL site does (E1-1/E1-3).
+                self._register_unfilled_sell(
+                    rebalance_order.ticker, rebalance_position, rebalance_order, rebalance_result
+                )
+            finally:
+                self._release_defensive_exit_guard(rebalance_order.ticker)
 
         # Execute main order
         order = OrderRequest(
@@ -1151,9 +1187,11 @@ class ExecutionCoordinator:
         breached stop and race to close the same position. RiskMonitor only
         ever triggers a defensive SELL through this method (never BUY), but
         the `is_sell` check is explicit rather than assumed, matching the
-        "BUY/ADD paths stay untouched" contract shared with the other
+        "BUY/ADD paths stay untouched" contract shared with the other 5
         guarded SELL sites (`_close_position`/`_reduce_position`/
-        `on_trade_approved`'s SELL/REDUCE main path).
+        `on_trade_approved`'s SELL/REDUCE main path AND its rebalance-orders
+        loop, N1/`handle_alert_action`'s EXECUTE_STOP_LOSS/
+        EXECUTE_TAKE_PROFIT) — 6 guarded SELL sites total.
         """
         from services.autonomy import check_autonomy
 
