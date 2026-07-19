@@ -101,6 +101,11 @@ async def register_fill_as_position(
                 avg_price=avg_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
+                # L3 (spec docs/superpowers/specs/2026-07-19-decision-lineage-
+                # design.md): mirrors the coordinator's ManagedPosition.
+                # analysis_session_id above — the SAME session_id is the
+                # durable entry decision id for the PM's own ledger too.
+                entry_decision_id=session_id,
             )
         else:
             # coalesce: PM에 이미 사용자가 설정한 스탑(non-None)이 있으면
@@ -109,11 +114,19 @@ async def register_fill_as_position(
             # quantity는 증분 델타 → update_position은 절대값 할당이므로
             # 기존 보유량에 합산해 넘긴다(2-트랜치 20+28=48; 델타를 그대로
             # 넘기면 PM만 28로 과소보고).
+            # entry_decision_id도 동일 coalesce: 기존 포지션에 이미 진짜
+            # 진입 결정 id가 있으면(첫 트랜치) 이후 트랜치의 session_id로
+            # 덮어쓰지 않는다 — coordinator._add_position의 merge 분기가
+            # analysis_session_id를 절대 건드리지 않는 것과 동일 불변식
+            # (entry는 최초 1회만 성립).
             position_manager.update_position(
                 ticker=ticker,
                 quantity=existing.quantity + quantity,
                 stop_loss=stop_loss if existing.stop_loss is None else None,
                 take_profit=take_profit if existing.take_profit is None else None,
+                entry_decision_id=(
+                    session_id if existing.entry_decision_id is None else None
+                ),
             )
     except Exception as e:
         logger.warning(

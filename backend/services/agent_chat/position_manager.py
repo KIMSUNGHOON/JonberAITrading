@@ -137,6 +137,19 @@ class MonitoredPosition(BaseModel):
     last_check: datetime = Field(default_factory=datetime.now)
     last_discussion: Optional[datetime] = None
 
+    # Provenance (L3, 2026-07-19,
+    # docs/superpowers/specs/2026-07-19-decision-lineage-design.md Task L3):
+    # the durable agent_chat_decisions.id of the discussion that established
+    # this position's ENTRY, when one exists. Set once at add_position()
+    # time and never overwritten by a later merge/update (mirrors
+    # ExecutionCoordinator._add_position's analysis_session_id, whose own
+    # merge branch never touches it either once a position already exists).
+    # In-memory only (pydantic model, no schema/persistence needed here) — a
+    # broker-sync-discovered position (sync_from_account) has no discussion
+    # behind it, so this stays None. That is the normal, expected case (spec
+    # D2), not a gap.
+    entry_decision_id: Optional[str] = None
+
     # Strategic re-evaluation tracking (P3, 2026-07-15,
     # docs/superpowers/plans/2026-07-15-position-mgmt-execution.md). When
     # this position was last proactively re-judged (interval OR
@@ -407,6 +420,7 @@ class PositionManager:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
+        entry_decision_id: Optional[str] = None,
     ) -> MonitoredPosition:
         """
         Add a position to monitor.
@@ -420,6 +434,10 @@ class PositionManager:
             stop_loss: Stop-loss price
             take_profit: Take-profit price
             trailing_stop_pct: Trailing stop percentage
+            entry_decision_id: durable agent_chat_decisions.id that decided
+                this entry (L3) — optional, defaults to None so every
+                existing call site (sync_from_account, direct test/manual
+                calls) is byte-for-byte unchanged.
 
         Returns:
             Created MonitoredPosition
@@ -433,6 +451,7 @@ class PositionManager:
             stop_loss=stop_loss,
             take_profit=take_profit,
             trailing_stop_pct=trailing_stop_pct,
+            entry_decision_id=entry_decision_id,
             highest_price=current_price or avg_price,
             lowest_price=current_price or avg_price,
             # Strategic re-eval baseline starts at monitoring-start (P3) —
@@ -467,6 +486,7 @@ class PositionManager:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
+        entry_decision_id: Optional[str] = None,
     ) -> Optional[MonitoredPosition]:
         """Update a monitored position.
 
@@ -500,6 +520,9 @@ class PositionManager:
 
         if trailing_stop_pct is not None:
             position.trailing_stop_pct = trailing_stop_pct
+
+        if entry_decision_id is not None:
+            position.entry_decision_id = entry_decision_id
 
         position.last_check = datetime.now()
         self._schedule_persist_stops()
@@ -972,9 +995,16 @@ class PositionManager:
             position.discussion_count += 1
             position.last_discussion = datetime.now()
 
-            # Handle decision
+            # Handle decision. session.id is the REAL, persisted
+            # agent_chat_decisions.id (decision_log.persist_session writes
+            # it verbatim as decision_id on both the decision and vote
+            # rows) — the only place a genuine discussion-issued exit
+            # decision id exists (L3, spec
+            # docs/superpowers/specs/2026-07-19-decision-lineage-design.md).
             if session.decision:
-                await self._apply_decision(position, session.decision)
+                await self._apply_decision(
+                    position, session.decision, decision_id=session.id
+                )
 
         except Exception as e:
             logger.error(
@@ -995,6 +1025,10 @@ class PositionManager:
             event_type=event.event_type.value,
         )
 
+        # decision_id intentionally omitted here (defaults to None):
+        # mechanical stop-loss/take-profit auto-execution has no upstream
+        # discussion decision to cite — spec D2 says NULL is correct here,
+        # not a gap. Do not thread one in.
         try:
             if event.event_type == PositionEventType.STOP_LOSS_HIT:
                 await self._execute_close_position(position, "stop_loss")
@@ -1011,6 +1045,7 @@ class PositionManager:
         self,
         position: MonitoredPosition,
         reason: str,
+        decision_id: Optional[str] = None,
     ) -> None:
         """Execute an autonomous defensive close via the trading coordinator.
 
@@ -1054,7 +1089,7 @@ class PositionManager:
             from app.dependencies import get_trading_coordinator
             trading_coord = await get_trading_coordinator()
 
-            await trading_coord._close_position(position.ticker)
+            await trading_coord._close_position(position.ticker, decision_id=decision_id)
 
             # Remove from monitoring
             self.remove_position(position.ticker)
@@ -1260,6 +1295,7 @@ class PositionManager:
         position: MonitoredPosition,
         requested_quantity: int,
         reason: str,
+        decision_id: Optional[str] = None,
     ) -> None:
         """Execute a quantity-specified partial sell via the trading
         coordinator (P1, 2026-07-15,
@@ -1322,7 +1358,7 @@ class PositionManager:
 
             trading_coord = await get_trading_coordinator()
             result = await trading_coord._reduce_position(
-                position.ticker, clamped_quantity
+                position.ticker, clamped_quantity, decision_id=decision_id
             )
 
             if result is None:
@@ -1491,6 +1527,7 @@ class PositionManager:
         position: MonitoredPosition,
         add_quantity: int,
         reason: str,
+        decision_id: Optional[str] = None,
     ) -> None:
         """Execute a percentage-of-holding ADD (increase) via the trading
         coordinator (P2, 2026-07-15,
@@ -1549,7 +1586,7 @@ class PositionManager:
 
             trading_coord = await get_trading_coordinator()
             result = await trading_coord._add_to_position(
-                position.ticker, add_quantity
+                position.ticker, add_quantity, decision_id=decision_id
             )
 
             if result is None:
@@ -1604,6 +1641,7 @@ class PositionManager:
         self,
         position: MonitoredPosition,
         decision,
+        decision_id: Optional[str] = None,
     ) -> None:
         """Apply a decision from agent discussion to the position.
 
@@ -1638,7 +1676,9 @@ class PositionManager:
 
         try:
             if decision.action == DecisionAction.SELL:
-                await self._execute_close_position(position, "agent_decision")
+                await self._execute_close_position(
+                    position, "agent_decision", decision_id=decision_id
+                )
 
             elif decision.action == DecisionAction.REDUCE:
                 # Partial close - calculate quantity
@@ -1646,14 +1686,17 @@ class PositionManager:
                     new_quantity = position.quantity - decision.quantity
                     if new_quantity <= 0:
                         # Full close: the REAL executing path. Unchanged.
-                        await self._execute_close_position(position, "agent_decision_reduce")
+                        await self._execute_close_position(
+                            position, "agent_decision_reduce", decision_id=decision_id
+                        )
                     else:
                         # Partial reduce: real execution path (P1,
                         # 2026-07-15) — a quantity-specified SELL through the
                         # SAME autonomy gate the full-close path uses.
                         # Replaces P0's notify-only stand-in.
                         await self._execute_reduce_position(
-                            position, decision.quantity, "agent_decision_reduce_partial"
+                            position, decision.quantity, "agent_decision_reduce_partial",
+                            decision_id=decision_id,
                         )
 
             elif decision.action in (DecisionAction.HOLD, DecisionAction.ADD):
@@ -1666,7 +1709,7 @@ class PositionManager:
                     # HOLD regardless of the add's own outcome.
                     add_qty = round(position.quantity * self.config.add_position_pct)
                     await self._execute_add_position(
-                        position, add_qty, "agent_decision_add"
+                        position, add_qty, "agent_decision_add", decision_id=decision_id
                     )
 
                 # Update stops if provided — after sanity validation (P0-2a).

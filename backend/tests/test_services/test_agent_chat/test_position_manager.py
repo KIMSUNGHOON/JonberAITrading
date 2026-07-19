@@ -1391,7 +1391,7 @@ class TestApplyDecisionHonestyP0:
         closed = []
         fake_coord = MagicMock()
 
-        async def _close(ticker):
+        async def _close(ticker, decision_id=None):
             closed.append(ticker)
 
         fake_coord._close_position = _close
@@ -1420,7 +1420,7 @@ class TestApplyDecisionHonestyP0:
         closed = []
         fake_coord = MagicMock()
 
-        async def _close(ticker):
+        async def _close(ticker, decision_id=None):
             closed.append(ticker)
 
         fake_coord._close_position = _close
@@ -1504,7 +1504,7 @@ class TestApplyDecisionReducePartialP1:
         reduce_calls = []
         fake_coord = MagicMock()
 
-        async def _reduce(ticker, quantity):
+        async def _reduce(ticker, quantity, decision_id=None):
             reduce_calls.append((ticker, quantity))
             return _order_result(filled_quantity=quantity)
 
@@ -1549,7 +1549,7 @@ class TestApplyDecisionReducePartialP1:
         reduce_calls = []
         fake_coord = MagicMock()
 
-        async def _reduce(ticker, quantity):
+        async def _reduce(ticker, quantity, decision_id=None):
             reduce_calls.append((ticker, quantity))
             return _order_result(filled_quantity=quantity)
 
@@ -1596,7 +1596,7 @@ class TestApplyDecisionReducePartialP1:
 
         fake_coord = MagicMock()
 
-        async def _reduce(ticker, quantity):
+        async def _reduce(ticker, quantity, decision_id=None):
             return _order_result(filled_quantity=0, requested_quantity=quantity)
 
         fake_coord._reduce_position = _reduce
@@ -1677,7 +1677,7 @@ class TestApplyDecisionReducePartialP1:
 
         fake_coord = MagicMock()
 
-        async def _reduce(ticker, quantity):
+        async def _reduce(ticker, quantity, decision_id=None):
             # Simulate the coordinator's own clamp/ledger actually selling
             # the full 100 (e.g. its ManagedPosition only held 100 too, and
             # the clamp there collapsed the request into a full close).
@@ -1806,7 +1806,7 @@ class TestApplyDecisionAddP2:
         add_calls = []
         fake_coord = MagicMock()
 
-        async def _add(ticker, quantity):
+        async def _add(ticker, quantity, decision_id=None):
             add_calls.append((ticker, quantity))
             return _buy_order_result(filled_quantity=quantity, avg_price=74_000)
 
@@ -1849,7 +1849,7 @@ class TestApplyDecisionAddP2:
         add_calls = []
         fake_coord = MagicMock()
 
-        async def _add(ticker, quantity):
+        async def _add(ticker, quantity, decision_id=None):
             add_calls.append((ticker, quantity))
             return _buy_order_result(filled_quantity=quantity)
 
@@ -1877,7 +1877,7 @@ class TestApplyDecisionAddP2:
         add_calls = []
         fake_coord = MagicMock()
 
-        async def _add(ticker, quantity):
+        async def _add(ticker, quantity, decision_id=None):
             add_calls.append((ticker, quantity))
             return _buy_order_result(filled_quantity=quantity)
 
@@ -1927,7 +1927,7 @@ class TestApplyDecisionAddP2:
         add_calls = []
         fake_coord = MagicMock()
 
-        async def _add(ticker, quantity):
+        async def _add(ticker, quantity, decision_id=None):
             add_calls.append((ticker, quantity))
             return _buy_order_result(filled_quantity=quantity)
 
@@ -1968,7 +1968,7 @@ class TestApplyDecisionAddP2:
 
         fake_coord = MagicMock()
 
-        async def _add(ticker, quantity):
+        async def _add(ticker, quantity, decision_id=None):
             return _buy_order_result(filled_quantity=0)
 
         fake_coord._add_to_position = _add
@@ -2038,7 +2038,7 @@ class TestApplyDecisionAddP2:
 
         fake_coord = MagicMock()
 
-        async def _add(ticker, quantity):
+        async def _add(ticker, quantity, decision_id=None):
             return _buy_order_result(filled_quantity=quantity)
 
         fake_coord._add_to_position = _add
@@ -2426,7 +2426,13 @@ class TestStrategicReevalTriggerP3:
         (real) -> a manual discussion whose session.decision is SELL ->
         _apply_decision (real) -> the SAME gated close path defensive SELLs
         already use. Proves P3 reuses the existing chain end-to-end rather
-        than duplicating execution."""
+        than duplicating execution.
+
+        L3 (spec docs/superpowers/specs/2026-07-19-decision-lineage-
+        design.md): also pins that session.id -- the REAL, persisted
+        agent_chat_decisions.id -- reaches the coordinator's _close_position
+        call as decision_id, closing 끊김 B (the discussion knows the real
+        decision id but _apply_decision used to drop it on the floor)."""
         pm = self._position_manager(reeval_interval_minutes=60, reeval_price_change_pct=3.0)
         position = self._fresh_no_defensive_position(pm)
         position.last_reeval_at = datetime.now() - timedelta(minutes=61)
@@ -2437,7 +2443,7 @@ class TestStrategicReevalTriggerP3:
             stop_loss=None,
             take_profit=None,
         )
-        session = SimpleNamespace(decision=decision)
+        session = SimpleNamespace(id="reeval-decision-1", decision=decision)
 
         fake_coordinator = MagicMock()
         fake_coordinator.start_manual_discussion = AsyncMock(return_value=session)
@@ -2446,8 +2452,8 @@ class TestStrategicReevalTriggerP3:
         closed = []
         fake_trading_coord = MagicMock()
 
-        async def _close(ticker):
-            closed.append(ticker)
+        async def _close(ticker, decision_id=None):
+            closed.append((ticker, decision_id))
 
         fake_trading_coord._close_position = _close
         monkeypatch.setattr(
@@ -2466,7 +2472,10 @@ class TestStrategicReevalTriggerP3:
         call_kwargs = fake_coordinator.start_manual_discussion.await_args.kwargs
         assert call_kwargs["ticker"] == "005930"
         assert call_kwargs["wait"] is True
-        assert closed == ["005930"], "the SELL decision must reach the REAL gated close path"
+        assert closed == [("005930", "reeval-decision-1")], (
+            "the SELL decision must reach the REAL gated close path WITH "
+            "the discussion's real decision id threaded as decision_id"
+        )
         assert pm.get_position("005930") is None
 
     # ---- 9. Regression: existing defensive-event detection unaffected ----
@@ -2497,3 +2506,140 @@ class TestStrategicReevalTriggerP3:
             e for e in events if e.event_type == PositionEventType.STRATEGIC_REEVAL
         ]
         assert strategic_events == [], "defensive event must suppress strategic reeval this tick"
+
+
+# -------------------------------------------
+# Decision-Id Provenance (L3, 2026-07-19)
+# -------------------------------------------
+#
+# 끊김 B: MonitoredPosition carried no provenance at all, and
+# _trigger_discussion held session.id (the REAL, persisted
+# agent_chat_decisions.id) but dropped it before _apply_decision ever
+# reached the coordinator. The discussion-issued exit -> coordinator
+# decision_id chain (Step 1 test 1) is pinned end-to-end by
+# TestPositionManagerStrategicReeval::test_strategic_reeval_decision_flows_to_apply_decision
+# above (real _trigger_discussion -> real _apply_decision -> real
+# _execute_close_position). These tests cover the remaining three: the
+# non-discussion auto-execute path staying decision_id=None (spec D2), the
+# entry_decision_id field round trip, and existing add_position call sites
+# staying unaffected.
+#
+# Spec: docs/superpowers/specs/2026-07-19-decision-lineage-design.md (L3)
+# Brief: .superpowers/sdd/task-L-3-brief.md
+
+
+class TestDecisionIdLineageL3:
+    @staticmethod
+    def _position(config, quantity=100, current_price=68000, stop_loss=68875):
+        pm = PositionManager(config=config)
+        pos = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=quantity,
+            avg_price=72500,
+            current_price=current_price,
+            stop_loss=stop_loss,
+        )
+        return pm, pos
+
+    # ---- Step 1 test 2: auto-execute (non-discussion) close = decision_id=None ----
+
+    @pytest.mark.asyncio
+    async def test_auto_execute_stop_loss_close_has_no_decision_id(
+        self, config, monkeypatch
+    ):
+        """D2 (spec): a mechanical stop-loss auto-execute close has no
+        upstream discussion decision to cite -- decision_id must reach the
+        coordinator as explicit None, not be silently omitted or invented."""
+        pm, pos = self._position(config)
+
+        close_calls = []
+        fake_coord = MagicMock()
+
+        async def _close(ticker, decision_id=None):
+            close_calls.append((ticker, decision_id))
+
+        fake_coord._close_position = _close
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        event = PositionEvent(
+            ticker="005930",
+            event_type=PositionEventType.STOP_LOSS_HIT,
+            current_price=68000,
+            trigger_value=68875,
+            message="손절가 도달",
+            auto_execute=True,
+        )
+        await pm._auto_execute_event(event, pos)
+
+        assert close_calls == [("005930", None)], (
+            "auto-execute (non-discussion) close must pass decision_id=None explicitly"
+        )
+
+    # ---- Step 1 test 4: existing add_position call sites unaffected (default None) ----
+
+    def test_add_position_default_entry_decision_id_is_none(self, config):
+        """Every existing add_position call site (direct test calls,
+        sync_from_account) omits entry_decision_id -- must default to None,
+        byte-for-byte unchanged behavior."""
+        pm = PositionManager(config=config)
+        pos = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=72500,
+        )
+        assert pos.entry_decision_id is None
+
+    def test_add_position_accepts_explicit_entry_decision_id(self, config):
+        """New optional param: when a caller HAS a durable decision id, it
+        lands on the created position."""
+        pm = PositionManager(config=config)
+        pos = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=72500,
+            entry_decision_id="dec-entry-1",
+        )
+        assert pos.entry_decision_id == "dec-entry-1"
+
+    def test_update_position_sets_entry_decision_id_when_passed(self, config):
+        pm = PositionManager(config=config)
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=72500,
+        )
+        pm.update_position("005930", entry_decision_id="dec-backfill-1")
+        assert pm.get_position("005930").entry_decision_id == "dec-backfill-1"
+
+    def test_update_position_omitted_entry_decision_id_leaves_field_unchanged(
+        self, config
+    ):
+        """update_position's default None must NOT clobber an already-set
+        entry_decision_id -- the same coalesce discipline every other
+        optional field in this method already follows."""
+        pm = PositionManager(config=config)
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=72500,
+            entry_decision_id="dec-entry-1",
+        )
+        pm.update_position("005930", current_price=73000)
+        assert pm.get_position("005930").entry_decision_id == "dec-entry-1"

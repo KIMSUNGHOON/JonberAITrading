@@ -74,7 +74,8 @@ async def test_new_position_registers_in_both_engines_with_stops(monkeypatch):
     assert pos.take_profit == 77000.0
     assert pos.analysis_session_id == "sess-1"
 
-    # (2) PM: 신규 티커 → add_position, 스탑 그대로 전달
+    # (2) PM: 신규 티커 → add_position, 스탑 그대로 전달 + entry_decision_id=session_id
+    # (L3: 코디네이터 쪽 analysis_session_id와 동일 id가 PM 쪽 entry_decision_id로도 전달)
     pm.add_position.assert_called_once_with(
         ticker="005930",
         stock_name="삼성전자",
@@ -82,6 +83,7 @@ async def test_new_position_registers_in_both_engines_with_stops(monkeypatch):
         avg_price=70000.0,
         stop_loss=66500.0,
         take_profit=77000.0,
+        entry_decision_id="sess-1",
     )
     pm.update_position.assert_not_called()
 
@@ -117,13 +119,16 @@ async def test_existing_pm_stop_is_preserved_but_quantity_updates(monkeypatch):
     assert coordinator._add_position.call_count == 1
 
     # PM: 기존 티커 → update_position, stop_loss는 기존 non-None이라 미전달(None),
-    # take_profit은 기존 None이었으므로 신규값 전달, quantity는 증분 합산(5+15=20)
+    # take_profit은 기존 None이었으므로 신규값 전달, quantity는 증분 합산(5+15=20).
+    # session_id 미전달(None) + 기존 entry_decision_id도 None → coalesce 결과 None
+    # (L3: 값이 없으니 백필할 것도 없음).
     pm.add_position.assert_not_called()
     pm.update_position.assert_called_once_with(
         ticker="005930",
         quantity=20,
         stop_loss=None,
         take_profit=77000.0,
+        entry_decision_id=None,
     )
 
 
@@ -167,6 +172,7 @@ async def test_incremental_fill_delta_sums_into_existing_pm_quantity(monkeypatch
         quantity=48,
         stop_loss=246560.0,
         take_profit=289440.0,
+        entry_decision_id=None,
     )
 
 
@@ -252,3 +258,101 @@ async def test_pm_lookup_failure_does_not_prevent_coordinator_registration(monke
     )
 
     assert coordinator._add_position.call_count == 1
+
+
+# -------------------------------------------
+# entry_decision_id round trip (L3, 2026-07-19,
+# docs/superpowers/specs/2026-07-19-decision-lineage-design.md)
+# -------------------------------------------
+#
+# Mirrors the ManagedPosition.analysis_session_id wiring above, but for the
+# PM's OWN ledger (MonitoredPosition.entry_decision_id). Same coalesce
+# discipline as stop_loss/take_profit: a fresh position gets the incoming
+# session_id outright; an existing position only backfills when its own
+# entry_decision_id is still None -- a real, already-recorded entry decision
+# is never overwritten by a later fill's session_id (mirrors
+# ExecutionCoordinator._add_position's merge branch, which never touches
+# analysis_session_id once a position already exists).
+
+
+async def test_existing_pm_entry_decision_id_backfilled_when_none(monkeypatch):
+    """The PM's own ledger has no entry_decision_id yet (e.g. this ticker was
+    first registered by a path with no session_id) -- a later fill carrying
+    a real session_id backfills it."""
+    coordinator = _coordinator()
+    existing = MonitoredPosition(
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=5,
+        avg_price=68000.0,
+        current_price=70000.0,
+        stop_loss=None,
+        take_profit=None,
+        entry_decision_id=None,
+    )
+    pm = _pm(existing=existing)
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(pm)),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=15,
+        avg_price=69000.0,
+        stop_loss=None,
+        take_profit=None,
+        session_id="sess-backfill",
+    )
+
+    pm.update_position.assert_called_once_with(
+        ticker="005930",
+        quantity=20,
+        stop_loss=None,
+        take_profit=None,
+        entry_decision_id="sess-backfill",
+    )
+
+
+async def test_existing_pm_entry_decision_id_not_overwritten_once_set(monkeypatch):
+    """The PM's own ledger already has a real entry_decision_id (the first
+    tranche's discussion) -- a second tranche's DIFFERENT session_id must
+    NOT overwrite it. Entry is a one-time fact, mirroring the coordinator's
+    own ManagedPosition.analysis_session_id merge behavior."""
+    coordinator = _coordinator()
+    existing = MonitoredPosition(
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=5,
+        avg_price=68000.0,
+        current_price=70000.0,
+        stop_loss=None,
+        take_profit=None,
+        entry_decision_id="sess-original-entry",
+    )
+    pm = _pm(existing=existing)
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(pm)),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=15,
+        avg_price=69000.0,
+        stop_loss=None,
+        take_profit=None,
+        session_id="sess-second-tranche",
+    )
+
+    pm.update_position.assert_called_once_with(
+        ticker="005930",
+        quantity=20,
+        stop_loss=None,
+        take_profit=None,
+        entry_decision_id=None,
+    )

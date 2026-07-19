@@ -275,7 +275,7 @@ async def test_defensive_close_blocked_when_gate_denies(monkeypatch):
     closed = []
     fake_coord = MagicMock()
 
-    async def _close(ticker):
+    async def _close(ticker, decision_id=None):
         closed.append(ticker)
 
     fake_coord._close_position = _close
@@ -336,7 +336,7 @@ async def test_defensive_close_proceeds_when_gate_allows(monkeypatch):
     closed = []
     fake_coord = MagicMock()
 
-    async def _close(ticker):
+    async def _close(ticker, decision_id=None):
         closed.append(ticker)
 
     fake_coord._close_position = _close
