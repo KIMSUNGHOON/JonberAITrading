@@ -101,6 +101,21 @@ def get_event_korean(event_type: PositionEventType) -> dict:
     })
 
 
+# Minor review fix (S-2): `_execute_close_position`/`_execute_reduce_position`
+# pass one of these `reason` strings through. Used by
+# `_fallback_to_discussion_on_hitl_deny` to label its reconstructed event
+# with the type that actually matches WHY the close/reduce was attempted,
+# instead of defaulting every non-take_profit reason to STOP_LOSS_HIT.
+# "agent_decision"/"agent_decision_reduce"/"agent_decision_reduce_partial"
+# (a plain discussion SELL/REDUCE, not a mechanical stop trigger) are
+# intentionally absent here -- they fall through to the caller's
+# STRATEGIC_REEVAL default.
+_EXIT_REASON_TO_EVENT_TYPE: Dict[str, PositionEventType] = {
+    "stop_loss": PositionEventType.STOP_LOSS_HIT,
+    "take_profit": PositionEventType.TAKE_PROFIT_HIT,
+}
+
+
 class PositionAction(str, Enum):
     """Actions that can be taken on positions."""
     HOLD = "hold"                    # Keep position
@@ -1195,10 +1210,17 @@ class PositionManager:
         if not self._should_trigger_discussion(position):
             return
 
-        event_type = (
-            PositionEventType.TAKE_PROFIT_HIT
-            if reason == "take_profit"
-            else PositionEventType.STOP_LOSS_HIT
+        # Minor review fix (S-2): reconstructed event_type must reflect the
+        # ACTUAL trigger, not default every non-take_profit reason to
+        # STOP_LOSS_HIT. `_execute_close_position`/`_execute_reduce_position`
+        # pass `reason` through as one of "stop_loss", "take_profit", or an
+        # "agent_decision*" family (a plain discussion SELL/REDUCE, not a
+        # mechanical stop trigger) — the latter maps to STRATEGIC_REEVAL, the
+        # closest existing event type for "a decision is being re-applied",
+        # so the reconstructed event's log/notification accurately describes
+        # what actually happened.
+        event_type = _EXIT_REASON_TO_EVENT_TYPE.get(
+            reason, PositionEventType.STRATEGIC_REEVAL
         )
         event = self._create_event(
             position,

@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 import services.storage_service as ss
 import services.agent_chat.position_manager as pm_mod
-from services.agent_chat.models import DecisionAction
+from services.agent_chat.models import DecisionAction, TradeDecision
 from services.agent_chat.position_manager import (
     PositionManager,
     PositionManagerConfig,
@@ -2838,3 +2838,162 @@ class TestS2AutoStopLossDefaultAndHitlFallback:
         pm._trigger_discussion.assert_not_awaited()
         notifier.send_message.assert_awaited_once()
 
+
+
+# -------------------------------------------
+# S-2 review fix: recursion-safety permanent regression (real chain)
+# -------------------------------------------
+#
+# The reviewer probed this exact scenario: a HITL-denied STOP_LOSS_HIT falls
+# back to a discussion (`_fallback_to_discussion_on_hitl_deny` ->
+# `_trigger_discussion`); the discussion re-decides SELL; `_apply_decision`
+# routes that SELL back into `_execute_close_position`; the SAME market_mode
+# gate denies it again; the SECOND `_fallback_to_discussion_on_hitl_deny`
+# call must NOT spawn a second discussion, because `_trigger_discussion` sets
+# `position.last_discussion` to "now" BEFORE `_apply_decision` even runs --
+# so the re-entry is blocked by `_should_trigger_discussion`'s cooldown
+# interval, not by call depth. This test exercises the REAL method chain
+# (`_execute_close_position` -> `_fallback_to_discussion_on_hitl_deny` ->
+# `_trigger_discussion` -> `_apply_decision` -> `_execute_close_position`
+# again) with nothing mocked except the autonomy gate and the chat-
+# coordinator boundary (`start_manual_discussion`, which would otherwise
+# spin up a real LLM discussion) -- unlike the existing S-2 tests above,
+# which stub `_trigger_discussion` itself and so cannot catch a recursion
+# regression.
+
+
+class TestS2RecursionSafetyRealChain:
+    @staticmethod
+    def _position_manager():
+        cfg = PositionManagerConfig(
+            check_interval_seconds=30,
+            stop_loss_warning_pct=2.0,
+            take_profit_warning_pct=2.0,
+            significant_gain_pct=10.0,
+            significant_loss_pct=5.0,
+        )
+        return PositionManager(config=cfg)
+
+    @pytest.mark.asyncio
+    async def test_hitl_fallback_sell_redecision_does_not_recurse(self, monkeypatch):
+        pm = self._position_manager()
+        position = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=70000,  # already through stop_loss
+            stop_loss=71000,
+        )
+
+        # The gate ALWAYS denies with market_mode -- both the original
+        # mechanical STOP_LOSS_HIT attempt AND the discussion's re-decided
+        # SELL hit the SAME live check on every call.
+        async def deny_gate(market, **kwargs):
+            return GateDecision(
+                allowed=False, reason="trading_mode:kiwoom is 'hitl'", check="market_mode"
+            )
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
+
+        # Chat-coordinator boundary only: a real discussion would call an
+        # LLM, so start_manual_discussion is stubbed to return a re-decided
+        # SELL -- but _trigger_discussion/_apply_decision/
+        # _fallback_to_discussion_on_hitl_deny/_execute_close_position all
+        # run for real (no mocking of PositionManager's own methods).
+        sell_decision = TradeDecision(
+            action=DecisionAction.SELL,
+            confidence=0.8,
+            consensus_level=0.8,
+            rationale="re-decided SELL",
+        )
+        fake_session = SimpleNamespace(decision=sell_decision, id="sess-1")
+
+        start_calls = []
+
+        async def fake_start_manual_discussion(ticker, stock_name, wait=False):
+            start_calls.append((ticker, stock_name, wait))
+            return fake_session
+
+        fake_coordinator = MagicMock()
+        fake_coordinator.start_manual_discussion = fake_start_manual_discussion
+        pm.set_chat_coordinator(fake_coordinator)
+
+        notifier = MagicMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock()
+
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            # The original mechanical STOP_LOSS_HIT auto-execution attempt --
+            # the entry point a real RiskMonitor-triggered auto-execute would
+            # use (mirrors _auto_execute_event's own call shape).
+            await pm._execute_close_position(position, "stop_loss")
+
+        assert start_calls == [("005930", "삼성전자", True)], (
+            "start_manual_discussion must fire EXACTLY once -- the "
+            "re-decided SELL's own re-denial must be blocked by the "
+            "discussion cooldown (_should_trigger_discussion), not spawn a "
+            "second discussion"
+        )
+        assert position.discussion_count == 1
+        assert position.ticker in pm._positions, (
+            "the position must remain monitored -- denied both times, never "
+            "executed"
+        )
+
+
+# -------------------------------------------
+# S-2 review fix: fallback event reason -> event_type label mapping (Minor)
+# -------------------------------------------
+#
+# `_fallback_to_discussion_on_hitl_deny`'s reconstructed event previously
+# labeled EVERY non-"take_profit" reason as STOP_LOSS_HIT, including
+# "agent_decision"/"agent_decision_reduce"/"agent_decision_reduce_partial"
+# (a plain discussion SELL/REDUCE, not a mechanical stop trigger) -- a log/
+# notification accuracy bug, not a functional one (event_type here only
+# feeds logging/history, never auto_execute).
+
+
+class TestFallbackEventReasonLabelMapping:
+    @staticmethod
+    def _position_manager():
+        return PositionManager(config=PositionManagerConfig())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reason,expected_event_type",
+        [
+            ("stop_loss", PositionEventType.STOP_LOSS_HIT),
+            ("take_profit", PositionEventType.TAKE_PROFIT_HIT),
+            ("agent_decision", PositionEventType.STRATEGIC_REEVAL),
+            ("agent_decision_reduce", PositionEventType.STRATEGIC_REEVAL),
+            ("agent_decision_reduce_partial", PositionEventType.STRATEGIC_REEVAL),
+        ],
+    )
+    async def test_fallback_event_type_matches_reason(self, reason, expected_event_type):
+        pm = self._position_manager()
+        position = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=70000,
+            stop_loss=71000,
+        )
+        pm._trigger_discussion = AsyncMock()
+
+        gate = GateDecision(
+            allowed=False, reason="trading_mode:kiwoom is 'hitl'", check="market_mode"
+        )
+
+        await pm._fallback_to_discussion_on_hitl_deny(position, reason, gate)
+
+        pm._trigger_discussion.assert_awaited_once()
+        fired_event = pm._trigger_discussion.await_args.args[0]
+        assert fired_event.event_type == expected_event_type, (
+            f"reason={reason!r} must label the reconstructed event as "
+            f"{expected_event_type}, not default to STOP_LOSS_HIT"
+        )

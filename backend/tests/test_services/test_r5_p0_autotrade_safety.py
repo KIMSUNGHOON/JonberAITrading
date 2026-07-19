@@ -15,6 +15,8 @@ decision→execution translation layer. These tests pin the corrected behavior:
 Spec: docs/superpowers/specs/2026-07-12-autotrade-model-audit.md §A
 """
 
+import asyncio
+import logging
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -461,3 +463,214 @@ async def test_monitor_defensive_sell_proceeds_when_gate_allows(monkeypatch):
     assert not any(p.ticker == "005930" for p in coord._state.positions), (
         "fully filled defensive sell must remove the position"
     )
+
+
+
+# -------------------------------------------
+# S-2 review fix — dual-engine concurrent defensive-exit race guard
+# -------------------------------------------
+#
+# RiskMonitor (1s tick, via `_execute_order_from_monitor`) and PositionManager
+# (30s tick, via `_execute_close_position` -> `_close_position`) can each
+# detect the SAME breached stop and race to close the SAME position: both
+# read `_state.positions` for the CURRENT quantity, then `await` an order
+# submission. If the second engine's read lands before the first engine's
+# fill has been reconciled back into `_state.positions` (`_apply_sell_fill`),
+# it still sees the pre-fill quantity and submits a SECOND full-size SELL —
+# a genuine double-liquidation (the paper broker fills unconditionally, with
+# no holdings check). `_acquire_defensive_exit_guard`/
+# `_release_defensive_exit_guard` (a ticker-scoped in-flight `set`, see
+# `ExecutionCoordinator.__init__`) close this gap.
+#
+# Spec: docs/superpowers/specs/2026-07-19-survival-discipline-design.md
+# (S-2 review fixes, Critical finding)
+
+
+async def test_second_defensive_exit_skipped_while_first_inflight(monkeypatch, caplog):
+    """(1) Race reproduction: engine 1 (RiskMonitor path,
+    `_execute_order_from_monitor`) submits an order and is held inside the
+    broker await (simulating the submit-to-fill-confirmation window) while
+    engine 2 (PositionManager path, `_close_position`) detects the SAME
+    breached stop and attempts to close it too. Pre-fix (no guard), engine 2
+    would read the same pre-fill quantity and place its OWN full SELL — two
+    orders for one position. Post-fix: engine 2 is skipped as a no-op,
+    logs `defensive_exit_skipped_inflight`, and places zero orders."""
+    coord, position = _coordinator_with_watched_position()
+
+    entered = asyncio.Event()
+    hold = asyncio.Event()
+    call_count = {"n": 0}
+
+    async def slow_execute(order):
+        call_count["n"] += 1
+        entered.set()
+        await hold.wait()
+        return OrderResult(
+            order_id="o1",
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=order.price or 68_000,
+            status="filled",
+        )
+
+    coord._execute_order = slow_execute
+
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+    # Engine 1: begins order submission and blocks inside slow_execute —
+    # this is the submit-await-confirm window the race exploits.
+    task1 = asyncio.create_task(coord._execute_order_from_monitor(_stop_loss_order()))
+    await entered.wait()
+
+    # Engine 2: detects the SAME breached stop while engine 1's order is
+    # still in flight.
+    with caplog.at_level(logging.WARNING, logger="services.trading.coordinator"):
+        result2 = await coord._close_position("005930")
+
+    assert result2 is None, "the second concurrent exit must be skipped as a no-op"
+    assert call_count["n"] == 1, "only ONE order may reach the broker while the first is in flight"
+    skip_logs = [
+        r for r in caplog.records if "defensive_exit_skipped_inflight" in r.getMessage()
+    ]
+    assert len(skip_logs) == 1, "the skip must be logged"
+
+    # Let engine 1 finish.
+    hold.set()
+    await task1
+
+    assert call_count["n"] == 1, "still only one order after the first execution completes"
+
+
+async def test_defensive_exit_guard_released_after_completion_allows_retry(monkeypatch):
+    """(2) After the first execution finishes, the `finally`-discard must
+    release the guard — a later, independent defensive exit for the SAME
+    ticker must proceed normally, not be permanently blocked by a stale
+    guard entry."""
+    coord, position = _coordinator_with_watched_position()
+    captured = await _capture_executed_order(coord)
+
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+    await coord._execute_order_from_monitor(_stop_loss_order())
+
+    assert "005930" not in coord._defensive_exit_inflight, (
+        "the guard must be released once the first execution completes"
+    )
+
+    # A fresh position (e.g. a new AGENT_AUTO fill) re-establishes the
+    # ticker; a second, independent defensive exit must NOT be skipped.
+    coord._add_position(
+        ManagedPosition(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=5,
+            avg_price=72_500,
+            current_price=68_000,
+            stop_loss=68_000,
+            stop_loss_mode=StopLossMode.AGENT_AUTO,
+        )
+    )
+    result = await coord._close_position("005930")
+
+    assert result is not None
+    assert len(captured) == 2, "the retry must place a genuine second order, not be skipped"
+
+
+async def test_reduce_delegating_to_close_does_not_self_deadlock_or_double_acquire():
+    """(3) `_reduce_position`'s oversell clamp collapses into a delegated
+    `_close_position` call for the SAME ticker within the SAME call stack.
+    This must neither deadlock (ruling out `asyncio.Lock`, whose re-entrant
+    acquire would deadlock here) nor silently self-skip via a naive
+    double-acquire of the in-flight guard (which would return a spurious
+    None instead of actually closing the position)."""
+    coord, position = _coordinator_with_watched_position()  # quantity=10
+    captured = await _capture_executed_order(coord)
+
+    result = await asyncio.wait_for(
+        coord._reduce_position("005930", 999),  # clamps to full close (>= held)
+        timeout=2.0,
+    )
+
+    assert result is not None, (
+        "the delegated close must actually execute, not be silently skipped "
+        "by a self-collision with its own caller's guard"
+    )
+    assert len(captured) == 1, "exactly one order must be placed, not zero or two"
+    assert "005930" not in coord._defensive_exit_inflight, (
+        "the guard must be fully released after the delegated call completes"
+    )
+
+
+async def test_buy_path_unaffected_by_inflight_sell_guard():
+    """(4) The SELL-direction in-flight guard must never block a BUY —
+    `on_trade_approved`'s `is_sell_main` gate keeps the BUY/ADD path
+    untouched even when this exact ticker already has a SELL exit in
+    flight."""
+    coord = _live_coordinator()
+    captured = await _capture_executed_order(coord)
+
+    # Simulate a SELL defensive exit already in flight for this ticker.
+    coord._defensive_exit_inflight.add("005930")
+
+    result = await coord.on_trade_approved(
+        session_id="s1",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="BUY",
+        entry_price=50_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+        quantity_override=1,
+    )
+
+    assert len(captured) == 1, "a BUY must never be blocked by the SELL-direction guard"
+    assert captured[0].side == OrderSide.BUY
+    assert result.quantity == 1
+
+
+async def test_sell_main_path_skipped_while_defensive_exit_inflight(monkeypatch):
+    """(4b) Symmetric guard check on `on_trade_approved`'s OWN SELL/REDUCE
+    main path: a discussion-issued SELL for a ticker that already has a
+    defensive exit in flight (e.g. RiskMonitor mid-stop-loss) must be
+    skipped as a no-op — quantity 0, rejection rationale, zero orders."""
+    coord = _live_coordinator()
+    coord.portfolio_agent.calculate_allocation = MagicMock(
+        return_value=AllocationPlan(
+            ticker="005930",
+            stock_name="삼성전자",
+            side=OrderSide.SELL,
+            quantity=1,
+            entry_price=50_000,
+            estimated_amount=50_000,
+            position_pct=1.0,
+            rationale="stub allocation",
+            rebalance_orders=[],
+        )
+    )
+    captured = await _capture_executed_order(coord)
+
+    coord._defensive_exit_inflight.add("005930")
+
+    result = await coord.on_trade_approved(
+        session_id="s1",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="SELL",
+        entry_price=50_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+        quantity_override=1,
+    )
+
+    assert captured == [], "no order may be placed while a defensive exit is in flight"
+    assert result.quantity == 0

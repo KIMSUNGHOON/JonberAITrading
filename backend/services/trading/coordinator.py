@@ -189,6 +189,63 @@ class ExecutionCoordinator:
         # PositionManager lookups, heavier than the fill-tracker poll.
         self._reconcile_tick_count = 0
 
+        # S-2 review fix (dual-engine concurrent defensive-exit race): two
+        # independent monitoring engines — RiskMonitor (1s tick, via
+        # `_execute_order_from_monitor`) and PositionManager (30s tick, via
+        # `_execute_close_position` -> `_close_position`) — can each detect
+        # the SAME breached stop and race to close the SAME position. Both
+        # read `_state.positions` for the CURRENT quantity, then `await` an
+        # order submission; if the second engine's read happens before the
+        # first engine's fill has been reconciled back into `_state.positions`
+        # (`_apply_sell_fill`), it still sees the pre-fill quantity and
+        # submits a SECOND full-size SELL — a real double-liquidation (the
+        # paper broker fills unconditionally, with no holdings check).
+        #
+        # Ticker-scoped in-flight guard, not an asyncio.Lock: a Lock would
+        # deadlock the moment `_reduce_position` delegates to
+        # `_close_position` for the SAME ticker within the SAME call stack
+        # (re-entrant acquire), and "lock across an await" invites exactly
+        # the kind of subtle cross-coroutine ordering bugs this fix exists to
+        # eliminate. A plain `set` needs none of that: on a single-threaded
+        # asyncio event loop, a membership check followed immediately by an
+        # add — with NO `await` in between — cannot be interleaved by any
+        # other coroutine, so `_acquire_defensive_exit_guard` is atomic by
+        # construction without any explicit synchronization primitive.
+        self._defensive_exit_inflight: set = set()
+
+    def _acquire_defensive_exit_guard(self, ticker: str) -> bool:
+        """Atomically claim `ticker` for an in-flight defensive SELL exit.
+
+        MUST be called with no `await` between the membership check and the
+        `.add()` below — that adjacency (not a lock) is what makes this
+        atomic on the single-threaded event loop. Returns True (guard
+        acquired, caller may proceed to place the order) if `ticker` was not
+        already in flight, or False (caller must skip as a no-op) if another
+        SELL execution already owns this ticker's exit right now.
+
+        Pure `set` membership/insert — no I/O, no exception vector — so a
+        SELL order can never be blocked by a failure IN the guard itself,
+        only by a genuine concurrent in-flight exit for the same ticker.
+        """
+        if ticker in self._defensive_exit_inflight:
+            logger.warning(
+                f"[Coordinator] defensive_exit_skipped_inflight: {ticker} "
+                f"already has a SELL exit in flight — skipping duplicate "
+                f"(first execution owns this exit; a failed first attempt "
+                f"is naturally retried on the next monitor tick)"
+            )
+            return False
+        self._defensive_exit_inflight.add(ticker)
+        return True
+
+    def _release_defensive_exit_guard(self, ticker: str) -> None:
+        """Release `ticker`'s in-flight defensive-exit claim. Always called
+        from a `finally` block by the acquiring call site so a raised
+        exception during order placement can never leave a ticker
+        permanently stuck as "in flight" (a `.discard()` on a missing key is
+        a no-op, so this is also safe to call defensively)."""
+        self._defensive_exit_inflight.discard(ticker)
+
     # -------------------------------------------
     # Activity Logging
     # -------------------------------------------
@@ -668,84 +725,120 @@ class ExecutionCoordinator:
             },
         )
 
-        result = await self._execute_order(order)
-
-        # Log execution result
-        if result.filled_quantity > 0:
-            self._log_activity(
-                ActivityType.ORDER_EXECUTED,
-                f"Order filled: {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
-                agent="order",
-                ticker=ticker,
-                details={
-                    "filled_quantity": result.filled_quantity,
-                    "avg_price": result.avg_price,
-                    "order_id": result.order_id,
-                },
+        # S-2 review fix: on_trade_approved is a THIRD source of SELL orders
+        # for `ticker` (e.g. a watch-list agent-chat SELL/REDUCE decision) —
+        # it can race a RiskMonitor/PositionManager defensive exit on the
+        # SAME ticker exactly like the dual-engine race `_close_position`/
+        # `_reduce_position`/`_execute_order_from_monitor` guard against (see
+        # `_close_position`'s docstring). Guard just the order-placement +
+        # fill-reconciliation window below — BUY orders never touch this
+        # guard (`is_sell_main` gates it), matching every other site's
+        # "BUY/ADD paths stay untouched" contract.
+        is_sell_main = side == OrderSide.SELL
+        if is_sell_main and not self._acquire_defensive_exit_guard(ticker):
+            rationale = (
+                f"Defensive exit already in flight for {ticker} — skipped to "
+                f"avoid a duplicate SELL"
             )
-            # Update order agent with success result
-            self._update_agent_status(
-                "order",
-                AgentStatus.IDLE,
-                action=f"Filled {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
-                processing_stock=ticker,
-                processing_stock_name=stock_name,
-                trade_details={
-                    "action": action,
-                    "quantity": result.filled_quantity,
-                    "entry_price": result.avg_price,
-                    "total_amount": result.filled_quantity * result.avg_price,
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                },
-                last_result={
-                    "success": True,
-                    "message": f"Order filled: {result.filled_quantity} shares",
-                    "order_id": result.order_id,
-                    "filled_quantity": result.filled_quantity,
-                    "avg_price": result.avg_price,
-                },
-            )
-            self._complete_agent_task("order", success=True)
-
-            # E1-4 (scope 2, PART 2 gap follow-up): this branch used to ONLY
-            # write the ledger row (see the now-superseded comment this
-            # replaces) — it never decremented `_state.positions`, so a fill
-            # placed through THIS entry point (agent-chat direct decisions +
-            # queue replays) left a phantom leftover position exactly the
-            # size of the fill; only a LATER poll delta (E1-2) would shave
-            # anything off, never the placement-time fill itself.
-            # `_apply_sell_fill` is the shared choke point every OTHER SELL
-            # caller (RiskMonitor triggers, _execute_order_from_monitor,
-            # rebalance orders above) already uses — it performs the SAME
-            # ledger write this block used to do directly (record_trade_fill,
-            # still gated on `_persistence_active` internally) AND reconciles
-            # the local position (decrement/remove + realized P&L), so
-            # routing through it here REPLACES the direct call rather than
-            # adding a second one (which would double-record the same fill).
-            if side == OrderSide.SELL:
-                self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
-        else:
             self._log_activity(
-                ActivityType.ORDER_FAILED,
-                f"Order failed: {result.message or 'Unknown error'}",
-                agent="order",
+                ActivityType.TRADE_REJECTED,
+                rationale,
+                agent="system",
                 ticker=ticker,
             )
-            # Update order agent with failure result
-            self._update_agent_status(
-                "order",
-                AgentStatus.IDLE,
-                action=f"Order failed: {result.message or 'Unknown error'}",
-                error=result.message,
-                processing_stock=ticker,
-                processing_stock_name=stock_name,
-                last_result={
-                    "success": False,
-                    "message": result.message or "Unknown error",
-                },
+            return AllocationPlan(
+                ticker=ticker,
+                stock_name=stock_name,
+                side=side,
+                quantity=0,
+                entry_price=entry_price,
+                estimated_amount=0,
+                position_pct=0,
+                rationale=rationale,
             )
-            self._complete_agent_task("order", success=False)
+
+        try:
+            result = await self._execute_order(order)
+
+            # Log execution result
+            if result.filled_quantity > 0:
+                self._log_activity(
+                    ActivityType.ORDER_EXECUTED,
+                    f"Order filled: {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
+                    agent="order",
+                    ticker=ticker,
+                    details={
+                        "filled_quantity": result.filled_quantity,
+                        "avg_price": result.avg_price,
+                        "order_id": result.order_id,
+                    },
+                )
+                # Update order agent with success result
+                self._update_agent_status(
+                    "order",
+                    AgentStatus.IDLE,
+                    action=f"Filled {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
+                    processing_stock=ticker,
+                    processing_stock_name=stock_name,
+                    trade_details={
+                        "action": action,
+                        "quantity": result.filled_quantity,
+                        "entry_price": result.avg_price,
+                        "total_amount": result.filled_quantity * result.avg_price,
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit,
+                    },
+                    last_result={
+                        "success": True,
+                        "message": f"Order filled: {result.filled_quantity} shares",
+                        "order_id": result.order_id,
+                        "filled_quantity": result.filled_quantity,
+                        "avg_price": result.avg_price,
+                    },
+                )
+                self._complete_agent_task("order", success=True)
+
+                # E1-4 (scope 2, PART 2 gap follow-up): this branch used to ONLY
+                # write the ledger row (see the now-superseded comment this
+                # replaces) — it never decremented `_state.positions`, so a fill
+                # placed through THIS entry point (agent-chat direct decisions +
+                # queue replays) left a phantom leftover position exactly the
+                # size of the fill; only a LATER poll delta (E1-2) would shave
+                # anything off, never the placement-time fill itself.
+                # `_apply_sell_fill` is the shared choke point every OTHER SELL
+                # caller (RiskMonitor triggers, _execute_order_from_monitor,
+                # rebalance orders above) already uses — it performs the SAME
+                # ledger write this block used to do directly (record_trade_fill,
+                # still gated on `_persistence_active` internally) AND reconciles
+                # the local position (decrement/remove + realized P&L), so
+                # routing through it here REPLACES the direct call rather than
+                # adding a second one (which would double-record the same fill).
+                if side == OrderSide.SELL:
+                    self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+            else:
+                self._log_activity(
+                    ActivityType.ORDER_FAILED,
+                    f"Order failed: {result.message or 'Unknown error'}",
+                    agent="order",
+                    ticker=ticker,
+                )
+                # Update order agent with failure result
+                self._update_agent_status(
+                    "order",
+                    AgentStatus.IDLE,
+                    action=f"Order failed: {result.message or 'Unknown error'}",
+                    error=result.message,
+                    processing_stock=ticker,
+                    processing_stock_name=stock_name,
+                    last_result={
+                        "success": False,
+                        "message": result.message or "Unknown error",
+                    },
+                )
+                self._complete_agent_task("order", success=False)
+        finally:
+            if is_sell_main:
+                self._release_defensive_exit_guard(ticker)
 
         # If successful, add to monitoring
         if result.filled_quantity > 0 and side == OrderSide.BUY:
@@ -1042,43 +1135,61 @@ class ExecutionCoordinator:
         places nothing and leaves the position tracked/watched — the
         USER_APPROVAL alert path (RiskMonitor's non-AGENT_AUTO branch) is
         untouched by this change.
+
+        S-2 review fix: guarded by the coordinator-wide in-flight defensive-
+        exit set (`_acquire_defensive_exit_guard`) — RiskMonitor's 1s tick
+        and PositionManager's 30s tick can otherwise both detect the same
+        breached stop and race to close the same position. RiskMonitor only
+        ever triggers a defensive SELL through this method (never BUY), but
+        the `is_sell` check is explicit rather than assumed, matching the
+        "BUY/ADD paths stay untouched" contract shared with the other
+        guarded SELL sites (`_close_position`/`_reduce_position`/
+        `on_trade_approved`'s SELL/REDUCE main path).
         """
         from services.autonomy import check_autonomy
 
-        position = next(
-            (p for p in self._state.positions if p.ticker == order.ticker), None
-        )
-
-        gate = await check_autonomy(
-            "kiwoom",
-            action="SELL",
-            quantity=order.quantity,
-            entry_price=order.price,
-        )
-        if not gate.allowed:
-            logger.warning(
-                f"[Coordinator] AGENT_AUTO defensive sell blocked by gate: "
-                f"{order.ticker} check={gate.check} reason={gate.reason}"
-            )
-            # Notify once per denied episode, not on every RiskMonitor tick —
-            # mirrors the PositionManager A2 latch (close_gate_denied_notified).
-            if position is not None and not position.monitor_gate_denied_notified:
-                position.monitor_gate_denied_notified = True
-                await self._notify_monitor_gate_denied(order, gate.reason)
+        is_sell = order.side == "sell"
+        if is_sell and not self._acquire_defensive_exit_guard(order.ticker):
             return
 
-        if position is not None and position.monitor_gate_denied_notified:
-            # Gate allowed again: clear the latch so a future denial notifies.
-            position.monitor_gate_denied_notified = False
+        try:
+            position = next(
+                (p for p in self._state.positions if p.ticker == order.ticker), None
+            )
 
-        result = await self._execute_order(order)
-        # Track the ACTUAL fill: full → remove, partial → reduce, none → retain.
-        self._apply_sell_fill(order.ticker, result.filled_quantity, order=order, result=result)
-        # E1-3: register any unfilled remainder of this AGENT_AUTO defensive
-        # sell (see _close_position's same call for the full rationale) — a
-        # stop-loss/take-profit trigger that only partially filled at the
-        # broker previously went unwatched by the ka10076 poll entirely.
-        self._register_unfilled_sell(order.ticker, position, order, result)
+            gate = await check_autonomy(
+                "kiwoom",
+                action="SELL",
+                quantity=order.quantity,
+                entry_price=order.price,
+            )
+            if not gate.allowed:
+                logger.warning(
+                    f"[Coordinator] AGENT_AUTO defensive sell blocked by gate: "
+                    f"{order.ticker} check={gate.check} reason={gate.reason}"
+                )
+                # Notify once per denied episode, not on every RiskMonitor tick —
+                # mirrors the PositionManager A2 latch (close_gate_denied_notified).
+                if position is not None and not position.monitor_gate_denied_notified:
+                    position.monitor_gate_denied_notified = True
+                    await self._notify_monitor_gate_denied(order, gate.reason)
+                return
+
+            if position is not None and position.monitor_gate_denied_notified:
+                # Gate allowed again: clear the latch so a future denial notifies.
+                position.monitor_gate_denied_notified = False
+
+            result = await self._execute_order(order)
+            # Track the ACTUAL fill: full → remove, partial → reduce, none → retain.
+            self._apply_sell_fill(order.ticker, result.filled_quantity, order=order, result=result)
+            # E1-3: register any unfilled remainder of this AGENT_AUTO defensive
+            # sell (see _close_position's same call for the full rationale) — a
+            # stop-loss/take-profit trigger that only partially filled at the
+            # broker previously went unwatched by the ka10076 poll entirely.
+            self._register_unfilled_sell(order.ticker, position, order, result)
+        finally:
+            if is_sell:
+                self._release_defensive_exit_guard(order.ticker)
 
     async def _notify_monitor_gate_denied(self, order: OrderRequest, gate_reason: str) -> None:
         """Best-effort Telegram notice when the autonomy gate blocks an
@@ -1894,17 +2005,21 @@ class ExecutionCoordinator:
         await self._notify_state_change()
 
     async def _close_position(
-        self, ticker: str, decision_id: Optional[str] = None
+        self,
+        ticker: str,
+        decision_id: Optional[str] = None,
+        _skip_inflight_guard: bool = False,
     ) -> Optional[OrderResult]:
         """Close a position at market price.
 
         Returns the OrderResult of the placed SELL (or None if there was no
-        position to close) — P1 (2026-07-15) added this return value so
-        `_reduce_position` can delegate here when its own oversell clamp
-        collapses a partial request into a full close, and still learn the
-        ACTUAL filled quantity. Existing callers that ignore the return value
-        (`handle_alert_action`'s CLOSE_POSITION, PositionManager's
-        `_execute_close_position`) are unaffected.
+        position to close, or a concurrent defensive exit already owns this
+        ticker — see the guard note below) — P1 (2026-07-15) added this
+        return value so `_reduce_position` can delegate here when its own
+        oversell clamp collapses a partial request into a full close, and
+        still learn the ACTUAL filled quantity. Existing callers that ignore
+        the return value (`handle_alert_action`'s CLOSE_POSITION,
+        PositionManager's `_execute_close_position`) are unaffected.
 
         `decision_id` (L2, spec D2): optional durable decision-ledger id
         threaded into OrderRequest.session_id when the caller has one (e.g.
@@ -1913,38 +2028,58 @@ class ExecutionCoordinator:
         `_reduce_position` delegation with no id of its own) is byte-for-byte
         unchanged. NULL here is correct, not a gap, for callers with no
         upstream decision to cite.
-        """
-        position = next(
-            (p for p in self._state.positions if p.ticker == ticker),
-            None
-        )
 
-        if not position:
-            logger.warning(f"[Coordinator] Position {ticker} not found")
+        S-2 review fix: guarded by the coordinator-wide in-flight
+        defensive-exit set (`_acquire_defensive_exit_guard`) so a concurrent
+        close from a DIFFERENT engine (RiskMonitor via
+        `_execute_order_from_monitor`, or another PositionManager tick) for
+        the SAME ticker is skipped as a no-op instead of doubling the sell.
+        `_skip_inflight_guard=True` is for `_reduce_position`'s OWN
+        delegation into this method when its oversell clamp collapses a
+        partial request into a full close — `_reduce_position` already holds
+        the guard for this ticker at that point, so re-acquiring here would
+        self-deny (the ticker is already "in flight", owned by the very call
+        that's delegating); skipping applies ONLY to that one internal call
+        site, never to an external caller.
+        """
+        if not _skip_inflight_guard and not self._acquire_defensive_exit_guard(ticker):
             return None
 
-        order = OrderRequest(
-            ticker=ticker,
-            stock_name=position.stock_name,
-            side=OrderSide.SELL,
-            quantity=position.quantity,
-            price=position.current_price,
-            reason="User-initiated close",
-            session_id=decision_id,
-        )
+        try:
+            position = next(
+                (p for p in self._state.positions if p.ticker == ticker),
+                None
+            )
 
-        result = await self._execute_order(order)
-        # Only drop/reduce tracking by the ACTUAL fill — a rejected or unfilled
-        # sell must keep the position under defense (A3).
-        self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
-        # E1-3: a partial/unfilled defensive close still has broker-side
-        # exposure nothing is watching yet — register the remainder with the
-        # fill tracker (same helper on_trade_approved's BUY/SELL entries use,
-        # E1-1/E1-2) so the ka10076 poll can pick up the post-fill later.
-        # stop_loss/take_profit are None: this is an exit, not an entry with
-        # defense levels of its own to carry forward.
-        self._register_unfilled_sell(ticker, position, order, result)
-        return result
+            if not position:
+                logger.warning(f"[Coordinator] Position {ticker} not found")
+                return None
+
+            order = OrderRequest(
+                ticker=ticker,
+                stock_name=position.stock_name,
+                side=OrderSide.SELL,
+                quantity=position.quantity,
+                price=position.current_price,
+                reason="User-initiated close",
+                session_id=decision_id,
+            )
+
+            result = await self._execute_order(order)
+            # Only drop/reduce tracking by the ACTUAL fill — a rejected or unfilled
+            # sell must keep the position under defense (A3).
+            self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+            # E1-3: a partial/unfilled defensive close still has broker-side
+            # exposure nothing is watching yet — register the remainder with the
+            # fill tracker (same helper on_trade_approved's BUY/SELL entries use,
+            # E1-1/E1-2) so the ka10076 poll can pick up the post-fill later.
+            # stop_loss/take_profit are None: this is an exit, not an entry with
+            # defense levels of its own to carry forward.
+            self._register_unfilled_sell(ticker, position, order, result)
+            return result
+        finally:
+            if not _skip_inflight_guard:
+                self._release_defensive_exit_guard(ticker)
 
     async def _reduce_position(
         self, ticker: str, quantity: int, decision_id: Optional[str] = None
@@ -1979,48 +2114,66 @@ class ExecutionCoordinator:
         the ACTUAL filled quantity — never the requested one — the same
         choke-point discipline `_apply_sell_fill` already applies to every
         other SELL path.
+
+        S-2 review fix: guarded by the coordinator-wide in-flight
+        defensive-exit set for the same dual-engine race `_close_position`
+        guards against (see its docstring) — acquired ONCE here at the top
+        and held across the delegated `_close_position(_skip_inflight_guard=
+        True)` call below, so the delegation never tries to re-acquire it.
         """
-        position = next(
-            (p for p in self._state.positions if p.ticker == ticker), None
-        )
-        if not position:
-            logger.warning(f"[Coordinator] Position {ticker} not found for reduce")
+        if not self._acquire_defensive_exit_guard(ticker):
             return None
 
-        sell_qty = min(quantity, position.quantity)
-        if sell_qty <= 0:
-            logger.warning(
-                f"[Coordinator] Reduce for {ticker} requested non-positive "
-                f"sell quantity ({quantity} vs held {position.quantity})"
+        try:
+            position = next(
+                (p for p in self._state.positions if p.ticker == ticker), None
             )
-            return None
+            if not position:
+                logger.warning(f"[Coordinator] Position {ticker} not found for reduce")
+                return None
 
-        if sell_qty >= position.quantity:
-            # Clamp collapses this into a full close — delegate rather than
-            # duplicate _close_position's removal/stop-cleanup logic.
-            return await self._close_position(ticker, decision_id=decision_id)
+            sell_qty = min(quantity, position.quantity)
+            if sell_qty <= 0:
+                logger.warning(
+                    f"[Coordinator] Reduce for {ticker} requested non-positive "
+                    f"sell quantity ({quantity} vs held {position.quantity})"
+                )
+                return None
 
-        order = OrderRequest(
-            ticker=ticker,
-            stock_name=position.stock_name,
-            side=OrderSide.SELL,
-            quantity=sell_qty,
-            price=position.current_price,
-            reason="Autonomous partial reduce",
-            session_id=decision_id,
-        )
+            if sell_qty >= position.quantity:
+                # Clamp collapses this into a full close — delegate rather than
+                # duplicate _close_position's removal/stop-cleanup logic. This
+                # call already holds the in-flight guard for `ticker` (acquired
+                # above), so tell _close_position to skip re-acquiring it —
+                # re-acquiring would self-deny (see _close_position's guard
+                # docstring) and a second release here would double-discard.
+                return await self._close_position(
+                    ticker, decision_id=decision_id, _skip_inflight_guard=True
+                )
 
-        result = await self._execute_order(order)
-        # Reconcile by the ACTUAL fill, not the requested quantity — same
-        # choke point every other SELL path uses (full → remove, partial →
-        # decrement, none → retain).
-        self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
-        # E1-3: register any unfilled remainder (see _close_position's same
-        # call for the full rationale) — the clamp-to-full-close branch above
-        # already gets this via the delegated _close_position call, so only
-        # this direct-partial branch needs its own call.
-        self._register_unfilled_sell(ticker, position, order, result)
-        return result
+            order = OrderRequest(
+                ticker=ticker,
+                stock_name=position.stock_name,
+                side=OrderSide.SELL,
+                quantity=sell_qty,
+                price=position.current_price,
+                reason="Autonomous partial reduce",
+                session_id=decision_id,
+            )
+
+            result = await self._execute_order(order)
+            # Reconcile by the ACTUAL fill, not the requested quantity — same
+            # choke point every other SELL path uses (full → remove, partial →
+            # decrement, none → retain).
+            self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+            # E1-3: register any unfilled remainder (see _close_position's same
+            # call for the full rationale) — the clamp-to-full-close branch above
+            # already gets this via the delegated _close_position call, so only
+            # this direct-partial branch needs its own call.
+            self._register_unfilled_sell(ticker, position, order, result)
+            return result
+        finally:
+            self._release_defensive_exit_guard(ticker)
 
     async def _add_to_position(
         self, ticker: str, quantity: int, decision_id: Optional[str] = None
