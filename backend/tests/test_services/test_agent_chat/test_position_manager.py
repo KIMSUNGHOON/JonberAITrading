@@ -669,6 +669,148 @@ class TestTrailingStop:
 
 
 # -------------------------------------------
+# Take-Profit Lock-In Tests (S-5, survival discipline)
+# -------------------------------------------
+#
+# docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2 D2/S-5:
+# take-profit EXECUTION stays discussion-gated (auto_execute_take_profit
+# stays False), but once price has reached take_profit at least once, a
+# retracement back below it should ratchet the stop-loss up toward
+# breakeven+lock_in_ratio*(gain) -- protecting the profit even though
+# nothing gets sold automatically.
+
+
+class TestTakeProfitLockIn:
+    """S-5: take_profit_reached_at fire-once marking + the breakeven+alpha
+    stop ratchet it drives on a post-TP retracement."""
+
+    @pytest.mark.asyncio
+    async def test_take_profit_hit_records_once_and_does_not_auto_sell(
+        self, position_manager
+    ):
+        """(1) TP reached -> take_profit_reached_at recorded exactly once;
+        auto_execute_take_profit stays False so nothing gets sold, and a
+        refire on the next tick (existing TAKE_PROFIT_HIT semantics -- it
+        intentionally keeps firing every tick it's still true) must NOT move
+        the recorded timestamp."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=70000,
+            current_price=70000,
+            take_profit=77000,
+        )
+        position = position_manager._positions["005930"]
+        assert position.take_profit_reached_at is None
+        assert position_manager.config.auto_execute_take_profit is False
+
+        position.current_price = 77000  # TP hit
+        events = []
+        position_manager.on_event(lambda e: events.append(e))
+        await position_manager._check_position(position)
+
+        first_recorded = position.take_profit_reached_at
+        assert first_recorded is not None
+        assert position.quantity == 100, "no auto-sell -- take-profit execution stays OFF"
+        tp_events = [e for e in events if e.event_type == PositionEventType.TAKE_PROFIT_HIT]
+        assert len(tp_events) >= 1
+        assert tp_events[0].auto_execute is False
+
+        # Refire: the *_HIT event fires again every tick (unchanged, existing
+        # semantics) but the fire-once mark must not move.
+        await position_manager._check_position(position)
+        assert position.take_profit_reached_at == first_recorded
+        assert position.quantity == 100
+
+    @pytest.mark.asyncio
+    async def test_retracement_locks_in_stop_at_breakeven_plus_alpha(
+        self, position_manager
+    ):
+        """(2) After TP is reached, a retracement below it raises stop_loss
+        to entry*(1 + lock_in_ratio*(tp-entry)/entry) -- hand-computed here
+        -- and a further retracement never lowers it again.
+
+        take_profit is deliberately only a 4% target (avg 70,000 -> TP
+        72,800) -- comfortably below the position manager's OWN unrelated
+        `trailing_activation_pct` default (5.0%, auto-activates the
+        pre-existing highest-price trailing stop on a big enough gain). A
+        10%+ target would also auto-activate that feature and its own
+        (legitimately higher, since both mechanisms only ever raise the
+        stop) ratchet would confound this test's hand-computed lock-in
+        number -- so this keeps the two ratchet mechanisms cleanly
+        separated."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=70000,
+            current_price=72800,
+            take_profit=72800,
+        )
+        position = position_manager._positions["005930"]
+        await position_manager._check_position(position)  # records TP reached
+        assert position.take_profit_reached_at is not None
+
+        # Retrace below take_profit.
+        position.current_price = 71500
+        await position_manager._check_position(position)
+
+        lock_in_ratio = position_manager.config.trailing_lock_in_ratio
+        expected_stop = 70000 * (1 + lock_in_ratio * (72800 - 70000) / 70000)
+        assert expected_stop == pytest.approx(70840.0)
+        assert position.stop_loss == pytest.approx(expected_stop)
+
+        # Further retracement (still above the lock-in level) must NOT lower
+        # the already-raised stop.
+        position.current_price = 71000
+        await position_manager._check_position(position)
+        assert position.stop_loss == pytest.approx(expected_stop)
+
+    @pytest.mark.asyncio
+    async def test_lock_in_never_lowers_an_already_higher_stop(self, position_manager):
+        """(2b) If the existing stop is already above what lock-in alone
+        would compute, the hook must leave it untouched (the `max`)."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=70000,
+            current_price=72800,  # 4% target, below trailing_activation_pct
+            take_profit=72800,
+            stop_loss=71500,  # already above the 70,840 lock-in level
+        )
+        position = position_manager._positions["005930"]
+        await position_manager._check_position(position)  # records TP reached
+
+        position.current_price = 72000
+        await position_manager._check_position(position)
+
+        assert position.stop_loss == 71500, "an already-higher stop must never be lowered"
+
+    def test_lock_in_rejects_when_sanity_check_fails(self, position_manager):
+        """(4) A lock-in candidate that fails `_stops_sane` against the
+        CURRENT price (e.g. price has already fallen through it) is rejected
+        outright, exactly like the decision-path and restore-path
+        rejections -- `_stops_sane` is shared across all three call sites."""
+        position = position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=70000,
+            current_price=71000,
+            take_profit=77000,
+        )
+        position.take_profit_reached_at = datetime.now()  # reached earlier
+
+        # lock_in_price = 70000 * (1 + 0.3 * (77000-70000)/70000) = 72,100.
+        # current_price 71,000 < 72,100 -> _stops_sane must reject it.
+        position_manager._apply_take_profit_lock_in(position)
+
+        assert position.stop_loss is None, "insane candidate must be rejected, not applied"
+
+
+# -------------------------------------------
 # Summary Tests
 # -------------------------------------------
 
@@ -825,6 +967,7 @@ class TestStopLevelPersistence:
             "stop_loss": 68875,
             "take_profit": 79750,
             "trailing_stop_pct": 5.0,
+            "take_profit_reached_at": None,  # S-5 schema extension
         }
 
     @pytest.mark.asyncio
@@ -984,6 +1127,106 @@ class TestStopLevelPersistence:
         )
         position_manager.update_position(ticker="005930", stop_loss=70000)
         assert position_manager.remove_position("005930") is True
+
+
+# -------------------------------------------
+# Trailing-stop persistence bugfix (S-5, survival discipline)
+# -------------------------------------------
+#
+# Pre-S-5, _check_trailing_stop raised position.stop_loss via a direct
+# attribute assignment that never called _schedule_persist_stops -- so a
+# raised trailing stop-loss lived only in memory and silently vanished on the
+# next restart. These pin the fix: the raise now goes through
+# update_position (same fire-and-forget persist hook every other stop-level
+# mutator already relies on), so it actually lands in the blob and survives
+# a simulated restart.
+
+
+class TestTrailingStopPersistenceBugfix:
+    @pytest.mark.asyncio
+    async def test_trailing_stop_raise_survives_restart(self, config, temp_storage):
+        """(3) Round trip: raise a trailing stop via _check_trailing_stop
+        (NOT via a manual _persist_stops() call after the raise -- only the
+        fire-and-forget hook inside update_position may persist it), then
+        simulate a full restart and confirm restore_stop_overlay brings the
+        raised value back. Deliberately RED pre-fix: the old direct
+        attribute assignment never scheduled a persist, so the blob would
+        still hold the pre-trailing (no-stop) baseline and restore would
+        find nothing for this ticker."""
+        pm1 = PositionManager(config=config)
+        position = pm1.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=70000,
+            current_price=76500,
+            trailing_stop_pct=5.0,
+        )
+        position.highest_price = 76500
+        # Flush the pre-trailing (no-stop) baseline deterministically, so
+        # the assertions below can only pass if _check_trailing_stop's OWN
+        # raise triggers a NEW persist -- not an accidental race with
+        # add_position's own fire-and-forget write landing late.
+        await pm1._persist_stops()
+
+        events = []
+        pm1.on_event(lambda e: events.append(e))
+        await pm1._check_trailing_stop(position, events)
+
+        raised_stop = position.stop_loss
+        assert raised_stop == pytest.approx(76500 * 0.95)
+
+        # No manual _persist_stops() call here -- only the scheduled
+        # fire-and-forget hook (invoked by update_position, if and only if
+        # the fix routes the raise through it) may persist the raise. Give
+        # it a chance to land.
+        await asyncio.sleep(0.05)
+
+        # Simulate a restart: brand-new PM instance, nothing in memory.
+        pm2 = PositionManager(config=config)
+        holdings = [_fake_holding("005930", "삼성전자", 100, 70000, 76500)]
+        with patch(
+            "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+            AsyncMock(return_value=_fake_kiwoom_client(holdings)),
+        ):
+            await pm2.sync_from_account()
+
+        assert pm2.get_position("005930").stop_loss is None  # not yet restored
+
+        restored = await pm2.restore_stop_overlay()
+
+        assert restored == 1, (
+            "the raised trailing stop must have made it into the persisted "
+            "blob via update_position -> _schedule_persist_stops"
+        )
+        assert pm2.get_position("005930").stop_loss == pytest.approx(raised_stop)
+
+    @pytest.mark.asyncio
+    async def test_trailing_stop_raise_rejected_by_sanity_check(self, config):
+        """The new sanity gate on the trailing-stop raise: if the computed
+        level is not sane against the CURRENT price, the stop_loss raise is
+        skipped (kept at its prior value) while trailing_stop_price -- a
+        pure internal tracking field, not a live order level -- still
+        updates as before."""
+        pm = PositionManager(config=config)
+        position = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=90,
+            current_price=97,
+            trailing_stop_pct=1.0,
+        )
+        position.highest_price = 100  # new_trailing_price = 100*0.99 = 99 > current 97
+
+        events = []
+        await pm._check_trailing_stop(position, events)
+
+        assert position.stop_loss is None, "insane trailing raise must be rejected"
+        assert position.trailing_stop_price == pytest.approx(99.0), (
+            "the internal trailing tracking value still updates independent "
+            "of the stop_loss sanity gate"
+        )
 
 
 # -------------------------------------------

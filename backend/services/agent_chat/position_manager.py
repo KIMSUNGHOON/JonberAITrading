@@ -184,6 +184,21 @@ class MonitoredPosition(BaseModel):
     # (the *_HIT events are not de-duped). Reset when the gate next allows.
     close_gate_denied_notified: bool = False
 
+    # S-5 (survival discipline, 2026-07-19,
+    # docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2):
+    # timestamp of the FIRST tick this position's take-profit was reached
+    # (current_price >= take_profit) -- fire-once (a later tick where it's
+    # still true does NOT overwrite it) and never reset once set, even after
+    # price falls back below take_profit. Deliberately separate from the
+    # TAKE_PROFIT_HIT event, which intentionally keeps refiring every tick
+    # it's still true (existing semantics, unchanged by this task). Drives
+    # `_apply_take_profit_lock_in`'s breakeven+lock-in stop ratchet on a
+    # post-TP retracement. Included in the persisted stops overlay blob (see
+    # `_persist_stops`/`restore_stop_overlay`) so a restart mid-retracement
+    # doesn't forget a profit was ever reached; a pre-S-5 blob simply has no
+    # such key, which restores as None (backward compatible).
+    take_profit_reached_at: Optional[datetime] = None
+
     @property
     def unrealized_pnl(self) -> float:
         return (self.current_price - self.avg_price) * self.quantity
@@ -251,6 +266,15 @@ class PositionManagerConfig(BaseModel):
     # Trailing stop defaults
     default_trailing_pct: float = 5.0
     trailing_activation_pct: float = 5.0  # Activate trailing after 5% gain
+
+    # S-5 (survival discipline, 2026-07-19,
+    # docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2):
+    # fraction of the take-profit's profit distance above entry (avg_price)
+    # to lock in as a raised stop-loss once take_profit has been reached at
+    # least once and price has since retraced back below it. 0.3 = lock in
+    # 30% of the (take_profit - entry) gain, e.g. entry 70,000 / TP 77,000
+    # -> lock-in stop = 70,000 * (1 + 0.3 * 0.1) = 72,100.
+    trailing_lock_in_ratio: float = 0.3
 
     # Discussion limits
     min_discussion_interval_minutes: int = 15
@@ -515,6 +539,7 @@ class PositionManager:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
+        trailing_stop_price: Optional[float] = None,
         entry_decision_id: Optional[str] = None,
     ) -> Optional[MonitoredPosition]:
         """Update a monitored position.
@@ -549,6 +574,13 @@ class PositionManager:
 
         if trailing_stop_pct is not None:
             position.trailing_stop_pct = trailing_stop_pct
+
+        if trailing_stop_price is not None:
+            # S-5 bug fix: previously `_check_trailing_stop` assigned this
+            # attribute directly, bypassing this method entirely (and thus
+            # `_schedule_persist_stops`). Now routed through here like every
+            # other stop-level field.
+            position.trailing_stop_price = trailing_stop_price
 
         if entry_decision_id is not None:
             position.entry_decision_id = entry_decision_id
@@ -716,22 +748,43 @@ class PositionManager:
             )
 
             if tp_distance_pct <= 0:
-                # Take-profit hit
+                # Take-profit hit. Auto-execution stays OFF here
+                # (auto_execute_take_profit defaults False, decision D2,
+                # unchanged by S-5) -- this is a pure bookkeeping mark, not
+                # an execution trigger. Fire-once (S-5): an already-set
+                # timestamp is left alone, even though the *_HIT event below
+                # intentionally keeps refiring every tick this stays true
+                # (existing semantics -- spec §1).
+                if position.take_profit_reached_at is None:
+                    position.take_profit_reached_at = datetime.now()
+
                 events.append(self._create_event(
                     position, PositionEventType.TAKE_PROFIT_HIT,
                     position.take_profit,
                     f"익절가 도달: ₩{position.current_price:,.0f} >= ₩{position.take_profit:,.0f}",
                     auto_execute=self.config.auto_execute_take_profit,
                 ))
-            elif tp_distance_pct <= self.config.take_profit_warning_pct:
-                # Approaching take-profit
-                if PositionEventType.TAKE_PROFIT_NEAR.value not in position.events_triggered:
-                    events.append(self._create_event(
-                        position, PositionEventType.TAKE_PROFIT_NEAR,
-                        tp_distance_pct,
-                        f"익절가 근접: {tp_distance_pct:.1f}% 거리",
-                    ))
-                    position.events_triggered.append(PositionEventType.TAKE_PROFIT_NEAR.value)
+            else:
+                if tp_distance_pct <= self.config.take_profit_warning_pct:
+                    # Approaching take-profit
+                    if PositionEventType.TAKE_PROFIT_NEAR.value not in position.events_triggered:
+                        events.append(self._create_event(
+                            position, PositionEventType.TAKE_PROFIT_NEAR,
+                            tp_distance_pct,
+                            f"익절가 근접: {tp_distance_pct:.1f}% 거리",
+                        ))
+                        position.events_triggered.append(PositionEventType.TAKE_PROFIT_NEAR.value)
+
+                # S-5: profit-lock trailing after a take-profit retracement.
+                # `tp_distance_pct > 0` here means current_price < take_profit
+                # -- once take_profit has been reached at least once
+                # (take_profit_reached_at set), every tick it stays below TP
+                # is a candidate to ratchet the stop up toward
+                # breakeven+lock-in. This only ever raises the STOP; it never
+                # sells -- profit-taking EXECUTION stays discussion-gated
+                # (D2/auto_execute_take_profit unchanged).
+                if position.take_profit_reached_at is not None:
+                    self._apply_take_profit_lock_in(position)
 
         # Check significant gain/loss
         pnl_pct = position.unrealized_pnl_pct
@@ -877,6 +930,62 @@ class PositionManager:
             message,
         )
 
+    def _apply_take_profit_lock_in(self, position: MonitoredPosition) -> None:
+        """Ratchet the stop-loss up to a breakeven+lock-in level after a
+        take-profit retracement (S-5, docs/superpowers/specs/
+        2026-07-19-survival-discipline-design.md §2 D2/S-5).
+
+        Only meaningful once `position.take_profit_reached_at` is set (the
+        caller in `_check_position` already gates on that) -- current price
+        being below take_profit is the caller's other precondition. Computes:
+
+            new_stop = max(current stop_loss, entry * (1 + lock_in_ratio * (tp - entry) / entry))
+
+        i.e. locks in `trailing_lock_in_ratio` (default 30%) of the take
+        profit's gain distance above the entry price (avg_price) -- never
+        below the position's CURRENT stop (the `max()`: a stop this hook, or
+        anything else, has already raised can never be lowered by it).
+
+        Routed through `update_position` so both `_stops_sane` (reject an
+        insane level outright rather than apply it -- mirrors the
+        `_apply_decision` HOLD/ADD stop-adjustment path) and
+        `_schedule_persist_stops` (survive a restart) apply -- the SAME fix
+        applied to `_check_trailing_stop` below for the pre-existing
+        trailing stop, which had the identical direct-assignment bug.
+
+        No-op guarded: recomputes to the exact same value every tick the
+        retracement condition holds (it only depends on avg_price/
+        take_profit/config, never on the fluctuating current_price), so once
+        applied this returns immediately on every subsequent tick without
+        calling `update_position` (and rescheduling a persist) again.
+        """
+        if position.avg_price <= 0 or position.take_profit is None:
+            return
+
+        profit_distance_ratio = (
+            (position.take_profit - position.avg_price) / position.avg_price
+        )
+        lock_in_price = position.avg_price * (
+            1 + self.config.trailing_lock_in_ratio * profit_distance_ratio
+        )
+
+        current_stop = position.stop_loss if position.stop_loss is not None else 0.0
+        new_stop = max(current_stop, lock_in_price)
+
+        if new_stop == position.stop_loss:
+            return  # nothing would change -- skip the update_position round-trip
+
+        if not self._stops_sane(position.current_price, new_stop, None):
+            logger.warning(
+                "take_profit_lock_in_rejected",
+                ticker=position.ticker,
+                candidate_stop=new_stop,
+                current_price=position.current_price,
+            )
+            return
+
+        self.update_position(position.ticker, stop_loss=new_stop)
+
     async def _check_trailing_stop(
         self,
         position: MonitoredPosition,
@@ -895,11 +1004,38 @@ class PositionManager:
             new_trailing_price > position.trailing_stop_price
         ):
             old_price = position.trailing_stop_price
-            position.trailing_stop_price = new_trailing_price
 
-            # Also update stop-loss if trailing stop is higher
-            if position.stop_loss is None or new_trailing_price > position.stop_loss:
-                position.stop_loss = new_trailing_price
+            # S-5 bug fix (docs/superpowers/specs/
+            # 2026-07-19-survival-discipline-design.md §1/§2): both of these
+            # used to be direct attribute assignments
+            # (`position.trailing_stop_price = ...` / `position.stop_loss =
+            # ...`), bypassing BOTH the `_stops_sane` sanity gate AND
+            # `_schedule_persist_stops` -- a raised trailing stop-loss
+            # silently vanished on the next restart. Routed through
+            # `update_position` now, mirroring the `_apply_decision`
+            # stop-setting path (~L1827/`_apply_take_profit_lock_in` above).
+            # `trailing_stop_price` is a pure internal tracking value (not a
+            # live order level), so it always updates on this branch same as
+            # before; the actual stop_loss raise is additionally
+            # sanity-gated -- if the current price has already fallen
+            # through the computed level, the raise is skipped (existing
+            # stop_loss kept) rather than creating an immediate
+            # stop_loss_hit spin.
+            update_kwargs: Dict[str, float] = {"trailing_stop_price": new_trailing_price}
+
+            raise_stop = position.stop_loss is None or new_trailing_price > position.stop_loss
+            if raise_stop:
+                if self._stops_sane(position.current_price, new_trailing_price, None):
+                    update_kwargs["stop_loss"] = new_trailing_price
+                else:
+                    logger.warning(
+                        "trailing_stop_raise_rejected",
+                        ticker=position.ticker,
+                        candidate_stop=new_trailing_price,
+                        current_price=position.current_price,
+                    )
+
+            self.update_position(position.ticker, **update_kwargs)
 
             if old_price:
                 events.append(self._create_event(
@@ -2089,6 +2225,16 @@ class PositionManager:
                             "stop_loss": position.stop_loss,
                             "take_profit": position.take_profit,
                             "trailing_stop_pct": position.trailing_stop_pct,
+                            # S-5: schema extension. isoformat/None -- a
+                            # pre-S-5 blob simply lacks this key, which
+                            # `.get()` on restore reads back as None (see
+                            # restore_stop_overlay), matching a fresh
+                            # position's own default.
+                            "take_profit_reached_at": (
+                                position.take_profit_reached_at.isoformat()
+                                if position.take_profit_reached_at is not None
+                                else None
+                            ),
                         }
                         for ticker, position in self._positions.items()
                     }
@@ -2227,8 +2373,36 @@ class PositionManager:
                 ):
                     kwargs["trailing_stop_pct"] = saved["trailing_stop_pct"]
 
+                restored_this_ticker = False
                 if kwargs:
                     self.update_position(ticker, **kwargs)
+                    restored_this_ticker = True
+
+                # take_profit_reached_at (S-5): a plain bookkeeping
+                # timestamp, not a live order level -- restored directly, no
+                # `_stops_sane` gate (that gate validates stop_loss/
+                # take_profit against the CURRENT price, which has no
+                # bearing on "was TP ever reached in the past"). A pre-S-5
+                # blob has no such key -- `saved.get(...)` is None -> no-op,
+                # field stays None exactly like a fresh position's default
+                # (backward compatible).
+                if (
+                    position.take_profit_reached_at is None
+                    and saved.get("take_profit_reached_at") is not None
+                ):
+                    try:
+                        position.take_profit_reached_at = datetime.fromisoformat(
+                            saved["take_profit_reached_at"]
+                        )
+                        restored_this_ticker = True
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "restore_take_profit_reached_at_invalid",
+                            ticker=ticker,
+                            value=saved.get("take_profit_reached_at"),
+                        )
+
+                if restored_this_ticker:
                     restored += 1
 
             # Unconditional re-save: reflects the restores above and drops any
