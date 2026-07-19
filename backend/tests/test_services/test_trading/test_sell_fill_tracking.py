@@ -50,6 +50,7 @@ from services.trading.models import (
     OrderRequest,
     OrderResult,
     OrderSide,
+    OrderType,
     StopLossMode,
     TradingMode,
 )
@@ -1015,3 +1016,142 @@ async def test_add_to_position_decision_id_defaults_to_none(temp_storage):
     await coord._add_to_position("005930", 5)
 
     assert captured[0].session_id is None
+
+
+
+# -------------------------------------------
+# 11) S-3 (survival discipline) — defensive exits submit MARKET orders, not
+#     LIMIT. `_close_position`/`_reduce_position` previously left
+#     OrderRequest.order_type at its default (`OrderType.LIMIT`, models.py)
+#     submitted AT the position's current_price — in a gap/crash a LIMIT
+#     order records a fill at that (favorable) price instead of the worse
+#     real fill (same rationale as risk_monitor.py's P2-4 fix for
+#     `_execute_stop_loss`/`_execute_take_profit`, now extended to these
+#     coordinator-level sites). `on_trade_approved`'s own SELL/REDUCE main
+#     order gets the same treatment; BUY/ADD stays LIMIT — the global
+#     invariant (entry BUY/ADD LIMIT, s-global-constraints.md) is untouched
+#     by this switch.
+#     Spec: docs/superpowers/specs/2026-07-19-survival-discipline-design.md
+#     §2 S-3.
+# -------------------------------------------
+
+
+async def test_close_position_submits_market_order(temp_storage):
+    coord, position = _coordinator_with_position(quantity=8)
+    captured = _stub_execute_order_capturing(
+        coord, filled=8, status="filled", order_id="MKT-CLOSE1"
+    )
+
+    await coord._close_position("005930")
+
+    assert captured[0].order_type == OrderType.MARKET
+
+
+async def test_reduce_position_submits_market_order(temp_storage):
+    coord, position = _coordinator_with_position(quantity=50)
+    captured = _stub_execute_order_capturing(
+        coord, filled=6, status="partial", order_id="MKT-REDUCE1"
+    )
+
+    await coord._reduce_position("005930", 20)
+
+    assert captured[0].order_type == OrderType.MARKET
+
+
+async def test_reduce_position_delegated_full_close_submits_market_order(temp_storage):
+    """The oversell-clamp delegation into `_close_position` must also be
+    MARKET, not silently fall back to LIMIT on the collapsed-to-full-close
+    path."""
+    coord, position = _coordinator_with_position(quantity=10)
+    captured = _stub_execute_order_capturing(
+        coord, filled=4, status="partial", order_id="MKT-COLLAPSE1"
+    )
+
+    await coord._reduce_position("005930", 999)  # clamps to full close
+
+    assert captured[0].order_type == OrderType.MARKET
+
+
+async def test_on_trade_approved_sell_main_order_submits_market(temp_storage):
+    coord = _live_coordinator(OrderSide.SELL, quantity=10)
+    coord._add_position(_entry_position(quantity=30))
+    captured = _stub_execute_order_capturing(
+        coord, filled=10, status="filled", order_id="MKT-SELL1"
+    )
+
+    await coord.on_trade_approved(
+        session_id="s-mkt1",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="SELL",
+        entry_price=260_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+    )
+
+    assert captured[0].order_type == OrderType.MARKET
+
+
+async def test_on_trade_approved_reduce_main_order_submits_market(temp_storage):
+    coord = _live_coordinator(OrderSide.SELL, quantity=10)
+    coord._add_position(_entry_position(quantity=30))
+    captured = _stub_execute_order_capturing(
+        coord, filled=10, status="filled", order_id="MKT-REDUCE-MAIN1"
+    )
+
+    await coord.on_trade_approved(
+        session_id="s-mkt2",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="REDUCE",
+        entry_price=260_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+    )
+
+    assert captured[0].order_type == OrderType.MARKET
+
+
+async def test_on_trade_approved_buy_main_order_stays_limit(temp_storage):
+    """Pin: BUY entries must stay LIMIT — the global invariant (entry
+    BUY/ADD LIMIT) is untouched by the S-3 defensive-exit MARKET switch."""
+    coord = _live_coordinator(OrderSide.BUY, quantity=10)
+    captured = _stub_execute_order_capturing(
+        coord, filled=10, status="filled", order_id="MKT-BUY1"
+    )
+
+    await coord.on_trade_approved(
+        session_id="s-mkt3",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="BUY",
+        entry_price=260_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+    )
+
+    assert captured[0].order_type == OrderType.LIMIT
+
+
+async def test_on_trade_approved_add_main_order_stays_limit(temp_storage):
+    """Pin: ADD entries must stay LIMIT too — same invariant as BUY."""
+    coord = _live_coordinator(OrderSide.BUY, quantity=10)
+    captured = _stub_execute_order_capturing(
+        coord, filled=10, status="filled", order_id="MKT-ADD1"
+    )
+
+    await coord.on_trade_approved(
+        session_id="s-mkt4",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="ADD",
+        entry_price=260_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+    )
+
+    assert captured[0].order_type == OrderType.LIMIT

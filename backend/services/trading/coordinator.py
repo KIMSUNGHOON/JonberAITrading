@@ -19,6 +19,7 @@ from .models import (
     ManagedPosition,
     OrderRequest,
     OrderResult,
+    OrderType,
     AllocationPlan,
     TradingAlert,
     AlertType,
@@ -692,6 +693,14 @@ class ExecutionCoordinator:
             side=side,
             quantity=allocation.quantity,
             price=entry_price,
+            # S-3 (survival discipline): a SELL/REDUCE decision reaching this
+            # entry point (e.g. an agent-chat discussion outcome) is a
+            # liquidation, same category as the other defensive-exit sites
+            # (_close_position/_reduce_position/_execute_order_from_monitor)
+            # — submit MARKET so it reports the true fill in a gap/crash.
+            # BUY/ADD stays LIMIT (global invariant, unaffected by `side`
+            # since it's only SELL here).
+            order_type=OrderType.MARKET if side == OrderSide.SELL else OrderType.LIMIT,
             session_id=session_id,
             reason=f"Trade approval (risk: {risk_score})",
         )
@@ -1927,72 +1936,99 @@ class ExecutionCoordinator:
         elif action == "EXECUTE_STOP_LOSS" and alert.ticker:
             config = self.risk_monitor._watching.get(alert.ticker)
             if config:
-                # Update risk agent status - executing stop-loss
-                self._update_agent_status(
-                    "risk",
-                    AgentStatus.WORKING,
-                    task=f"Executing stop-loss for {config.stock_name or alert.ticker}",
-                    processing_stock=alert.ticker,
-                    processing_stock_name=config.stock_name,
-                    trade_details={
-                        "action": "STOP_LOSS",
-                        "quantity": config.quantity,
-                        "entry_price": config.entry_price,
-                        "stop_loss": config.stop_loss,
-                        "current_price": config.last_price,
-                    },
-                )
+                # S-3 review carry-over (S-2 in-flight guard, 5th SELL entry
+                # point): a user-confirmed alert click can race an
+                # autonomous defensive exit (RiskMonitor's AGENT_AUTO tick,
+                # or PositionManager) for the SAME ticker — same guard as
+                # _close_position/_reduce_position/
+                # _execute_order_from_monitor/on_trade_approved's SELL/
+                # REDUCE main path (see _close_position's docstring).
+                # Guard-denied: skip as a no-op — the position stays
+                # tracked/watched, the OTHER engine's exit already owns it.
+                if self._acquire_defensive_exit_guard(alert.ticker):
+                    try:
+                        # Update risk agent status - executing stop-loss
+                        self._update_agent_status(
+                            "risk",
+                            AgentStatus.WORKING,
+                            task=f"Executing stop-loss for {config.stock_name or alert.ticker}",
+                            processing_stock=alert.ticker,
+                            processing_stock_name=config.stock_name,
+                            trade_details={
+                                "action": "STOP_LOSS",
+                                "quantity": config.quantity,
+                                "entry_price": config.entry_price,
+                                "stop_loss": config.stop_loss,
+                                "current_price": config.last_price,
+                            },
+                        )
 
-                price = config.last_price or config.entry_price
-                # L2 (spec D2): decision_id/session_id left unset (NULL) on
-                # purpose — a user-confirmed alert action has no upstream
-                # decision record to thread; NULL is the correct lineage
-                # state here, not a gap to wire.
-                order = OrderRequest(
-                    ticker=alert.ticker,
-                    stock_name=config.stock_name,
-                    side=OrderSide.SELL,
-                    quantity=config.quantity,
-                    price=price,
-                    reason="User-confirmed stop-loss",
-                )
-                result = await self._execute_order(order)
-                # Track the ACTUAL fill — a rejected/unfilled sell keeps the
-                # position under defense instead of orphaning it (review #8).
-                self._apply_sell_fill(alert.ticker, result.filled_quantity, order=order, result=result)
+                        price = config.last_price or config.entry_price
+                        # L2 (spec D2): decision_id/session_id left unset (NULL) on
+                        # purpose — a user-confirmed alert action has no upstream
+                        # decision record to thread; NULL is the correct lineage
+                        # state here, not a gap to wire.
+                        order = OrderRequest(
+                            ticker=alert.ticker,
+                            stock_name=config.stock_name,
+                            side=OrderSide.SELL,
+                            quantity=config.quantity,
+                            price=price,
+                            # S-3 (survival discipline): MARKET, not the
+                            # OrderRequest default of LIMIT — same rationale
+                            # as _close_position's MARKET switch.
+                            order_type=OrderType.MARKET,
+                            reason="User-confirmed stop-loss",
+                        )
+                        result = await self._execute_order(order)
+                        # Track the ACTUAL fill — a rejected/unfilled sell keeps the
+                        # position under defense instead of orphaning it (review #8).
+                        self._apply_sell_fill(alert.ticker, result.filled_quantity, order=order, result=result)
+                    finally:
+                        self._release_defensive_exit_guard(alert.ticker)
 
         elif action == "EXECUTE_TAKE_PROFIT" and alert.ticker:
             config = self.risk_monitor._watching.get(alert.ticker)
             if config:
-                # Update risk agent status - executing take-profit
-                self._update_agent_status(
-                    "risk",
-                    AgentStatus.WORKING,
-                    task=f"Executing take-profit for {config.stock_name or alert.ticker}",
-                    processing_stock=alert.ticker,
-                    processing_stock_name=config.stock_name,
-                    trade_details={
-                        "action": "TAKE_PROFIT",
-                        "quantity": config.quantity,
-                        "entry_price": config.entry_price,
-                        "take_profit": config.take_profit,
-                        "current_price": config.last_price,
-                    },
-                )
+                # S-3 review carry-over — same in-flight guard as
+                # EXECUTE_STOP_LOSS above (see its comment for the full
+                # rationale).
+                if self._acquire_defensive_exit_guard(alert.ticker):
+                    try:
+                        # Update risk agent status - executing take-profit
+                        self._update_agent_status(
+                            "risk",
+                            AgentStatus.WORKING,
+                            task=f"Executing take-profit for {config.stock_name or alert.ticker}",
+                            processing_stock=alert.ticker,
+                            processing_stock_name=config.stock_name,
+                            trade_details={
+                                "action": "TAKE_PROFIT",
+                                "quantity": config.quantity,
+                                "entry_price": config.entry_price,
+                                "take_profit": config.take_profit,
+                                "current_price": config.last_price,
+                            },
+                        )
 
-                price = config.last_price or config.take_profit
-                # L2 (spec D2): decision_id/session_id left unset (NULL) —
-                # same rationale as EXECUTE_STOP_LOSS above.
-                order = OrderRequest(
-                    ticker=alert.ticker,
-                    stock_name=config.stock_name,
-                    side=OrderSide.SELL,
-                    quantity=config.quantity,
-                    price=price,
-                    reason="User-confirmed take-profit",
-                )
-                result = await self._execute_order(order)
-                self._apply_sell_fill(alert.ticker, result.filled_quantity, order=order, result=result)
+                        price = config.last_price or config.take_profit
+                        # L2 (spec D2): decision_id/session_id left unset (NULL) —
+                        # same rationale as EXECUTE_STOP_LOSS above.
+                        order = OrderRequest(
+                            ticker=alert.ticker,
+                            stock_name=config.stock_name,
+                            side=OrderSide.SELL,
+                            quantity=config.quantity,
+                            price=price,
+                            # S-3: MARKET, not LIMIT — same rationale as
+                            # EXECUTE_STOP_LOSS above.
+                            order_type=OrderType.MARKET,
+                            reason="User-confirmed take-profit",
+                        )
+                        result = await self._execute_order(order)
+                        self._apply_sell_fill(alert.ticker, result.filled_quantity, order=order, result=result)
+                    finally:
+                        self._release_defensive_exit_guard(alert.ticker)
 
         elif action == "HOLD":
             # Do nothing, just acknowledge
@@ -2061,6 +2097,17 @@ class ExecutionCoordinator:
                 side=OrderSide.SELL,
                 quantity=position.quantity,
                 price=position.current_price,
+                # S-3 (survival discipline): defensive/user-initiated closes
+                # submit as MARKET, not the OrderRequest default of LIMIT —
+                # matches risk_monitor.py's existing _execute_stop_loss/
+                # _execute_take_profit convention (P2-4) so a gap/crash
+                # reports the true adverse fill instead of the (favorable)
+                # price captured above. `price` is kept as the mock/paper
+                # broker's fill-price fallback and the live Kiwoom fill-
+                # confirm's fallback_price — MARKET orders never actually
+                # send it to the broker (order_agent.py only tick-rounds/
+                # sends price for LIMIT).
+                order_type=OrderType.MARKET,
                 reason="User-initiated close",
                 session_id=decision_id,
             )
@@ -2157,6 +2204,9 @@ class ExecutionCoordinator:
                 side=OrderSide.SELL,
                 quantity=sell_qty,
                 price=position.current_price,
+                # S-3: same MARKET rationale as _close_position above — a
+                # partial defensive reduce must report the true fill too.
+                order_type=OrderType.MARKET,
                 reason="Autonomous partial reduce",
                 session_id=decision_id,
             )

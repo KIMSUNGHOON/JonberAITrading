@@ -29,13 +29,16 @@ from services.autonomy import GateDecision
 from services.trading.coordinator import ExecutionCoordinator
 from services.trading.market_hours import MarketSession
 from services.trading.models import (
+    AlertType,
     AllocationPlan,
     ManagedPosition,
     OrderRequest,
     OrderResult,
     OrderSide,
+    OrderType,
     QueueStatus,
     StopLossMode,
+    TradingAlert,
     TradingMode,
 )
 
@@ -674,3 +677,97 @@ async def test_sell_main_path_skipped_while_defensive_exit_inflight(monkeypatch)
 
     assert captured == [], "no order may be placed while a defensive exit is in flight"
     assert result.quantity == 0
+
+
+
+# -------------------------------------------
+# S-3 review carry-over — `handle_alert_action`'s EXECUTE_STOP_LOSS/
+# EXECUTE_TAKE_PROFIT branches are a 5th, previously-unguarded SELL entry
+# point: a user-confirmed alert click can race an autonomous defensive exit
+# (RiskMonitor's AGENT_AUTO tick, or PositionManager) for the SAME ticker,
+# exactly like the four sites the S-2 review fix already guards
+# (`_close_position`/`_reduce_position`/`_execute_order_from_monitor`/
+# `on_trade_approved`'s SELL/REDUCE main path — see the "S-2 review fix"
+# section above). Same `_acquire_defensive_exit_guard`/
+# `_release_defensive_exit_guard` contract: guard-denied -> skip as a no-op
+# (zero orders, position stays tracked/watched); guard-allowed -> executes
+# normally AND submits MARKET (S-3's order-type unification, not just LIMIT
+# at the trigger price).
+#
+# Spec: docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2 S-3
+# -------------------------------------------
+
+
+def _pending_alert(alert_type: AlertType, ticker: str = "005930") -> TradingAlert:
+    return TradingAlert(
+        id="alert-1",
+        alert_type=alert_type,
+        ticker=ticker,
+        title="t",
+        message="m",
+        action_required=True,
+    )
+
+
+async def test_execute_stop_loss_skipped_while_defensive_exit_inflight():
+    coord, position = _coordinator_with_watched_position()
+    coord._state.pending_alerts.append(_pending_alert(AlertType.STOP_LOSS_TRIGGERED))
+    captured = await _capture_executed_order(coord)
+
+    # Simulate a defensive exit for this ticker already in flight (e.g.
+    # RiskMonitor's AGENT_AUTO tick mid-SELL) at the moment the user clicks
+    # the alert's "EXECUTE_STOP_LOSS" action.
+    coord._defensive_exit_inflight.add("005930")
+
+    await coord.handle_alert_action("alert-1", "EXECUTE_STOP_LOSS")
+
+    assert captured == [], "no order may be placed while a defensive exit is in flight"
+    assert any(p.ticker == "005930" for p in coord._state.positions), (
+        "the skip is a no-op -- the position must stay tracked, not phantom-closed"
+    )
+    assert "005930" in coord.risk_monitor._watching
+
+
+async def test_execute_take_profit_skipped_while_defensive_exit_inflight():
+    coord, position = _coordinator_with_watched_position()
+    coord._state.pending_alerts.append(_pending_alert(AlertType.TAKE_PROFIT_TRIGGERED))
+    captured = await _capture_executed_order(coord)
+
+    coord._defensive_exit_inflight.add("005930")
+
+    await coord.handle_alert_action("alert-1", "EXECUTE_TAKE_PROFIT")
+
+    assert captured == [], "no order may be placed while a defensive exit is in flight"
+    assert any(p.ticker == "005930" for p in coord._state.positions)
+    assert "005930" in coord.risk_monitor._watching
+
+
+async def test_execute_stop_loss_proceeds_and_submits_market_when_not_inflight():
+    """Guard-allowed path: executes normally (unchanged behavior) AND now
+    submits MARKET, not LIMIT (S-3)."""
+    coord, position = _coordinator_with_watched_position()
+    coord._state.pending_alerts.append(_pending_alert(AlertType.STOP_LOSS_TRIGGERED))
+    captured = await _capture_executed_order(coord)
+
+    await coord.handle_alert_action("alert-1", "EXECUTE_STOP_LOSS")
+
+    assert len(captured) == 1
+    assert captured[0].order_type == OrderType.MARKET
+    assert captured[0].side == OrderSide.SELL
+    # The guard must be released after completion -- not left permanently
+    # claimed (mirrors test_defensive_exit_guard_released_after_completion_
+    # allows_retry above).
+    assert "005930" not in coord._defensive_exit_inflight
+
+
+async def test_execute_take_profit_proceeds_and_submits_market_when_not_inflight():
+    coord, position = _coordinator_with_watched_position()
+    coord._state.pending_alerts.append(_pending_alert(AlertType.TAKE_PROFIT_TRIGGERED))
+    captured = await _capture_executed_order(coord)
+
+    await coord.handle_alert_action("alert-1", "EXECUTE_TAKE_PROFIT")
+
+    assert len(captured) == 1
+    assert captured[0].order_type == OrderType.MARKET
+    assert captured[0].side == OrderSide.SELL
+    assert "005930" not in coord._defensive_exit_inflight

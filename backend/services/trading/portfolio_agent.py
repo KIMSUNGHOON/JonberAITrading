@@ -15,6 +15,7 @@ from .models import (
     ManagedPosition,
     OrderRequest,
     OrderSide,
+    OrderType,
     RiskParameters,
     TradingState,
 )
@@ -335,11 +336,23 @@ class PortfolioAgent:
                     # on purpose — a portfolio-rebalance liquidation has no
                     # upstream decision record to thread; NULL is the
                     # correct lineage state here, not a gap to wire.
+                    # S-3 (survival discipline): MARKET, not the
+                    # OrderRequest default of LIMIT — a rebalance sell is a
+                    # system-initiated liquidation of an UNRELATED position,
+                    # same category as a defensive stop-loss/take-profit
+                    # exit (risk_monitor.py's P2-4 convention). `price` is
+                    # now set explicitly too (previously omitted entirely,
+                    # leaving it None) — MARKET orders never send this to
+                    # the broker, but it's still the mock/paper broker's
+                    # fill-price fallback and the live fill-confirm's
+                    # fallback_price, same as every other MARKET site.
                     rebalance_orders.append(OrderRequest(
                         ticker=pos.ticker,
                         stock_name=pos.stock_name,
                         side=OrderSide.SELL,
                         quantity=sell_qty,
+                        price=pos.current_price,
+                        order_type=OrderType.MARKET,
                         reason=f"Rebalancing to accommodate new position",
                     ))
                     excess -= sell_qty * pos.current_price
@@ -400,11 +413,15 @@ class PortfolioAgent:
                 if sell_qty > 0:
                     # L2 (spec D2): decision_id/session_id left unset (NULL)
                     # — same rationale as the rebalance SELL above.
+                    # S-3: MARKET + explicit price — same rationale as
+                    # _check_rebalancing_needed's rebalance SELL above.
                     rebalance_orders.append(OrderRequest(
                         ticker=position.ticker,
                         stock_name=position.stock_name,
                         side=OrderSide.SELL,
                         quantity=sell_qty,
+                        price=position.current_price,
+                        order_type=OrderType.MARKET,
                         reason=f"Position exceeds max allocation ({pos_pct:.1f}% > {max_pct:.1f}%)",
                     ))
 
