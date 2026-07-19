@@ -144,6 +144,15 @@ def compute_market_regime(
     셋 다 None이면 None(저장 안 함, 현행과 동일).
     market_sentiment_label = score를 threshold로 bullish/bearish/neutral 라벨링.
     breadth 필드(id/trade_date/breadth_*/regime_label/source)는 보존(하위호환).
+
+    L-5: breadth가 없으면(스캐너 미완료 등) regime_label은 더 이상 'neutral'
+    하드코딩이 아니라 sentiment_score 기반 폴백을 쓴다 — score >= threshold면
+    'risk_on', <= -threshold면 'risk_off', 그 사이는 'neutral'. 단, 신호 자체가
+    하나도 없으면(지수·수급 전부 무의미 -> signals가 빈 리스트) 폴백을 태우지
+    않고 스켈레톤의 기존 'neutral'을 그대로 유지한다(threshold=0 같은 극단값에서
+    score=0.0이 '>= threshold'를 만족해 'risk_on'으로 오분류되는 것을 방지).
+    breadth가 있으면 이 폴백은 전혀 실행되지 않는다 — regime_label은 위에서
+    dict(breadth)로 복사된 값 그대로 byte-불변.
     """
     if breadth is None and index is None and flow is None:
         return None
@@ -169,7 +178,7 @@ def compute_market_regime(
     out["foreign_net_amount"] = flw.get("foreign_net_amount")
     out["institution_net_amount"] = flw.get("institution_net_amount")
 
-    # sentiment_score = available 신호 평균
+    # sentiment_score = available 신호 평균 (regime_label 폴백보다 먼저 계산되어야 함)
     signals: list[float] = []
     if breadth is not None and breadth.get("breadth_ratio") is not None:
         signals.append(float(breadth["breadth_ratio"]))
@@ -193,5 +202,15 @@ def compute_market_regime(
         out["market_sentiment_label"] = "bearish"
     else:
         out["market_sentiment_label"] = "neutral"
+
+    # L-5 폴백: breadth 없을 때만, 그리고 신호가 하나라도 있을 때만 적용.
+    if breadth is None and signals:
+        if score >= threshold:
+            out["regime_label"] = "risk_on"
+        elif score <= -threshold:
+            out["regime_label"] = "risk_off"
+        else:
+            out["regime_label"] = "neutral"
+
     return out
 
