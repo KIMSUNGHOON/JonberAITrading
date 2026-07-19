@@ -50,6 +50,10 @@ STRATEGY_MAPPED_FIELDS: dict[str, tuple[float, float]] = {
     "default_stop_loss_pct": (3.0, 15.0),
     "default_take_profit_pct": (5.0, 30.0),
     "max_trade_notional_pct": (5.0, 30.0),
+    # S-4 (생존 규율, decision D4): R 기반 사이징 예산 — 게이트 미참조라
+    # GATE_PROTECTED가 아닌 allowlist. 퍼센트 단위, ×100 변환 없음(RiskParameters
+    # .risk_budget_pct/PositionSizingRules.risk_budget_pct 둘 다 퍼센트).
+    "risk_budget_pct": (0.25, 1.5),
 }
 
 # 자율 게이트·브레이커·모드 필드 — 전략이 절대 못 움직인다(테스트로 봉인).
@@ -73,6 +77,7 @@ def _source_values(strategy: TradingStrategy) -> dict[str, float]:
         "default_stop_loss_pct": strategy.exit_conditions.stop_loss_pct * 100.0,
         "default_take_profit_pct": strategy.exit_conditions.take_profit_pct * 100.0,
         "max_trade_notional_pct": strategy.position_sizing.max_trade_notional_pct,
+        "risk_budget_pct": strategy.position_sizing.risk_budget_pct,
     }
 
 

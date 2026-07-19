@@ -29,6 +29,7 @@ from agents.prompts import (
     KR_STOCK_STRATEGIC_DECISION_PROMPT,
 )
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+from services.trading.r_sizing import r_cap_value
 from services.trading.strategy_consensus import clamp_knob
 from .helpers import (
     _get_stk_cd_safely,
@@ -51,6 +52,24 @@ async def _get_active_strategy():
         return (await get_trading_coordinator()).get_strategy()
     except Exception:
         return None
+
+
+async def _get_risk_budget_pct() -> float:
+    """활성 RiskParameters.risk_budget_pct 조회 (best-effort — 실패/
+    coordinator 미가동 시 모델 기본값, 그래프 노드를 절대 막지 않는다).
+    lazy import는 _get_active_strategy와 동일 패턴 — S-4(생존 규율) R 캡이
+    strategy_apply의 전략-적응/수동 PUT 값과 동일한 SSOT(공유 RiskParameters
+    인스턴스)를 읽도록 한다."""
+    from services.trading.models import RiskParameters
+
+    default = RiskParameters.model_fields["risk_budget_pct"].default
+    try:
+        from app.dependencies import get_trading_coordinator
+
+        coordinator = await get_trading_coordinator()
+        return coordinator.risk_params.risk_budget_pct
+    except Exception:
+        return default
 
 
 def _strategy_stop_params(strategy, risk_score: float) -> tuple[float, float, float]:
@@ -301,6 +320,21 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
     current_price = market_data.get("cur_prc", 0)
     position_size_pct = float(risk_signals.get("max_position_pct", 5.0))
 
+    # S-4 (생존 규율, decision D4): stop_loss/take_profit 산출을 수량 계산
+    # 앞으로 재배치 — 산식·폴백 자체는 완전히 불변(byte-identical), R 캡이
+    # Proposal이 실제로 갖게 될 그 stop_loss 값을 그대로 수량 계산에서 쓸 수
+    # 있도록 순서만 바뀐다.
+    suggested_stop_loss = risk_signals.get(
+        "suggested_stop_loss",
+        int(current_price * (1 - strategy.exit_conditions.stop_loss_pct))
+        if strategy else int(current_price * 0.95),
+    )
+    suggested_take_profit = risk_signals.get(
+        "suggested_take_profit",
+        int(current_price * (1 + strategy.exit_conditions.take_profit_pct))
+        if strategy else int(current_price * 1.10),
+    )
+
     # Calculate quantity based on action type and available balance
     quantity = 0
     if action in (TradeAction.BUY, TradeAction.ADD) and current_price > 0:
@@ -311,6 +345,31 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
 
             # Calculate quantity: (orderable * position_size%) / price
             investment_amount = int(orderable_amount * position_size_pct / 100)
+
+            # S-4: R 기반 사이징 — 예산 risk_budget_pct%(계좌 적응 [0.25,1.5])
+            # ÷ 손절거리 캡을 기존 notional 캡과 min() 결합(더 작은 쪽 채택).
+            # r_cap_value 가드(거리<0.5% 등) 미충족 시 None -> 기존 값 유지.
+            # equity는 이 사이징 경로가 애초에 쓰는 가용현금(orderable_amount)
+            # 기준 — portfolio_agent의 계좌 총평가액 기준과는 이 경로가 원래
+            # 갖고 있던 로컬 자본 베이스가 다르므로 의도적으로 그대로 둔다
+            # (spec §1 "(a) 가용현금×pct").
+            risk_budget_pct = await _get_risk_budget_pct()
+            r_cap = r_cap_value(
+                equity=orderable_amount,
+                risk_budget_pct=risk_budget_pct,
+                entry_price=current_price,
+                stop_price=suggested_stop_loss,
+            )
+            if r_cap is not None and r_cap < investment_amount:
+                logger.debug(
+                    "kr_stock_r_cap_applied",
+                    stk_cd=stk_cd,
+                    investment_amount=investment_amount,
+                    r_cap=r_cap,
+                    risk_budget_pct=risk_budget_pct,
+                )
+                investment_amount = int(r_cap)
+
             quantity = investment_amount // current_price
 
             logger.info(
@@ -345,16 +404,8 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         action=action,
         quantity=quantity,
         entry_price=current_price,
-        stop_loss=risk_signals.get(
-            "suggested_stop_loss",
-            int(current_price * (1 - strategy.exit_conditions.stop_loss_pct))
-            if strategy else int(current_price * 0.95),
-        ),
-        take_profit=risk_signals.get(
-            "suggested_take_profit",
-            int(current_price * (1 + strategy.exit_conditions.take_profit_pct))
-            if strategy else int(current_price * 1.10),
-        ),
+        stop_loss=suggested_stop_loss,
+        take_profit=suggested_take_profit,
         risk_score=float(risk_signals.get("risk_score", 0.5)),
         position_size_pct=position_size_pct,
         rationale=response,

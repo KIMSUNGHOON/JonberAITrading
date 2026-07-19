@@ -1,6 +1,9 @@
-"""S-3 (survival discipline): PortfolioAgent's rebalance SELL orders must
-submit as MARKET, not the OrderRequest default of LIMIT — and must carry an
-explicit `price` (previously omitted entirely, leaving `price=None`).
+"""S-3/S-4 (survival discipline): PortfolioAgent's rebalance SELL orders and
+R-based buy-side sizing.
+
+S-3 — rebalance SELL orders must submit as MARKET, not the OrderRequest
+default of LIMIT — and must carry an explicit `price` (previously omitted
+entirely, leaving `price=None`).
 
 Real gap: `_check_rebalancing_needed`/`suggest_rebalancing` build their
 rebalance `OrderRequest`s with no `order_type` (defaults to `OrderType.LIMIT`,
@@ -28,6 +31,7 @@ Spec: docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2 S-3.
 from services.trading.models import (
     AccountInfo,
     ManagedPosition,
+    OrderSide,
     OrderType,
     RiskParameters,
     TradingState,
@@ -96,3 +100,112 @@ def test_suggest_rebalancing_sell_is_market_with_price():
     assert order.ticker == "005930"
     assert order.order_type == OrderType.MARKET
     assert order.price == 100_000  # position.current_price, not None
+
+
+# =============================================================================
+# S-4 (생존 규율, decision D4): R-based sizing — _calculate_max_position_value
+# now takes entry_price/stop_loss and min()-combines the risk-bucket cap with
+# r_sizing.r_cap_value's R-budget cap (smaller wins). Spec: docs/superpowers/
+# specs/2026-07-19-survival-discipline-design.md §2 S-4.
+# =============================================================================
+
+
+def test_calculate_max_position_value_adopts_r_cap_when_smaller():
+    """브리프 Step1 ②: R 캡이 기존(리스크버킷) 캡보다 작을 때 채택.
+
+    5억 계좌, risk_score=1 (factor 1.0) -> 기존 캡 = 500,000,000*0.15 =
+    75,000,000. entry=100,000/stop=90,000 (10% 거리) -> r_cap =
+    500,000,000*0.0075/0.10 = 37,500,000 < 75,000,000 -> R 캡 채택.
+    """
+    agent = _agent()  # defaults: max_single_position_pct=0.15, risk_budget_pct=0.75
+    value = agent._calculate_max_position_value(
+        total_equity=500_000_000, risk_score=1, entry_price=100_000, stop_loss=90_000
+    )
+    assert value == 37_500_000
+
+
+def test_calculate_max_position_value_keeps_existing_cap_when_r_cap_larger():
+    """브리프 Step1 ②: R 캡이 기존 캡보다 클 때 기존 캡 유지(회귀).
+
+    entry=100,000/stop=98,000 (2% 거리) -> r_cap = 500,000,000*0.0075/0.02 =
+    187,500,000 > 75,000,000 기존 캡 -> 기존 캡 그대로.
+    """
+    agent = _agent()
+    value = agent._calculate_max_position_value(
+        total_equity=500_000_000, risk_score=1, entry_price=100_000, stop_loss=98_000
+    )
+    assert value == 75_000_000
+
+
+def test_calculate_max_position_value_unaffected_when_stop_loss_none():
+    """stop_loss=None(가드) -> R 캡 미적용, 기존(risk_score 버킷) 캡 그대로 —
+    S-4 이전 호출부(스탑 없는 큐잉 트레이드 등)의 회귀 핀."""
+    agent = _agent()
+    value = agent._calculate_max_position_value(
+        total_equity=500_000_000, risk_score=1, entry_price=100_000, stop_loss=None
+    )
+    assert value == 75_000_000
+    # entry_price/stop_loss 둘 다 생략(기존 2-인자 호출)해도 동일해야 한다.
+    value_no_kwargs = agent._calculate_max_position_value(total_equity=500_000_000, risk_score=1)
+    assert value_no_kwargs == 75_000_000
+
+
+# -------------------------------------------
+# End-to-end via calculate_allocation (public API) — proves the wiring, not
+# just the private helper.
+# -------------------------------------------
+
+
+def _fresh_buy_account() -> AccountInfo:
+    return AccountInfo(total_equity=500_000_000, available_cash=400_000_000, total_stock_value=0)
+
+
+def test_buy_allocation_quantity_reflects_r_cap_when_tighter():
+    agent = _agent()
+    plan = agent.calculate_allocation(
+        account=_fresh_buy_account(),
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.BUY,
+        entry_price=100_000,
+        risk_score=1,
+        stop_loss=90_000,  # 10% distance -> r_cap=37,500,000 binds
+        take_profit=120_000,
+    )
+    assert plan.quantity == 375
+    assert plan.estimated_amount == 37_500_000
+    assert plan.stop_loss == 90_000
+
+
+def test_buy_allocation_quantity_unaffected_when_r_cap_looser():
+    agent = _agent()
+    plan = agent.calculate_allocation(
+        account=_fresh_buy_account(),
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.BUY,
+        entry_price=100_000,
+        risk_score=1,
+        stop_loss=98_000,  # 2% distance -> r_cap=187,500,000, looser than 75M
+        take_profit=120_000,
+    )
+    assert plan.quantity == 750
+    assert plan.estimated_amount == 75_000_000
+
+
+def test_buy_allocation_quantity_regression_when_no_stop_loss():
+    """스탑 없는 기존 호출부(예: 큐잉 트레이드 원복)와 동일 수치 — S-4가 R 캡을
+    적용 못 해도(가드) 사이징 결과는 이전 그대로."""
+    agent = _agent()
+    plan = agent.calculate_allocation(
+        account=_fresh_buy_account(),
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.BUY,
+        entry_price=100_000,
+        risk_score=1,
+        stop_loss=None,
+        take_profit=None,
+    )
+    assert plan.quantity == 750
+    assert plan.estimated_amount == 75_000_000

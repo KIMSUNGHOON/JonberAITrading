@@ -107,6 +107,12 @@ class PositionSizingRules(BaseModel):
     # 바운드로 클램프해 RiskParameters.max_trade_notional_pct에 매핑(자율 사이징).
     max_trade_notional_pct: float = Field(default=15.0, ge=0.5, le=50.0)
 
+    # S-4 (생존 규율 — decision D4): R 기반 사이징 예산 — strategy_apply가
+    # [0.25, 1.5] 하드 바운드로 클램프해 RiskParameters.risk_budget_pct에
+    # 매핑. 기본값(0.75)은 RiskParameters 모델 기본값과 동일 — 전략 없음/
+    # 미조정=거동 불변.
+    risk_budget_pct: float = Field(default=0.75, ge=0.1, le=3.0)
+
 
 class TradingStrategy(BaseModel):
     """Complete trading strategy configuration"""

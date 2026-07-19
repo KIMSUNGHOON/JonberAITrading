@@ -268,6 +268,25 @@ class RiskParameters(BaseModel):
         description="Default take-profit distance from entry, %"
     )
 
+    # S-4 (생존 규율 — docs/superpowers/specs/2026-07-19-survival-discipline-
+    # design.md §2 S-4, decision D4): per-trade R risk budget as % of total
+    # account equity. Both sizing sites (portfolio_agent
+    # ._calculate_max_position_value, KR graph decision_nodes' quantity
+    # calc) feed this into services.trading.r_sizing.r_cap_value and
+    # min()-combine the result with their existing notional/cash caps — the
+    # smaller of the two always wins, so this can only ever tighten sizing,
+    # never loosen it. Hard Field bounds are deliberately loose (0.1-3.0);
+    # the real ceiling is strategy_apply.STRATEGY_MAPPED_FIELDS' (0.25, 1.5)
+    # EOD-consensus clamp. Not gate-protected (services/autonomy/gate.py
+    # never reads it) — safe for a strategy to adapt.
+    risk_budget_pct: float = Field(
+        default=0.75,
+        ge=0.1, le=3.0,
+        description="Per-trade R risk budget as % of total equity — "
+                     "position-value ceiling = equity*(risk_budget_pct/100)"
+                     "/stop_distance_pct, min()-combined with existing caps"
+    )
+
 
 # -------------------------------------------
 # Order Models

@@ -219,6 +219,153 @@ class TestKRPositionAwareDecisionRegression:
 
 
 # =============================================================================
+# S-4 (생존 규율, decision D4): R-based sizing — quantity calc r_cap_value()
+# min()-combines the notional cap with an R-budget cap using the SAME
+# stop_loss the proposal carries (stop_loss precompute moved before the
+# quantity calc — the "reorder is harmless" pin lives here too).
+# Spec: docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2 S-4.
+# =============================================================================
+
+
+class TestRCapSizingDecisionNodes:
+    @staticmethod
+    def _buy_leaning_analyses():
+        return {
+            "technical_analysis": {
+                "agent_type": "technical", "signal": "buy", "confidence": 0.8,
+                "summary": "상승 추세", "key_factors": [],
+            },
+            "fundamental_analysis": {
+                "agent_type": "fundamental", "signal": "buy", "confidence": 0.8,
+                "summary": "저평가", "key_factors": [],
+            },
+            "sentiment_analysis": {
+                "agent_type": "sentiment", "signal": "buy", "confidence": 0.8,
+                "summary": "긍정적 뉴스", "key_factors": [],
+            },
+        }
+
+    @staticmethod
+    def _fake_kiwoom_client(orderable_amount: int):
+        client = MagicMock()
+        client.get_cash_balance = AsyncMock(
+            return_value=MagicMock(ord_psbl_amt=orderable_amount)
+        )
+        return client
+
+    def _wire_common_mocks(self, monkeypatch, kr, *, orderable_amount: int, risk_budget_pct: float = 0.75):
+        async def fake_decide_action(llm, messages, *, rule_action, **kwargs):
+            return rule_action, "", "rule_fallback", None, None
+
+        monkeypatch.setattr(kr, "get_llm_provider", lambda: MagicMock())
+        monkeypatch.setattr(kr, "decide_action", fake_decide_action)
+        # 결정론성 확보 — 전역 coordinator 싱글턴 오염(다른 테스트가 먼저
+        # 초기화했을 수 있음)과 무관하게 전략=None/risk_budget_pct 고정값을
+        # 강제한다 (best-effort lazy fetch를 우회).
+        monkeypatch.setattr(kr, "_get_active_strategy", AsyncMock(return_value=None))
+        monkeypatch.setattr(kr, "_get_risk_budget_pct", AsyncMock(return_value=risk_budget_pct))
+        monkeypatch.setattr(
+            kr, "get_shared_kiwoom_client_async",
+            AsyncMock(return_value=self._fake_kiwoom_client(orderable_amount)),
+        )
+        _quiet_kr_telegram(monkeypatch)
+
+    async def test_r_cap_tightens_quantity_when_binding(self, monkeypatch):
+        """R 캡이 기존 notional 캡보다 작을 때 채택 — 수량이 줄어든다.
+
+        orderable=10,000,000, position_size_pct=50 -> investment_amount=
+        5,000,000(사전 R캡). stop 10% 거리 -> r_cap=10,000,000*0.0075/0.10=
+        750,000 < 5,000,000 -> 채택. quantity=750,000//100,000=7.
+        """
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+
+        self._wire_common_mocks(monkeypatch, kr, orderable_amount=10_000_000)
+
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "market_data": {"cur_prc": 100_000},
+            "risk_assessment": {
+                "signals": {
+                    "max_position_pct": 50.0,
+                    "suggested_stop_loss": 90_000,  # 10% distance
+                    "suggested_take_profit": 120_000,
+                    "risk_score": 0.5,
+                }
+            },
+            **self._buy_leaning_analyses(),
+        }
+
+        result = await kr.kr_stock_strategic_decision_node(state)
+        proposal = result["trade_proposal"]
+
+        assert proposal["action"] == "BUY"
+        assert proposal["quantity"] == 7
+        # stop_loss/take_profit는 risk_signals 값 그대로 — 재배치 무해.
+        assert proposal["stop_loss"] == 90_000
+        assert proposal["take_profit"] == 120_000
+
+    async def test_r_cap_does_not_bind_when_looser_than_notional_cap(self, monkeypatch):
+        """R 캡이 기존 notional 캡보다 클 때 — 기존 수량 그대로(회귀 핀).
+
+        orderable=10,000,000, position_size_pct=5(기본) -> investment_amount=
+        500,000. stop 2% 거리 -> r_cap=3,750,000 (느슨) -> 미채택.
+        """
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+
+        self._wire_common_mocks(monkeypatch, kr, orderable_amount=10_000_000)
+
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "market_data": {"cur_prc": 100_000},
+            "risk_assessment": {
+                "signals": {
+                    "max_position_pct": 5.0,
+                    "suggested_stop_loss": 98_000,  # 2% distance
+                    "suggested_take_profit": 110_000,
+                    "risk_score": 0.5,
+                }
+            },
+            **self._buy_leaning_analyses(),
+        }
+
+        result = await kr.kr_stock_strategic_decision_node(state)
+        proposal = result["trade_proposal"]
+
+        assert proposal["action"] == "BUY"
+        assert proposal["quantity"] == 5  # 500,000 // 100,000, R 캡 미적용
+        assert proposal["stop_loss"] == 98_000
+        assert proposal["take_profit"] == 110_000
+
+    async def test_stop_precompute_reorder_is_byte_identical_pin(self, monkeypatch):
+        """재배치 무해 핀: risk_signals에 suggested_stop_loss가 없어 폴백 산식
+        경로를 타도(strategy=None) proposal.stop_loss/take_profit이 재배치
+        이전과 동일한 폴백 값(entry*0.95 / entry*1.10)을 낸다 — 산식은 불변,
+        순서만 수량 계산 앞으로 옮겨졌을 뿐."""
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+
+        self._wire_common_mocks(monkeypatch, kr, orderable_amount=10_000_000)
+
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "market_data": {"cur_prc": 70_000},
+            # risk_assessment 키 자체가 없음 -> risk_signals={} -> 폴백 산식
+            **self._buy_leaning_analyses(),
+        }
+
+        result = await kr.kr_stock_strategic_decision_node(state)
+        proposal = result["trade_proposal"]
+
+        assert proposal["stop_loss"] == int(70_000 * 0.95)      # 66500, byte-identical
+        assert proposal["take_profit"] == int(70_000 * 1.10)    # 77000, byte-identical
+        # position_size_pct 기본값 5.0 -> investment_amount=500,000.
+        # distance=(70000-66500)/70000=5% -> r_cap=1,500,000 (느슨) -> 미채택.
+        assert proposal["quantity"] == 500_000 // 70_000  # 7
+
+
+# =============================================================================
 # Coin: new wiring — existing_position injection + SELL sizing
 # =============================================================================
 

@@ -19,6 +19,7 @@ from .models import (
     RiskParameters,
     TradingState,
 )
+from .r_sizing import r_cap_value
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,8 @@ class PortfolioAgent:
 
         # 2. Calculate position size based on risk
         max_position_value = self._calculate_max_position_value(
-            account.total_equity, risk_score
+            account.total_equity, risk_score,
+            entry_price=entry_price, stop_loss=stop_loss,
         )
 
         # 3. Consider existing position
@@ -278,11 +280,19 @@ class PortfolioAgent:
         self,
         total_equity: float,
         risk_score: int,
+        entry_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
     ) -> float:
         """
         Calculate maximum position value based on risk.
 
-        Higher risk score = smaller position.
+        Higher risk score = smaller position. S-4 (생존 규율, decision D4):
+        additionally min()-combined with the R-based risk-budget cap
+        (equity * risk_budget_pct% / stop distance) — whichever of the two
+        is SMALLER wins, so this can only ever tighten sizing, never loosen
+        it. entry_price/stop_loss default to None so existing callers that
+        don't have a stop yet stay call-compatible; r_cap_value's own guard
+        then simply doesn't apply (returns None -> no change here).
         """
         base_max = total_equity * self.risk_params.max_single_position_pct
 
@@ -297,7 +307,23 @@ class PortfolioAgent:
         else:
             risk_factor = 0.5
 
-        return base_max * risk_factor
+        max_value = base_max * risk_factor
+
+        r_cap = r_cap_value(
+            equity=total_equity,
+            risk_budget_pct=self.risk_params.risk_budget_pct,
+            entry_price=entry_price if entry_price is not None else 0,
+            stop_price=stop_loss,
+        )
+        if r_cap is not None and r_cap < max_value:
+            logger.debug(
+                f"[PortfolioAgent] R cap {r_cap:,.0f} tighter than risk-bucket "
+                f"cap {max_value:,.0f} — adopting R cap "
+                f"(risk_budget_pct={self.risk_params.risk_budget_pct}%)"
+            )
+            max_value = r_cap
+
+        return max_value
 
     def _check_rebalancing_needed(
         self,

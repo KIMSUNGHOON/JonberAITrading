@@ -7,6 +7,9 @@ invariant test here is the cheapest permanent seal against that vector.
 Phase5 결정B: max_trade_notional_pct는 이제 allowlist(STRATEGY_MAPPED_FIELDS)
 소속 — [5,30] 하드 바운드 내 자율 사이징 적응(test_strategy_notional_pct_
 clamped_to_bounds).
+
+S-4 (생존 규율, decision D4): risk_budget_pct도 allowlist 소속 — [0.25, 1.5]
+하드 바운드 내 적응(test_risk_budget_pct_clamped_to_bounds).
 """
 
 import pytest
@@ -34,7 +37,7 @@ def test_allowlist_and_denylist_are_disjoint_and_exact():
     assert set(STRATEGY_MAPPED_FIELDS) == {
         "max_single_position_pct", "min_cash_ratio",
         "default_stop_loss_pct", "default_take_profit_pct",
-        "max_trade_notional_pct",
+        "max_trade_notional_pct", "risk_budget_pct",
     }
     assert GATE_PROTECTED_FIELDS == frozenset({
         "max_daily_loss_pct", "max_open_positions",
@@ -66,6 +69,21 @@ def test_strategy_notional_pct_clamped_to_bounds():
     assert rp.max_trade_notional_pct == 5.0
 
 
+def test_risk_budget_pct_clamped_to_bounds():
+    """S-4 (decision D4): 브리프 Step1 ④ — strategy_apply 클램프 (0.25, 1.5)
+    왕복. EOD 전략 합의/수동 편집이 risk_budget_pct를 하드 바운드 밖으로
+    밀어내려 해도 [0.25, 1.5] 안으로 클램프된다 (RiskParameters Field 자체의
+    (0.1, 3.0)보다 좁은, strategy_apply 독자 클램프)."""
+    rp = RiskParameters()
+    strategy = _strategy(risk_budget_pct=2.0)  # > 상한 1.5
+    apply_strategy_to_risk_params(strategy, rp)
+    assert rp.risk_budget_pct == pytest.approx(1.5)
+
+    strategy.position_sizing.risk_budget_pct = 0.15  # < 하한 0.25
+    apply_strategy_to_risk_params(strategy, rp)
+    assert rp.risk_budget_pct == pytest.approx(0.25)
+
+
 def test_notional_pct_not_in_gate_protected():
     assert "max_trade_notional_pct" in STRATEGY_MAPPED_FIELDS
     assert "max_trade_notional_pct" not in GATE_PROTECTED_FIELDS
@@ -76,7 +94,7 @@ def test_mapping_applies_with_unit_conversion_in_place():
     rp = RiskParameters()
     strategy = _strategy(max_position_pct=0.12, min_cash_ratio=0.25,
                          stop_loss_pct=0.06, take_profit_pct=0.20,
-                         max_trade_notional_pct=20.0)
+                         max_trade_notional_pct=20.0, risk_budget_pct=1.0)
     rp_id = id(rp)
     changes = apply_strategy_to_risk_params(strategy, rp)
     assert id(rp) == rp_id  # in-place, 객체 교체 없음
@@ -85,8 +103,10 @@ def test_mapping_applies_with_unit_conversion_in_place():
     assert rp.default_stop_loss_pct == pytest.approx(6.0)   # 분율→퍼센트 ×100
     assert rp.default_take_profit_pct == pytest.approx(20.0)
     assert rp.max_trade_notional_pct == pytest.approx(20.0)
+    assert rp.risk_budget_pct == pytest.approx(1.0)
     assert set(changes) == set(STRATEGY_MAPPED_FIELDS)
     assert changes["default_stop_loss_pct"] == (pytest.approx(8.0), pytest.approx(6.0))
+    assert changes["risk_budget_pct"] == (pytest.approx(0.75), pytest.approx(1.0))
 
 
 def test_mapping_clamps_to_bounds():
