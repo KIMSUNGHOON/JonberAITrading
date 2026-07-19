@@ -114,19 +114,22 @@ async def register_fill_as_position(
             # quantity는 증분 델타 → update_position은 절대값 할당이므로
             # 기존 보유량에 합산해 넘긴다(2-트랜치 20+28=48; 델타를 그대로
             # 넘기면 PM만 28로 과소보고).
-            # entry_decision_id도 동일 coalesce: 기존 포지션에 이미 진짜
-            # 진입 결정 id가 있으면(첫 트랜치) 이후 트랜치의 session_id로
-            # 덮어쓰지 않는다 — coordinator._add_position의 merge 분기가
-            # analysis_session_id를 절대 건드리지 않는 것과 동일 불변식
-            # (entry는 최초 1회만 성립).
+            # entry_decision_id는 merge 분기에서 절대 건드리지 않는다(L4,
+            # spec 2026-07-19 decision-lineage L-3 리뷰 이월 정정) —
+            # coordinator._add_position의 merge 분기가 analysis_session_id를
+            # 절대 건드리지 않는 것과 동일 불변식(entry는 최초 1회만 성립).
+            # 이전엔 existing.entry_decision_id가 None일 때 session_id로
+            # backfill했으나, 고아 채택(orphan adoption — entry_decision_id=
+            # None이 정상, D3)된 포지션이 사후에 무관한 세션ID로 재등록되면
+            # 그 무관 세션이 "진입 결정"으로 오귀속되어 캘리브레이션을
+            # 오염시킨다. entry_decision_id는 신규 등록(add_position) 시에만
+            # 설정된다.
             position_manager.update_position(
                 ticker=ticker,
                 quantity=existing.quantity + quantity,
                 stop_loss=stop_loss if existing.stop_loss is None else None,
                 take_profit=take_profit if existing.take_profit is None else None,
-                entry_decision_id=(
-                    session_id if existing.entry_decision_id is None else None
-                ),
+                entry_decision_id=None,
             )
     except Exception as e:
         logger.warning(

@@ -261,24 +261,30 @@ async def test_pm_lookup_failure_does_not_prevent_coordinator_registration(monke
 
 
 # -------------------------------------------
-# entry_decision_id round trip (L3, 2026-07-19,
-# docs/superpowers/specs/2026-07-19-decision-lineage-design.md)
+# entry_decision_id round trip (L3 introduced this field, 2026-07-19,
+# docs/superpowers/specs/2026-07-19-decision-lineage-design.md; L4 corrected
+# the merge branch below -- see the docstrings)
 # -------------------------------------------
 #
 # Mirrors the ManagedPosition.analysis_session_id wiring above, but for the
-# PM's OWN ledger (MonitoredPosition.entry_decision_id). Same coalesce
-# discipline as stop_loss/take_profit: a fresh position gets the incoming
-# session_id outright; an existing position only backfills when its own
-# entry_decision_id is still None -- a real, already-recorded entry decision
-# is never overwritten by a later fill's session_id (mirrors
-# ExecutionCoordinator._add_position's merge branch, which never touches
-# analysis_session_id once a position already exists).
+# PM's OWN ledger (MonitoredPosition.entry_decision_id). A fresh position
+# gets the incoming session_id outright. An EXISTING position's
+# entry_decision_id is NEVER touched by a merge -- not even to backfill a
+# None -- mirroring ExecutionCoordinator._add_position's merge branch, which
+# never touches analysis_session_id once a position already exists (L4: the
+# original L3 implementation backfilled a None entry_decision_id on merge,
+# which mis-attributes an unrelated later fill's session_id as the "entry
+# decision" for a position whose real entry legitimately has none, e.g. an
+# orphan adopted with no upstream decision, D3/D2 -- corrupting
+# calibration's entry-decision outcome scoring).
 
 
-async def test_existing_pm_entry_decision_id_backfilled_when_none(monkeypatch):
+async def test_existing_pm_entry_decision_id_never_backfilled_on_merge(monkeypatch):
     """The PM's own ledger has no entry_decision_id yet (e.g. this ticker was
-    first registered by a path with no session_id) -- a later fill carrying
-    a real session_id backfills it."""
+    adopted as an orphan with no originating decision, D3) -- a later fill's
+    session_id must NOT be adopted as the entry decision. entry_decision_id
+    is set ONLY on a brand-new position (the branch above), never on merge
+    (L4 correction of L3's original backfill-if-None behavior)."""
     coordinator = _coordinator()
     existing = MonitoredPosition(
         ticker="005930",
@@ -304,7 +310,7 @@ async def test_existing_pm_entry_decision_id_backfilled_when_none(monkeypatch):
         avg_price=69000.0,
         stop_loss=None,
         take_profit=None,
-        session_id="sess-backfill",
+        session_id="sess-should-not-backfill",
     )
 
     pm.update_position.assert_called_once_with(
@@ -312,7 +318,7 @@ async def test_existing_pm_entry_decision_id_backfilled_when_none(monkeypatch):
         quantity=20,
         stop_loss=None,
         take_profit=None,
-        entry_decision_id="sess-backfill",
+        entry_decision_id=None,
     )
 
 

@@ -2002,7 +2002,7 @@ class StorageService:
             return 0
 
     async def update_decision_outcome(
-        self, decision_id: str, realized_pnl: float
+        self, decision_id: Optional[str], realized_pnl: float
     ) -> bool:
         """
         Backfill the realized P&L outcome of an already-recorded agent-chat
@@ -2014,24 +2014,58 @@ class StorageService:
         to it for later analysis.
 
         Args:
-            decision_id: agent_chat_decisions.id to update
-            realized_pnl: realized P&L amount to record
+            decision_id: agent_chat_decisions.id to update. A falsy value
+                (None/"") is a NORMAL input — e.g. a mechanical stop/take-
+                profit close, a user-approved alert action, or a rebalance
+                liquidation legitimately have no originating decision to
+                cite (spec D2) — so it is short-circuited outright rather
+                than issued as a `WHERE id = NULL` query (which SQL never
+                matches, silently no-opping the UPDATE while still paying
+                for a connection).
+            realized_pnl: realized P&L amount to record.
 
         Returns:
-            True if the UPDATE executed successfully (including when no row
-            matched decision_id — this is not treated as an error since a
-            decision may legitimately not exist, e.g. a monitor-driven
-            stop/take-profit close with no originating decision).
+            True only when the UPDATE actually matched and updated exactly
+            one row. False in every other case — a falsy `decision_id` (no
+            UPDATE attempted), a `decision_id` that matched no row
+            (rowcount == 0, e.g. a monitor-driven stop/take-profit close
+            with no originating decision — legitimate, not an error), or a
+            storage exception. Every False-returning path (except the
+            exception path, which already logs its own
+            `decision_outcome_update_failed` error) logs a
+            `decision_outcome_update_missed` warning carrying decision_id/
+            realized_pnl (L4) — previously a non-matching UPDATE returned
+            True unconditionally, making a real lineage gap indistinguishable
+            from a genuine backfill.
         """
+        if not decision_id:
+            logger.warning(
+                "decision_outcome_update_missed",
+                decision_id=decision_id,
+                realized_pnl=realized_pnl,
+                reason="missing_decision_id",
+            )
+            return False
+
         await self.initialize()
 
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
-                await conn.execute(
+                cursor = await conn.execute(
                     "UPDATE agent_chat_decisions SET outcome_realized_pnl = ? WHERE id = ?",
                     (realized_pnl, decision_id),
                 )
                 await conn.commit()
+
+                if cursor.rowcount == 0:
+                    logger.warning(
+                        "decision_outcome_update_missed",
+                        decision_id=decision_id,
+                        realized_pnl=realized_pnl,
+                        reason="no_matching_row",
+                    )
+                    return False
+
                 logger.debug(
                     "decision_outcome_updated",
                     decision_id=decision_id,

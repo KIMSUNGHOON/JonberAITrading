@@ -10,6 +10,7 @@ realized P&L can be attributed back to it, and a fire-and-forget wrapper
 storage failure can never break the sell path.
 """
 
+import logging
 import uuid
 from datetime import datetime
 from unittest.mock import MagicMock
@@ -107,12 +108,75 @@ async def test_update_decision_outcome_backfills_agent_chat_decisions(tmp_path):
     assert got[0]["outcome_realized_pnl"] == 12345.0
 
 
-async def test_update_decision_outcome_missing_id_returns_false_not_raise(tmp_path):
+async def test_update_decision_outcome_missing_id_returns_false_not_raise(
+    tmp_path, caplog
+):
     st = StorageService(db_path=str(tmp_path / "t.db"))
-    # No matching row — UPDATE affects 0 rows. Must not raise; contract only
-    # requires "never breaks the caller", not that it report a hard failure.
-    result = await st.update_decision_outcome("nonexistent-id", 1.0)
-    assert result in (True, False)
+    # No matching row — UPDATE affects 0 rows. Must not raise, and (L4) must
+    # now deterministically report False (with a warning) rather than the
+    # old ambiguous "either True or False" contract — a 0-row UPDATE is a
+    # real lineage gap that must be observable, not silently swallowed as a
+    # false success.
+    with caplog.at_level(logging.WARNING):
+        result = await st.update_decision_outcome("nonexistent-id", 1.0)
+    assert result is False
+    assert any(
+        "decision_outcome_update_missed" in rec.message for rec in caplog.records
+    )
+
+
+async def test_update_decision_outcome_none_decision_id_returns_false_without_query(
+    tmp_path, monkeypatch, caplog
+):
+    """L4: a falsy decision_id (None) must short-circuit BEFORE any DB
+    connection is attempted — the previous `WHERE id = NULL` query was a
+    meaningless always-0-match round trip. Proven here by making any
+    aiosqlite.connect call raise: if the guard is missing, this test fails
+    loudly instead of silently passing."""
+    st = StorageService(db_path=str(tmp_path / "t.db"))
+
+    async def _must_not_connect(*args, **kwargs):
+        raise AssertionError(
+            "update_decision_outcome must not touch the DB for a falsy decision_id"
+        )
+
+    monkeypatch.setattr(ss.aiosqlite, "connect", _must_not_connect)
+
+    with caplog.at_level(logging.WARNING):
+        result = await st.update_decision_outcome(None, 1.0)
+
+    assert result is False
+    assert any(
+        "decision_outcome_update_missed" in rec.message for rec in caplog.records
+    )
+
+
+async def test_update_decision_outcome_empty_string_decision_id_returns_false(
+    tmp_path,
+):
+    st = StorageService(db_path=str(tmp_path / "t.db"))
+    result = await st.update_decision_outcome("", 1.0)
+    assert result is False
+
+
+async def test_update_decision_outcome_success_returns_true(tmp_path):
+    """Existing success path (rowcount==1) must stay byte-for-byte True —
+    L4 only tightens the False paths, never touches the success path."""
+    st = StorageService(db_path=str(tmp_path / "t.db"))
+    did = str(uuid.uuid4())
+    await st.save_agent_chat_decision(
+        {
+            "id": did,
+            "ticker": "005930",
+            "status": "decided",
+            "action": "BUY",
+            "confidence": 0.7,
+            "consensus_level": 0.8,
+            "rationale": "test",
+        },
+        [],
+    )
+    assert await st.update_decision_outcome(did, 42.0) is True
 
 
 # -------------------------------------------
@@ -248,3 +312,52 @@ async def test_record_kr_realized_pnl_without_running_loop_logs_and_does_not_rai
 
     # Must not raise even without an event loop to schedule onto.
     trade_log.record_kr_realized_pnl(**_kwargs())
+
+
+async def test_record_kr_realized_pnl_async_logs_warning_when_outcome_backfill_missed(
+    temp_storage, caplog
+):
+    """L4: entry_decision_id points at no existing decision row (rowcount==0
+    inside update_decision_outcome) -- the call site (trade_log.py) must log
+    its OWN warning so a specific realized-P&L write's failed backfill is
+    observable next to the trade that caused it, not just buried in
+    storage_service's own log."""
+    with caplog.at_level(logging.WARNING):
+        await trade_log.record_kr_realized_pnl_async(
+            **_kwargs(entry_decision_id="does-not-exist", realized_amount=999.0)
+        )
+
+    assert any(
+        "kr_realized_pnl_decision_outcome_backfill_missed" in rec.message
+        for rec in caplog.records
+    )
+
+
+async def test_record_kr_realized_pnl_async_no_warning_when_outcome_backfill_succeeds(
+    temp_storage, caplog
+):
+    """Sanity converse of the above: a REAL matching decision must not emit
+    the call-site warning."""
+    did = str(uuid.uuid4())
+    await temp_storage.save_agent_chat_decision(
+        {
+            "id": did,
+            "ticker": "005930",
+            "status": "decided",
+            "action": "BUY",
+            "confidence": 0.7,
+            "consensus_level": 0.8,
+            "rationale": "test",
+        },
+        [],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await trade_log.record_kr_realized_pnl_async(
+            **_kwargs(entry_decision_id=did, realized_amount=777.0)
+        )
+
+    assert not any(
+        "kr_realized_pnl_decision_outcome_backfill_missed" in rec.message
+        for rec in caplog.records
+    )

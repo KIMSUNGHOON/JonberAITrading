@@ -170,7 +170,22 @@ async def record_kr_realized_pnl_async(
         }
         await storage.save_kr_realized_pnl(record)
         if entry_decision_id:
-            await storage.update_decision_outcome(entry_decision_id, realized_amount)
+            outcome_updated = await storage.update_decision_outcome(
+                entry_decision_id, realized_amount
+            )
+            if not outcome_updated:
+                # L4: update_decision_outcome already logged the storage-side
+                # reason (decision_outcome_update_missed) -- this warning is
+                # the CALL-SITE observation that a specific realized-P&L
+                # write's outcome backfill never landed, so the gap shows up
+                # right next to the trade that caused it (previously this
+                # branch discarded the bool return entirely and stayed
+                # silent).
+                logger.warning(
+                    "kr_realized_pnl_decision_outcome_backfill_missed",
+                    entry_decision_id=entry_decision_id,
+                    realized_amount=realized_amount,
+                )
     except Exception as e:
         logger.warning(
             "kr_realized_pnl_record_failed", stk_cd=stk_cd, error=str(e)
