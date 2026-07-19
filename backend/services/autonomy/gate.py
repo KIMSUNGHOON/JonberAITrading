@@ -6,7 +6,8 @@ two consumers: the analysis-pipeline auto-approve injector and the
 ChatCoordinator execution path — both autonomy engines share one policy.
 
 Check chain (first failure denies):
-    master_gate → market_mode → paper_only → daily_loss_breaker
+    master_gate → market_mode → paper_only
+    → daily_loss_breaker (BUY/ADD only, S-1/D3)
     → coordinator_active (BUY/ADD, kiwoom only)
     → max_positions (BUY/ADD only) → notional_cap (BUY/ADD only, kiwoom only)
 
@@ -17,8 +18,16 @@ Design rules:
   (Relaxing it is an explicit, separate P3 change.)
 - Limits come from RiskParameters (max_daily_loss_pct / max_open_positions /
   max_trade_notional_pct), adjustable via the existing risk-params API.
+- The daily-loss breaker is scoped to POSITION_INCREASING_ACTIONS (S-1/D3,
+  docs/superpowers/specs/2026-07-19-survival-discipline-design.md §D3): no
+  short-selling exists in this system, so SELL/REDUCE is always a size-down
+  and can never deepen today's loss — exempting it keeps the breaker's
+  purpose (stop compounding losses) intact instead of also freezing the
+  stop-loss exit that would stop the bleeding. master_gate/market_mode/
+  paper_only stay action-agnostic (they precede the action branch).
 
 Spec: docs/superpowers/specs/2026-07-11-r3-autonomous-hitl-mode-design.md §2.1
+Spec: docs/superpowers/specs/2026-07-19-survival-discipline-design.md §D3 (S-1)
 """
 
 from dataclasses import dataclass
@@ -283,26 +292,35 @@ async def check_autonomy(
     except Exception as e:
         return _deny("risk_params", str(e))
 
-    # 4. Daily-loss circuit breaker (re-computed per request — the check IS the breaker)
-    try:
-        loss_pct = float(await daily_loss_provider(market))
-    except Exception as e:
-        return _deny("daily_loss_breaker", str(e))
-    if loss_pct >= params.max_daily_loss_pct:
-        today = date.today()
-        if _last_breaker_notice_date != today:
-            _last_breaker_notice_date = today
-            await _notify_breaker(
-                f"⛔ 자율 매매 서킷 브레이커 발동: 당일 실현 손실 {loss_pct:.2f}% ≥ "
-                f"한도 {params.max_daily_loss_pct:.2f}%. 오늘 자율 승인은 전면 중단됩니다 (HITL은 정상)."
-            )
-        return _deny(
-            "daily_loss_breaker",
-            f"daily loss {loss_pct:.2f}% >= limit {params.max_daily_loss_pct:.2f}%",
-        )
-
-    # 5 + 6 + 7 apply only to exposure-increasing actions.
+    # 4 + 5 + 6 + 7 apply only to exposure-increasing actions (S-1 / D3,
+    # docs/superpowers/specs/2026-07-19-survival-discipline-design.md §D3):
+    # this system has no short-selling, so a SELL/REDUCE is always a
+    # size-down — it can never be the thing that deepens today's loss.
+    # Scoping the daily-loss breaker to BUY/ADD (same guard as caps 5/6/7
+    # already use) keeps the breaker's purpose intact — stop compounding
+    # losses — while removing the paradox where a tripped breaker also
+    # blocks the stop-loss exit that would stop the bleeding. Master gate /
+    # market mode / paper-only above are unaffected: they gate the request
+    # regardless of action, before this branch is ever reached.
     if action in POSITION_INCREASING_ACTIONS:
+        # 4. Daily-loss circuit breaker (re-computed per request — the check IS the breaker)
+        try:
+            loss_pct = float(await daily_loss_provider(market))
+        except Exception as e:
+            return _deny("daily_loss_breaker", str(e))
+        if loss_pct >= params.max_daily_loss_pct:
+            today = date.today()
+            if _last_breaker_notice_date != today:
+                _last_breaker_notice_date = today
+                await _notify_breaker(
+                    f"⛔ 자율 매매 서킷 브레이커 발동: 당일 실현 손실 {loss_pct:.2f}% ≥ "
+                    f"한도 {params.max_daily_loss_pct:.2f}%. 오늘 자율 승인은 전면 중단됩니다 (HITL은 정상)."
+                )
+            return _deny(
+                "daily_loss_breaker",
+                f"daily loss {loss_pct:.2f}% >= limit {params.max_daily_loss_pct:.2f}%",
+            )
+
         # 5. Coordinator must be active (kiwoom only — coin has no equivalent
         # fill-tracker/coordinator; scoped here, not in the provider, in case
         # a caller ever swaps a coin-specific default in). See

@@ -118,6 +118,65 @@ async def test_daily_loss_breaker_notifies_once_per_day(master_on, monkeypatch):
     assert len(sent) == 1
 
 
+class TestDailyLossBreakerScopedToPositionIncreasingActions:
+    """S-1 / D3 (docs/superpowers/specs/2026-07-19-survival-discipline-design.md
+    §D3): this system has no short-selling, so a SELL/REDUCE is always a
+    size-down — it can never be the thing that deepens a loss. Blocking the
+    stop-loss exit that would stop the bleeding because the breaker itself
+    tripped is exactly backwards. Scope the breaker to
+    POSITION_INCREASING_ACTIONS (BUY/ADD), same as caps 5/6/7 already are.
+    Master/mode/paper stay action-agnostic (they precede the action branch).
+    """
+
+    @pytest.mark.parametrize("action", ["SELL", "REDUCE"])
+    async def test_tripped_breaker_allows_risk_reducing_actions(self, master_on, action):
+        decision = await _check(
+            action=action, quantity=None, entry_price=None,
+            **_providers(daily_loss_pct=5.0),  # tripped: default limit is 3.0%
+        )
+        assert decision.allowed is True
+
+    @pytest.mark.parametrize("action", ["BUY", "ADD"])
+    async def test_tripped_breaker_still_denies_position_increasing_actions(
+        self, master_on, action
+    ):
+        decision = await _check(action=action, **_providers(daily_loss_pct=5.0))
+        assert decision.allowed is False
+        assert decision.check == "daily_loss_breaker"
+
+    async def test_master_off_still_denies_sell_even_with_tripped_breaker(self):
+        # No master_on fixture: AUTONOMY_ENABLED defaults False. The
+        # exemption is breaker-only -- master/mode/paper precede the action
+        # branch entirely and must keep denying SELL regardless.
+        decision = await _check(
+            action="SELL", quantity=None, entry_price=None,
+            **_providers(daily_loss_pct=5.0),
+        )
+        assert decision.allowed is False
+        assert decision.check == "master_gate"
+
+    async def test_hitl_mode_still_denies_sell_even_with_tripped_breaker(self, master_on):
+        decision = await _check(
+            action="SELL", quantity=None, entry_price=None,
+            **_providers(mode="hitl", daily_loss_pct=5.0),
+        )
+        assert decision.allowed is False
+        assert decision.check == "market_mode"
+
+    @pytest.mark.parametrize(
+        "action", ["BUY", "ADD", "SELL", "REDUCE", "HOLD", "WATCH"]
+    )
+    async def test_untripped_breaker_behavior_is_unchanged(self, master_on, action):
+        # Byte-invariant: with the breaker not tripped, every action's
+        # outcome is unchanged from pre-D3 behavior -- allowed, since nothing
+        # else denies at these defaults (positions=0, equity=10M, pct=15%).
+        decision = await _check(
+            action=action, quantity=10, entry_price=50_000,
+            **_providers(daily_loss_pct=0.0),
+        )
+        assert decision.allowed is True
+
+
 async def test_max_positions_denies_buy(master_on):
     decision = await _check(action="BUY", **_providers(positions=5))
     assert not decision.allowed
@@ -434,13 +493,17 @@ class TestDefaultDailyLossProvider:
     async def test_gate_denies_when_default_provider_lookup_fails(
         self, master_on, monkeypatch
     ):
-        # 통합: 기본 프로바이더 조회 실패 → 게이트 deny (fail-closed)
+        # 통합: 기본 프로바이더 조회 실패 → 게이트 deny (fail-closed).
+        # S-1/D3: the breaker is now scoped to POSITION_INCREASING_ACTIONS,
+        # so this must exercise a BUY/ADD (HOLD would now legitimately skip
+        # the breaker entirely — see
+        # TestDailyLossBreakerScopedToPositionIncreasingActions).
         self._mock_client(monkeypatch, realized_pnl=0,
                           pnl_exc=RuntimeError("mockapi down"))
         providers = _providers()
         providers.pop("daily_loss_provider")  # 기본 프로바이더 사용
         decision = await check_autonomy(
-            "kiwoom", action="HOLD", quantity=None, entry_price=None, **providers
+            "kiwoom", action="BUY", quantity=None, entry_price=None, **providers
         )
         assert decision.allowed is False
         assert decision.check == "daily_loss_breaker"
