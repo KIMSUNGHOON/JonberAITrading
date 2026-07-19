@@ -470,6 +470,23 @@ class StorageService:
                     },
                 )
 
+                # agent_chat_decisions.decision_source/session_ref (L1,
+                # decision lineage restoration 2026-07-19): promotes this
+                # table to the durable ledger for BOTH the agent-chat debate
+                # path (existing rows, decision_source left NULL -- read
+                # consumers treat NULL as the 'agent_chat' fallback per spec
+                # D1, not backfilled) AND the LangGraph analysis/execution
+                # path (new rows via persist_analysis_decision,
+                # decision_source='analysis', session_ref=originating
+                # session id -- kept for traceability even though that
+                # session itself may later be GC'd; this row is what
+                # survives).
+                await self._ensure_columns(
+                    conn,
+                    "agent_chat_decisions",
+                    {"decision_source": "TEXT", "session_ref": "TEXT"},
+                )
+
                 # Create indexes for better query performance
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
@@ -1788,6 +1805,12 @@ class StorageService:
                 total_messages/total_rounds (int/None — session-ssot P4-3:
                 transcript size, for a list view that shouldn't have to
                 parse agent_chat_transcripts' JSON blob per row).
+                decision_source/session_ref (str/None — L1, decision
+                lineage restoration: 'analysis' + originating session id
+                for LangGraph-path decisions written via
+                persist_analysis_decision; omitted/None for the normal
+                agent-chat debate path, which leaves both columns NULL —
+                read consumers treat NULL decision_source as 'agent_chat').
             votes: list of dicts with keys decision_id, agent_type, vote,
                 confidence, reasoning, key_factors (list),
                 suggested_position_pct, suggested_stop_loss_pct,
@@ -1808,8 +1831,8 @@ class StorageService:
                      entry_price, stop_loss, take_profit, position_pct,
                      news_sentiment, news_count, behavioral_signals,
                      market_sentiment, flow, agent_weights,
-                     total_messages, total_rounds)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_messages, total_rounds, decision_source, session_ref)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         decision["id"],
@@ -1844,6 +1867,12 @@ class StorageService:
                         else None,
                         decision.get("total_messages"),
                         decision.get("total_rounds"),
+                        # L1: 'agent_chat' path never sets these -- both land
+                        # NULL, which read consumers treat as the
+                        # 'agent_chat' fallback (spec D1). Only
+                        # persist_analysis_decision passes them explicitly.
+                        decision.get("decision_source"),
+                        decision.get("session_ref"),
                     ),
                 )
 
@@ -1893,33 +1922,46 @@ class StorageService:
         ticker: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
+        source: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        """Get agent-chat decisions, newest first, optionally filtered by ticker."""
+        """Get agent-chat decisions, newest first, optionally filtered by
+        ticker and/or decision_source.
+
+        Args:
+            source: filters on decision_source (L1: 'agent_chat' or
+                'analysis'). NULL rows (every row written before L1, and
+                every agent_chat-path row since -- that path never sets the
+                column) are matched under 'agent_chat' via
+                COALESCE(decision_source, 'agent_chat'), per spec D1's
+                stated fallback interpretation. Default None returns every
+                row regardless of source -- byte-identical to pre-L1
+                callers.
+        """
         await self.initialize()
 
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
                 conn.row_factory = aiosqlite.Row
 
+                clauses = []
+                params: list[Any] = []
                 if ticker:
-                    cursor = await conn.execute(
-                        """
-                        SELECT * FROM agent_chat_decisions
-                        WHERE ticker = ?
-                        ORDER BY created_at DESC
-                        LIMIT ? OFFSET ?
-                        """,
-                        (ticker, limit, offset),
-                    )
-                else:
-                    cursor = await conn.execute(
-                        """
-                        SELECT * FROM agent_chat_decisions
-                        ORDER BY created_at DESC
-                        LIMIT ? OFFSET ?
-                        """,
-                        (limit, offset),
-                    )
+                    clauses.append("ticker = ?")
+                    params.append(ticker)
+                if source:
+                    clauses.append("COALESCE(decision_source, 'agent_chat') = ?")
+                    params.append(source)
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+                cursor = await conn.execute(
+                    f"""
+                    SELECT * FROM agent_chat_decisions
+                    {where}
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*params, limit, offset),
+                )
 
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
