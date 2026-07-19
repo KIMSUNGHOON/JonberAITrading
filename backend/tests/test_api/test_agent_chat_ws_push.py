@@ -34,6 +34,19 @@ from services.agent_chat.models import (
     VoteType,
 )
 
+# L-6 (lineage-restoration measurement-integrity gate): this file drives
+# real ChatCoordinator.start_manual_discussion() completions (only ChatRoom
+# and _fetch_market_context are faked -- persist_session is never mocked),
+# so every DECIDED/CANCELLED completion below calls
+# decision_log.persist_session() -> StorageService.save_agent_chat_decision()
+# against the process-wide get_storage_service() singleton. Confirmed via
+# file-isolated DB-count delta (2026-07-19): running this file alone added
+# exactly 5 rows (NO_ACTION/BUY/NO_ACTION/SELL/NO_ACTION) to the LIVE
+# backend/data/storage.db's agent_chat_decisions table -- the same pattern
+# found repeated 4x in the 05:43~06:12 contamination burst. See
+# .superpowers/sdd/task-L-6-report.md.
+pytestmark = pytest.mark.usefixtures("isolated_storage_service")
+
 
 class FakeRoom:
     """Stand-in for ChatRoom: real ChatSession + the same callback surface."""
