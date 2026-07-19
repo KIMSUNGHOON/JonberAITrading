@@ -30,11 +30,29 @@ quo, not a regression).
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import structlog
 
 logger = structlog.get_logger()
+
+# I3 (final-review fix): fixed UTC+9 offset -- mirrors
+# app/api/routes/trading.py's own `KST = timezone(timedelta(hours=9))`
+# (that module's `trade_date = request.date or datetime.now(KST).strftime(
+# "%Y-%m-%d")` is the existing repo convention this follows), not pytz's
+# Asia/Seoul (services/trading/market_hours.py) -- no DST in KST, so the
+# fixed offset is exact and avoids the extra dependency here.
+_KST = timezone(timedelta(hours=9))
+
+
+def _trade_date_kst_today() -> str:
+    """KST 'today' as "%Y-%m-%d" -- the exact format
+    `calibration._within_window` parses and `app/api/routes/trading.py`'s
+    trade_date default already produces. A tiny seam (not inlined into
+    `persist_analysis_decision` below) so tests can monkeypatch a specific
+    date without needing to time-travel the real clock."""
+    return datetime.now(_KST).strftime("%Y-%m-%d")
 
 
 async def persist_analysis_decision(
@@ -45,6 +63,7 @@ async def persist_analysis_decision(
     action: str,
     confidence: Optional[float],
     rationale: Optional[str],
+    stock_name: Optional[str] = None,
 ) -> Optional[str]:
     """Persist a compact decision row for a LangGraph analysis-path decision.
 
@@ -66,6 +85,9 @@ async def persist_analysis_decision(
         action: the decided action (e.g. "BUY"/"SELL"/"ADD"/"REDUCE").
         confidence: decision confidence, if available.
         rationale: free-text rationale, if available.
+        stock_name: optional display name (e.g. "삼성전자") — threaded
+            through when the caller has it in scope; None keeps existing
+            callers byte-for-byte unchanged.
 
     Returns:
         The new decision id (a fresh uuid4 str) on success, else None. Never
@@ -77,6 +99,12 @@ async def persist_analysis_decision(
         decision = {
             "id": decision_id,
             "ticker": ticker,
+            "stock_name": stock_name,
+            # I3 (final-review fix): was never set (always NULL) before this
+            # fix -- calibration._within_window fail-opens on a missing
+            # trade_date (always included), so every analysis decision
+            # silently bypassed `window_days` regardless of staleness.
+            "trade_date": _trade_date_kst_today(),
             "status": "decided",
             "action": action,
             "confidence": confidence,

@@ -341,7 +341,13 @@ async def test_rebalance_partial_fill_registers_unfilled_remainder(temp_storage,
     assert order.ord_no == "REBAL3"
     assert order.total_quantity == 20
     assert order.filled_quantity == 12
-    assert order.source_session_id == "s-rebal"
+    # I1 (final-review fix, spec D2): source_session_id is the placed
+    # rebalance order's own session_id -- `_rebalance_order()`/
+    # portfolio_agent's rebalance orders never set OrderRequest.session_id
+    # (a system-computed rebalance sell has no upstream decision to cite),
+    # so this is None, NOT the (unrelated) position's entry-side
+    # analysis_session_id ("s-rebal").
+    assert order.source_session_id is None
     assert order.risk_score == 6
     assert order.stop_loss is None
     assert order.take_profit is None

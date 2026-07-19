@@ -192,7 +192,16 @@ async def test_analysis_path_full_lineage_e2e(temp_storage):
     assert await storage.update_decision_outcome(entry_decision_id, expected_pnl) is True
 
     # -- label_and_calibrate scores the entry decision --
-    as_of_date = datetime.now().strftime("%Y-%m-%d")
+    # I3 (final-review fix): persist_analysis_decision now stamps trade_date
+    # as explicit KST "today" (services.trading.decision_ledger._KST) rather
+    # than leaving it NULL -- as_of_date here must be computed the SAME way
+    # (not naive datetime.now(), which can drift a calendar day from KST on
+    # a non-KST host) so this test's window check stays host-timezone
+    # independent instead of relying on _within_window's missing-trade_date
+    # fail-open (the exact behavior this fix removes).
+    from datetime import timedelta, timezone
+
+    as_of_date = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
     result = await label_and_calibrate(storage, as_of_date)
     assert result["decisions_scored"] >= 1
 

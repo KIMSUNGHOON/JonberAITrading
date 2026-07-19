@@ -246,7 +246,15 @@ async def test_zero_fill_tracks_remainder_no_ghost_position(monkeypatch):
     assert tracked.filled_quantity == 0
     assert tracked.stop_loss == 66500
     assert tracked.take_profit == 77000
-    assert tracked.source_session_id == "sess-1"
+    # I2 (final-review fix, spec-change pin, mirrors the register_fill_as_
+    # position session_id pin above at line ~207): source_session_id is now
+    # the durable decision-ledger id (`decision_id`), NOT state["session_id"]
+    # ("sess-1") -- this file's autouse _no_real_decision_ledger fixture
+    # neutralizes the persist call to return None, so it surfaces here as
+    # None rather than a fresh uuid (real non-None-id coverage lives in
+    # tests/test_agents/test_kr_execution_trade_log.py, which uses real tmp
+    # storage instead of mocking this call away).
+    assert tracked.source_session_id is None
     assert tracked.trade_date == date.today().strftime("%Y%m%d")
     assert tracked.risk_score == 6  # threaded from the proposal (0.6 -> 6)
     # A memory-only TrackedOrder dies with the process — registration must
@@ -383,7 +391,10 @@ async def test_reduce_partial_fill_uses_confirmed_qty_and_registers_sell_remaind
     # An exit carries no defense levels of its own forward.
     assert tracked.stop_loss is None
     assert tracked.take_profit is None
-    assert tracked.source_session_id == "sess-1"
+    # I2: source_session_id is the durable decision-ledger id, NOT
+    # state["session_id"] ("sess-1") -- see test_zero_fill_tracks_remainder_
+    # no_ghost_position's comment above for the full spec-change rationale.
+    assert tracked.source_session_id is None
     assert tracked.risk_score == 6  # int(0.6 * 10)
     coordinator._schedule_persist.assert_called_once()
 
@@ -446,7 +457,10 @@ async def test_sell_partial_fill_registers_sell_remainder(monkeypatch):
     assert tracked.filled_quantity == 4
     assert tracked.stop_loss is None
     assert tracked.take_profit is None
-    assert tracked.source_session_id == "sess-1"
+    # I2: source_session_id is the durable decision-ledger id, NOT
+    # state["session_id"] ("sess-1") -- see test_zero_fill_tracks_remainder_
+    # no_ghost_position's comment above for the full spec-change rationale.
+    assert tracked.source_session_id is None
     coordinator._schedule_persist.assert_called_once()
 
 

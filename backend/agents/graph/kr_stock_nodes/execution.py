@@ -273,6 +273,10 @@ async def kr_stock_execution_node(state: dict) -> dict:
                 action=action.value,
                 confidence=synthesis.get("average_confidence"),
                 rationale=synthesis.get("decision_rationale") or proposal.get("rationale"),
+                # I3 (final-review fix): stk_nm is already in scope here
+                # (proposal.get("stk_nm", stk_cd) above) -- thread it through
+                # so the durable decision row carries a display name too.
+                stock_name=stk_nm,
             )
         except Exception as decision_ledger_err:
             logger.warning(
@@ -519,7 +523,14 @@ async def kr_stock_execution_node(state: dict) -> dict:
                             limit_price=entry_price,
                             stop_loss=proposal.get("stop_loss"),
                             take_profit=proposal.get("take_profit"),
-                            source_session_id=state.get("session_id"),
+                            # I2 (final-review fix): the durable decision-
+                            # ledger id, matching register_fill_as_position's
+                            # session_id kwarg just above (L2, spec D1) --
+                            # NOT state.get("session_id") (a dangling
+                            # SessionManager id once that session is GC'd,
+                            # P5). None (persist failed/no id) threads
+                            # through as-is, same as the BUY position path.
+                            source_session_id=decision_id,
                             risk_score=risk_score_int,
                             trade_date=date.today().strftime("%Y%m%d"),
                         )
@@ -564,7 +575,14 @@ async def kr_stock_execution_node(state: dict) -> dict:
                         filled_quantity=filled_qty,
                         filled_amount=filled_qty * avg_fill_price,
                         limit_price=entry_price,
-                        source_session_id=state.get("session_id"),
+                        # I2 (final-review fix): the durable decision-ledger
+                        # id (this EXIT's own decision_id), NOT
+                        # state.get("session_id") -- mirrors the BUY-side
+                        # fix above. This is what the post-fill poll path
+                        # (_poll_tracked_fills -> _apply_sell_position_delta
+                        # -> record_kr_realized_pnl(exit_decision_id=...))
+                        # later reads as the EXIT decision's lineage anchor.
+                        source_session_id=decision_id,
                         risk_score=risk_score_int,
                         trade_date=date.today().strftime("%Y%m%d"),
                     )

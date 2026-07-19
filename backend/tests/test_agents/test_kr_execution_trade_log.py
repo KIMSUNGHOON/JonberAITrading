@@ -379,3 +379,102 @@ async def test_buy_decision_id_survives_into_position_and_subsequent_close(
     pnl_rows = await temp_storage.get_kr_realized_pnl(stk_cd="005930")
     assert len(pnl_rows) == 1
     assert pnl_rows[0]["entry_decision_id"] == decision_id
+
+
+
+# -------------------------------------------
+# I2 (final-review fix, spec D2 parity): the graph node's OWN
+# fill-tracker registrations for an unfilled BUY remainder (execution.py
+# ~522) and a SELL/REDUCE remainder (execution.py ~567) must carry the SAME
+# durable decision_id as `register_fill_as_position`'s session_id kwarg
+# above (L2, line ~501) -- both previously read state.get("session_id")
+# (the ephemeral SessionManager id) instead. Uses `_mock_coordinator()`
+# (fill_tracker is a bare MagicMock) rather than the real
+# ExecutionCoordinator above, since these assert on the TrackedOrder object
+# passed to `fill_tracker.register(...)` directly.
+# -------------------------------------------
+
+
+async def test_buy_decision_id_survives_into_tracked_order_remainder(
+    monkeypatch, temp_storage
+):
+    """A zero-fill BUY's unfilled remainder is tracked via
+    `coordinator.fill_tracker.register(TrackedOrder(...))` -- its
+    `source_session_id` must be the durable decision_id persist_analysis_
+    decision (backed by REAL tmp storage here, so a genuine fresh uuid4 is
+    returned), NOT state["session_id"] ("sess-graph-1")."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeKiwoomClient([])  # zero fill -> remaining_qty > 0 branch
+    coordinator = _mock_coordinator()
+
+    with patch(
+        "agents.graph.kr_stock_nodes.execution.get_shared_kiwoom_client_async",
+        AsyncMock(return_value=client),
+    ), patch(
+        "app.dependencies.get_trading_coordinator",
+        AsyncMock(return_value=coordinator),
+    ), patch(
+        "services.trading.position_registration.register_fill_as_position",
+        new_callable=AsyncMock,
+    ):
+        result = await kr_stock_execution_node(_state())
+
+    assert result["execution_status"] == "placed_pending_fill"
+    coordinator.fill_tracker.register.assert_called_once()
+    tracked = coordinator.fill_tracker.register.call_args.args[0]
+    assert tracked.side == "buy"
+    assert tracked.source_session_id is not None
+    assert tracked.source_session_id != "sess-graph-1"
+
+    import uuid
+
+    uuid.UUID(tracked.source_session_id)  # a real uuid4, not a placeholder
+
+
+async def test_sell_decision_id_survives_into_tracked_order_remainder(
+    monkeypatch, temp_storage
+):
+    """The SELL/REDUCE-side sibling of the BUY test above (execution.py's
+    OTHER fill-tracker registration site, ~567) -- a partial REDUCE's
+    unfilled remainder must carry the durable decision_id too. This is the
+    id the post-fill poll path (`_poll_tracked_fills` ->
+    `_apply_sell_position_delta` -> `record_kr_realized_pnl(exit_decision_
+    id=...)`) later reads as the EXIT decision's lineage anchor."""
+    monkeypatch.setattr("asyncio.sleep", _no_sleep)
+    client = _FakeKiwoomClient(
+        [_filled("ORD2", 12, 71000, buy_sell_tp="매도")], ord_no="ORD2"
+    )
+    coordinator = _mock_coordinator()
+    existing = {
+        "quantity": 100,
+        "entry_price": 65000,
+        "stop_loss": 60000,
+        "take_profit": 75000,
+    }
+
+    with patch(
+        "agents.graph.kr_stock_nodes.execution.get_shared_kiwoom_client_async",
+        AsyncMock(return_value=client),
+    ), patch(
+        "app.dependencies.get_trading_coordinator",
+        AsyncMock(return_value=coordinator),
+    ):
+        result = await kr_stock_execution_node(
+            _state(
+                action="REDUCE",
+                quantity=30,
+                entry_price=71000,
+                existing_position=existing,
+            )
+        )
+
+    assert result["execution_status"] == "completed"
+    coordinator.fill_tracker.register.assert_called_once()
+    tracked = coordinator.fill_tracker.register.call_args.args[0]
+    assert tracked.side == "sell"
+    assert tracked.source_session_id is not None
+    assert tracked.source_session_id != "sess-graph-1"
+
+    import uuid
+
+    uuid.UUID(tracked.source_session_id)

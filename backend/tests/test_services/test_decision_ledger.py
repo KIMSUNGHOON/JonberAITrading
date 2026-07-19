@@ -206,3 +206,147 @@ async def test_calibration_naturally_excludes_analysis_rows_from_per_agent(tmp_p
     per_agent = result["per_agent_accuracy"]
     assert set(per_agent.keys()) == {"technical"}
     assert per_agent["technical"]["decisions_scored"] == 1
+
+
+# -------------------------------------------
+# I3 (final-review fix): persist_analysis_decision must stamp `trade_date`
+# (KST "today", "%Y-%m-%d" -- the same format app/api/routes/trading.py's
+# own trade_date default and calibration._within_window both use) on every
+# analysis-path decision row. Pre-fix, `trade_date` was never set at all
+# (always NULL) -- calibration._within_window fail-opens on a missing
+# trade_date (always included, by design, for a genuinely unknown date), so
+# an analysis decision silently bypassed `window_days` entirely regardless
+# of how stale it actually was.
+# -------------------------------------------
+
+
+async def test_persist_analysis_decision_sets_trade_date_kst_today(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+
+    decision_id = await persist_analysis_decision(
+        storage,
+        session_id="sess-td",
+        ticker="005930",
+        action="BUY",
+        confidence=0.5,
+        rationale="trade_date coverage",
+    )
+    assert decision_id is not None
+
+    rows = await storage.get_agent_chat_decisions(ticker="005930")
+    assert len(rows) == 1
+    expected = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+    assert rows[0]["trade_date"] == expected
+
+
+async def test_persist_analysis_decision_threads_optional_stock_name(tmp_path):
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+
+    decision_id = await persist_analysis_decision(
+        storage,
+        session_id="sess-sn",
+        ticker="005930",
+        action="BUY",
+        confidence=0.5,
+        rationale="stock_name coverage",
+        stock_name="삼성전자",
+    )
+    assert decision_id is not None
+
+    rows = await storage.get_agent_chat_decisions(ticker="005930")
+    assert rows[0]["stock_name"] == "삼성전자"
+
+
+async def test_persist_analysis_decision_stock_name_defaults_to_none(tmp_path):
+    """Existing callers (this file's other tests, none of which pass
+    stock_name) must stay byte-for-byte unchanged."""
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+
+    decision_id = await persist_analysis_decision(
+        storage,
+        session_id="sess-sn-none",
+        ticker="005930",
+        action="BUY",
+        confidence=0.5,
+        rationale="test",
+    )
+    rows = await storage.get_agent_chat_decisions(ticker="005930")
+    assert rows[0]["stock_name"] is None
+
+
+async def test_stale_analysis_decision_excluded_from_calibration_window(
+    tmp_path, monkeypatch
+):
+    """I3 regression: `label_and_calibrate`'s 30-day (default) window must
+    correctly EXCLUDE a stale analysis-path decision now that trade_date is
+    actually populated -- pre-fix, the missing trade_date fail-opened
+    _within_window (always True), so a decision from 31+ days ago was
+    silently scored on every calibration run regardless of window_days.
+
+    Monkeypatches decision_ledger's own KST-today helper (not calibration)
+    to simulate a decision persisted 31 days before `as_of_date` -- proves
+    the fix end-to-end through the REAL persist_analysis_decision function,
+    not a hand-rolled row."""
+    import services.trading.decision_ledger as decision_ledger_module
+
+    as_of_date = "2026-07-19"
+    stale_trade_date = "2026-06-18"  # 31 days before as_of -> outside [cutoff, as_of]
+
+    monkeypatch.setattr(
+        decision_ledger_module, "_trade_date_kst_today", lambda: stale_trade_date
+    )
+
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    decision_id = await persist_analysis_decision(
+        storage,
+        session_id="sess-stale",
+        ticker="005930",
+        action="BUY",
+        confidence=0.5,
+        rationale="stale decision",
+    )
+    assert decision_id is not None
+    await storage.update_decision_outcome(decision_id, 10_000.0)
+
+    result = await label_and_calibrate(storage, as_of_date, window_days=30)
+
+    # Excluded entirely: not scored, and never labeled.
+    assert result["decisions_scored"] == 0
+    row = (await storage.get_agent_chat_decisions(ticker="005930"))[0]
+    assert row["outcome_label"] is None
+
+
+async def test_recent_analysis_decision_included_in_calibration_window(
+    tmp_path, monkeypatch
+):
+    """Sanity counterpart to the exclusion test above: a decision inside the
+    window (10 days before as_of) must still be scored -- the fix narrows
+    the window correctly rather than excluding everything."""
+    import services.trading.decision_ledger as decision_ledger_module
+
+    as_of_date = "2026-07-19"
+    recent_trade_date = "2026-07-09"  # 10 days before as_of -> inside window
+
+    monkeypatch.setattr(
+        decision_ledger_module, "_trade_date_kst_today", lambda: recent_trade_date
+    )
+
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    decision_id = await persist_analysis_decision(
+        storage,
+        session_id="sess-recent",
+        ticker="005930",
+        action="BUY",
+        confidence=0.5,
+        rationale="recent decision",
+    )
+    assert decision_id is not None
+    await storage.update_decision_outcome(decision_id, 10_000.0)
+
+    result = await label_and_calibrate(storage, as_of_date, window_days=30)
+
+    assert result["decisions_scored"] == 1
+    row = (await storage.get_agent_chat_decisions(ticker="005930"))[0]
+    assert row["outcome_label"] == "correct"

@@ -888,8 +888,24 @@ class ExecutionCoordinator:
         `on_trade_approved` builds from). `position` may be None —
         `_execute_order_from_monitor` looks it up defensively and can find
         nothing if the local ledger no longer tracks the ticker — in which
-        case `source_session_id`/`risk_score` are simply omitted, same as
-        `_track_unfilled` already accepts `None` for both.
+        case `risk_score` is simply omitted, same as `_track_unfilled`
+        already accepts `None` for it.
+
+        `source_session_id` (I1, final-review fix, spec D2): the PLACED
+        ORDER's own `session_id`, not `position.analysis_session_id` (the
+        position's ENTRY-side decision). The pre-fix code read the entry id
+        here, so a post-fill exit tranche (`_poll_tracked_fills` ->
+        `_apply_sell_position_delta` -> `record_kr_realized_pnl`) mis-
+        attributed `exit_decision_id` to the entry decision for every
+        partially-filled exit, discussion-driven or mechanical alike. Every
+        caller already threads (or deliberately omits) `order.session_id`
+        correctly per spec D2: `_close_position`/`_reduce_position` forward
+        an optional `decision_id` into it (a discussion-driven exit's own
+        decision id, correctly distinct from the position's entry id), while
+        a mechanical stop-loss/take-profit (`_execute_order_from_monitor`)
+        and a system rebalance sell never set it at all — both naturally
+        land None here, which is correct (no upstream decision to cite), not
+        a gap.
 
         stop_loss/take_profit are always None here: every caller is an EXIT,
         which has no defense levels of its own to carry forward (unlike an
@@ -902,7 +918,7 @@ class ExecutionCoordinator:
             stock_name,
             result,
             limit_price=order.price,
-            source_session_id=position.analysis_session_id if position else None,
+            source_session_id=order.session_id,
             risk_score=position.risk_score if position else None,
         )
         if registered:

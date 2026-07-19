@@ -561,10 +561,46 @@ async def test_close_position_partial_fill_registers_sell_remainder(temp_storage
     assert order.ord_no == "CLOSE1"
     assert order.total_quantity == 8
     assert order.filled_quantity == 3
-    assert order.source_session_id == "s-close"
+    # I1 (final-review fix, spec D2): source_session_id now comes from the
+    # PLACED ORDER's own session_id (the exit's decision_id, threaded via
+    # `_close_position(decision_id=...)`), NOT the position's entry-side
+    # `analysis_session_id` ("s-close" here) -- this call passes no
+    # decision_id (the user-initiated-close/mechanical shape), which
+    # correctly has NO upstream decision to cite. See
+    # test_close_position_with_decision_id_registers_sell_remainder_with_
+    # decision_id below for the discussion-driven-exit case, where this
+    # field correctly carries the EXIT decision id instead.
+    assert order.source_session_id is None
     assert order.risk_score == 7
     assert order.stop_loss is None
     assert order.take_profit is None
+
+
+async def test_close_position_with_decision_id_registers_sell_remainder_with_decision_id(
+    temp_storage,
+):
+    """I1 regression: a discussion-driven exit (decision_id threaded into
+    `_close_position`) must register the fill-tracker remainder's
+    `source_session_id` as the EXIT decision id -- NOT the position's entry
+    `analysis_session_id` ("s-entry" here, deliberately distinct from the
+    decision_id, so a pre-fix implementation that reads
+    `position.analysis_session_id` fails this assertion). This is the
+    post-fill exit-decision_id/ledger-row lineage the poll path
+    (`_poll_tracked_fills` -> `_apply_sell_position_delta` ->
+    `record_kr_realized_pnl(exit_decision_id=...)`) ultimately reads."""
+    coord, position = _coordinator_with_position(
+        quantity=8, session_id="s-entry", risk_score=7
+    )
+    _stub_execute_order(coord, requested=8, filled=3, status="partial", order_id="CLOSE-DEC1")
+
+    result = await coord._close_position("005930", decision_id="dec-close-discuss-1")
+
+    assert result.filled_quantity == 3
+    tracking = coord.fill_tracker.tracking()
+    assert len(tracking) == 1
+    order = tracking[0]
+    assert order.source_session_id == "dec-close-discuss-1"
+    assert order.source_session_id != "s-entry"
 
 
 async def test_close_position_full_fill_does_not_register(temp_storage):
@@ -593,7 +629,10 @@ async def test_reduce_position_partial_fill_registers_sell_remainder(temp_storag
     assert order.ord_no == "REDUCE9"
     assert order.total_quantity == 20
     assert order.filled_quantity == 6
-    assert order.source_session_id == "s-reduce"
+    # I1: source_session_id is the placed order's own session_id (None here
+    # -- no decision_id was threaded into this _reduce_position call), NOT
+    # the position's entry-side analysis_session_id ("s-reduce").
+    assert order.source_session_id is None
     assert order.risk_score == 4
 
 
@@ -649,7 +688,12 @@ async def test_monitor_defensive_sell_partial_fill_registers_sell_remainder(
     assert order.ord_no == "MON1"
     assert order.total_quantity == 10
     assert order.filled_quantity == 4
-    assert order.source_session_id == "s-monitor"
+    # I1: source_session_id is the placed order's own session_id.
+    # `_stop_loss_order()` (RiskMonitor's real construction, mirrored) never
+    # sets OrderRequest.session_id -- a mechanical stop-loss/take-profit has
+    # no upstream decision to cite (spec D2) -- so this is None, NOT the
+    # position's entry-side analysis_session_id ("s-monitor").
+    assert order.source_session_id is None
     assert order.risk_score == 5
     assert order.stop_loss is None
     assert order.take_profit is None
