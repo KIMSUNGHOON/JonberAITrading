@@ -11,19 +11,28 @@ this is intentionally minimal.
 
 `compute_regime_snapshot` is a pure, SYNCHRONOUS function (no LLM, no
 network, no dependency on this app's own storage) that reads the LATEST
-completed `scan_sessions` row for a given trade_date directly off the
-scanner's own sqlite db via the stdlib `sqlite3` module (there is no async
-reader/writer contract to honor here — the scanner db is read read-only and
-independently of this app's aiosqlite storage). It does NOT write anywhere;
-persisting the returned dict (via
+completed-OR-partial `scan_sessions` row for a given trade_date directly off
+the scanner's own sqlite db via the stdlib `sqlite3` module (there is no
+async reader/writer contract to honor here — the scanner db is read
+read-only and independently of this app's aiosqlite storage). It does NOT
+write anywhere; persisting the returned dict (via
 `storage_service.StorageService.save_regime_snapshot`) is left to a later
 orchestrator task that decides IF/WHEN to save.
 
+SC-1: a scan that got stopped (timeout/manual stop) before reaching the end
+of the universe is recorded by the scanner as status='partial' rather than
+being left orphaned at 'running' forever — this function treats 'partial'
+the same as 'completed' so a scan that covered most of the day's universe
+still contributes its breadth counts instead of being silently discarded
+(real incident: a 90-minute-timeout stop once orphaned 3700/4276 collected
+stocks at status='running', so breadth was 0/neutral all day). Among same-day
+rows the LATEST by started_at still wins regardless of status.
+
 Failure-harmless by design, mirroring `calibration.label_and_calibrate`/
 `eod_snapshot.write_daily_snapshot`: any error (missing db file, missing
-table, malformed row) — or simply no completed scan for that day — returns
-`None` rather than raising, since this must never break whatever EOD job
-calls it.
+table, malformed row) — or simply no completed/partial scan for that day —
+returns `None` rather than raising, since this must never break whatever EOD
+job calls it.
 """
 
 from __future__ import annotations
@@ -47,7 +56,8 @@ SCANNER_DB_PATH = Path(__file__).parent.parent.parent / "data" / "scanner_result
 
 
 def compute_regime_snapshot(scanner_db_path: str, trade_date: str) -> Optional[dict]:
-    """Compute a market-regime snapshot from the day's latest completed scan.
+    """Compute a market-regime snapshot from the day's latest completed (or
+    partial, SC-1) scan.
 
     Args:
         scanner_db_path: path to the background scanner's sqlite db
@@ -57,9 +67,9 @@ def compute_regime_snapshot(scanner_db_path: str, trade_date: str) -> Optional[d
     Returns:
         dict with keys id (new uuid4), trade_date, breadth_buy, breadth_sell,
         breadth_hold, breadth_ratio, regime_label ("risk_on"/"risk_off"/
-        "neutral"), source ("scanner"). `None` if no completed scan exists
-        for trade_date, or on any error (missing db file, missing table,
-        etc.) — never raises.
+        "neutral"), source ("scanner"). `None` if no completed-or-partial
+        scan exists for trade_date, or on any error (missing db file,
+        missing table, etc.) — never raises.
     """
     try:
         conn = sqlite3.connect(scanner_db_path)
@@ -69,7 +79,7 @@ def compute_regime_snapshot(scanner_db_path: str, trade_date: str) -> Optional[d
                 """
                 SELECT buy_count, sell_count, hold_count
                 FROM scan_sessions
-                WHERE status = 'completed' AND date(started_at) = ?
+                WHERE status IN ('completed', 'partial') AND date(started_at) = ?
                 ORDER BY started_at DESC
                 LIMIT 1
                 """,

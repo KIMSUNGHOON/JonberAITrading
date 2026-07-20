@@ -249,3 +249,90 @@ async def test_save_and_get_regime_snapshots_roundtrip(tmp_path):
     assert rows[0]["breadth_sell"] == 5
     assert rows[0]["breadth_hold"] == 10
     assert rows[0]["source"] == "scanner"
+
+
+# ---------------------------------------------------------------------------
+# SC-1: partial(stop_scan 도중 종결) 세션도 breadth 소비 대상 — 고아
+# status='running' 버그의 실측 근본원인(scanner.py stop_scan이 세션을
+# 'running'으로 영구 고아화 -> 이 게이트가 0건 반환).
+# ---------------------------------------------------------------------------
+
+
+async def test_compute_regime_snapshot_consumes_partial_session(tmp_path):
+    """status='partial' 세션(스캔 도중 stop_scan으로 종결)도 'completed'와
+    동일하게 breadth 소비 대상이어야 한다(수정 전 RED=0건/neutral 강제)."""
+    today = _today()
+    db_path = _make_scanner_db(
+        tmp_path,
+        [
+            {
+                "id": str(uuid.uuid4()),
+                "started_at": f"{today} 09:00:00",
+                "status": "partial",
+                "buy_count": 40,
+                "sell_count": 5,
+                "hold_count": 10,
+            }
+        ],
+    )
+
+    record = compute_regime_snapshot(db_path, today)
+
+    assert record is not None
+    assert record["breadth_ratio"] > 0.15
+    assert record["regime_label"] == "risk_on"
+    assert record["breadth_buy"] == 40
+
+
+async def test_compute_regime_snapshot_prefers_latest_over_status(tmp_path):
+    """같은 날 completed(이른 시각)와 partial(늦은 시각)이 공존하면, 상태와
+    무관하게 최신 started_at(partial 쪽)이 우선해야 한다(스펙: '최신
+    started_at 우선 유지')."""
+    today = _today()
+    db_path = _make_scanner_db(
+        tmp_path,
+        [
+            {
+                "id": str(uuid.uuid4()),
+                "started_at": f"{today} 09:00:00",
+                "status": "completed",
+                "buy_count": 5,
+                "sell_count": 40,
+                "hold_count": 10,
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "started_at": f"{today} 15:00:00",
+                "status": "partial",
+                "buy_count": 40,
+                "sell_count": 5,
+                "hold_count": 10,
+            },
+        ],
+    )
+
+    record = compute_regime_snapshot(db_path, today)
+
+    assert record is not None
+    assert record["regime_label"] == "risk_on"  # 15:00 partial 세션 우선
+
+
+async def test_compute_regime_snapshot_failed_session_still_excluded(tmp_path):
+    """status='failed'/'running' 등 partial·completed가 아닌 상태는 여전히
+    소비 대상이 아니어야 한다(게이트 확장이 과잉 확장되지 않았음을 확인)."""
+    today = _today()
+    db_path = _make_scanner_db(
+        tmp_path,
+        [
+            {
+                "id": str(uuid.uuid4()),
+                "started_at": f"{today} 09:00:00",
+                "status": "failed",
+                "buy_count": 40,
+                "sell_count": 5,
+                "hold_count": 10,
+            }
+        ],
+    )
+
+    assert compute_regime_snapshot(db_path, today) is None

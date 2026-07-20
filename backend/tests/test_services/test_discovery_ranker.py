@@ -323,6 +323,96 @@ async def test_rank_candidates_returns_empty_when_no_session_for_date(tmp_path, 
 
 
 # ---------------------------------------------------------------------------
+# SC-1: status='partial'(스캔 도중 stop_scan으로 종결) 세션도 랭킹 소비
+# 대상이어야 한다 -- 실측 고아 버그(scanner.py stop_scan이 세션을
+# 'running'으로 영구 고아화)의 근본 수정: regime.py와 동일한 게이트 확장.
+# ---------------------------------------------------------------------------
+
+
+async def test_rank_candidates_consumes_partial_session(tmp_path, storage):
+    """status='partial' 세션도 'completed'와 동일하게 랭킹 대상이어야 한다
+    (수정 전 RED=[] -- _load_discovery_session이 'completed'만 찾았음)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "Good", "factor_json": _passing_factor(momentum=0.5)}],
+        status="partial",
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    by_ticker = {c.ticker: c for c in candidates}
+
+    assert "005930" in by_ticker
+    assert by_ticker["005930"].composite is not None
+    assert by_ticker["005930"].rank == 1
+
+
+async def test_rank_candidates_still_excludes_running_session(tmp_path, storage):
+    """status='running'(아직 진행 중, 아직 종결되지 않은 세션)은 여전히
+    랭킹 대상이 아니어야 한다(게이트 확장이 과잉 확장되지 않았음을 확인)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "Good", "factor_json": _passing_factor(momentum=0.5)}],
+        status="running",
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    assert candidates == []
+
+
+async def test_rank_candidates_prefers_latest_over_status(tmp_path, storage):
+    """같은 날 completed(이른 세션)와 partial(늦은 세션)이 공존하면 최신
+    started_at(partial)이 우선해야 한다(스펙: '최신 started_at 우선
+    유지'). `_seed_scanner_db`는 고정 시각을 쓰므로, 두 세션을 서로 다른
+    session_id로 각각 시딩하고 두 번째 호출의 started_at이 더 늦도록
+    trade_date는 같게 두되 두 번째 세션만 이후에 삽입해 직접 UPDATE로
+    시각을 벌린다."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "000660", "stk_nm": "Early", "factor_json": _passing_factor(momentum=0.1)}],
+        session_id="sess-early",
+        status="completed",
+    )
+    async with aiosqlite.connect(str(scanner_db)) as db:
+        await db.execute(
+            "INSERT INTO scan_sessions "
+            "(id, started_at, completed_at, total_stocks, completed, failed, "
+            " buy_count, sell_count, hold_count, watch_count, avoid_count, "
+            " status, universe_fallback, scan_mode) "
+            "VALUES ('sess-late', ?, ?, 1, 1, 0, 0, 0, 0, 1, 0, 'partial', 0, 'discovery')",
+            (f"{trade_date} 20:00:00", f"{trade_date} 20:05:00"),
+        )
+        await db.execute(
+            "INSERT INTO scan_results "
+            "(stk_cd, stk_nm, action, signal, confidence, summary, key_factors, "
+            " current_price, market_type, scanned_at, scan_session_id, factor_json) "
+            "VALUES ('005930', 'Late', 'WATCH', 'discovery', 0.0, '', '', 0, '', ?, "
+            " 'sess-late', ?)",
+            (
+                f"{trade_date} 20:01:00",
+                json.dumps(_passing_factor(momentum=0.9), ensure_ascii=False),
+            ),
+        )
+        await db.commit()
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    tickers = {c.ticker for c in candidates}
+
+    assert tickers == {"005930"}, "가장 늦게 시작된 partial 세션(sess-late)만 소비돼야 한다"
+
+
+# ---------------------------------------------------------------------------
 # ② 가중치 app_settings 왕복 + 미존재 시 시드
 # ---------------------------------------------------------------------------
 

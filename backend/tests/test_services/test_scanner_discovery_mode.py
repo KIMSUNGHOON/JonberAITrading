@@ -11,6 +11,8 @@ tmp_path 픽스처로 scanner.py의 모듈 전역 DB_PATH를 monkeypatch한다(�
 scanner_results.db 오염 금지, ds-global-constraints.md 준수).
 """
 
+import asyncio
+import contextlib
 import json
 from datetime import datetime
 from typing import Optional
@@ -681,3 +683,118 @@ async def test_regime_snapshot_consumes_discovery_breadth_end_to_end(monkeypatch
         "테스트 픽스처(0.25)가 임계값보다 커야 non-neutral 레이블을 검증할 수 있다"
     )
     assert record["regime_label"] == "risk_on"
+
+
+# ---------------------------------------------------------------------------
+# SC-1: stop_scan orphan-fix — status='partial' 종결 + 부분 breadth 반영
+#
+# 실측 사고: discovery EOD 스캔이 90분 타임아웃으로 stop_scan 호출 시
+# scan_sessions row가 status='running'인 채 영구 고아로 남아, regime.py·
+# ranker.py의 `WHERE status = 'completed'` 게이트가 0건을 반환 → 84%
+# 스캔(3700/4276)이 breadth·랭킹에 통째로 미반영됐다.
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_scan_marks_running_session_partial_with_saved_count(monkeypatch):
+    """타임아웃/수동 stop처럼 스캔 도중 stop_scan()이 호출되면, 세션 row는
+    status='partial'로 명시 종결되어야 하고(수정 전 RED=영구 'running' 고아),
+    completed는 그 시점까지 실제로 scan_results에 저장된 행 수와 일치해야
+    한다. 배치 2(10종목)는 release Event로 블록해 배치 1(50종목=discovery
+    QUICK_BATCH_SIZE)만 저장된 상태에서 stop_scan을 호출하도록 결정적으로
+    구성한다."""
+    batch1 = [(f"{100000 + i:06d}", f"S1-{i}", "코스피") for i in range(50)]
+    batch2 = [(f"{200000 + i:06d}", f"S2-{i}", "코스피") for i in range(10)]
+    stock_list = batch1 + batch2
+
+    stock_infos = {code: _stock_info(code, name) for code, name, _ in stock_list}
+    chart_dfs = {code: _make_chart_df(65) for code, _, _ in stock_list}
+
+    blocked_codes = {code for code, _, _ in batch2}
+    release = asyncio.Event()
+
+    class _SlowClient(FakeKiwoomClient):
+        async def get_daily_chart_df(self, stk_cd: str, base_dt=None, upd_stkpc_tp="1"):
+            if stk_cd in blocked_codes:
+                await release.wait()
+            return await super().get_daily_chart_df(
+                stk_cd, base_dt=base_dt, upd_stkpc_tp=upd_stkpc_tp
+            )
+
+    client = _SlowClient(stock_infos=stock_infos, chart_dfs=chart_dfs)
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+
+    # 배치 1 저장 완료를 결정적으로 대기하기 위한 훅 — 배치 2(블록됨)가
+    # 저장되기 전에 정확히 stop_scan()을 호출할 수 있게 한다.
+    batch1_saved = asyncio.Event()
+    original_save = BackgroundScanner._save_discovery_results_batch
+
+    async def _tracking_save(self, pairs, session_id):
+        await original_save(self, pairs, session_id)
+        batch1_saved.set()
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_save_discovery_results_batch", _tracking_save
+    )
+
+    await scanner.start_scan(
+        stock_list=stock_list, mode="discovery", notify_progress=False
+    )
+
+    await asyncio.wait_for(batch1_saved.wait(), timeout=5)
+
+    # 사전조건: 배치 1만 저장된 상태(배치 2는 아직 release 대기 중).
+    rows_before_stop = await _fetch_rows(scanner_module.DB_PATH)
+    assert len(rows_before_stop) == 50
+
+    await scanner.stop_scan()
+
+    # stop_scan이 취소한 태스크가 실제로 풀릴 때까지 대기(CancelledError는
+    # 정상 종료 신호 — 여기서 흡수).
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(scanner._task, timeout=5)
+
+    release.set()  # 방어적 정리(배치 2가 취소로 이미 풀렸어야 함)
+
+    rows = await _fetch_rows(scanner_module.DB_PATH)
+    assert len(rows) == 50, "배치 2는 취소돼 저장되면 안 된다"
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["status"] == "partial", (
+        "수정 전에는 stop_scan이 세션을 'running'으로 영구 고아 상태로 "
+        "남겼다(RED)"
+    )
+    assert session["completed"] == 50, "completed는 실제 저장된 행 수와 일치해야 한다"
+
+
+async def test_stop_scan_noop_when_no_scan_running():
+    """스캔이 실행 중이 아닐 때 stop_scan()은 아무 것도 하지 않아야 한다
+    (세션도 없고 예외도 없어야 함)."""
+    scanner = BackgroundScanner()
+    await scanner.stop_scan()  # 예외 없이 조용히 반환
+
+    sessions = await scanner.get_scan_sessions(limit=10)
+    assert sessions == []
+
+
+async def test_normal_completion_session_status_still_completed(monkeypatch):
+    """정상 완주 세션은 여전히 status='completed'여야 한다(SC-1의
+    `_save_session_complete` 무변경 불변식 회귀 고정)."""
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자")},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert sessions[0]["status"] == "completed"
+    assert sessions[0]["completed"] == 1

@@ -191,14 +191,18 @@ async def _get_regime_snapshot_for_date(
 async def _load_discovery_session(
     scanner_db_path, trade_date: str
 ) -> Optional[dict[str, Any]]:
-    """Latest completed scan_mode='discovery' session for `trade_date`, or
-    None if no such session exists yet (scan didn't run / hasn't finished)."""
+    """Latest completed-or-partial (SC-1) scan_mode='discovery' session for
+    `trade_date`, or None if no such session exists yet (scan didn't run /
+    hasn't finished/stopped). A 'partial' row (stopped before covering the
+    whole universe -- see scanner.py's stop_scan) is treated the same as
+    'completed' so a timed-out scan's collected tickers still get ranked
+    instead of the whole day's session being discarded."""
     async with aiosqlite.connect(str(scanner_db_path)) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
             SELECT * FROM scan_sessions
-            WHERE status = 'completed' AND scan_mode = 'discovery'
+            WHERE status IN ('completed', 'partial') AND scan_mode = 'discovery'
               AND date(started_at) = ?
             ORDER BY started_at DESC
             LIMIT 1
@@ -235,8 +239,8 @@ async def rank_candidates(storage, scanner_db_path, trade_date: str) -> list[Can
     descending with `rank` assigned 1..N; quality-filter-excluded candidates
     (composite=None, rank=None) follow, unranked but still returned so the
     caller can ledger-record them (spec: "품질 필터 탈락 행은 랭킹 제외하되
-    원장 기록 대상"). Returns [] if no completed discovery session exists yet
-    for `trade_date` (nothing to rank).
+    원장 기록 대상"). Returns [] if no completed-or-partial (SC-1) discovery
+    session exists yet for `trade_date` (nothing to rank).
     """
     weights_cfg = await _load_regime_weights(storage)
 

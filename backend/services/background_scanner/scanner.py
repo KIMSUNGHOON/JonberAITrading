@@ -151,6 +151,13 @@ class BackgroundScanner:
         # into scan_sessions.universe_fallback (DS-2).
         self._universe_fallback_used = False
 
+        # SC-1: the scan_sessions.id of the currently in-flight scan (set by
+        # start_scan, read by stop_scan so it can record a 'partial'
+        # completion row for the session actually running — start_scan only
+        # ever kept `session_id` as a local variable before this, so
+        # stop_scan had no way to identify which row to update).
+        self._current_session_id: Optional[str] = None
+
     async def _init_db(self):
         """Initialize SQLite database for storing scan results."""
         if self._db_initialized:
@@ -414,6 +421,9 @@ class BackgroundScanner:
 
         # Generate session ID
         session_id = datetime.now().strftime("%Y%m%d%H%M%S")
+        # SC-1: stop_scan needs this to record a 'partial' row for the
+        # session it's actually stopping.
+        self._current_session_id = session_id
 
         self._progress = ScanProgress(
             status=ScanStatus.RUNNING,
@@ -505,6 +515,52 @@ class BackgroundScanner:
                 self._progress.watch_count,
                 self._progress.avoid_count,
                 "completed",
+                session_id,
+            ))
+            await db.commit()
+
+    async def _save_session_partial(self, session_id: str):
+        """SC-1: record a partial-completion scan session row.
+
+        `stop_scan()` cancels `self._task` to interrupt an in-flight scan,
+        which means `_scan_all_stocks` never reaches its own
+        `_save_session_complete` call — the scan_sessions row was
+        previously left stuck at status='running' forever (a permanent
+        orphan once the process moved on), which made regime.py's and
+        ranker.py's `status = 'completed'` gates silently return zero rows
+        for a scan that may have gotten most of the way through the
+        universe (real incident: 3700/4276 stocks saved, entirely
+        unconsumed).
+
+        Mirrors `_save_session_complete`'s exact UPDATE shape/value source
+        (`self._progress.*` — the same counters the stop notification right
+        below already surfaces as "완료: N/M") with status='partial'
+        instead of 'completed'. `_save_session_complete` itself is
+        untouched — a normal completion's row stays byte-identical.
+        """
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE scan_sessions SET
+                    completed_at = ?,
+                    completed = ?,
+                    failed = ?,
+                    buy_count = ?,
+                    sell_count = ?,
+                    hold_count = ?,
+                    watch_count = ?,
+                    avoid_count = ?,
+                    status = ?
+                WHERE id = ?
+            """, (
+                datetime.now(),
+                self._progress.completed,
+                self._progress.failed,
+                self._progress.buy_count,
+                self._progress.sell_count,
+                self._progress.hold_count,
+                self._progress.watch_count,
+                self._progress.avoid_count,
+                "partial",
                 session_id,
             ))
             await db.commit()
@@ -1774,6 +1830,23 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
             self._progress.status = ScanStatus.IDLE
             self._running = False
             self._paused = False
+
+            # SC-1: record the partial-completion row BEFORE cancelling the
+            # task -- _task.cancel() interrupts _scan_all_stocks before it
+            # can ever reach its own _save_session_complete, which used to
+            # leave the DB row orphaned at status='running' forever (see
+            # _save_session_partial's docstring). No-op if no scan session
+            # was ever started (self._current_session_id unset). Best-effort
+            # -- a failure here must not block the cancel/notify below.
+            if self._current_session_id:
+                try:
+                    await self._save_session_partial(self._current_session_id)
+                except Exception as e:
+                    logger.warning(
+                        "scan_partial_session_save_failed",
+                        session_id=self._current_session_id,
+                        error=str(e),
+                    )
 
             if self._task:
                 self._task.cancel()
