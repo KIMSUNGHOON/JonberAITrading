@@ -1894,7 +1894,7 @@ class TestStopSanity:
 
     @pytest.mark.asyncio
     async def test_restore_preserved_gap_through_tp_chain_no_sell_then_lock_in(
-        self, config, temp_storage
+        self, config, temp_storage, monkeypatch
     ):
         """⑦ D1b 체인 (무해성 + 락인 훅 생존의 실 경로 증거): 보존된 tp
         갭업 엔트리가 실 경로(`_check_position`)에서 (a) TAKE_PROFIT_HIT을
@@ -1914,6 +1914,12 @@ class TestStopSanity:
         }}))
 
         pm = PositionManager(config=config)
+        # regression-guard(D1b 리뷰 Minor): 분류 로직이 되돌아가 이 픽스처가
+        # 드롭 경로를 타더라도 실 Telegram으로 새지 않게 — 형제 테스트와
+        # 동일 타깃 목킹(리뷰 검증 중 실발송 사고의 재발 방지).
+        monkeypatch.setattr(
+            "services.telegram.get_telegram_notifier", lambda: self._notifier()
+        )
         pm.add_position(
             ticker="005930", stock_name="삼성전자", quantity=100,
             avg_price=70000, current_price=72800,
