@@ -1927,26 +1927,43 @@ class ExecutionCoordinator:
 
         G-2 (gap discipline, spec docs/superpowers/specs/
         2026-07-20-gap-discipline-design.md §N2): dedup by (ticker,
-        alert_type) — skip the append if an UNRESOLVED alert with the same
-        key is already sitting in `_state.pending_alerts`. Before this fix
-        every RiskMonitor alert (action_required or not) was appended here
+        alert_type) — REPLACE the UNRESOLVED alert already sitting in
+        `_state.pending_alerts` for the same key with this new one, in
+        place, instead of appending a duplicate. Before this fix every
+        RiskMonitor alert (action_required or not) was appended here
         unconditionally on every call, so a repeatedly-firing trigger (e.g.
         a stop-loss re-evaluated on each 1s tick while the position stays
         watched) grew this list without bound for the process lifetime.
-        Once the existing entry resolves (`alert.resolved = True`, or it is
-        pruned — see `handle_alert_action`'s cleanup below), a fresh alert
-        for the same key may be appended again. `self._alert_callback`/
-        `_notify_state_change` still fire on every call, dedup'd or not —
-        only the list append is gated; this mirrors RiskMonitor's own
-        `_add_alert` dedup convention (risk_monitor.py) without touching it.
+
+        G-2 review fix (2026-07-20): the FIRST version of this dedup
+        (skip-append instead of replace) introduced a fresh bug —
+        `RiskMonitor._add_alert` (risk_monitor.py) dedups the SAME
+        (ticker, alert_type) key by REPLACING the existing pending entry
+        with the new one (new id) on every tick, not skipping. Skip-append
+        here left `_state.pending_alerts` pinned to the FIRST tick's stale
+        id forever, while `GET /trading/alerts` (backed by
+        `risk_monitor.get_pending_alerts()`) always showed the latest id —
+        the two stores diverged. `handle_alert_action(latest_id, ...)` then
+        silently no-op'd (id not found in `_state.pending_alerts`) and the
+        stale entry could never be pruned, permanently blocking future
+        alerts for that key. Replacing in place (mirroring RiskMonitor's
+        own convention exactly) keeps both stores' ids in sync while still
+        capping the list at one entry per unresolved key. Once the existing
+        entry resolves (`alert.resolved = True`, or it is pruned — see
+        `handle_alert_action`'s cleanup below), a fresh alert for the same
+        key is appended as a new entry instead of replacing anything.
+        `self._alert_callback`/`_notify_state_change` still fire on every
+        call, deduped or not — only the list mutation is gated.
         """
-        already_pending = any(
-            not existing.resolved
-            and existing.ticker == alert.ticker
-            and existing.alert_type == alert.alert_type
-            for existing in self._state.pending_alerts
-        )
-        if not already_pending:
+        for idx, existing in enumerate(self._state.pending_alerts):
+            if (
+                not existing.resolved
+                and existing.ticker == alert.ticker
+                and existing.alert_type == alert.alert_type
+            ):
+                self._state.pending_alerts[idx] = alert
+                break
+        else:
             self._state.pending_alerts.append(alert)
 
         if self._alert_callback:

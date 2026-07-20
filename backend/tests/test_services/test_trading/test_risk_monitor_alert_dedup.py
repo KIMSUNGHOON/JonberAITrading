@@ -207,8 +207,9 @@ async def test_gate_allowed_executed_alert_unchanged_via_real_wiring(monkeypatch
 
 # -------------------------------------------
 # ④ coordinator._on_alert: dedup pending_alerts by (ticker, alert_type)
-# while unresolved; a fresh alert for the same key may append again once
-# the prior one resolves.
+# while unresolved -- REPLACE in place (G-2 review fix, 2026-07-20; see
+# _on_alert's docstring); a fresh alert for the same key may append again
+# once the prior one resolves.
 # -------------------------------------------
 
 
@@ -222,7 +223,12 @@ def _alert(alert_id: str, ticker="005930", alert_type=AlertType.ORDER_FILLED) ->
     )
 
 
-async def test_on_alert_dedup_skips_duplicate_unresolved():
+async def test_on_alert_dedup_replaces_duplicate_unresolved_in_place():
+    """G-2 review fix: a second unresolved duplicate REPLACES the first
+    entry (matching RiskMonitor._add_alert's own convention) instead of
+    being skipped -- skip-append left a stale id in `_state.pending_alerts`
+    that diverged from `risk_monitor.get_pending_alerts()`'s latest id (see
+    the ★E2E test below for the full failure mode this caused)."""
     coord = ExecutionCoordinator(kiwoom_client=None)
 
     await coord._on_alert(_alert("a1"))
@@ -232,8 +238,8 @@ async def test_on_alert_dedup_skips_duplicate_unresolved():
         a for a in coord._state.pending_alerts
         if a.ticker == "005930" and a.alert_type == AlertType.ORDER_FILLED
     ]
-    assert len(matching) == 1, "a second unresolved duplicate must not be appended"
-    assert matching[0].id == "a1", "the FIRST (still unresolved) entry is kept, not replaced"
+    assert len(matching) == 1, "a second unresolved duplicate must not grow the list"
+    assert matching[0].id == "a2", "the NEWEST entry replaces the stale one, not the reverse"
 
 
 async def test_on_alert_dedup_allows_reappend_after_resolved():
@@ -270,3 +276,73 @@ async def test_on_alert_dedup_is_scoped_to_ticker_and_type():
 
     ids = {a.id for a in coord._state.pending_alerts}
     assert ids == {"a1", "a2", "a3"}, "distinct (ticker, alert_type) keys must not dedup each other"
+
+
+# -------------------------------------------
+# ⑤ ★E2E: the id in `_state.pending_alerts` must always match the id
+# `risk_monitor.get_pending_alerts()` (GET /trading/alerts's source) is
+# currently reporting -- through the REAL RiskMonitor._add_alert /
+# coordinator._on_alert wiring, no direct-alert-construction shortcuts.
+# -------------------------------------------
+
+
+async def test_pending_alerts_id_stays_synced_with_risk_monitor_across_ticks():
+    """G-2 review Critical (real incident, reproduced by the reviewer with a
+    3-tick scenario): `RiskMonitor._add_alert` REPLACES the unresolved
+    (ticker, alert_type) entry with a brand-new id on every tick (its own
+    docstring, risk_monitor.py). Pre-fix, `coordinator._on_alert` instead
+    SKIPPED the append, pinning `_state.pending_alerts` to the FIRST tick's
+    stale id forever -- while `GET /trading/alerts`
+    (risk_monitor.get_pending_alerts()-backed) kept reporting the latest id.
+    A user clicking EXECUTE_STOP_LOSS on the alert the UI showed them then
+    hit `handle_alert_action(latest_id)` -> not found -> silent no-op (their
+    click did nothing), AND the stale entry could never be pruned, blocking
+    all future alerts for that (ticker, alert_type) key permanently.
+    """
+    coord = _coordinator_with_watched_position()
+    config = coord.risk_monitor._watching["005930"]
+    # `_handle_stop_loss` reads the LIVE `risk_params.stop_loss_mode` (not
+    # the per-position config snapshot, which the helper above sets to
+    # AGENT_AUTO) -- force USER_APPROVAL so it takes the alert (not
+    # auto-execute) branch, same as a real "manual confirmation" account.
+    coord.risk_monitor.risk_params.stop_loss_mode = StopLossMode.USER_APPROVAL
+
+    # Three ticks below the stop -- each is a REAL RiskMonitor._add_alert
+    # call that mints a brand-new alert id (uuid4) for the same
+    # (ticker, alert_type) key.
+    await coord.risk_monitor._handle_stop_loss("005930", config, 67_000)
+    await coord.risk_monitor._handle_stop_loss("005930", config, 67_000)
+    await coord.risk_monitor._handle_stop_loss("005930", config, 67_000)
+
+    state_alerts = [
+        a for a in coord._state.pending_alerts
+        if a.ticker == "005930" and a.alert_type == AlertType.STOP_LOSS_TRIGGERED
+    ]
+    rm_alerts = [
+        a for a in coord.risk_monitor.get_pending_alerts()
+        if a.ticker == "005930" and a.alert_type == AlertType.STOP_LOSS_TRIGGERED
+    ]
+
+    # No unbounded growth on either side of the wiring.
+    assert len(state_alerts) == 1, "_state.pending_alerts must not grow across repeat ticks"
+    assert len(rm_alerts) == 1, "risk_monitor's own pending list must not grow across repeat ticks"
+
+    # The core regression: both stores must agree on the CURRENT id. Pre-fix
+    # this failed -- state_alerts[0].id stayed pinned to tick 1's id while
+    # rm_alerts[0].id had already moved to tick 3's id.
+    assert state_alerts[0].id == rm_alerts[0].id, (
+        "coordinator._state.pending_alerts and GET /trading/alerts "
+        "(risk_monitor-backed) must report the SAME id for this key"
+    )
+
+    latest_id = rm_alerts[0].id
+
+    # A user action on the id the UI is CURRENTLY showing must be handled,
+    # not silently dropped as "not found".
+    await coord.handle_alert_action(latest_id, "HOLD")
+
+    assert coord._state.pending_alerts == [], (
+        "handle_alert_action(latest_id, 'HOLD') must find, resolve, and "
+        "prune the alert -- pre-fix this was a silent not-found no-op that "
+        "also permanently blocked future alerts for this key"
+    )
