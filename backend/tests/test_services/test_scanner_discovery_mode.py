@@ -888,12 +888,15 @@ async def test_normal_completion_session_status_still_completed(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_stop_scan_partial_notification_shows_n_of_m_percent(monkeypatch, caplog):
-    """stop_scan()이 partial 종결하면, Telegram 통지 문구와 로그 양쪽에
-    "부분 완주 50/60(83.3%) -- breadth 반영, 승격 보류"가 그대로 노출돼야
-    한다. 배치1(50종목)만 저장된 상태에서 stop -- completed=50/total=60."""
-    import logging
-
+async def _start_scan_then_stop_partial(monkeypatch, *, notify_progress: bool, reason: str):
+    """FI-1 테스트 헬퍼: 배치1(50종목)만 저장된 상태에서
+    `stop_scan(reason=reason)`을 호출한다(배치2=10종목은 release Event로
+    블록해 부분 완주 50/60을 결정적으로 재현). `(scanner, sent_messages)`를
+    반환 -- 호출부가 발신 Telegram 메시지와 DB 세션 행 양쪽을 검사할 수
+    있게 한다. 호출부는 매번 새 db_path(pytest tmp_path, 함수 스코프)에서
+    실행돼야 세션 id(초 단위 타임스탬프) 충돌이 없다 -- 이 헬퍼를 같은
+    테스트 함수 안에서 반복 호출하지 말 것(파라미터화된 별도 테스트로
+    분리)."""
     batch1 = [(f"{100000 + i:06d}", f"S1-{i}", "코스피") for i in range(50)]
     batch2 = [(f"{200000 + i:06d}", f"S2-{i}", "코스피") for i in range(10)]
     stock_list = batch1 + batch2
@@ -938,28 +941,47 @@ async def test_stop_scan_partial_notification_shows_n_of_m_percent(monkeypatch, 
     )
 
     await scanner.start_scan(
-        stock_list=stock_list, mode="discovery", notify_progress=False
+        stock_list=stock_list, mode="discovery", notify_progress=notify_progress
     )
     await asyncio.wait_for(batch1_saved.wait(), timeout=5)
 
-    with caplog.at_level(logging.INFO, logger=scanner_module.__name__):
-        await scanner.stop_scan()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.wait_for(scanner._task, timeout=5)
+    await scanner.stop_scan(reason=reason)
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(scanner._task, timeout=5)
 
-    release.set()
+    release.set()  # 방어적 정리(배치 2가 취소로 이미 풀렸어야 함)
+
+    return scanner, sent_messages
+
+
+async def test_stop_scan_partial_notification_shows_n_of_m_percent(monkeypatch, caplog):
+    """FI-1 게이트가 열린 경로(notify_progress=True + reason="timeout")에서
+    stop_scan()이 partial 종결하면, Telegram 통지 문구와 로그 양쪽에
+    "부분 완주 50/60(83.3%) -- breadth 반영, 승격 보류"가 그대로 노출돼야
+    한다. 배치1(50종목)만 저장된 상태에서 stop -- completed=50/total=60."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger=scanner_module.__name__):
+        scanner, sent_messages = await _start_scan_then_stop_partial(
+            monkeypatch, notify_progress=True, reason="timeout"
+        )
 
     expected_note = "부분 완주 50/60(83.3%) — breadth 반영, 승격 보류"
 
-    assert len(sent_messages) == 1
-    assert "⏹ *백그라운드 분석 중지*" in sent_messages[0]
-    assert "분석 완료: 50/60" in sent_messages[0]
-    assert expected_note in sent_messages[0]
+    # notify_progress=True는 start_scan() 자신의 "시작" 통지(:458, FI-1과
+    # 무관하게 이미 게이트돼 있던 별개 지점)도 함께 내보낸다 -- stop 통지만
+    # 골라 검사한다.
+    stop_messages = [m for m in sent_messages if m.startswith("⏹")]
+    assert len(stop_messages) == 1
+    assert "⏹ *백그라운드 분석 중지*" in stop_messages[0]
+    assert "분석 완료: 50/60" in stop_messages[0]
+    assert expected_note in stop_messages[0]
 
     matching = [r for r in caplog.records if expected_note in r.getMessage()]
     assert len(matching) == 1, (
         "partial 종결 로그에 '부분 완주 N/M(X%) -- breadth 반영, 승격 보류' "
-        "문구가 명시돼야 한다"
+        "문구가 명시돼야 한다(게이트는 Telegram 발신에만 걸리고 로그는 "
+        "reason/notify_progress 무관하게 항상 남는다)"
     )
 
 
@@ -979,6 +1001,62 @@ async def test_stop_scan_noop_leaves_no_partial_notification(monkeypatch):
     await scanner.stop_scan()
 
     assert sent_messages == []
+
+
+async def test_stop_scan_notify_progress_false_suppresses_timeout_notification(monkeypatch):
+    """FI-1 ① (현행 RED=무조건 발송): notify_progress=False로 시작된 스캔이
+    reason="timeout"(coordinator의 watchdog 정리 경로)으로 stop되면, partial
+    Telegram 통지가 전혀 발송되면 안 된다 -- 오늘 4276종목 EOD 스캔
+    (notify_progress=False)이 타임아웃 시에도 통지를 보낸 실사고의 재현."""
+    scanner, sent_messages = await _start_scan_then_stop_partial(
+        monkeypatch, notify_progress=False, reason="timeout"
+    )
+
+    assert sent_messages == []
+
+    # DB에는 여전히 partial로 기록돼야 한다(통지 억제가 SC-1 영속을 깨면
+    # 안 된다 -- ⑤ 항목과 상보).
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert sessions[0]["status"] == "partial"
+    assert sessions[0]["completed"] == 50
+
+
+async def test_stop_scan_reason_manual_suppresses_notification_unconditionally(monkeypatch):
+    """FI-1 ②: reason="manual"(FE의 POST /scanner/stop)은 notify_progress가
+    True(즉 게이트가 원래 열려 있었을) 스캔이라도 통지를 무조건 억제한다 --
+    방금 Stop을 누른 사용자에게 그 사실을 다시 알릴 필요가 없다."""
+    scanner, sent_messages = await _start_scan_then_stop_partial(
+        monkeypatch, notify_progress=True, reason="manual"
+    )
+
+    # notify_progress=True는 start_scan() 자신의 "시작" 통지를 여전히
+    # 내보낸다(FI-1과 무관, 이미 게이트돼 있던 별개 지점) -- reason="manual"이
+    # 억제하는 건 stop_scan()의 partial 통지뿐이다.
+    assert not any(m.startswith("⏹") for m in sent_messages), (
+        "reason='manual'은 partial 중지 통지를 무조건 억제해야 한다"
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert sessions[0]["status"] == "partial"
+    assert sessions[0]["completed"] == 50
+
+
+@pytest.mark.parametrize("reason", ["manual", "timeout"])
+@pytest.mark.parametrize("notify_progress", [True, False])
+async def test_stop_scan_partial_db_write_unconditional_across_all_reason_combos(
+    monkeypatch, notify_progress, reason
+):
+    """FI-1 ⑤: _save_session_partial의 DB 영속은 reason/notify_progress
+    조합과 무관하게 항상 일어나야 한다(통지 게이트가 실수로 DB 기록까지
+    감싸면 SC-1이 재발한다). manual/timeout x notify_progress True/False
+    네 조합 전부(파라미터화, 각자 독립 tmp DB) 전부에서 partial +
+    completed=50이 기록되는지 확인한다."""
+    scanner, _ = await _start_scan_then_stop_partial(
+        monkeypatch, notify_progress=notify_progress, reason=reason
+    )
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert sessions[0]["status"] == "partial"
+    assert sessions[0]["completed"] == 50
 
 
 async def test_normal_completion_telegram_message_byte_invariant(monkeypatch):
@@ -1027,3 +1105,109 @@ async def test_normal_completion_telegram_message_byte_invariant(monkeypatch):
     )
     assert sent_messages[0] == expected
     assert "부분 완주" not in sent_messages[0]
+
+
+# ---------------------------------------------------------------------------
+# FI-D3: 고아 세션 리컨실 -- 기동 시 status='running' 잔재 -> 'aborted'
+#
+# 실측 사고: 오늘(20260720153027) 프로세스가 재시작되며 status='running'
+# 세션이 영구 고아로 남았다(stop_scan을 거치지 않고 프로세스가 죽은 경우라
+# _save_session_partial도 결코 호출되지 못한다 -- FI-1의 게이트/reason
+# 수정으로는 못 잡는 별개의 실패 모드).
+# ---------------------------------------------------------------------------
+
+
+async def test_reconcile_orphan_scan_sessions_marks_running_aborted():
+    """기동 시 리컨실은 status='running'인 행을 전부 'aborted'로 바꾸고,
+    반환값으로 몇 건을 고쳤는지 보고해야 한다."""
+    scanner = BackgroundScanner()
+    await scanner._init_db()
+
+    async with aiosqlite.connect(scanner_module.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260720153027", datetime(2026, 7, 20, 15, 30, 27), 4276, "running"),
+        )
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260719090000", datetime(2026, 7, 19, 9, 0, 0), 100, "running"),
+        )
+        await db.commit()
+
+    reconciled = await scanner.reconcile_orphan_scan_sessions()
+    assert reconciled == 2
+
+    sessions = {
+        s["id"]: s["status"] for s in await scanner.get_scan_sessions(limit=10)
+    }
+    assert sessions["20260720153027"] == "aborted"
+    assert sessions["20260719090000"] == "aborted"
+
+
+async def test_reconcile_orphan_scan_sessions_leaves_completed_and_partial_untouched():
+    """리컨실은 status='completed'/'partial' 행은 절대 건드리면 안 된다 --
+    regime.py/ranker.py의 `status IN ('completed', 'partial')` 게이트가
+    소비하는 정상 breadth 데이터이므로 SC-1이 재발하면 안 된다."""
+    scanner = BackgroundScanner()
+    await scanner._init_db()
+
+    async with aiosqlite.connect(scanner_module.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260718090000", datetime(2026, 7, 18, 9, 0, 0), 100, "completed"),
+        )
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260717090000", datetime(2026, 7, 17, 9, 0, 0), 100, "partial"),
+        )
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260720153027", datetime(2026, 7, 20, 15, 30, 27), 4276, "running"),
+        )
+        await db.commit()
+
+    reconciled = await scanner.reconcile_orphan_scan_sessions()
+    assert reconciled == 1
+
+    sessions = {
+        s["id"]: s["status"] for s in await scanner.get_scan_sessions(limit=10)
+    }
+    assert sessions["20260718090000"] == "completed"
+    assert sessions["20260717090000"] == "partial"
+    assert sessions["20260720153027"] == "aborted"
+
+
+async def test_reconcile_orphan_scan_sessions_no_running_rows_is_noop():
+    """running 행이 하나도 없으면(정상 재시작 직후 등) 0을 반환하고 아무
+    행도 바뀌지 않는다."""
+    scanner = BackgroundScanner()
+    await scanner._init_db()
+
+    async with aiosqlite.connect(scanner_module.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260718090000", datetime(2026, 7, 18, 9, 0, 0), 100, "completed"),
+        )
+        await db.commit()
+
+    reconciled = await scanner.reconcile_orphan_scan_sessions()
+    assert reconciled == 0
+
+    sessions = await scanner.get_scan_sessions(limit=10)
+    assert sessions[0]["status"] == "completed"
+
+
+async def test_reconcile_orphan_scan_sessions_never_raises_on_missing_db():
+    """DB 파일이 아직 없는 상태(어떤 스캔도 실행된 적 없는 새 배포)에서도
+    리컨실은 예외 없이 0을 반환해야 한다(best-effort never-raise)."""
+    scanner = BackgroundScanner()
+    # _init_db()를 의도적으로 호출하지 않는다 -- reconcile 스스로가
+    # _init_db()를 호출해 테이블을 만들어야 한다(메서드 계약).
+    reconciled = await scanner.reconcile_orphan_scan_sessions()
+    assert reconciled == 0

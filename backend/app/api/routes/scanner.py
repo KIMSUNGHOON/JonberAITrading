@@ -208,10 +208,15 @@ async def resume_scan():
 
 @router.post("/stop")
 async def stop_scan():
-    """Stop the background scan."""
+    """Stop the background scan.
+
+    reason="manual" (FI-1): an FE-initiated stop suppresses the
+    partial-completion Telegram notification unconditionally -- the user
+    who just clicked Stop doesn't need a message telling them so.
+    """
     try:
         scanner = await get_background_scanner()
-        await scanner.stop_scan()
+        await scanner.stop_scan(reason="manual")
 
         return {
             "status": "stopped",

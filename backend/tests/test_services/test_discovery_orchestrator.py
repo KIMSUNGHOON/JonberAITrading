@@ -552,8 +552,8 @@ class _InstantCompleteScanner:
         status = ScanStatus.RUNNING if self._get_progress_calls == 1 else ScanStatus.COMPLETED
         return SimpleNamespace(status=status)
 
-    async def stop_scan(self):
-        self._calls.append(("scanner.stop_scan", {}))
+    async def stop_scan(self, reason: str = "manual"):
+        self._calls.append(("scanner.stop_scan", {"reason": reason}))
 
     def get_results(self):
         return []
@@ -576,8 +576,8 @@ class _AlwaysRunningScanner:
     def get_progress(self):
         return SimpleNamespace(status=ScanStatus.RUNNING)
 
-    async def stop_scan(self):
-        self._calls.append(("scanner.stop_scan", {}))
+    async def stop_scan(self, reason: str = "manual"):
+        self._calls.append(("scanner.stop_scan", {"reason": reason}))
 
     def get_results(self):
         return []
@@ -609,8 +609,8 @@ class _BusyScanner:
     def get_progress(self):
         return SimpleNamespace(status=ScanStatus.RUNNING)
 
-    async def stop_scan(self):
-        self._calls.append(("scanner.stop_scan", {}))
+    async def stop_scan(self, reason: str = "manual"):
+        self._calls.append(("scanner.stop_scan", {"reason": reason}))
 
     def get_results(self):
         return []
@@ -1109,8 +1109,8 @@ class _UniverseAwareInstantCompleteScanner:
         status = ScanStatus.RUNNING if self._get_progress_calls == 1 else ScanStatus.COMPLETED
         return SimpleNamespace(status=status, total_stocks=self._total_stocks)
 
-    async def stop_scan(self):
-        self._calls.append(("scanner.stop_scan", {}))
+    async def stop_scan(self, reason: str = "manual"):
+        self._calls.append(("scanner.stop_scan", {"reason": reason}))
 
     def get_results(self):
         return []

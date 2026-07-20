@@ -2851,7 +2851,12 @@ class ExecutionCoordinator:
                 "with EOD chain, promotion skipped for today"
             )
             try:
-                await scanner.stop_scan()
+                # FI-1: reason="timeout" -- this stop still follows the
+                # scan's own notify_progress preference (start_scan(mode=
+                # "discovery", notify_progress=False) above), it just isn't
+                # unconditionally suppressed the way an FE-initiated manual
+                # stop is.
+                await scanner.stop_scan(reason="timeout")
             except Exception as e:
                 logger.warning(f"[Coordinator] Discovery scan stop_scan cleanup failed: {e}")
             return False

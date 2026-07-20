@@ -110,6 +110,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("discovery_regime_weights_migration_failed", error=str(e))
 
+    # FI-1: reconcile orphaned scan_sessions rows left at status='running' by
+    # a previous process that died mid-scan (crash/kill) without ever
+    # reaching stop_scan()'s own partial-completion cleanup. MUST run here,
+    # before anything in this process could itself start a scan, so every
+    # 'running' row found is guaranteed to be a previous-process leftover
+    # (see BackgroundScanner.reconcile_orphan_scan_sessions docstring).
+    # Never-raise -- a reconcile failure must not block startup.
+    try:
+        from services.background_scanner import get_background_scanner
+
+        bg_scanner = await get_background_scanner()
+        reconciled = await bg_scanner.reconcile_orphan_scan_sessions()
+        logger.info("scan_orphan_reconcile_complete", reconciled=reconciled)
+    except Exception as e:
+        logger.warning("scan_orphan_reconcile_failed", error=str(e))
+
     # Initialize realtime service (Upbit WebSocket)
     try:
         realtime_service = await get_realtime_service()

@@ -134,6 +134,17 @@ class BackgroundScanner:
         self._use_llm = False  # Whether to use LLM for analysis
         self._gpu_monitor = None
 
+        # FI-1: the notify_progress preference THIS scan was started with,
+        # stashed off the start_scan() local so stop_scan() -- called much
+        # later, often by a completely different caller (the coordinator's
+        # timeout watchdog) that has no notify_progress argument of its own
+        # -- can gate its own partial-completion Telegram notification on
+        # it, same as every other notification point in this class already
+        # does. Default True mirrors start_scan's own default; only ever
+        # meaningfully read after start_scan has run (stop_scan's real work
+        # is itself gated on self._running, which start_scan sets).
+        self._notify_progress = True
+
         # Watch-list auto-promotion config (see start_scan args).
         self._auto_promote_enabled = self.DEFAULT_AUTO_PROMOTE_ENABLED
         self._promote_confidence_threshold = self.DEFAULT_PROMOTE_CONFIDENCE_THRESHOLD
@@ -387,6 +398,12 @@ class BackgroundScanner:
         # the LLM regardless of what the caller passed for use_llm.
         self._mode = mode
         self._use_llm = False if mode == "discovery" else use_llm
+
+        # FI-1: stop_scan() (called well after this method returns, often by
+        # a caller -- e.g. the coordinator's timeout watchdog -- with no
+        # notify_progress argument of its own) must know THIS scan's own
+        # notify_progress preference to gate its own notification.
+        self._notify_progress = notify_progress
 
         # Store watch-list auto-promotion preferences. For mode="discovery"
         # these are stored but never consulted — see
@@ -1831,8 +1848,36 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
                 f"남은 종목: {self._progress.total_stocks - self._progress.completed}개"
             )
 
-    async def stop_scan(self):
-        """Stop the background scan."""
+    async def stop_scan(self, reason: str = "manual"):
+        """Stop the background scan.
+
+        Args:
+            reason: "manual" (default) -- an FE-initiated stop (POST
+                /scanner/stop) -- suppresses the partial-completion Telegram
+                notification below unconditionally; a user who just clicked
+                Stop doesn't need a message telling them a scan they just
+                stopped, stopped. "timeout" -- the coordinator's
+                `_run_discovery_scan` watchdog cleanup -- instead follows the
+                same `self._notify_progress` gate every other notification
+                point in this class already uses (start_scan's own start
+                notification, `_scan_all_stocks`' completion notification),
+                so an EOD discovery scan started with `notify_progress=False`
+                never fires a stop notification the caller explicitly opted
+                out of.
+
+                FI-1: prior to this, the partial notification below fired
+                unconditionally regardless of `notify_progress` or which
+                caller triggered the stop -- a 4276-stock EOD scan
+                (notify_progress=False) that hit its watchdog timeout still
+                sent a Telegram "분석 중지" message every time, and the FE's
+                own manual Stop button re-notified the user of an action
+                they had just taken themselves.
+
+        `_save_session_partial` below (the SC-1 DB persistence fix) is NOT
+        gated by `reason` or `notify_progress` -- it must always run so
+        regime.py/ranker.py's breadth accounting reflects reality regardless
+        of how or why the scan was stopped.
+        """
         if self._running:
             self._cancel_event.set()
             self._progress.status = ScanStatus.IDLE
@@ -1859,7 +1904,7 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
             if self._task:
                 self._task.cancel()
 
-            logger.info("background_scan_stopped")
+            logger.info("background_scan_stopped", reason=reason)
 
             # SC-3: the stop above always corresponds to a partial-completion
             # session (a normal completion clears self._running BEFORE
@@ -1870,8 +1915,8 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
             # "완료: 3700/4276" with no indication that breadth was still
             # reflected and only promotion was withheld, which read as a
             # total abandonment rather than a partial-completion. Surface
-            # the same N/M/percent explicitly in both the log and (if
-            # Telegram is configured) the notification text.
+            # the same N/M/percent explicitly in both the log and (if the
+            # notification isn't gated off below) the notification text.
             completed = self._progress.completed
             total = self._progress.total_stocks
             coverage_pct = (completed / total * 100) if total else 0.0
@@ -1888,11 +1933,59 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
                 coverage_pct=round(coverage_pct, 1),
             )
 
-            await self._send_telegram_notification(
-                f"⏹ *백그라운드 분석 중지*\n\n"
-                f"분석 완료: {completed}/{total}\n"
-                f"{partial_note}"
-            )
+            # FI-1: a manual stop never notifies (the caller already knows);
+            # any other reason (currently just "timeout") still follows this
+            # scan's own notify_progress preference.
+            if reason != "manual" and self._notify_progress:
+                await self._send_telegram_notification(
+                    f"⏹ *백그라운드 분석 중지*\n\n"
+                    f"분석 완료: {completed}/{total}\n"
+                    f"{partial_note}"
+                )
+
+    async def reconcile_orphan_scan_sessions(self) -> int:
+        """FI-1: mark leftover status='running' scan_sessions rows 'aborted'.
+
+        A process that dies (crash, forced kill) while a scan is in flight
+        never reaches stop_scan()/_save_session_partial, nor
+        _scan_all_stocks'/_save_session_complete -- its scan_sessions row is
+        left at status='running' forever once the process is gone (the same
+        underlying orphan failure mode `_save_session_partial`'s docstring
+        describes for stop_scan, but for a process that never got to call
+        stop_scan at all -- e.g. today's 20260720153027 incident). 'aborted'
+        is deliberately its own status, distinct from 'partial' (a
+        stop_scan-recorded partial completion -- real breadth was saved)
+        and 'completed'/'failed' -- and outside the
+        `status IN ('completed', 'partial')` gates regime.py/ranker.py use
+        to consume scan results (SC-1), so an aborted row is never mistaken
+        for consumable breadth.
+
+        MUST be called at process startup BEFORE any scan starts in THIS
+        process (see app.main's lifespan) -- at that point this process can
+        never have a genuinely in-flight 'running' row of its own, so every
+        'running' row found here is guaranteed to be a leftover from a
+        previous process.
+
+        Best-effort / never-raises -- e.g. the DB file may not exist yet if
+        no scan has ever run. The caller also wraps this in its own
+        try/except for startup-safety logging, but this method swallows its
+        own errors too and reports 0 reconciled rather than propagating.
+
+        Returns:
+            Number of rows reconciled (0 if none were orphaned, or on any
+            internal failure).
+        """
+        try:
+            await self._init_db()
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "UPDATE scan_sessions SET status = 'aborted' WHERE status = 'running'"
+                )
+                await db.commit()
+                return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        except Exception as e:
+            logger.warning("scan_orphan_reconcile_failed", error=str(e))
+            return 0
 
     def get_progress(self) -> ScanProgress:
         """Get current scan progress."""
