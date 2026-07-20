@@ -4,6 +4,7 @@ Trading API Routes
 Provides endpoints for auto-trading system control and monitoring.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -63,6 +64,14 @@ from services.trading.eod_digest import build_eod_digest, narrate_eod_digest
 # 모듈 경계를 넘어 재사용하는 기존 전례를 따른 것(밑줄 접두는 "패키지 내부
 # 공용" 관례이지 진짜 private가 아님).
 from services.discovery.ledger import get_discovery_performance, _top_strategy_tag
+# 수동 발굴 트리거(POST /discovery/run) — 마감 엣지의 discovery 블록과 완전히
+# 동일한 두 호출(_run_discovery_scan → run_discovery_pipeline)을 라이브
+# coordinator/scanner 싱글턴에 대해 실행한다. get_settings로 DISCOVERY_ENABLED
+# 킬스위치를, get_background_scanner로 코디네이터가 트리거하는 바로 그 스캐너
+# 인스턴스를 재사용한다(coordinator.py:55-57과 동일 import 경로).
+from app.config import get_settings
+from services.background_scanner.scanner import get_background_scanner
+from services.discovery.orchestrator import run_discovery_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -1126,6 +1135,101 @@ async def run_eod_report_now(
         "digest": digest,
         "narrative": narrative,
         "notified": notified,
+    }
+
+
+class DiscoveryRunRequest(BaseModel):
+    date: Optional[str] = None  # 생략 시 오늘(서버 로컬 날짜 = KST wall clock)
+
+
+# fire-and-forget 백그라운드 태스크 강참조 보관소 — asyncio는 태스크를 약참조로만
+# 붙들어 create_task 반환값을 아무도 안 잡으면 스캔(수 시간) 도중 GC로 취소될 수
+# 있다. 완료 시 스스로 비우는 집합에 담아 살아있게 한다(add_done_callback).
+_discovery_run_tasks: set = set()
+
+
+@router.post("/discovery/run")
+async def run_discovery_now(
+    request: DiscoveryRunRequest,
+    coordinator=Depends(get_trading_coordinator),
+):
+    """수동 발굴(discovery) 파이프라인 트리거 — 마감 엣지(coordinator._check_
+    queue_on_market_open의 open→closed 엣지, 장 마감 시 1회)를 재시작/장애로
+    놓쳤거나, 개장 전에 미리 후보를 준비하고 싶을 때 쓰는 수동 트리거.
+    /eod-report/run·/strategy/consensus/run과 동일한 "놓친 엣지 복구" 관용구.
+
+    마감 엣지 블록의 discovery 두 스텝을 그대로 떼어내 실행한다
+    (coordinator.py:2918-2947과 동일):
+      1) coordinator._run_discovery_scan() — 전 종목 discovery 스캔 트리거 +
+         완료까지 폴링(notify_progress=False, 스캐너 busy면 skip, SC-2 동적
+         타임아웃). scan_ok(bool) 반환.
+      2) run_discovery_pipeline(...) — backfill→rank→LLM검토→promote→원장.
+         승격은 Depends로 주입된 **라이브 coordinator 싱글턴**의 워치리스트에
+         반영되므로 다음 개장 시 target_entry_price ±3% 근접분이 fire된다.
+         (별도 프로세스 스크립트로는 이 라이브 워치리스트에 닿을 수 없어 무의미
+         — 반드시 이 in-process 경로여야 한다.)
+
+    스캔은 전 종목(수천)·수십 분~수 시간이 걸리므로 이 라우트는 작업을
+    asyncio.create_task로 백그라운드에 던지고 즉시 반환한다(POST /scanner/start
+    와 동일한 fire-and-forget). 진행은 GET /scanner/progress, 결과는 GET
+    /trading/discovery/candidates·GET /trading/watch-list로 관찰한다.
+
+    trade_date는 요청 시점의 서버 로컬 날짜(datetime.now(), naive)로 한 번만
+    계산해 백그라운드 태스크에 넘긴다 — 마감 체인(coordinator.py:2943)과 동일한
+    계산이며, 스캔 세션의 started_at 날짜와 일치해야 하는 불변식이다
+    (ranker._load_discovery_session이 date(started_at)=trade_date로 매칭 —
+    KST-aware를 쓰면 자정 근처 UTC 오프셋에서 어긋나 조용히 0건이 될 수 있어
+    naive 로컬을 그대로 쓴다). request.date로 명시 override 가능.
+
+    DISCOVERY_ENABLED가 off면 아무 것도 하지 않고 enabled=False로 즉시 반환
+    (마감 체인의 킬스위치 가드와 동일 의미).
+    """
+    if not get_settings().DISCOVERY_ENABLED:
+        return {
+            "ok": False,
+            "enabled": False,
+            "started": False,
+            "message": "DISCOVERY_ENABLED is off — 발굴 트리거 거부",
+        }
+
+    trade_date = request.date or datetime.now().strftime("%Y-%m-%d")
+
+    async def _run_discovery_job():
+        # 두 호출 모두 내부적으로 never-raise이지만, 마감 체인의 방어 심화
+        # (coordinator.py:2920/2938 try/except)를 동일하게 한 번 더 감싼다.
+        try:
+            scan_ok = await coordinator._run_discovery_scan()
+            summary = await run_discovery_pipeline(
+                coordinator=coordinator,
+                storage=await get_storage_service(),
+                scanner=await get_background_scanner(),
+                trade_date=trade_date,
+                scan_ok=scan_ok,
+            )
+            logger.info(
+                "[Discovery] manual run finished trade_date=%s scan_ok=%s summary=%s",
+                trade_date,
+                scan_ok,
+                summary,
+            )
+        except Exception as e:
+            logger.warning(
+                "[Discovery] manual run failed trade_date=%s: %s", trade_date, e
+            )
+
+    task = asyncio.create_task(_run_discovery_job())
+    _discovery_run_tasks.add(task)
+    task.add_done_callback(_discovery_run_tasks.discard)
+
+    return {
+        "ok": True,
+        "enabled": True,
+        "started": True,
+        "trade_date": trade_date,
+        "message": (
+            "발굴 스캔 시작 — GET /scanner/progress 로 진행 확인, "
+            "GET /trading/discovery/candidates·/watch-list 로 결과 확인"
+        ),
     }
 
 
