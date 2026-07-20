@@ -994,6 +994,13 @@ class BackgroundScanner:
                     factor_json = {
                         "quality_filter_passed": True,
                         "skip_reason": None,
+                        # DQ-2: flow 결측 재정규화의 1차 소스 -- ka10131 수급
+                        # 랭킹에 이 종목이 존재했는지(flow_map.get(stk_cd) is
+                        # not None) 그대로. ranker._effective_weights가 이
+                        # 플래그로 flow 가중을 나머지 3팩터에 재분배할지
+                        # 판정한다(없는 구 스캔은 raw flow==0.0 프록시로
+                        # 폴백 -- ranker.py 쪽 하위호환).
+                        "flow_present": flow is not None,
                         "scores": strategy_scores,
                         "atoms": atoms,
                         "close_price": snap.price,

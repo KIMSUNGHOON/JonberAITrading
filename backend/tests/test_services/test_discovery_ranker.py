@@ -22,6 +22,7 @@ import pytest
 
 from services.agent_chat.coordinator import ChatCoordinator
 from services.discovery import ranker
+from services.discovery.factors import STRATEGIES
 from services.discovery.ranker import (
     DEFAULT_REGIME_WEIGHTS,
     Candidate,
@@ -147,8 +148,13 @@ def _passing_factor(
     meanrev: float = 0.0,
     close_price: float = 50_000.0,
     market_cap: float = 100_000_000_000.0,
+    flow_present: bool | None = None,
 ) -> dict:
-    return {
+    """`flow_present=None`(default) omits the key entirely -- reproduces a
+    pre-DQ-2 scan's factor_json shape, so `rank_candidates` must fall back to
+    the raw-flow-zero proxy. Pass `True`/`False` explicitly to pin the DQ-2
+    flag itself (round-trip / explicit-priority-over-proxy tests)."""
+    factor = {
         "quality_filter_passed": True,
         "skip_reason": None,
         "scores": {
@@ -159,6 +165,9 @@ def _passing_factor(
         "close_price": close_price,
         "market_cap": market_cap,
     }
+    if flow_present is not None:
+        factor["flow_present"] = flow_present
+    return factor
 
 
 def _failing_factor(reason: str = "insufficient_history") -> dict:
@@ -320,6 +329,175 @@ async def test_rank_candidates_returns_empty_when_no_session_for_date(tmp_path, 
 
     candidates = await rank_candidates(storage, str(scanner_db), "2026-07-20")
     assert candidates == []
+
+
+# ---------------------------------------------------------------------------
+# DQ-2: flow 결측 재정규화 -- _effective_weights 순수 함수 단위 테스트
+# ---------------------------------------------------------------------------
+
+
+class TestEffectiveWeights:
+    # _effective_weights 자체는 순수 동기 함수지만, 모듈 전역
+    # pytestmark(asyncio)는 클래스 속성 재선언으로 무효화되지 않는다(module
+    # -> class 마크는 누적이지 override가 아님) -- 그래서 이 테스트들도 다른
+    # 테스트와 동일하게 async def로 선언해 pytest-asyncio 경고 없이 자연스럽게
+    # 수렴시킨다(본문은 동기 호출만 있고 await은 없음).
+    async def test_flow_missing_redistributes_bearish_weights_manual(self):
+        """수기 대조: bearish {momentum .10 pullback .20 flow .35 meanrev .35}
+        에서 flow 결측 -> {momentum .154 pullback .308 flow 0 meanrev .538},
+        합은 여전히 1.0으로 보존."""
+        base = {k: DEFAULT_REGIME_WEIGHTS["bearish"][k] for k in STRATEGIES}
+        eff = ranker._effective_weights(base, flow_present=False)
+
+        assert eff["momentum"] == pytest.approx(0.153846, abs=1e-5)
+        assert eff["pullback"] == pytest.approx(0.307692, abs=1e-5)
+        assert eff["meanrev"] == pytest.approx(0.538462, abs=1e-5)
+        assert eff["flow"] == 0.0
+        assert sum(eff.values()) == pytest.approx(1.0)
+
+    async def test_flow_present_returns_base_unchanged(self):
+        """flow_present=True는 재분배 없이 base 가중을 그대로(방어적 복사로)
+        반환해야 한다 -- DQ-D 원칙: 재정규화는 결측 종목만."""
+        base = {"momentum": 0.10, "pullback": 0.20, "flow": 0.35, "meanrev": 0.35}
+        eff = ranker._effective_weights(base, flow_present=True)
+
+        assert eff == base
+        assert eff is not base
+
+    async def test_non_strategy_keys_pass_through_untouched(self):
+        """base_weights에 threshold/daily_cap 같은 비-팩터 키가 섞여 있어도
+        (레짐 설정 dict 원형) STRATEGIES 4키만 재분배 대상이고 나머지는
+        그대로 통과해야 한다."""
+        base = {
+            "momentum": 0.10, "pullback": 0.20, "flow": 0.35, "meanrev": 0.35,
+            "threshold": 0.65, "daily_cap": 2,
+        }
+        eff = ranker._effective_weights(base, flow_present=False)
+
+        assert eff["threshold"] == 0.65
+        assert eff["daily_cap"] == 2
+        assert sum(eff[k] for k in STRATEGIES) == pytest.approx(1.0)
+
+    async def test_degenerate_all_zero_weights_never_raises(self):
+        """나머지 3키 합이 0인 손상된 가중 설정도 예외 없이 flow만 0으로
+        두고 반환해야 한다(fail-closed, 랭킹 전체를 죽이면 안 됨)."""
+        base = {"momentum": 0.0, "pullback": 0.0, "flow": 1.0, "meanrev": 0.0}
+        eff = ranker._effective_weights(base, flow_present=False)
+        assert eff["flow"] == 0.0
+        assert eff["momentum"] == 0.0
+        assert eff["pullback"] == 0.0
+        assert eff["meanrev"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# DQ-2: rank_candidates 배선 -- 재정규화된 composite + 원장 _weights
+# ---------------------------------------------------------------------------
+
+
+async def test_rank_candidates_renormalizes_composite_when_flow_missing(tmp_path, storage):
+    """크레오에스지 실측 검산(spec §0): momentum=0.32/pullback=0.54/
+    meanrev=0.67, flow 결측(flow_present=False, bearish 레짐) -> 재정규화
+    composite=0.576. base(비재정규화) 가중 계산은 RED 값 0.373(구조상
+    3745 반올림)과 일치해야 한다 -- 재정규화가 실제로 더 높은 composite를
+    낸다는 것을 함께 확인."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "bearish")
+
+    factor = _passing_factor(
+        momentum=0.32, pullback=0.54, flow=0.0, meanrev=0.67, flow_present=False,
+    )
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "066970", "stk_nm": "크레오에스지", "factor_json": factor}],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    c = candidates[0]
+
+    w = DEFAULT_REGIME_WEIGHTS["bearish"]
+    base_composite = 0.32 * w["momentum"] + 0.54 * w["pullback"] + 0.67 * w["meanrev"]
+    assert base_composite == pytest.approx(0.3745, abs=1e-4)  # RED 대조값(구현 전 수치)
+
+    assert c.composite == pytest.approx(0.576, abs=1e-3)
+    assert c.composite > base_composite
+    assert c.weights["flow"] == 0.0
+    assert c.weights["meanrev"] == pytest.approx(0.538462, abs=1e-5)
+    assert c.weights["momentum"] == pytest.approx(0.153846, abs=1e-5)
+    assert c.weights["pullback"] == pytest.approx(0.307692, abs=1e-5)
+
+
+async def test_rank_candidates_flow_present_flag_roundtrips_from_factor_json(tmp_path, storage):
+    """factor_json에 명시적으로 저장된 flow_present=True 플래그가 raw flow
+    프록시보다 우선해야 한다 -- flow raw 스코어가 우연히 0.0이어도(예: 랭킹
+    최하위권 존재) 플래그가 True면 재정규화가 적용되지 않아야 한다(플래그
+    우선순위 왕복 확인)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "bearish")
+
+    factor = _passing_factor(
+        momentum=0.32, pullback=0.54, flow=0.0, meanrev=0.67, flow_present=True,
+    )
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "삼성전자", "factor_json": factor}],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    c = candidates[0]
+
+    w = DEFAULT_REGIME_WEIGHTS["bearish"]
+    expected = 0.32 * w["momentum"] + 0.54 * w["pullback"] + 0.0 * w["flow"] + 0.67 * w["meanrev"]
+    assert c.composite == pytest.approx(expected)
+    for k in STRATEGIES:
+        assert c.weights[k] == pytest.approx(w[k])
+
+
+async def test_rank_candidates_falls_back_to_raw_flow_zero_proxy_when_flag_absent(tmp_path, storage):
+    """구 스캔(factor_json에 flow_present 키 자체가 없음) 하위호환: raw
+    flow==0.0을 결측 프록시로 삼아 재정규화가 여전히 적용돼야 한다(웹젠
+    실측 케이스와 동일한 배선 경로, spec §0)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "bearish")
+
+    factor = _passing_factor(momentum=0.32, pullback=0.54, flow=0.0, meanrev=0.67)
+    assert "flow_present" not in factor  # 사전조건: 구 스캔 형태(플래그 없음)
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "063080", "stk_nm": "웹젠", "factor_json": factor}],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    c = candidates[0]
+    assert c.composite == pytest.approx(0.576, abs=1e-3)
+    assert c.weights["flow"] == 0.0
+
+
+async def test_rank_candidates_composite_unchanged_when_flow_present(tmp_path, storage):
+    """flow가 실제로 존재하는 종목(raw flow!=0.0 프록시로 flow_present=True
+    판정)은 재정규화가 적용되지 않고 base 가중 그대로 composite가 계산돼야
+    한다 -- DQ-D 원칙 회귀 핀: 결측 종목만 재정규화, 존재 종목은 무접촉."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "bearish")
+
+    factor = _passing_factor(momentum=0.32, pullback=0.54, flow=0.40, meanrev=0.67)
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "삼성전자", "factor_json": factor}],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    c = candidates[0]
+
+    w = DEFAULT_REGIME_WEIGHTS["bearish"]
+    expected = 0.32 * w["momentum"] + 0.54 * w["pullback"] + 0.40 * w["flow"] + 0.67 * w["meanrev"]
+    assert c.composite == pytest.approx(expected)
+    for k in STRATEGIES:
+        assert c.weights[k] == pytest.approx(w[k])
 
 
 # ---------------------------------------------------------------------------

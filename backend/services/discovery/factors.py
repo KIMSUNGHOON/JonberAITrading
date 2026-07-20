@@ -307,6 +307,11 @@ def compute_strategy_scores(snap: StockSnapshot, flow: Optional[FlowRank]) -> di
     }
 
     atoms_out = dict(atoms)
+    # DQ-2: flow 결측 재정규화의 1차 소스(scanner.py가 factor_json 최상위에도
+    # 별도로 저장) -- ranker._effective_weights가 소비하는 진실 값을 여기서
+    # 명시적으로 노출해, "값 도메인 암묵 구분"(flow==0.0 결측 vs 존재)에
+    # 의존하지 않고도 결측 여부를 직접 판단할 수 있게 한다.
+    atoms_out["flow_present"] = flow is not None
     if flow is not None:
         atoms_out["flow_rank"] = flow.rank
         atoms_out["flow_orgn_cont_days"] = flow.orgn_cont_days

@@ -328,6 +328,18 @@ class TestFlowStrategy:
         assert atoms["flow_frgnr_cont_days"] == 1
         assert atoms["flow_net_amt"] == 3_000_000_000
 
+    def test_atoms_expose_flow_present_flag(self):
+        """DQ-2: compute_strategy_scores 반환(_atoms)에 flow_present bool이
+        노출돼야 한다 -- scanner.py가 factor_json 최상위에 저장하는 값과
+        별개로, 이 모듈 자체의 반환값에서도 결측 여부를 직접 판단할 수
+        있어야 한다는 계약."""
+        assert compute_strategy_scores(self._snap(), None)["_atoms"]["flow_present"] is False
+
+        flow = FlowRank(
+            ticker="300001", orgn_net_amt=0, frgnr_net_amt=0, orgn_cont_days=0, frgnr_cont_days=0, rank=1
+        )
+        assert compute_strategy_scores(self._snap(), flow)["_atoms"]["flow_present"] is True
+
 
 # ---------------------------------------------------------------------------
 # ④ 클램프 — 스코어 전부 [0,1]

@@ -488,6 +488,51 @@ async def test_flow_fetched_exactly_once_per_market(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# DQ-2: factor_json에 flow_present bool 저장(왕복) -- ranker._effective_
+# weights 재정규화의 1차 소스.
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_scan_records_flow_present_flag_in_factor_json(monkeypatch):
+    """flow_map(ka10131 랭킹)에 존재하는 종목은 factor_json 최상위에
+    flow_present=True, 없는 종목은 flow_present=False가 저장돼야 한다 --
+    DB round-trip(json.dumps -> sqlite -> json.loads) 후에도 bool 그대로
+    보존."""
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "삼성전자"),
+            "000660": _stock_info("000660", "SK하이닉스"),
+        },
+        chart_dfs={
+            "005930": _make_chart_df(65),
+            "000660": _make_chart_df(65),
+        },
+        flow_responses={
+            "001": [{"stk_cd": "005930", "orgn_net_amt": 1e9, "frgnr_net_amt": 2e9,
+                      "orgn_cont_days": 3, "frgnr_cont_days": 4}],
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "삼성전자", "코스피"),
+            ("000660", "SK하이닉스", "코스피"),
+        ],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    by_ticker = {r["stk_cd"]: json.loads(r["factor_json"]) for r in rows}
+
+    assert by_ticker["005930"]["flow_present"] is True
+    assert by_ticker["000660"]["flow_present"] is False
+
+
+# ---------------------------------------------------------------------------
 # ⑥ discovery 모드에서 기존 자동 승격 비발화(auto_promote_enabled와 무관)
 # ---------------------------------------------------------------------------
 
