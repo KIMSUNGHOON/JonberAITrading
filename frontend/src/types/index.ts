@@ -1688,6 +1688,59 @@ export interface EodDigest {
   error?: string;
 }
 
+// FI-4: mirrors GET /trading/discovery/candidates row shape verbatim
+// (backend app/api/routes/trading.py::DiscoveryCandidateResponse). This is
+// the dedicated ledger page's per-row shape -- broader than FI-3's
+// EodDigestDiscoveryPromoted (which only carries the EOD digest's promoted
+// summary fields), since the ledger page also needs skip_reason/rank/
+// regime_label/close_price/the full fwd_1d/5d/20d triple for ANY row
+// (promoted or skipped), not just today's promotions.
+export interface DiscoveryCandidate {
+  id: string | null;
+  trade_date: string | null;
+  ticker: string | null;
+  name: string | null;
+  composite_score: number | null;
+  top_strategy_tag: string | null;
+  regime_label: string | null;
+  rank: number | null;
+  promoted: boolean;
+  skip_reason: string | null;
+  close_price: number | null;
+  // Raw fractions (e.g. 0.0123 == +1.23%), same convention as
+  // EodDigestDiscoveryPrevDay.avg_fwd_1d -- render with an explicit *100
+  // (see PerformancePanel.tsx/DiscoveryLedgerPanel.tsx's local fmtFwdPct),
+  // never reuse fmtPct() as-is.
+  fwd_1d: number | null;
+  fwd_5d: number | null;
+  fwd_20d: number | null;
+}
+
+export interface DiscoveryCandidatesResponse {
+  candidates: DiscoveryCandidate[];
+  // Row count on THIS page, not the total match count (mirrors
+  // GET /trading/watch-list's `count` convention -- see FI-2 report).
+  count: number;
+}
+
+// FI-4: mirrors GET /trading/discovery/performance's per-tag bucket
+// (backend DiscoveryPerformanceBucket).
+export interface DiscoveryPerformanceBucket {
+  candidates: number;
+  promoted: number;
+  // Raw fractions, same fmtFwdPct convention as DiscoveryCandidate.fwd_1d.
+  avg_fwd_1d: number | null;
+  avg_fwd_5d: number | null;
+  // Raw fraction (e.g. 0.5 == 50% of promoted-then-tracked rows finished
+  // fwd_5d positive) -- render as `(n * 100).toFixed(0)}%`.
+  hit_rate_5d: number | null;
+}
+
+export interface DiscoveryPerformanceResponse {
+  days: number;
+  by_strategy_tag: Record<string, DiscoveryPerformanceBucket>;
+}
+
 export interface EodReportResponse {
   trade_date: string;
   created_at: string;

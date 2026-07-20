@@ -37,9 +37,11 @@ describe('nav map', () => {
       expect(NAV_ITEMS.some((n) => n.label === 'Watchlist')).toBe(false);
     });
 
-    it('NAV_ITEMS has exactly 7 items in the expected order', () => {
+    // FI-4 (2026-07-20) added the 'discovery' ledger page as an 8th
+    // nav-rail/⌘K entry -- this pin was bumped from 7 to 8 alongside it.
+    it('NAV_ITEMS has exactly 8 items in the expected order', () => {
       expect(NAV_ITEMS.map((n) => n.view)).toEqual([
-        'dashboard', 'analysis', 'positions', 'agent-chat', 'scanner', 'trading', 'trades',
+        'dashboard', 'analysis', 'positions', 'agent-chat', 'scanner', 'discovery', 'trading', 'trades',
       ]);
     });
 

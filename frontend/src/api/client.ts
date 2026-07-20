@@ -61,6 +61,9 @@ import type {
   PerformanceResponse,
   // EOD Report Types (E3-5)
   EodReportResponse,
+  // Discovery Ledger Types (FI-4)
+  DiscoveryCandidatesResponse,
+  DiscoveryPerformanceResponse,
   // Scanner Types
   ScanProgressResponse,
   ScanResultsResponse,
@@ -1513,6 +1516,47 @@ class ApiClient {
     }
   }
 
+  // -------------------------------------------
+  // Discovery Ledger Endpoints (FI-4)
+  // -------------------------------------------
+
+  /**
+   * Get discovery_candidates ledger rows (FI-2's GET
+   * /trading/discovery/candidates) -- the raw per-day scan output the
+   * discovery/regime ranker leaves behind, promoted or not, with the
+   * post-hoc fwd_1d/5d/20d forward returns once backfilled. All filters are
+   * optional; omitting them all returns the newest rows across every date.
+   * An empty ledger is a normal 200 + `{candidates: [], count: 0}`, not an
+   * error -- the dedicated ledger page (DiscoveryLedgerPanel) renders that
+   * as an honest "발굴 이력 없음" rather than surfacing it as a fetch failure.
+   */
+  async getDiscoveryCandidates(params?: {
+    trade_date?: string;
+    promoted?: boolean;
+    limit?: number;
+    offset?: number;
+  }): Promise<DiscoveryCandidatesResponse> {
+    const response = await this.client.get<DiscoveryCandidatesResponse>(
+      '/trading/discovery/candidates',
+      { params }
+    );
+    return response.data;
+  }
+
+  /**
+   * Get discovery performance summary grouped by strategy tag (FI-2's GET
+   * /trading/discovery/performance) -- candidate/promoted counts and
+   * avg fwd_1d/fwd_5d/hit_rate_5d over a trailing window. `days` omitted
+   * lets the backend apply its own default (14).
+   */
+  async getDiscoveryPerformance(days?: number): Promise<DiscoveryPerformanceResponse> {
+    const response = await this.client.get<DiscoveryPerformanceResponse>(
+      '/trading/discovery/performance',
+      { params: days !== undefined ? { days } : undefined }
+    );
+    return response.data;
+  }
+
   /**
    * Add a stock to watch list.
    */
@@ -2137,6 +2181,17 @@ export const getPerformance = (params?: { base?: number; start?: string; end?: s
 
 // EOD Report API (E3-5)
 export const getEodReport = (date?: string) => apiClient.getEodReport(date);
+
+// Discovery Ledger API (FI-4)
+export const getDiscoveryCandidates = (params?: {
+  trade_date?: string;
+  promoted?: boolean;
+  limit?: number;
+  offset?: number;
+}) => apiClient.getDiscoveryCandidates(params);
+
+export const getDiscoveryPerformance = (days?: number) =>
+  apiClient.getDiscoveryPerformance(days);
 
 // Background Scanner API
 export const startScan = (request?: StartScanRequest) =>

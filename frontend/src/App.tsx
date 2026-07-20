@@ -24,6 +24,7 @@ import { AnalysisPage } from '@/pages/AnalysisPage';
 import { WorkflowPage } from '@/pages/WorkflowPage';
 import { AnalysisDetailPage } from '@/pages/AnalysisDetailPage';
 import { ScannerResultsPage } from '@/pages/ScannerResultsPage';
+import { DiscoveryLedgerPanel } from '@/components/terminal/panels/DiscoveryLedgerPanel';
 import { TradingDashboard } from '@/components/trading';
 import { AgentChatDashboard } from '@/components/agent-chat';
 
@@ -114,6 +115,7 @@ function App() {
           <Route path="workflow/:sessionId" element={<SessionBridge><WorkflowPage /></SessionBridge>} />
           <Route path="positions" element={<PositionsPage />} />
           <Route path="scanner" element={<ScannerResultsPage />} />
+          <Route path="discovery" element={<DiscoveryLedgerPanel />} />
           <Route path="agent-chat" element={<div className="p-3 md:p-4"><AgentChatDashboard /></div>} />
           <Route path="trading" element={<TradingDashboard />} />
           <Route path="trades" element={<TradesPage />} />

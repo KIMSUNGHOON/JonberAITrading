@@ -14,7 +14,7 @@
 export type ViewKey =
   | 'dashboard' | 'analysis' | 'analysis-detail' | 'workflow'
   | 'positions' | 'scanner' | 'agent-chat'
-  | 'trading' | 'trades';
+  | 'trading' | 'trades' | 'discovery';
 
 /** Static path for a view. Detail views need a sessionId. */
 export function viewToPath(view: ViewKey, sessionId?: string): string {
@@ -25,6 +25,7 @@ export function viewToPath(view: ViewKey, sessionId?: string): string {
     case 'workflow': return sessionId ? `/workflow/${sessionId}` : '/analysis';
     case 'positions': return '/positions';
     case 'scanner': return '/scanner';
+    case 'discovery': return '/discovery';
     case 'agent-chat': return '/agent-chat';
     case 'trading': return '/trading';
     case 'trades': return '/trades';
@@ -38,6 +39,7 @@ export function pathToView(pathname: string): ViewKey {
   if (pathname.startsWith('/workflow')) return 'analysis';
   if (pathname.startsWith('/positions')) return 'positions';
   if (pathname.startsWith('/scanner')) return 'scanner';
+  if (pathname.startsWith('/discovery')) return 'discovery';
   if (pathname.startsWith('/agent-chat')) return 'agent-chat';
   if (pathname.startsWith('/trading')) return 'trading';
   if (pathname.startsWith('/trades')) return 'trades';
@@ -51,6 +53,7 @@ export const NAV_ITEMS: { view: ViewKey; label: string }[] = [
   { view: 'positions', label: 'Positions' },
   { view: 'agent-chat', label: 'Agent Chat' },
   { view: 'scanner', label: 'Scanner' },
+  { view: 'discovery', label: 'Discovery' },
   { view: 'trading', label: 'Auto-trade' },
   { view: 'trades', label: 'Trades' },
 ];

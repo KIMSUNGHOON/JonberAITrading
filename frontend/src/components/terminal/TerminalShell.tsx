@@ -7,7 +7,7 @@ import { useEffect, useState } from 'react';
 import { Outlet } from 'react-router-dom';
 import {
   LayoutDashboard, Activity, Wallet, Receipt,
-  Bot, Scan, MessageSquare, Settings,
+  Bot, Scan, Telescope, MessageSquare, Settings,
 } from 'lucide-react';
 import { useStore } from '@/store';
 import { useGoTo, useActiveView } from '@/hooks/useNav';
@@ -28,6 +28,7 @@ const NAV_ICONS: Partial<Record<ViewKey, React.ReactNode>> = {
   positions: <Wallet size={17} />,
   'agent-chat': <MessageSquare size={17} />,
   scanner: <Scan size={17} />,
+  discovery: <Telescope size={17} />,
   trading: <Bot size={17} />,
   trades: <Receipt size={17} />,
 };
