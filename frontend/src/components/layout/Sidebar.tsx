@@ -18,6 +18,7 @@ import {
   Receipt,
   Bot,
   Scan,
+  Telescope,
   MessageSquare,
 } from 'lucide-react';
 import { useStore } from '@/store';
@@ -38,6 +39,7 @@ const NAV_ICONS: Partial<Record<ViewKey, React.ReactNode>> = {
   scanner: <Scan className="w-5 h-5" />,
   trading: <Bot className="w-5 h-5" />,
   trades: <Receipt className="w-5 h-5" />,
+  discovery: <Telescope className="w-5 h-5" />,
 };
 
 interface NavItemProps {

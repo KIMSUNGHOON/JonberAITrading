@@ -16,6 +16,7 @@ from httpx import AsyncClient
 
 from app.main import app
 
+import services.background_scanner.scanner as scanner_module
 import services.storage_service as storage_service_module
 
 
@@ -136,6 +137,46 @@ def set_test_env(monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "development")
     monkeypatch.setenv("DEBUG", "true")
     monkeypatch.setenv("MARKET_DATA_MODE", "mock")
+
+
+# -------------------------------------------
+# FI final-fix review Minor 2: scanner_results.db isolation (autouse)
+# -------------------------------------------
+#
+# app.main's lifespan (FI-1, see BackgroundScanner.reconcile_orphan_scan_
+# sessions) unconditionally runs an UPDATE against
+# services.background_scanner.scanner.DB_PATH on every process startup --
+# including every `with TestClient(app) as ...:` boot anywhere in the
+# suite (module- or function-scoped `client` fixtures across
+# tests/test_api/*.py all trigger FastAPI's lifespan). Left unpatched,
+# this write silently touches the real backend/data/scanner_results.db
+# from ordinary test runs -- the same tripwire-violating pattern the L-6
+# incident below caught for storage.db, just for a different DB file.
+#
+# Session-scoped + autouse so it patches the module attribute once,
+# before ANY test's own fixtures run: pytest instantiates higher-scoped
+# fixtures first within a test request ("higher-scoped fixtures are
+# instantiated first"), so this always wins the race against a
+# module-scoped `client` fixture (e.g. tests/test_api/test_discovery_
+# routes.py's) even on that module's very first test. Plain attribute
+# reassignment rather than the `monkeypatch` fixture -- `monkeypatch` is
+# function-scoped and cannot be requested from a session-scoped fixture.
+# DB_PATH is read fresh off the module global at every call site inside
+# scanner.py (never cached on the BackgroundScanner instance), so
+# reassigning the attribute here is sufficient regardless of when
+# scanner.py was first imported relative to this fixture running.
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_scanner_db_path(tmp_path_factory):
+    """Autouse: redirect scanner.DB_PATH at a throwaway sqlite file for the
+    whole test session so no TestClient(app) boot's FI-1 orphan-reconcile
+    (or any other scanner DB write) ever touches the real
+    backend/data/scanner_results.db."""
+    original = scanner_module.DB_PATH
+    scanner_module.DB_PATH = tmp_path_factory.mktemp("scanner_db_isolation") / "scanner_results.db"
+    yield
+    scanner_module.DB_PATH = original
 
 
 # -------------------------------------------

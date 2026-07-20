@@ -1636,7 +1636,7 @@ export interface EodDigestRegime {
   // scan actually completed, 0-100) -- backend now forwards this
   // (eod_digest.py::_build_regime_section), null when no breadth was
   // recorded for the snapshot (e.g. discovery never ran that day).
-  scan_coverage_pct: number | null;
+  scan_coverage_pct?: number | null;
 }
 
 // FI-3: mirrors eod_digest.py::_build_discovery_section's promoted-row
