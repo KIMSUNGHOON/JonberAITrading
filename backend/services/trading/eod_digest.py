@@ -363,6 +363,10 @@ async def _build_regime_section(storage: Any) -> Optional[dict[str, Any]]:
         "label": row.get("market_sentiment_label"),
         "index_kospi_chg_pct": row.get("index_kospi_chg_pct"),
         "index_kosdaq_chg_pct": row.get("index_kosdaq_chg_pct"),
+        # FI-2: SC-3가 regime_snapshot에 이미 저장하는 스캔 커버리지(%) --
+        # 이전까지 이 함수가 label/index 3필드만 골라 반환해 EOD 응답 도달
+        # 전에 잘렸다(spec §1 FE-E 실측). additive -- 기존 3필드는 무변경.
+        "scan_coverage_pct": row.get("scan_coverage_pct"),
     }
 
 

@@ -168,7 +168,7 @@ async def _seed_strategy_revision(storage, trade_date, rationale="야간 선물 
     )
 
 
-async def _seed_regime_snapshot(storage, trade_date):
+async def _seed_regime_snapshot(storage, trade_date, scan_coverage_pct=None):
     await storage.save_regime_snapshot(
         {
             "id": str(uuid.uuid4()),
@@ -181,6 +181,9 @@ async def _seed_regime_snapshot(storage, trade_date):
             "market_sentiment_label": "risk_on",
             "index_kospi_chg_pct": 0.8,
             "index_kosdaq_chg_pct": 1.2,
+            # FI-2: optional -- default None mirrors "SC-3 코드는 있지만
+            # breadth 없이 저장된 옛 스냅샷" 케이스 (regime.py:116).
+            "scan_coverage_pct": scan_coverage_pct,
         }
     )
 
@@ -265,6 +268,25 @@ async def test_build_eod_digest_assembles_all_sections(tmp_path):
     assert regime["label"] == "risk_on"
     assert regime["index_kospi_chg_pct"] == 0.8
     assert regime["index_kosdaq_chg_pct"] == 1.2
+    # FI-2: _seed_regime_snapshot's default (scan_coverage_pct not passed)
+    # -- existing 3 fields above are unchanged by the additive key below.
+    assert regime["scan_coverage_pct"] is None
+
+
+async def test_build_eod_digest_regime_scan_coverage_pct_present(tmp_path):
+    """FI-2: SC-3가 저장한 scan_coverage_pct가 EOD digest의 regime 섹션까지
+    도달한다 -- 이전에는 _build_regime_section이 label/index 3필드만 골라
+    반환해 여기서 잘렸다(spec §1 FE-E)."""
+    trade_date = "2026-07-17"
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    await _seed_regime_snapshot(storage, trade_date, scan_coverage_pct=84.0)
+    coordinator = _StubCoordinator(summary=_portfolio_summary())
+
+    digest = await build_eod_digest(coordinator=coordinator, storage=storage, trade_date=trade_date)
+
+    assert digest["regime"]["scan_coverage_pct"] == 84.0
+    # unrelated existing fields still present/correct alongside the new one.
+    assert digest["regime"]["label"] == "risk_on"
 
 
 async def test_build_eod_digest_holdings_degrade_when_state_unavailable(tmp_path):

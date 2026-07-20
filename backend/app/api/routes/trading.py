@@ -58,6 +58,11 @@ from services.trading.strategy_orchestrator import (
 # E3-4: EOD 리포트 API -- digest 재조립기 + LLM 내러티브(narrate_eod_digest는
 # 이 모듈의 유일한 LLM 호출, 실패는 항상 None로 흡수됨 -- eod_digest.py 참고).
 from services.trading.eod_digest import build_eod_digest, narrate_eod_digest
+# FI-2: 발굴(discovery) 원장 조회 -- get_discovery_performance는 순수 집계
+# (LLM/네트워크 없음), _top_strategy_tag는 eod_digest.py:66도 동일하게
+# 모듈 경계를 넘어 재사용하는 기존 전례를 따른 것(밑줄 접두는 "패키지 내부
+# 공용" 관례이지 진짜 private가 아님).
+from services.discovery.ledger import get_discovery_performance, _top_strategy_tag
 
 logger = logging.getLogger(__name__)
 
@@ -1122,6 +1127,126 @@ async def run_eod_report_now(
         "narrative": narrative,
         "notified": notified,
     }
+
+
+# -------------------------------------------
+# FI-2: Discovery Ledger Query Endpoints
+#
+# storage.get_discovery_candidates (services/storage_service.py:2650) has no
+# `promoted` filter and no `offset` param -- adding either would touch a
+# storage-layer signature several other callers depend on (eod_digest.py,
+# services/discovery/ledger.py). Per the FI-2 brief this stays minimally
+# invasive: both filters are applied here, in the route, after a single
+# storage query. `promoted` filtering happens on an over-fetched batch
+# (see _DISCOVERY_CANDIDATES_OVERFETCH_CAP below) since we can't know in
+# advance how many of the newest-N rows match the filter; `offset` is a
+# plain list slice. For this single-user paper-trading app's data volume
+# this is correct in practice, with a documented edge: a `promoted` filter
+# combined with more than _DISCOVERY_CANDIDATES_OVERFETCH_CAP total rows
+# for the requested trade_date could under-return older matches -- FI-4's
+# ledger page is expected to scope by trade_date, keeping per-day volume
+# far under the cap.
+# -------------------------------------------
+
+_DISCOVERY_CANDIDATES_OVERFETCH_CAP = 5000
+
+
+class DiscoveryCandidateResponse(BaseModel):
+    id: Optional[str] = None
+    trade_date: Optional[str] = None
+    ticker: Optional[str] = None
+    name: Optional[str] = None
+    composite_score: Optional[float] = None
+    top_strategy_tag: Optional[str] = Field(
+        None, description="strategy_scores_json에서 계산한 최고 기여 전략 태그"
+    )
+    regime_label: Optional[str] = None
+    rank: Optional[int] = None
+    promoted: bool = False
+    skip_reason: Optional[str] = None
+    close_price: Optional[float] = None
+    fwd_1d: Optional[float] = None
+    fwd_5d: Optional[float] = None
+    fwd_20d: Optional[float] = None
+
+
+class DiscoveryCandidatesResponse(BaseModel):
+    candidates: List[DiscoveryCandidateResponse] = Field(default_factory=list)
+    count: int = Field(0, description="이 페이지에 실제로 담긴 후보 수 (전체 매치 수 아님)")
+
+
+def _to_discovery_candidate_response(row: Dict[str, Any]) -> DiscoveryCandidateResponse:
+    return DiscoveryCandidateResponse(
+        id=row.get("id"),
+        trade_date=row.get("trade_date"),
+        ticker=row.get("ticker"),
+        name=row.get("name"),
+        composite_score=row.get("composite_score"),
+        top_strategy_tag=_top_strategy_tag(row.get("strategy_scores_json")),
+        regime_label=row.get("regime_label"),
+        rank=row.get("rank"),
+        promoted=bool(row.get("promoted")),
+        skip_reason=row.get("skip_reason"),
+        close_price=row.get("close_price"),
+        fwd_1d=row.get("fwd_1d"),
+        fwd_5d=row.get("fwd_5d"),
+        fwd_20d=row.get("fwd_20d"),
+    )
+
+
+@router.get("/discovery/candidates", response_model=DiscoveryCandidatesResponse)
+async def get_discovery_candidates_route(
+    trade_date: Optional[str] = None,
+    promoted: Optional[bool] = None,
+    limit: int = 200,
+    offset: int = 0,
+):
+    """FI-2: discovery_candidates 원장 조회 (발굴 스캔이 남긴 후보 + 승격
+    여부 + 사후 채워지는 fwd_1d/5d/20d).
+
+    trade_date로 특정일로 좁힐 수 있고, promoted로 승격/스킵만 골라볼 수
+    있다(둘 다 optional -- 생략하면 전체 최신순). limit/offset은 이 라우트
+    레벨에서 적용된다(위 섹션 docstring 참고). 후보가 하나도 없어도(빈
+    테이블이거나 필터에 아무것도 안 걸려도) 200 + 빈 리스트를 반환한다 --
+    404가 아니다(원장 조회는 "아직 없음"이 정상 상태).
+    """
+    storage = await get_storage_service()
+
+    fetch_limit = (
+        _DISCOVERY_CANDIDATES_OVERFETCH_CAP if promoted is not None else (offset + limit)
+    )
+    rows = await storage.get_discovery_candidates(trade_date=trade_date, limit=fetch_limit)
+
+    if promoted is not None:
+        rows = [r for r in rows if bool(r.get("promoted")) == promoted]
+
+    page = rows[offset : offset + limit]
+    candidates = [_to_discovery_candidate_response(r) for r in page]
+    return DiscoveryCandidatesResponse(candidates=candidates, count=len(candidates))
+
+
+class DiscoveryPerformanceBucket(BaseModel):
+    candidates: int = 0
+    promoted: int = 0
+    avg_fwd_1d: Optional[float] = None
+    avg_fwd_5d: Optional[float] = None
+    hit_rate_5d: Optional[float] = None
+
+
+class DiscoveryPerformanceResponse(BaseModel):
+    days: int
+    by_strategy_tag: Dict[str, DiscoveryPerformanceBucket] = Field(default_factory=dict)
+
+
+@router.get("/discovery/performance", response_model=DiscoveryPerformanceResponse)
+async def get_discovery_performance_route(days: int = 14):
+    """FI-2: 발굴 전략태그별 성과 요약 (services/discovery/ledger.py::
+    get_discovery_performance 그대로 위임 -- 순수 집계, 빈 원장/윈도우 밖은
+    빈 dict, 절대 raise 하지 않음). 전략별 후보 수·승격 수·평균 fwd_1d/5d·
+    hit_rate_5d."""
+    storage = await get_storage_service()
+    summary = await get_discovery_performance(storage, days=days)
+    return DiscoveryPerformanceResponse(days=days, by_strategy_tag=summary)
 
 
 # -------------------------------------------
