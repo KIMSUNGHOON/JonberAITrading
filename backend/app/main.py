@@ -94,6 +94,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("storage_connection_failed", error=str(e))
 
+    # DQ-3: re-seed discovery regime-weight thresholds once at startup. A
+    # stored discovery:regime_weights config that still matches the
+    # pre-DQ-3 hardcoded default (bearish threshold 0.65, un-recalibrated)
+    # gets moved onto the new measured default (bearish threshold ->
+    # 0.52); any hand-adjusted or EOD-strategy-consensus-updated config is
+    # left untouched (deep-compared against the old snapshot). never-raise
+    # -- a migration failure never blocks startup.
+    try:
+        from services.discovery.ranker import migrate_regime_weights_reseed
+
+        storage_service = await get_storage_service()
+        reseeded = await migrate_regime_weights_reseed(storage_service)
+        logger.info("discovery_regime_weights_migration_complete", reseeded=reseeded)
+    except Exception as e:
+        logger.warning("discovery_regime_weights_migration_failed", error=str(e))
+
     # Initialize realtime service (Upbit WebSocket)
     try:
         realtime_service = await get_realtime_service()

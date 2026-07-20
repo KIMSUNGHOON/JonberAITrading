@@ -65,6 +65,30 @@ DEFAULT_REGIME_WEIGHTS: dict[str, dict[str, float]] = {
     },
     "bearish": {
         "flow": 0.35, "meanrev": 0.35, "pullback": 0.20, "momentum": 0.10,
+        # DQ-3 실측 재산출 (2026-07-20, DQ-1 ETN 제외 + DQ-2 재정규화 적용
+        # 후 순수 실주식 composite 분포): 상위 크레오에스지 0.574 · 웹젠
+        # 0.536, threshold>=0.52 3개 -> daily_cap 2로 상위 2 승격. 구값
+        # 0.65는 재정규화 전 스케일 기준이라 실질적으로 승격 0건이었다.
+        "threshold": 0.52, "daily_cap": 2,
+    },
+}
+
+# DQ-3 재시드 마이그레이션 기준점 -- DQ-3 이전(재정규화 문턱 재산출 이전)
+# DEFAULT_REGIME_WEIGHTS의 정확한 스냅샷. `migrate_regime_weights_reseed`가
+# 저장된 app_settings 값을 이 스냅샷과 deep-compare해 "손대지 않은 구
+# 시드"인지 판별한다 -- 이 상수 자체는 앞으로 절대 수정하지 않는다(다음
+# 재산출 태스크가 필요하면 새 스냅샷 상수를 별도로 추가할 것).
+_OLD_DEFAULT_REGIME_WEIGHTS: dict[str, dict[str, float]] = {
+    "bullish": {
+        "momentum": 0.40, "pullback": 0.25, "flow": 0.25, "meanrev": 0.10,
+        "threshold": 0.55, "daily_cap": 5,
+    },
+    "neutral": {
+        "flow": 0.30, "pullback": 0.30, "momentum": 0.20, "meanrev": 0.20,
+        "threshold": 0.55, "daily_cap": 5,
+    },
+    "bearish": {
+        "flow": 0.35, "meanrev": 0.35, "pullback": 0.20, "momentum": 0.10,
         "threshold": 0.65, "daily_cap": 2,
     },
 }
@@ -145,6 +169,46 @@ async def _load_regime_weights(storage) -> dict[str, dict[str, float]]:
             "discovery_regime_weights_corrupt_using_default", error=str(e)
         )
         return copy.deepcopy(DEFAULT_REGIME_WEIGHTS)
+
+
+async def migrate_regime_weights_reseed(storage) -> bool:
+    """앱 시작 시 1회 호출되는 재시드 마이그레이션(DQ-3). 저장된
+    `discovery:regime_weights`가 DQ-3 이전 DEFAULT(`_OLD_DEFAULT_REGIME_WEIGHTS`
+    스냅샷)와 정확히(deep) 일치하는 경우에만 새 `DEFAULT_REGIME_WEIGHTS`로
+    덮어쓴다 -- 사용자가 손으로 조정했거나 EOD 전략합의가 이미 갱신한 값은
+    이 스냅샷과 달라 그대로 보존된다. 저장값이 아예 없으면(신규 배포, 아직
+    한 번도 읽힌 적 없음) 아무것도 하지 않는다 -- `_load_regime_weights`가
+    다음 읽기에서 새 DEFAULT로 정상 시딩하므로 기존 시드 경로는 그대로다.
+
+    `_load_regime_weights`의 "저장값 우선" 계약(위 함수)은 이 마이그레이션이
+    저장값을 *사전에* 갱신하는 방식으로만 관여한다 -- 그 계약 자체는 여기서
+    건드리지 않는다.
+
+    never-raise: 손상된 JSON, storage 예외 등 어떤 실패도 로그만 남기고
+    False를 반환한다 -- 마이그레이션 실패가 기동을 막으면 안 된다.
+
+    Returns:
+        True if the stored value was rewritten, False otherwise (no stored
+        value / stored value doesn't match the old snapshot / error).
+    """
+    try:
+        raw = await storage.get_app_setting(REGIME_WEIGHTS_SETTING_KEY)
+        if raw is None:
+            return False
+
+        loaded = json.loads(raw)
+        if loaded != _OLD_DEFAULT_REGIME_WEIGHTS:
+            return False
+
+        await storage.set_app_setting(
+            REGIME_WEIGHTS_SETTING_KEY,
+            json.dumps(DEFAULT_REGIME_WEIGHTS, ensure_ascii=False),
+        )
+        logger.info("discovery_regime_weights_reseeded_dq3")
+        return True
+    except Exception as e:
+        logger.warning("discovery_regime_weights_reseed_failed", error=str(e))
+        return False
 
 
 def _extract_regime_label(

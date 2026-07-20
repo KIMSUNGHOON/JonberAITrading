@@ -123,3 +123,65 @@ async def test_get_all_stocks_exclude_etf_etn_false_keeps_everything_byte_invari
     )
     codes = {i.code for i in items}
     assert codes == set(_REAL_STOCK_CODES) | set(_ETF_ETN_CODES)
+
+
+# ---------------------------------------------------------------------------
+# DQ-3: 발행사 브랜드 프리픽스 강화 — DQ-1 키워드 목록은 브랜드명만 있고
+# 키워드가 없는 ETF("KODEX 200" 등)를 못 잡는 결함이 있었다. 브랜드는 줄
+# 시작(^)만 매칭해 실주식명 중간의 우연일치를 방지한다.
+# ---------------------------------------------------------------------------
+
+_BRAND_UNIVERSE = {
+    "return_code": 0,
+    "list": [
+        # 실주식 -- 브랜드 프리픽스와 무관하게 통과해야 함(오탐 방지 회귀).
+        {"code": "005930", "name": "삼성전자", "marketName": "코스피"},
+        {"code": "000660", "name": "SK하이닉스", "marketName": "코스피"},
+        {"code": "900001", "name": "크레오에스지", "marketName": "코스닥"},
+        {"code": "900002", "name": "웹젠", "marketName": "코스닥"},
+        {"code": "900003", "name": "제이에스링크", "marketName": "코스닥"},
+        {"code": "900004", "name": "다스코", "marketName": "코스닥"},
+        {"code": "900005", "name": "코웨이", "marketName": "코스피"},
+        {"code": "900006", "name": "슈프리마에이치큐", "marketName": "코스닥"},
+        {"code": "900007", "name": "솔본", "marketName": "코스닥"},
+        # 브랜드 프리픽스가 우연히 종목명 앞부분과 겹치는 실제 상장사 --
+        # 공백 경계 요구가 없으면 오탐(잘못 제외)되는 케이스.
+        {"code": "138930", "name": "BNK금융지주", "marketName": "코스피"},
+        {"code": "195940", "name": "HK이노엔", "marketName": "코스닥"},
+        # 브랜드-프리픽스만 있고 DQ-1 키워드는 전혀 없는 ETF -- DQ-1 결함
+        # 재현 케이스(브랜드 필터 없으면 실주식으로 오분류됨).
+        {"code": "500010", "name": "KODEX 200", "marketName": "코스피"},
+        {"code": "500011", "name": "TIGER 미국나스닥100", "marketName": "코스피"},
+        {"code": "500012", "name": "ACE 미국S&P500", "marketName": "코스피"},
+        {"code": "500013", "name": "KBSTAR 200", "marketName": "코스피"},
+        {"code": "500014", "name": "SOL 미국배당다우존스", "marketName": "코스피"},
+        {"code": "500015", "name": "1Q 200", "marketName": "코스피"},
+        # 해외/상품 키워드 보강 -- 브랜드 없이 키워드만으로 잡히는 케이스.
+        {"code": "500016", "name": "KODEX 인도Nifty50", "marketName": "코스피"},
+        {"code": "500017", "name": "TIGER 커버드콜", "marketName": "코스피"},
+    ],
+}
+
+_BRAND_REAL_STOCK_CODES = [
+    "005930", "000660", "900001", "900002", "900003", "900004",
+    "900005", "900006", "900007", "138930", "195940",
+]
+_BRAND_ETF_CODES = [
+    "500010", "500011", "500012", "500013", "500014", "500015",
+    "500016", "500017",
+]
+
+
+@pytest.mark.asyncio
+async def test_get_all_stocks_brand_prefix_filters_etf_keeps_real_stocks():
+    """브랜드 프리픽스 전용 ETF(키워드 없이 브랜드+지수명만)는 제외되고,
+    브랜드 프리픽스와 우연히 겹치는 실주식(BNK금융지주/HK이노엔 -- 공백 없이
+    바로 한글이 이어짐)은 통과해야 한다."""
+    client, _ = _client_with_fake_http(_BRAND_UNIVERSE)
+    items = await client.get_all_stocks(
+        include_kospi=True, include_kosdaq=True, exclude_etf_etn=True,
+    )
+    codes = {i.code for i in items}
+    assert codes == set(_BRAND_REAL_STOCK_CODES)
+    for code in _BRAND_ETF_CODES:
+        assert code not in codes

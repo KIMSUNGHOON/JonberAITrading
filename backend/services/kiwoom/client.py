@@ -72,9 +72,62 @@ _ETF_ETN_NAME_KEYWORDS: tuple[str, ...] = (
     "인버스",
     "레버리지",
     "선물",
+    # DQ-3 보강 — 해외지수/상품/테마 ETF·ETN이 흔히 쓰는 단어. "리츠"는
+    # REITS(mrkt_tp=6)가 이미 위 mrkt_tp=0,10 쿼리에서 구조적으로 빠지므로
+    # 실효 매치는 없을 것으로 보이나(정상 상장 리츠는 애초에 이 목록에
+    # 들어오지 않음), Kiwoom 분류가 어긋나는 예외 케이스에 대한 방어선으로
+    # 유지한다.
+    "미국",
+    "중국",
+    "일본",
+    "베트남",
+    "인도",
+    "S&P",
+    "나스닥",
+    "배당",
+    "커버드콜",
+    "하이일드",
+    "액티브",
+    "리츠",
 )
+
+# 발행사 브랜드 프리픽스 (DQ-3) — DQ-1 키워드 목록은 브랜드명 없이 상품명만
+# 있는 ETF/ETN을 못 잡는 결함이 있었다("KODEX 200"처럼 브랜드+지수명만인
+# 경우 위 키워드 어디에도 안 걸림). 종목명 "줄 시작"에서만 매칭한다 — 실제
+# ETF/ETN 명명 관례가 "브랜드 + 공백 + 설명"이므로, 브랜드 뒤에 공백(또는
+# 문자열 끝)이 오는 경우만 매치해 "BNK금융지주"(실제 은행지주 종목, BNK
+# 뒤에 공백 없이 바로 한글)·"HK이노엔"(실제 제약 종목, HK 뒤에 공백 없음)
+# 같은 브랜드-프리픽스 우연일치를 배제한다.
+_ETF_ETN_BRAND_PREFIXES: tuple[str, ...] = (
+    "KODEX",
+    "TIGER",
+    "ACE",
+    "KBSTAR",
+    "PLUS",
+    "RISE",
+    "SOL",
+    "HANARO",
+    "KOSEF",
+    "ARIRANG",
+    "TIMEFOLIO",
+    "TIME",
+    "WON",
+    "KIWOOM",
+    "1Q",
+    "HK",
+    "BNK",
+    "FOCUS",
+    "TREX",
+    "KCGI",
+)
+
 _ETF_ETN_NAME_RE = re.compile(
-    "|".join(re.escape(kw) for kw in _ETF_ETN_NAME_KEYWORDS),
+    "(?:"
+    + "|".join(re.escape(kw) for kw in _ETF_ETN_NAME_KEYWORDS)
+    + ")"
+    + "|^(?:"
+    + "|".join(re.escape(p) for p in _ETF_ETN_BRAND_PREFIXES)
+    + r")(?=\s|$)",
     re.IGNORECASE,
 )
 

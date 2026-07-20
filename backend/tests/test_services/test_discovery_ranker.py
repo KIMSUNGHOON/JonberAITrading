@@ -624,6 +624,93 @@ async def test_regime_weights_corrupt_value_falls_back_to_default(storage):
 
 
 # ---------------------------------------------------------------------------
+# ②b DQ-3: 문턱 재산출 핀 + 재시드 마이그레이션
+# ---------------------------------------------------------------------------
+
+
+async def test_default_regime_weights_bearish_threshold_recalibrated():
+    """DQ-3 실측 핀(2026-07-20): DQ-1 ETN 제외 + DQ-2 재정규화 적용 후
+    순수 실주식 composite 분포 재측정 결과 bearish threshold만 0.65 -> 0.52로
+    갱신(상위 크레오에스지 0.574 · 웹젠 0.536, >=0.52 3개, daily_cap 2로 상위
+    2 승격). neutral/bullish threshold와 일 캡(bearish 2 · neutral/bullish 5)은
+    전부 불변."""
+    assert DEFAULT_REGIME_WEIGHTS["bearish"]["threshold"] == pytest.approx(0.52)
+    assert DEFAULT_REGIME_WEIGHTS["bearish"]["daily_cap"] == 2
+    assert DEFAULT_REGIME_WEIGHTS["neutral"]["threshold"] == pytest.approx(0.55)
+    assert DEFAULT_REGIME_WEIGHTS["neutral"]["daily_cap"] == 5
+    assert DEFAULT_REGIME_WEIGHTS["bullish"]["threshold"] == pytest.approx(0.55)
+    assert DEFAULT_REGIME_WEIGHTS["bullish"]["daily_cap"] == 5
+
+
+async def test_migrate_reseed_overwrites_when_stored_matches_old_default(storage):
+    """① 저장값이 정확히 구 DEFAULT(bearish threshold 0.65)와 일치하면
+    새 DEFAULT(bearish threshold 0.52)로 덮어써야 한다."""
+    await storage.set_app_setting(
+        ranker.REGIME_WEIGHTS_SETTING_KEY,
+        json.dumps(ranker._OLD_DEFAULT_REGIME_WEIGHTS, ensure_ascii=False),
+    )
+
+    migrated = await ranker.migrate_regime_weights_reseed(storage)
+
+    assert migrated is True
+    stored_raw = await storage.get_app_setting(ranker.REGIME_WEIGHTS_SETTING_KEY)
+    assert json.loads(stored_raw) == DEFAULT_REGIME_WEIGHTS
+
+
+async def test_migrate_reseed_preserves_user_adjusted_value(storage):
+    """② 저장값이 구 DEFAULT와 조금이라도 다르면(사용자/EOD 조정) 절대
+    덮어쓰지 않고 그대로 보존해야 한다."""
+    custom = json.loads(json.dumps(ranker._OLD_DEFAULT_REGIME_WEIGHTS))
+    custom["bullish"]["threshold"] = 0.42
+    await storage.set_app_setting(
+        ranker.REGIME_WEIGHTS_SETTING_KEY, json.dumps(custom, ensure_ascii=False)
+    )
+
+    migrated = await ranker.migrate_regime_weights_reseed(storage)
+
+    assert migrated is False
+    stored_raw = await storage.get_app_setting(ranker.REGIME_WEIGHTS_SETTING_KEY)
+    assert json.loads(stored_raw) == custom
+
+
+async def test_migrate_reseed_noop_when_no_stored_value(storage):
+    """③ 저장값 자체가 없으면(신규 배포) 아무것도 쓰지 않는다 -- 기존
+    _load_regime_weights 시드 경로가 다음 읽기에서 새 DEFAULT로 정상 시딩한다."""
+    migrated = await ranker.migrate_regime_weights_reseed(storage)
+
+    assert migrated is False
+    assert await storage.get_app_setting(ranker.REGIME_WEIGHTS_SETTING_KEY) is None
+
+    weights = await ranker._load_regime_weights(storage)
+    assert weights == DEFAULT_REGIME_WEIGHTS
+
+
+async def test_migrate_reseed_never_raises_on_storage_error(monkeypatch, storage):
+    """④ storage 예외(손상된 접근 등)는 절대 전파되지 않고 False로
+    수렴해야 한다 -- 마이그레이션 실패가 기동을 막으면 안 된다."""
+    async def boom(*args, **kwargs):
+        raise RuntimeError("storage boom")
+
+    monkeypatch.setattr(storage, "get_app_setting", boom)
+
+    migrated = await ranker.migrate_regime_weights_reseed(storage)
+
+    assert migrated is False
+
+
+async def test_migrate_reseed_never_raises_on_corrupt_stored_json(storage):
+    """손상된(비-JSON) 저장값도 예외 없이 False로 수렴해야 한다(구 DEFAULT와
+    일치 여부를 판정할 수 없으므로 보존 취급)."""
+    await storage.set_app_setting(ranker.REGIME_WEIGHTS_SETTING_KEY, "not valid json{{{")
+
+    migrated = await ranker.migrate_regime_weights_reseed(storage)
+
+    assert migrated is False
+    stored_raw = await storage.get_app_setting(ranker.REGIME_WEIGHTS_SETTING_KEY)
+    assert stored_raw == "not valid json{{{"
+
+
+# ---------------------------------------------------------------------------
 # ③ LLM JSON 성공/파싱 실패 = 보류 (+top_n 밖 후보는 절대 호출 안 됨)
 # ---------------------------------------------------------------------------
 
