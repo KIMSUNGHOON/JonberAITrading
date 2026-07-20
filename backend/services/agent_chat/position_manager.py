@@ -2278,6 +2278,60 @@ class PositionManager:
                 error=str(e),
             )
 
+    @staticmethod
+    def _restore_stop_is_structurally_insane(
+        current_price: Optional[float],
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+    ) -> bool:
+        """Restore-path-only sanity gate (G-1, docs/superpowers/specs/
+        2026-07-20-gap-discipline-design.md D1) — deliberately NOT
+        `_stops_sane`, which stays byte-invariant for the intraday
+        stop-SETTING paths (`_apply_decision`, `_apply_take_profit_lock_in`,
+        `_check_trailing_stop`): a stop being newly set at-or-above the
+        current price must still be rejected there, or it fires
+        stop_loss_hit on the very same tick (the 2026-07-12 15:40 CPU-spin
+        hang this repo already fixed once).
+
+        A RESTORED stop is different: it is not being newly set, it already
+        existed and survived a restart. The 2026-07-20 00:02 incident
+        (`restore_stops_insane_dropped ticker=000660 stop_loss=1,807,923
+        current_price=1,782,000`) showed the old shared `_stops_sane` gate
+        dropping an already-raised protective stop just because a pre-open
+        gap pushed price through it — discarding real discipline instead of
+        enforcing it. D1: a gap-through stop is not corrupted data, it's the
+        ordinary shape stop discipline takes at a gap open. Preserve it
+        verbatim; `_check_position`'s existing STOP_LOSS_HIT detection (fully
+        unchanged by this method) fires on it normally on the next monitor
+        tick, exactly like any other price crossing.
+
+        Classification (only two ways an entry is dropped — everything else,
+        INCLUDING stop_loss at-or-above current_price, restores normally):
+        - current_price unknown/non-positive: cannot validate at all,
+          fail-closed.
+        - take_profit at-or-below current_price: unlike stop_loss, a
+          restored take_profit gap gets no preserve exception — D1 only
+          covers stop-loss discipline, and this is the exact P0-2b
+          polluted-blob shape (pre-G-1 behavior, unchanged).
+        - stop_loss and take_profit both set with stop_loss >= take_profit:
+          the two saved levels contradict each other independent of the
+          current price — never a legitimate gap, always corrupted data
+          (this also catches a gap-through-shaped stop_loss whose paired
+          take_profit is beneath it, which would otherwise look like a
+          preservable gap).
+        """
+        if not current_price or current_price <= 0:
+            return True
+        if take_profit is not None and take_profit <= current_price:
+            return True
+        if (
+            stop_loss is not None
+            and take_profit is not None
+            and stop_loss >= take_profit
+        ):
+            return True
+        return False
+
     async def restore_stop_overlay(self) -> int:
         """Restore persisted stop levels onto currently-monitored positions.
 
@@ -2289,9 +2343,16 @@ class PositionManager:
         - A ticker still held has its stop fields restored ONLY where the
           field is currently None — a value already set this session (by a
           fresher broker sync or a manual update) wins over the stale blob.
-        - An entry whose saved stops fail _stops_sane against the position's
-          current price (P0-2b: polluted/stale blob) is skipped entirely and
-          its values dropped from the blob by the re-save.
+        - An entry that is structurally insane per
+          `_restore_stop_is_structurally_insane` (P0-2b: polluted/stale
+          blob — NOT the same gate as `_stops_sane`, see that method's
+          docstring) is skipped entirely and its values dropped from the
+          blob by the re-save.
+        - An entry whose stop_loss alone is at-or-above the current price
+          (a pre-open gap ran through an already-raised stop) is preserved
+          verbatim instead of dropped (G-1/D1) — a `gap_through_stop_restored`
+          info log fires and the normal monitor loop fires STOP_LOSS_HIT on
+          it next tick, same as any other price crossing.
 
         Returns the number of tickers whose stops were restored.
         """
@@ -2344,45 +2405,69 @@ class PositionManager:
 
                 saved_stop = saved.get("stop_loss")
                 saved_take = saved.get("take_profit")
-                if not self._stops_sane(position.current_price, saved_stop, saved_take):
-                    # P0-2b: polluted/stale blob entry — e.g. a take_profit at
-                    # or below the current price would fire an instant
-                    # take-profit storm on the first monitor cycle after
-                    # restore. Skip the whole entry; the re-save below drops
-                    # the insane values from the blob.
+                current_price = position.current_price
+                restored_this_ticker = False
+
+                if self._restore_stop_is_structurally_insane(
+                    current_price, saved_stop, saved_take
+                ):
+                    # Structural violation (P0-2b: polluted/stale blob) —
+                    # see `_restore_stop_is_structurally_insane`'s docstring
+                    # for the exact classification. Skip stop_loss/
+                    # take_profit/trailing_stop_pct entirely; the re-save
+                    # below drops the insane values from the blob.
+                    # take_profit_reached_at is handled separately below,
+                    # independent of this drop (G-1).
                     logger.warning(
                         "restore_stops_insane_dropped",
                         ticker=ticker,
                         stop_loss=saved_stop,
                         take_profit=saved_take,
-                        current_price=position.current_price,
+                        current_price=current_price,
                     )
                     await self._notify_restore_stops_dropped(
-                        ticker, saved_stop, saved_take, position.current_price
+                        ticker, saved_stop, saved_take, current_price
                     )
-                    continue
+                else:
+                    # G-1/D1: a saved stop_loss at-or-above the current price
+                    # is a pre-open gap that ran through an already-raised
+                    # stop, not corrupted data — preserve it verbatim and let
+                    # `_check_position`'s ordinary STOP_LOSS_HIT detection
+                    # (unchanged) fire on it the next monitor tick.
+                    if (
+                        saved_stop is not None
+                        and current_price is not None
+                        and saved_stop >= current_price
+                    ):
+                        logger.info(
+                            "gap_through_stop_restored",
+                            ticker=ticker,
+                            stop_loss=saved_stop,
+                            current_price=current_price,
+                        )
 
-                kwargs: Dict[str, float] = {}
-                if position.stop_loss is None and saved.get("stop_loss") is not None:
-                    kwargs["stop_loss"] = saved["stop_loss"]
-                if position.take_profit is None and saved.get("take_profit") is not None:
-                    kwargs["take_profit"] = saved["take_profit"]
-                if (
-                    position.trailing_stop_pct is None
-                    and saved.get("trailing_stop_pct") is not None
-                ):
-                    kwargs["trailing_stop_pct"] = saved["trailing_stop_pct"]
+                    kwargs: Dict[str, float] = {}
+                    if position.stop_loss is None and saved_stop is not None:
+                        kwargs["stop_loss"] = saved_stop
+                    if position.take_profit is None and saved_take is not None:
+                        kwargs["take_profit"] = saved_take
+                    if (
+                        position.trailing_stop_pct is None
+                        and saved.get("trailing_stop_pct") is not None
+                    ):
+                        kwargs["trailing_stop_pct"] = saved["trailing_stop_pct"]
 
-                restored_this_ticker = False
-                if kwargs:
-                    self.update_position(ticker, **kwargs)
-                    restored_this_ticker = True
+                    if kwargs:
+                        self.update_position(ticker, **kwargs)
+                        restored_this_ticker = True
 
-                # take_profit_reached_at (S-5): a plain bookkeeping
-                # timestamp, not a live order level -- restored directly, no
-                # `_stops_sane` gate (that gate validates stop_loss/
-                # take_profit against the CURRENT price, which has no
-                # bearing on "was TP ever reached in the past"). A pre-S-5
+                # take_profit_reached_at (S-5, independent since G-1): a
+                # plain bookkeeping timestamp, not a live order level --
+                # restored unconditionally, regardless of whether the
+                # stop_loss/take_profit fields above were structurally
+                # dropped, preserved as a gap-through, or restored normally
+                # (the field has no sanity concept of its own — it never
+                # bears on "was TP ever reached in the past"). A pre-S-5
                 # blob has no such key -- `saved.get(...)` is None -> no-op,
                 # field stays None exactly like a fresh position's default
                 # (backward compatible).
