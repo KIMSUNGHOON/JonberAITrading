@@ -336,3 +336,123 @@ async def test_compute_regime_snapshot_failed_session_still_excluded(tmp_path):
     )
 
     assert compute_regime_snapshot(db_path, today) is None
+
+
+
+# ---------------------------------------------------------------------------
+# SC-3: regime_snapshot.scan_coverage_pct -- 사후 감사 "이 날 breadth는
+# 몇 % 표본이었는가"를 구분 가능하게 함. completed=100 고정,
+# partial=completed/total*100, breadth 세션 자체가 없으면(compute_regime_
+# snapshot이 None 반환) coverage 개념 자체가 없음.
+# ---------------------------------------------------------------------------
+
+
+async def test_compute_regime_snapshot_coverage_pct_partial_is_completed_over_total(tmp_path):
+    """partial 세션(84/100 저장)의 scan_coverage_pct는 completed/total*100
+    == 84.0이어야 한다."""
+    today = _today()
+    db_path = _make_scanner_db(
+        tmp_path,
+        [
+            {
+                "id": str(uuid.uuid4()),
+                "started_at": f"{today} 09:00:00",
+                "status": "partial",
+                "total_stocks": 100,
+                "completed": 84,
+                "buy_count": 40,
+                "sell_count": 5,
+                "hold_count": 10,
+            }
+        ],
+    )
+
+    record = compute_regime_snapshot(db_path, today)
+
+    assert record is not None
+    assert record["scan_coverage_pct"] == 84.0
+
+
+async def test_compute_regime_snapshot_coverage_pct_completed_is_100(tmp_path):
+    """정상 완주(status='completed') 세션의 scan_coverage_pct는 저장된
+    completed/total 값과 무관하게 항상 100이어야 한다(정의상 전체 유니버스를
+    다 돈 것)."""
+    today = _today()
+    db_path = _make_scanner_db(
+        tmp_path,
+        [
+            {
+                "id": str(uuid.uuid4()),
+                "started_at": f"{today} 09:00:00",
+                "status": "completed",
+                "total_stocks": 100,
+                "completed": 100,
+                "buy_count": 40,
+                "sell_count": 5,
+                "hold_count": 10,
+            }
+        ],
+    )
+
+    record = compute_regime_snapshot(db_path, today)
+
+    assert record is not None
+    assert record["scan_coverage_pct"] == 100.0
+
+
+async def test_compute_regime_snapshot_no_session_that_day_returns_none_not_coverage(tmp_path):
+    """breadth 세션 자체가 없는 날은 compute_regime_snapshot이 None을
+    반환한다 -- scan_coverage_pct도 당연히 존재하지 않는다(record 자체가
+    없으므로 coverage 개념도 없음, 소비자는 이 None 자체를 '표본 없음'으로
+    읽어야 한다)."""
+    db_path = _make_scanner_db(tmp_path, [])
+    assert compute_regime_snapshot(db_path, _today()) is None
+
+
+
+async def test_save_and_get_regime_snapshot_scan_coverage_pct_roundtrip(tmp_path):
+    """storage_service의 regime_snapshot 테이블이 scan_coverage_pct를
+    nullable 컬럼으로 저장/조회할 수 있어야 한다(_ensure_columns 관례 --
+    fresh DB에서도 CREATE TABLE 직후 ALTER로 추가됨)."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    record = {
+        "id": str(uuid.uuid4()),
+        "trade_date": "2026-07-20",
+        "breadth_buy": 40,
+        "breadth_sell": 5,
+        "breadth_hold": 10,
+        "breadth_ratio": 0.6363636363636364,
+        "regime_label": "risk_on",
+        "source": "scanner",
+        "scan_coverage_pct": 84.0,
+    }
+
+    assert await storage.save_regime_snapshot(record) is True
+
+    rows = await storage.get_regime_snapshots()
+    assert len(rows) == 1
+    assert rows[0]["scan_coverage_pct"] == 84.0
+
+
+async def test_save_regime_snapshot_scan_coverage_pct_defaults_to_none(tmp_path):
+    """record에 scan_coverage_pct 키가 아예 없어도(레거시 호출부/breadth
+    폴백 스켈레톤) 저장이 깨지지 않고 NULL로 들어가야 한다(nullable 컬럼
+    회귀 -- 기존 test_save_and_get_regime_snapshots_roundtrip이 이미 이
+    키 없이 저장하는 것과 동일한 경로)."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    record = {
+        "id": str(uuid.uuid4()),
+        "trade_date": "2026-07-20",
+        "breadth_buy": 40,
+        "breadth_sell": 5,
+        "breadth_hold": 10,
+        "breadth_ratio": 0.6363636363636364,
+        "regime_label": "risk_on",
+        "source": "scanner",
+    }
+
+    assert await storage.save_regime_snapshot(record) is True
+
+    rows = await storage.get_regime_snapshots()
+    assert len(rows) == 1
+    assert rows[0]["scan_coverage_pct"] is None

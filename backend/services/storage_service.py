@@ -470,6 +470,20 @@ class StorageService:
                     },
                 )
 
+                # Regime snapshot scan_coverage_pct (SC-3): what fraction of
+                # the day's universe the consumed scan_sessions row (SC-1's
+                # 'completed'-or-'partial' gate in regime.py) actually
+                # covered -- 100 for a full completion, completed/total*100
+                # for a partial one, None when there was no scan session for
+                # that day at all. Without this, a regime row computed from
+                # an 84%-complete scan is indistinguishable from one computed
+                # from a full sweep in any post-hoc audit.
+                await self._ensure_columns(
+                    conn,
+                    "regime_snapshot",
+                    {"scan_coverage_pct": "REAL"},
+                )
+
                 # agent_chat_decisions.decision_source/session_ref (L1,
                 # decision lineage restoration 2026-07-19): promotes this
                 # table to the durable ledger for BOTH the agent-chat debate
@@ -2338,8 +2352,9 @@ class StorageService:
                      breadth_ratio, regime_label, source,
                      index_kospi, index_kospi_chg_pct, index_kosdaq,
                      index_kosdaq_chg_pct, foreign_net_amount,
-                     institution_net_amount, market_sentiment_label, sentiment_score)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     institution_net_amount, market_sentiment_label, sentiment_score,
+                     scan_coverage_pct)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["id"], record.get("trade_date"),
@@ -2352,6 +2367,7 @@ class StorageService:
                         record.get("institution_net_amount"),
                         record.get("market_sentiment_label"),
                         record.get("sentiment_score"),
+                        record.get("scan_coverage_pct"),
                     ),
                 )
                 await conn.commit()

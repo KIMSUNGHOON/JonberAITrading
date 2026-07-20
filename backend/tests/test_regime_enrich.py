@@ -58,6 +58,28 @@ def test_no_breadth_still_gets_trade_date_from_arg():
     assert out["foreign_net_amount"] == 500.0
 
 
+def test_no_breadth_scan_coverage_pct_is_none():
+    """SC-3: breadth 세션이 없는 날(스캐너 미완료 등)의 스켈레톤은
+    scan_coverage_pct=None이어야 한다 -- 표본 자체가 없으므로 0이나 다른
+    숫자로 오인되면 안 된다."""
+    index = {"index_kospi": 2500.0, "index_kospi_chg_pct": 1.5,
+             "index_kosdaq": 850.0, "index_kosdaq_chg_pct": 1.0}
+    out = compute_market_regime(None, index, None, "2026-07-16", 0.1)
+    assert out["scan_coverage_pct"] is None
+
+
+def test_breadth_scan_coverage_pct_is_preserved_through_enrich():
+    """SC-3: breadth가 있으면 그 scan_coverage_pct(SC-1의 partial 세션
+    등에서 유래)는 compute_market_regime을 거쳐도 그대로 보존돼야 한다
+    (다른 breadth 필드들과 동일한 dict(breadth) 보존 규칙)."""
+    breadth = {"id": "x", "trade_date": "2026-07-16", "breadth_buy": 300,
+               "breadth_sell": 50, "breadth_hold": 100, "breadth_ratio": 0.55,
+               "regime_label": "risk_on", "source": "scanner",
+               "scan_coverage_pct": 84.0}
+    out = compute_market_regime(breadth, None, None, "2026-07-16", threshold=0.1)
+    assert out["scan_coverage_pct"] == 84.0
+
+
 def test_index_only_no_flow_still_scores():
     breadth = {"id": "a", "trade_date": "2026-07-16", "breadth_buy": 200,
                "breadth_sell": 100, "breadth_hold": 50, "breadth_ratio": 0.29,

@@ -77,7 +77,8 @@ def compute_regime_snapshot(scanner_db_path: str, trade_date: str) -> Optional[d
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 """
-                SELECT buy_count, sell_count, hold_count
+                SELECT buy_count, sell_count, hold_count, status, completed,
+                       total_stocks
                 FROM scan_sessions
                 WHERE status IN ('completed', 'partial') AND date(started_at) = ?
                 ORDER BY started_at DESC
@@ -95,6 +96,24 @@ def compute_regime_snapshot(scanner_db_path: str, trade_date: str) -> Optional[d
         buy_count = int(row["buy_count"] or 0)
         sell_count = int(row["sell_count"] or 0)
         hold_count = int(row["hold_count"] or 0)
+
+        # SC-3: expose what fraction of the day's universe this breadth is
+        # actually sampled from -- a 'partial' row (SC-1) contributes its
+        # breadth same as 'completed', but with no coverage figure a partial
+        # scan at 5% and one at 95% look identical to any downstream reader.
+        # 'completed' is always the full universe by definition (100); a
+        # 'partial' row with an unreadable/zero total_stocks (defensive --
+        # should not happen given the scanner always sets it) falls back to
+        # None rather than a misleading number.
+        if row["status"] == "completed":
+            scan_coverage_pct = 100.0
+        else:  # 'partial' (the only other value the WHERE clause admits)
+            total_stocks = row["total_stocks"]
+            completed_count = row["completed"]
+            if total_stocks:
+                scan_coverage_pct = (completed_count or 0) / total_stocks * 100
+            else:
+                scan_coverage_pct = None
 
         breadth_ratio = (buy_count - sell_count) / max(
             1, buy_count + sell_count + hold_count
@@ -117,6 +136,7 @@ def compute_regime_snapshot(scanner_db_path: str, trade_date: str) -> Optional[d
             "breadth_ratio": breadth_ratio,
             "regime_label": regime_label,
             "source": "scanner",
+            "scan_coverage_pct": scan_coverage_pct,
         }
     except Exception as e:
         logger.warning(
@@ -176,6 +196,7 @@ def compute_market_regime(
             "trade_date": trade_date,
             "breadth_buy": None, "breadth_sell": None, "breadth_hold": None,
             "breadth_ratio": None, "regime_label": "neutral", "source": "market",
+            "scan_coverage_pct": None,  # SC-3: no scan session that day
         }
 
     # 지수/수급 필드 병합(없으면 None)

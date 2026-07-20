@@ -1853,9 +1853,37 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
 
             logger.info("background_scan_stopped")
 
+            # SC-3: the stop above always corresponds to a partial-completion
+            # session (a normal completion clears self._running BEFORE
+            # reaching _save_session_complete -- see _scan_all_stocks -- so
+            # stop_scan() is a guaranteed no-op via the `if self._running:`
+            # guard once a scan has already finished on its own). Today's
+            # incident: this Telegram message showed only "분석 중지" +
+            # "완료: 3700/4276" with no indication that breadth was still
+            # reflected and only promotion was withheld, which read as a
+            # total abandonment rather than a partial-completion. Surface
+            # the same N/M/percent explicitly in both the log and (if
+            # Telegram is configured) the notification text.
+            completed = self._progress.completed
+            total = self._progress.total_stocks
+            coverage_pct = (completed / total * 100) if total else 0.0
+            partial_note = (
+                f"부분 완주 {completed}/{total}({coverage_pct:.1f}%) — "
+                f"breadth 반영, 승격 보류"
+            )
+
+            logger.info(
+                partial_note,
+                session_id=self._current_session_id,
+                completed=completed,
+                total=total,
+                coverage_pct=round(coverage_pct, 1),
+            )
+
             await self._send_telegram_notification(
                 f"⏹ *백그라운드 분석 중지*\n\n"
-                f"분석 완료: {self._progress.completed}/{self._progress.total_stocks}"
+                f"분석 완료: {completed}/{total}\n"
+                f"{partial_note}"
             )
 
     def get_progress(self) -> ScanProgress:

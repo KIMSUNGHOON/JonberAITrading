@@ -798,3 +798,153 @@ async def test_normal_completion_session_status_still_completed(monkeypatch):
     sessions = await scanner.get_scan_sessions(limit=1)
     assert sessions[0]["status"] == "completed"
     assert sessions[0]["completed"] == 1
+
+
+
+# ---------------------------------------------------------------------------
+# SC-3: 관측성/정합 -- partial 종결이 로그+Telegram 통지에 "부분 완주
+# N/M(X%) -- breadth 반영, 승격 보류"로 명시돼야 한다(오늘 사건: "분석 중지"
+# 문구만 보여 84% 완주가 전면 폐기된 것으로 오인됨). 정상 완료 통지
+# (_send_scan_summary)는 이 태스크로 완전 무접촉이어야 한다(byte-불변).
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_scan_partial_notification_shows_n_of_m_percent(monkeypatch, caplog):
+    """stop_scan()이 partial 종결하면, Telegram 통지 문구와 로그 양쪽에
+    "부분 완주 50/60(83.3%) -- breadth 반영, 승격 보류"가 그대로 노출돼야
+    한다. 배치1(50종목)만 저장된 상태에서 stop -- completed=50/total=60."""
+    import logging
+
+    batch1 = [(f"{100000 + i:06d}", f"S1-{i}", "코스피") for i in range(50)]
+    batch2 = [(f"{200000 + i:06d}", f"S2-{i}", "코스피") for i in range(10)]
+    stock_list = batch1 + batch2
+
+    stock_infos = {code: _stock_info(code, name) for code, name, _ in stock_list}
+    chart_dfs = {code: _make_chart_df(65) for code, _, _ in stock_list}
+
+    blocked_codes = {code for code, _, _ in batch2}
+    release = asyncio.Event()
+
+    class _SlowClient(FakeKiwoomClient):
+        async def get_daily_chart_df(self, stk_cd: str, base_dt=None, upd_stkpc_tp="1"):
+            if stk_cd in blocked_codes:
+                await release.wait()
+            return await super().get_daily_chart_df(
+                stk_cd, base_dt=base_dt, upd_stkpc_tp=upd_stkpc_tp
+            )
+
+    client = _SlowClient(stock_infos=stock_infos, chart_dfs=chart_dfs)
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+
+    batch1_saved = asyncio.Event()
+    original_save = BackgroundScanner._save_discovery_results_batch
+
+    async def _tracking_save(self, pairs, session_id):
+        await original_save(self, pairs, session_id)
+        batch1_saved.set()
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_save_discovery_results_batch", _tracking_save
+    )
+
+    sent_messages = []
+
+    async def _capture_telegram(self, message):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_send_telegram_notification", _capture_telegram
+    )
+
+    await scanner.start_scan(
+        stock_list=stock_list, mode="discovery", notify_progress=False
+    )
+    await asyncio.wait_for(batch1_saved.wait(), timeout=5)
+
+    with caplog.at_level(logging.INFO, logger=scanner_module.__name__):
+        await scanner.stop_scan()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(scanner._task, timeout=5)
+
+    release.set()
+
+    expected_note = "부분 완주 50/60(83.3%) — breadth 반영, 승격 보류"
+
+    assert len(sent_messages) == 1
+    assert "⏹ *백그라운드 분석 중지*" in sent_messages[0]
+    assert "분석 완료: 50/60" in sent_messages[0]
+    assert expected_note in sent_messages[0]
+
+    matching = [r for r in caplog.records if expected_note in r.getMessage()]
+    assert len(matching) == 1, (
+        "partial 종결 로그에 '부분 완주 N/M(X%) -- breadth 반영, 승격 보류' "
+        "문구가 명시돼야 한다"
+    )
+
+
+async def test_stop_scan_noop_leaves_no_partial_notification(monkeypatch):
+    """스캔이 실행 중이 아닐 때 stop_scan()은 partial 통지도 전혀 보내지
+    않아야 한다(SC-1의 no-op 가드가 SC-3 문구 추가로도 깨지지 않음)."""
+    sent_messages = []
+
+    async def _capture_telegram(self, message):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_send_telegram_notification", _capture_telegram
+    )
+
+    scanner = BackgroundScanner()
+    await scanner.stop_scan()
+
+    assert sent_messages == []
+
+
+async def test_normal_completion_telegram_message_byte_invariant(monkeypatch):
+    """SC-3: 정상 완료 Telegram 통지(_send_scan_summary)는 이번 태스크로
+    한 바이트도 바뀌면 안 된다 -- SC-3의 partial 문구는 stop_scan() 경로
+    (_save_session_partial이 관여하는 경로)에만 추가되고, 정상 완주 경로의
+    _send_scan_summary는 완전 무접촉이어야 한다."""
+    scanner = BackgroundScanner()
+    scanner._progress.total_stocks = 100
+    scanner._progress.completed = 100
+    scanner._progress.failed = 0
+    scanner._progress.buy_count = 40
+    scanner._progress.sell_count = 10
+    scanner._progress.hold_count = 30
+    scanner._progress.watch_count = 15
+    scanner._progress.avoid_count = 5
+    scanner._progress.started_at = datetime(2026, 7, 20, 9, 0, 0)
+    scanner._progress.completed_at = datetime(2026, 7, 20, 9, 30, 0)
+
+    sent_messages = []
+
+    async def _capture_telegram(self, message):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_send_telegram_notification", _capture_telegram
+    )
+
+    await scanner._send_scan_summary()
+
+    assert len(sent_messages) == 1
+    expected = (
+        "✅ *백그라운드 분석 완료*\n\n"
+        "📊 *분석 결과*\n"
+        "• 총 분석: 100개\n"
+        "• 완료: 100개\n"
+        "• 실패: 0개\n\n"
+        "📈 *추천 분포*\n"
+        "• 매수(BUY): 40개\n"
+        "• 매도(SELL): 10개\n"
+        "• 보유(HOLD): 30개\n"
+        "• 관망(WATCH): 15개\n"
+        "• 회피(AVOID): 5개\n\n"
+        "⏱ 소요 시간: 30.0분\n\n"
+        "_결과는 Scanner Results 탭에서 확인하세요_"
+    )
+    assert sent_messages[0] == expected
+    assert "부분 완주" not in sent_messages[0]
