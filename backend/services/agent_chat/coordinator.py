@@ -1164,9 +1164,15 @@ class ChatCoordinator:
                     )
                     news_count = len(result.articles)
 
-                    # Simple sentiment calculation
                     if news_count > 0:
-                        # Use price momentum as proxy if no analyzer
+                        # Price-momentum proxy — this is the DEGRADE path
+                        # only (편향② 근본 원인: technical agent already
+                        # exposes price_change_pct directly, so echoing it
+                        # here as "sentiment" makes the two agents vote in
+                        # lockstep). Real sentiment comes from
+                        # NewsSentimentAnalyzer below; this stays the
+                        # fail-closed fallback for analyzer exception/
+                        # timeout/not-configured.
                         change = stock_info.get("prdy_ctrt", 0)
                         if change > 2:
                             news_sentiment = "positive"
@@ -1174,6 +1180,27 @@ class ChatCoordinator:
                             news_sentiment = "negative"
                         else:
                             news_sentiment = "neutral"
+
+                        try:
+                            from agents.llm_provider import get_llm_provider
+                            from services.news.sentiment import NewsSentimentAnalyzer
+
+                            analyzer = NewsSentimentAnalyzer(get_llm_provider())
+                            sentiment_result = await asyncio.wait_for(
+                                analyzer.analyze(
+                                    articles=result.articles[:5],
+                                    stock_name=stock_name,
+                                    stock_code=ticker,
+                                ),
+                                timeout=20.0,
+                            )
+                            news_sentiment = sentiment_result.sentiment
+                        except Exception as sentiment_error:
+                            logger.warning(
+                                "news_sentiment_fallback",
+                                ticker=ticker,
+                                error=str(sentiment_error),
+                            )
             except Exception as e:
                 logger.warning("news_fetch_failed", error=str(e))
 
@@ -1181,6 +1208,17 @@ class ChatCoordinator:
             # never promotes is_stale — a strategy fetch failure must not
             # block the debate (see _build_strategy_context docstring).
             strategy_directive, strategy_knobs = await self._build_strategy_context()
+
+            # ka10001 mrkt_tot_amt 단위=억원 (scanner.py:852-856과 동일 근거,
+            # 라이브 실측 2026-07-18: 005930 -> 14,908,010억 ≈ 1,490조).
+            # 무보정이면 fundamental_agent 표시가 왜곡돼 LLM이 "데이터
+            # 오류"를 매수 보류 근거로 오용한다(편향③) — 원 단위로 환산.
+            mrkt_tot_amt = stock_info.get("mrkt_tot_amt")
+            market_cap = (
+                float(mrkt_tot_amt) * 100_000_000
+                if mrkt_tot_amt is not None
+                else None
+            )
 
             return MarketContext(
                 ticker=ticker,
@@ -1192,7 +1230,7 @@ class ChatCoordinator:
                 per=stock_info.get("per"),
                 pbr=stock_info.get("pbr"),
                 eps=stock_info.get("eps"),
-                market_cap=stock_info.get("mrkt_tot_amt"),
+                market_cap=market_cap,
                 news_sentiment=news_sentiment,
                 news_count=news_count,
                 has_position=has_position,

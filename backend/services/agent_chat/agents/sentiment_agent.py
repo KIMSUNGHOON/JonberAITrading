@@ -179,9 +179,6 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             data={
                 "news_sentiment": context.news_sentiment,
                 "news_count": context.news_count,
-                "momentum": "positive" if context.price_change_pct > 2 else (
-                    "negative" if context.price_change_pct < -2 else "neutral"
-                ),
             },
         )
 

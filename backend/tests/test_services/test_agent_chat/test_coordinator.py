@@ -4,6 +4,8 @@ Tests for ChatCoordinator
 Unit tests for the ChatCoordinator that manages multiple chat rooms.
 """
 
+import asyncio
+
 import pandas as pd
 import pytest
 import pytest_asyncio
@@ -787,3 +789,259 @@ class TestAutonomousExecutionMarksWatchConverted:
 
         fake_trading_coord.on_trade_approved.assert_not_awaited()
         fake_trading_coord.mark_watch_converted.assert_not_called()
+
+
+# -------------------------------------------
+# E-2: Vote Direction Bias Removal — market_cap correction + sentiment wiring
+# -------------------------------------------
+#
+# 편향③(시총 미보정)+②(sentiment momentum 메아리) 관련 _fetch_market_context
+# 회귀. NewsSentimentAnalyzer는 실 LLM/실 네트워크 금지 원칙에 따라 항상 목.
+
+
+class TestMarketCapCorrection:
+    """coordinator._fetch_market_context의 mrkt_tot_amt(억원 단위)를 원
+    단위로 보정하는지 확인(scanner.py:852-856과 동일 근거). 무보정 시
+    fundamental_agent가 왜소한 값으로 표시해 LLM이 "데이터 오류"를 매수
+    보류 근거로 오용한다(편향③, 라이브 워치 레코드 실측)."""
+
+    @pytest.mark.asyncio
+    async def test_market_cap_scaled_by_1e8(self, coordinator):
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": 0.5,
+            "mrkt_tot_amt": 14_908_010,  # 억원 단위 (라이브 실측 2026-07-18)
+        }
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+        ):
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.market_cap == 14_908_010 * 100_000_000
+        # 수기 대조: 14,908,010억원 -> 약 1,490.8조원
+        assert round(context.market_cap / 1_000_000_000_000, 1) == 1490.8
+
+    @pytest.mark.asyncio
+    async def test_market_cap_none_when_source_missing(self, coordinator):
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": 0.5,
+        }
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+        ):
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.market_cap is None
+
+
+def _mock_news_service(article_count: int = 6):
+    """뉴스 서비스 목 — providers 존재+search_stock_news가 기사 목록 반환."""
+    from services.news.base import NewsArticle
+
+    articles = [
+        NewsArticle(
+            title=f"뉴스 {i}",
+            link=f"https://example.com/{i}",
+            pub_date=datetime.now(),
+        )
+        for i in range(article_count)
+    ]
+    news_service = MagicMock()
+    news_service.providers = ["mock_provider"]
+    news_service.search_stock_news = AsyncMock(
+        return_value=SimpleNamespace(articles=articles)
+    )
+    return news_service
+
+
+class TestNewsSentimentWiring:
+    """E-2 편향②: 뉴스 상위 5건을 NewsSentimentAnalyzer로 실분석해 실감성
+    라벨을 쓰는지, 예외/타임아웃 시 기존 등락률 라벨로 안전 하강하는지
+    확인한다(spec E-2 ③). 실 네트워크·실 LLM 금지 — analyzer는 항상 목."""
+
+    @pytest.mark.asyncio
+    async def test_analyzer_success_uses_real_label_over_price_fallback(self, coordinator):
+        from services.news.sentiment import NewsSentimentResult
+
+        # prdy_ctrt=-3.0%면 등락률 폴백 라벨은 negative가 될 상황 — analyzer
+        # 성공 시 실라벨(positive)이 폴백에 덮이지 않고 그대로 쓰여야 한다.
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": -3.0,
+        }
+        mock_news_service = _mock_news_service(article_count=6)
+
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=mock_news_service),
+            ),
+            patch("services.news.sentiment.NewsSentimentAnalyzer") as MockAnalyzer,
+        ):
+            MockAnalyzer.return_value.analyze = AsyncMock(
+                return_value=NewsSentimentResult(
+                    sentiment="positive",
+                    score=55,
+                    confidence=0.8,
+                    summary="긍정적 실적 발표",
+                )
+            )
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.news_sentiment == "positive"
+
+        # 상위 5건만 analyzer에 전달됐는지(전체 6건 중)
+        _, call_kwargs = MockAnalyzer.return_value.analyze.call_args
+        assert len(call_kwargs["articles"]) == 5
+
+    @pytest.mark.asyncio
+    async def test_analyzer_exception_falls_back_to_price_change_label(self, coordinator):
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": 3.0,
+        }
+        mock_news_service = _mock_news_service()
+
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=mock_news_service),
+            ),
+            patch("services.news.sentiment.NewsSentimentAnalyzer") as MockAnalyzer,
+            patch("services.agent_chat.coordinator.logger") as mock_logger,
+        ):
+            MockAnalyzer.return_value.analyze = AsyncMock(
+                side_effect=RuntimeError("llm backend down")
+            )
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.news_sentiment == "positive"  # 등락률 +3.0% 폴백 라벨
+
+        fallback_calls = [
+            c for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "news_sentiment_fallback"
+        ]
+        assert len(fallback_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_analyzer_timeout_falls_back_to_price_change_label(self, coordinator):
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": -3.0,
+        }
+        mock_news_service = _mock_news_service()
+
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=mock_news_service),
+            ),
+            patch("services.news.sentiment.NewsSentimentAnalyzer") as MockAnalyzer,
+        ):
+            MockAnalyzer.return_value.analyze = AsyncMock(side_effect=asyncio.TimeoutError())
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.news_sentiment == "negative"  # 등락률 -3.0% 폴백 라벨
+
+    @pytest.mark.asyncio
+    async def test_no_articles_skips_analyzer_and_leaves_sentiment_none(self, coordinator):
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": 0.5,
+        }
+        mock_news_service = _mock_news_service(article_count=0)
+
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=mock_news_service),
+            ),
+            patch("services.news.sentiment.NewsSentimentAnalyzer") as MockAnalyzer,
+        ):
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.news_sentiment is None
+        MockAnalyzer.return_value.analyze.assert_not_called()
