@@ -343,6 +343,7 @@ async def test_defensive_close_proceeds_when_gate_allows(monkeypatch):
 
     async def _close(ticker, decision_id=None):
         closed.append(ticker)
+        return MagicMock()  # non-None -- coordinator proceeded (N3)
 
     fake_coord._close_position = _close
     monkeypatch.setattr(

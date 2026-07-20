@@ -41,6 +41,11 @@ def r_cap_value(
     Returns None (caller keeps its existing cap unmodified) when:
     - `stop_price` is None (no stop to size against)
     - `entry_price` <= 0 (degenerate/no price)
+    - `stop_price` <= 0 (invalid/degenerate stop -- N4, spec docs/
+      superpowers/specs/2026-07-20-gap-discipline-design.md §2 G-3: left
+      unguarded, this computed a ~100% stop distance, collapsing the cap
+      down to equity * risk_budget_pct% -- conservative in direction but
+      an unintended, surprising value rather than "R rule doesn't apply")
     - `stop_price` >= `entry_price` (not a long-side risk-reducing stop)
     - the stop distance is under `MIN_STOP_DISTANCE_PCT` of entry (a
       near-zero risk distance would blow the cap up to an effectively
@@ -49,6 +54,8 @@ def r_cap_value(
     if stop_price is None:
         return None
     if entry_price <= 0:
+        return None
+    if stop_price <= 0:
         return None
     if stop_price >= entry_price:
         return None

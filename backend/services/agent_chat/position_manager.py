@@ -784,7 +784,7 @@ class PositionManager:
                 # sells -- profit-taking EXECUTION stays discussion-gated
                 # (D2/auto_execute_take_profit unchanged).
                 if position.take_profit_reached_at is not None:
-                    self._apply_take_profit_lock_in(position)
+                    self._apply_take_profit_lock_in(position, events)
 
         # Check significant gain/loss
         pnl_pct = position.unrealized_pnl_pct
@@ -930,7 +930,9 @@ class PositionManager:
             message,
         )
 
-    def _apply_take_profit_lock_in(self, position: MonitoredPosition) -> None:
+    def _apply_take_profit_lock_in(
+        self, position: MonitoredPosition, events: List[PositionEvent]
+    ) -> None:
         """Ratchet the stop-loss up to a breakeven+lock-in level after a
         take-profit retracement (S-5, docs/superpowers/specs/
         2026-07-19-survival-discipline-design.md §2 D2/S-5).
@@ -958,6 +960,18 @@ class PositionManager:
         take_profit/config, never on the fluctuating current_price), so once
         applied this returns immediately on every subsequent tick without
         calling `update_position` (and rescheduling a persist) again.
+
+        Observability (G-3, spec docs/superpowers/specs/
+        2026-07-20-gap-discipline-design.md §2): a successful ratchet logs
+        `take_profit_lock_in_applied` and appends a TRAILING_STOP_UPDATE
+        event into the caller's `events` list -- the SAME event type and
+        `requires_discussion=False` convention `_check_trailing_stop` below
+        already uses for its own stop-loss raise (this hook is the
+        semantically identical "raise the stop, never sell" ratchet, just
+        triggered by a take-profit retracement instead of a new high). No
+        new PositionEventType needed; the message text is what
+        distinguishes a lock-in raise from a %-trailing raise in event
+        history/notifications.
         """
         if position.avg_price <= 0 or position.take_profit is None:
             return
@@ -985,6 +999,20 @@ class PositionManager:
             return
 
         self.update_position(position.ticker, stop_loss=new_stop)
+
+        logger.info(
+            "take_profit_lock_in_applied",
+            ticker=position.ticker,
+            old_stop=current_stop,
+            new_stop=new_stop,
+        )
+
+        events.append(self._create_event(
+            position, PositionEventType.TRAILING_STOP_UPDATE,
+            new_stop,
+            f"익절 후 락인 스탑 상향: ₩{current_stop:,.0f} → ₩{new_stop:,.0f}",
+            requires_discussion=False,
+        ))
 
     async def _check_trailing_stop(
         self,
@@ -1259,7 +1287,29 @@ class PositionManager:
             from app.dependencies import get_trading_coordinator
             trading_coord = await get_trading_coordinator()
 
-            await trading_coord._close_position(position.ticker, decision_id=decision_id)
+            result = await trading_coord._close_position(
+                position.ticker, decision_id=decision_id
+            )
+
+            if result is None:
+                # N3 (spec docs/superpowers/specs/2026-07-20-gap-discipline-
+                # design.md §2 G-3): the coordinator returns None when it
+                # SKIPPED this close outright -- a concurrent in-flight
+                # defensive exit already owns this ticker (S-2 guard), or
+                # the position was already gone broker-side -- NOT when an
+                # order was placed and merely unfilled/rejected (that still
+                # returns an OrderResult). Dropping PM's own watch here
+                # would leave a monitoring gap until the next
+                # add_position/reconciler pass (up to ~60s) with nothing
+                # else defending the position in the meantime. Keep
+                # watching; the owning engine (or the next monitor tick)
+                # handles it.
+                logger.warning(
+                    "close_position_skipped_kept_monitored",
+                    ticker=position.ticker,
+                    reason=reason,
+                )
+                return
 
             # Remove from monitoring
             self.remove_position(position.ticker)

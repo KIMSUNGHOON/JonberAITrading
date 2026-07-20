@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
+import structlog.testing
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta
 
@@ -805,9 +806,60 @@ class TestTakeProfitLockIn:
 
         # lock_in_price = 70000 * (1 + 0.3 * (77000-70000)/70000) = 72,100.
         # current_price 71,000 < 72,100 -> _stops_sane must reject it.
-        position_manager._apply_take_profit_lock_in(position)
+        events = []
+        position_manager._apply_take_profit_lock_in(position, events)
 
         assert position.stop_loss is None, "insane candidate must be rejected, not applied"
+        assert events == [], "a rejected candidate must not emit an observability event"
+
+    @pytest.mark.asyncio
+    async def test_lock_in_applied_logs_and_emits_event(self, position_manager):
+        """G-3 (spec docs/superpowers/specs/2026-07-20-gap-discipline-
+        design.md §2): a successful lock-in ratchet must be observable the
+        same way the pre-existing %-trailing-stop ratchet already is
+        (`_check_trailing_stop` fires TRAILING_STOP_UPDATE) -- before this
+        fix a lock-in raise was silent (no log, no event)."""
+        position_manager.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=70000,
+            current_price=72800,
+            take_profit=72800,
+        )
+        position = position_manager._positions["005930"]
+        await position_manager._check_position(position)  # records TP reached
+
+        events = []
+        position_manager.on_event(lambda e: events.append(e))
+
+        # Retrace below take_profit -- triggers the lock-in ratchet.
+        position.current_price = 71500
+        with structlog.testing.capture_logs() as logs:
+            await position_manager._check_position(position)
+
+        lock_in_ratio = position_manager.config.trailing_lock_in_ratio
+        expected_stop = 70000 * (1 + lock_in_ratio * (72800 - 70000) / 70000)
+        assert position.stop_loss == pytest.approx(expected_stop)
+
+        applied_logs = [
+            e for e in logs if e.get("event") == "take_profit_lock_in_applied"
+        ]
+        assert len(applied_logs) == 1
+        assert applied_logs[0]["ticker"] == "005930"
+        assert applied_logs[0]["old_stop"] == 0.0  # no prior stop_loss was set
+        assert applied_logs[0]["new_stop"] == pytest.approx(expected_stop)
+
+        lock_in_events = [
+            e for e in events
+            if e.event_type == PositionEventType.TRAILING_STOP_UPDATE
+            and e.trigger_value == pytest.approx(expected_stop)
+        ]
+        assert len(lock_in_events) == 1, (
+            "a successful lock-in ratchet must emit a TRAILING_STOP_UPDATE "
+            "event, symmetric with the existing %-trailing-stop raise"
+        )
+        assert lock_in_events[0].requires_discussion is False
 
 
 # -------------------------------------------
@@ -1831,6 +1883,7 @@ class TestApplyDecisionHonestyP0:
 
         async def _close(ticker, decision_id=None):
             closed.append(ticker)
+            return MagicMock()  # non-None -- coordinator proceeded (N3)
 
         fake_coord._close_position = _close
         monkeypatch.setattr(
@@ -1860,6 +1913,7 @@ class TestApplyDecisionHonestyP0:
 
         async def _close(ticker, decision_id=None):
             closed.append(ticker)
+            return MagicMock()  # non-None -- coordinator proceeded (N3)
 
         fake_coord._close_position = _close
         monkeypatch.setattr(
@@ -2892,6 +2946,7 @@ class TestStrategicReevalTriggerP3:
 
         async def _close(ticker, decision_id=None):
             closed.append((ticker, decision_id))
+            return MagicMock()  # non-None -- coordinator proceeded (N3)
 
         fake_trading_coord._close_position = _close
         monkeypatch.setattr(
@@ -3166,6 +3221,7 @@ class TestS2AutoStopLossDefaultAndHitlFallback:
 
         async def _close(ticker, decision_id=None):
             closed.append(ticker)
+            return MagicMock()  # non-None -- coordinator proceeded (N3)
 
         fake_coord._close_position = _close
         monkeypatch.setattr(
@@ -3381,6 +3437,120 @@ class TestS2RecursionSafetyRealChain:
             "the position must remain monitored -- denied both times, never "
             "executed"
         )
+
+
+# -------------------------------------------
+# N3: coordinator-skipped close must NOT drop PM's own watch
+# -------------------------------------------
+#
+# `coordinator._close_position` returns None when it SKIPPED the close
+# outright (S-2's in-flight guard: a concurrent defensive exit for the SAME
+# ticker already owns it, or the position was already gone broker-side) --
+# NOT when an order was placed and merely unfilled/rejected (that path still
+# returns an OrderResult). Before this fix `_execute_close_position` called
+# `remove_position` unconditionally, ignoring the return value entirely --
+# a skipped close silently dropped PM's watch, leaving the position
+# undefended until the next add_position/reconciler pass (up to ~60s).
+#
+# Spec: docs/superpowers/specs/2026-07-20-gap-discipline-design.md §1/§2 N3
+# Brief: .superpowers/sdd/task-G-3-brief.md
+
+
+class TestN3CoordinatorSkipKeepsMonitoring:
+    @staticmethod
+    def _position(config, quantity=100, current_price=68000, stop_loss=68875):
+        pm = PositionManager(config=config)
+        pos = pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=quantity,
+            avg_price=72500,
+            current_price=current_price,
+            stop_loss=stop_loss,
+        )
+        return pm, pos
+
+    @pytest.mark.asyncio
+    async def test_coordinator_none_return_keeps_position_monitored_and_warns(
+        self, config, monkeypatch
+    ):
+        """RED (pre-fix): the position used to be removed from monitoring
+        unconditionally, even though the coordinator reported it skipped the
+        close. GREEN: the position stays monitored and a warning is logged
+        instead."""
+        pm, pos = self._position(config)
+
+        fake_coord = MagicMock()
+
+        async def _close(ticker, decision_id=None):
+            return None  # coordinator skipped: in-flight guard / not found
+
+        fake_coord._close_position = _close
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        with structlog.testing.capture_logs() as logs:
+            await pm._execute_close_position(pos, "stop_loss")
+
+        assert pm.get_position("005930") is not None, (
+            "a coordinator-skipped close must NOT drop PM's own watch -- "
+            "that would leave a monitoring gap until the next "
+            "add_position/reconciler pass"
+        )
+
+        warnings = [
+            e for e in logs
+            if e.get("event") == "close_position_skipped_kept_monitored"
+        ]
+        assert len(warnings) == 1
+        assert warnings[0]["ticker"] == "005930"
+        assert warnings[0]["reason"] == "stop_loss"
+
+        # The "position_closed" success log must NOT fire on a skip.
+        closed_logs = [e for e in logs if e.get("event") == "position_closed"]
+        assert closed_logs == []
+
+    @pytest.mark.asyncio
+    async def test_coordinator_non_none_return_still_removes_as_before(
+        self, config, monkeypatch
+    ):
+        """Byte-invariant: a normal completion (coordinator returns an
+        actual OrderResult, non-None) keeps removing the position from
+        monitoring exactly as before -- this guard only changes the
+        None/skip branch."""
+        pm, pos = self._position(config)
+
+        fake_coord = MagicMock()
+
+        async def _close(ticker, decision_id=None):
+            return MagicMock()  # a real OrderResult stand-in -- non-None
+
+        fake_coord._close_position = _close
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        async def allow_gate(market, **kwargs):
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        with structlog.testing.capture_logs() as logs:
+            await pm._execute_close_position(pos, "stop_loss")
+
+        assert pm.get_position("005930") is None
+
+        closed_logs = [e for e in logs if e.get("event") == "position_closed"]
+        assert len(closed_logs) == 1
+        assert closed_logs[0]["ticker"] == "005930"
 
 
 # -------------------------------------------

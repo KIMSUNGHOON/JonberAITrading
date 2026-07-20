@@ -53,6 +53,15 @@ def test_r_cap_value_none_when_stop_at_or_above_entry():
     assert r_cap_value(500_000_000, 0.75, 100_000, 105_000) is None
 
 
+def test_r_cap_value_none_when_stop_non_positive():
+    """가드 5 (N4, gap-discipline G-3, spec docs/superpowers/specs/
+    2026-07-20-gap-discipline-design.md §2): stop_price<=0 -> R 캡 미적용.
+    가드 없이는 거리가 ~100%로 계산되어 캡이 equity*risk_budget_pct%로
+    붕괴한다(보수적 방향이지만 의도치 않은 값 -- "R 룰 미적용"이어야 한다)."""
+    assert r_cap_value(500_000_000, 0.75, 100_000, 0) is None
+    assert r_cap_value(500_000_000, 0.75, 100_000, -1) is None
+
+
 def test_r_cap_value_none_when_distance_under_half_percent_floor():
     """가드 4: 손절거리 비율 < 0.5% -> R 캡 미적용 (0으로 나누기 근접 방지)."""
     # distance = 0.4% < 0.5% floor
