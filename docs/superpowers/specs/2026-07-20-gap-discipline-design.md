@@ -24,7 +24,7 @@
 - **장중 신규 설정 경로(_stops_sane via update_position)는 byte-불변** — 락인·토론발 스탑 설정의 즉시 발동 방지 유지.
 
 ### G-2 허위 실행 알림 봉합 (N2)
-- `_execute_order_from_monitor` → `bool` 반환(주문 제출=True, deny/인플라이트 스킵/실패=False). 기존 호출부 하위호환(반환 무시 호출 무해).
+- `_execute_order_from_monitor` → `bool` 반환(주문 제출=True, deny/인플라이트 스킵=False). **예외는 전파 유지**(리뷰 판정: False 치환 시 기존 ORDER_FAILED 알림 경로가 사장됨 — 전파가 옳음). 기존 호출부 하위호환(반환 무시 호출 무해).
 - `_execute_stop_loss/_execute_take_profit`: False면 "Executed" 알림 미생성(1회 래치 deny 통지는 기존 유지). 성공 시 기존 알림 불변.
 - `_on_alert`의 pending_alerts: 동일 (ticker, alert_type) 미해결 항목 존재 시 append 스킵(dedup — action_required 무관). 기존 소비자(FE pending_alerts_count·알림 처리) 거동 확인.
 
