@@ -248,3 +248,62 @@ def test_notional_knob_low_suggestion_clamps_to_hard_bound():
     assert out.position_sizing.max_trade_notional_pct == pytest.approx(
         max(lo, 6.0 * (1 - MAX_RELATIVE_DELTA))
     )
+
+
+# ---------- consensus_threshold (E-3, 진입 활성화) ----------
+#
+# 배경: agent_chat models.py:272/chat_room.py:55에 4-에이전트 합의 문턱
+# 0.75가 하드코딩돼 있었다(조정 불가). EntryConditions.consensus_threshold
+# 신설(strategy.py, Field ge=0.5 le=0.9, 기본 0.75 불변)로 세션 생성 시
+# 활성 전략에서 값을 읽어 주입할 수 있게 됐고, 여기 KNOB_BOUNDS[0.60,0.85]
+# 는 EOD 전략 합의가 그 값을 조정할 수 있는 안전 레일(수동 PUT은 Field의
+# 더 넓은 0.5-0.9까지 허용 — clamp_knob이 coordinator._build_strategy_context
+# 소비 경로에서 별도로 방어).
+
+def test_consensus_threshold_knob_bound_is_0_60_to_0_85():
+    """단위 회귀 가드: strategy.py Field 범위(0.5-0.9)보다 좁은 EOD 조정
+    안전 레일 — max_trade_notional_pct와 동일한 '더 좁은 하드레일' 패턴."""
+    assert KNOB_BOUNDS["consensus_threshold"] == (0.60, 0.85)
+
+
+def test_consensus_threshold_knob_hard_bounds_clamp():
+    from services.trading.strategy_consensus import clamp_knob
+    assert clamp_knob("consensus_threshold", 0.95) == 0.85
+    assert clamp_knob("consensus_threshold", 0.10) == 0.60
+
+
+def test_consensus_threshold_knob_writes_to_entry_conditions():
+    """apply_consensus가 consensus_threshold 제안을 median -> hard bound ->
+    델타캡 순으로 클램프해 strategy.entry_conditions.consensus_threshold에
+    실제로 반영하는지 (E-3 KNOB_BOUNDS 배선 검증)."""
+    current = TradingStrategy()  # consensus_threshold=0.75 (기본)
+    assert current.entry_conditions.consensus_threshold == pytest.approx(0.75)
+    votes = [_vote(adjustments={"consensus_threshold": 0.95}, panelist="a"),
+             _vote(adjustments={"consensus_threshold": 0.95}, panelist="b")]
+    out = apply_consensus(current, votes, "defensive", 0.8, "2026-07-15", "rev-1")
+    hi = KNOB_BOUNDS["consensus_threshold"][1]
+    # 0.95는 하드바운드(<=0.85) 밖 -> 클램프 0.85, 델타캡 상한 0.75*1.25=
+    # 0.9375는 0.85보다 넓어 하드바운드가 실제 상한이 된다.
+    assert out.entry_conditions.consensus_threshold == pytest.approx(
+        min(hi, 0.75 * (1 + MAX_RELATIVE_DELTA))
+    )
+    # 원본 불변: 중첩 서브모델까지 deep copy여야 함 (shallow copy 회귀 감지)
+    assert current.entry_conditions.consensus_threshold == pytest.approx(0.75)
+
+
+def test_consensus_threshold_knob_delta_caps_before_hard_bound():
+    """현재값이 바운드 상단 근처일 때, 극단적으로 낮은 제안은 하드바운드가
+    아니라 델타캡에 먼저 걸린다(0.63 != 하드바운드 하한 0.60)."""
+    current = TradingStrategy()
+    current.entry_conditions.consensus_threshold = 0.84
+    votes = [_vote(adjustments={"consensus_threshold": 0.10}, panelist="a"),
+             _vote(adjustments={"consensus_threshold": 0.10}, panelist="b")]
+    out = apply_consensus(current, votes, "defensive", 0.8, "2026-07-15", "rev-1")
+    assert out.entry_conditions.consensus_threshold == pytest.approx(
+        0.84 * (1 - MAX_RELATIVE_DELTA)
+    )
+
+
+def test_consensus_threshold_default_is_0_75_unchanged():
+    """절대 원칙: 기본값 0.75 불변 — 전략 미조정 시 배포 직후 거동 동일."""
+    assert TradingStrategy().entry_conditions.consensus_threshold == pytest.approx(0.75)

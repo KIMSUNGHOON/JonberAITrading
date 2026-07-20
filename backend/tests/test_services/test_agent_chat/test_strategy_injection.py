@@ -146,8 +146,27 @@ async def test_build_strategy_context_failure_is_none_not_stale():
     coordinator = ChatCoordinator()
     with patch("app.dependencies.get_trading_coordinator",
                new=AsyncMock(side_effect=RuntimeError("down"))):
-        directive, knobs = await coordinator._build_strategy_context()
+        directive, knobs, consensus_threshold = await coordinator._build_strategy_context()
     assert directive is None and knobs is None
+    # E-3: 조회 실패 = 기존 하드코딩 0.75와 동일값(거동 불변) — None이 아니라
+    # 항상 구체적 float를 반환해 호출부가 or-폴백 없이 그대로 쓸 수 있다.
+    assert consensus_threshold == pytest.approx(0.75)
+
+
+async def test_build_strategy_context_no_strategy_defaults_to_0_75():
+    """E-3 ②: 전략 자체가 부재(get_strategy() -> None)인 경우도 실패 케이스와
+    동일하게 0.75 폴백 — 세션 문턱이 하드코딩과 다르게 흔들리지 않는다."""
+    from services.agent_chat.coordinator import ChatCoordinator
+
+    trading = MagicMock()
+    trading.get_strategy.return_value = None
+
+    coordinator = ChatCoordinator()
+    with patch("app.dependencies.get_trading_coordinator",
+               new=AsyncMock(return_value=trading)):
+        directive, knobs, consensus_threshold = await coordinator._build_strategy_context()
+    assert directive is None and knobs is None
+    assert consensus_threshold == pytest.approx(0.75)
 
 
 async def test_build_strategy_context_formats_percent_units():
@@ -163,10 +182,11 @@ async def test_build_strategy_context_formats_percent_units():
     coordinator = ChatCoordinator()
     with patch("app.dependencies.get_trading_coordinator",
                new=AsyncMock(return_value=trading)):
-        directive, knobs = await coordinator._build_strategy_context()
+        directive, knobs, consensus_threshold = await coordinator._build_strategy_context()
     assert knobs["stop_loss_pct"] == pytest.approx(6.0)     # 분율→퍼센트
     assert knobs["max_position_pct"] == pytest.approx(8.0)
     assert "테스트 전략" in directive and "6.0%" in directive
+    assert consensus_threshold == pytest.approx(0.75)  # 미조정 기본값
 
 
 async def test_build_strategy_context_clamps_extreme_knobs():
@@ -184,5 +204,65 @@ async def test_build_strategy_context_clamps_extreme_knobs():
     coordinator = ChatCoordinator()
     with patch("app.dependencies.get_trading_coordinator",
                new=AsyncMock(return_value=trading)):
-        _, knobs = await coordinator._build_strategy_context()
+        _, knobs, _ = await coordinator._build_strategy_context()
     assert knobs["stop_loss_pct"] == pytest.approx(15.0)  # 0.15 클램프 × 100
+
+
+# ---------- E-3: consensus_threshold 전략화 + entry_conditions soft guidance ----------
+
+async def test_build_strategy_context_reflects_active_strategy_consensus_threshold():
+    """E-3 ①: 전략 consensus_threshold=0.68 -> 세션 문턱 0.68 (현행 RED은
+    하드코딩 0.75 고정이라 이 테스트가 실패했다)."""
+    from services.agent_chat.coordinator import ChatCoordinator
+    from services.trading.strategy import TradingStrategy
+
+    strategy = TradingStrategy(name="완화 전략")
+    strategy.entry_conditions.consensus_threshold = 0.68
+    trading = MagicMock()
+    trading.get_strategy.return_value = strategy
+
+    coordinator = ChatCoordinator()
+    with patch("app.dependencies.get_trading_coordinator",
+               new=AsyncMock(return_value=trading)):
+        _, _, consensus_threshold = await coordinator._build_strategy_context()
+    assert consensus_threshold == pytest.approx(0.68)
+
+
+async def test_build_strategy_context_consensus_threshold_clamped_to_knob_bounds():
+    """E-3 ④: KNOB_BOUNDS[0.60,0.85] 클램프 왕복 — 수동 PUT이 Field 범위
+    (0.5-0.9)까지 극단값을 허용해도 이 소비 경로는 더 좁은 안전 레일 안에서만
+    세션에 주입한다(stop_loss_pct와 동일 방어 패턴)."""
+    from services.agent_chat.coordinator import ChatCoordinator
+    from services.trading.strategy import TradingStrategy
+
+    strategy = TradingStrategy(name="극단 전략")
+    strategy.entry_conditions.consensus_threshold = 0.9  # Field 상한, KNOB hi=0.85
+    trading = MagicMock()
+    trading.get_strategy.return_value = strategy
+
+    coordinator = ChatCoordinator()
+    with patch("app.dependencies.get_trading_coordinator",
+               new=AsyncMock(return_value=trading)):
+        _, _, consensus_threshold = await coordinator._build_strategy_context()
+    assert consensus_threshold == pytest.approx(0.85)
+
+
+async def test_build_strategy_context_includes_entry_conditions_soft_guidance_section():
+    """E-3 ③: entry_conditions가 "진입 기준(참고)" 섹션으로 프롬프트에
+    주입되고, 하드 게이트가 아님을 명시하는 문구를 포함한다 — 값 스냅샷은
+    min_technical_score를 포함."""
+    from services.agent_chat.coordinator import ChatCoordinator
+    from services.trading.strategy import TradingStrategy
+
+    strategy = TradingStrategy(name="기준 전략")
+    strategy.entry_conditions.min_technical_score = 63
+    trading = MagicMock()
+    trading.get_strategy.return_value = strategy
+
+    coordinator = ChatCoordinator()
+    with patch("app.dependencies.get_trading_coordinator",
+               new=AsyncMock(return_value=trading)):
+        directive, _, _ = await coordinator._build_strategy_context()
+    assert "진입 기준" in directive
+    assert "하드 게이트 아님" in directive
+    assert "63" in directive  # min_technical_score 스냅샷

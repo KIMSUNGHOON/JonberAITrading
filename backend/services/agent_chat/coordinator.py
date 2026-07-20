@@ -699,6 +699,11 @@ class ChatCoordinator:
                 ticker=ticker,
                 stock_name=stock_name,
                 context=context,
+                # E-3: 활성 전략의 consensus_threshold를 단일 소스(context)에서
+                # 그대로 전달 — chat_room.py 기본값(0.75)은 전략 없음/조회
+                # 실패 시에만 실제로 쓰인다(context.consensus_threshold도 그
+                # 경우 0.75).
+                consensus_threshold=context.consensus_threshold,
                 agent_weights=await self._compute_agent_weights(),
             )
 
@@ -977,17 +982,22 @@ class ChatCoordinator:
         except Exception as e:
             logger.warning("telegram_notification_failed", error=str(e))
 
-    async def _build_strategy_context(self) -> tuple[Optional[str], Optional[dict]]:
-        """활성 TradingStrategy → (프롬프트 디렉티브, 퍼센트 노브). 조회 실패/
-        전략 없음 = (None, None) — 절대 raise하지 않고, 토론을 막지 않는다
-        (is_stale 승격 금지)."""
+    async def _build_strategy_context(
+        self,
+    ) -> tuple[Optional[str], Optional[dict], float]:
+        """활성 TradingStrategy → (프롬프트 디렉티브, 퍼센트 노브, 합의 문턱).
+        조회 실패/전략 없음 = (None, None, 0.75) — 절대 raise하지 않고, 토론을
+        막지 않는다(is_stale 승격 금지). 세 번째 값(consensus_threshold)은
+        항상 구체적인 float — ChatSession/chat_room.py의 기존 하드코딩
+        0.75와 동일한 기본값이라 조회 실패 시에도 거동이 바뀌지 않는다
+        (E-3, 진입 활성화)."""
         try:
             from app.dependencies import get_trading_coordinator
             from services.trading.strategy_consensus import clamp_knob
 
             strategy = (await get_trading_coordinator()).get_strategy()
             if strategy is None:
-                return None, None
+                return None, None, 0.75
             # Phase4 최종리뷰 Fix2: T2(strategy_apply)와 동일 KNOB_BOUNDS로
             # 클램프한 뒤 퍼센트로 변환 — 수동 PUT /strategy가 Pydantic 필드
             # 범위(예: stop_loss_pct 0.50)까지 허용해도, 이 소비 경로가
@@ -1006,6 +1016,13 @@ class ChatCoordinator:
                     "min_cash_ratio", strategy.position_sizing.min_cash_ratio
                 ) * 100.0,
             }
+            # E-3: 합의 문턱도 동일 KNOB_BOUNDS 방어 클램프(0.60-0.85) — 수동
+            # PUT이 EntryConditions Field 범위(0.5-0.9)까지 허용해도 이 소비
+            # 경로는 그보다 좁은 안전 레일 안에서만 세션에 주입한다.
+            entry = strategy.entry_conditions
+            consensus_threshold = clamp_knob(
+                "consensus_threshold", entry.consensus_threshold
+            )
             lines = [
                 f"전략명: {strategy.name} / 성향: {strategy.risk_tolerance.value}"
                 f" / 스타일: {strategy.trading_style.value}",
@@ -1013,15 +1030,23 @@ class ChatCoordinator:
                 f" 최소 현금 {knobs['min_cash_ratio']:.1f}%",
                 f"청산 지침: 손절 {knobs['stop_loss_pct']:.1f}%,"
                 f" 익절 {knobs['take_profit_pct']:.1f}%",
+                # E-3: entry_conditions를 "진입 기준(참고)" 섹션으로 주입 —
+                # soft guidance(하드 게이트 아님): 어떤 코드도 이 값들로
+                # 투표를 거부/강제하지 않는다. 4-에이전트 합의 문턱만
+                # consensus_threshold를 통해 세션에 실제로 반영된다(별도 배선).
+                f"진입 기준(참고, 하드 게이트 아님 — 참고용 가이드일 뿐 강제 아님):"
+                f" 기술점수≥{entry.min_technical_score}, 펀더멘털≥{entry.min_fundamental_score},"
+                f" 심리≥{entry.min_sentiment_score}, 리스크≤{entry.max_risk_score},"
+                f" 합의문턱={consensus_threshold:.2f}",
             ]
             if strategy.system_prompt:
                 lines.append(f"운용 원칙: {strategy.system_prompt[:400]}")
             if strategy.custom_instructions:
                 lines.append(f"추가 지침: {strategy.custom_instructions[:400]}")
-            return "\n".join(lines), knobs
+            return "\n".join(lines), knobs, consensus_threshold
         except Exception as e:
             logger.warning("strategy_context_build_failed", error=str(e))
-            return None, None
+            return None, None, 0.75
 
     async def _compute_agent_weights(self) -> Optional[dict]:
         """agent_calibration 최신 스냅샷 → 가중 틸트. 표본 부족/데이터 없음/
@@ -1221,7 +1246,9 @@ class ChatCoordinator:
             # Phase4: best-effort active-strategy context. Never raises and
             # never promotes is_stale — a strategy fetch failure must not
             # block the debate (see _build_strategy_context docstring).
-            strategy_directive, strategy_knobs = await self._build_strategy_context()
+            strategy_directive, strategy_knobs, consensus_threshold = (
+                await self._build_strategy_context()
+            )
 
             # ka10001 mrkt_tot_amt 단위=억원 (scanner.py:852-856과 동일 근거,
             # 라이브 실측 2026-07-18: 005930 -> 14,908,010억 ≈ 1,490조).
@@ -1255,6 +1282,7 @@ class ChatCoordinator:
                 total_portfolio_value=total_portfolio,
                 strategy_directive=strategy_directive,
                 strategy_knobs=strategy_knobs,
+                consensus_threshold=consensus_threshold,
             )
 
         except Exception as e:
@@ -1336,6 +1364,9 @@ class ChatCoordinator:
             ticker=ticker,
             stock_name=stock_name,
             context=context,
+            # E-3: 자동 경로(_start_discussion)와 동일하게 context 단일
+            # 소스에서 consensus_threshold 전달.
+            consensus_threshold=context.consensus_threshold,
             agent_weights=await self._compute_agent_weights(),
         )
         _fire_room_created(room)

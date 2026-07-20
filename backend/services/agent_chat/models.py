@@ -218,6 +218,12 @@ class MarketContext(BaseModel):
     strategy_directive: Optional[str] = Field(default=None)
     strategy_knobs: Optional[Dict[str, float]] = Field(default=None)
 
+    # E-3: 활성 전략의 entry_conditions.consensus_threshold (best-effort —
+    # coordinator._build_strategy_context가 채움. 조회 실패/전략 없음=0.75
+    # 기본값 그대로 — 배포 직후 거동 불변). ChatRoom 생성 시 이 값을 그대로
+    # ChatSession.consensus_threshold에 전달한다(단일 소스화).
+    consensus_threshold: float = Field(default=0.75)
+
 
 class ChatRound(BaseModel):
     """

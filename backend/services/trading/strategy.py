@@ -72,6 +72,14 @@ class EntryConditions(BaseModel):
     entry_proximity_pct: float = Field(default=0.03, ge=0.005, le=0.10)
     opportunity_min_confidence: float = Field(default=0.75, ge=0.5, le=0.95)
 
+    # E-3 (진입 활성화): 4-에이전트 합의 문턱 — agent_chat 세션 생성 시 활성
+    # 전략에서 읽어 ChatSession.consensus_threshold/ChatRoom에 주입(coordinator.
+    # _build_strategy_context — 조회 실패/전략 없음=기존 하드코딩 0.75로 진행,
+    # 거동 불변). strategy_consensus.KNOB_BOUNDS[0.60,0.85]가 EOD 합의 조정
+    # 범위를 이 Field 범위보다 더 좁게 제한한다. 기본값 0.75는 models.py의
+    # ChatSession/chat_room.py의 기존 하드코딩과 동일 — 배포 직후 거동 불변.
+    consensus_threshold: float = Field(default=0.75, ge=0.5, le=0.9)
+
 
 class ExitConditions(BaseModel):
     """Conditions for exiting a position"""

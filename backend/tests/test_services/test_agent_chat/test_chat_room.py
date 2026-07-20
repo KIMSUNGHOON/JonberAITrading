@@ -93,6 +93,27 @@ class TestChatRoomInitialization:
         """Test that session starts in INITIALIZING status."""
         assert chat_room.session.status == SessionStatus.INITIALIZING
 
+    def test_session_consensus_threshold_matches_constructor_arg(self, mock_market_context):
+        """E-3: ChatRoom(consensus_threshold=...)가 session.consensus_threshold
+        에 그대로 반영된다 — coordinator가 활성 전략 값(예 0.68)을 전달하면
+        기존 하드코딩 0.75가 아니라 그 값으로 세션이 생성돼야 한다."""
+        room = ChatRoom(
+            ticker="005930",
+            stock_name="삼성전자",
+            context=mock_market_context,
+            consensus_threshold=0.68,
+        )
+        assert room.session.consensus_threshold == pytest.approx(0.68)
+
+    def test_session_consensus_threshold_default_is_0_75(self, mock_market_context):
+        """인자 미지정 시 기존 하드코딩과 동일한 기본값 — 배포 직후 거동 불변."""
+        room = ChatRoom(
+            ticker="005930",
+            stock_name="삼성전자",
+            context=mock_market_context,
+        )
+        assert room.session.consensus_threshold == pytest.approx(0.75)
+
 
 # -------------------------------------------
 # Callback Tests

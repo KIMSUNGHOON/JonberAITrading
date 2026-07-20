@@ -396,6 +396,42 @@ class TestManualDiscussion:
                 stock_name="삼성전자",
             )
 
+    @pytest.mark.asyncio
+    async def test_start_manual_discussion_passes_context_consensus_threshold(
+        self, coordinator, mock_market_context
+    ):
+        """E-3: 세션 생성 시 활성 전략에서 읽은 consensus_threshold(context에
+        best-effort 주입됨, coordinator._build_strategy_context)를 ChatRoom
+        생성자에 그대로 전달한다 — 하드코딩 0.75를 단일 소스(context)로 우회."""
+        mock_market_context.consensus_threshold = 0.68
+
+        with patch('services.agent_chat.coordinator.ChatRoom') as MockRoom:
+            mock_session = MagicMock()
+            mock_session.id = "test-session"
+            mock_session.status = SessionStatus.DECIDED
+            mock_session.decision = TradeDecision(
+                action=DecisionAction.HOLD,
+                confidence=0.7,
+                consensus_level=0.75,
+                rationale="Hold decision",
+            )
+
+            mock_room_instance = AsyncMock()
+            mock_room_instance.start = AsyncMock(return_value=mock_session)
+            mock_room_instance.session = mock_session
+            MockRoom.return_value = mock_room_instance
+
+            with patch.object(coordinator, '_fetch_market_context') as mock_context:
+                mock_context.return_value = mock_market_context
+
+                await coordinator.start_manual_discussion(
+                    ticker="005930",
+                    stock_name="삼성전자",
+                )
+
+        _, kwargs = MockRoom.call_args
+        assert kwargs["consensus_threshold"] == pytest.approx(0.68)
+
 
 # -------------------------------------------
 # Stale Market Data Tests (CRITICAL safety fix, 2026-07-14)
