@@ -498,6 +498,37 @@ def _ensure_watch_room(coordinator, cap: int = WATCH_TOTAL_CAP) -> bool:
     return _evict_worst_discovery_watch(coordinator)
 
 
+def _resolve_exit_pcts(coordinator) -> tuple[float, float]:
+    """(stop_loss_pct, take_profit_pct) as FRACTIONS (e.g. 0.045 == 4.5%) for
+    discovery-promoted watch entries (P2-D1/E-1).
+
+    Source of truth is the active strategy's `exit_conditions`
+    (already fraction-scaled, ExitConditions.stop_loss_pct/take_profit_pct).
+    No active strategy (`get_strategy()` returns None) or a lookup failure
+    both fall back to `coordinator.risk_params`' account-level defaults
+    (`default_stop_loss_pct`/`default_take_profit_pct`) -- those are stored
+    as PERCENTAGE POINTS (e.g. 8.0 == 8%), so they're divided by 100 here to
+    match ExitConditions' fraction convention. This mirrors
+    `_detect_opportunity`'s best-effort strategy-lookup pattern in
+    services/agent_chat/coordinator.py -- a strategy-access hiccup degrades
+    to the pre-existing account default, it never blocks promotion."""
+    try:
+        strategy = coordinator.get_strategy()
+        if strategy is not None:
+            return (
+                strategy.exit_conditions.stop_loss_pct,
+                strategy.exit_conditions.take_profit_pct,
+            )
+    except Exception as e:
+        logger.warning("discovery_strategy_lookup_failed", error=str(e))
+
+    risk_params = coordinator.risk_params
+    return (
+        risk_params.default_stop_loss_pct / 100.0,
+        risk_params.default_take_profit_pct / 100.0,
+    )
+
+
 def _candidate_summary_text(c: Candidate) -> str:
     return (
         f"발굴 랭킹 #{c.rank} · 레짐={c.regime_label} · "
@@ -588,6 +619,7 @@ async def promote_candidates(coordinator, storage, candidates: list[Candidate]) 
 
     held_tickers = {p.ticker for p in coordinator.state.positions}
     daily_promoted = 0
+    stop_pct, tp_pct = _resolve_exit_pcts(coordinator)
 
     for c in eligible:
         if c.composite < c.threshold:
@@ -632,6 +664,20 @@ async def promote_candidates(coordinator, storage, candidates: list[Candidate]) 
             summary.skipped[c.ticker] = c.skip_reason
             continue
 
+        # P2-D1/E-1: seed target/stop/take from the discovery close price so
+        # _detect_opportunity's price-proximity branch (services/agent_chat/
+        # coordinator.py) can actually fire on this entry -- previously all
+        # three were omitted (None), which silently starved discovery
+        # promotions of any entry-price signal and left them dependent on
+        # the (much stricter) high-confidence-only fallback branch.
+        target_entry_price: Optional[float] = None
+        stop_loss: Optional[float] = None
+        take_profit: Optional[float] = None
+        if c.close_price:
+            target_entry_price = c.close_price
+            stop_loss = c.close_price * (1 - stop_pct)
+            take_profit = c.close_price * (1 + tp_pct)
+
         coordinator.add_to_watch_list(
             session_id=f"discovery:{c.trade_date}",
             ticker=c.ticker,
@@ -639,9 +685,20 @@ async def promote_candidates(coordinator, storage, candidates: list[Candidate]) 
             signal="discovery",
             confidence=c.composite,
             current_price=c.close_price or 0.0,
+            target_entry_price=target_entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
             analysis_summary=_candidate_summary_text(c),
             key_factors=_candidate_key_factors(c),
             source="discovery",
+        )
+        logger.info(
+            "discovery_candidate_promoted",
+            ticker=c.ticker,
+            target_entry_price=target_entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            confidence=c.composite,
         )
         c.skip_reason = None
         c.promoted = True

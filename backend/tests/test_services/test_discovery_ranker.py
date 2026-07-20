@@ -20,6 +20,7 @@ import uuid
 import aiosqlite
 import pytest
 
+from services.agent_chat.coordinator import ChatCoordinator
 from services.discovery import ranker
 from services.discovery.ranker import (
     DEFAULT_REGIME_WEIGHTS,
@@ -30,7 +31,8 @@ from services.discovery.ranker import (
 )
 from services.storage_service import StorageService
 from services.trading.coordinator import ExecutionCoordinator
-from services.trading.models import ManagedPosition
+from services.trading.models import ManagedPosition, RiskParameters
+from services.trading.strategy import ExitConditions, TradingStrategy
 
 pytestmark = pytest.mark.asyncio
 
@@ -594,6 +596,114 @@ async def test_promote_no_candidates_is_a_noop(storage, coordinator):
     assert summary.promoted == []
     assert summary.skipped == {}
     assert summary.total_candidates == 0
+
+
+# ---------------------------------------------------------------------------
+# ⑧ E-1 (P2-D1): 승격 시 target/stop/tp 전달 -- discovery→토론 연결 완결
+# ---------------------------------------------------------------------------
+
+
+async def test_promotion_fills_target_stop_take_and_confidence_from_active_strategy(
+    storage, coordinator,
+):
+    """수기 계산 대조: close=10,000 · 활성 전략 stop_loss_pct=4.5% ->
+    stop_loss=9,550. take_profit_pct=12% -> take_profit=11,200.
+    confidence는 여전히 cand.composite(문턱/게이트와 무관하게 유지)."""
+    coordinator.set_strategy(
+        TradingStrategy(
+            exit_conditions=ExitConditions(stop_loss_pct=0.045, take_profit_pct=0.12)
+        )
+    )
+    c = _candidate("005930", composite=0.62, threshold=0.1, close_price=10_000.0)
+
+    summary = await promote_candidates(coordinator, storage, [c])
+    assert summary.promoted == ["005930"]
+
+    watched = coordinator.get_watch_list()[0]
+    assert watched.target_entry_price == pytest.approx(10_000.0)
+    assert watched.stop_loss == pytest.approx(9_550.0)
+    assert watched.take_profit == pytest.approx(11_200.0)
+    assert watched.confidence == pytest.approx(0.62)
+
+
+async def test_promoted_candidate_triggers_detect_opportunity_end_to_end(storage, coordinator):
+    """종단 핀: promote_candidates가 채운 target_entry_price가 실제로
+    _detect_opportunity(services/agent_chat/coordinator.py)의 가격근접
+    분기를 발화시켜야 한다. confidence=0.62는 고정 문턱 0.75(무접촉) 미달이라
+    confidence 단독으로는 결코 True가 될 수 없다 -- 가격근접 분기가 유일한
+    발화 경로.
+
+    RED(배선 전) 재현: target_entry_price=None이면 이 분기는 항상 스킵되고
+    confidence도 문턱 미달이라 동일 current_price에서도 False였다."""
+    c = _candidate("005930", composite=0.62, threshold=0.1, close_price=10_000.0)
+    summary = await promote_candidates(coordinator, storage, [c])
+    assert summary.promoted == ["005930"]
+
+    watched = coordinator.get_watch_list()[0]
+    assert watched.target_entry_price == pytest.approx(10_000.0)
+
+    stock = {
+        "ticker": watched.ticker,
+        "current_price": 10_150.0,  # target(10,000)의 1.5% 이내 -- 문턱 0.03 이내
+        "target_entry_price": watched.target_entry_price,
+        "confidence": watched.confidence,
+    }
+
+    chat_coordinator = ChatCoordinator()
+    assert await chat_coordinator._detect_opportunity(stock) is True
+
+    # RED 회귀 핀: 배선 전 동작(target_entry_price=None)은 동일 가격/신뢰도에서도
+    # 결코 True를 반환하지 않았다.
+    stale_stock = dict(stock, target_entry_price=None)
+    assert await chat_coordinator._detect_opportunity(stale_stock) is False
+
+
+async def test_promotion_falls_back_to_risk_params_when_no_active_strategy(storage):
+    """전략 조회 실패(활성 전략 없음, get_strategy()->None) 시
+    coordinator.risk_params의 default_stop_loss_pct/default_take_profit_pct로
+    폴백한다. RiskParameters는 퍼센트 포인트(예: 4.0 == 4%)로 저장되므로
+    100으로 나눈 값이 stop/tp 계산에 쓰여야 한다."""
+    coordinator = ExecutionCoordinator(
+        kiwoom_client=None,
+        risk_params=RiskParameters(default_stop_loss_pct=4.0, default_take_profit_pct=20.0),
+    )
+    assert coordinator.get_strategy() is None  # 활성 전략 없음 = 조회 실패와 동치
+
+    c = _candidate("005930", composite=0.62, threshold=0.1, close_price=10_000.0)
+    summary = await promote_candidates(coordinator, storage, [c])
+    assert summary.promoted == ["005930"]
+
+    watched = coordinator.get_watch_list()[0]
+    assert watched.target_entry_price == pytest.approx(10_000.0)
+    assert watched.stop_loss == pytest.approx(9_600.0)  # 10,000 * (1 - 0.04)
+    assert watched.take_profit == pytest.approx(12_000.0)  # 10,000 * (1 + 0.20)
+
+
+async def test_promotion_leaves_existing_manual_watch_entries_untouched(storage, coordinator):
+    """기존 manual 워치 항목은 discovery 승격 배선 확장과 무관하게 그대로
+    유지돼야 한다 (target/stop/tp가 새로 채워지거나 덮어써지지 않음)."""
+    manual = coordinator.add_to_watch_list(
+        session_id="manual-s", ticker="000660", stock_name="수동종목",
+        signal="hold", confidence=0.5, current_price=50_000.0, source="manual",
+    )
+    assert manual.target_entry_price is None
+    assert manual.stop_loss is None
+    assert manual.take_profit is None
+
+    c = _candidate("005930", composite=0.62, threshold=0.1, close_price=10_000.0)
+    summary = await promote_candidates(coordinator, storage, [c])
+    assert summary.promoted == ["005930"]
+
+    by_ticker = {w.ticker: w for w in coordinator.get_watch_list()}
+    manual_after = by_ticker["000660"]
+    assert manual_after.target_entry_price is None
+    assert manual_after.stop_loss is None
+    assert manual_after.take_profit is None
+    assert manual_after.source == "manual"
+
+    # discovery 항목은 여전히 정상 배선됨.
+    discovered = by_ticker["005930"]
+    assert discovered.target_entry_price == pytest.approx(10_000.0)
 
 
 # ---------------------------------------------------------------------------
