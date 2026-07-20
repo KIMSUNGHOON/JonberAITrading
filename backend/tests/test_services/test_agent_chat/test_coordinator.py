@@ -442,6 +442,10 @@ class TestStaleMarketContext:
                 "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
                 AsyncMock(side_effect=RuntimeError("no account access")),
             ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=_mock_empty_news_service()),
+            ),
         ):
             context = await coordinator._fetch_market_context("005930", "삼성전자")
 
@@ -827,6 +831,10 @@ class TestMarketCapCorrection:
                 "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
                 AsyncMock(side_effect=RuntimeError("no account access")),
             ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=_mock_empty_news_service()),
+            ),
         ):
             context = await coordinator._fetch_market_context("005930", "삼성전자")
 
@@ -855,10 +863,26 @@ class TestMarketCapCorrection:
                 "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
                 AsyncMock(side_effect=RuntimeError("no account access")),
             ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=_mock_empty_news_service()),
+            ),
         ):
             context = await coordinator._fetch_market_context("005930", "삼성전자")
 
         assert context.market_cap is None
+
+
+def _mock_empty_news_service():
+    """뉴스 서비스 목 — providers 없음(뉴스/감성 경로 미진입).
+
+    market_cap/stale 판정처럼 뉴스와 무관한 어서션을 검증하는 테스트에서
+    app.dependencies.get_news_service를 목킹하지 않으면 실 NAVER API +
+    실 LLM(Ollama) 추론까지 실행돼 격리가 깨진다(리뷰 Critical, -s 실증).
+    """
+    news_service = MagicMock()
+    news_service.providers = []
+    return news_service
 
 
 def _mock_news_service(article_count: int = 6):
@@ -971,6 +995,68 @@ class TestNewsSentimentWiring:
             context = await coordinator._fetch_market_context("005930", "삼성전자")
 
         assert context.news_sentiment == "positive"  # 등락률 +3.0% 폴백 라벨
+
+        fallback_calls = [
+            c for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "news_sentiment_fallback"
+        ]
+        assert len(fallback_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_analyzer_internal_fallback_falls_back_to_price_change_label(
+        self, coordinator
+    ):
+        """analyzer가 LLM 예외를 내부에서 삼켜 raise 없이 neutral 결과를
+        돌려주는 경로(리뷰 Important — 최빈 실패모드)를 목킹한다.
+        analyzer.analyze가 예외를 던지지 않고 is_fallback=True인
+        NewsSentimentResult를 반환해도 coordinator가 이를 성공으로
+        오인하지 않고 등락률 폴백 라벨을 쓰며 news_sentiment_fallback을
+        로그해야 한다(수정 전에는 neutral이 그대로 news_sentiment에
+        흡수되고 폴백 로그가 전혀 발동하지 않았다)."""
+        from services.news.sentiment import NewsSentimentResult
+
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": 3.0,
+        }
+        mock_news_service = _mock_news_service()
+
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("no account access")),
+            ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=mock_news_service),
+            ),
+            patch("services.news.sentiment.NewsSentimentAnalyzer") as MockAnalyzer,
+            patch("services.agent_chat.coordinator.logger") as mock_logger,
+        ):
+            MockAnalyzer.return_value.analyze = AsyncMock(
+                return_value=NewsSentimentResult(
+                    sentiment="neutral",
+                    score=0,
+                    confidence=0.2,
+                    summary="종목 뉴스 분석 중 오류가 발생했습니다.",
+                    is_fallback=True,
+                )
+            )
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        # neutral이 그대로 흡수되지 않고 등락률 +3.0% 폴백 라벨(positive)이
+        # 쓰여야 한다.
+        assert context.news_sentiment == "positive"
 
         fallback_calls = [
             c for c in mock_logger.warning.call_args_list

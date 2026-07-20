@@ -50,6 +50,18 @@ class NewsSentimentResult(BaseModel):
         default="HOLD",
         description="Trading recommendation based on sentiment: BUY, SELL, or HOLD"
     )
+    is_fallback: bool = Field(
+        default=False,
+        description=(
+            "True only when this result was synthesized after the LLM call "
+            "itself failed (exception/timeout) — the analyzer swallows that "
+            "exception and returns a neutral-looking result, so callers must "
+            "check this flag (not just sentiment=='neutral') to detect the "
+            "failure and apply their own fallback. False on every real "
+            "analysis outcome, including a genuine LLM-derived neutral call "
+            "and the 'no articles' early-return."
+        ),
+    )
 
 
 class NewsSentimentAnalyzer:
@@ -160,6 +172,7 @@ class NewsSentimentAnalyzer:
                 risk_factors=[],
                 positive_factors=[],
                 recommendation="HOLD",
+                is_fallback=True,
             )
 
     def _format_articles(self, articles: List[NewsArticle]) -> str:

@@ -1194,6 +1194,20 @@ class ChatCoordinator:
                                 ),
                                 timeout=20.0,
                             )
+                            if sentiment_result.is_fallback:
+                                # analyzer swallowed its own LLM exception
+                                # and returned a neutral-looking result
+                                # instead of raising (services/news/
+                                # sentiment.py analyze() except-block) — the
+                                # most common failure mode. Without this
+                                # check that neutral silently overwrote the
+                                # price-momentum proxy above and the
+                                # news_sentiment_fallback log never fired
+                                # (리뷰 Important). Re-raise to reuse the
+                                # existing fallback path below.
+                                raise RuntimeError(
+                                    "news_sentiment_analyzer_internal_fallback"
+                                )
                             news_sentiment = sentiment_result.sentiment
                         except Exception as sentiment_error:
                             logger.warning(
