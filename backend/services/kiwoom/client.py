@@ -12,6 +12,7 @@ Rate Limiting:
 """
 
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -53,6 +54,29 @@ logger = structlog.get_logger()
 
 # 키움 서버 시간대 (실현손익 기본 조회일 계산)
 KST = timezone(timedelta(hours=9))
+
+# ETN/스팩/채권 파생상품 이름 패턴 (DQ-1) — ETF/리츠/ELW는 이미 get_all_stocks의
+# mrkt_tp=0,10 쿼리에서 구조적으로 제외되므로(전용 시장구분 존재), 여기서는
+# 전용 시장구분이 없어 코스피/코스닥에 혼입되는 ETN·스팩만 이름으로 거른다.
+# 보수적 키워드 목록 — 오탐(정상 종목 오제외)보다 누락(ETN 잔존)이 안전하므로
+# 종목명 전반에 흔한 한 글자/두 글자 단어는 넣지 않는다.
+_ETF_ETN_NAME_KEYWORDS: tuple[str, ...] = (
+    "ETN",
+    "스팩",
+    "채권",
+    "회사채",
+    "국고",
+    "통안",
+    "금리",
+    "CD ",
+    "인버스",
+    "레버리지",
+    "선물",
+)
+_ETF_ETN_NAME_RE = re.compile(
+    "|".join(re.escape(kw) for kw in _ETF_ETN_NAME_KEYWORDS),
+    re.IGNORECASE,
+)
 
 
 class KiwoomClient:
@@ -1457,6 +1481,7 @@ class KiwoomClient:
         include_kospi: bool = True,
         include_kosdaq: bool = True,
         exclude_warnings: bool = True,
+        exclude_etf_etn: bool = True,
     ) -> list[StockListItem]:
         """
         KOSPI/KOSDAQ 전체 종목 조회
@@ -1465,6 +1490,13 @@ class KiwoomClient:
             include_kospi: 코스피 포함 여부
             include_kosdaq: 코스닥 포함 여부
             exclude_warnings: 투자주의/경고 종목 제외 여부
+            exclude_etf_etn: ETN/스팩/채권 파생상품 이름 패턴 제외 여부
+                (DQ-1 — ETF/리츠/ELW는 mrkt_tp 쿼리에서 이미 구조적으로
+                제외되므로 대상 아님). 기본 True — 현재 유일한 콜사이트인
+                discovery 스캐너(_load_stock_list)가 원하는 거동이며, 이
+                파라미터를 명시하지 않는 다른 잠재 소비자도 오염된 유니버스보다
+                안전한 쪽(제외)을 기본으로 받는다. False로 넘기면 이름 필터
+                없이 기존 거동(byte-불변) 그대로 유지된다.
 
         Returns:
             StockListItem 리스트
@@ -1482,6 +1514,11 @@ class KiwoomClient:
         if exclude_warnings:
             all_stocks = [s for s in all_stocks if s.is_normal]
 
+        if exclude_etf_etn:
+            all_stocks = [
+                s for s in all_stocks if not _ETF_ETN_NAME_RE.search(s.name)
+            ]
+
         # 중복 제거 (코드 기준)
         seen = set()
         unique_stocks = []
@@ -1495,6 +1532,7 @@ class KiwoomClient:
             total=len(unique_stocks),
             kospi=include_kospi,
             kosdaq=include_kosdaq,
+            exclude_etf_etn=exclude_etf_etn,
         )
 
         return unique_stocks

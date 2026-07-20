@@ -129,6 +129,7 @@ class FakeKiwoomClient:
         self.flow_calls: list[str] = []
         self.stock_info_calls: list[str] = []
         self.chart_df_calls: list[str] = []
+        self.get_all_stocks_calls: list[dict] = []
 
     async def get_stock_info(self, stk_cd: str, ttl=None):
         self.stock_info_calls.append(stk_cd)
@@ -152,7 +153,21 @@ class FakeKiwoomClient:
         self.flow_calls.append(mrkt_tp)
         return self._flow_responses.get(mrkt_tp)
 
-    async def get_all_stocks(self, include_kospi=True, include_kosdaq=True, exclude_warnings=True):
+    async def get_all_stocks(
+        self,
+        include_kospi=True,
+        include_kosdaq=True,
+        exclude_warnings=True,
+        exclude_etf_etn=False,  # 목 기본값=False — 스캐너가 명시 전달하는지 검증하기 위함
+    ):
+        self.get_all_stocks_calls.append(
+            {
+                "include_kospi": include_kospi,
+                "include_kosdaq": include_kosdaq,
+                "exclude_warnings": exclude_warnings,
+                "exclude_etf_etn": exclude_etf_etn,
+            }
+        )
         if self._all_stocks_error is not None:
             raise self._all_stocks_error
         return []
@@ -349,6 +364,25 @@ async def test_non_discovery_scan_records_no_universe_fallback(monkeypatch):
     sessions = await scanner.get_scan_sessions(limit=1)
     assert sessions[0]["universe_fallback"] == 0
     assert sessions[0]["scan_mode"] == "discovery"
+
+
+# ---------------------------------------------------------------------------
+# DQ-1: _load_stock_list이 get_all_stocks에 exclude_etf_etn=True를 전달
+# ---------------------------------------------------------------------------
+
+
+async def test_load_stock_list_requests_etf_etn_exclusion(monkeypatch):
+    """discovery 스캔이 stock_list=None(자동 유니버스 로드)이면
+    _load_stock_list가 client.get_all_stocks를 exclude_etf_etn=True로
+    호출해야 한다 — ETN/스팩 혼입 방지(DQ-1)."""
+    client = FakeKiwoomClient()
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=None, mode="discovery")
+
+    assert len(client.get_all_stocks_calls) == 1
+    assert client.get_all_stocks_calls[0]["exclude_etf_etn"] is True
 
 
 # ---------------------------------------------------------------------------

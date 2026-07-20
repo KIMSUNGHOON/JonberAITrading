@@ -297,6 +297,7 @@ class BackgroundScanner:
                 include_kospi=True,
                 include_kosdaq=True,
                 exclude_warnings=True,
+                exclude_etf_etn=True,  # DQ-1: ETN/스팩 유니버스 혼입 제외
             )
 
             stock_list = [
