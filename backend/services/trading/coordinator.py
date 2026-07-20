@@ -1169,7 +1169,7 @@ class ExecutionCoordinator:
 
         return result
 
-    async def _execute_order_from_monitor(self, order: OrderRequest):
+    async def _execute_order_from_monitor(self, order: OrderRequest) -> bool:
         """Execute order from risk monitor (stop-loss/take-profit).
 
         This is the choke point for every AGENT_AUTO defensive sell — it MUST
@@ -1192,12 +1192,22 @@ class ExecutionCoordinator:
         `on_trade_approved`'s SELL/REDUCE main path AND its rebalance-orders
         loop, N1/`handle_alert_action`'s EXECUTE_STOP_LOSS/
         EXECUTE_TAKE_PROFIT) — 6 guarded SELL sites total.
+
+        G-2 (gap discipline, spec docs/superpowers/specs/
+        2026-07-20-gap-discipline-design.md §N2): returns `bool` — True only
+        when the order actually reached `_execute_order` (submitted to the
+        broker); False when the in-flight guard or the autonomy gate skipped
+        it. Before this fix the method returned nothing, so RiskMonitor's
+        `_execute_stop_loss`/`_execute_take_profit` could not tell a denied
+        or in-flight-skipped call apart from a real submission and generated
+        a false "Executed" alert unconditionally on every 1s tick. Existing
+        callers that ignore the return value are unaffected by adding it.
         """
         from services.autonomy import check_autonomy
 
         is_sell = order.side == "sell"
         if is_sell and not self._acquire_defensive_exit_guard(order.ticker):
-            return
+            return False
 
         try:
             position = next(
@@ -1220,7 +1230,7 @@ class ExecutionCoordinator:
                 if position is not None and not position.monitor_gate_denied_notified:
                     position.monitor_gate_denied_notified = True
                     await self._notify_monitor_gate_denied(order, gate.reason)
-                return
+                return False
 
             if position is not None and position.monitor_gate_denied_notified:
                 # Gate allowed again: clear the latch so a future denial notifies.
@@ -1234,6 +1244,7 @@ class ExecutionCoordinator:
             # stop-loss/take-profit trigger that only partially filled at the
             # broker previously went unwatched by the ka10076 poll entirely.
             self._register_unfilled_sell(order.ticker, position, order, result)
+            return True
         finally:
             if is_sell:
                 self._release_defensive_exit_guard(order.ticker)
@@ -1912,8 +1923,31 @@ class ExecutionCoordinator:
         self._state_callback = callback
 
     async def _on_alert(self, alert: TradingAlert):
-        """Handle alert from risk monitor."""
-        self._state.pending_alerts.append(alert)
+        """Handle alert from risk monitor.
+
+        G-2 (gap discipline, spec docs/superpowers/specs/
+        2026-07-20-gap-discipline-design.md §N2): dedup by (ticker,
+        alert_type) — skip the append if an UNRESOLVED alert with the same
+        key is already sitting in `_state.pending_alerts`. Before this fix
+        every RiskMonitor alert (action_required or not) was appended here
+        unconditionally on every call, so a repeatedly-firing trigger (e.g.
+        a stop-loss re-evaluated on each 1s tick while the position stays
+        watched) grew this list without bound for the process lifetime.
+        Once the existing entry resolves (`alert.resolved = True`, or it is
+        pruned — see `handle_alert_action`'s cleanup below), a fresh alert
+        for the same key may be appended again. `self._alert_callback`/
+        `_notify_state_change` still fire on every call, dedup'd or not —
+        only the list append is gated; this mirrors RiskMonitor's own
+        `_add_alert` dedup convention (risk_monitor.py) without touching it.
+        """
+        already_pending = any(
+            not existing.resolved
+            and existing.ticker == alert.ticker
+            and existing.alert_type == alert.alert_type
+            for existing in self._state.pending_alerts
+        )
+        if not already_pending:
+            self._state.pending_alerts.append(alert)
 
         if self._alert_callback:
             await self._alert_callback(alert)

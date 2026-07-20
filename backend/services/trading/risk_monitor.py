@@ -54,7 +54,7 @@ class RiskMonitor:
         risk_params: Optional[RiskParameters] = None,
         price_fetcher: Optional[Callable[..., Awaitable[float]]] = None,
         alert_sender: Optional[Callable[[TradingAlert], Awaitable[None]]] = None,
-        order_executor: Optional[Callable[[OrderRequest], Awaitable[None]]] = None,
+        order_executor: Optional[Callable[[OrderRequest], Awaitable[bool]]] = None,
         price_sink: Optional[Callable[[str, float], None]] = None,
     ):
         """
@@ -68,7 +68,12 @@ class RiskMonitor:
                 — the fetcher must accept an optional `ttl` keyword and
                 forward it to its own cache layer.
             alert_sender: Async function to send alerts
-            order_executor: Async function to execute orders
+            order_executor: Async function to execute orders. Returns bool
+                (G-2) — True only when an order was actually submitted;
+                False when the caller's autonomy gate denied it or a
+                concurrent in-flight guard skipped it. _execute_stop_loss/
+                _execute_take_profit use this to avoid generating a false
+                "Executed" alert for a no-op call.
             price_sink: Optional callback(ticker, price) invoked every tick
                 right after a fresh price is fetched (T1, MEDIUM finding A).
                 Decoupled from the monitor's own stop-loss/take-profit logic
@@ -581,17 +586,31 @@ class RiskMonitor:
             # the ACTUAL fill (remove on full, reduce on partial, keep on none) —
             # do NOT unconditionally remove here or it clobbers a re-registered
             # partial remainder / a retained unfilled position (review #5b).
-            await self._execute_order(order)
+            #
+            # G-2 (gap discipline, spec docs/superpowers/specs/
+            # 2026-07-20-gap-discipline-design.md §N2): the executor now
+            # returns bool — True only when an order was actually SUBMITTED
+            # (autonomy gate allowed + in-flight guard acquired). Before this
+            # fix the return value was ignored, so a gate-denied or
+            # in-flight-skipped stop-loss (a silent no-op at the coordinator)
+            # still generated a "Stop-Loss Executed" alert below — falsely,
+            # and unconditionally on every 1s tick for as long as the price
+            # stayed under the stop. The coordinator's own gate-denied notice
+            # (Telegram, latched once per episode) already tells the human
+            # nothing executed — no alert is substituted here for the False
+            # case.
+            submitted = await self._execute_order(order)
 
-            alert = TradingAlert(
-                id=str(uuid.uuid4())[:8],
-                alert_type=AlertType.ORDER_FILLED,
-                ticker=ticker,
-                title=f"Stop-Loss Executed: {ticker}",
-                message=f"Sold {config.quantity} shares at ₩{current_price:,.0f}",
-                action_required=False,
-            )
-            await self._add_alert(alert)
+            if submitted:
+                alert = TradingAlert(
+                    id=str(uuid.uuid4())[:8],
+                    alert_type=AlertType.ORDER_FILLED,
+                    ticker=ticker,
+                    title=f"Stop-Loss Executed: {ticker}",
+                    message=f"Sold {config.quantity} shares at ₩{current_price:,.0f}",
+                    action_required=False,
+                )
+                await self._add_alert(alert)
 
         except Exception as e:
             logger.error(f"[RiskMonitor] Stop-loss execution failed: {e}")
@@ -635,17 +654,23 @@ class RiskMonitor:
         try:
             # See _execute_stop_loss: the executor reconciles by actual fill; do
             # not unconditionally remove here (review #5b).
-            await self._execute_order(order)
+            #
+            # G-2 (gap discipline, spec docs/superpowers/specs/
+            # 2026-07-20-gap-discipline-design.md §N2): same bool-return gate
+            # as _execute_stop_loss above — no false "Executed" alert when
+            # nothing was actually submitted.
+            submitted = await self._execute_order(order)
 
-            alert = TradingAlert(
-                id=str(uuid.uuid4())[:8],
-                alert_type=AlertType.ORDER_FILLED,
-                ticker=ticker,
-                title=f"Take-Profit Executed: {ticker}",
-                message=f"Sold {config.quantity} shares at ₩{current_price:,.0f}",
-                action_required=False,
-            )
-            await self._add_alert(alert)
+            if submitted:
+                alert = TradingAlert(
+                    id=str(uuid.uuid4())[:8],
+                    alert_type=AlertType.ORDER_FILLED,
+                    ticker=ticker,
+                    title=f"Take-Profit Executed: {ticker}",
+                    message=f"Sold {config.quantity} shares at ₩{current_price:,.0f}",
+                    action_required=False,
+                )
+                await self._add_alert(alert)
 
         except Exception as e:
             logger.error(f"[RiskMonitor] Take-profit execution failed: {e}")

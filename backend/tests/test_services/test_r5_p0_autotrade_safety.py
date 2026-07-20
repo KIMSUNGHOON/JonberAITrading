@@ -410,12 +410,16 @@ async def test_monitor_defensive_sell_blocked_when_gate_denies(monkeypatch):
 
     monkeypatch.setattr(autonomy_pkg, "check_autonomy", deny_gate)
 
-    await coord._execute_order_from_monitor(_stop_loss_order())
+    result = await coord._execute_order_from_monitor(_stop_loss_order())
 
     assert captured == [], "gate-denied defensive sell must not place an order"
     assert any(p.ticker == "005930" for p in coord._state.positions), (
         "blocked position must stay in _state.positions"
     )
+    # G-2 (N2): the caller (RiskMonitor) needs this to distinguish "gate
+    # denied" from "actually executed" so it doesn't fire a false "Executed"
+    # alert — see test_risk_monitor_defensive_market_order.py for that half.
+    assert result is False, "gate-denied call must return False, not None/truthy"
 
 
 async def test_monitor_defensive_sell_notifies_once_per_denied_episode(monkeypatch):
@@ -440,12 +444,14 @@ async def test_monitor_defensive_sell_notifies_once_per_denied_episode(monkeypat
 
     order = _stop_loss_order()
     # Three RiskMonitor ticks deny the same stopped-out position.
-    await coord._execute_order_from_monitor(order)
-    await coord._execute_order_from_monitor(order)
-    await coord._execute_order_from_monitor(order)
+    r1 = await coord._execute_order_from_monitor(order)
+    r2 = await coord._execute_order_from_monitor(order)
+    r3 = await coord._execute_order_from_monitor(order)
 
     assert notices == ["005930"], "denied defensive sell must notify once, not every tick"
     assert any(p.ticker == "005930" for p in coord._state.positions)
+    # G-2 (N2): every denied tick returns False, not just the first.
+    assert (r1, r2, r3) == (False, False, False)
 
 
 async def test_monitor_defensive_sell_proceeds_when_gate_allows(monkeypatch):
@@ -459,13 +465,58 @@ async def test_monitor_defensive_sell_proceeds_when_gate_allows(monkeypatch):
 
     monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
 
-    await coord._execute_order_from_monitor(_stop_loss_order())
+    result = await coord._execute_order_from_monitor(_stop_loss_order())
 
     assert len(captured) == 1
     assert captured[0].ticker == "005930"
     assert not any(p.ticker == "005930" for p in coord._state.positions), (
         "fully filled defensive sell must remove the position"
     )
+    # G-2 (N2): a real submission must return True.
+    assert result is True, "a submitted order must return True"
+
+
+async def test_monitor_defensive_sell_returns_false_when_inflight_skipped(monkeypatch):
+    """G-2 (N2): a SECOND `_execute_order_from_monitor` call for the SAME
+    ticker while the first is still in flight (S-2's guard) must return
+    False, exactly like a gate denial — RiskMonitor relies on this to avoid
+    generating a false "Executed" alert for the skipped call. Race pattern
+    mirrors test_second_defensive_exit_skipped_while_first_inflight above,
+    but both calls go through THIS method (not a cross-engine race)."""
+    coord, position = _coordinator_with_watched_position()
+
+    entered = asyncio.Event()
+    hold = asyncio.Event()
+
+    async def slow_execute(order):
+        entered.set()
+        await hold.wait()
+        return OrderResult(
+            order_id="o1",
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=order.price or 68_000,
+            status="filled",
+        )
+
+    coord._execute_order = slow_execute
+
+    async def allow_gate(market, **kwargs):
+        return GateDecision(allowed=True, reason="ok", check="all")
+
+    monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+    task1 = asyncio.create_task(coord._execute_order_from_monitor(_stop_loss_order()))
+    await entered.wait()
+
+    result2 = await coord._execute_order_from_monitor(_stop_loss_order())
+    assert result2 is False, "the in-flight-skipped call must return False"
+
+    hold.set()
+    result1 = await task1
+    assert result1 is True, "the first (non-skipped) call must return True"
 
 
 

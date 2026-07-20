@@ -198,3 +198,158 @@ async def test_stop_loss_mode_runtime_change_reaches_already_watched_position():
     assert captured["order"].order_type == OrderType.MARKET
     assert captured["order"].side == "sell"
 
+
+
+# -------------------------------------------
+# G-2 (gap discipline, 2026-07-20): no false "Executed" alert when the
+# order_executor did not actually submit anything (autonomy gate denial or
+# a concurrent in-flight guard skip at the coordinator, both surfaced as a
+# `False` return -- see coordinator.py's `_execute_order_from_monitor`).
+# Before this fix `_execute_stop_loss`/`_execute_take_profit` ignored the
+# executor's return value entirely and generated a "Stop-Loss/Take-Profit
+# Executed" ORDER_FILLED alert unconditionally on every call, including a
+# denied/skipped one -- and since the position stays watched (nothing was
+# actually sold), the very next 1s tick re-triggers the same false alert,
+# growing pending_alerts without bound for as long as price stays past the
+# stop and the gate keeps denying.
+#
+# Spec: docs/superpowers/specs/2026-07-20-gap-discipline-design.md §N2
+# -------------------------------------------
+
+
+async def test_execute_stop_loss_no_executed_alert_when_not_submitted():
+    """RED before the fix: this asserted 0 but the old code always appended
+    1 ORDER_FILLED alert regardless of what the executor returned."""
+    monitor = _monitor()
+    sent = []
+
+    async def alert_sender(alert):
+        sent.append(alert)
+
+    async def executor(order):
+        return False  # gate denied / in-flight skipped -- nothing submitted
+
+    monitor._send_alert = alert_sender
+    monitor._execute_order = executor
+    position = _position(stop_loss=65_000)
+    monitor.add_position(position)
+    config = monitor._watching["005930"]
+
+    await monitor._execute_stop_loss("005930", config, 64_000)
+
+    executed = [a for a in sent if a.alert_type == AlertType.ORDER_FILLED]
+    assert executed == [], "no order was submitted -- no false Executed alert"
+
+
+async def test_execute_stop_loss_executed_alert_unchanged_when_submitted():
+    """Byte-invariant happy path: executor returns True (order actually
+    submitted) -- the existing "Stop-Loss Executed" alert still fires with
+    the exact same title/message/action_required as before this fix."""
+    monitor = _monitor()
+    sent = []
+
+    async def alert_sender(alert):
+        sent.append(alert)
+
+    async def executor(order):
+        return True
+
+    monitor._send_alert = alert_sender
+    monitor._execute_order = executor
+    position = _position(stop_loss=65_000)
+    monitor.add_position(position)
+    config = monitor._watching["005930"]
+
+    await monitor._execute_stop_loss("005930", config, 64_000)
+
+    executed = [a for a in sent if a.alert_type == AlertType.ORDER_FILLED]
+    assert len(executed) == 1
+    assert executed[0].title == "Stop-Loss Executed: 005930"
+    assert executed[0].message == "Sold 10 shares at ₩64,000"
+    assert executed[0].action_required is False
+
+
+async def test_execute_take_profit_no_executed_alert_when_not_submitted():
+    """Symmetric take-profit case."""
+    monitor = _monitor(take_profit_mode=StopLossMode.AGENT_AUTO)
+    sent = []
+
+    async def alert_sender(alert):
+        sent.append(alert)
+
+    async def executor(order):
+        return False
+
+    monitor._send_alert = alert_sender
+    monitor._execute_order = executor
+    position = _position(take_profit=75_000)
+    monitor.add_position(position)
+    config = monitor._watching["005930"]
+
+    await monitor._execute_take_profit("005930", config, 76_000)
+
+    executed = [a for a in sent if a.alert_type == AlertType.ORDER_FILLED]
+    assert executed == [], "no order was submitted -- no false Executed alert"
+
+
+async def test_execute_take_profit_executed_alert_unchanged_when_submitted():
+    """Byte-invariant happy path for take-profit."""
+    monitor = _monitor(take_profit_mode=StopLossMode.AGENT_AUTO)
+    sent = []
+
+    async def alert_sender(alert):
+        sent.append(alert)
+
+    async def executor(order):
+        return True
+
+    monitor._send_alert = alert_sender
+    monitor._execute_order = executor
+    position = _position(take_profit=75_000)
+    monitor.add_position(position)
+    config = monitor._watching["005930"]
+
+    await monitor._execute_take_profit("005930", config, 76_000)
+
+    executed = [a for a in sent if a.alert_type == AlertType.ORDER_FILLED]
+    assert len(executed) == 1
+    assert executed[0].title == "Take-Profit Executed: 005930"
+    assert executed[0].message == "Sold 10 shares at ₩76,000"
+    assert executed[0].action_required is False
+
+
+async def test_stop_loss_no_executed_alert_through_check_position_when_gate_style_deny():
+    """End-to-end through the real trigger path (_check_position), not just
+    the direct helper call -- proves the fix also applies when the monitor
+    loop itself drives the trigger, matching how RiskMonitor is wired in
+    production (order_executor = coordinator._execute_order_from_monitor,
+    which returns False on gate denial)."""
+    monitor = _monitor()
+    sent = []
+
+    async def alert_sender(alert):
+        sent.append(alert)
+
+    async def denying_executor(order):
+        return False
+
+    monitor._send_alert = alert_sender
+    monitor._execute_order = denying_executor
+    position = _position(avg_price=70_000, stop_loss=65_000)
+    monitor.add_position(position)
+    config = monitor._watching["005930"]
+
+    async def fetcher(_ticker, ttl=None):
+        return 64_000  # below stop_loss -> triggers
+
+    monitor._get_price = fetcher
+
+    # Multiple ticks: a denied/in-flight-skipped stop stays watched, so a
+    # real 1s loop would re-trigger this every tick. None of them may
+    # produce a false Executed alert.
+    await monitor._check_position("005930", config)
+    await monitor._check_position("005930", config)
+    await monitor._check_position("005930", config)
+
+    executed = [a for a in sent if a.alert_type == AlertType.ORDER_FILLED]
+    assert executed == [], "repeated denied ticks must never produce a false Executed alert"
