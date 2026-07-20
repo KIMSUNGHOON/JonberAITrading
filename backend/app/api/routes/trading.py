@@ -1138,10 +1138,6 @@ async def run_eod_report_now(
     }
 
 
-class DiscoveryRunRequest(BaseModel):
-    date: Optional[str] = None  # 생략 시 오늘(서버 로컬 날짜 = KST wall clock)
-
-
 # fire-and-forget 백그라운드 태스크 강참조 보관소 — asyncio는 태스크를 약참조로만
 # 붙들어 create_task 반환값을 아무도 안 잡으면 스캔(수 시간) 도중 GC로 취소될 수
 # 있다. 완료 시 스스로 비우는 집합에 담아 살아있게 한다(add_done_callback).
@@ -1149,10 +1145,7 @@ _discovery_run_tasks: set = set()
 
 
 @router.post("/discovery/run")
-async def run_discovery_now(
-    request: DiscoveryRunRequest,
-    coordinator=Depends(get_trading_coordinator),
-):
+async def run_discovery_now(coordinator=Depends(get_trading_coordinator)):
     """수동 발굴(discovery) 파이프라인 트리거 — 마감 엣지(coordinator._check_
     queue_on_market_open의 open→closed 엣지, 장 마감 시 1회)를 재시작/장애로
     놓쳤거나, 개장 전에 미리 후보를 준비하고 싶을 때 쓰는 수동 트리거.
@@ -1179,10 +1172,12 @@ async def run_discovery_now(
     계산이며, 스캔 세션의 started_at 날짜와 일치해야 하는 불변식이다
     (ranker._load_discovery_session이 date(started_at)=trade_date로 매칭 —
     KST-aware를 쓰면 자정 근처 UTC 오프셋에서 어긋나 조용히 0건이 될 수 있어
-    naive 로컬을 그대로 쓴다). request.date로 명시 override 가능.
+    naive 로컬을 그대로 쓴다). 스캔은 늘 오늘 새로 돌므로 날짜 override는 두지
+    않는다(과거 날짜=세션 불일치로 조용히 0건이 되는 footgun 차단).
 
-    DISCOVERY_ENABLED가 off면 아무 것도 하지 않고 enabled=False로 즉시 반환
-    (마감 체인의 킬스위치 가드와 동일 의미).
+    DISCOVERY_ENABLED가 off면 enabled=False로, 트레이딩 미기동(coordinator
+    start() 전)이면 started=False로 스캔조차 시작하지 않고 즉시 거부한다
+    (아래 가드 주석 참고).
     """
     if not get_settings().DISCOVERY_ENABLED:
         return {
@@ -1192,7 +1187,20 @@ async def run_discovery_now(
             "message": "DISCOVERY_ENABLED is off — 발굴 트리거 거부",
         }
 
-    trade_date = request.date or datetime.now().strftime("%Y-%m-%d")
+    # Important(리뷰 봉합): coordinator가 아직 start()되지 않았으면
+    # add_to_watch_list의 _schedule_persist가 no-op이라 승격이 워치리스트에
+    # 영속되지 않는다. 이후 /trading/start의 _restore_state가 스테일 blob으로
+    # 워치리스트를 덮어써 방금 승격한 후보가 조용히 증발한다(원장/FE는 승격됐다고
+    # 표시하는 위험한 불일치). 기동 전이면 수 시간짜리 스캔조차 시작하지 않고 거부.
+    if not getattr(coordinator, "_persistence_active", False):
+        return {
+            "ok": False,
+            "enabled": True,
+            "started": False,
+            "message": "트레이딩 미기동 — 먼저 POST /trading/start 후 다시 호출(승격 영속 보장)",
+        }
+
+    trade_date = datetime.now().strftime("%Y-%m-%d")
 
     async def _run_discovery_job():
         # 두 호출 모두 내부적으로 never-raise이지만, 마감 체인의 방어 심화

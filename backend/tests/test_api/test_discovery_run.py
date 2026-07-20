@@ -35,18 +35,24 @@ def _settings(enabled: bool) -> MagicMock:
     return s
 
 
-async def _post(json_body: dict):
+def _coordinator(*, persistence_active: bool, scan_ok: bool = True) -> MagicMock:
+    coordinator = MagicMock()
+    coordinator._persistence_active = persistence_active
+    coordinator._run_discovery_scan = AsyncMock(return_value=scan_ok)
+    return coordinator
+
+
+async def _post():
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        return await client.post("/api/trading/discovery/run", json=json_body)
+        return await client.post("/api/trading/discovery/run")
 
 
 async def _drain_discovery_jobs():
     # 라우트가 방금 스케줄한 fire-and-forget 잡을 완주시킨다. 동일 루프이므로
     # 집합에 담긴 태스크를 await하면 잡 본체(_run_discovery_scan +
     # run_discovery_pipeline)가 결정론적으로 실행된다. 잡이 이미 끝나
-    # done-callback으로 집합에서 빠졌다면(모두 즉시 반환하는 AsyncMock이라
-    # 가능) 이미 mock이 호출된 뒤이므로 그대로 통과한다.
+    # done-callback으로 집합에서 빠졌다면 이미 mock이 호출된 뒤이므로 통과한다.
     for _ in range(3):
         pending = list(trading_module._discovery_run_tasks)
         if not pending:
@@ -58,14 +64,15 @@ async def _drain_discovery_jobs():
 
 async def test_discovery_run_disabled_short_circuits():
     """DISCOVERY_ENABLED off → enabled/started False, 스캔·파이프라인 미호출."""
-    coordinator = MagicMock()
-    coordinator._run_discovery_scan = AsyncMock(return_value=True)
+    coordinator = _coordinator(persistence_active=True)
     app.dependency_overrides[get_trading_coordinator] = lambda: coordinator
     try:
-        with patch.object(trading_module, "get_settings", return_value=_settings(False)), patch.object(
+        with patch.object(
+            trading_module, "get_settings", return_value=_settings(False)
+        ), patch.object(
             trading_module, "run_discovery_pipeline", new=AsyncMock()
         ) as pipeline:
-            resp = await _post({})
+            resp = await _post()
             await _drain_discovery_jobs()
     finally:
         app.dependency_overrides.clear()
@@ -79,12 +86,37 @@ async def test_discovery_run_disabled_short_circuits():
     pipeline.assert_not_awaited()
 
 
+async def test_discovery_run_refuses_when_coordinator_not_started():
+    """트레이딩 미기동(_persistence_active False) → started False, 스캔조차
+    시작 안 함. 승격이 워치리스트에 영속되지 않아 이후 /trading/start의
+    _restore_state가 덮어써 증발하는 위험한 불일치를 사전 차단."""
+    coordinator = _coordinator(persistence_active=False)
+    app.dependency_overrides[get_trading_coordinator] = lambda: coordinator
+    try:
+        with patch.object(
+            trading_module, "get_settings", return_value=_settings(True)
+        ), patch.object(
+            trading_module, "run_discovery_pipeline", new=AsyncMock()
+        ) as pipeline:
+            resp = await _post()
+            await _drain_discovery_jobs()
+    finally:
+        app.dependency_overrides.clear()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["enabled"] is True
+    assert body["started"] is False
+    coordinator._run_discovery_scan.assert_not_awaited()
+    pipeline.assert_not_awaited()
+
+
 async def test_discovery_run_spawns_scan_then_pipeline_with_live_singletons():
-    """enabled → started True + 백그라운드 잡이 _run_discovery_scan 후
+    """enabled + 기동됨 → started True + 백그라운드 잡이 _run_discovery_scan 후
     run_discovery_pipeline를 **주입된 라이브 coordinator/scanner/storage**와
-    올바른 trade_date·scan_ok로 호출한다."""
-    coordinator = MagicMock()
-    coordinator._run_discovery_scan = AsyncMock(return_value=True)
+    오늘(naive) trade_date·scan_ok로 호출한다."""
+    coordinator = _coordinator(persistence_active=True, scan_ok=True)
     app.dependency_overrides[get_trading_coordinator] = lambda: coordinator
     fake_scanner = MagicMock()
     fake_storage = MagicMock()
@@ -100,17 +132,18 @@ async def test_discovery_run_spawns_scan_then_pipeline_with_live_singletons():
             "run_discovery_pipeline",
             new=AsyncMock(return_value={"promoted": ["005930"], "scan_ok": True}),
         ) as pipeline:
-            resp = await _post({"date": "2026-07-21"})
+            resp = await _post()
             await _drain_discovery_jobs()
     finally:
         app.dependency_overrides.clear()
 
+    today = datetime.now().strftime("%Y-%m-%d")
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
     assert body["enabled"] is True
     assert body["started"] is True
-    assert body["trade_date"] == "2026-07-21"
+    assert body["trade_date"] == today
 
     coordinator._run_discovery_scan.assert_awaited_once()
     pipeline.assert_awaited_once()
@@ -118,15 +151,14 @@ async def test_discovery_run_spawns_scan_then_pipeline_with_live_singletons():
     assert kwargs["coordinator"] is coordinator  # 라이브 싱글턴 그대로
     assert kwargs["scanner"] is fake_scanner
     assert kwargs["storage"] is fake_storage
-    assert kwargs["trade_date"] == "2026-07-21"
+    assert kwargs["trade_date"] == today
     assert kwargs["scan_ok"] is True
 
 
-async def test_discovery_run_defaults_trade_date_to_today_naive():
-    """date 생략 시 trade_date = 서버 로컬 오늘(naive) — 마감 체인과 동일 계산
-    (스캔 세션 started_at 날짜 매칭 불변식)."""
-    coordinator = MagicMock()
-    coordinator._run_discovery_scan = AsyncMock(return_value=False)
+async def test_discovery_run_scan_not_ok_still_calls_pipeline():
+    """scan_ok=False여도 파이프라인은 호출된다(backfill은 scan_ok 무관 —
+    파이프라인 내부가 소유). trade_date는 오늘, scan_ok=False로 전달."""
+    coordinator = _coordinator(persistence_active=True, scan_ok=False)
     app.dependency_overrides[get_trading_coordinator] = lambda: coordinator
     try:
         with patch.object(
@@ -138,7 +170,7 @@ async def test_discovery_run_defaults_trade_date_to_today_naive():
         ), patch.object(
             trading_module, "run_discovery_pipeline", new=AsyncMock(return_value=None)
         ) as pipeline:
-            resp = await _post({})
+            resp = await _post()
             await _drain_discovery_jobs()
     finally:
         app.dependency_overrides.clear()
@@ -146,8 +178,6 @@ async def test_discovery_run_defaults_trade_date_to_today_naive():
     today = datetime.now().strftime("%Y-%m-%d")
     assert resp.status_code == 200
     assert resp.json()["trade_date"] == today
-    # scan_ok=False여도 파이프라인은 호출된다(backfill은 scan_ok 무관 — 파이프라인
-    # 내부가 소유). trade_date는 요청 시점 오늘로 넘어간다.
     pipeline.assert_awaited_once()
     _, kwargs = pipeline.call_args
     assert kwargs["trade_date"] == today

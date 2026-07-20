@@ -700,6 +700,28 @@ async def _persist_ledger(storage, candidates: list[Candidate]) -> None:
         logger.error("discovery_ledger_persist_failed", error=str(e))
 
 
+async def _prior_promoted_count(storage, trade_date: Optional[str]) -> int:
+    """How many candidates were ALREADY promoted for `trade_date` (DS-3
+    ledger). Seeds `promote_candidates`' regime daily-cap counter so the cap
+    is enforced per-trade_date ACROSS multiple same-day pipeline runs — e.g.
+    a manual POST /trading/discovery/run before open plus the scheduler's own
+    market-close-edge run at 15:30, both stamping today's trade_date. Without
+    this, each call's counter restarts at 0 and the day could promote up to
+    2x the regime daily cap of distinct new tickers (the already-watched gate
+    only dedupes the SAME tickers, not the count). Fails OPEN (0) on any
+    error, mirroring `_cooldown_blocked`. The normal single-run-per-day case
+    has zero prior promotions → seed 0 → behaviour identical to before."""
+    if not trade_date:
+        return 0
+    try:
+        return await storage.count_promoted_discovery_candidates(trade_date)
+    except Exception as e:
+        logger.warning(
+            "discovery_prior_promoted_lookup_failed", trade_date=trade_date, error=str(e)
+        )
+        return 0
+
+
 async def promote_candidates(coordinator, storage, candidates: list[Candidate]) -> PromoteSummary:
     """Apply every conservative gate (spec Section 5) in order, promote
     survivors into `coordinator`'s watch list (`source='discovery'`), and
@@ -741,7 +763,10 @@ async def promote_candidates(coordinator, storage, candidates: list[Candidate]) 
     )
 
     held_tickers = {p.ticker for p in coordinator.state.positions}
-    daily_promoted = 0
+    # Seed from the ledger so the regime daily cap holds per-trade_date across
+    # multiple same-day runs (manual /trading/discovery/run + scheduler close
+    # edge). First run of the day → 0 → identical to the pre-seeding behaviour.
+    daily_promoted = await _prior_promoted_count(storage, trade_date)
     stop_pct, tp_pct = _resolve_exit_pcts(coordinator)
 
     for c in eligible:

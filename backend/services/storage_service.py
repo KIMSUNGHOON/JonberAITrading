@@ -2727,6 +2727,32 @@ class StorageService:
             logger.error("discovery_candidates_get_failed", error=str(e))
             return []
 
+    async def count_promoted_discovery_candidates(self, trade_date: str) -> int:
+        """Count rows in discovery_candidates for `trade_date` with
+        promoted=1. Used by ranker.promote_candidates to seed the per-
+        trade_date regime daily cap so the cap holds across MULTIPLE same-day
+        pipeline runs (manual POST /trading/discovery/run + the scheduler's
+        market-close-edge run). A dedicated COUNT (not get_discovery_
+        candidates + client-side count) is required because that method is
+        newest-first + LIMIT-bounded and could miss an earlier run's promoted
+        rows behind a large later batch. Fails OPEN (0) on any storage error
+        — the caller must never block promotion on a lookup failure."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM discovery_candidates "
+                    "WHERE trade_date = ? AND promoted = 1",
+                    (trade_date,),
+                )
+                row = await cursor.fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+        except Exception as e:
+            logger.error(
+                "discovery_promoted_count_failed", trade_date=trade_date, error=str(e)
+            )
+            return 0
+
     async def update_discovery_forward_returns(
         self,
         id: str,

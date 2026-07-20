@@ -860,6 +860,43 @@ async def test_promote_daily_cap_bearish_limits_to_two(storage, coordinator):
     assert candidates[2].skip_reason == "daily_cap"
 
 
+async def test_promote_daily_cap_counts_prior_same_date_promotions(storage, coordinator):
+    """Important 봉합: 같은 trade_date에 이미 승격된 후보가 원장에 있으면 그
+    수만큼 일일 캡이 미리 차감된다 — 수동 POST /trading/discovery/run(개장 전)과
+    스케줄러 마감 엣지(15:30)가 같은 날 각각 파이프라인을 돌려도 일일 캡이 2배로
+    늘지 않도록. per-call 카운터라면 신규 티커 2건이 또 승격됐겠지만, 원장 시드
+    (2) 덕에 bearish 캡(2)에 이미 도달해 전부 skip된다."""
+    trade_date = "2026-07-20"
+    # 오전 수동 실행이 이미 승격해 원장에 남긴 2건(같은 trade_date, promoted=1).
+    await storage.save_discovery_candidates(
+        [
+            {
+                "trade_date": trade_date, "ticker": t, "name": t,
+                "composite_score": 0.9,
+                "strategy_scores_json": {"momentum": 0.9, "pullback": 0.1, "flow": 0.1, "meanrev": 0.0},
+                "regime_label": "bearish", "rank": i + 1,
+                "llm_verdict_json": {"suitable": True}, "promoted": 1,
+                "skip_reason": None, "close_price": 50000.0,
+            }
+            for i, t in enumerate(["100001", "100002"])
+        ]
+    )
+
+    # 두 번째 실행: 완전히 다른 신규 티커들. 캡이 per-call로 리셋되면 2건 승격됐겠지만
+    # 원장 시드(2)로 daily_cap(2)에 이미 도달 → 전부 daily_cap skip.
+    fresh = [
+        _candidate(
+            f"20000{i}", trade_date=trade_date, composite=0.90 - i * 0.01,
+            rank=i + 1, threshold=0.65, daily_cap=2, regime_label="bearish",
+        )
+        for i in range(2)
+    ]
+    summary = await promote_candidates(coordinator, storage, fresh)
+
+    assert summary.promoted == []
+    assert all(c.skip_reason == "daily_cap" for c in fresh)
+
+
 async def test_promote_cooldown_blocks_repromotion_within_7_days(storage, coordinator):
     trade_date = "2026-07-20"
     past_date = "2026-07-17"  # 3 calendar days before trade_date -> within cooldown
