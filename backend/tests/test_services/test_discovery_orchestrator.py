@@ -1007,3 +1007,173 @@ async def test_notify_eod_summary_discovery_refresh_on_calls_build_section(
     assert result is True
     assert len(build_calls) == 1
     assert build_calls[0][1] == today
+
+
+
+# ---------------------------------------------------------------------------
+# ⑧ SC-2: 동적 스캔 타임아웃 (docs/superpowers/specs/
+#    2026-07-20-scan-reliability-design.md §2) -- 고정 5400s 캡이 4276종목x2콜
+#    x0.7s=99.8분 이론치 앞에서 구조적으로 초과되던 문제. 계약(브리프 그대로):
+#    `timeout = max(5400, min(14400, int(U*1.5*1.3+600)))`, U는
+#    scanner.get_progress().total_stocks를 스캔 시작 확인 시점에 읽는다.
+#    U 취득 실패(None/0/음수) = 5400 폴백. 브리프 5종:
+#    ①clamp 내부(U=4276) ②하한(U=1000) ③상한(U=15000) ④폴백 ⑤로그.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_discovery_scan_timeout_within_clamp_range():
+    """① U=4276(오늘 실측 전체 유니버스) -- 공식 그대로 계산한 값이 클램프
+    구간(5400~14400) 내부에 떨어진다. 정확한 산식: 4276*1.5*1.3+600=8938.2
+    -> int 8938 (스펙/브리프 산문의 "≈8340"은 +600 버퍼를 더하기 전 값의
+    반올림 근사이고, 계약의 원문인 `max(5400, min(14400, int(U*1.5*1.3+600)))`
+    공식이 SSOT이므로 이 정확한 값을 그대로 고정한다)."""
+    result = coordinator_module._compute_discovery_scan_timeout_seconds(4276)
+
+    assert result == 8938.0
+    assert 5400.0 <= result <= 14400.0
+
+
+def test_compute_discovery_scan_timeout_floor_clamp_small_universe():
+    """② U=1000 -> raw=1000*1.5*1.3+600=2550 (< 5400 하한) -> 5400 클램프."""
+    result = coordinator_module._compute_discovery_scan_timeout_seconds(1000)
+    assert result == 5400.0
+
+
+def test_compute_discovery_scan_timeout_cap_clamp_large_universe():
+    """③ U=15000 -> raw=15000*1.5*1.3+600=29850 (> 14400 상한) -> 14400 클램프."""
+    result = coordinator_module._compute_discovery_scan_timeout_seconds(15000)
+    assert result == 14400.0
+
+
+def test_compute_discovery_scan_timeout_fallback_when_universe_unreadable():
+    """④ U 취득 실패(None/0/음수) -> 클램프 산식 미적용, 고정 5400 폴백."""
+    assert coordinator_module._compute_discovery_scan_timeout_seconds(None) == 5400.0
+    assert coordinator_module._compute_discovery_scan_timeout_seconds(0) == 5400.0
+    assert coordinator_module._compute_discovery_scan_timeout_seconds(-1) == 5400.0
+
+
+def test_compute_discovery_scan_timeout_logs_computation_evidence(caplog):
+    """⑤ 산출 근거 info 로그 -- event명 `discovery_scan_timeout_computed` +
+    universe/raw_seconds/clamped_seconds가 로그 메시지에 노출된다."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
+        coordinator_module._compute_discovery_scan_timeout_seconds(4276)
+
+    matching = [
+        r for r in caplog.records if "discovery_scan_timeout_computed" in r.getMessage()
+    ]
+    assert len(matching) == 1
+    msg = matching[0].getMessage()
+    assert "universe=4276" in msg
+    assert "raw_seconds=8938.2" in msg
+    assert "clamped_seconds=8938" in msg
+
+
+def test_compute_discovery_scan_timeout_fallback_also_logs(caplog):
+    """폴백 경로도 근거 로그를 남긴다(⑤의 대칭 케이스) -- universe 필드는
+    실패값을 그대로 노출하고, fallback임을 메시지에서 식별 가능해야 한다."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger=coordinator_module.__name__):
+        coordinator_module._compute_discovery_scan_timeout_seconds(None)
+
+    matching = [
+        r for r in caplog.records if "discovery_scan_timeout_computed" in r.getMessage()
+    ]
+    assert len(matching) == 1
+    msg = matching[0].getMessage()
+    assert "clamped_seconds=5400.0" in msg
+    assert "fallback" in msg
+
+
+class _UniverseAwareInstantCompleteScanner:
+    """`_InstantCompleteScanner`와 동일한 RUNNING-once-then-COMPLETED 셔틀
+    이되, `get_progress()`가 `total_stocks`도 함께 실어 나른다 -- SC-2가
+    실제 스캐너에서 읽는 필드를 목이 흉내내야 배선(와이어링) 자체를
+    검증할 수 있다(순수 함수 단위 테스트만으로는 `_run_discovery_scan`이
+    그 값을 실제로 읽어 `asyncio.wait_for`에 넘기는지 확인 못함)."""
+
+    def __init__(self, calls, total_stocks: int):
+        self._calls = calls
+        self._get_progress_calls = 0
+        self.is_running = False
+        self._total_stocks = total_stocks
+
+    async def start_scan(self, **kwargs):
+        self._calls.append(("scanner.start_scan", kwargs))
+        self.is_running = True
+
+    def get_progress(self):
+        self._get_progress_calls += 1
+        status = ScanStatus.RUNNING if self._get_progress_calls == 1 else ScanStatus.COMPLETED
+        return SimpleNamespace(status=status, total_stocks=self._total_stocks)
+
+    async def stop_scan(self):
+        self._calls.append(("scanner.stop_scan", {}))
+
+    def get_results(self):
+        return []
+
+
+async def test_run_discovery_scan_wires_universe_into_dynamic_timeout(monkeypatch):
+    """통합 배선 확인: `_run_discovery_scan`이 스캔 시작 확인 직후의
+    progress 스냅샷에서 total_stocks(=4276)를 읽어 SC-2 산식 결과
+    (8938.0)를 그대로 `asyncio.wait_for`의 timeout으로 전달한다 -- 옛
+    고정값 `_DISCOVERY_SCAN_TIMEOUT_SECONDS`(5400.0)가 아니라."""
+    import asyncio as asyncio_module
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    calls: list = []
+    scanner = _UniverseAwareInstantCompleteScanner(calls, total_stocks=4276)
+
+    async def _fake_get_background_scanner():
+        return scanner
+
+    monkeypatch.setattr(coordinator_module, "get_background_scanner", _fake_get_background_scanner)
+
+    captured_timeouts = []
+    real_wait_for = asyncio_module.wait_for
+
+    async def _spy_wait_for(coro, timeout=None):
+        captured_timeouts.append(timeout)
+        return await real_wait_for(coro, timeout=timeout)
+
+    monkeypatch.setattr(coordinator_module.asyncio, "wait_for", _spy_wait_for)
+
+    result = await coord._run_discovery_scan()
+
+    assert result is True
+    assert captured_timeouts == [8938.0]
+
+
+async def test_run_discovery_scan_falls_back_to_static_timeout_when_universe_missing(monkeypatch):
+    """`get_progress()`가 total_stocks를 실어 나르지 않는(구형/축약) 목
+    스캐너 -- SC-2 이전부터 있던 `_InstantCompleteScanner`가 정확히 이
+    형태다 -- 에서는 정적 폴백(`_DISCOVERY_SCAN_TIMEOUT_SECONDS`)이 그대로
+    `asyncio.wait_for`에 전달되어, SC-1 이전 회귀 스위트가 무수정으로
+    계속 통과하는 이유를 명시적으로 고정한다."""
+    import asyncio as asyncio_module
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    calls: list = []
+    scanner = _InstantCompleteScanner(calls)  # no total_stocks attribute
+
+    async def _fake_get_background_scanner():
+        return scanner
+
+    monkeypatch.setattr(coordinator_module, "get_background_scanner", _fake_get_background_scanner)
+
+    captured_timeouts = []
+    real_wait_for = asyncio_module.wait_for
+
+    async def _spy_wait_for(coro, timeout=None):
+        captured_timeouts.append(timeout)
+        return await real_wait_for(coro, timeout=timeout)
+
+    monkeypatch.setattr(coordinator_module.asyncio, "wait_for", _spy_wait_for)
+
+    result = await coord._run_discovery_scan()
+
+    assert result is True
+    assert captured_timeouts == [coordinator_module._DISCOVERY_SCAN_TIMEOUT_SECONDS]

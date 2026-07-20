@@ -60,16 +60,89 @@ logger = logging.getLogger(__name__)
 
 
 # DS-5: discovery EOD-chain scan-trigger wait, behind the DISCOVERY_ENABLED
-# kill switch (app/config.py). Cap mirrors spec §3/§8 (90 min scan window;
-# past this a timeout is logged and the rest of the chain proceeds with
-# promotion skipped for the day, never blocking the market-close scheduler
-# tick). Poll interval mirrors the brief's "실코드 수단이 폴링이면 5s
-# 간격" instruction — BackgroundScanner exposes no completion event/future
-# to await directly, only ScanStatus via the existing get_progress() (the
-# same public surface app/api/routes/scanner.py's own status polling
-# already uses).
+# kill switch (app/config.py). SC-2 (docs/superpowers/specs/
+# 2026-07-20-scan-reliability-design.md §2) made the wait dynamic — the old
+# static 90-minute cap was a structural undercount (4276 stocks x 2 calls x
+# 0.7s rate-limiter interval = ~99.8 theoretical minutes, before any safety
+# margin, so a full-universe scan could exceed it on the API-call count
+# alone). `_DISCOVERY_SCAN_TIMEOUT_SECONDS` below is now the FLOOR (never
+# time out faster than the old cap, even for a tiny universe) and also the
+# FALLBACK used when the universe size can't be read (see
+# `_compute_discovery_scan_timeout_seconds`). Poll interval mirrors the
+# brief's "실코드 수단이 폴링이면 5s 간격" instruction — BackgroundScanner
+# exposes no completion event/future to await directly, only ScanStatus via
+# the existing get_progress() (the same public surface
+# app/api/routes/scanner.py's own status polling already uses).
 _DISCOVERY_SCAN_TIMEOUT_SECONDS = 5400.0
 _DISCOVERY_SCAN_POLL_INTERVAL_SECONDS = 5.0
+
+# SC-2 dynamic-timeout tuning constants — all from spec §2 SC-2, kept
+# separate (not folded into one magic expression) so each has its own
+# rationale on record:
+#   - PER_STOCK: theoretical per-ticker API cost. Discovery collection makes
+#     2 calls/stock (ka10001 + ka10081), both funneled through
+#     rate_limiter.py's single shared 0.7s-interval query bucket -> 1.4s/
+#     stock theoretical (measured ~1.46s live, ~4% overhead). Rounded up to
+#     1.5s as the baseline the spec anchors the formula on.
+#   - SAFETY_FACTOR: +30% margin over the theoretical estimate for network
+#     jitter/retries so the timeout isn't shaving the estimate too close.
+#   - BUFFER: fixed +600s (10 min) added after the per-stock estimate for
+#     scan startup overhead and tail latency on the last few stocks.
+#   - CAP: 4h hard ceiling — the close-to-open window is ~17.5h, so even the
+#     largest plausible universe can't stall the EOD chain behind this call
+#     indefinitely (spec §4 risk table).
+_DISCOVERY_SCAN_TIMEOUT_PER_STOCK_SECONDS = 1.5
+_DISCOVERY_SCAN_TIMEOUT_SAFETY_FACTOR = 1.3
+_DISCOVERY_SCAN_TIMEOUT_BUFFER_SECONDS = 600.0
+_DISCOVERY_SCAN_TIMEOUT_CAP_SECONDS = 14400.0
+
+
+def _compute_discovery_scan_timeout_seconds(universe: Optional[int]) -> float:
+    """SC-2: universe-proportional discovery scan timeout.
+
+    ``timeout = clamp(universe * 1.5 * 1.3 + 600, floor=_DISCOVERY_SCAN_
+    TIMEOUT_SECONDS(5400), cap=_DISCOVERY_SCAN_TIMEOUT_CAP_SECONDS(14400))``
+    (spec §2 SC-2, verbatim). `universe` is expected to be the scanner's own
+    `get_progress().total_stocks`, read right after the post-start_scan
+    RUNNING confirmation (see `_run_discovery_scan`) — by that point
+    `BackgroundScanner.start_scan()` has already synchronously populated
+    `total_stocks = len(stock_list)` on `self._progress` before returning
+    (scanner.py — set well before the scan task itself is created), so no
+    extra poll/wait for it is needed.
+
+    Falls back to the static floor/cap-independent `_DISCOVERY_SCAN_
+    TIMEOUT_SECONDS` when `universe` couldn't be read (None or <= 0) — same
+    behavior as the pre-SC-2 fixed timeout for that case.
+    """
+    if not universe or universe <= 0:
+        fallback = _DISCOVERY_SCAN_TIMEOUT_SECONDS
+        logger.info(
+            "[Coordinator] discovery_scan_timeout_computed universe=%r "
+            "raw_seconds=None clamped_seconds=%s (fallback: universe "
+            "unavailable)",
+            universe,
+            fallback,
+        )
+        return fallback
+
+    raw_seconds = (
+        universe
+        * _DISCOVERY_SCAN_TIMEOUT_PER_STOCK_SECONDS
+        * _DISCOVERY_SCAN_TIMEOUT_SAFETY_FACTOR
+        + _DISCOVERY_SCAN_TIMEOUT_BUFFER_SECONDS
+    )
+    clamped_seconds = max(
+        _DISCOVERY_SCAN_TIMEOUT_SECONDS,
+        min(_DISCOVERY_SCAN_TIMEOUT_CAP_SECONDS, int(raw_seconds)),
+    )
+    logger.info(
+        "[Coordinator] discovery_scan_timeout_computed universe=%s "
+        "raw_seconds=%.1f clamped_seconds=%s",
+        universe,
+        raw_seconds,
+        clamped_seconds,
+    )
+    return float(clamped_seconds)
 
 
 # Actions that grow exposure map to a BUY order; everything else reduces it and
@@ -2691,9 +2764,12 @@ class ExecutionCoordinator:
 
     async def _run_discovery_scan(self) -> bool:
         """DS-5: trigger a discovery-mode background scan and wait for it to
-        finish, capped at `_DISCOVERY_SCAN_TIMEOUT_SECONDS` (spec §3/§8:
-        90 min). Only ever called from `_check_queue_on_market_open` behind
-        the `settings.DISCOVERY_ENABLED` kill switch.
+        finish, capped at a SC-2 dynamic, universe-proportional timeout (see
+        `_compute_discovery_scan_timeout_seconds`; floor/fallback
+        `_DISCOVERY_SCAN_TIMEOUT_SECONDS`, cap `_DISCOVERY_SCAN_TIMEOUT_
+        CAP_SECONDS` — spec §2 SC-2). Only ever called from
+        `_check_queue_on_market_open` behind the `settings.DISCOVERY_ENABLED`
+        kill switch.
 
         Never raises — every branch below is defensive and returns False on
         anything but a clean scan-session status of ScanStatus.COMPLETED, so
@@ -2741,12 +2817,24 @@ class ExecutionCoordinator:
             logger.warning(f"[Coordinator] Discovery scan failed to start: {e}")
             return False
 
-        if scanner.get_progress().status != ScanStatus.RUNNING:
+        progress_after_start = scanner.get_progress()
+        if progress_after_start.status != ScanStatus.RUNNING:
             logger.warning(
                 "[Coordinator] Discovery scan did not start (scanner busy?) "
                 "— skipping today's discovery"
             )
             return False
+
+        # SC-2: read the universe size off the SAME progress snapshot used
+        # for the RUNNING confirmation above (no extra get_progress() call)
+        # — `start_scan()` has already synchronously set `total_stocks =
+        # len(stock_list)` by the time it returns (scanner.py), so this is
+        # never a stale/pre-scan read. `getattr` (not `.total_stocks`
+        # directly) tolerates progress objects that don't carry the field at
+        # all, which folds into the same "universe unavailable" fallback
+        # path as a real 0/None reading.
+        universe = getattr(progress_after_start, "total_stocks", None)
+        timeout_seconds = _compute_discovery_scan_timeout_seconds(universe)
 
         async def _poll_until_not_running() -> None:
             while scanner.get_progress().status == ScanStatus.RUNNING:
@@ -2754,13 +2842,13 @@ class ExecutionCoordinator:
 
         try:
             await asyncio.wait_for(
-                _poll_until_not_running(), timeout=_DISCOVERY_SCAN_TIMEOUT_SECONDS
+                _poll_until_not_running(), timeout=timeout_seconds
             )
         except asyncio.TimeoutError:
             logger.warning(
                 f"[Coordinator] Discovery scan timed out after "
-                f"{_DISCOVERY_SCAN_TIMEOUT_SECONDS}s — proceeding with EOD "
-                "chain, promotion skipped for today"
+                f"{timeout_seconds}s (universe={universe}) — proceeding "
+                "with EOD chain, promotion skipped for today"
             )
             try:
                 await scanner.stop_scan()
