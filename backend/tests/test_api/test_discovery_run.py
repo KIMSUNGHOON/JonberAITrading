@@ -155,6 +155,43 @@ async def test_discovery_run_spawns_scan_then_pipeline_with_live_singletons():
     assert kwargs["scan_ok"] is True
 
 
+async def test_discovery_run_aborts_pipeline_if_stopped_mid_scan():
+    """TOCTOU 방어: 요청 시점엔 기동돼 있어 스캔은 시작하지만, 스캔(수 시간)
+    도중 /trading/stop이 _persistence_active를 False로 되돌리면 승격 직전
+    재확인에서 파이프라인을 건너뛴다(미영속 승격→_restore_state 증발 방지)."""
+    coordinator = _coordinator(persistence_active=True)
+
+    async def _scan_then_stop():
+        # 스캔이 도는 사이 사용자가 /trading/stop 한 상황을 흉내: 스캔 완료 후
+        # coordinator가 미기동 상태로 바뀐다.
+        coordinator._persistence_active = False
+        return True
+
+    coordinator._run_discovery_scan = AsyncMock(side_effect=_scan_then_stop)
+    app.dependency_overrides[get_trading_coordinator] = lambda: coordinator
+    try:
+        with patch.object(
+            trading_module, "get_settings", return_value=_settings(True)
+        ), patch.object(
+            trading_module, "get_storage_service", new=AsyncMock(return_value=MagicMock())
+        ), patch.object(
+            trading_module, "get_background_scanner", new=AsyncMock(return_value=MagicMock())
+        ), patch.object(
+            trading_module, "run_discovery_pipeline", new=AsyncMock()
+        ) as pipeline:
+            resp = await _post()
+            await _drain_discovery_jobs()
+    finally:
+        app.dependency_overrides.clear()
+
+    # 요청 시점 가드는 통과했으므로 started=True로 스캔은 시작됐지만...
+    assert resp.status_code == 200
+    assert resp.json()["started"] is True
+    coordinator._run_discovery_scan.assert_awaited_once()
+    # ...승격 직전 재확인에서 미기동을 감지해 파이프라인은 호출되지 않는다.
+    pipeline.assert_not_awaited()
+
+
 async def test_discovery_run_scan_not_ok_still_calls_pipeline():
     """scan_ok=False여도 파이프라인은 호출된다(backfill은 scan_ok 무관 —
     파이프라인 내부가 소유). trade_date는 오늘, scan_ok=False로 전달."""

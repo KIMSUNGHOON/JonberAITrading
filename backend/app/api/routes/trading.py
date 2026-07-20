@@ -1207,6 +1207,19 @@ async def run_discovery_now(coordinator=Depends(get_trading_coordinator)):
         # (coordinator.py:2920/2938 try/except)를 동일하게 한 번 더 감싼다.
         try:
             scan_ok = await coordinator._run_discovery_scan()
+            # TOCTOU 방어(리뷰 Minor): 스캔이 수 시간이라 그 사이 /trading/stop이
+            # _persistence_active를 다시 False로 되돌릴 수 있다. 그 상태에서 승격하면
+            # add_to_watch_list가 영속되지 않고 다음 /trading/start의 _restore_state가
+            # 덮어써 승격이 조용히 증발한다(요청 시점 가드로는 못 막는 잔여 창).
+            # 승격 직전 재확인해 미기동이면 파이프라인을 건너뛴다.
+            if not getattr(coordinator, "_persistence_active", False):
+                logger.warning(
+                    "[Discovery] manual run aborted before pipeline — trading "
+                    "stopped mid-scan (_persistence_active False); skipping promotion "
+                    "to avoid unpersisted-then-clobbered watch entries. trade_date=%s",
+                    trade_date,
+                )
+                return
             summary = await run_discovery_pipeline(
                 coordinator=coordinator,
                 storage=await get_storage_service(),
