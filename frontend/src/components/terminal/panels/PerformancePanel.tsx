@@ -16,7 +16,7 @@ import { useTradeNotifications } from '@/hooks/useTradeNotifications';
 import type {
   PerformanceDailyPoint, PerformanceResponse, EodReportResponse,
   EodDigest, EodDigestWatchItem, EodDigestAccount, EodDigestHolding,
-  EodDigestStrategy, EodDigestRegime,
+  EodDigestStrategy, EodDigestRegime, EodDigestDiscovery, EodDigestDiscoveryPromoted,
 } from '@/types';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting, DASH, TH, fmtInt, fmtPct, fmtPrice } from './shared';
@@ -321,6 +321,13 @@ function EodStrategyBlock({
       </div>
       <div className="text-dim text-[10px] mt-1">
         시장 레짐 {regime?.label ?? DASH} · KOSPI {fmtPct(regime?.index_kospi_chg_pct)} · KOSDAQ {fmtPct(regime?.index_kosdaq_chg_pct)}
+        {/* FI-3: scan_coverage_pct is honestly absent (not DASH) when the
+            regime snapshot never recorded a breadth figure -- unlike the
+            KPI cells above, there is no "failed lookup" story here, just
+            "this field doesn't apply today". */}
+        {regime?.scan_coverage_pct != null && (
+          <> · 스캔 커버리지 {regime.scan_coverage_pct.toFixed(1)}%</>
+        )}
       </div>
       {strategy.rationale_excerpt && (
         <div className="text-muted mt-1.5 leading-snug">{strategy.rationale_excerpt}</div>
@@ -347,7 +354,80 @@ function EodStrategyBlock({
   );
 }
 
-/** narrative 없을 때의 4블록 템플릿: 워치 표 · 잔고 카드 · 보유 표 · 전략 스탠스+노브. */
+/**
+ * FI-3: DS-5's discovery ledger section (오늘 승격 종목·스킵 카운트·전일
+ * fwd_1d 요약). `discovery` is `undefined`/`null` for report rows persisted
+ * before DS-5 landed, or when the discovery ledger has genuinely never been
+ * written to (feature never used) -- in both cases this renders nothing at
+ * all, matching the pre-FI-3 layout exactly ("기존 불변" per the brief).
+ * Once the ledger has ANY history, `discovery` is an always-present object
+ * (possibly all-empty for "ran today, nothing to report"), which DOES
+ * render the block with an honest empty-state message rather than vanish.
+ */
+function EodDiscoveryPromotedTable({ promoted }: { promoted: EodDigestDiscoveryPromoted[] }) {
+  if (!promoted || promoted.length === 0) {
+    return <div className="px-0 py-1 text-[11px] text-dim">오늘 승격 종목 없음</div>;
+  }
+  return (
+    <table className="w-full text-[11px] tabular-nums">
+      <thead>
+        <tr>
+          <th className={`${TH} text-left`}>종목</th>
+          <th className={TH}>종합점수</th>
+          <th className={`${TH} text-left`}>최고기여전략</th>
+        </tr>
+      </thead>
+      <tbody>
+        {promoted.map((p, i) => (
+          <tr key={p.ticker ?? i} className="border-b border-hairline last:border-b-0">
+            <td className="text-left px-2 py-1 truncate max-w-[110px]">{p.name ?? p.ticker ?? DASH}</td>
+            <td className="text-right px-2 py-1">{p.composite_score != null ? p.composite_score.toFixed(3) : DASH}</td>
+            <td className="text-left px-2 py-1 text-muted">{p.top_strategy_tag ?? DASH}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+/**
+ * discovery_candidates.fwd_1d is a raw fraction ((price/close_price) - 1.0,
+ * see ledger.py), NOT pre-scaled like EodDigestAccount.cumulative_return_pct
+ * -- fmtPct() would render 0.0123 as "+0.01%" instead of the intended
+ * "+1.23%", so this multiplies by 100 explicitly rather than reusing it.
+ */
+function fmtFwdPct(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return DASH;
+  const pct = n * 100;
+  return `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
+}
+
+function EodDiscoveryBlock({ discovery }: { discovery: EodDigestDiscovery | null | undefined }) {
+  if (!discovery) return null;
+  const skipEntries = Object.entries(discovery.skip_counts ?? {});
+  const prevDay = discovery.prev_day;
+  return (
+    <div className="px-2.5 py-2 text-[11px]">
+      <div className="text-[10px] uppercase tracking-wide text-muted mb-1">발굴 현황</div>
+      <EodDiscoveryPromotedTable promoted={discovery.promoted} />
+      <div className="text-dim text-[10px] mt-1.5">
+        오늘 후보 {discovery.total_candidates}건
+        {skipEntries.length > 0 && (
+          <> · 스킵 {skipEntries.map(([reason, count]) => `${reason} ${count}`).join(' · ')}</>
+        )}
+      </div>
+      {prevDay && (
+        <div className="text-dim text-[10px] mt-1">
+          전일({prevDay.trade_date ?? DASH}) 후보 {prevDay.candidate_count}건
+          {' · '}fwd_1d 집계 {prevDay.fwd_1d_filled_count}건
+          {' · '}평균 {fmtFwdPct(prevDay.avg_fwd_1d)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** narrative 없을 때의 5블록 템플릿: 워치 표 · 잔고 카드 · 보유 표 · 전략 스탠스+노브 · 발굴 현황(FI-3). */
 function EodDigestFallback({ digest }: { digest: EodDigest }) {
   return (
     <div className="flex flex-col gap-2">
@@ -355,6 +435,7 @@ function EodDigestFallback({ digest }: { digest: EodDigest }) {
       <EodAccountCard account={digest.account} />
       <EodHoldingsTable holdings={digest.holdings} />
       <EodStrategyBlock strategy={digest.strategy} regime={digest.regime} />
+      <EodDiscoveryBlock discovery={digest.discovery} />
     </div>
   );
 }

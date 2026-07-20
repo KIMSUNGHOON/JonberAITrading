@@ -1135,6 +1135,13 @@ export interface WatchedStock {
   risk_score: number;
   created_at: string;
   updated_at: string;
+  // FI-3: provenance -- 'manual' (user/analysis-flow add, backend default)
+  // vs 'discovery' (regime-weighted ranking auto-promotion). Already
+  // present on GET /trading/operations' watching rows (models.py::
+  // WatchedStock.source); optional here since older callers/fixtures
+  // predate the field and the FE treats a missing value identically to
+  // 'manual' (see OperationsPanel.WatchingColumn).
+  source?: string;
 }
 
 export interface WatchListResponse {
@@ -1625,6 +1632,40 @@ export interface EodDigestRegime {
   label: string | null;
   index_kospi_chg_pct: number | null;
   index_kosdaq_chg_pct: number | null;
+  // FI-2/FI-3: SC-3's scan breadth (% of the day's universe the discovery
+  // scan actually completed, 0-100) -- backend now forwards this
+  // (eod_digest.py::_build_regime_section), null when no breadth was
+  // recorded for the snapshot (e.g. discovery never ran that day).
+  scan_coverage_pct: number | null;
+}
+
+// FI-3: mirrors eod_digest.py::_build_discovery_section's promoted-row
+// shape verbatim (ticker/name/composite_score/top_strategy_tag).
+export interface EodDigestDiscoveryPromoted {
+  ticker: string | null;
+  name: string | null;
+  composite_score: number | null;
+  top_strategy_tag: string | null;
+}
+
+// FI-3: mirrors _build_discovery_section's prev_day summary (yesterday's
+// candidates' fwd_1d forward-return backfill status).
+export interface EodDigestDiscoveryPrevDay {
+  trade_date: string | null;
+  candidate_count: number;
+  fwd_1d_filled_count: number;
+  // Raw fraction (e.g. 0.0123 == +1.23%), NOT pre-scaled like
+  // cumulative_return_pct -- see eod_digest.py/ledger.py's
+  // `(price / close_price) - 1.0`. Render with an explicit *100, do not
+  // reuse fmtPct() as-is.
+  avg_fwd_1d: number | null;
+}
+
+export interface EodDigestDiscovery {
+  promoted: EodDigestDiscoveryPromoted[];
+  skip_counts: Record<string, number>;
+  total_candidates: number;
+  prev_day: EodDigestDiscoveryPrevDay | null;
 }
 
 export interface EodDigest {
@@ -1638,6 +1679,12 @@ export interface EodDigest {
   // (_compute_staleness_note) -- absent on the normal market-close chain's
   // digest, and always absent/null when strategy+regime are both current.
   staleness_note?: string | null;
+  // FI-3: build_eod_digest (backend) always includes this key going
+  // forward (DS-5), but report_json rows persisted before DS-5 landed
+  // simply lack it -- optional (not just nullable) so those old rows still
+  // type-check; the renderer treats missing exactly like null (block
+  // hidden, "기존 불변" per the FI-3 brief).
+  discovery?: EodDigestDiscovery | null;
   error?: string;
 }
 

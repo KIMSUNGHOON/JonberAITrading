@@ -303,11 +303,19 @@ export function WatchingColumn({
         const targetEntry = w.target_entry_price as number | null;
         const confidence = typeof w.confidence === 'number' ? w.confidence : null;
         const status = typeof w.status === 'string' ? w.status : null;
+        // FI-3: provenance badge -- 'discovery' (regime-weighted ranking
+        // auto-promotion, services/discovery/ranker.py) gets a small
+        // "발굴" label; 'manual' (the historical default, user/analysis-
+        // flow add) stays unbadged/unchanged.
+        const source = typeof w.source === 'string' ? w.source : 'manual';
         return (
           <div key={id ?? i} className={CARD}>
             <div className="font-semibold flex items-center gap-1.5">
               {name}
               <span className="text-dim text-[10px] font-normal">{ticker}</span>
+              {source === 'discovery' && (
+                <span className="text-[9px] px-1 py-px rounded bg-accent/10 text-accent font-medium">발굴</span>
+              )}
             </div>
             <div className="text-muted">
               현재 {fmtPrice(currentPrice, 'kiwoom')} · 목표진입 {fmtPrice(targetEntry, 'kiwoom')}

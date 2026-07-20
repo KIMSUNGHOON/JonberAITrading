@@ -352,6 +352,52 @@ it('큐가 비어있으면 Process 버튼을 렌더하지 않는다', async () =
 });
 
 // -------------------------------------------
+// FI-3: 감시 항목 provenance 배지 -- source='discovery'(regime-weighted
+// ranking auto-promotion)는 "발굴" 배지, 'manual'/미지정은 무배지.
+// -------------------------------------------
+
+it('감시 항목의 source가 discovery이면 "발굴" 배지를 렌더한다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    watching: [{
+      id: 'watch-1', ticker: '005930', stock_name: '삼성전자',
+      current_price: 71000, target_entry_price: 70000, confidence: 0.75, status: 'active',
+      source: 'discovery',
+    }],
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
+  expect(screen.getByText('발굴')).toBeInTheDocument();
+});
+
+it('감시 항목의 source가 manual이면 배지를 렌더하지 않는다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    watching: [{
+      id: 'watch-1', ticker: '005930', stock_name: '삼성전자',
+      current_price: 71000, target_entry_price: 70000, confidence: 0.75, status: 'active',
+      source: 'manual',
+    }],
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
+  expect(screen.queryByText('발굴')).not.toBeInTheDocument();
+});
+
+it('감시 항목에 source가 아예 없으면(레거시) manual과 동일하게 배지를 렌더하지 않는다', async () => {
+  getOperations.mockResolvedValue({
+    ...BASE,
+    watching: [{
+      id: 'watch-1', ticker: '005930', stock_name: '삼성전자',
+      current_price: 71000, target_entry_price: 70000, confidence: 0.75, status: 'active',
+    }],
+  });
+  render(<OperationsPanel />);
+  await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
+  expect(screen.queryByText('발굴')).not.toBeInTheDocument();
+});
+
+// -------------------------------------------
 // T7 review HIGH #2: coin has no sessions[] array — a single active-session
 // slot. Two concurrent AWAITING_APPROVAL coin sessions both render a row,
 // but the slot can only ever reflect one. Before this fix, clicking the

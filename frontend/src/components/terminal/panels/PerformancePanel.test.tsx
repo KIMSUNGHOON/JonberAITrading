@@ -148,8 +148,104 @@ const EOD_DIGEST_FIXTURE = {
     key_knobs: { stop_loss_pct: -3.0, take_profit_pct: 6.0, max_position_pct: 20.0, max_trade_notional_pct: 10.0 },
     changed: true,
   },
-  regime: { label: 'RISK_ON', index_kospi_chg_pct: 0.8, index_kosdaq_chg_pct: 1.1 },
+  // FI-3: scan_coverage_pct null by default -- most pre-existing tests
+  // below predate FI-3 and must keep NOT rendering the coverage line.
+  regime: { label: 'RISK_ON', index_kospi_chg_pct: 0.8, index_kosdaq_chg_pct: 1.1, scan_coverage_pct: null },
 };
+
+// -------------------------------------------
+// FI-3: EOD 리포트 discovery 섹션 + regime 스캔 커버리지
+// -------------------------------------------
+
+const DISCOVERY_FIXTURE = {
+  promoted: [
+    { ticker: '005930', name: '삼성전자', composite_score: 0.812, top_strategy_tag: 'momentum' },
+  ],
+  skip_counts: { below_threshold: 2, unknown: 1 },
+  total_candidates: 4,
+  prev_day: {
+    trade_date: '20260715', candidate_count: 12, fwd_1d_filled_count: 8, avg_fwd_1d: 0.0123,
+  },
+};
+
+it('EOD 리포트: discovery 섹션이 있으면 승격 종목·스킵 카운트·전일 fwd_1d 요약을 렌더한다', async () => {
+  getPerformance.mockResolvedValue(MINIMAL_PERFORMANCE);
+  getEodReport.mockResolvedValue({
+    trade_date: '20260716',
+    created_at: '2026-07-16T09:00:00+09:00',
+    digest: { ...EOD_DIGEST_FIXTURE, discovery: DISCOVERY_FIXTURE },
+    narrative: null,
+  });
+  render(<PerformancePanel />);
+  await waitFor(() => expect(screen.getByText('발굴 현황')).toBeInTheDocument());
+  // 승격 종목: 이름·종합점수·전략태그
+  expect(screen.getByText('momentum')).toBeInTheDocument();
+  expect(screen.getByText('0.812')).toBeInTheDocument();
+  // 스킵 카운트
+  expect(screen.getByText(/below_threshold 2/)).toBeInTheDocument();
+  expect(screen.getByText(/unknown 1/)).toBeInTheDocument();
+  // 전일 fwd_1d 요약 (0.0123 -> +1.23%, NOT +0.01%)
+  expect(screen.getByText(/전일\(20260715\)/)).toBeInTheDocument();
+  expect(screen.getByText(/\+1\.23%/)).toBeInTheDocument();
+});
+
+it('EOD 리포트: discovery가 null이면 발굴 현황 블록이 아예 렌더되지 않는다(기존 불변)', async () => {
+  getPerformance.mockResolvedValue(MINIMAL_PERFORMANCE);
+  getEodReport.mockResolvedValue({
+    trade_date: '20260716',
+    created_at: '2026-07-16T09:00:00+09:00',
+    digest: { ...EOD_DIGEST_FIXTURE, discovery: null },
+    narrative: null,
+  });
+  render(<PerformancePanel />);
+  await waitFor(() => expect(screen.getByText('BULLISH')).toBeInTheDocument());
+  expect(screen.queryByText('발굴 현황')).not.toBeInTheDocument();
+});
+
+it('EOD 리포트: discovery가 오늘 승격 종목 없이 존재하면(빈 원장 아님) 정직한 빈 상태를 렌더한다', async () => {
+  getPerformance.mockResolvedValue(MINIMAL_PERFORMANCE);
+  getEodReport.mockResolvedValue({
+    trade_date: '20260716',
+    created_at: '2026-07-16T09:00:00+09:00',
+    digest: {
+      ...EOD_DIGEST_FIXTURE,
+      discovery: { promoted: [], skip_counts: {}, total_candidates: 0, prev_day: null },
+    },
+    narrative: null,
+  });
+  render(<PerformancePanel />);
+  await waitFor(() => expect(screen.getByText('발굴 현황')).toBeInTheDocument());
+  expect(screen.getByText('오늘 승격 종목 없음')).toBeInTheDocument();
+  expect(screen.getByText(/오늘 후보 0건/)).toBeInTheDocument();
+});
+
+it('EOD 리포트: regime.scan_coverage_pct가 있으면 스캔 커버리지를 표시하고, null이면 표시하지 않는다', async () => {
+  getPerformance.mockResolvedValue(MINIMAL_PERFORMANCE);
+  getEodReport.mockResolvedValue({
+    trade_date: '20260716',
+    created_at: '2026-07-16T09:00:00+09:00',
+    digest: {
+      ...EOD_DIGEST_FIXTURE,
+      regime: { ...EOD_DIGEST_FIXTURE.regime, scan_coverage_pct: 84.0 },
+    },
+    narrative: null,
+  });
+  render(<PerformancePanel />);
+  await waitFor(() => expect(screen.getByText(/스캔 커버리지 84\.0%/)).toBeInTheDocument());
+});
+
+it('EOD 리포트: regime.scan_coverage_pct가 null이면 커버리지 문구를 렌더하지 않는다', async () => {
+  getPerformance.mockResolvedValue(MINIMAL_PERFORMANCE);
+  getEodReport.mockResolvedValue({
+    trade_date: '20260716',
+    created_at: '2026-07-16T09:00:00+09:00',
+    digest: EOD_DIGEST_FIXTURE, // scan_coverage_pct: null
+    narrative: null,
+  });
+  render(<PerformancePanel />);
+  await waitFor(() => expect(screen.getByText('BULLISH')).toBeInTheDocument());
+  expect(screen.queryByText(/스캔 커버리지/)).not.toBeInTheDocument();
+});
 
 it('EOD 리포트: narrative가 있으면 본문을 렌더하고 staleness_note 경고줄도 함께 표시한다', async () => {
   getPerformance.mockResolvedValue(MINIMAL_PERFORMANCE);
