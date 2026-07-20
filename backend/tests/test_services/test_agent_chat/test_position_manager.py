@@ -1536,15 +1536,19 @@ class TestStopSanity:
 
     @pytest.mark.asyncio
     async def test_restore_drops_insane_blob_entries(self, config, temp_storage):
-        """(b) The live-pollution shape: fixture stops 68875/79750 persisted for
-        005930 while the stock now trades at 90,000 — take_profit 79,750 <=
-        price would fire an instant take-profit storm on the first monitor
-        cycle after restore. The polluted entry must be skipped AND its values
-        dropped from the blob; the sane entry restores normally."""
+        """(b) The live-pollution shape: fixture stops 85000/80000 persisted
+        for 005930 while the stock now trades at 90,000 — stop_loss 85,000 >=
+        take_profit 80,000 is a self-contradictory pair independent of the
+        current price (D1b: `take_profit <= current_price` ALONE is no
+        longer this test's drop reason — that shape now restores/preserves,
+        see `test_restore_preserves_gap_through_tp_and_logs` below, which
+        reuses this test's PRE-D1b fixture values 68875/79750/90000 to pin
+        the inversion explicitly). The polluted entry must be skipped AND
+        its values dropped from the blob; the sane entry restores normally."""
         await temp_storage.set_app_setting(_STOPS_KEY, json.dumps({"stops": {
             "005930": {
-                "stop_loss": 68875.0,
-                "take_profit": 79750.0,
+                "stop_loss": 85000.0,
+                "take_profit": 80000.0,
                 "trailing_stop_pct": None,
             },
             "000660": {
@@ -1585,11 +1589,18 @@ class TestStopSanity:
         """(M1, final-review) A restore-drop was previously Telegram-silent —
         the human had no way to learn a position came back up from a restart
         with NO stop-loss/take-profit protection. The drop path must fire the
-        same best-effort notifier the decision-path rejection uses."""
+        same best-effort notifier the decision-path rejection uses.
+
+        Fixture (D1b, 2026-07-20 follow-up): stop_loss(85000) >=
+        take_profit(80000) is a genuinely still-insane structural violation
+        post-D1b (contradictory levels, independent of current price) —
+        the original 68875/79750/90000 fixture used here no longer drops
+        (that shape is a preserved tp gap-up now, see
+        `test_restore_preserves_gap_through_tp_and_logs`)."""
         await temp_storage.set_app_setting(_STOPS_KEY, json.dumps({"stops": {
             "005930": {
-                "stop_loss": 68875.0,
-                "take_profit": 79750.0,
+                "stop_loss": 85000.0,
+                "take_profit": 80000.0,
                 "trailing_stop_pct": None,
             },
         }}))
@@ -1805,6 +1816,202 @@ class TestStopSanity:
         assert pos.stop_loss == 1_700_000, (
             "decision-path gap-through stop must still be rejected -- _stops_sane "
             "is unchanged by G-1"
+        )
+        notifier.send_message.assert_awaited_once()
+
+    # ---- restore path: gap-through preservation, take_profit side (D1b,
+    # 2026-07-20 follow-up) ----
+    #
+    # 결정 D1b (spec docs/superpowers/specs/2026-07-20-gap-discipline-design.md
+    # §0, commit 614ded1): G-1이 stop_loss 갭 관통은 보존하면서 take_profit
+    # 갭업(take_profit <= current_price)은 여전히 "구조적 위법"으로 분류해
+    # 엔트리 전체(동반 스탑 + S-5 락인 트리거 포함)를 드롭하던 비대칭을
+    # 해소한다. 무해 근거: 익절은 토론 트리거일 뿐 자동 매도가 없다
+    # (auto_execute_take_profit=False, take_profit_mode=user_approval) --
+    # 보존해도 즉시 청산이 발생하지 않고, 오히려 보존해야 S-5 락인 트리거와
+    # 동반 스탑이 살아남는다. 잔존 구조적 위법은 가격 <= 0과 stop >= tp
+    # 두 가지뿐이다.
+
+    @pytest.mark.asyncio
+    async def test_restore_preserves_gap_through_tp_and_logs(self, config, temp_storage):
+        """⑥ D1b 반전 핀: 이 픽스처(stop_loss 68875 / take_profit 79750 /
+        current_price 90000)는 `test_restore_drops_insane_blob_entries`가
+        D1b 이전에 "폴루션(insane)"으로 드롭하던 정확히 그 값이다 --
+        take_profit(79750) <= current_price(90000)라는 이유만으로는 더 이상
+        구조적 위법이 아니다(stop(68875) < take(79750)이므로 stop>=take
+        모순도 아니다). D1b 이후에는 드롭 대신 보존 + 동반 스탑도 함께
+        생존 + `gap_through_tp_restored` info 로그(티커·익절가·현재가).
+        드롭이 아니므로 기각 통지는 발사되지 않는다. Pre-fix RED: 구
+        `_restore_stop_is_structurally_insane`가 이 엔트리를 통째로
+        드롭했다(스탑까지 함께)."""
+        await temp_storage.set_app_setting(_STOPS_KEY, json.dumps({"stops": {
+            "005930": {
+                "stop_loss": 68875.0,
+                "take_profit": 79750.0,
+                "trailing_stop_pct": None,
+            },
+        }}))
+
+        pm = PositionManager(config=config)
+        pm.add_position(
+            ticker="005930", stock_name="삼성전자", quantity=100,
+            avg_price=72500, current_price=90000,
+        )
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ), patch.object(pm_mod, "logger") as mock_logger:
+            restored = await pm.restore_stop_overlay()
+
+        assert restored == 1
+        pos = pm.get_position("005930")
+        assert pos.take_profit == 79750.0, (
+            "gap-up take_profit must be preserved, not dropped (D1b)"
+        )
+        assert pos.stop_loss == 68875.0, (
+            "the accompanying stop_loss must survive alongside the preserved tp "
+            "-- D1b's whole point is the entry is no longer dropped wholesale"
+        )
+        notifier.send_message.assert_not_awaited()
+
+        gap_logs = [
+            c for c in mock_logger.info.call_args_list
+            if c.args and c.args[0] == "gap_through_tp_restored"
+        ]
+        assert len(gap_logs) == 1
+        _, kwargs = gap_logs[0]
+        assert kwargs["ticker"] == "005930"
+        assert kwargs["take_profit"] == 79750.0
+        assert kwargs["current_price"] == 90000
+
+        drop_warnings = [
+            c for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "restore_stops_insane_dropped"
+        ]
+        assert drop_warnings == []
+
+    @pytest.mark.asyncio
+    async def test_restore_preserved_gap_through_tp_chain_no_sell_then_lock_in(
+        self, config, temp_storage
+    ):
+        """⑦ D1b 체인 (무해성 + 락인 훅 생존의 실 경로 증거): 보존된 tp
+        갭업 엔트리가 실 경로(`_check_position`)에서 (a) TAKE_PROFIT_HIT을
+        발화해도 매도가 전혀 없고(quantity 불변, auto_execute=False) --
+        토론/기록 트리거일 뿐 -- take_profit_reached_at만 기록하며, (b) 그
+        후 가격이 되돌림하면 S-5 락인 훅(`_apply_take_profit_lock_in`)이
+        `TestTakeProfitLockIn.test_retracement_locks_in_stop_at_breakeven_plus_alpha`와
+        동일한 손계산으로 stop_loss를 정상 ratchet한다 -- 같은 세션에서 tp에
+        도달한 것과 완전히 동일한 체인이 restore로 보존된 엔트리에서도
+        그대로 작동함을 증명한다."""
+        await temp_storage.set_app_setting(_STOPS_KEY, json.dumps({"stops": {
+            "005930": {
+                "stop_loss": 68000.0,
+                "take_profit": 72800.0,
+                "trailing_stop_pct": None,
+            },
+        }}))
+
+        pm = PositionManager(config=config)
+        pm.add_position(
+            ticker="005930", stock_name="삼성전자", quantity=100,
+            avg_price=70000, current_price=72800,
+        )
+
+        restored = await pm.restore_stop_overlay()
+        assert restored == 1
+        position = pm.get_position("005930")
+        assert position.take_profit == 72800.0, "gap-up tp preserved by restore"
+        assert position.stop_loss == 68000.0, (
+            "accompanying stop preserved alongside the preserved tp"
+        )
+        assert position.take_profit_reached_at is None, (
+            "not yet marked -- only a real monitor tick marks it, not restore itself"
+        )
+
+        # Tick 1: real _check_position path -- TAKE_PROFIT_HIT fires, no sell.
+        events = []
+        pm.on_event(lambda e: events.append(e))
+        await pm._check_position(position)
+
+        tp_events = [e for e in events if e.event_type == PositionEventType.TAKE_PROFIT_HIT]
+        assert len(tp_events) >= 1
+        assert tp_events[0].auto_execute is False
+        assert position.quantity == 100, (
+            "no auto-sell on a restore-preserved gap-through tp -- take-profit "
+            "execution stays discussion-gated exactly like a same-session hit"
+        )
+        assert position.take_profit_reached_at is not None
+
+        # Tick 2: retrace below tp -- the S-5 lock-in ratchet must fire
+        # normally, chained off the restore-preserved tp/reached_at exactly
+        # like a same-session take-profit hit would.
+        position.current_price = 71500
+        await pm._check_position(position)
+
+        lock_in_ratio = pm.config.trailing_lock_in_ratio
+        expected_stop = 70000 * (1 + lock_in_ratio * (72800 - 70000) / 70000)
+        assert expected_stop == pytest.approx(70840.0)
+        assert position.stop_loss == pytest.approx(expected_stop), (
+            "S-5 lock-in must ratchet the stop off a restore-preserved "
+            "gap-through tp, same as a same-session take-profit hit"
+        )
+
+    @pytest.mark.asyncio
+    async def test_restore_drops_when_current_price_invalid(self, config, temp_storage):
+        """⑧ 구조적 위법 잔존 (2종 중 하나): current_price가 알수없음
+        (<=0)이면 스탑/익절 필드가 어떤 값이든 검증 자체가 불가능하다 --
+        D1b로도 바뀌지 않는 fail-closed 드롭. 두 저장 값 모두 통째로 드롭
+        + 사람에게 통지되어야 한다."""
+        await temp_storage.set_app_setting(_STOPS_KEY, json.dumps({"stops": {
+            "005930": {
+                "stop_loss": 65000.0,
+                "take_profit": 80000.0,
+                "trailing_stop_pct": None,
+            },
+        }}))
+
+        pm = PositionManager(config=config)
+        pm.add_position(
+            ticker="005930", stock_name="삼성전자", quantity=100,
+            avg_price=70000, current_price=72000,
+        )
+        pm.get_position("005930").current_price = 0
+
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            restored = await pm.restore_stop_overlay()
+
+        assert restored == 0
+        pos = pm.get_position("005930")
+        assert pos.stop_loss is None
+        assert pos.take_profit is None
+        notifier.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_decision_take_profit_gap_through_still_rejected_unlike_restore(
+        self, config
+    ):
+        """⑨ 회귀 핀 (⑤의 대칭): 장중 신규 설정 경로(_apply_decision ->
+        `_stops_sane`)는 D1b로도 byte-불변이어야 한다 -- take_profit이
+        현재가 이하로 "결정"에 들어오면(즉시 익절 폭주 방지) 여전히
+        기각되어야 한다. restore 전용 경로만 tp 갭업을 보존하고, 장중
+        신규 설정 경로는 그대로 거부한다는 비대칭을 고정하는 핀."""
+        pm, pos = self._pm_and_position(config, current_price=72800.0)
+        notifier = self._notifier()
+        with patch(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(return_value=notifier),
+        ):
+            await pm._apply_decision(pos, self._decision(take_profit=72800.0))
+
+        assert pos.take_profit is None, (
+            "decision-path gap-through take_profit must still be rejected -- "
+            "_stops_sane is unchanged by D1b"
         )
         notifier.send_message.assert_awaited_once()
 

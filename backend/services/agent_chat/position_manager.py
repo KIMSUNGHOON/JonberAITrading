@@ -2334,16 +2334,17 @@ class PositionManager:
         stop_loss: Optional[float],
         take_profit: Optional[float],
     ) -> bool:
-        """Restore-path-only sanity gate (G-1, docs/superpowers/specs/
-        2026-07-20-gap-discipline-design.md D1) — deliberately NOT
-        `_stops_sane`, which stays byte-invariant for the intraday
-        stop-SETTING paths (`_apply_decision`, `_apply_take_profit_lock_in`,
-        `_check_trailing_stop`): a stop being newly set at-or-above the
-        current price must still be rejected there, or it fires
-        stop_loss_hit on the very same tick (the 2026-07-12 15:40 CPU-spin
-        hang this repo already fixed once).
+        """Restore-path-only sanity gate (G-1/D1, extended D1b — docs/
+        superpowers/specs/2026-07-20-gap-discipline-design.md §0) —
+        deliberately NOT `_stops_sane`, which stays byte-invariant for the
+        intraday stop-SETTING paths (`_apply_decision`,
+        `_apply_take_profit_lock_in`, `_check_trailing_stop`): a stop or
+        take-profit being newly set at-or-through the current price must
+        still be rejected there, or it fires stop_loss_hit/take_profit_hit
+        on the very same tick (the 2026-07-12 15:40 CPU-spin hang this repo
+        already fixed once).
 
-        A RESTORED stop is different: it is not being newly set, it already
+        A RESTORED level is different: it is not being newly set, it already
         existed and survived a restart. The 2026-07-20 00:02 incident
         (`restore_stops_insane_dropped ticker=000660 stop_loss=1,807,923
         current_price=1,782,000`) showed the old shared `_stops_sane` gate
@@ -2355,24 +2356,33 @@ class PositionManager:
         unchanged by this method) fires on it normally on the next monitor
         tick, exactly like any other price crossing.
 
-        Classification (only two ways an entry is dropped — everything else,
-        INCLUDING stop_loss at-or-above current_price, restores normally):
+        D1b (this method, 2026-07-20 follow-up): the SAME reasoning extends
+        to a restored take_profit gapping through the current price
+        (`take_profit <= current_price`) — G-1 originally kept that shape
+        classified as structurally insane (drop the WHOLE entry, including
+        its accompanying stop_loss and S-5 lock-in trigger), which was an
+        asymmetry: a favorable gap-up lost its protective stop while an
+        adverse gap-through-stop kept it. Take-profit has no auto-sell
+        behind it either way (`auto_execute_take_profit=False`,
+        `take_profit_mode=user_approval` — TAKE_PROFIT_HIT only ever opens a
+        discussion or marks `take_profit_reached_at`), so preserving it is
+        harmless and keeps the S-5 lock-in ratchet chain alive. See
+        `restore_stop_overlay` for the accompanying `gap_through_tp_restored`
+        log, symmetric with `gap_through_stop_restored` below.
+
+        Classification (only two ways an entry is dropped now — everything
+        else, INCLUDING stop_loss at-or-above current_price and take_profit
+        at-or-below current_price, restores normally):
         - current_price unknown/non-positive: cannot validate at all,
           fail-closed.
-        - take_profit at-or-below current_price: unlike stop_loss, a
-          restored take_profit gap gets no preserve exception — D1 only
-          covers stop-loss discipline, and this is the exact P0-2b
-          polluted-blob shape (pre-G-1 behavior, unchanged).
         - stop_loss and take_profit both set with stop_loss >= take_profit:
           the two saved levels contradict each other independent of the
           current price — never a legitimate gap, always corrupted data
-          (this also catches a gap-through-shaped stop_loss whose paired
-          take_profit is beneath it, which would otherwise look like a
-          preservable gap).
+          (this also catches a gap-through-shaped stop_loss or take_profit
+          whose paired level sits on the wrong side of it, which would
+          otherwise look like a preservable gap).
         """
         if not current_price or current_price <= 0:
-            return True
-        if take_profit is not None and take_profit <= current_price:
             return True
         if (
             stop_loss is not None
@@ -2403,6 +2413,13 @@ class PositionManager:
           verbatim instead of dropped (G-1/D1) — a `gap_through_stop_restored`
           info log fires and the normal monitor loop fires STOP_LOSS_HIT on
           it next tick, same as any other price crossing.
+        - An entry whose take_profit alone is at-or-below the current price
+          (a favorable gap-up ran through an already-set target) is likewise
+          preserved verbatim, accompanying stop_loss included (D1b) — a
+          `gap_through_tp_restored` info log fires and the normal monitor
+          loop fires TAKE_PROFIT_HIT on it next tick (still no auto-sell —
+          auto_execute_take_profit stays False), keeping the S-5 lock-in
+          ratchet chain intact for a later retracement.
 
         Returns the number of tickers whose stops were restored.
         """
@@ -2493,6 +2510,27 @@ class PositionManager:
                             "gap_through_stop_restored",
                             ticker=ticker,
                             stop_loss=saved_stop,
+                            current_price=current_price,
+                        )
+
+                    # D1b: the symmetric favorable case — a saved take_profit
+                    # at-or-below the current price is a gap-up that ran
+                    # through an already-set target, not corrupted data.
+                    # Preserve it verbatim and let `_check_position`'s
+                    # ordinary TAKE_PROFIT_HIT detection (unchanged, and
+                    # still no auto-sell — auto_execute_take_profit=False)
+                    # fire on it the next monitor tick, which is also what
+                    # keeps the S-5 lock-in ratchet chain alive on a later
+                    # retracement.
+                    if (
+                        saved_take is not None
+                        and current_price is not None
+                        and saved_take <= current_price
+                    ):
+                        logger.info(
+                            "gap_through_tp_restored",
+                            ticker=ticker,
+                            take_profit=saved_take,
                             current_price=current_price,
                         )
 
