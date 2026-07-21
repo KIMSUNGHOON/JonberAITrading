@@ -960,20 +960,23 @@ class ExecutionCoordinator:
 
         # If successful, add to monitoring
         if result.filled_quantity > 0 and side == OrderSide.BUY:
-            position = ManagedPosition(
+            # H3: 즉시체결도 pending체결(:3240)과 동일하게 register_fill_as_position로
+            # 등록 → RiskMonitor(via _add_position, 기존과 동일) + PositionManager
+            # 양쪽 감시엔진에 등록(이중엔진 실현). 이전엔 수동 _add_position만 호출해
+            # PM 미등록이라 PM의 30s 손절/트레일링/재평가가 이 포지션엔 안 돌았다.
+            await register_fill_as_position(
+                self,
                 ticker=ticker,
                 stock_name=stock_name or ticker,
                 quantity=result.filled_quantity,
                 avg_price=result.avg_price,
-                current_price=result.avg_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
+                session_id=session_id,
+                source="placement_fill",
                 stop_loss_mode=self.risk_params.stop_loss_mode,
-                status=PositionStatus.FILLED,
-                analysis_session_id=session_id,
                 risk_score=risk_score,
             )
-            self._add_position(position)
 
             self._log_activity(
                 ActivityType.POSITION_OPENED,

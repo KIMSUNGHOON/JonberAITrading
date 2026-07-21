@@ -13,10 +13,20 @@ coordinator._add_position은 자체적으로 평균 합산하지만 PM.update_po
 지연 import(함수 내부 import)를 쓰므로 patch 지점은 헬퍼 모듈이 아니라 원본
 `services.agent_chat.coordinator.get_chat_coordinator`.
 """
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
 from services.agent_chat.position_manager import MonitoredPosition, PositionManager
-from services.trading.models import ManagedPosition, StopLossMode
+from services.trading.coordinator import ExecutionCoordinator
+from services.trading.market_hours import MarketSession
+from services.trading.models import (
+    AllocationPlan,
+    ManagedPosition,
+    OrderResult,
+    OrderSide,
+    StopLossMode,
+    TradingMode,
+)
 from services.trading.position_registration import register_fill_as_position
 
 
@@ -362,3 +372,93 @@ async def test_existing_pm_entry_decision_id_not_overwritten_once_set(monkeypatc
         take_profit=None,
         entry_decision_id=None,
     )
+
+
+# -------------------------------------------
+# H3 — on_trade_approved's IMMEDIATE-fill BUY branch must register through
+# register_fill_as_position too (dual-engine parity with the pending/partial
+# fill branch at coordinator.py:~3240), not a bare manual `_add_position`.
+# -------------------------------------------
+
+
+def _h3_open_session() -> MarketSession:
+    """A market session that is open right now — mirrors
+    test_r5_p0_autotrade_safety.py's `_open_session` so `on_trade_approved`
+    takes the immediate-execution path instead of queueing."""
+    return MarketSession(
+        is_open=True,
+        current_time=datetime.now(),
+        next_open=None,
+        next_close=None,
+        message="open",
+    )
+
+
+def _h3_live_coordinator() -> ExecutionCoordinator:
+    """A coordinator wired to execute a BUY immediately (ACTIVE + market
+    open + a stubbed allocation), same shape as
+    test_r5_p0_autotrade_safety.py's `_live_coordinator`."""
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    coord._state.mode = TradingMode.ACTIVE
+    coord._market_hours.get_market_session = MagicMock(return_value=_h3_open_session())
+    coord._refresh_account_info = AsyncMock()
+    coord.portfolio_agent.calculate_allocation = MagicMock(
+        return_value=AllocationPlan(
+            ticker="005930",
+            stock_name="삼성전자",
+            side=OrderSide.BUY,
+            quantity=10,
+            entry_price=70_000,
+            estimated_amount=700_000,
+            position_pct=1.0,
+            rationale="stub allocation",
+            rebalance_orders=[],
+        )
+    )
+    return coord
+
+
+def _h3_stub_immediate_full_fill(coord: ExecutionCoordinator) -> None:
+    """Stub `_execute_order` so the order fills in FULL immediately
+    (result.filled_quantity > 0), driving `on_trade_approved`'s
+    immediate-fill BUY branch rather than the unfilled/partial tracker."""
+
+    async def _exec(order):
+        return OrderResult(
+            order_id="o1",
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=order.price or 70_000,
+            status="filled",
+        )
+
+    coord._execute_order = _exec
+
+
+async def test_immediate_fill_buy_registers_via_register_fill_as_position(monkeypatch):
+    """H3: 즉시체결 BUY가 pending체결과 동일하게 register_fill_as_position로
+    등록돼 PositionManager까지 미러된다(단일 _add_position 아님)."""
+    from unittest.mock import patch
+
+    coord = _h3_live_coordinator()
+    _h3_stub_immediate_full_fill(coord)
+
+    with patch("services.trading.coordinator.register_fill_as_position", new=AsyncMock()) as reg:
+        await coord.on_trade_approved(
+            session_id="sess-h3",
+            ticker="005930",
+            stock_name="삼성전자",
+            action="BUY",
+            entry_price=70_000,
+            stop_loss=66_500,
+            take_profit=77_000,
+            risk_score=5,
+        )
+
+        reg.assert_awaited_once()
+        _, kwargs = reg.call_args
+        assert kwargs["ticker"] == "005930"
+        assert kwargs["quantity"] > 0
+        assert kwargs["source"] == "placement_fill"
