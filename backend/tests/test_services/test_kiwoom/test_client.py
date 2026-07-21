@@ -73,6 +73,34 @@ class TestKiwoomClientParsers:
     def test_parse_float_empty(self):
         assert KiwoomClient._parse_float("") == 0.0
 
+    # --- _parse_float: Kiwoom 부호 규약 (--N=음수 이중부호) ---
+    def test_parse_float_double_minus_is_negative(self):
+        assert KiwoomClient._parse_float("--35") == -35.0
+        assert KiwoomClient._parse_float("--3206") == -3206.0
+
+    def test_parse_float_single_plus_stripped(self):
+        assert KiwoomClient._parse_float("+122068") == 122068.0
+
+    def test_parse_float_single_minus_kept(self):
+        assert KiwoomClient._parse_float("-2") == -2.0
+        assert KiwoomClient._parse_float("-1.22") == -1.22
+
+    def test_parse_float_plus_decimal(self):
+        assert KiwoomClient._parse_float("+2.50") == 2.5
+
+    def test_parse_float_plain_and_comma(self):
+        assert KiwoomClient._parse_float("123") == 123.0
+        assert KiwoomClient._parse_float("+55,000") == 55000.0
+
+    def test_parse_float_none_empty_lone_sign(self):
+        assert KiwoomClient._parse_float(None) == 0.0
+        assert KiwoomClient._parse_float("") == 0.0
+        assert KiwoomClient._parse_float("-") == 0.0
+
+    def test_parse_float_numeric_passthrough(self):
+        assert KiwoomClient._parse_float(55000) == 55000.0
+        assert KiwoomClient._parse_float(-55000) == -55000.0
+
 
 class TestKiwoomClientInit:
     """Test client initialization"""

@@ -471,13 +471,18 @@ class KiwoomClient:
 
     @staticmethod
     def _parse_float(value: str | float | None) -> float:
-        """실수 파싱"""
+        """실수 파싱. Kiwoom 부호 규약: 양수 '+N', 음수 이중부호 '--N'
+        (ka10131 순매수액 등) 또는 단일 '-N'(연속일수·등락률). '--N'을 '-N'으로
+        정규화하고 선두 '+'를 제거한다."""
         if value is None:
             return 0.0
         if isinstance(value, (int, float)):
             return float(value)
-        value = str(value).strip().replace("+", "").replace(",", "")
-        if not value:
+        value = str(value).strip().replace(",", "")
+        if value.startswith("--"):
+            value = value[1:]          # '--35' -> '-35'
+        value = value.lstrip("+")      # '+122068' -> '122068'
+        if not value or value in ("-", "."):
             return 0.0
         return float(value)
 
