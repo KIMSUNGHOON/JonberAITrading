@@ -26,6 +26,7 @@ from services.discovery.factors import STRATEGIES
 from services.discovery.ranker import (
     DEFAULT_REGIME_WEIGHTS,
     Candidate,
+    _build_llm_messages,
     llm_review_top,
     promote_candidates,
     rank_candidates,
@@ -251,6 +252,37 @@ def storage(tmp_path):
 @pytest.fixture
 def coordinator():
     return ExecutionCoordinator(kiwoom_client=None)
+
+
+# ---------------------------------------------------------------------------
+# flow_present -- LLM 프롬프트 flow-missing 명시 (#1, Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_candidate_has_flow_present_field_default_false():
+    c = _candidate("005930")
+    assert c.flow_present is False
+
+
+def test_build_llm_messages_flow_present_shows_number():
+    c = _candidate("005930")
+    c.flow_present = True
+    c.raw_scores = {"momentum": 0.6, "pullback": 0.6, "flow": 0.5, "meanrev": 0.6}
+    msgs = _build_llm_messages(c)
+    prompt = msgs[-1].content
+    assert "flow=0.500" in prompt
+    assert "미가용" not in prompt
+
+
+def test_build_llm_messages_flow_absent_shows_unavailable_not_zero():
+    c = _candidate("005930")
+    c.flow_present = False
+    c.raw_scores = {"momentum": 0.6, "pullback": 0.6, "flow": 0.0, "meanrev": 0.6}
+    msgs = _build_llm_messages(c)
+    prompt = msgs[-1].content
+    assert "미가용" in prompt
+    assert "부정신호 아님" in prompt
+    assert "flow=0.000" not in prompt
 
 
 # ---------------------------------------------------------------------------

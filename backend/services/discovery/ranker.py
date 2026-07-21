@@ -127,6 +127,7 @@ class Candidate:
     skip_reason: Optional[str] = None
     llm_verdict: Optional[dict[str, Any]] = None
     promoted: bool = False
+    flow_present: bool = False
 
 
 @dataclass
@@ -433,6 +434,7 @@ async def rank_candidates(storage, scanner_db_path, trade_date: str) -> list[Can
                 raw_scores=raw_scores,
                 composite=composite,
                 close_price=factor.get("close_price"),
+                flow_present=flow_present,
             )
         )
 
@@ -463,13 +465,18 @@ def _build_llm_messages(candidate: Candidate) -> list:
 
     scores = candidate.raw_scores or {}
     composite = candidate.composite if candidate.composite is not None else 0.0
+    flow_str = (
+        f"{scores.get('flow', 0.0):.3f}"
+        if candidate.flow_present
+        else "미가용(수급랭킹 미포함 — 부정신호 아님)"
+    )
     user_prompt = (
         f"종목: {candidate.name or candidate.ticker}({candidate.ticker})\n"
         f"레짐: {candidate.regime_label}\n"
         f"레짐가중 종합점수: {composite:.4f} (문턱 {candidate.threshold:.2f})\n"
         f"전략별 원점수(0~1): momentum={scores.get('momentum', 0.0):.3f}, "
         f"pullback={scores.get('pullback', 0.0):.3f}, "
-        f"flow={scores.get('flow', 0.0):.3f}, "
+        f"flow={flow_str}, "
         f"meanrev={scores.get('meanrev', 0.0):.3f}\n"
         f"종가: {candidate.close_price}\n"
         f"발굴 랭킹: #{candidate.rank}\n"
