@@ -628,11 +628,18 @@ class ExecutionCoordinator:
             current_positions=self._state.positions,
         )
 
-        # Override quantity if provided
+        # H2: quantity_override를 allocation 캡(calculate_allocation이 산정한 R-사이징/
+        # min_cash/max_stock 상한 = allocation.quantity)으로 클램프한다. override가
+        # 캡을 통째 덮어써 캡을 우회하지 못하게 — override≤캡이면 그대로, 초과면 캡.
         if quantity_override and quantity_override > 0:
-            allocation.quantity = quantity_override
-            allocation.estimated_amount = quantity_override * entry_price
-            allocation.rationale += f" (quantity override: {quantity_override})"
+            capped = min(quantity_override, allocation.quantity)
+            allocation.quantity = capped
+            allocation.estimated_amount = capped * entry_price
+            allocation.rationale += (
+                f" (quantity override {quantity_override} clamped to {capped})"
+                if capped < quantity_override
+                else f" (quantity override: {quantity_override})"
+            )
 
         # Log allocation decision
         self._log_activity(

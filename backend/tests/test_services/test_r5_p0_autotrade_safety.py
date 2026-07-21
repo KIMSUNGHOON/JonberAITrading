@@ -165,6 +165,87 @@ async def test_reduce_action_executes_as_sell_order():
 
 
 # -------------------------------------------
+# H2 — quantity_override must be clamped to the allocation cap, not
+# wholesale overwrite it (allocation.quantity is the R-sizing/min_cash/
+# max_stock upper bound calculate_allocation already computed).
+# -------------------------------------------
+
+
+async def test_quantity_override_clamped_to_allocation_cap():
+    """H2: quantity_override that exceeds the allocation cap (calculate_allocation's
+    R-sizing/min_cash/max_stock upper bound) must be clamped to that cap, not
+    overwrite it wholesale — otherwise the moderator's override bypasses sizing caps."""
+    coord = _live_coordinator()
+    coord.portfolio_agent.calculate_allocation = MagicMock(
+        return_value=AllocationPlan(
+            ticker="005930",
+            stock_name="삼성전자",
+            side=OrderSide.BUY,
+            quantity=5,  # cap
+            entry_price=50_000,
+            estimated_amount=250_000,
+            position_pct=1.0,
+            rationale="stub allocation",
+            rebalance_orders=[],
+        )
+    )
+    captured = await _capture_executed_order(coord)
+
+    result = await coord.on_trade_approved(
+        session_id="s1",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="BUY",
+        entry_price=50_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+        quantity_override=100,  # exceeds cap
+    )
+
+    assert len(captured) == 1
+    assert captured[0].quantity == 5, "override must be clamped to the allocation cap"
+    assert result.quantity == 5
+    assert result.estimated_amount == 5 * 50_000
+
+
+async def test_quantity_override_below_cap_is_unchanged():
+    """H2 guard: an override that stays within the allocation cap must pass through
+    unchanged (the clamp must not shrink legitimate overrides)."""
+    coord = _live_coordinator()
+    coord.portfolio_agent.calculate_allocation = MagicMock(
+        return_value=AllocationPlan(
+            ticker="005930",
+            stock_name="삼성전자",
+            side=OrderSide.BUY,
+            quantity=5,  # cap
+            entry_price=50_000,
+            estimated_amount=250_000,
+            position_pct=1.0,
+            rationale="stub allocation",
+            rebalance_orders=[],
+        )
+    )
+    captured = await _capture_executed_order(coord)
+
+    result = await coord.on_trade_approved(
+        session_id="s1",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="BUY",
+        entry_price=50_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=5,
+        quantity_override=3,  # within cap
+    )
+
+    assert len(captured) == 1
+    assert captured[0].quantity == 3, "override within cap must pass through unchanged"
+    assert result.quantity == 3
+
+
+# -------------------------------------------
 # A5 — queued autonomous BUY/ADD must keep its quantity
 # -------------------------------------------
 
