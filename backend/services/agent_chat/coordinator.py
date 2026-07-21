@@ -1174,6 +1174,34 @@ class ChatCoordinator:
                         break
             except Exception as e:
                 logger.warning("portfolio_fetch_failed", error=str(e))
+                # H1/M1 fail-closed: Kiwoom 계좌조회 실패 시 fail-open(has_position=
+                # False, available_cash=None)하면 보유종목이 미보유로 오판돼 중복 신규
+                # BUY가 나가고(vote_to_action BUY), 정상 합의가 quantity=None으로
+                # 폐기된다. ExecutionCoordinator의 권위 in-memory 상태로 폴백한다.
+                try:
+                    from app.dependencies import get_trading_coordinator
+                    trading_coord = await get_trading_coordinator()
+                    for p in trading_coord._state.positions:
+                        if p.ticker == ticker:
+                            has_position = True
+                            position_quantity = p.quantity
+                            position_avg_price = p.avg_price
+                            position_pnl_pct = p.unrealized_pnl_pct
+                            break
+                    acct = trading_coord._state.account
+                    if available_cash is None:
+                        available_cash = acct.available_cash
+                    if total_portfolio is None:
+                        total_portfolio = acct.total_equity
+                    logger.info(
+                        "market_context_account_fallback",
+                        ticker=ticker, has_position=has_position,
+                        source="coordinator_state",
+                    )
+                except Exception as e2:
+                    # 폴백도 실패(사실상 in-memory라 불가). available_cash=None 유지
+                    # → 게이트가 quantity 불명으로 BUY 거부(fail-closed 자연 성립).
+                    logger.warning("market_context_fallback_failed", error=str(e2))
 
             # Fetch news sentiment
             news_sentiment = None

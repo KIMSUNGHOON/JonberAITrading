@@ -1167,3 +1167,128 @@ class TestNewsSentimentWiring:
 
         assert context.news_sentiment is None
         MockAnalyzer.return_value.analyze.assert_not_called()
+
+
+# -------------------------------------------
+# H1/M1: 계좌조회 실패 시 coordinator 권위상태 폴백
+# -------------------------------------------
+#
+# Kiwoom 계좌조회(get_account_balance)가 예외를 던지면 기존 코드는 warning만
+# 남기고 has_position=False/available_cash=None을 방치한다. 보유종목이
+# 미보유로 오판되면 agents의 vote_to_action(bullish, has_position=False)이
+# 중복 신규 BUY를 내고(H1), available_cash=None은 모더레이터가 quantity를
+# 계산 못 해 정상 합의를 폐기한다(M1). ExecutionCoordinator의 권위
+# in-memory 상태(_state.positions/_state.account)로 폴백해야 한다.
+
+
+class TestAccountFallbackOnKiwoomFailure:
+    """_fetch_market_context의 계좌조회 except 경로가 ExecutionCoordinator의
+    권위 상태로 폴백하는지 확인한다."""
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_coordinator_state_on_kiwoom_failure(
+        self, coordinator
+    ):
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": 0.5,
+        }
+
+        # coordinator 권위상태: 005930 10주 보유 + 가용현금 3,000,000원
+        held = MagicMock(
+            ticker="005930",
+            quantity=10,
+            avg_price=70000.0,
+            unrealized_pnl_pct=5.0,
+        )
+        fake_trading_coord = MagicMock()
+        fake_trading_coord._state.positions = [held]
+        fake_trading_coord._state.account = MagicMock(
+            available_cash=3_000_000.0,
+            total_equity=50_000_000.0,
+        )
+
+        async def fake_get_trading_coordinator():
+            return fake_trading_coord
+
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            # Kiwoom 계좌조회가 예외 (ratelimit/token-expiry 등 실측 선례)
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(
+                    side_effect=RuntimeError("ratelimit")
+                ),
+            ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=_mock_empty_news_service()),
+            ),
+            patch(
+                "app.dependencies.get_trading_coordinator",
+                fake_get_trading_coordinator,
+            ),
+        ):
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.is_stale is False
+        assert context.has_position is True
+        assert context.position_quantity == 10
+        assert context.position_avg_price == 70000.0
+        assert context.position_pnl_pct == 5.0
+        assert context.available_cash == 3_000_000.0
+        assert context.total_portfolio_value == 50_000_000.0
+
+    @pytest.mark.asyncio
+    async def test_fallback_also_failing_leaves_available_cash_none(
+        self, coordinator
+    ):
+        """폴백(ExecutionCoordinator 조회)까지 실패하면 available_cash는
+        None으로 남아야 한다 — fail-closed: 게이트가 quantity 불명으로 BUY를
+        거부하게 만드는 것이 의도된 동작이다(never-raise 폴백)."""
+        real_stock_info = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "cur_prc": 72500,
+            "prdy_ctrt": 0.5,
+        }
+
+        async def fake_get_trading_coordinator():
+            raise RuntimeError("trading coordinator unavailable")
+
+        with (
+            patch(
+                "agents.tools.kr_market_data.get_kr_stock_info",
+                AsyncMock(return_value=real_stock_info),
+            ),
+            patch(
+                "agents.tools.kr_market_data.get_kr_daily_chart",
+                AsyncMock(return_value=pd.DataFrame()),
+            ),
+            patch(
+                "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+                AsyncMock(side_effect=RuntimeError("ratelimit")),
+            ),
+            patch(
+                "app.dependencies.get_news_service",
+                AsyncMock(return_value=_mock_empty_news_service()),
+            ),
+            patch(
+                "app.dependencies.get_trading_coordinator",
+                fake_get_trading_coordinator,
+            ),
+        ):
+            context = await coordinator._fetch_market_context("005930", "삼성전자")
+
+        assert context.is_stale is False
+        assert context.has_position is False
+        assert context.available_cash is None
