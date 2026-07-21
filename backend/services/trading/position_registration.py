@@ -138,3 +138,26 @@ async def register_fill_as_position(
             source=source,
             error=str(e),
         )
+
+
+def mirror_sell_to_position_manager(ticker: str, remaining_quantity: int) -> None:
+    """SELL 체결의 PositionManager 미러 — register_fill_as_position(등록)의
+    제거/차감 짝. remaining_quantity<=0 → PM.remove_position(전량 청산);
+    >0 → PM.update_position(quantity=remaining, 절대값 할당=coordinator 권위
+    잔량으로 PM 재동기). PM 미기동(position_manager is None)/미보유면 no-op.
+    best-effort never-raise: coordinator 측 재조정은 이미 완료됐으므로 PM
+    미러 실패가 SELL 처리를 막으면 안 된다(register_fill_as_position의 PM
+    미러가 best-effort인 것과 대칭)."""
+    try:
+        from services.agent_chat.coordinator import get_chat_coordinator_sync
+        pm = get_chat_coordinator_sync().position_manager
+        if pm is None:
+            return
+        if remaining_quantity <= 0:
+            pm.remove_position(ticker)
+        else:
+            pm.update_position(ticker, quantity=remaining_quantity)
+    except Exception as e:
+        logger.warning(
+            "mirror_sell_to_position_manager_failed", ticker=ticker, error=str(e)
+        )

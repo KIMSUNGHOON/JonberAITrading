@@ -462,3 +462,54 @@ async def test_immediate_fill_buy_registers_via_register_fill_as_position(monkey
         assert kwargs["ticker"] == "005930"
         assert kwargs["quantity"] > 0
         assert kwargs["source"] == "placement_fill"
+
+
+def test_mirror_sell_full_close_calls_pm_remove(monkeypatch):
+    """remaining<=0 → PM.remove_position 호출."""
+    from unittest.mock import MagicMock
+    import services.trading.position_registration as pr
+    pm = MagicMock()
+    chat = MagicMock(); chat.position_manager = pm
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator_sync", lambda: chat
+    )
+    pr.mirror_sell_to_position_manager("005930", 0)
+    pm.remove_position.assert_called_once_with("005930")
+    pm.update_position.assert_not_called()
+
+
+def test_mirror_sell_partial_calls_pm_update_with_remaining(monkeypatch):
+    """remaining>0 → PM.update_position(quantity=remaining) 절대값 할당."""
+    from unittest.mock import MagicMock
+    import services.trading.position_registration as pr
+    pm = MagicMock()
+    chat = MagicMock(); chat.position_manager = pm
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator_sync", lambda: chat
+    )
+    pr.mirror_sell_to_position_manager("005930", 25)
+    pm.update_position.assert_called_once_with("005930", quantity=25)
+    pm.remove_position.assert_not_called()
+
+
+def test_mirror_sell_pm_not_running_is_noop(monkeypatch):
+    """PM 미기동(position_manager None) → no-op, 예외 없음."""
+    from unittest.mock import MagicMock
+    import services.trading.position_registration as pr
+    chat = MagicMock(); chat.position_manager = None
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator_sync", lambda: chat
+    )
+    pr.mirror_sell_to_position_manager("005930", 0)  # 예외 없이 통과
+
+
+def test_mirror_sell_never_raises_on_pm_error(monkeypatch):
+    """PM 미러가 예외를 던져도 never-raise(로그만)."""
+    from unittest.mock import MagicMock
+    import services.trading.position_registration as pr
+    pm = MagicMock(); pm.remove_position.side_effect = RuntimeError("boom")
+    chat = MagicMock(); chat.position_manager = pm
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator_sync", lambda: chat
+    )
+    pr.mirror_sell_to_position_manager("005930", 0)  # 예외 전파 안 함

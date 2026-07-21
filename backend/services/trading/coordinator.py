@@ -42,7 +42,7 @@ from .market_hours import MarketType, get_market_hours_service, is_krx_open_cach
 from .strategy import TradingStrategy
 from .strategy_apply import apply_strategy_to_risk_params
 from .pending_order_tracker import PendingOrderTracker, TrackedOrder
-from .position_registration import register_fill_as_position
+from .position_registration import register_fill_as_position, mirror_sell_to_position_manager
 from .reconciler import reconcile
 from .trade_log import record_trade_fill, record_kr_realized_pnl, wait_for_pending_trade_fill_writes
 from .cadence import compute_watch_ttl
@@ -1556,6 +1556,7 @@ class ExecutionCoordinator:
 
         if quantity >= position.quantity:
             self._remove_position(ticker)
+            mirror_sell_to_position_manager(ticker, 0)
         else:
             position.quantity -= quantity
             position.last_updated = datetime.now()
@@ -1567,6 +1568,7 @@ class ExecutionCoordinator:
                 f"[Coordinator] Position {ticker} reduced by {quantity}; "
                 f"{position.quantity} remaining"
             )
+            mirror_sell_to_position_manager(ticker, position.quantity)
 
     # -------------------------------------------
     # State Persistence (R5-P1 A4)

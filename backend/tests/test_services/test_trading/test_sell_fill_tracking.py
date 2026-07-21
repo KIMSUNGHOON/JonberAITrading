@@ -1155,3 +1155,39 @@ async def test_on_trade_approved_add_main_order_stays_limit(temp_storage):
     )
 
     assert captured[0].order_type == OrderType.LIMIT
+
+
+# -------------------------------------------
+# 12) Task 1 (dual-engine removal symmetry) — `_apply_sell_position_delta`
+#     mirrors its coordinator-side removal/decrement into the agent-chat
+#     PositionManager via `mirror_sell_to_position_manager`, closing the
+#     gap where a coordinator-path SELL left a stale position in the PM
+#     (coordinator showed 0, PM count 1) until a manual /positions/sync.
+# -------------------------------------------
+
+
+async def test_apply_sell_position_delta_full_close_mirrors_pm_remove(temp_storage):
+    """전량 SELL → coordinator _remove_position + mirror(ticker, 0)."""
+    from unittest.mock import patch
+
+    coord, position = _coordinator_with_position(quantity=60)
+
+    with patch("services.trading.coordinator.mirror_sell_to_position_manager") as mir:
+        coord._apply_sell_position_delta("005930", 60, avg_price=None)
+
+    assert not any(p.ticker == "005930" for p in coord._state.positions)  # coordinator 제거
+    mir.assert_called_once_with("005930", 0)
+
+
+async def test_apply_sell_position_delta_partial_mirrors_pm_remaining(temp_storage):
+    """부분 SELL → coordinator 잔량 차감 + mirror(ticker, remaining)."""
+    from unittest.mock import patch
+
+    coord, position = _coordinator_with_position(quantity=60)
+
+    with patch("services.trading.coordinator.mirror_sell_to_position_manager") as mir:
+        coord._apply_sell_position_delta("005930", 25, avg_price=None)
+
+    pos = next(p for p in coord._state.positions if p.ticker == "005930")
+    assert pos.quantity == 35  # 60-25
+    mir.assert_called_once_with("005930", 35)
