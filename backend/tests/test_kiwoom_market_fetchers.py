@@ -59,3 +59,38 @@ async def test_get_inst_foreign_flow_returns_none_on_empty():
     c = _make_client()
     c._request = AsyncMock(return_value={})   # no key
     assert await c.get_inst_foreign_flow("001") is None
+
+
+@pytest.mark.asyncio
+async def test_get_inst_foreign_flow_parses_double_minus():
+    c = _make_client()
+    c._request = AsyncMock(return_value={
+        "orgn_frgnr_cont_trde_prst": [
+            {"stk_cd": "005935", "orgn_nettrde_amt": "--35", "frgnr_nettrde_amt": "+122068",
+             "orgn_cont_netprps_dys": "-2", "frgnr_cont_netprps_dys": "+1"},
+        ]
+    })
+    rows = await c.get_inst_foreign_flow("001")
+    assert rows is not None and len(rows) == 1
+    assert rows[0]["orgn_net_amt"] == pytest.approx(-35.0)
+    assert rows[0]["frgnr_net_amt"] == pytest.approx(122068.0)
+    assert rows[0]["orgn_cont_days"] == -2 and rows[0]["frgnr_cont_days"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_inst_foreign_flow_skips_bad_row_keeps_rest():
+    c = _make_client()
+    c._request = AsyncMock(return_value={
+        "orgn_frgnr_cont_trde_prst": [
+            {"stk_cd": "AAA", "orgn_nettrde_amt": "+10", "frgnr_nettrde_amt": "+1",
+             "orgn_cont_netprps_dys": "+1", "frgnr_cont_netprps_dys": "+1"},
+            {"stk_cd": "BAD", "orgn_nettrde_amt": "not_a_number", "frgnr_nettrde_amt": "+1",
+             "orgn_cont_netprps_dys": "+1", "frgnr_cont_netprps_dys": "+1"},
+            {"stk_cd": "CCC", "orgn_nettrde_amt": "--5", "frgnr_nettrde_amt": "+2",
+             "orgn_cont_netprps_dys": "+1", "frgnr_cont_netprps_dys": "+1"},
+        ]
+    })
+    rows = await c.get_inst_foreign_flow("001")
+    assert rows is not None
+    codes = [r["stk_cd"] for r in rows]
+    assert codes == ["AAA", "CCC"]   # BAD 행만 skip, 나머지 보존

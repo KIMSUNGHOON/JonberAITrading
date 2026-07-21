@@ -724,7 +724,7 @@ class KiwoomClient:
 
     async def get_inst_foreign_flow(self, mrkt_tp: str = "001") -> Optional[list[dict]]:
         """기관외국인연속매매현황요청 (ka10131). mrkt_tp: "001"=KOSPI, "101"=KOSDAQ.
-        실패-무해: 예외/빈응답이면 None."""
+        실패-무해: 예외/빈응답이면 None. 행단위: 한 행 파싱 실패는 해당 행만 skip."""
         try:
             result = await self._request(
                 api_id="ka10131",
@@ -740,13 +740,19 @@ class KiwoomClient:
                 return None
             out = []
             for r in rows:
-                out.append({
-                    "stk_cd": r.get("stk_cd", ""),
-                    "orgn_net_amt": self._parse_float(r.get("orgn_nettrde_amt")),
-                    "frgnr_net_amt": self._parse_float(r.get("frgnr_nettrde_amt")),
-                    "orgn_cont_days": int(self._parse_float(r.get("orgn_cont_netprps_dys"))),
-                    "frgnr_cont_days": int(self._parse_float(r.get("frgnr_cont_netprps_dys"))),
-                })
+                try:
+                    out.append({
+                        "stk_cd": r.get("stk_cd", ""),
+                        "orgn_net_amt": self._parse_float(r.get("orgn_nettrde_amt")),
+                        "frgnr_net_amt": self._parse_float(r.get("frgnr_nettrde_amt")),
+                        "orgn_cont_days": int(self._parse_float(r.get("orgn_cont_netprps_dys"))),
+                        "frgnr_cont_days": int(self._parse_float(r.get("frgnr_cont_netprps_dys"))),
+                    })
+                except Exception as e:
+                    logger.warning(
+                        f"[Kiwoom] get_inst_foreign_flow({mrkt_tp}) row skipped: {e}"
+                    )
+                    continue
             return out
         except Exception as e:
             logger.warning(f"[Kiwoom] get_inst_foreign_flow({mrkt_tp}) failed: {e}")
