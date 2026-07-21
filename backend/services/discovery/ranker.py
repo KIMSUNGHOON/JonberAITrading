@@ -99,6 +99,12 @@ WATCH_TOTAL_CAP = 30
 # Re-promotion cooldown, in calendar days (spec Section 5).
 COOLDOWN_DAYS = 7
 
+# #3: pre-open fallback window, in calendar days -- a discovery run before
+# market close has no today-dated regime_snapshot row yet (EOD-only write),
+# so the most recent PAST snapshot within this many days is used as a
+# reasonable approximation instead of hardcoding 'neutral'.
+REGIME_SNAPSHOT_FALLBACK_DAYS = 7
+
 
 # ---------------------------------------------------------------------------
 # Candidate -- the unit that flows through rank -> llm_review -> promote.
@@ -234,15 +240,49 @@ async def _get_regime_snapshot_for_date(
     trade_date match is the latest one recorded for that day -- accretion
     style, mirrors regime_snapshot's own storage convention). Any storage
     error is swallowed -- absence of a snapshot is a normal 'neutral
-    fallback' case, not a hard failure."""
+    fallback' case, not a hard failure.
+
+    #3: if there is no exact-date row (a pre-open discovery run, since
+    regime_snapshot is only written by the EOD chain after close), fall
+    back to the most recent snapshot strictly before `trade_date`, but only
+    if it is within REGIME_SNAPSHOT_FALLBACK_DAYS calendar days -- older
+    than that is treated as no signal (None -> caller's 'neutral' default),
+    since a stale regime read is worse than no read. This is a non-binding
+    approximation: it only shifts ranking weights/thresholds, never gates
+    promotion directly."""
     try:
         snapshots = await storage.get_regime_snapshots(limit=500)
     except Exception as e:
         logger.warning("discovery_regime_snapshot_lookup_failed", error=str(e))
         return None
+    # 완전일치 우선(EOD 후 당일 행)
     for snap in snapshots:
         if snap.get("trade_date") == trade_date:
             return snap
+    # #3: 개장 전 폴백 — 당일 행 부재 시 trade_date 이전 중 가장 최근 스냅샷을
+    # REGIME_SNAPSHOT_FALLBACK_DAYS 이내에서 채택(snapshots는 newest-first).
+    try:
+        target = _parse_date(trade_date)
+    except (ValueError, TypeError):
+        return None
+    for snap in snapshots:
+        std = snap.get("trade_date")
+        if not std:
+            continue
+        try:
+            sd = _parse_date(std)
+        except (ValueError, TypeError):
+            continue
+        if sd >= target:
+            continue  # 미래/동일(동일은 위에서 처리)은 건너뜀
+        age = (target - sd).days  # 가장 최근 과거 스냅샷(newest-first 첫 매치)
+        if age <= REGIME_SNAPSHOT_FALLBACK_DAYS:
+            logger.info(
+                "discovery_regime_snapshot_fallback",
+                requested=trade_date, used=std, age_days=age,
+            )
+            return snap
+        return None  # 가장 최근 과거 스냅샷이 너무 오래됨 → neutral
     return None
 
 

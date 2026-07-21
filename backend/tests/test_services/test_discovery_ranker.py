@@ -743,6 +743,43 @@ async def test_migrate_reseed_never_raises_on_corrupt_stored_json(storage):
 
 
 # ---------------------------------------------------------------------------
+# #3 regime_snapshot 개장 전 전일 폴백 (Task 4)
+# ---------------------------------------------------------------------------
+
+
+async def test_regime_snapshot_exact_match_preferred(storage):
+    from services.discovery.ranker import _get_regime_snapshot_for_date
+
+    await _seed_regime_snapshot(storage, "2026-07-20", "bearish")
+    await _seed_regime_snapshot(storage, "2026-07-21", "neutral")
+
+    snap = await _get_regime_snapshot_for_date(storage, "2026-07-21")
+
+    assert snap is not None and snap["trade_date"] == "2026-07-21"
+
+
+async def test_regime_snapshot_falls_back_to_prev_day(storage):
+    from services.discovery.ranker import _get_regime_snapshot_for_date
+
+    await _seed_regime_snapshot(storage, "2026-07-20", "bearish")  # D-1
+
+    snap = await _get_regime_snapshot_for_date(storage, "2026-07-21")
+
+    assert snap is not None and snap["trade_date"] == "2026-07-20"
+    assert snap.get("market_sentiment_label") == "bearish"
+
+
+async def test_regime_snapshot_fallback_rejects_too_old(storage):
+    from services.discovery.ranker import _get_regime_snapshot_for_date
+
+    await _seed_regime_snapshot(storage, "2026-07-10", "bearish")  # 11일 전 > 7일
+
+    snap = await _get_regime_snapshot_for_date(storage, "2026-07-21")
+
+    assert snap is None
+
+
+# ---------------------------------------------------------------------------
 # ③ LLM JSON 성공/파싱 실패 = 보류 (+top_n 밖 후보는 절대 호출 안 됨)
 # ---------------------------------------------------------------------------
 
