@@ -1008,6 +1008,21 @@ class BackgroundScanner:
                     scores = compute_strategy_scores(snap, flow)
                     atoms = scores["_atoms"]
                     strategy_scores = {k: v for k, v in scores.items() if k != "_atoms"}
+
+                    # US 신호 T5: AI밸류체인 종목 + 당일 캐시 신호 존재 시만
+                    # 소량 넛지(≤0.05). off/결측/비-AI밸류체인 -> 0.0.
+                    # never-raise: 실패는 로그만 남기고 0.0 유지.
+                    _us_bonus = 0.0
+                    try:
+                        from services.discovery.ai_valuechain import is_ai_valuechain
+                        from services.trading.us_market_data import get_cached_us_ai_signal
+                        if is_ai_valuechain(stk_cd):
+                            _us = await get_cached_us_ai_signal()
+                            if _us is not None:
+                                _us_bonus = max(0.0, float(_us.get("signal", 0.0))) * 0.05
+                    except Exception as e:
+                        logger.warning("us_crossmarket_bonus_failed", stk_cd=stk_cd, error=str(e))
+
                     factor_json = {
                         "quality_filter_passed": True,
                         "skip_reason": None,
@@ -1022,6 +1037,9 @@ class BackgroundScanner:
                         "atoms": atoms,
                         "close_price": snap.price,
                         "market_cap": snap.market_cap,
+                        # US 신호 T5: AI밸류체인 종목 + 당일 캐시 신호 존재 시만
+                        # ranker.rank_candidates가 composite에 소량 가산.
+                        "us_crossmarket_bonus": _us_bonus,
                     }
                     summary = f"{stk_nm}: 발굴 수집 완료(품질필터 통과)"
                 else:

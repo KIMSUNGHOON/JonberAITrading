@@ -466,6 +466,10 @@ async def rank_candidates(storage, scanner_db_path, trade_date: str) -> list[Can
         )
         effective_weights = _effective_weights(strategy_weights, flow_present)
         composite = sum(raw_scores[k] * effective_weights[k] for k in STRATEGIES)
+        # US 신호 T5: US AI 크로스마켓 넛지 -- factor_json에 값이 있을 때만
+        # 소량 가산(≤0.05), clamp 1.0. 구 factor_json(키 없음) -> .get(...,
+        # 0.0) -> composite 무변경(하위호환). STRATEGIES/가중치는 무접촉.
+        composite = min(1.0, composite + float(factor.get("us_crossmarket_bonus", 0.0)))
 
         ranked.append(
             Candidate(

@@ -533,6 +533,58 @@ async def test_rank_candidates_composite_unchanged_when_flow_present(tmp_path, s
 
 
 # ---------------------------------------------------------------------------
+# US AI 크로스마켓 넛지 -- composite에 소량 가산, clamp 1.0, 하위호환 (US 신호 T5)
+# ---------------------------------------------------------------------------
+
+
+async def test_rank_candidates_composite_adds_us_crossmarket_bonus(tmp_path, storage):
+    """factor_json에 us_crossmarket_bonus가 있는 종목만 composite에 가산되고,
+    없는 종목(구 factor_json 형태)은 하위호환으로 무변경이어야 한다."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    factor_with_bonus = _passing_factor(momentum=0.4, pullback=0.4, flow=0.4, meanrev=0.4)
+    factor_with_bonus["us_crossmarket_bonus"] = 0.05
+    factor_without_bonus = _passing_factor(momentum=0.4, pullback=0.4, flow=0.4, meanrev=0.4)
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [
+            {"stk_cd": "005930", "stk_nm": "WithBonus", "factor_json": factor_with_bonus},
+            {"stk_cd": "000660", "stk_nm": "NoBonus", "factor_json": factor_without_bonus},
+        ],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    by_ticker = {c.ticker: c for c in candidates}
+
+    w = DEFAULT_REGIME_WEIGHTS["neutral"]
+    base = 0.4 * w["momentum"] + 0.4 * w["pullback"] + 0.4 * w["flow"] + 0.4 * w["meanrev"]
+
+    assert by_ticker["000660"].composite == pytest.approx(base)
+    assert by_ticker["005930"].composite == pytest.approx(base + 0.05)
+
+
+async def test_rank_candidates_composite_bonus_clamped_at_one(tmp_path, storage):
+    """이미 만점권 composite에 bonus가 더해져도 1.0을 넘지 않아야 한다."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    factor = _passing_factor(momentum=1.0, pullback=1.0, flow=1.0, meanrev=1.0)
+    factor["us_crossmarket_bonus"] = 0.05
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "Maxed", "factor_json": factor}],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    assert candidates[0].composite == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
 # SC-1: status='partial'(스캔 도중 stop_scan으로 종결) 세션도 랭킹 소비
 # 대상이어야 한다 -- 실측 고아 버그(scanner.py stop_scan이 세션을
 # 'running'으로 영구 고아화)의 근본 수정: regime.py와 동일한 게이트 확장.
