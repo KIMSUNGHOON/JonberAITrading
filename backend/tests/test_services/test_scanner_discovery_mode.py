@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock
 
 from services.background_scanner import scanner as scanner_module
 from services.background_scanner.scanner import BackgroundScanner
-from services.kiwoom.models import StockBasicInfo
+from services.kiwoom.models import StockBasicInfo, StockListItem
 from services.trading.coordinator import ExecutionCoordinator
 
 # Note: no module-level `pytestmark` marker — pytest.ini sets asyncio_mode =
@@ -121,11 +121,24 @@ class FakeKiwoomClient:
     있게 한다.
     """
 
-    def __init__(self, stock_infos=None, chart_dfs=None, flow_responses=None, all_stocks_error=None):
+    def __init__(
+        self,
+        stock_infos=None,
+        chart_dfs=None,
+        flow_responses=None,
+        all_stocks_error=None,
+        all_stocks_result=None,
+    ):
         self._stock_infos = stock_infos or {}
         self._chart_dfs = chart_dfs or {}
         self._flow_responses = flow_responses or {}
         self._all_stocks_error = all_stocks_error
+        # T2: get_all_stocks now returns (stocks, missing_markets). Default
+        # mirrors the pre-T2 "no stub configured" behavior (empty universe,
+        # no missing markets) but shaped as the new tuple contract.
+        self._all_stocks_result = (
+            all_stocks_result if all_stocks_result is not None else ([], [])
+        )
         self.flow_calls: list[str] = []
         self.stock_info_calls: list[str] = []
         self.chart_df_calls: list[str] = []
@@ -170,7 +183,7 @@ class FakeKiwoomClient:
         )
         if self._all_stocks_error is not None:
             raise self._all_stocks_error
-        return []
+        return self._all_stocks_result
 
 
 @pytest.fixture
@@ -364,6 +377,52 @@ async def test_non_discovery_scan_records_no_universe_fallback(monkeypatch):
     sessions = await scanner.get_scan_sessions(limit=1)
     assert sessions[0]["universe_fallback"] == 0
     assert sessions[0]["scan_mode"] == "discovery"
+
+
+# ---------------------------------------------------------------------------
+# T2 (발굴 유니버스 rate-limit 회복): KOSDAQ만 실패해도 KOSPI 실 유니버스는
+# 그대로 쓰고 universe_partial에 기록 -- universe_fallback(15개 하드코딩)과는
+# 구분되는, 승격 허용 대상.
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_scan_records_universe_partial_when_one_market_missing(monkeypatch):
+    """get_all_stocks가 (KOSPI 2종목, missing=["KOSDAQ"])를 반환하면
+    _load_stock_list은 그 실 데이터를 그대로 쓴다 -- 15개 하드코딩 폴백으로
+    떨어지지 않는다. universe_fallback=0(승격 억제 아님) +
+    universe_partial='KOSDAQ'로 기록돼야 한다."""
+    kospi_items = [
+        StockListItem(code="005930", name="삼성전자", market_name="코스피"),
+        StockListItem(code="000660", name="SK하이닉스", market_name="코스피"),
+    ]
+    client = FakeKiwoomClient(all_stocks_result=(kospi_items, ["KOSDAQ"]))
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=None, mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["universe_fallback"] == 0
+    assert session["universe_partial"] == "KOSDAQ"
+    # 15개 하드코딩 폴백이 아니라 실 KOSPI 유니버스(2종목) 그대로.
+    assert session["total_stocks"] == 2
+
+
+async def test_discovery_scan_no_universe_partial_when_both_markets_succeed(monkeypatch):
+    """양 시장 모두 성공하면 universe_partial이 기록되지 않아야 한다(양성
+    대조 -- NULL/falsy)."""
+    kospi_items = [StockListItem(code="005930", name="삼성전자", market_name="코스피")]
+    client = FakeKiwoomClient(all_stocks_result=(kospi_items, []))
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=None, mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["universe_fallback"] == 0
+    assert not session["universe_partial"]
 
 
 # ---------------------------------------------------------------------------

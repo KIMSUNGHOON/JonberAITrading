@@ -60,7 +60,8 @@ CREATE TABLE scan_sessions (
     avoid_count INTEGER,
     status TEXT,
     universe_fallback INTEGER,
-    scan_mode TEXT
+    scan_mode TEXT,
+    universe_partial TEXT
 )
 """
 
@@ -90,6 +91,7 @@ async def _seed_scanner_db(
     *,
     session_id: str = "sess-1",
     universe_fallback: bool = False,
+    universe_partial: str = "",
     status: str = "completed",
     scan_mode: str = "discovery",
 ) -> str:
@@ -104,8 +106,8 @@ async def _seed_scanner_db(
             INSERT INTO scan_sessions
             (id, started_at, completed_at, total_stocks, completed, failed,
              buy_count, sell_count, hold_count, watch_count, avoid_count,
-             status, universe_fallback, scan_mode)
-            VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, ?, 0, ?, ?, ?)
+             status, universe_fallback, scan_mode, universe_partial)
+            VALUES (?, ?, ?, ?, ?, 0, 0, 0, 0, ?, 0, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -117,6 +119,7 @@ async def _seed_scanner_db(
                 status,
                 1 if universe_fallback else 0,
                 scan_mode,
+                universe_partial or None,
             ),
         )
         for r in results:
@@ -192,6 +195,7 @@ def _candidate(
     rank: int = 1,
     close_price: float = 50_000.0,
     universe_fallback: bool = False,
+    universe_partial: bool = False,
     quality_filter_passed: bool = True,
     llm_suitable: bool | None = True,
 ) -> Candidate:
@@ -206,6 +210,7 @@ def _candidate(
         daily_cap=daily_cap,
         weights={"momentum": 0.25, "pullback": 0.25, "flow": 0.25, "meanrev": 0.25},
         universe_fallback=universe_fallback,
+        universe_partial=universe_partial,
         quality_filter_passed=quality_filter_passed,
         raw_scores=(
             {"momentum": 0.6, "pullback": 0.6, "flow": 0.6, "meanrev": 0.6}
@@ -324,6 +329,44 @@ async def test_rank_candidates_composite_matches_manual_calculation(tmp_path, st
     # B's composite is higher -> rank 1.
     assert by_ticker["000660"].rank == 1
     assert by_ticker["005930"].rank == 2
+
+
+async def test_rank_candidates_reads_universe_partial_from_session(tmp_path, storage):
+    """T2: session.universe_partial('KOSDAQ')이 각 Candidate.universe_partial
+    로 그대로 옮겨져야 한다 -- 단, 이 신호는 관측용일 뿐, composite/rank
+    계산이나 아래 promote_candidates 게이트에는 전혀 영향을 주지 않는다
+    (그 확인은 test_promote_universe_partial_does_not_suppress_candidates가
+    맡는다)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "A", "factor_json": _passing_factor(momentum=0.5)}],
+        universe_partial="KOSDAQ",
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    assert len(candidates) == 1
+    assert candidates[0].universe_partial is True
+    assert candidates[0].universe_fallback is False
+
+
+async def test_rank_candidates_universe_partial_false_when_not_recorded(tmp_path, storage):
+    """양성 대조: universe_partial이 세션에 기록되지 않은(NULL/기본값)
+    정상 완전 유니버스 세션은 candidate.universe_partial이 False여야 한다."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "A", "factor_json": _passing_factor(momentum=0.5)}],
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    assert candidates[0].universe_partial is False
 
 
 async def test_rank_candidates_excludes_quality_filter_failures_from_ranking(tmp_path, storage):
@@ -1238,6 +1281,22 @@ async def test_promote_universe_fallback_skips_all_candidates(storage, coordinat
 
     ledger = await storage.get_discovery_candidates(trade_date=c1.trade_date)
     assert {r["skip_reason"] for r in ledger} == {"universe_fallback"}
+
+
+async def test_promote_universe_partial_does_not_suppress_candidates(storage, coordinator):
+    """T2: universe_partial(부분이지만 실 유니버스)은 universe_fallback(15개
+    하드코딩 폴백)과 달리 승격을 억제하면 안 된다 -- 정상 composite/threshold/
+    LLM 게이트를 그대로 통과해 승격돼야 한다."""
+    c = _candidate(
+        "005930", composite=0.9, threshold=0.1, universe_partial=True,
+    )
+
+    summary = await promote_candidates(coordinator, storage, [c])
+
+    assert summary.promoted == ["005930"]
+    assert c.skip_reason is None
+    assert c.promoted is True
+    assert [w.ticker for w in coordinator.get_watch_list()] == ["005930"]
 
 
 async def test_promote_no_candidates_is_a_noop(storage, coordinator):

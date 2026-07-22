@@ -140,6 +140,12 @@ class Candidate:
     llm_verdict: Optional[dict[str, Any]] = None
     promoted: bool = False
     flow_present: bool = False
+    # T2: observability only -- which market(s), if any, were missing from
+    # this session's universe (e.g. "KOSDAQ"). Unlike `universe_fallback`,
+    # this NEVER suppresses promotion (see promote_candidates' gate #1,
+    # which only reads universe_fallback) -- a partial-but-real universe's
+    # candidates go through the normal composite/threshold/LLM gates.
+    universe_partial: bool = False
 
 
 @dataclass
@@ -404,6 +410,9 @@ async def rank_candidates(storage, scanner_db_path, trade_date: str) -> list[Can
         return []
 
     universe_fallback = bool(session.get("universe_fallback"))
+    # T2: purely observational -- NOT wired into any gate (see Candidate's
+    # universe_partial docstring / promote_candidates gate #1).
+    universe_partial = bool(session.get("universe_partial"))
 
     snapshot = await _get_regime_snapshot_for_date(storage, trade_date)
     regime_label = _extract_regime_label(snapshot, weights_cfg)
@@ -460,6 +469,7 @@ async def rank_candidates(storage, scanner_db_path, trade_date: str) -> list[Can
             daily_cap=daily_cap,
             weights=dict(strategy_weights),
             universe_fallback=universe_fallback,
+            universe_partial=universe_partial,
         )
 
         if not factor or not factor.get("quality_filter_passed"):

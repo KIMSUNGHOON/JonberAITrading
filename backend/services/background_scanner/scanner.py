@@ -161,6 +161,13 @@ class BackgroundScanner:
         # to _get_fallback_stock_list() (get_all_stocks failure) — recorded
         # into scan_sessions.universe_fallback (DS-2).
         self._universe_fallback_used = False
+        # T2: comma-joined market names (e.g. "KOSDAQ") that failed to load
+        # on the most recent _load_stock_list() call while at least one
+        # OTHER market succeeded — a real, partial universe that is still
+        # promotion-eligible (unlike _universe_fallback_used's 15-name
+        # hardcoded list). Recorded into scan_sessions.universe_partial.
+        # Empty string means "no partial universe this run".
+        self._universe_partial_markets = ""
 
         # SC-1: the scan_sessions.id of the currently in-flight scan (set by
         # start_scan, read by stop_scan so it can record a 'partial'
@@ -265,7 +272,14 @@ class BackgroundScanner:
             await self._ensure_columns(
                 db,
                 "scan_sessions",
-                {"universe_fallback": "INTEGER", "scan_mode": "TEXT"},
+                {
+                    "universe_fallback": "INTEGER",
+                    "scan_mode": "TEXT",
+                    # T2: comma-joined market names that were missing from an
+                    # otherwise-usable partial universe (NULL/'' when the
+                    # session's universe was complete or a full fallback).
+                    "universe_partial": "TEXT",
+                },
             )
 
             await db.commit()
@@ -297,6 +311,20 @@ class BackgroundScanner:
         """
         Load full KOSPI/KOSDAQ stock list from Kiwoom API.
 
+        T2 (발굴 유니버스 rate-limit 회복): `get_all_stocks` now returns
+        (stocks, missing_markets) — one market failing (e.g. KOSDAQ still
+        rate-limited after retries) no longer discards the market(s) that
+        DID succeed. Three outcomes:
+          - both markets fail (stocks empty) -> hardcoded 15-name fallback,
+            `_universe_fallback_used = True` (promotion-suppressed, same as
+            pre-T2 behavior).
+          - one market missing but the other succeeded -> the real partial
+            universe is used as-is, `_universe_fallback_used` stays False,
+            and `_universe_partial_markets` records which market(s) were
+            missing (promotion IS allowed — a partial real universe is not
+            the same as the hardcoded fallback).
+          - both markets succeed -> full universe, neither flag set.
+
         Returns:
             List of (stock_code, stock_name, market_type) tuples
         """
@@ -304,30 +332,48 @@ class BackgroundScanner:
 
         try:
             client = await get_shared_kiwoom_client_async()
-            all_stocks = await client.get_all_stocks(
+            all_stocks, missing_markets = await client.get_all_stocks(
                 include_kospi=True,
                 include_kosdaq=True,
                 exclude_warnings=True,
                 exclude_etf_etn=True,  # DQ-1: ETN/스팩 유니버스 혼입 제외
             )
-
-            stock_list = [
-                (stock.code, stock.name, stock.market_name)
-                for stock in all_stocks
-            ]
-
-            logger.info(
-                "stock_list_loaded",
-                total=len(stock_list),
-            )
-
-            return stock_list
-
         except Exception as e:
             logger.error("stock_list_load_failed", error=str(e))
             # Fallback to hardcoded list if API fails
             self._universe_fallback_used = True
             return self._get_fallback_stock_list()
+
+        if not all_stocks:
+            # Both markets failed -- nothing real to work with.
+            logger.error(
+                "stock_list_load_failed",
+                error="all_markets_failed",
+                missing=missing_markets,
+            )
+            self._universe_fallback_used = True
+            return self._get_fallback_stock_list()
+
+        if missing_markets:
+            # Partial but real universe -- promotion stays allowed.
+            self._universe_partial_markets = ",".join(missing_markets)
+            logger.warning(
+                "universe_partial",
+                missing=missing_markets,
+                count=len(all_stocks),
+            )
+
+        stock_list = [
+            (stock.code, stock.name, stock.market_name)
+            for stock in all_stocks
+        ]
+
+        logger.info(
+            "stock_list_loaded",
+            total=len(stock_list),
+        )
+
+        return stock_list
 
     def _get_fallback_stock_list(self) -> List[tuple]:
         """Fallback stock list if API fails."""
@@ -431,9 +477,10 @@ class BackgroundScanner:
             self._gpu_monitor = None
 
         # Load stock list if not provided (only _load_stock_list() calls can
-        # set the fallback flag — an explicitly supplied stock_list never
-        # counts as a fallback).
+        # set the fallback/partial flags — an explicitly supplied stock_list
+        # never counts as a fallback or partial universe).
         self._universe_fallback_used = False
+        self._universe_partial_markets = ""
         if stock_list is None:
             stock_list = await self._load_stock_list()
 
@@ -467,6 +514,7 @@ class BackgroundScanner:
             session_id,
             scan_mode=scan_mode_label,
             universe_fallback=self._universe_fallback_used,
+            universe_partial=self._universe_partial_markets,
         )
 
         # Send Telegram notification
@@ -491,13 +539,14 @@ class BackgroundScanner:
         session_id: str,
         scan_mode: str = "quick",
         universe_fallback: bool = False,
+        universe_partial: str = "",
     ):
         """Save scan session start to database."""
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
                 INSERT INTO scan_sessions
-                (id, started_at, total_stocks, status, scan_mode, universe_fallback)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (id, started_at, total_stocks, status, scan_mode, universe_fallback, universe_partial)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 session_id,
                 datetime.now(),
@@ -505,6 +554,7 @@ class BackgroundScanner:
                 "running",
                 scan_mode,
                 1 if universe_fallback else 0,
+                universe_partial or None,
             ))
             await db.commit()
 

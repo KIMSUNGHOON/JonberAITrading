@@ -131,6 +131,10 @@ _ETF_ETN_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 발굴 유니버스 T2/T3: get_all_stocks가 KOSPI 조회 직후 KOSDAQ을 곧바로 때리지
+# 않도록 두는 스페이싱(초) — 연속 대량 조회로 인한 유량제한 재유발 예방.
+_INTER_MARKET_DELAY = 1.0
+
 
 class KiwoomClient:
     """
@@ -1546,9 +1550,19 @@ class KiwoomClient:
         include_kosdaq: bool = True,
         exclude_warnings: bool = True,
         exclude_etf_etn: bool = True,
-    ) -> list[StockListItem]:
+    ) -> tuple[list[StockListItem], list[str]]:
         """
         KOSPI/KOSDAQ 전체 종목 조회
+
+        T2(발굴 유니버스 T2 — 부분 유니버스 보존): 각 시장은 독립적으로
+        조회되어, 한쪽(예: KOSDAQ)이 재시도 소진 후에도 유량제한 등으로
+        실패해도 다른 쪽(예: KOSPI)의 결과는 버려지지 않고 그대로 반환된다
+        — 반환값이 list가 아니라 (stocks, missing_markets) 튜플인 이유.
+        `missing_markets`는 실패한 시장명("KOSPI"/"KOSDAQ") 목록이며, 두
+        시장 모두 실패하면 stocks=[]가 된다(호출부가 완전 폴백 여부를
+        `not stocks`로 판정할 수 있게). KOSPI/KOSDAQ 사이에는
+        `_INTER_MARKET_DELAY`만큼 대기해 연속 호출로 인한 유량제한
+        재유발을 예방한다.
 
         Args:
             include_kospi: 코스피 포함 여부
@@ -1563,17 +1577,35 @@ class KiwoomClient:
                 없이 기존 거동(byte-불변) 그대로 유지된다.
 
         Returns:
-            StockListItem 리스트
+            (StockListItem 리스트, 실패한 시장명 리스트) 튜플. 필터
+            (exclude_warnings/exclude_etf_etn)는 성공한 시장의 결과에만
+            적용된다.
         """
         all_stocks: list[StockListItem] = []
+        missing_markets: list[str] = []
 
         if include_kospi:
-            kospi_stocks = await self.get_stock_list(MarketType.KOSPI)
-            all_stocks.extend(kospi_stocks)
+            try:
+                all_stocks.extend(await self.get_stock_list(MarketType.KOSPI))
+            except KiwoomError as e:
+                logger.error(
+                    "stock_list_market_failed", market="KOSPI", error=str(e)
+                )
+                missing_markets.append("KOSPI")
+
+        if include_kospi and include_kosdaq:
+            # T2/T3: KOSPI 직후 곧바로 KOSDAQ을 때리면 유량제한을 재유발할
+            # 수 있어 시장 간 스페이싱을 둔다.
+            await asyncio.sleep(_INTER_MARKET_DELAY)
 
         if include_kosdaq:
-            kosdaq_stocks = await self.get_stock_list(MarketType.KOSDAQ)
-            all_stocks.extend(kosdaq_stocks)
+            try:
+                all_stocks.extend(await self.get_stock_list(MarketType.KOSDAQ))
+            except KiwoomError as e:
+                logger.error(
+                    "stock_list_market_failed", market="KOSDAQ", error=str(e)
+                )
+                missing_markets.append("KOSDAQ")
 
         if exclude_warnings:
             all_stocks = [s for s in all_stocks if s.is_normal]
@@ -1597,6 +1629,7 @@ class KiwoomClient:
             kospi=include_kospi,
             kosdaq=include_kosdaq,
             exclude_etf_etn=exclude_etf_etn,
+            missing_markets=missing_markets,
         )
 
-        return unique_stocks
+        return unique_stocks, missing_markets
