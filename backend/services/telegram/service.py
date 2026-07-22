@@ -716,7 +716,7 @@ _모니터링 중..._
         for p in promoted[:_MAX]:
             lines.append(
                 f"• {p['name']} {p['ticker']} · {self._fmt_composite(p.get('composite'))} "
-                f"{p.get('strategy') or '-'} · 워치 {self._fmt_krw(p.get('target'))}"
+                f"{p.get('strategy') or '-'} · 워치 {self._fmt_price(p.get('target'))}"
             )
         if len(promoted) > _MAX:
             lines.append(f"• 외 {len(promoted) - _MAX}종")
@@ -725,6 +725,15 @@ _모니터링 중..._
             tail = f"+{daily_cap_waiting}종 daily_cap 대기 · {tail}"
         lines.append(tail)
         return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_price(value) -> str:
+        """워치 진입가격(레벨) 플레인 천단위 표기 — 승인 형식 "3,850".
+        `_fmt_krw`는 P&L용 부호(+₩)를 붙여 가격 레벨엔 부적절하므로 별도."""
+        try:
+            return f"{int(round(float(value))):,}" if value is not None else "―"
+        except (TypeError, ValueError):
+            return "―"
 
     @staticmethod
     def _fmt_composite(value) -> str:
