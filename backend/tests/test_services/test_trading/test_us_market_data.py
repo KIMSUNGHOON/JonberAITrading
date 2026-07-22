@@ -1,6 +1,6 @@
 import json
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -47,10 +47,40 @@ async def test_fetch_parses_and_skips_failed(monkeypatch):
     assert out == {"SMH": {"chg_pct": 2.0, "prev_close": 1.0}}
 
 
+async def test_fetch_all_failed_returns_none(monkeypatch):
+    fake = MagicMock()
+    fake.FINNHUB_API_KEY = MagicMock(); fake.FINNHUB_API_KEY.get_secret_value.return_value = "k"
+    monkeypatch.setattr(um, "get_settings", lambda: fake)
+    async def fake_quote(client, ticker, api_key):
+        return None
+    monkeypatch.setattr(um, "_finnhub_quote", fake_quote)
+    out = await um.fetch_us_ai_overnight(["SMH", "MU", "NVDA"])
+    assert out is None  # {} → None (`out or None`), not an empty dict
+
+
 async def test_refresh_disabled_is_noop(monkeypatch):
     fake = MagicMock(); fake.US_SIGNAL_ENABLED = False
     monkeypatch.setattr(um, "get_settings", lambda: fake)
     assert await um.refresh_us_ai_signal_cache() is None
+
+
+async def test_refresh_success_writes_cache_once(monkeypatch):
+    fake = MagicMock(); fake.US_SIGNAL_ENABLED = True
+    monkeypatch.setattr(um, "get_settings", lambda: fake)
+    snapshot = {"SMH": {"chg_pct": 2.0, "prev_close": 1.0}}
+    monkeypatch.setattr(um, "fetch_us_ai_overnight", AsyncMock(return_value=snapshot))
+    storage = MagicMock(); storage.set_app_setting = AsyncMock()
+    monkeypatch.setattr(um, "get_storage_service", AsyncMock(return_value=storage))
+
+    result = await um.refresh_us_ai_signal_cache()
+
+    storage.set_app_setting.assert_awaited_once()
+    key, raw = storage.set_app_setting.await_args.args
+    assert key == um.US_SIGNAL_CACHE_KEY
+    written = json.loads(raw)
+    assert written["signal"] == result["signal"]
+    assert round(written["signal_pct"], 4) == 2.0  # SMH만 → 재정규화 없이 그대로
+    assert written["as_of"] == date.today().isoformat()
 
 
 async def test_get_cached_returns_today_signal(monkeypatch):
