@@ -201,6 +201,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("holiday_service_init_failed", error=str(e))
 
+    # US AI 크로스마켓 신호 pre-open 스케줄러(US_SIGNAL_ENABLED off면 no-op) + 부팅 1회 갱신
+    try:
+        from services.trading.us_market_data import refresh_us_ai_signal_cache, start_us_signal_scheduler
+
+        us_signal_scheduler = start_us_signal_scheduler()
+        if us_signal_scheduler is not None:
+            await refresh_us_ai_signal_cache()  # 부팅 즉시 1회(다음 08:00 cron 전까지 신호 확보)
+            logger.info("us_ai_signal_scheduler_and_initial_refresh_done")
+    except Exception as e:
+        logger.warning("us_ai_signal_scheduler_init_failed", error=str(e))
+
     # Initialize the LLM router (best-effort CLI/HTTP health probes for /api/llm/stats)
     try:
         from agents.llm.router import get_router

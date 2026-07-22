@@ -107,6 +107,21 @@ async def refresh_us_ai_signal_cache() -> Optional[dict]:
         return None
 
 
+def start_us_signal_scheduler():
+    """pre-open 일일 cron(08:00 KST) — US 마감 후·KR 개장(09:00) 전 신호 갱신.
+    US_SIGNAL_ENABLED off면 None(스케줄러 미기동). krx_holiday.start_scheduler 패턴."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    if not get_settings().US_SIGNAL_ENABLED:
+        return None
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(refresh_us_ai_signal_cache, trigger="cron", hour=8, minute=0,
+                       id="us_ai_signal_refresh", replace_existing=True)
+    scheduler.start()
+    logger.info("us_ai_signal_scheduler_started")
+    return scheduler
+
+
 async def get_cached_us_ai_signal() -> Optional[dict]:
     """캐시된 당일 US 신호. off/미존재/stale(오늘 아님)/파싱실패 → None. never-raise.
     소비처(sentiment/discovery) 단일 소스."""

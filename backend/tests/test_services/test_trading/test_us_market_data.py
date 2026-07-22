@@ -106,3 +106,20 @@ async def test_get_cached_disabled_none(monkeypatch):
     fake = MagicMock(); fake.US_SIGNAL_ENABLED = False
     monkeypatch.setattr(um, "get_settings", lambda: fake)
     assert await um.get_cached_us_ai_signal() is None
+
+
+def test_scheduler_disabled_returns_none(monkeypatch):
+    fake = MagicMock(); fake.US_SIGNAL_ENABLED = False
+    monkeypatch.setattr(um, "get_settings", lambda: fake)
+    assert um.start_us_signal_scheduler() is None
+
+
+async def test_scheduler_enabled_registers_cron_job(monkeypatch):
+    # AsyncIOScheduler.start() requires a running event loop (matches real
+    # usage: start_us_signal_scheduler() is called from the async lifespan).
+    fake = MagicMock(); fake.US_SIGNAL_ENABLED = True
+    monkeypatch.setattr(um, "get_settings", lambda: fake)
+    sched = um.start_us_signal_scheduler()
+    assert sched is not None
+    assert len(sched.get_jobs()) == 1  # 일일 cron 1개
+    sched.shutdown(wait=False)
