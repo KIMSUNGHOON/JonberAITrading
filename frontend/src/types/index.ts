@@ -1758,6 +1758,14 @@ export interface UsSignalComponent {
 export interface UsSignalCurationItem {
   ticker: string;
   name: string;
+  signal_type?: string | null; // "memory" | "accel" (v2 서브신호 배지)
+}
+// v2: overall과 별도 산출되는 memory/accel/demand 서브신호. components는
+// {ticker: change_pct}(이미 퍼센트, weight 아님) -- overall의 UsSignalComponent[]와 shape 다름.
+export interface UsSubSignal {
+  signal: number | null;
+  signal_pct: number | null;
+  components: Record<string, number>;
 }
 export interface UsSignalResponse {
   enabled: boolean;
@@ -1767,4 +1775,5 @@ export interface UsSignalResponse {
   components: UsSignalComponent[];
   computed_at: string | null;
   curation: UsSignalCurationItem[];
+  sub_signals?: { memory?: UsSubSignal; accel?: UsSubSignal; demand?: UsSubSignal } | null;
 }
