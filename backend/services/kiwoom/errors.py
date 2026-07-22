@@ -59,6 +59,13 @@ INVALID_TOKEN_CODES = frozenset({8003, 8005, 8006, 8009, 8015, 8016})
 INVALID_CREDENTIAL_CODES = frozenset({8001, 8002, 8011, 8012})
 MODE_MISMATCH_CODES = frozenset({8030, 8031})
 
+# 유량(rate-limit) 초과를 전용 코드(1700/-903)가 아니라 일반 코드(예: 5)로
+# 감싸고 실제 사유를 return_msg에 중첩해 반환하는 경우를 식별하는 메시지
+# 마커 (is_token_expired와 동일한 중첩 패턴). 오탐 방지를 위해 이 두
+# 문구만 사용한다 — 다른 코드-5 오류(예: 종목코드 오류)와 겹치지 않는
+# 명확한 유량초과 전용 표현.
+RATE_LIMIT_MSG_MARKERS = ("유량", "허용된 요청 개수")
+
 
 # 에러 코드 -> 메시지 매핑
 ERROR_MESSAGES: dict[int, str] = {
@@ -127,8 +134,13 @@ class KiwoomError(Exception):
 
     @property
     def is_rate_limit(self) -> bool:
-        """레이트리밋 에러인지 확인 (서버 1700 또는 내부 합성 코드)"""
-        return self.code in RATE_LIMIT_CODES or self.code == KiwoomErrorCode.RATE_LIMIT_EXCEEDED
+        """레이트리밋 에러인지 확인 (서버 1700/-903, 또는 유량초과를 일반
+        코드(예: 5)로 감싸고 실제 사유를 return_msg에 중첩해 반환하는
+        경우 — is_token_expired와 동일한 중첩 패턴)."""
+        if self.code in RATE_LIMIT_CODES or self.code == KiwoomErrorCode.RATE_LIMIT_EXCEEDED:
+            return True
+        msg = self.message or ""
+        return any(marker in msg for marker in RATE_LIMIT_MSG_MARKERS)
 
     @property
     def is_token_expired(self) -> bool:

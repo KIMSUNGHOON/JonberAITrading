@@ -160,6 +160,38 @@ class TestKiwoomError:
         assert error.is_order_error is False
 
 
+class TestKiwoomErrorRateLimitCode5:
+    """코드 5(일반 오류)로 감싸 유량초과를 반환하는 라이브 관측 패턴.
+
+    Kiwoom는 유량(rate-limit) 초과를 전용 코드(1700/-903)가 아니라 일반
+    코드 5로 감싸고, 실제 사유를 return_msg에 중첩해 반환하는 경우가 있다
+    (is_token_expired와 동일한 중첩 패턴). 코드만 보면 놓쳐 재시도가 뜨지
+    않고 발굴 유니버스가 15종목 폴백으로 축소된다.
+    """
+
+    def test_code5_with_유량_marker_is_rate_limit(self):
+        error = KiwoomError(
+            code=5,
+            message="허용된 요청 개수를 초과하였습니다[1700:허용된 API 요청 개수를 초과하였습니다. 유량=1, API ID=ka10099]",
+        )
+        assert error.is_rate_limit is True
+        assert error.is_retryable is True
+
+    def test_code5_without_marker_not_rate_limit(self):
+        error = KiwoomError(code=5, message="종목코드 오류입니다")
+        assert error.is_rate_limit is False
+
+    def test_existing_1700_still_rate_limit(self):
+        assert KiwoomError(code=1700, message="x").is_rate_limit is True
+
+    def test_rate_limit_exceeded_negative_code(self):
+        assert KiwoomError(code=KiwoomErrorCode.RATE_LIMIT_EXCEEDED, message="x").is_rate_limit is True
+
+    def test_허용된요청개수_marker_alt(self):
+        error = KiwoomError(code=5, message="허용된 요청 개수를 초과했습니다")
+        assert error.is_rate_limit is True
+
+
 class TestKiwoomAuthError:
     """KiwoomAuthError tests"""
 
