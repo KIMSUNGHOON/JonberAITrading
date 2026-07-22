@@ -1374,6 +1374,56 @@ async def get_discovery_performance_route(days: int = 14):
     return DiscoveryPerformanceResponse(days=days, by_strategy_tag=summary)
 
 
+class UsSignalComponent(BaseModel):
+    ticker: str
+    weight: float
+    change_pct: Optional[float] = None
+
+
+class UsSignalCurationItem(BaseModel):
+    ticker: str
+    name: str
+
+
+class UsSignalResponse(BaseModel):
+    enabled: bool
+    as_of: Optional[str] = None
+    signal_pct: Optional[float] = None
+    signal: Optional[float] = None
+    components: List[UsSignalComponent] = Field(default_factory=list)
+    computed_at: Optional[str] = None
+    curation: List[UsSignalCurationItem] = Field(default_factory=list)
+
+
+@router.get("/discovery/us-signal", response_model=UsSignalResponse)
+async def get_us_signal_route():
+    """현재 US AI 크로스마켓 신호 + 적용 큐레이션(읽기전용). off/stale이면 신호필드 null·큐레이션은 항상."""
+    from app.config import get_settings
+    from services.trading.us_market_data import get_cached_us_ai_signal, US_AI_TICKERS
+    from services.discovery.ai_valuechain import AI_VALUECHAIN_TICKERS
+
+    enabled = bool(get_settings().US_SIGNAL_ENABLED)
+    cached = await get_cached_us_ai_signal()  # off/stale/실패 → None (never-raise)
+    comps_pct = (cached or {}).get("components") or {}
+    components = [
+        UsSignalComponent(ticker=t, weight=w, change_pct=comps_pct.get(t))
+        for t, w in US_AI_TICKERS.items()
+    ]
+    curation = [
+        UsSignalCurationItem(ticker=t, name=n)
+        for t, n in AI_VALUECHAIN_TICKERS.items()
+    ]
+    return UsSignalResponse(
+        enabled=enabled,
+        as_of=(cached or {}).get("as_of"),
+        signal_pct=(cached or {}).get("signal_pct"),
+        signal=(cached or {}).get("signal"),
+        components=components,
+        computed_at=(cached or {}).get("computed_at"),
+        curation=curation,
+    )
+
+
 # -------------------------------------------
 # Trade Queue Endpoints
 # -------------------------------------------
