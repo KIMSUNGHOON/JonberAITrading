@@ -64,11 +64,15 @@ export default function UsSignalCard() {
 
       {state === 'loading' && <div className="text-sm text-muted">상태 확인 중…</div>}
 
-      {state !== 'loading' && !enabled && (
+      {state === 'error' && !data && (
+        <div className="text-sm text-muted mb-3">신호 상태 조회 실패 — 재시도 중…</div>
+      )}
+
+      {state === 'ready' && !enabled && (
         <div className="text-sm text-muted mb-3">US 신호 비활성 (US_SIGNAL_ENABLED off)</div>
       )}
 
-      {state !== 'loading' && enabled && !fresh && (
+      {state === 'ready' && enabled && !fresh && (
         <div className="text-sm text-muted mb-3">당일 신호 대기 중 (개장 전 갱신 예정)</div>
       )}
 
@@ -86,7 +90,7 @@ export default function UsSignalCard() {
               <span key={c.ticker}>
                 {i > 0 && ' · '}
                 {c.ticker} {Math.round(c.weight * 100)}%{' '}
-                <span className={(c.change_pct ?? 0) >= 0 ? 'text-up' : 'text-down'}>
+                <span className={c.change_pct == null ? 'text-dim' : c.change_pct >= 0 ? 'text-up' : 'text-down'}>
                   {fmtPct(c.change_pct)}
                 </span>
               </span>
