@@ -1,4 +1,6 @@
-from services.discovery.ai_valuechain import AI_VALUECHAIN_TICKERS, is_ai_valuechain
+from services.discovery.ai_valuechain import (
+    AI_VALUECHAIN_TICKERS, is_ai_valuechain, valuechain_signal_type,
+)
 
 
 def test_core_tickers_present():
@@ -31,3 +33,23 @@ def test_is_ai_valuechain():
     assert is_ai_valuechain("011070") is False  # LG이노텍 (애플 카메라, 제외)
     assert is_ai_valuechain("") is False
     assert is_ai_valuechain(None) is False
+
+
+def test_signal_type_tagging():
+    assert valuechain_signal_type("005930") == "memory"
+    assert valuechain_signal_type("000660") == "memory"
+    assert valuechain_signal_type("042700") == "memory"
+    assert valuechain_signal_type("402340") == "memory"  # 하이닉스 지주 프록시
+    assert valuechain_signal_type("007660") == "accel"
+    assert valuechain_signal_type("353200") == "accel"
+    assert valuechain_signal_type("009150") == "accel"
+    assert valuechain_signal_type("035420") is None  # 비-밸류체인
+    assert valuechain_signal_type("") is None
+    assert valuechain_signal_type(None) is None
+
+
+def test_membership_still_works():
+    assert is_ai_valuechain("005930") is True
+    assert is_ai_valuechain("035420") is False
+    # 값이 dict여도 name 접근
+    assert AI_VALUECHAIN_TICKERS["005930"]["name"] == "삼성전자"

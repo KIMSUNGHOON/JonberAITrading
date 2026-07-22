@@ -1283,16 +1283,18 @@ class ChatCoordinator:
             # never-raise: 실패는 로그만, 토론을 막지 않는다.
             us_market_context = None
             try:
-                from services.discovery.ai_valuechain import is_ai_valuechain
-                from services.trading.us_market_data import get_cached_us_ai_signal
+                from services.discovery.ai_valuechain import is_ai_valuechain, valuechain_signal_type
+                from services.trading.us_market_data import get_cached_us_ai_signal, get_subsignal
                 if is_ai_valuechain(ticker):
                     _us = await get_cached_us_ai_signal()
-                    if _us is not None:
-                        _comp = _us.get("components", {})
+                    _sub = get_subsignal(_us, valuechain_signal_type(ticker))
+                    if _sub is not None and _sub.get("signal") is not None:
+                        _comp = _sub.get("components", {})
                         _parts = ", ".join(f"{k} {v:+.1f}%" for k, v in _comp.items())
-                        _dir = "강세" if _us["signal"] > 0 else ("약세" if _us["signal"] < 0 else "중립")
+                        _dir = "강세" if _sub["signal"] > 0 else ("약세" if _sub["signal"] < 0 else "중립")
+                        _label = "메모리/HBM" if valuechain_signal_type(ticker) == "memory" else "AI가속기"
                         us_market_context = (
-                            f"간밤 미 AI 반도체 {_dir}({_parts}). 이 종목은 AI 공급망(메모리/HBM)으로 "
+                            f"간밤 미 {_label} {_dir}({_parts}). 이 종목은 해당 미 공급망을 "
                             f"선행 추종 경향이나 확정 신호 아님 — 자체 밸류에이션·수급·뉴스가 우선."
                         )
             except Exception as e:

@@ -1014,12 +1014,13 @@ class BackgroundScanner:
                     # never-raise: 실패는 로그만 남기고 0.0 유지.
                     _us_bonus = 0.0
                     try:
-                        from services.discovery.ai_valuechain import is_ai_valuechain
-                        from services.trading.us_market_data import get_cached_us_ai_signal
+                        from services.discovery.ai_valuechain import is_ai_valuechain, valuechain_signal_type
+                        from services.trading.us_market_data import get_cached_us_ai_signal, get_subsignal
                         if is_ai_valuechain(stk_cd):
                             _us = await get_cached_us_ai_signal()
-                            if _us is not None:
-                                _us_bonus = max(0.0, float(_us.get("signal", 0.0))) * 0.05
+                            _sub = get_subsignal(_us, valuechain_signal_type(stk_cd))
+                            if _sub is not None and _sub.get("signal") is not None:
+                                _us_bonus = max(0.0, float(_sub.get("signal") or 0.0)) * 0.05
                     except Exception as e:
                         logger.warning("us_crossmarket_bonus_failed", stk_cd=stk_cd, error=str(e))
 

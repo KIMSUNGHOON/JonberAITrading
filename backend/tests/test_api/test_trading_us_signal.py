@@ -49,6 +49,10 @@ def test_us_signal_enabled_fresh(client: TestClient):
         "signal": 1.0,
         "signal_pct": 5.8,
         "components": {"SMH": 4.52, "MU": 12.17, "NVDA": 1.97},
+        "sub_signals": {
+            "memory": {"signal": 0.9, "signal_pct": 8.3, "components": {"MU": 12.17, "SMH": 4.52}},
+            "accel": {"signal": 0.4, "signal_pct": 1.97, "components": {"NVDA": 1.97}},
+        },
         "as_of": "2026-07-22",
         "computed_at": "2026-07-22T03:09:12Z",
     }
@@ -66,11 +70,21 @@ def test_us_signal_enabled_fresh(client: TestClient):
     comps = {c["ticker"]: c for c in d["components"]}
     assert comps["SMH"]["weight"] == 0.5 and comps["SMH"]["change_pct"] == 4.52
     assert comps["MU"]["change_pct"] == 12.17
-    # 큐레이션 7종 항상
-    codes = {c["ticker"] for c in d["curation"]}
+    # 큐레이션 7종 항상 + signal_type 채워짐
+    curation = {c["ticker"]: c for c in d["curation"]}
+    codes = set(curation)
     assert {
         "005930", "000660", "042700", "007660", "353200", "009150", "402340",
     } <= codes
+    assert curation["005930"]["signal_type"] == "memory"
+    assert curation["000660"]["signal_type"] == "memory"
+    assert curation["402340"]["signal_type"] == "memory"
+    assert curation["007660"]["signal_type"] == "accel"
+    assert curation["353200"]["signal_type"] == "accel"
+    assert curation["009150"]["signal_type"] == "accel"
+    # sub_signals passthrough (캐시 원형 그대로, FE가 파싱)
+    assert d["sub_signals"]["memory"]["signal_pct"] == 8.3
+    assert d["sub_signals"]["accel"]["signal"] == 0.4
 
 
 def test_us_signal_enabled_stale_returns_nulls(client: TestClient):
@@ -88,6 +102,7 @@ def test_us_signal_enabled_stale_returns_nulls(client: TestClient):
     assert {c["ticker"] for c in d["components"]} == {"SMH", "MU", "NVDA"}
     assert all(c["change_pct"] is None for c in d["components"])
     assert len(d["curation"]) == 7  # 큐레이션은 항상
+    assert d["sub_signals"] is None
 
 
 def test_us_signal_disabled(client: TestClient):
@@ -102,3 +117,4 @@ def test_us_signal_disabled(client: TestClient):
     assert d["enabled"] is False
     assert d["signal_pct"] is None
     assert len(d["curation"]) == 7
+    assert d["sub_signals"] is None

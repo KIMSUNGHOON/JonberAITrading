@@ -1383,6 +1383,7 @@ class UsSignalComponent(BaseModel):
 class UsSignalCurationItem(BaseModel):
     ticker: str
     name: str
+    signal_type: Optional[str] = None
 
 
 class UsSignalResponse(BaseModel):
@@ -1393,6 +1394,7 @@ class UsSignalResponse(BaseModel):
     components: List[UsSignalComponent] = Field(default_factory=list)
     computed_at: Optional[str] = None
     curation: List[UsSignalCurationItem] = Field(default_factory=list)
+    sub_signals: Optional[dict] = None
 
 
 @router.get("/discovery/us-signal", response_model=UsSignalResponse)
@@ -1410,8 +1412,8 @@ async def get_us_signal_route():
         for t, w in US_AI_TICKERS.items()
     ]
     curation = [
-        UsSignalCurationItem(ticker=t, name=n)
-        for t, n in AI_VALUECHAIN_TICKERS.items()
+        UsSignalCurationItem(ticker=t, name=v["name"], signal_type=v.get("signal_type"))
+        for t, v in AI_VALUECHAIN_TICKERS.items()
     ]
     return UsSignalResponse(
         enabled=enabled,
@@ -1421,6 +1423,7 @@ async def get_us_signal_route():
         components=components,
         computed_at=(cached or {}).get("computed_at"),
         curation=curation,
+        sub_signals=(cached or {}).get("sub_signals"),
     )
 
 
