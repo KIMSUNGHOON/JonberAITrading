@@ -36,6 +36,11 @@ configure_logging(
 
 logger = structlog.get_logger()
 
+# Strong references for fire-and-forget lifespan tasks (e.g. the US AI signal
+# boot refresh) so they aren't garbage-collected mid-flight; entries are
+# discarded via add_done_callback once the task completes.
+_background_tasks: set[asyncio.Task] = set()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -207,8 +212,14 @@ async def lifespan(app: FastAPI):
 
         us_signal_scheduler = start_us_signal_scheduler()
         if us_signal_scheduler is not None:
-            await refresh_us_ai_signal_cache()  # 부팅 즉시 1회(다음 08:00 cron 전까지 신호 확보)
-            logger.info("us_ai_signal_scheduler_and_initial_refresh_done")
+            # 논블로킹: Finnhub 장애 시 3종목 x 10s 타임아웃이 최대 ~30s
+            # 앱 부팅을 지연시킬 수 있어 fire-and-forget으로 실행(refresh는
+            # never-raise라 태스크가 루프를 죽일 수 없음). 강참조 보관으로
+            # GC 수거 방지(다음 08:00 cron 전까지는 캐시가 비어도 무해).
+            task = asyncio.create_task(refresh_us_ai_signal_cache())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+            logger.info("us_ai_signal_scheduler_started_and_refresh_scheduled")
     except Exception as e:
         logger.warning("us_ai_signal_scheduler_init_failed", error=str(e))
 
