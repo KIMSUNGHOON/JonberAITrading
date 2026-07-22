@@ -396,6 +396,16 @@ class ChatCoordinator:
         # module-level "Session-history read merge" section above).
         self._last_discussion: Dict[str, datetime] = {}  # ticker -> last discussion time
 
+        # Discovery watch first-discussion guarantee: discovery-promoted
+        # watches carry composite confidence (~0.65-0.73, below the 0.75
+        # opportunity threshold) and can gap away from target_entry_price at
+        # open, so neither _detect_opportunity branch (proximity/confidence)
+        # may ever fire for them. Tracks tickers that have already had their
+        # guaranteed first review so it fires exactly once per promotion (per
+        # process — in-memory, re-review-on-restart is acceptable, no
+        # persistence needed).
+        self._discovery_reviewed: set[str] = set()
+
         # Scheduler for periodic checks
         self._scheduler: Optional[AsyncIOScheduler] = None
         self._running = False
@@ -572,6 +582,12 @@ class ChatCoordinator:
             available_slots = self.max_concurrent - len(self._active_rooms)
             for stock in opportunities[:available_slots]:
                 await self._start_discussion(stock)
+                ticker = stock.get("ticker")
+                # Mark on ACTUAL start (room present in _active_rooms), not
+                # on detect -- so a slot-starved/stale-context skip leaves
+                # the ticker eligible to retry the guaranteed review next tick.
+                if stock.get("signal") == "discovery" and ticker in self._active_rooms:
+                    self._discovery_reviewed.add(ticker)
 
         except Exception as e:
             logger.error("watch_list_check_failed", error=str(e))
@@ -663,6 +679,12 @@ class ChatCoordinator:
                 ticker=ticker,
                 confidence=confidence,
             )
+            return True
+
+        # 발굴 승격 워치 첫 평가 보장 — confidence=composite(<0.75)로 확신분기가 죽어
+        # 갭 시 미토론이던 갭 봉합. 근접/확신 무관 최소 1회 토론(투표는 불변).
+        if stock.get("signal") == "discovery" and ticker not in self._discovery_reviewed:
+            logger.info("opportunity_detected_discovery_first_review", ticker=ticker)
             return True
 
         return False

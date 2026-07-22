@@ -579,6 +579,58 @@ class TestOpportunityDetection:
         assert should_discuss is False
 
 
+class TestDiscoveryWatchFirstReview:
+    """Discovery-promoted watches must get a first discussion regardless of
+    proximity/confidence — see specs/2026-07-22-discovery-watch-first-discussion.
+    Composite confidence (~0.65-0.73) sits below the 0.75 opportunity
+    threshold, and a gap-away-from-target open means the proximity branch
+    never fires either, so without this guarantee a discovery promotion can
+    go undiscussed forever."""
+
+    @pytest.mark.asyncio
+    async def test_discovery_watch_first_review_triggers(self, coordinator):
+        stock = {
+            "ticker": "044340",
+            "current_price": 4200,
+            "target_entry_price": 3850,
+            "confidence": 0.70,
+            "signal": "discovery",
+        }
+        # Out of proximity (9.1% > 3%) and below min_confidence (0.70 < 0.75)
+        # -- would be False without the discovery-first-review branch.
+        assert await coordinator._detect_opportunity(stock) is True
+
+        # Once marked reviewed (as _check_watch_list does after an actual
+        # discussion start), the same stock no longer force-triggers.
+        coordinator._discovery_reviewed.add("044340")
+        assert await coordinator._detect_opportunity(stock) is False
+
+    @pytest.mark.asyncio
+    async def test_non_discovery_unchanged(self, coordinator):
+        stock = {
+            "ticker": "005930",
+            "current_price": 274000,
+            "target_entry_price": 257000,
+            "confidence": 0.70,
+            "signal": "hold",
+        }
+        # Non-discovery signal must not be force-triggered by this branch.
+        assert await coordinator._detect_opportunity(stock) is False
+
+    @pytest.mark.asyncio
+    async def test_discovery_proximity_still_true(self, coordinator):
+        stock = {
+            "ticker": "x",
+            "current_price": 3900,
+            "target_entry_price": 3850,
+            "confidence": 0.70,
+            "signal": "discovery",
+        }
+        # Existing proximity branch (1.3% < 3%) still fires independent of
+        # the new discovery-first-review branch.
+        assert await coordinator._detect_opportunity(stock) is True
+
+
 # -------------------------------------------
 # Discussion Interval Tests
 # -------------------------------------------
