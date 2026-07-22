@@ -135,6 +135,7 @@ class KiwoomRateLimiter:
         query_limit: int = DEFAULT_QUERY_LIMIT,
         order_limit: int = DEFAULT_ORDER_LIMIT,
         per_api_min_interval: Optional[float] = None,
+        per_api_overrides: Optional[dict[str, float]] = None,
     ):
         """
         Rate Limiter 초기화
@@ -146,6 +147,10 @@ class KiwoomRateLimiter:
                 None이면 설정값(KIWOOM_PER_API_MIN_INTERVAL, 기본 1.0초)을 사용.
                 에러 1700(API ID별 제한) 방지용 — 전역 버킷(1701/1702 보호)과는
                 별개로 각 api_id마다 추가로 적용된다.
+            per_api_overrides: api_id별 per_api_min_interval override (초).
+                None이면 설정값(KIWOOM_PER_API_OVERRIDES, 기본
+                {"ka10099": 2.0})을 사용. 여기 없는 api_id는 위
+                per_api_min_interval(flat 기본값)을 그대로 사용한다.
         """
         self._query_bucket = TokenBucket(
             max_tokens=query_limit,
@@ -163,6 +168,17 @@ class KiwoomRateLimiter:
 
             per_api_min_interval = get_settings().KIWOOM_PER_API_MIN_INTERVAL
         self._per_api_min_interval = per_api_min_interval
+
+        if per_api_overrides is None:
+            from app.config import get_settings
+
+            per_api_overrides = get_settings().KIWOOM_PER_API_OVERRIDES
+        # api_id -> min-interval override (seconds), taking precedence over
+        # self._per_api_min_interval for that specific api_id (e.g. ka10099,
+        # a heavy list API, gets a longer interval to prevent — rather than
+        # only retry/survive — its rate limit). api_ids not present here
+        # fall back to the flat self._per_api_min_interval above, unchanged.
+        self._per_api_overrides: dict[str, float] = dict(per_api_overrides or {})
 
         # api_id -> monotonic timestamp of its last granted request.
         self._per_api_last_grant: dict[str, float] = {}
@@ -208,7 +224,10 @@ class KiwoomRateLimiter:
             last_grant = self._per_api_last_grant.get(api_id)
             if last_grant is not None:
                 now = time.monotonic()
-                wait_time = self._per_api_min_interval - (now - last_grant)
+                interval = self._per_api_overrides.get(
+                    api_id, self._per_api_min_interval
+                )
+                wait_time = interval - (now - last_grant)
                 if wait_time > 0:
                     if timeout is not None:
                         elapsed = now - start_time

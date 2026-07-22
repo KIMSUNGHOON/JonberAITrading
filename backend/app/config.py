@@ -101,6 +101,14 @@ class Settings(BaseSettings):
     # `services/kiwoom/rate_limiter.py::KiwoomRateLimiter`.
     KIWOOM_PER_API_MIN_INTERVAL: float = Field(default=1.0, ge=0)
 
+    # Per-api_id overrides of KIWOOM_PER_API_MIN_INTERVAL above, keyed by
+    # api_id. ka10099 (전체 종목 리스트, used by the discovery universe scan)
+    # is a heavy list API that hits Kiwoom's rate limit more easily than a
+    # typical single-stock query — give it a longer interval than the flat
+    # default so we avoid the rate limit rather than only retry/survive it.
+    # api_ids not present here fall back to KIWOOM_PER_API_MIN_INTERVAL.
+    KIWOOM_PER_API_OVERRIDES: dict[str, float] = {"ka10099": 2.0}
+
     # Autonomy master gate (R3). False = trading_mode toggles are inert and
     # every autonomous execution path is denied at the shared gate.
     AUTONOMY_ENABLED: bool = False

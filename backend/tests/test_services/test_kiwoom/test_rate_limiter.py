@@ -401,3 +401,116 @@ class TestPerApiRateGate:
 
         assert limiter._per_api_min_interval == get_settings().KIWOOM_PER_API_MIN_INTERVAL
         assert limiter._per_api_min_interval == 1.0
+
+
+class TestPerApiOverride:
+    """ka10099 (heavy list API used by the discovery universe scan) gets a
+    longer per-api min-interval than the flat KIWOOM_PER_API_MIN_INTERVAL,
+    via KIWOOM_PER_API_OVERRIDES — to PREVENT its rate limit rather than
+    only retry/survive it (see rate_limiter.py `_acquire_per_api_then_global`).
+
+    Timing tests below drive a monkeypatched `time.monotonic` clock and a
+    fake `asyncio.sleep` that advances that same fake clock by the
+    requested duration instead of actually waiting — so the assertions
+    exercise the REAL wait_time computation (including the global bucket's
+    own min_interval / refill interacting with it) without spending any
+    real wall-clock time in the test (no real 2s sleep).
+    """
+
+    @staticmethod
+    def _install_fake_clock(monkeypatch):
+        """Patch rate_limiter's `time.monotonic` and `asyncio.sleep` so
+        every sleep instantly advances a shared virtual clock instead of
+        actually waiting. Returns (fake_now, recorded_waits)."""
+        fake_now = [1_000.0]  # start well above any min_interval so the
+        # very first per-bucket "last_request=0.0" check never looks like
+        # a too-soon repeat request.
+        recorded_waits: list[float] = []
+
+        def fake_monotonic() -> float:
+            return fake_now[0]
+
+        async def fake_sleep(seconds: float) -> None:
+            recorded_waits.append(seconds)
+            fake_now[0] += seconds
+
+        monkeypatch.setattr(
+            "services.kiwoom.rate_limiter.time.monotonic", fake_monotonic
+        )
+        monkeypatch.setattr(
+            "services.kiwoom.rate_limiter.asyncio.sleep", fake_sleep
+        )
+        return fake_now, recorded_waits
+
+    @pytest.mark.asyncio
+    async def test_ka10099_override_spacing_is_2s(self, monkeypatch):
+        """Two consecutive ka10099 acquires must be spaced >= 2.0s (the
+        override), even though the flat per_api_min_interval is 1.0s."""
+        fake_now, _ = self._install_fake_clock(monkeypatch)
+
+        limiter = KiwoomRateLimiter(
+            query_limit=5,
+            order_limit=5,
+            per_api_min_interval=1.0,
+            per_api_overrides={"ka10099": 2.0},
+        )
+
+        await limiter.acquire(RequestType.QUERY, api_id="ka10099")
+        t1 = fake_now[0]
+        await limiter.acquire(RequestType.QUERY, api_id="ka10099")
+        t2 = fake_now[0]
+
+        assert t2 - t1 >= 2.0, (
+            f"expected >= 2.0s override spacing for ka10099, got {t2 - t1:.3f}s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ka10001_keeps_flat_1s_interval(self, monkeypatch):
+        """A non-overridden api_id (ka10001) must keep the flat 1.0s
+        interval — the override must NOT leak onto other api_ids."""
+        fake_now, _ = self._install_fake_clock(monkeypatch)
+
+        limiter = KiwoomRateLimiter(
+            query_limit=5,
+            order_limit=5,
+            per_api_min_interval=1.0,
+            per_api_overrides={"ka10099": 2.0},
+        )
+
+        await limiter.acquire(RequestType.QUERY, api_id="ka10001")
+        t1 = fake_now[0]
+        await limiter.acquire(RequestType.QUERY, api_id="ka10001")
+        t2 = fake_now[0]
+
+        spacing = t2 - t1
+        assert spacing >= 1.0, f"expected >= 1.0s flat spacing for ka10001, got {spacing:.3f}s"
+        assert spacing < 2.0, (
+            f"ka10001 must NOT pick up ka10099's 2.0s override, got {spacing:.3f}s"
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_per_api_overrides_from_settings(self):
+        """When per_api_overrides is not passed explicitly, it must be
+        sourced from configurable settings (KIWOOM_PER_API_OVERRIDES),
+        which defaults to {"ka10099": 2.0}."""
+        from app.config import get_settings
+
+        limiter = KiwoomRateLimiter()
+
+        assert limiter._per_api_overrides == get_settings().KIWOOM_PER_API_OVERRIDES
+        assert limiter._per_api_overrides.get("ka10099") == 2.0
+
+    @pytest.mark.asyncio
+    async def test_override_lookup_falls_back_for_unknown_api_id(self):
+        """An api_id with no override entry must resolve to the flat
+        per_api_min_interval, not KeyError / None."""
+        limiter = KiwoomRateLimiter(
+            per_api_min_interval=1.0, per_api_overrides={"ka10099": 2.0}
+        )
+
+        assert limiter._per_api_overrides.get(
+            "ka10001", limiter._per_api_min_interval
+        ) == 1.0
+        assert limiter._per_api_overrides.get(
+            "ka10099", limiter._per_api_min_interval
+        ) == 2.0
