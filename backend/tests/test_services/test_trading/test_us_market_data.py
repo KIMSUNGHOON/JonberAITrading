@@ -123,3 +123,62 @@ async def test_scheduler_enabled_registers_cron_job(monkeypatch):
     assert sched is not None
     assert len(sched.get_jobs()) == 1  # 일일 cron 1개
     sched.shutdown(wait=False)
+
+
+# --- v2 T1: memory/accel/demand 서브신호 (additive, 최상위 스키마 불변) ---
+
+def _snap(**pct):  # {"MU": 12.0, ...} → fetch 스냅샷 형태
+    return {t: {"chg_pct": v, "prev_close": 100.0} for t, v in pct.items()}
+
+
+def test_compute_includes_sub_signals_additive():
+    snap = _snap(SMH=4.0, MU=12.0, NVDA=2.0, AVGO=3.0, MSFT=1.0, GOOGL=1.0, AMZN=1.0, META=1.0)
+    out = um.compute_us_ai_signal(snap)
+    # 최상위 하위호환 유지
+    assert set(["signal", "signal_pct", "components", "as_of", "computed_at"]) <= set(out)
+    # 서브신호 3종
+    assert set(out["sub_signals"]) == {"memory", "accel", "demand"}
+    # memory = MU·SMH 균등 → (12+4)/2 = 8.0%
+    assert abs(out["sub_signals"]["memory"]["signal_pct"] - 8.0) < 1e-6
+    # accel = NVDA0.6·AVGO0.4 → 2*0.6+3*0.4 = 2.4%
+    assert abs(out["sub_signals"]["accel"]["signal_pct"] - 2.4) < 1e-6
+    # demand = 4종 균등 1.0% → 1.0
+    assert abs(out["sub_signals"]["demand"]["signal_pct"] - 1.0) < 1e-6
+
+
+def test_all_signal_tickers_is_union_dedup():
+    ts = um._all_signal_tickers()
+    assert set(ts) >= {"SMH", "MU", "NVDA", "AVGO", "MSFT", "GOOGL", "AMZN", "META"}
+    assert len(ts) == len(set(ts))  # dedup (SMH/MU/NVDA는 overall과 memory/accel에 중복)
+
+
+def test_get_subsignal_fallback_to_overall():
+    cached = {"signal": 0.5, "signal_pct": 1.5, "components": {"SMH": 1.5},
+              "sub_signals": {"memory": {"signal": 0.9, "signal_pct": 2.7, "components": {"MU": 2.7}}}}
+    assert um.get_subsignal(cached, "memory")["signal"] == 0.9
+    # 없는 타입 → overall 폴백
+    assert um.get_subsignal(cached, "accel")["signal"] == 0.5
+    assert um.get_subsignal(None, "memory") is None
+
+
+def test_missing_ticker_renormalizes_subsignal():
+    snap = _snap(MU=10.0)  # SMH 없음
+    out = um.compute_us_ai_signal(snap)
+    # memory는 MU만으로 재정규화 → 10.0
+    assert abs(out["sub_signals"]["memory"]["signal_pct"] - 10.0) < 1e-6
+    # accel/demand 티커 전무 → 서브신호에서 생략
+    assert "accel" not in out["sub_signals"]
+
+
+async def test_refresh_fetches_union_of_all_tickers(monkeypatch):
+    fake = MagicMock(); fake.US_SIGNAL_ENABLED = True
+    monkeypatch.setattr(um, "get_settings", lambda: fake)
+    snapshot = {"SMH": {"chg_pct": 2.0, "prev_close": 1.0}}
+    fetch_mock = AsyncMock(return_value=snapshot)
+    monkeypatch.setattr(um, "fetch_us_ai_overnight", fetch_mock)
+    storage = MagicMock(); storage.set_app_setting = AsyncMock()
+    monkeypatch.setattr(um, "get_storage_service", AsyncMock(return_value=storage))
+
+    await um.refresh_us_ai_signal_cache()
+
+    fetch_mock.assert_awaited_once_with(um._all_signal_tickers())

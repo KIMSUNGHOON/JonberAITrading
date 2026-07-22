@@ -18,6 +18,13 @@ _SIGNAL_SCALE_PCT = 3.0  # 가중 %change 3% = ±1.0 포화 (v1 단순, 실측 �
 US_SIGNAL_CACHE_KEY = "us_ai_signal"
 _FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
 
+# v2: overall과 별도로 계산되는 3층 서브신호 (메모리/가속기/하이퍼스케일러 수요)
+US_SUBSIGNAL_TICKERS: dict[str, dict[str, float]] = {
+    "memory": {"MU": 0.5, "SMH": 0.5},              # 메모리/HBM
+    "accel": {"NVDA": 0.6, "AVGO": 0.4},            # AI가속기/커스텀ASIC
+    "demand": {"MSFT": 0.25, "GOOGL": 0.25, "AMZN": 0.25, "META": 0.25},  # 하이퍼스케일러 capex
+}
+
 
 async def _finnhub_quote(client: httpx.AsyncClient, ticker: str, api_key: str) -> Optional[dict]:
     """Finnhub /quote 단일 티커. dp=%change, pc=prev close, c=current. 실패 None
@@ -57,15 +64,22 @@ async def fetch_us_ai_overnight(tickers: Optional[list[str]] = None) -> Optional
     return out or None
 
 
-def compute_us_ai_signal(snapshot: Optional[dict]) -> Optional[dict]:
-    """가중 오버나이트 %change → bounded signed [-1,1]. 결측 티커는 가중 재정규화.
-    전량 결측/빈 → None."""
+def _all_signal_tickers() -> list[str]:
+    """전 신호(overall+서브)의 티커 합집합 — 1회 fetch용."""
+    s = set(US_AI_TICKERS)
+    for w in US_SUBSIGNAL_TICKERS.values():
+        s.update(w)
+    return sorted(s)
+
+
+def _weighted(snapshot: Optional[dict], weights: dict[str, float]) -> Optional[dict]:
+    """가중 %change (결측 티커 재정규화). None=계산 불가."""
     if not snapshot:
         return None
     num = 0.0
     wsum = 0.0
     comps: dict[str, float] = {}
-    for t, w in US_AI_TICKERS.items():
+    for t, w in weights.items():
         q = snapshot.get(t)
         if q is None:
             continue
@@ -77,12 +91,43 @@ def compute_us_ai_signal(snapshot: Optional[dict]) -> Optional[dict]:
         return None
     signal_pct = num / wsum
     signal = max(-1.0, min(1.0, signal_pct / _SIGNAL_SCALE_PCT))
+    return {"signal": signal, "signal_pct": signal_pct, "components": comps}
+
+
+def compute_us_ai_signal(snapshot: Optional[dict]) -> Optional[dict]:
+    """가중 오버나이트 %change → bounded signed [-1,1]. 결측 티커는 가중 재정규화.
+    전량 결측/빈 → None. v2: overall과 함께 memory/accel/demand 서브신호도 additive로
+    산출(최상위 스키마는 불변, sub_signals만 추가)."""
+    overall = _weighted(snapshot, US_AI_TICKERS)
+    if overall is None:
+        return None
+    sub: dict[str, dict] = {}
+    for name, weights in US_SUBSIGNAL_TICKERS.items():
+        s = _weighted(snapshot, weights)
+        if s is not None:
+            sub[name] = s
     return {
-        "signal": signal,
-        "signal_pct": signal_pct,
-        "components": comps,
+        "signal": overall["signal"],
+        "signal_pct": overall["signal_pct"],
+        "components": overall["components"],
+        "sub_signals": sub,
         "as_of": date.today().isoformat(),
         "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def get_subsignal(cached: Optional[dict], signal_type: Optional[str]) -> Optional[dict]:
+    """캐시 dict에서 signal_type 서브신호 반환. 없으면 overall 폴백. cached None→None."""
+    if not cached:
+        return None
+    if signal_type:
+        sub = (cached.get("sub_signals") or {}).get(signal_type)
+        if sub is not None:
+            return sub
+    return {
+        "signal": cached.get("signal"),
+        "signal_pct": cached.get("signal_pct"),
+        "components": cached.get("components", {}),
     }
 
 
@@ -92,7 +137,7 @@ async def refresh_us_ai_signal_cache() -> Optional[dict]:
     if not get_settings().US_SIGNAL_ENABLED:
         return None
     try:
-        snapshot = await fetch_us_ai_overnight()
+        snapshot = await fetch_us_ai_overnight(_all_signal_tickers())
         signal = compute_us_ai_signal(snapshot)
         if signal is None:
             logger.warning("us_ai_signal_refresh_empty")
