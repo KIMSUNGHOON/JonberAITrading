@@ -585,6 +585,142 @@ async def test_rank_candidates_composite_bonus_clamped_at_one(tmp_path, storage)
 
 
 # ---------------------------------------------------------------------------
+# WS3: US demand 서브신호 기반 시장 틸트 (T4) -- momentum raw_score ×
+# demand.signal × K, bounded/additive, composite에 가산. STRATEGIES/가중치
+# 무접촉(넛지는 composite에만 적용).
+# ---------------------------------------------------------------------------
+
+
+async def test_demand_tilt_favors_momentum_when_us_hot(tmp_path, storage, monkeypatch):
+    """demand.signal=1.0(강한 양수) + momentum raw_score=1.0인 후보는
+    tilt=min(0.08, 1.0*1.0*0.08)=0.08만큼 composite가 상방된다(clamp 1.0)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    factor = _passing_factor(momentum=1.0, pullback=0.0, flow=0.0, meanrev=0.0, flow_present=True)
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "Momentum", "factor_json": factor}],
+    )
+
+    async def _fake_signal():
+        return {"sub_signals": {"demand": {"signal": 1.0}}}
+
+    monkeypatch.setattr(
+        "services.trading.us_market_data.get_cached_us_ai_signal", _fake_signal
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    c = candidates[0]
+
+    w = DEFAULT_REGIME_WEIGHTS["neutral"]
+    base = 1.0 * w["momentum"] + 0.0 * w["pullback"] + 0.0 * w["flow"] + 0.0 * w["meanrev"]
+    assert c.composite == pytest.approx(min(1.0, base + 0.08))
+
+
+async def test_no_tilt_when_demand_nonpositive(tmp_path, storage, monkeypatch):
+    """demand.signal<=0 -> tilt 미적용, composite는 base 가중합과 동일."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    factor = _passing_factor(momentum=1.0, pullback=0.0, flow=0.0, meanrev=0.0, flow_present=True)
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "Momentum", "factor_json": factor}],
+    )
+
+    async def _fake_signal():
+        return {"sub_signals": {"demand": {"signal": -0.5}}}
+
+    monkeypatch.setattr(
+        "services.trading.us_market_data.get_cached_us_ai_signal", _fake_signal
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    c = candidates[0]
+
+    w = DEFAULT_REGIME_WEIGHTS["neutral"]
+    base = 1.0 * w["momentum"]
+    assert c.composite == pytest.approx(base)
+
+
+async def test_no_tilt_when_us_signal_disabled(tmp_path, storage, monkeypatch):
+    """get_cached_us_ai_signal이 None(US 신호 off/미존재) -> tilt 미적용."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    factor = _passing_factor(momentum=1.0, pullback=0.0, flow=0.0, meanrev=0.0, flow_present=True)
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "Momentum", "factor_json": factor}],
+    )
+
+    async def _fake_signal():
+        return None
+
+    monkeypatch.setattr(
+        "services.trading.us_market_data.get_cached_us_ai_signal", _fake_signal
+    )
+
+    candidates = await rank_candidates(storage, str(scanner_db), trade_date)
+    c = candidates[0]
+
+    w = DEFAULT_REGIME_WEIGHTS["neutral"]
+    base = 1.0 * w["momentum"]
+    assert c.composite == pytest.approx(base)
+
+
+async def test_demand_tilt_zero_momentum_gets_no_tilt_and_weights_untouched(
+    tmp_path, storage, monkeypatch
+):
+    """momentum raw_score=0인 후보는 demand가 강해도 tilt=0 -- 가중치 벡터
+    자체가 바뀌지 않았음을 증명(고정 입력에 대한 가중합 composite가 demand
+    유무와 무관하게 동일해야 함)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    factor = _passing_factor(momentum=0.0, pullback=0.5, flow=0.5, meanrev=0.5)
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "NoMomentum", "factor_json": factor}],
+    )
+
+    w = DEFAULT_REGIME_WEIGHTS["neutral"]
+    expected = 0.0 * w["momentum"] + 0.5 * w["pullback"] + 0.5 * w["flow"] + 0.5 * w["meanrev"]
+
+    async def _fake_signal_hot():
+        return {"sub_signals": {"demand": {"signal": 1.0}}}
+
+    monkeypatch.setattr(
+        "services.trading.us_market_data.get_cached_us_ai_signal", _fake_signal_hot
+    )
+    candidates_hot = await rank_candidates(storage, str(scanner_db), trade_date)
+    c_hot = candidates_hot[0]
+    assert c_hot.composite == pytest.approx(expected)
+    for k in STRATEGIES:
+        assert c_hot.weights[k] == pytest.approx(w[k])
+
+    async def _fake_signal_off():
+        return None
+
+    monkeypatch.setattr(
+        "services.trading.us_market_data.get_cached_us_ai_signal", _fake_signal_off
+    )
+    candidates_off = await rank_candidates(storage, str(scanner_db), trade_date)
+    c_off = candidates_off[0]
+
+    # STRATEGIES/가중치 무접촉 핀: demand on/off 두 실행 모두 동일한
+    # 가중치와 동일한 composite를 낸다(모멘텀 0 후보는 틸트가 붙을 여지가
+    # 없으므로 결과가 완전히 일치해야 한다).
+    assert c_hot.composite == pytest.approx(c_off.composite)
+    assert c_hot.weights == pytest.approx(c_off.weights)
+
+
+# ---------------------------------------------------------------------------
 # SC-1: status='partial'(스캔 도중 stop_scan으로 종결) 세션도 랭킹 소비
 # 대상이어야 한다 -- 실측 고아 버그(scanner.py stop_scan이 세션을
 # 'running'으로 영구 고아화)의 근본 수정: regime.py와 동일한 게이트 확장.

@@ -105,6 +105,12 @@ COOLDOWN_DAYS = 7
 # reasonable approximation instead of hardcoding 'neutral'.
 REGIME_SNAPSHOT_FALLBACK_DAYS = 7
 
+# WS3 (US signal deepening v2, T4): US demand 서브신호(하이퍼스케일러 capex)
+# 기반 시장 틸트 -- momentum_raw_score × demand_signal × K, bounded/additive,
+# composite에만 가산(STRATEGIES/가중치 벡터는 무접촉). 실측 후 조정.
+_US_TILT_K = 0.08
+_US_TILT_MAX = 0.08
+
 
 # ---------------------------------------------------------------------------
 # Candidate -- the unit that flows through rank -> llm_review -> promote.
@@ -413,6 +419,21 @@ async def rank_candidates(storage, scanner_db_path, trade_date: str) -> list[Can
         regime_cfg.get("daily_cap", DEFAULT_REGIME_WEIGHTS["neutral"]["daily_cap"])
     )
 
+    # WS3: US demand 서브신호 기반 시장 틸트 드라이버 (1회 읽기, never-raise).
+    # 후보 루프 진입 전에 딱 한 번만 읽는다 -- 후보별로 반복 조회하지 않음.
+    _demand_signal = 0.0
+    try:
+        from services.trading.us_market_data import get_cached_us_ai_signal
+
+        _us = await get_cached_us_ai_signal()
+        if _us:
+            _demand_signal = float(
+                ((_us.get("sub_signals") or {}).get("demand") or {}).get("signal") or 0.0
+            )
+    except Exception as e:
+        logger.warning("discovery_demand_tilt_signal_read_failed", error=str(e))
+        _demand_signal = 0.0
+
     rows = await _load_scan_results(scanner_db_path, session["id"])
 
     ranked: list[Candidate] = []
@@ -470,6 +491,14 @@ async def rank_candidates(storage, scanner_db_path, trade_date: str) -> list[Can
         # 소량 가산(≤0.05), clamp 1.0. 구 factor_json(키 없음) -> .get(...,
         # 0.0) -> composite 무변경(하위호환). STRATEGIES/가중치는 무접촉.
         composite = min(1.0, composite + float(factor.get("us_crossmarket_bonus", 0.0)))
+        # WS3: demand 양수일 때만 momentum 후보 상방 틸트(bounded/additive/
+        # clamp). STRATEGIES/가중치는 무접촉 -- 기존 T5 넛지와 동일 스타일.
+        if _demand_signal > 0.0:
+            _tilt = min(
+                _US_TILT_MAX,
+                max(0.0, float(raw_scores.get("momentum", 0.0)) * _demand_signal * _US_TILT_K),
+            )
+            composite = min(1.0, composite + _tilt)
 
         ranked.append(
             Candidate(
