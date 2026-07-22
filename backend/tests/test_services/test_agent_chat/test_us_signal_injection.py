@@ -1,4 +1,5 @@
-"""US 신호 T4: sentiment 토론에 US AI 신호를 프롬프트 넛지로 주입.
+"""US 신호 T4(sentiment) + T3/WS1(risk+moderator): 토론에 US AI 신호를
+프롬프트 넛지로 주입.
 
 - MarketContext.us_market_context: Optional[str] = None (strategy_directive와
   동일한 optional-field 패턴).
@@ -7,13 +8,23 @@
 - sentiment_agent의 analysis/vote 프롬프트에 값이 있으면 그대로 노출되고,
   없으면 빈 문자열(불변) — 투표/confidence 로직은 절대 건드리지 않는다(실
   LLM/네트워크 금지, LLM 호출은 항상 목).
+- T3/WS1: risk_agent(analyze/vote)와 moderator_agent(make_decision)에도 같은
+  패턴으로 배선한다. technical/fundamental은 렌즈 순수성 보존을 위해 의도적으로
+  미배선(범위 밖). risk의 vote 방향과 moderator의 최종 액션은 US 컨텍스트
+  유무와 무관하게 불변이어야 한다(넛지는 서술문에만 영향).
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pandas as pd
 import pytest
 
-from services.agent_chat.models import MarketContext
+from services.agent_chat.models import (
+    AgentType,
+    AgentVote,
+    ChatSession,
+    MarketContext,
+    VoteType,
+)
 
 
 def _context(**kw):
@@ -155,6 +166,211 @@ class TestSentimentPromptInjection:
         result = await agent.analyze(ctx)
 
         assert result.confidence <= 0.5
+
+
+# ---------- risk agent prompt injection (T3/WS1, LLM 항상 목) ----------
+
+
+class TestRiskPromptInjection:
+    """risk_agent의 analyze()/vote()가 실제로 만드는 프롬프트를 sentiment와
+    동일한 방식으로 캡처/검증한다. respond()는 브리프대로 미변경(검증 대상
+    아님)."""
+
+    async def test_analysis_prompt_includes_us_context_when_set(self):
+        from services.agent_chat.agents.risk_agent import RiskDiscussionAgent
+
+        agent = RiskDiscussionAgent()
+        ctx = _context(us_market_context="간밤 미 AI 반도체 강세(SMH +4.5%)")
+
+        captured = {}
+
+        async def fake_generate(messages):
+            captured["prompt"] = messages[-1].content
+            return "신뢰도: 70%"
+
+        agent.llm.generate = AsyncMock(side_effect=fake_generate)
+
+        await agent.analyze(ctx)
+
+        assert "prompt" in captured
+        assert "간밤 미 AI 반도체 강세(SMH +4.5%)" in captured["prompt"]
+
+    async def test_analysis_prompt_empty_when_us_context_none(self):
+        from services.agent_chat.agents.risk_agent import RiskDiscussionAgent
+
+        agent = RiskDiscussionAgent()
+        ctx = _context()  # us_market_context defaults None
+
+        captured = {}
+
+        async def fake_generate(messages):
+            captured["prompt"] = messages[-1].content
+            return "신뢰도: 70%"
+
+        agent.llm.generate = AsyncMock(side_effect=fake_generate)
+
+        await agent.analyze(ctx)
+
+        assert "prompt" in captured
+        assert "None" not in captured["prompt"]
+        assert "간밤" not in captured["prompt"]
+
+    async def test_vote_prompt_includes_us_context_when_set(self):
+        from services.agent_chat.agents.risk_agent import RiskDiscussionAgent
+
+        agent = RiskDiscussionAgent()
+        ctx = _context(us_market_context="간밤 미 AI 반도체 강세(SMH +4.5%)")
+
+        # 구조화 투표 경로를 실패시켜 regex 폴백(=_call_llm)으로 강제 — 그
+        # 경로가 실제 vote_prompt_template.format(...)을 호출한다.
+        agent.llm.generate_structured = AsyncMock(side_effect=RuntimeError("force fallback"))
+
+        captured = {}
+
+        async def fake_generate(messages):
+            captured["prompt"] = messages[-1].content
+            return "투표: BUY\n신뢰도: 70%"
+
+        agent.llm.generate = AsyncMock(side_effect=fake_generate)
+
+        await agent.vote(ctx, [])
+
+        assert "prompt" in captured
+        assert "간밤 미 AI 반도체 강세(SMH +4.5%)" in captured["prompt"]
+
+    async def test_vote_prompt_empty_when_us_context_none(self):
+        from services.agent_chat.agents.risk_agent import RiskDiscussionAgent
+
+        agent = RiskDiscussionAgent()
+        ctx = _context()
+
+        agent.llm.generate_structured = AsyncMock(side_effect=RuntimeError("force fallback"))
+
+        captured = {}
+
+        async def fake_generate(messages):
+            captured["prompt"] = messages[-1].content
+            return "투표: BUY\n신뢰도: 70%"
+
+        agent.llm.generate = AsyncMock(side_effect=fake_generate)
+
+        await agent.vote(ctx, [])
+
+        assert "prompt" in captured
+        assert "None" not in captured["prompt"]
+        assert "간밤" not in captured["prompt"]
+
+    async def test_vote_direction_unchanged_by_us_context(self):
+        """넛지 계약 회귀 가드: 동일한 LLM 응답 텍스트라면 us_market_context
+        유무와 무관하게 vote()가 도출하는 방향/신뢰도가 동일해야 한다 — 방향은
+        응답 텍스트 파싱(regex 폴백)에서 나오지, 프롬프트에 무엇이 들어갔는지와
+        무관하다."""
+        from services.agent_chat.agents.risk_agent import RiskDiscussionAgent
+
+        response_text = "투표: BUY\n신뢰도: 70%\n포지션: 5%\n손절가: -5%\n익절가: +10%"
+
+        results = {}
+        for label, us_ctx in (("with_us", "간밤 미 AI 반도체 강세(SMH +4.5%)"), ("without_us", None)):
+            agent = RiskDiscussionAgent()
+            ctx = _context(us_market_context=us_ctx)
+            agent.llm.generate_structured = AsyncMock(side_effect=RuntimeError("force fallback"))
+            agent.llm.generate = AsyncMock(return_value=response_text)
+            results[label] = await agent.vote(ctx, [])
+
+        assert results["with_us"].vote == results["without_us"].vote
+        assert results["with_us"].confidence == results["without_us"].confidence
+        assert results["with_us"].suggested_position_pct == results["without_us"].suggested_position_pct
+
+
+# ---------- moderator agent prompt injection (T3/WS1, LLM 항상 목) ----------
+
+
+def _unanimous_buy_session(us_market_context=None):
+    """test_moderator_action_derivation.py의 _unanimous 헬퍼를 미러 — make_decision
+    이 실제로 소비하는 세션(투표 4개 + 합의)을 구성한다."""
+    ctx = MarketContext(
+        ticker="005930", stock_name="삼성전자",
+        current_price=70000, price_change_pct=1.0,
+        has_position=False, available_cash=10_000_000,
+        us_market_context=us_market_context,
+    )
+    session = ChatSession(
+        ticker="005930", stock_name="삼성전자", context=ctx,
+        consensus_threshold=0.75,
+    )
+    for at in (AgentType.TECHNICAL, AgentType.FUNDAMENTAL, AgentType.SENTIMENT):
+        session.add_vote(AgentVote(agent_type=at, vote=VoteType.BUY, confidence=0.8, reasoning="x"))
+    session.add_vote(
+        AgentVote(
+            agent_type=AgentType.RISK, vote=VoteType.BUY, confidence=0.8,
+            reasoning="x", suggested_position_pct=10.0,
+        )
+    )
+    session.calculate_consensus()
+    return session, ctx
+
+
+class TestModeratorPromptInjection:
+    """moderator_agent.make_decision()이 실제로 만드는 프롬프트를 캡처/검증한다.
+    _parse_decision/vote_to_action은 절대 건드리지 않는다 — 액션은 투표
+    합의에서 기계적으로 도출된다(CRITICAL 계약)."""
+
+    async def test_decision_prompt_includes_us_context_when_set(self):
+        from services.agent_chat.agents.moderator_agent import ModeratorAgent
+
+        agent = ModeratorAgent()
+        session, ctx = _unanimous_buy_session(us_market_context="간밤 미 AI 반도체 강세(SMH +4.5%)")
+
+        captured = {}
+
+        async def fake_generate(messages):
+            captured["prompt"] = messages[-1].content
+            return "결정: BUY."
+
+        agent.llm.generate = AsyncMock(side_effect=fake_generate)
+
+        await agent.make_decision(session, ctx)
+
+        assert "prompt" in captured
+        assert "간밤 미 AI 반도체 강세(SMH +4.5%)" in captured["prompt"]
+
+    async def test_decision_prompt_empty_when_us_context_none(self):
+        from services.agent_chat.agents.moderator_agent import ModeratorAgent
+
+        agent = ModeratorAgent()
+        session, ctx = _unanimous_buy_session(us_market_context=None)
+
+        captured = {}
+
+        async def fake_generate(messages):
+            captured["prompt"] = messages[-1].content
+            return "결정: BUY."
+
+        agent.llm.generate = AsyncMock(side_effect=fake_generate)
+
+        await agent.make_decision(session, ctx)
+
+        assert "prompt" in captured
+        assert "None" not in captured["prompt"]
+        assert "간밤" not in captured["prompt"]
+
+    async def test_decision_action_unchanged_by_us_context(self):
+        """넛지 계약 회귀 가드(CRITICAL): 동일한 투표 합의라면 us_market_context
+        유무와 무관하게 최종 액션이 동일해야 한다 — action은 vote_to_action(
+        session.get_majority_direction(), ...)에서 기계적으로 나오지, LLM
+        응답 서술문(프롬프트에 무엇이 들어갔는지)과 무관하다."""
+        from services.agent_chat.agents.moderator_agent import ModeratorAgent
+
+        decisions = {}
+        for label, us_ctx in (("with_us", "간밤 미 AI 반도체 강세(SMH +4.5%)"), ("without_us", None)):
+            agent = ModeratorAgent()
+            session, ctx = _unanimous_buy_session(us_market_context=us_ctx)
+            agent.llm.generate = AsyncMock(return_value="결정: BUY. 근거는 투표 합의.")
+            decisions[label] = await agent.make_decision(session, ctx)
+
+        assert decisions["with_us"].action == decisions["without_us"].action
+        assert decisions["with_us"].confidence == decisions["without_us"].confidence
+        assert decisions["with_us"].quantity == decisions["without_us"].quantity
 
 
 # ---------- coordinator._fetch_market_context wiring ----------

@@ -80,6 +80,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 
 ### 변동성 데이터
 - 일일 변동: {price_change_pct:+.2f}%
+{us_market_context}
 
 ---
 
@@ -131,6 +132,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 - 일일 변동: {price_change_pct:+.2f}%
 - 투자 가능: {available_cash}
 - 기존 포지션: {position_info}
+{us_market_context}
 
 ---
 
@@ -181,6 +183,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             available_cash=available_cash,
             total_portfolio=total_portfolio,
             position_info=position_info,
+            us_market_context=context.us_market_context or "",
         )
 
         response = await self._call_llm(self._effective_system_prompt(), prompt)
@@ -280,6 +283,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             price_change_pct=context.price_change_pct,
             available_cash=available_cash,
             position_info=position_info,
+            us_market_context=context.us_market_context or "",
         )
 
         risk_level = self._calculate_risk_level(context)

@@ -113,6 +113,7 @@ class ModeratorAgent(BaseDiscussionAgent):
 
 ### 토론 핵심 요약
 {discussion_summary}
+{us_market_context}
 
 ---
 
@@ -238,6 +239,7 @@ class ModeratorAgent(BaseDiscussionAgent):
             vote_summary=vote_summary,
             consensus_level=consensus_level,
             discussion_summary=discussion_summary,
+            us_market_context=context.us_market_context or "",
         )
 
         response = await self._call_llm(self._effective_system_prompt(), prompt)
