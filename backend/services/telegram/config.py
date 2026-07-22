@@ -56,6 +56,10 @@ class TelegramConfig(BaseSettings):
         default=True,
         description="Send end-of-day summary (digest+narrative) notifications (E3-3)"
     )
+    TELEGRAM_NOTIFY_DISCOVERY: bool = Field(
+        default=True,
+        description="Send autonomous discovery promotion notifications (concise, one-way)"
+    )
 
     @property
     def is_configured(self) -> bool:

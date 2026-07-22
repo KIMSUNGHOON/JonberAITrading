@@ -7,6 +7,7 @@ Uses polling mode - no external webhook required.
 
 import asyncio
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import lru_cache
 from typing import Optional
 
@@ -679,6 +680,71 @@ _모니터링 중..._
             message = self._format_daily_summary_template(trade_date, digest)
 
         return await self._send_message(message.strip())
+
+    async def send_discovery_promotion(
+        self, *, trade_date: str, promoted: list[dict], daily_cap_waiting: int = 0
+    ) -> bool:
+        """Concise, one-way notification for autonomous discovery
+        promotions (no buttons/HITL -- discovery promotes stocks to the
+        watchlist for the NEXT open's discussion/vote, it never trades
+        directly, so there is nothing to approve here).
+
+        `promoted` items: {"ticker","name","composite","strategy","target"}
+        (the discovery pipeline's promoted-candidate shape -- distinct from
+        `_format_discovery_block`'s digest["discovery"]["promoted"] shape
+        used by the EOD summary, which carries composite_score/
+        top_strategy_tag instead).
+
+        No-op (returns False, no send) when the gate is off OR `promoted`
+        is empty -- mirrors every other TELEGRAM_NOTIFY_* category gate
+        above, plus discovery's own "0 promotions -> nothing worth
+        notifying about" case.
+        """
+        if not self._config.TELEGRAM_NOTIFY_DISCOVERY:
+            return False
+        if not promoted:
+            return False
+
+        message = self._format_discovery_promotion(trade_date, promoted, daily_cap_waiting)
+        return await self._send_message(message.strip())
+
+    def _format_discovery_promotion(
+        self, trade_date: str, promoted: list[dict], daily_cap_waiting: int
+    ) -> str:
+        _MAX = 10
+        lines = [f"🔍 *자율 발굴 승격 {len(promoted)}종* · {trade_date}"]
+        for p in promoted[:_MAX]:
+            lines.append(
+                f"• {p['name']} {p['ticker']} · {self._fmt_composite(p.get('composite'))} "
+                f"{p.get('strategy') or '-'} · 워치 {self._fmt_krw(p.get('target'))}"
+            )
+        if len(promoted) > _MAX:
+            lines.append(f"• 외 {len(promoted) - _MAX}종")
+        tail = "개장 시 토론→투표"
+        if daily_cap_waiting > 0:
+            tail = f"+{daily_cap_waiting}종 daily_cap 대기 · {tail}"
+        lines.append(tail)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_composite(value) -> str:
+        """Format a composite score to 2 decimals, ROUND_HALF_UP.
+
+        Plain `f"{value:.2f}"` uses banker's rounding on the float's
+        underlying binary representation, which silently rounds
+        .xx5-ending values DOWN more often than not (e.g. 0.725 is stored
+        as 0.72499999999999997779... and formats to "0.72", not the
+        expected "0.73") -- surprising for a score display where users
+        expect familiar half-up rounding. Round via `Decimal(str(value))`
+        (the shortest decimal string that round-trips to the same float,
+        i.e. what a human almost certainly intended) rather than
+        `Decimal(value)` (which would re-expose the raw binary noise).
+        """
+        try:
+            d = Decimal(str(float(value) if value is not None else 0))
+        except (TypeError, ValueError, InvalidOperation):
+            return "0.00"
+        return str(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
     def _format_daily_summary_narrative(
         self, trade_date: str, digest: dict, narrative: str
