@@ -118,6 +118,70 @@ def _build_price_lookup(scanner: Any) -> dict[str, float]:
     return lookup
 
 
+async def _notify_promotions(candidates: Any, promote_summary: Any, trade_date: str) -> None:
+    """Best-effort Telegram notice for today's discovery promotions
+    (discovery-notify T2) -- covers BOTH the manual trigger (POST
+    /trading/discovery/run) and the 15:30 EOD close-edge path, since both
+    funnel through `run_discovery_pipeline`.
+
+    Builds the `promoted` detail list `TelegramNotifier.
+    send_discovery_promotion` expects ({"ticker","name","composite",
+    "strategy","target"}) by looking each promoted ticker back up in the
+    ranked `candidates` list. `strategy` is the candidate's top raw
+    (un-weighted) strategy tag -- the same "highest score in raw_scores"
+    computation as `ledger._top_strategy_tag`, just done directly on the
+    in-memory dict instead of round-tripping through its JSON-serialized
+    form. `target` is the candidate's discovery-scan close price (a watch
+    reference level, not an order price -- discovery only ever promotes to
+    the watchlist).
+
+    No-op when nothing was promoted this run (skips the Telegram call
+    entirely -- `send_discovery_promotion` itself also no-ops on an empty
+    list, but checking here avoids the dict/sort work for the common
+    zero-promotion tick).
+
+    Never raises: gated behind its own try/except (network/Telegram
+    failures are logged and swallowed) so a notification problem can never
+    take down the promotion pipeline this runs immediately after -- mirrors
+    every other best-effort Telegram call site in coordinator.py.
+    """
+    if not promote_summary.promoted:
+        return
+
+    try:
+        by_ticker = {c.ticker: c for c in candidates}
+        details: list[dict[str, Any]] = []
+        for ticker in promote_summary.promoted:
+            c = by_ticker.get(ticker)
+            if c is None:
+                continue
+            top_strategy = max(c.raw_scores, key=c.raw_scores.get) if c.raw_scores else None
+            details.append(
+                {
+                    "ticker": ticker,
+                    "name": c.name or ticker,
+                    "composite": c.composite,
+                    "strategy": top_strategy,
+                    "target": c.close_price,
+                }
+            )
+        details.sort(key=lambda d: float(d.get("composite") or 0), reverse=True)
+
+        daily_cap_waiting = sum(
+            1 for reason in promote_summary.skipped.values() if reason == "daily_cap"
+        )
+
+        from services.telegram import get_telegram_notifier
+
+        notifier = await get_telegram_notifier()
+        if notifier.is_ready:
+            await notifier.send_discovery_promotion(
+                trade_date=trade_date, promoted=details, daily_cap_waiting=daily_cap_waiting
+            )
+    except Exception as e:
+        logger.warning("discovery_promotion_notify_failed", trade_date=trade_date, error=str(e))
+
+
 async def run_discovery_pipeline(
     *,
     coordinator: Any,
@@ -176,6 +240,9 @@ async def run_discovery_pipeline(
         summary["total_candidates"] = promote_summary.total_candidates
         summary["promoted"] = promote_summary.promoted
         summary["skipped"] = promote_summary.skipped
+
+        await _notify_promotions(candidates, promote_summary, trade_date)
+
         return summary
     except Exception as e:
         logger.error("discovery_pipeline_failed", trade_date=trade_date, error=str(e))

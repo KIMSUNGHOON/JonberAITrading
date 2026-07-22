@@ -49,6 +49,28 @@ def coordinator():
     return ExecutionCoordinator(kiwoom_client=None)
 
 
+@pytest.fixture(autouse=True)
+def _stub_telegram_notifier(monkeypatch):
+    """T2: run_discovery_pipeline now notifies Telegram on promotion via
+    services.telegram.get_telegram_notifier() (lazy-imported inside
+    orchestrator._notify_promotions, mirroring coordinator.py's own
+    call-site convention so it stays monkeypatchable here). Stub it to a
+    never-ready fake by default so no test in this file can ever reach the
+    real Telegram API -- this repo's real .env carries live bot
+    credentials (see test_f3_fill_tracking.py's identical fixture). Tests
+    that want to observe the notify path replace this via their own
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", ...)."""
+    import services.telegram as telegram_module
+
+    class _NotReadyNotifier:
+        is_ready = False
+
+    async def _fake_get_telegram_notifier():
+        return _NotReadyNotifier()
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+
+
 class _FakeScanner:
     """Minimal BackgroundScanner stand-in — only the public surface
     `_build_price_lookup` reads (`get_results()`)."""
@@ -462,6 +484,254 @@ async def test_pipeline_promote_candidates_exception_returns_none_never_raises(
     )
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# ④b Telegram 승격 통지 배선 (T2) — 수동 트리거/15:30 EOD 양 경로가 모두
+#    run_discovery_pipeline을 통하므로 여기 한 곳만 검증하면 양쪽 다 커버.
+# ---------------------------------------------------------------------------
+
+
+class _FakeTelegramNotifier:
+    """`is_ready=True` fake -- records send_discovery_promotion calls
+    without touching the network. `raise_on_send` exercises the
+    never-raise guarantee around the notify call."""
+
+    def __init__(self, raise_on_send: bool = False):
+        self.is_ready = True
+        self.raise_on_send = raise_on_send
+        self.calls: list[dict] = []
+
+    async def send_discovery_promotion(self, *, trade_date, promoted, daily_cap_waiting=0):
+        if self.raise_on_send:
+            raise RuntimeError("telegram boom")
+        self.calls.append(
+            {
+                "trade_date": trade_date,
+                "promoted": promoted,
+                "daily_cap_waiting": daily_cap_waiting,
+            }
+        )
+        return True
+
+
+def _patch_telegram_notifier(monkeypatch, notifier: _FakeTelegramNotifier) -> None:
+    import services.telegram as telegram_module
+
+    async def _fake_get_telegram_notifier():
+        return notifier
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+
+
+async def test_pipeline_promotion_notifies_telegram_with_ranked_details(
+    tmp_path, storage, coordinator, monkeypatch
+):
+    """One promoted + one below-threshold-skipped candidate ->
+    send_discovery_promotion is called once with the promoted candidate's
+    real ranker.Candidate fields (name/composite/close_price) plus its top
+    raw-strategy tag, and daily_cap_waiting == 0 (the one skip here is
+    below_threshold, not daily_cap)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    monkeypatch.setattr(orchestrator_module, "SCANNER_DB_PATH", scanner_db)
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [
+            {
+                "stk_cd": "005930", "stk_nm": "삼성전자",
+                # neutral regime weights favor flow/pullback (0.30 each) over
+                # momentum/meanrev (0.20 each) -- flow highest here so both
+                # the composite clears the 0.55 threshold AND the top
+                # raw-strategy tag is deterministically "flow".
+                "factor_json": _passing_factor(momentum=0.85, pullback=0.85, flow=0.95, meanrev=0.85),
+            },
+            {
+                "stk_cd": "000660", "stk_nm": "SK하이닉스",
+                "factor_json": _passing_factor(momentum=0.05, pullback=0.05, flow=0.05, meanrev=0.05),
+            },
+        ],
+    )
+
+    fake_llm = _FakeLLMProvider(
+        responses={
+            "005930": '{"suitable": true, "confidence": 0.9, "rationale": "ok", "risks": "-"}',
+            "000660": '{"suitable": true, "confidence": 0.9, "rationale": "ok", "risks": "-"}',
+        }
+    )
+    monkeypatch.setattr(ranker_module, "get_llm_provider", lambda: fake_llm)
+
+    notifier = _FakeTelegramNotifier()
+    _patch_telegram_notifier(monkeypatch, notifier)
+
+    scanner = _FakeScanner([_scan_result("005930", 70_000), _scan_result("000660", 100_000)])
+
+    summary = await run_discovery_pipeline(
+        coordinator=coordinator, storage=storage, scanner=scanner,
+        trade_date=trade_date, scan_ok=True,
+    )
+
+    assert summary["promoted"] == ["005930"]
+    assert summary["skipped"] == {"000660": "below_threshold"}
+
+    assert len(notifier.calls) == 1
+    call = notifier.calls[0]
+    assert call["trade_date"] == trade_date
+    assert call["daily_cap_waiting"] == 0
+    assert len(call["promoted"]) == 1
+    detail = call["promoted"][0]
+    assert detail["ticker"] == "005930"
+    assert detail["name"] == "삼성전자"
+    assert detail["strategy"] == "flow"  # highest raw_scores entry (0.95 flow vs 0.85 others)
+    assert detail["target"] == 70_000.0  # Candidate.close_price from factor_json
+
+    # composite is whatever the regime-weighted formula produced on the
+    # ranked Candidate -- cross-check against the same value promote_
+    # candidates persisted to the ledger rather than re-deriving the
+    # formula here.
+    ledger = await storage.get_discovery_candidates(trade_date=trade_date)
+    ledger_row = next(r for r in ledger if r["ticker"] == "005930")
+    assert detail["composite"] == pytest.approx(ledger_row["composite_score"])
+
+
+async def test_pipeline_zero_promotions_does_not_notify_telegram(
+    tmp_path, storage, coordinator, monkeypatch
+):
+    """Every candidate below threshold -> promote_summary.promoted == []
+    -> send_discovery_promotion is never called (both the cheap
+    early-return in _notify_promotions and the no-op inside the telegram
+    service itself would each independently prevent a send here)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    monkeypatch.setattr(orchestrator_module, "SCANNER_DB_PATH", scanner_db)
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{
+            "stk_cd": "005930", "stk_nm": "삼성전자",
+            "factor_json": _passing_factor(momentum=0.05, pullback=0.05, flow=0.05, meanrev=0.05),
+        }],
+    )
+    monkeypatch.setattr(ranker_module, "get_llm_provider", lambda: _FakeLLMProvider())
+
+    notifier = _FakeTelegramNotifier()
+    _patch_telegram_notifier(monkeypatch, notifier)
+
+    scanner = _FakeScanner([_scan_result("005930", 70_000)])
+
+    summary = await run_discovery_pipeline(
+        coordinator=coordinator, storage=storage, scanner=scanner,
+        trade_date=trade_date, scan_ok=True,
+    )
+
+    assert summary["promoted"] == []
+    assert notifier.calls == []
+
+
+async def test_pipeline_scan_not_ok_does_not_notify_telegram(storage, coordinator, monkeypatch):
+    """scan_ok=False short-circuits before ranking/promotion entirely --
+    no candidates exist to promote, so Telegram is never touched."""
+    notifier = _FakeTelegramNotifier()
+    _patch_telegram_notifier(monkeypatch, notifier)
+    scanner = _FakeScanner([_scan_result("005930", 70_000)])
+
+    summary = await run_discovery_pipeline(
+        coordinator=coordinator, storage=storage, scanner=scanner,
+        trade_date="2026-07-20", scan_ok=False,
+    )
+
+    assert summary["promoted"] == []
+    assert notifier.calls == []
+
+
+async def test_pipeline_telegram_exception_never_raises_and_summary_still_returned(
+    tmp_path, storage, coordinator, monkeypatch
+):
+    """A Telegram/network failure during the notify step must NEVER break
+    the pipeline -- run_discovery_pipeline still returns the full summary
+    (promotion itself already happened and is unaffected)."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    monkeypatch.setattr(orchestrator_module, "SCANNER_DB_PATH", scanner_db)
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "삼성전자", "factor_json": _passing_factor()}],
+    )
+    fake_llm = _FakeLLMProvider(
+        responses={"005930": '{"suitable": true, "confidence": 0.9, "rationale": "ok", "risks": "-"}'}
+    )
+    monkeypatch.setattr(ranker_module, "get_llm_provider", lambda: fake_llm)
+
+    notifier = _FakeTelegramNotifier(raise_on_send=True)
+    _patch_telegram_notifier(monkeypatch, notifier)
+
+    scanner = _FakeScanner([_scan_result("005930", 70_000)])
+
+    summary = await run_discovery_pipeline(
+        coordinator=coordinator, storage=storage, scanner=scanner,
+        trade_date=trade_date, scan_ok=True,
+    )
+
+    assert summary is not None
+    assert summary["promoted"] == ["005930"]
+    assert summary["trade_date"] == trade_date
+    # ledger persistence (promote_candidates' own side effect) is unaffected
+    ledger = await storage.get_discovery_candidates(trade_date=trade_date)
+    assert len(ledger) == 1
+    assert ledger[0]["promoted"] == 1
+
+
+async def test_pipeline_telegram_not_ready_does_not_send(tmp_path, storage, coordinator, monkeypatch):
+    """notifier.is_ready is False (e.g. TELEGRAM_ENABLED off / never
+    initialized) -> send_discovery_promotion is never called, mirroring
+    the `if notifier.is_ready:` guard convention used at every other
+    best-effort Telegram call site in coordinator.py. This is exactly the
+    default fixture state, exercised here explicitly with a real
+    promotion to make the guard visible."""
+    trade_date = "2026-07-20"
+    scanner_db = tmp_path / "scanner.db"
+    monkeypatch.setattr(orchestrator_module, "SCANNER_DB_PATH", scanner_db)
+    await _seed_regime_snapshot(storage, trade_date, "neutral")
+
+    await _seed_scanner_db(
+        scanner_db, trade_date,
+        [{"stk_cd": "005930", "stk_nm": "삼성전자", "factor_json": _passing_factor()}],
+    )
+    fake_llm = _FakeLLMProvider(
+        responses={"005930": '{"suitable": true, "confidence": 0.9, "rationale": "ok", "risks": "-"}'}
+    )
+    monkeypatch.setattr(ranker_module, "get_llm_provider", lambda: fake_llm)
+
+    calls: list[dict] = []
+
+    class _NotReadyButSpiedNotifier:
+        is_ready = False
+
+        async def send_discovery_promotion(self, **kwargs):
+            calls.append(kwargs)
+            return True
+
+    import services.telegram as telegram_module
+
+    async def _fake_get_telegram_notifier():
+        return _NotReadyButSpiedNotifier()
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+
+    scanner = _FakeScanner([_scan_result("005930", 70_000)])
+
+    summary = await run_discovery_pipeline(
+        coordinator=coordinator, storage=storage, scanner=scanner,
+        trade_date=trade_date, scan_ok=True,
+    )
+
+    assert summary["promoted"] == ["005930"]
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------
