@@ -1748,3 +1748,23 @@ export interface EodReportResponse {
   digest?: EodDigest | null;
   narrative?: string | null;
 }
+
+// GET /api/trading/discovery/us-signal -- backend app/api/routes/trading.py UsSignalResponse
+export interface UsSignalComponent {
+  ticker: string;
+  weight: number;
+  change_pct: number | null; // 이미 퍼센트(Finnhub dp)
+}
+export interface UsSignalCurationItem {
+  ticker: string;
+  name: string;
+}
+export interface UsSignalResponse {
+  enabled: boolean;
+  as_of: string | null;
+  signal_pct: number | null;
+  signal: number | null;
+  components: UsSignalComponent[];
+  computed_at: string | null;
+  curation: UsSignalCurationItem[];
+}

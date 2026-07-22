@@ -54,6 +54,7 @@ import {
 import { useStore } from '@/store';
 import { TradingModeSection } from '@/components/settings/TradingModeSection';
 import { RiskParamsPanel } from '@/components/trading/RiskParamsPanel';
+import UsSignalCard from '@/components/terminal/panels/UsSignalCard';
 import type { AgentChatCoordinatorStatus } from '@/types';
 
 /** HH:mm for the last coordinator watch-list tick; DASH when unknown. */
@@ -217,6 +218,8 @@ export default function TradingDashboard() {
 
       <div className="flex-1 overflow-y-auto p-4">
         <div className="max-w-6xl mx-auto space-y-4">
+          <UsSignalCard />
+
           {/* 1행: 스위치 3개 */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
             {/* 트레이딩 모드 (공용 섹션 재사용) */}

@@ -15,6 +15,7 @@ import { useGoTo } from '@/hooks/useNav';
 import { getDiscoveryCandidates, getDiscoveryPerformance } from '@/api/client';
 import type { DiscoveryCandidate, DiscoveryPerformanceBucket } from '@/types';
 import { Awaiting, TH, DASH } from './shared';
+import UsSignalCard from './UsSignalCard';
 
 interface DiscoveryLedgerPanelProps {
   onBack?: () => void;
@@ -175,6 +176,8 @@ export function DiscoveryLedgerPanel({ onBack }: DiscoveryLedgerPanelProps) {
 
       <div className="flex-1 overflow-y-auto p-4">
         <div className="max-w-6xl mx-auto space-y-4">
+          <UsSignalCard />
+
           {/* Filters */}
           <div className="flex flex-wrap items-center gap-3">
             <label className="flex items-center gap-2 text-[11px] text-muted">

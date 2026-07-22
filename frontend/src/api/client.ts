@@ -64,6 +64,8 @@ import type {
   // Discovery Ledger Types (FI-4)
   DiscoveryCandidatesResponse,
   DiscoveryPerformanceResponse,
+  // US AI Cross-Market Signal (observability T2)
+  UsSignalResponse,
   // Scanner Types
   ScanProgressResponse,
   ScanResultsResponse,
@@ -1558,6 +1560,16 @@ class ApiClient {
   }
 
   /**
+   * Get the current US AI cross-market signal (GET /trading/discovery/us-signal)
+   * -- overnight US AI value-chain performance + curated ticker list used to
+   * nudge KR AI value-chain discovery/discussion.
+   */
+  async getUsSignal(): Promise<UsSignalResponse> {
+    const response = await this.client.get<UsSignalResponse>('/trading/discovery/us-signal');
+    return response.data;
+  }
+
+  /**
    * Add a stock to watch list.
    */
   async addToWatchList(request: AddToWatchListRequest): Promise<AddToWatchListResponse> {
@@ -2192,6 +2204,9 @@ export const getDiscoveryCandidates = (params?: {
 
 export const getDiscoveryPerformance = (days?: number) =>
   apiClient.getDiscoveryPerformance(days);
+
+// US AI Cross-Market Signal API (observability T2)
+export const getUsSignal = () => apiClient.getUsSignal();
 
 // Background Scanner API
 export const startScan = (request?: StartScanRequest) =>
