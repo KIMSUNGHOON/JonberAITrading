@@ -714,17 +714,28 @@ _모니터링 중..._
         _MAX = 10
         lines = [f"🔍 *자율 발굴 승격 {len(promoted)}종* · {trade_date}"]
         for p in promoted[:_MAX]:
+            # 종목명/전략은 자유텍스트 → Markdown 특수문자 이스케이프(발송 실패 방지)
+            name = self._md_escape(str(p.get("name") or p.get("ticker") or "-"))
+            strategy = self._md_escape(str(p.get("strategy") or "-"))
             lines.append(
-                f"• {p['name']} {p['ticker']} · {self._fmt_composite(p.get('composite'))} "
-                f"{p.get('strategy') or '-'} · 워치 {self._fmt_price(p.get('target'))}"
+                f"• {name} {p['ticker']} · {self._fmt_composite(p.get('composite'))} "
+                f"{strategy} · 워치 {self._fmt_price(p.get('target'))}"
             )
         if len(promoted) > _MAX:
             lines.append(f"• 외 {len(promoted) - _MAX}종")
         tail = "개장 시 토론→투표"
         if daily_cap_waiting > 0:
-            tail = f"+{daily_cap_waiting}종 daily_cap 대기 · {tail}"
+            # "daily_cap"의 밑줄은 Telegram Markdown italic 시작으로 오해돼 발송 실패 → 한글 표기
+            tail = f"+{daily_cap_waiting}종 일일한도 대기 · {tail}"
         lines.append(tail)
         return "\n".join(lines)
+
+    @staticmethod
+    def _md_escape(text: str) -> str:
+        """Telegram 레거시 Markdown 특수문자 이스케이프(자유텍스트용)."""
+        for ch in ("_", "*", "`", "["):
+            text = text.replace(ch, "\\" + ch)
+        return text
 
     @staticmethod
     def _fmt_price(value) -> str:

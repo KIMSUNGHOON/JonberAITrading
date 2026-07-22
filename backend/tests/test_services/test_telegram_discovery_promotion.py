@@ -62,7 +62,7 @@ async def test_discovery_promotion_format():
     assert "자율 발굴 승격 2종" in msg and "2026-07-22" in msg
     assert "위닉스 044340" in msg and "0.73" in msg and "momentum" in msg
     assert "SK이터닉스 475150" in msg and "0.67" in msg
-    assert "16종 daily_cap 대기" in msg and "개장 시 토론→투표" in msg
+    assert "16종 일일한도 대기" in msg and "개장 시 토론→투표" in msg
 
 
 async def test_discovery_promotion_no_daily_cap_waiting_omits_that_clause():
@@ -74,7 +74,7 @@ async def test_discovery_promotion_no_daily_cap_waiting_omits_that_clause():
     await notifier.send_discovery_promotion(trade_date="2026-07-22", promoted=promoted, daily_cap_waiting=0)
 
     msg = notifier._bot.send_message.call_args.kwargs["text"]
-    assert "daily_cap 대기" not in msg
+    assert "일일한도 대기" not in msg
     assert "개장 시 토론→투표" in msg
 
 
