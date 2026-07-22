@@ -1278,6 +1278,26 @@ class ChatCoordinator:
                 await self._build_strategy_context()
             )
 
+            # US 신호 T4: US AI 크로스마켓 신호(AI밸류체인 종목 + 당일 캐시
+            # 존재 시에만; off/결측/비-AI밸류체인이면 None — 주입 안 함).
+            # never-raise: 실패는 로그만, 토론을 막지 않는다.
+            us_market_context = None
+            try:
+                from services.discovery.ai_valuechain import is_ai_valuechain
+                from services.trading.us_market_data import get_cached_us_ai_signal
+                if is_ai_valuechain(ticker):
+                    _us = await get_cached_us_ai_signal()
+                    if _us is not None:
+                        _comp = _us.get("components", {})
+                        _parts = ", ".join(f"{k} {v:+.1f}%" for k, v in _comp.items())
+                        _dir = "강세" if _us["signal"] > 0 else ("약세" if _us["signal"] < 0 else "중립")
+                        us_market_context = (
+                            f"간밤 미 AI 반도체 {_dir}({_parts}). 이 종목은 AI 공급망(메모리/HBM)으로 "
+                            f"선행 추종 경향이나 확정 신호 아님 — 자체 밸류에이션·수급·뉴스가 우선."
+                        )
+            except Exception as e:
+                logger.warning("us_market_context_build_failed", ticker=ticker, error=str(e))
+
             # ka10001 mrkt_tot_amt 단위=억원 (scanner.py:852-856과 동일 근거,
             # 라이브 실측 2026-07-18: 005930 -> 14,908,010억 ≈ 1,490조).
             # 무보정이면 fundamental_agent 표시가 왜곡돼 LLM이 "데이터
@@ -1311,6 +1331,7 @@ class ChatCoordinator:
                 strategy_directive=strategy_directive,
                 strategy_knobs=strategy_knobs,
                 consensus_threshold=consensus_threshold,
+                us_market_context=us_market_context,
             )
 
         except Exception as e:

@@ -76,6 +76,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
 
 ### 가격 모멘텀
 - 전일 대비: {price_change_pct:+.2f}%
+{us_market_context}
 
 ---
 
@@ -126,6 +127,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
 - 뉴스 감성: {news_sentiment}
 - 분석 뉴스: {news_count}건
 - 가격 모멘텀: {price_change_pct:+.2f}%
+{us_market_context}
 
 ---
 
@@ -163,6 +165,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             price_change_pct=context.price_change_pct,
             news_sentiment=context.news_sentiment or "분석 중",
             news_count=context.news_count or 0,
+            us_market_context=context.us_market_context or "",
         )
 
         response = await self._call_llm(self._effective_system_prompt(), prompt)
@@ -247,6 +250,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             news_sentiment=context.news_sentiment or "N/A",
             news_count=context.news_count or 0,
             price_change_pct=context.price_change_pct,
+            us_market_context=context.us_market_context or "",
         )
 
         messages = [

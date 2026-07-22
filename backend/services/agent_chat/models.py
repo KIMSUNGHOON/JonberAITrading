@@ -218,6 +218,11 @@ class MarketContext(BaseModel):
     strategy_directive: Optional[str] = Field(default=None)
     strategy_knobs: Optional[Dict[str, float]] = Field(default=None)
 
+    # US 신호 T4: US AI 크로스마켓 신호 한 줄 요약(AI밸류체인 종목 + 당일 캐시
+    # 신호 존재 시에만 coordinator._fetch_market_context가 채움 — 프롬프트
+    # 넛지 전용, 투표/confidence 로직에는 관여하지 않는다).
+    us_market_context: Optional[str] = Field(default=None)
+
     # E-3: 활성 전략의 entry_conditions.consensus_threshold (best-effort —
     # coordinator._build_strategy_context가 채움. 조회 실패/전략 없음=0.75
     # 기본값 그대로 — 배포 직후 거동 불변). ChatRoom 생성 시 이 값을 그대로
