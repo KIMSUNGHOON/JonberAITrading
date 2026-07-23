@@ -580,12 +580,16 @@ class TestOpportunityDetection:
 
 
 class TestDiscoveryWatchFirstReview:
-    """Discovery-promoted watches must get a first discussion regardless of
-    proximity/confidence — see specs/2026-07-22-discovery-watch-first-discussion.
-    Composite confidence (~0.65-0.73) sits below the 0.75 opportunity
-    threshold, and a gap-away-from-target open means the proximity branch
-    never fires either, so without this guarantee a discovery promotion can
-    go undiscussed forever."""
+    """Discovery-promoted watches AND manually-added target-None watches must
+    get a first discussion regardless of proximity/confidence — see
+    specs/2026-07-22-discovery-watch-first-discussion (discovery) generalized
+    by specs/2026-07-23 (target-None) to `_first_reviewed`. Composite
+    confidence (~0.65-0.73) sits below the 0.75 opportunity threshold, and a
+    gap-away-from-target open means the proximity branch never fires either
+    for discovery watches; a manual watch with no target_entry_price has
+    nothing for the proximity branch to compare against and typically sits
+    at confidence 0.5. Without this guarantee either kind of watch can go
+    undiscussed forever."""
 
     @pytest.mark.asyncio
     async def test_discovery_watch_first_review_triggers(self, coordinator):
@@ -602,7 +606,7 @@ class TestDiscoveryWatchFirstReview:
 
         # Once marked reviewed (as _check_watch_list does after an actual
         # discussion start), the same stock no longer force-triggers.
-        coordinator._discovery_reviewed.add("044340")
+        coordinator._first_reviewed.add("044340")
         assert await coordinator._detect_opportunity(stock) is False
 
     @pytest.mark.asyncio
@@ -629,6 +633,68 @@ class TestDiscoveryWatchFirstReview:
         # Existing proximity branch (1.3% < 3%) still fires independent of
         # the new discovery-first-review branch.
         assert await coordinator._detect_opportunity(stock) is True
+
+    @pytest.mark.asyncio
+    async def test_targetless_watch_first_review_triggers(self, coordinator):
+        # target=None, confidence 0.5, signal="hold" (non-discovery) --
+        # before this generalization this was False forever (proximity
+        # branch has no target to compare, confidence branch needs 0.75).
+        stock = {
+            "ticker": "000660",
+            "current_price": 1911000,
+            "target_entry_price": None,
+            "confidence": 0.5,
+            "signal": "hold",
+        }
+        assert await coordinator._detect_opportunity(stock) is True
+
+        # Once marked reviewed, the same targetless stock reverts to False
+        # forever (it has no target, so it can never re-earn a review via
+        # proximity either).
+        coordinator._first_reviewed.add("000660")
+        assert await coordinator._detect_opportunity(stock) is False
+
+    @pytest.mark.asyncio
+    async def test_targetless_high_confidence_uses_confidence_branch(self, coordinator):
+        # High confidence should fire via the existing confidence branch,
+        # independent of the first-review guarantee (guarantee not needed).
+        stock = {
+            "ticker": "x",
+            "current_price": 100,
+            "target_entry_price": None,
+            "confidence": 0.8,
+            "signal": "hold",
+        }
+        assert await coordinator._detect_opportunity(stock) is True
+
+    @pytest.mark.asyncio
+    async def test_discovery_still_guaranteed(self, coordinator):
+        # Regression: discovery-promoted watches keep the same first-review
+        # guarantee behavior after the rename/generalization.
+        stock = {
+            "ticker": "044340",
+            "current_price": 4200,
+            "target_entry_price": 3850,
+            "confidence": 0.70,
+            "signal": "discovery",
+        }
+        assert await coordinator._detect_opportunity(stock) is True
+        coordinator._first_reviewed.add("044340")
+        assert await coordinator._detect_opportunity(stock) is False
+
+    @pytest.mark.asyncio
+    async def test_normal_manual_watch_unchanged(self, coordinator):
+        # Manual watch with a target, out of proximity, low confidence,
+        # non-discovery signal -- behavior must remain False (unchanged by
+        # the target-None generalization since it does have a target).
+        stock = {
+            "ticker": "005930",
+            "current_price": 270000,
+            "target_entry_price": 257000,
+            "confidence": 0.5,
+            "signal": "hold",
+        }
+        assert await coordinator._detect_opportunity(stock) is False
 
 
 # -------------------------------------------

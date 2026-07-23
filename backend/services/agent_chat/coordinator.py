@@ -396,15 +396,17 @@ class ChatCoordinator:
         # module-level "Session-history read merge" section above).
         self._last_discussion: Dict[str, datetime] = {}  # ticker -> last discussion time
 
-        # Discovery watch first-discussion guarantee: discovery-promoted
-        # watches carry composite confidence (~0.65-0.73, below the 0.75
-        # opportunity threshold) and can gap away from target_entry_price at
-        # open, so neither _detect_opportunity branch (proximity/confidence)
-        # may ever fire for them. Tracks tickers that have already had their
-        # guaranteed first review so it fires exactly once per promotion (per
-        # process — in-memory, re-review-on-restart is acceptable, no
+        # First-discussion guarantee: discovery-promoted watches carry
+        # composite confidence (~0.65-0.73, below the 0.75 opportunity
+        # threshold) and can gap away from target_entry_price at open; and
+        # manually-added watches with no target_entry_price (proximity
+        # branch has nothing to compare against, confidence is usually 0.5)
+        # can likewise never trigger either _detect_opportunity branch
+        # (proximity/confidence). Tracks tickers that have already had their
+        # guaranteed first review so it fires exactly once per promotion/add
+        # (per process — in-memory, re-review-on-restart is acceptable, no
         # persistence needed).
-        self._discovery_reviewed: set[str] = set()
+        self._first_reviewed: set[str] = set()
 
         # Scheduler for periodic checks
         self._scheduler: Optional[AsyncIOScheduler] = None
@@ -586,8 +588,9 @@ class ChatCoordinator:
                 # Mark on ACTUAL start (room present in _active_rooms), not
                 # on detect -- so a slot-starved/stale-context skip leaves
                 # the ticker eligible to retry the guaranteed review next tick.
-                if stock.get("signal") == "discovery" and ticker in self._active_rooms:
-                    self._discovery_reviewed.add(ticker)
+                if (stock.get("signal") == "discovery" or stock.get("target_entry_price") is None) \
+                        and ticker in self._active_rooms:
+                    self._first_reviewed.add(ticker)
 
         except Exception as e:
             logger.error("watch_list_check_failed", error=str(e))
@@ -681,10 +684,12 @@ class ChatCoordinator:
             )
             return True
 
-        # 발굴 승격 워치 첫 평가 보장 — confidence=composite(<0.75)로 확신분기가 죽어
-        # 갭 시 미토론이던 갭 봉합. 근접/확신 무관 최소 1회 토론(투표는 불변).
-        if stock.get("signal") == "discovery" and ticker not in self._discovery_reviewed:
-            logger.info("opportunity_detected_discovery_first_review", ticker=ticker)
+        # 첫 평가 보장: 발굴 승격(signal="discovery") 또는 진입타겟 없는 워치
+        # (target=None → 근접 브랜치 영영 못 뜸)는 근접/확신 무관 최소 1회 토론.
+        if (stock.get("signal") == "discovery" or target_price is None) \
+                and ticker not in self._first_reviewed:
+            logger.info("opportunity_detected_first_review", ticker=ticker,
+                        reason="discovery" if stock.get("signal") == "discovery" else "no_target")
             return True
 
         return False
