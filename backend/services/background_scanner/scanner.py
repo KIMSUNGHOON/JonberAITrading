@@ -2169,6 +2169,13 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
         `scan_results`(이 테이블, stk_cd 인덱스 idx_scan_results_stk_cd 有)에
         T3가 이미 저장하고 있었다.
 
+        `AND factor_json IS NOT NULL` 필수(T8 재리뷰 봉합): `scan_results`에는
+        discovery 외에 quick/LLM 스캔 writer(`_save_result_to_db`/
+        `_save_results_batch`)도 있는데, 이쪽은 factor_json을 아예 채우지
+        않아 NULL로 남는다. 필터 없이 `ORDER BY scanned_at DESC LIMIT 1`만
+        쓰면, EOD discovery 스캔 다음날 아침 일반 스윕이 같은 종목에 NULL
+        factor_json 행을 더 최신으로 얹는 순간 이 폴백이 조용히 무력화된다.
+
         never-raise: 조회/파싱 실패는 전부 None(호출자가 fail-open으로
         처리)."""
         try:
@@ -2176,7 +2183,7 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
             async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute(
                     "SELECT factor_json FROM scan_results WHERE stk_cd = ? "
-                    "ORDER BY scanned_at DESC LIMIT 1",
+                    "AND factor_json IS NOT NULL ORDER BY scanned_at DESC LIMIT 1",
                     (stk_cd,),
                 ) as cursor:
                     row = await cursor.fetchone()
