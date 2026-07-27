@@ -27,6 +27,7 @@ from services.discovery.ranker import (
     DEFAULT_REGIME_WEIGHTS,
     Candidate,
     _build_llm_messages,
+    _effective_weights,
     llm_review_top,
     promote_candidates,
     rank_candidates,
@@ -417,18 +418,24 @@ class TestEffectiveWeights:
     # -> class 마크는 누적이지 override가 아님) -- 그래서 이 테스트들도 다른
     # 테스트와 동일하게 async def로 선언해 pytest-asyncio 경고 없이 자연스럽게
     # 수렴시킨다(본문은 동기 호출만 있고 await은 없음).
-    async def test_flow_missing_redistributes_bearish_weights_manual(self):
-        """수기 대조: bearish {momentum .10 pullback .20 flow .35 meanrev .35}
-        에서 flow 결측 -> {momentum .154 pullback .308 flow 0 meanrev .538},
-        합은 여전히 1.0으로 보존."""
+    async def test_flow_missing_bearish_weights_unchanged_manual(self):
+        """DQ-2 재정규화는 2026-07-27 유동성 인지 아크에서 폐기됨.
+
+        구 동작(폐기): 수기 대조 bearish {momentum .10 pullback .20 flow .35
+        meanrev .35}에서 flow 결측 -> 재분배로 {momentum .154 pullback .308
+        flow 0 meanrev .538}, 합은 1.0으로 보존됐다 -- 이 재분배가 ka10131
+        상위~100행 결측 소형주 전체에서 momentum 가중을 부당 증폭시켰다.
+
+        신 동작: 재분배 없이 momentum/pullback/meanrev는 base 그대로 두고
+        flow 자리만 0 -- 합은 0.65로 줄어든다(수급 미확인 = 검증 실패)."""
         base = {k: DEFAULT_REGIME_WEIGHTS["bearish"][k] for k in STRATEGIES}
         eff = ranker._effective_weights(base, flow_present=False)
 
-        assert eff["momentum"] == pytest.approx(0.153846, abs=1e-5)
-        assert eff["pullback"] == pytest.approx(0.307692, abs=1e-5)
-        assert eff["meanrev"] == pytest.approx(0.538462, abs=1e-5)
+        assert eff["momentum"] == pytest.approx(0.10)
+        assert eff["pullback"] == pytest.approx(0.20)
+        assert eff["meanrev"] == pytest.approx(0.35)
         assert eff["flow"] == 0.0
-        assert sum(eff.values()) == pytest.approx(1.0)
+        assert sum(eff.values()) == pytest.approx(0.65)
 
     async def test_flow_present_returns_base_unchanged(self):
         """flow_present=True는 재분배 없이 base 가중을 그대로(방어적 복사로)
@@ -441,8 +448,11 @@ class TestEffectiveWeights:
 
     async def test_non_strategy_keys_pass_through_untouched(self):
         """base_weights에 threshold/daily_cap 같은 비-팩터 키가 섞여 있어도
-        (레짐 설정 dict 원형) STRATEGIES 4키만 재분배 대상이고 나머지는
-        그대로 통과해야 한다."""
+        (레짐 설정 dict 원형) 손대지 않고 그대로 통과해야 한다.
+
+        DQ-2 재정규화는 2026-07-27 유동성 인지 아크에서 폐기됨 -- 구 동작은
+        여기서 STRATEGIES 4키 합이 1.0으로 보존됐지만, 신 동작은 재분배가
+        없으므로 flow가 0으로 빠진 만큼 합이 줄어든다(0.65)."""
         base = {
             "momentum": 0.10, "pullback": 0.20, "flow": 0.35, "meanrev": 0.35,
             "threshold": 0.65, "daily_cap": 2,
@@ -451,11 +461,16 @@ class TestEffectiveWeights:
 
         assert eff["threshold"] == 0.65
         assert eff["daily_cap"] == 2
-        assert sum(eff[k] for k in STRATEGIES) == pytest.approx(1.0)
+        assert sum(eff[k] for k in STRATEGIES) == pytest.approx(0.65)
 
     async def test_degenerate_all_zero_weights_never_raises(self):
-        """나머지 3키 합이 0인 손상된 가중 설정도 예외 없이 flow만 0으로
-        두고 반환해야 한다(fail-closed, 랭킹 전체를 죽이면 안 됨)."""
+        """나머지 3키가 전부 0인 극단적 가중 설정도 예외 없이 flow만 0으로
+        두고 반환해야 한다(fail-closed, 랭킹 전체를 죽이면 안 됨).
+
+        DQ-2 재정규화는 2026-07-27 유동성 인지 아크에서 폐기됨 -- 구 동작은
+        나머지 3키 합이 0이면 0-나눗셈을 피하려고 이 케이스를 별도
+        분기했지만, 신 동작은 애초에 나눗셈이 없으므로 이 테스트는 이제
+        일반 경로의 자명한 결과를 회귀 확인하는 용도로 남는다."""
         base = {"momentum": 0.0, "pullback": 0.0, "flow": 1.0, "meanrev": 0.0}
         eff = ranker._effective_weights(base, flow_present=False)
         assert eff["flow"] == 0.0
@@ -465,16 +480,79 @@ class TestEffectiveWeights:
 
 
 # ---------------------------------------------------------------------------
+# B: flow 결측 재정규화 폐기
+# ---------------------------------------------------------------------------
+
+BULLISH = {"momentum": 0.40, "pullback": 0.25, "flow": 0.25, "meanrev": 0.10,
+           "threshold": 0.55, "daily_cap": 5}
+
+
+def test_flow_present_weights_unchanged():
+    """수급 랭킹에 있는 종목은 base 가중 그대로 -- 기존 동작 유지."""
+    w = _effective_weights(BULLISH, True)
+    assert w["momentum"] == pytest.approx(0.40)
+    assert w["flow"] == pytest.approx(0.25)
+
+
+def test_flow_missing_no_redistribution():
+    """핵심 회귀 -- flow 결측이어도 momentum 가중이 증폭되지 않는다.
+
+    구 동작: scale=1/0.75=1.333 -> momentum 0.40 -> 0.533 (33% 증폭).
+    신 동작: momentum 0.40 유지, flow 자리만 0."""
+    w = _effective_weights(BULLISH, False)
+    assert w["momentum"] == pytest.approx(0.40)
+    assert w["pullback"] == pytest.approx(0.25)
+    assert w["meanrev"] == pytest.approx(0.10)
+    assert w["flow"] == 0.0
+
+
+def test_flow_missing_weights_sum_below_one():
+    """수급 미확인은 '정보 부재'가 아니라 '검증 실패' -- composite가 자연히 낮아진다."""
+    w = _effective_weights(BULLISH, False)
+    total = sum(w[k] for k in ("momentum", "pullback", "flow", "meanrev"))
+    assert total == pytest.approx(0.75)
+
+
+def test_non_strategy_keys_pass_through():
+    w = _effective_weights(BULLISH, False)
+    assert w["threshold"] == 0.55
+    assert w["daily_cap"] == 5
+
+
+def test_bixolon_regression_composite_drops():
+    """빅솔론 실측 재현 -- 재정규화 폐기로 0.636 -> 0.477 대역."""
+    raw = {"momentum": 0.7411, "pullback": 0.7223, "flow": 0.0, "meanrev": 0.0}
+    w = _effective_weights(BULLISH, False)
+    composite = sum(raw[k] * w[k] for k in raw)
+    assert composite == pytest.approx(0.477, abs=0.01)
+    assert composite < 0.55          # 문턱 미달 = 승격 안 됨
+
+
+def test_flow_present_high_scorer_unchanged():
+    """자이에스앤디 실측 재현 -- flow_present 종목은 점수가 전혀 변하지 않는다."""
+    raw = {"momentum": 1.0, "pullback": 0.50, "flow": 0.67, "meanrev": 0.0}
+    w = _effective_weights(BULLISH, True)
+    composite = sum(raw[k] * w[k] for k in raw)
+    assert composite == pytest.approx(0.6925, abs=0.01)
+    assert composite >= 0.55
+
+
+# ---------------------------------------------------------------------------
 # DQ-2: rank_candidates 배선 -- 재정규화된 composite + 원장 _weights
 # ---------------------------------------------------------------------------
 
 
-async def test_rank_candidates_renormalizes_composite_when_flow_missing(tmp_path, storage):
-    """크레오에스지 실측 검산(spec §0): momentum=0.32/pullback=0.54/
-    meanrev=0.67, flow 결측(flow_present=False, bearish 레짐) -> 재정규화
-    composite=0.576. base(비재정규화) 가중 계산은 RED 값 0.373(구조상
-    3745 반올림)과 일치해야 한다 -- 재정규화가 실제로 더 높은 composite를
-    낸다는 것을 함께 확인."""
+async def test_rank_candidates_no_redistribution_when_flow_missing(tmp_path, storage):
+    """크레오에스지 실측 검산 -- DQ-2 재정규화는 2026-07-27 유동성 인지
+    아크에서 폐기됨.
+
+    구 동작(폐기): momentum=0.32/pullback=0.54/meanrev=0.67, flow 결측
+    (flow_present=False, bearish 레짐) -> 재정규화로 composite=0.576(base
+    0.3745보다 높게 부풀려짐).
+
+    신 동작: 재분배 없이 flow 자리만 0 -- composite는 base 그대로
+    0.3745이고, weights도 base 그대로(momentum/pullback/meanrev 무변경)여야
+    한다."""
     trade_date = "2026-07-20"
     scanner_db = tmp_path / "scanner.db"
     await _seed_regime_snapshot(storage, trade_date, "bearish")
@@ -492,14 +570,14 @@ async def test_rank_candidates_renormalizes_composite_when_flow_missing(tmp_path
 
     w = DEFAULT_REGIME_WEIGHTS["bearish"]
     base_composite = 0.32 * w["momentum"] + 0.54 * w["pullback"] + 0.67 * w["meanrev"]
-    assert base_composite == pytest.approx(0.3745, abs=1e-4)  # RED 대조값(구현 전 수치)
+    assert base_composite == pytest.approx(0.3745, abs=1e-4)
 
-    assert c.composite == pytest.approx(0.576, abs=1e-3)
-    assert c.composite > base_composite
+    assert c.composite == pytest.approx(base_composite)
+    assert c.composite == pytest.approx(0.3745, abs=1e-4)
     assert c.weights["flow"] == 0.0
-    assert c.weights["meanrev"] == pytest.approx(0.538462, abs=1e-5)
-    assert c.weights["momentum"] == pytest.approx(0.153846, abs=1e-5)
-    assert c.weights["pullback"] == pytest.approx(0.307692, abs=1e-5)
+    assert c.weights["meanrev"] == pytest.approx(w["meanrev"])
+    assert c.weights["momentum"] == pytest.approx(w["momentum"])
+    assert c.weights["pullback"] == pytest.approx(w["pullback"])
 
 
 async def test_rank_candidates_flow_present_flag_roundtrips_from_factor_json(tmp_path, storage):
@@ -531,8 +609,11 @@ async def test_rank_candidates_flow_present_flag_roundtrips_from_factor_json(tmp
 
 async def test_rank_candidates_falls_back_to_raw_flow_zero_proxy_when_flag_absent(tmp_path, storage):
     """구 스캔(factor_json에 flow_present 키 자체가 없음) 하위호환: raw
-    flow==0.0을 결측 프록시로 삼아 재정규화가 여전히 적용돼야 한다(웹젠
-    실측 케이스와 동일한 배선 경로, spec §0)."""
+    flow==0.0을 결측 프록시로 삼아 flow_present=False 경로가 여전히
+    적용돼야 한다(웹젠 실측 케이스와 동일한 배선 경로, spec §0).
+
+    DQ-2 재정규화는 2026-07-27 유동성 인지 아크에서 폐기됨 -- composite
+    기대값은 재분배 이전 base 그대로(0.3745)로 갱신."""
     trade_date = "2026-07-20"
     scanner_db = tmp_path / "scanner.db"
     await _seed_regime_snapshot(storage, trade_date, "bearish")
@@ -547,7 +628,7 @@ async def test_rank_candidates_falls_back_to_raw_flow_zero_proxy_when_flag_absen
 
     candidates = await rank_candidates(storage, str(scanner_db), trade_date)
     c = candidates[0]
-    assert c.composite == pytest.approx(0.576, abs=1e-3)
+    assert c.composite == pytest.approx(0.3745, abs=1e-4)
     assert c.weights["flow"] == 0.0
 
 

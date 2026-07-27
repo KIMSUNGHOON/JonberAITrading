@@ -349,40 +349,28 @@ async def _load_scan_results(scanner_db_path, session_id: str) -> list[dict[str,
 
 
 def _effective_weights(base_weights: dict, flow_present: bool) -> dict:
-    """flow 결측 재정규화(DQ-2, spec Section 2). `flow_present=True`면
-    `base_weights`를 그대로 복사해 반환한다(재분배 없음 -- flow가 실제로
-    존재하는 종목은 base 가중이 그대로 적용돼야 한다는 DQ-D 원칙: "편향
-    제거 != 억지 승격", 재정규화는 결측 종목만).
+    """랭킹에 실제로 적용할 전략 가중.
 
-    `flow_present=False`면 flow 가중을 나머지 STRATEGIES 3키(momentum/
-    pullback/meanrev)에 각 키의 상대 비중대로 재분배하고 flow 자리는 0.0으로
-    채운다 -- 합은 원래 4키(flow+나머지 3키) 합과 정확히 보존된다(예:
-    bearish {momentum .10 pullback .20 flow .35 meanrev .35} ->
-    {momentum .154 pullback .308 flow 0 meanrev .538}).
+    **유동성 인지 아크(B, 2026-07-27): 구 DQ-2 재정규화를 폐기했다.**
 
-    `base_weights`에 threshold/daily_cap처럼 STRATEGIES 밖의 키가 섞여
-    있어도(레짐 설정 dict 원형을 그대로 넘기는 호출자 대비) 그 값은 손대지
-    않고 그대로 통과시킨다 -- 재분배 대상은 STRATEGIES 4키뿐.
+    구 동작은 `flow_present=False`일 때 flow 가중을 나머지 3전략에 재분배했다.
+    의도는 "수급 데이터가 없는 종목을 부당하게 벌하지 않는다"였으나, ka10131
+    수급 랭킹이 상위 약 100행만 수집되므로 사실상 **소형주 전체**가 결측이 되고,
+    그 집단에서만 선택적으로 momentum 가중이 증폭됐다(bullish 실측: 0.40 ->
+    0.533, +33%). momentum은 구 수식에서 저유동성을 선호했으므로, 두 편향이
+    곱해져 "승격 종목이 전부 저유동성 momentum"이라는 결과를 만들었다.
 
-    나머지 3키 합이 0이거나 flow 가중 자체가 0 이하인 퇴화 케이스(손상된
-    가중 설정)는 재분배할 곳이 없으므로 flow만 0으로 두고 그대로 반환한다
-    -- fail-closed: 재정규화 실패가 랭킹 전체를 죽이면 안 된다(never
-    raise)."""
+    신 동작: flow 결측은 **검증 실패**로 취급한다. 재분배 없이 flow 자리만
+    0으로 두면 composite가 그만큼 자연히 낮아진다. 실측(2026-07-23 배치)상
+    threshold 0.55를 유지해도 17종이 통과해 daily_cap 5를 채우고 남는다 --
+    문턱 재산출은 불필요하다.
+
+    `flow_present=True` 경로와 STRATEGIES 밖 키(threshold/daily_cap) 통과
+    규약은 불변이다.
+    """
     result = dict(base_weights)
     if flow_present:
         return result
-
-    flow_weight = float(result.get("flow", 0.0))
-    remaining_keys = [k for k in STRATEGIES if k != "flow"]
-    remaining_sum = sum(float(result.get(k, 0.0)) for k in remaining_keys)
-
-    if flow_weight <= 0.0 or remaining_sum <= 0.0:
-        result["flow"] = 0.0
-        return result
-
-    scale = (remaining_sum + flow_weight) / remaining_sum
-    for k in remaining_keys:
-        result[k] = float(result.get(k, 0.0)) * scale
     result["flow"] = 0.0
     return result
 
