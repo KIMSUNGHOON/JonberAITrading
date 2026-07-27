@@ -83,13 +83,20 @@ async def _get_account_equity() -> Optional[float]:
     참조), skip-floor까지 그 베이스를 따라가면 계좌가 상당 부분 투자돼
     가용현금이 작을 때 floor가 비례해 낮아져 사실상 무력화된다(리뷰
     Important3) — 그래서 이 조회만 별도로 분리한다. lazy import는
-    _get_active_strategy와 동일 패턴."""
+    _get_active_strategy와 동일 패턴.
+
+    ⚠️ 예외를 삼키되 **로그는 남긴다**(최종 리뷰 Blocking3): 이 함수가 None을
+    반환하면 호출부가 0.0으로 대체하고, `apply_liquidity_cap`의 skip-floor
+    분기는 `equity > 0`이 선행 조건이라 **분기 자체가 평가되지 않고 통과**한다
+    — T6 리뷰가 살리려던 floor가 무발동으로 되돌아간다. 같은 커밋이 ADTV 실패
+    에는 경고를 명시적으로 붙였으므로 여기만 무로그면 원칙의 비대칭이다."""
     try:
         from app.dependencies import get_trading_coordinator
 
         coordinator = await get_trading_coordinator()
         return float(coordinator._state.account.total_equity)
-    except Exception:
+    except Exception as e:
+        logger.warning("liquidity_skip_equity_unavailable", error=str(e))
         return None
 
 
@@ -405,13 +412,35 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
             # 통째로 0이 되어버린다. adtv_median의 import는 모듈 스코프로 옮겼다
             # (inner try 안에서 하면 import 실패가 outer try로 새어 나가
             # investment_amount 전체를 0으로 만들 수 있었다).
+            #
+            # 킬스위치(LIQUIDITY_SIZING_CAP_ENABLED, 설계 §6): off면 ADTV를
+            # 구하지 않고 None을 넘겨 기존 fail-open 경로로 수렴한다
+            # (portfolio_agent._resolve_adtv와 동일 스위치·동일 결과).
+            from app.config import settings as _settings
+
             _adtv = None
-            try:
-                _adtv = adtv_median(await client.get_daily_chart_df(stk_cd))
-            except Exception as e:
-                logger.warning("liquidity_adtv_fetch_failed", stk_cd=stk_cd, error=str(e))
+            if not getattr(_settings, "LIQUIDITY_SIZING_CAP_ENABLED", True):
+                logger.warning("liquidity_sizing_cap_disabled", stk_cd=stk_cd)
+            else:
+                try:
+                    _adtv = adtv_median(await client.get_daily_chart_df(stk_cd))
+                except Exception as e:
+                    logger.warning("liquidity_adtv_fetch_failed", stk_cd=stk_cd, error=str(e))
 
             _skip_equity = await _get_account_equity()
+            if _skip_equity is None or _skip_equity <= 0:
+                # ⚠️ 최종 리뷰 Blocking3: equity<=0이면 apply_liquidity_cap의
+                # skip-floor 분기(`equity > 0` 선행 조건)가 아예 평가되지 않고
+                # 통과한다 — floor가 무발동인 채로 주문이 나간다. 게다가
+                # 확률적 위험이 아니다: coordinator._state.account.total_equity
+                # 는 _refresh_account_info 전 기본값이 0이므로 배포 후
+                # /trading/start 재발행 전 구간에서는 예외조차 없이 float(0)이
+                # 그대로 흐른다. 사유가 "liquidity_cap"/None으로만 보여 배포
+                # 창에서 관측이 불가능했던 지점.
+                logger.warning(
+                    "liquidity_skip_floor_disabled",
+                    stk_cd=stk_cd, equity=_skip_equity,
+                )
             investment_amount, _liq_reason = apply_liquidity_cap(
                 investment_amount, _adtv,
                 _skip_equity if _skip_equity is not None else 0.0,
@@ -429,6 +458,15 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
                 logger.warning(
                     "liquidity_cap_adtv_unknown",
                     stk_cd=stk_cd, investment_amount=investment_amount,
+                )
+            elif _liq_reason == "skip_floor_disabled":
+                # Blocking3: 캡 자체는 살아 있지만 skip-floor(과소포지션 진입
+                # 포기)만 빠진 상태 — 위 liquidity_skip_floor_disabled와 짝을
+                # 이뤄 "실제로 그 상태로 사이징이 끝났다"를 확정한다.
+                logger.warning(
+                    "liquidity_cap_without_skip_floor",
+                    stk_cd=stk_cd, adtv=_adtv,
+                    investment_amount=investment_amount,
                 )
 
             quantity = investment_amount // current_price

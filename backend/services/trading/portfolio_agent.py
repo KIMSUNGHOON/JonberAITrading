@@ -353,6 +353,14 @@ class PortfolioAgent:
                 f"[PortfolioAgent] 유동성 캡 미적용(adtv_unknown): "
                 f"max_value={max_value:,.0f} — R-cap/포지션 캡만 적용됨"
             )
+        elif liq_reason == "skip_floor_disabled":
+            # 최종 리뷰 Blocking3: 계좌 평가액이 0 이하라 skip-floor(과소포지션
+            # 진입 포기)를 평가할 수 없었다. 캡 자체는 결합됐지만 방어선 하나가
+            # 빠진 상태이므로 조용히 지나가면 안 된다.
+            logger.warning(
+                f"[PortfolioAgent] skip-floor 미평가(total_equity={total_equity}) "
+                f"— 유동성 캡만 결합됨 max_value={max_value:,.0f}"
+            )
 
         return max_value
 
@@ -370,8 +378,20 @@ class PortfolioAgent:
         저장하고 있었다(`stk_cd` 인덱스 有). `_stored_adtv`가 그 경로를
         조회한다.)
         """
+        from app.config import settings
         from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
         from services.discovery.liquidity import adtv_median
+
+        # C1 킬스위치(설계 §6, 최종 리뷰 Blocking2): off면 ADTV를 아예 구하지
+        # 않고 None을 반환해 `apply_liquidity_cap`의 기존 fail-open 경로
+        # ("adtv_unknown", 캡 미적용)로 수렴한다. R-cap과 포지션 캡은 계속
+        # 작동한다. decision_nodes.py의 다른 사이징 호출부도 같은 스위치를 본다.
+        if not getattr(settings, "LIQUIDITY_SIZING_CAP_ENABLED", True):
+            logger.warning(
+                f"[PortfolioAgent] 유동성 사이징 캡 킬스위치 off "
+                f"(LIQUIDITY_SIZING_CAP_ENABLED=False) — {ticker} 캡 미적용"
+            )
+            return None
 
         try:
             client = await get_shared_kiwoom_client_async()

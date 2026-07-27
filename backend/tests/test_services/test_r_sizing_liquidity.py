@@ -50,3 +50,40 @@ def test_skip_threshold_is_one_percent_of_equity():
 def test_zero_equity_is_safe():
     cap, reason = apply_liquidity_cap(20_000_000, 20 * 억, 0.0)
     assert cap >= 0.0
+
+
+# --- 최종 리뷰 Blocking3: skip-floor가 무로그로 비활성화되던 경로 ---
+# `equity > 0`이 skip-floor 분기의 선행 조건이라 equity=0이면 분기 자체가
+# 평가되지 않고 통과했고, 사유는 "liquidity_cap"/None으로만 보여 방어선이
+# 빠진 상태와 정상 동작이 로그에서 구분되지 않았다. equity=0은 드문 사고가
+# 아니라 확정 경로다(coordinator._state.account.total_equity 기본값 0).
+
+
+def test_zero_equity_surfaces_skip_floor_disabled_reason():
+    cap, reason = apply_liquidity_cap(20_000_000, 20 * 억, 0.0)
+    assert reason == "skip_floor_disabled"
+    # 캡 결합 자체는 평소와 동일(둘 중 작은 쪽) — 안전 방향은 유지된다.
+    assert cap == pytest.approx(10_000_000)
+
+
+def test_zero_equity_still_binds_cap_when_cap_is_tighter():
+    """사유가 바뀌어도 유동성 캡 자체는 계속 좁힌다 — fail-open이 아니다."""
+    cap, _ = apply_liquidity_cap(20_000_000, 5 * 억, 0.0)   # 0.5% = 250만원
+    assert cap == pytest.approx(2_500_000)
+
+
+def test_negative_equity_also_surfaces_skip_floor_disabled():
+    _, reason = apply_liquidity_cap(20_000_000, 20 * 억, -1.0)
+    assert reason == "skip_floor_disabled"
+
+
+def test_positive_equity_reason_unchanged():
+    """회귀 가드: 정상 equity에서는 기존 사유 문자열이 그대로여야 한다."""
+    assert apply_liquidity_cap(20_000_000, 20 * 억, EQUITY)[1] == "liquidity_cap"
+    assert apply_liquidity_cap(20_000_000, 400 * 억, EQUITY)[1] is None
+    assert apply_liquidity_cap(20_000_000, 5 * 억, EQUITY)[1] == "liquidity_too_thin"
+
+
+def test_adtv_unknown_wins_over_skip_floor_disabled():
+    """ADTV를 아예 모르면 skip-floor 이전에 캡 자체가 불가능하다."""
+    assert apply_liquidity_cap(20_000_000, None, 0.0)[1] == "adtv_unknown"

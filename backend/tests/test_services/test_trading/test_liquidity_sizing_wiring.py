@@ -274,3 +274,154 @@ class TestAdtvUnknownIsLogged:
         assert any(
             "adtv_unknown" in record.getMessage() for record in caplog.records
         ), "adtv_unknown일 때도 최소 한 줄은 로그로 남아야 한다(리뷰 Important2b)"
+
+
+# =============================================================================
+# 4) 최종 리뷰 Blocking2 — C1 사이징 캡 킬스위치(LIQUIDITY_SIZING_CAP_ENABLED)
+#    off면 두 사이징 호출부가 adtv=None을 넘겨 기존 fail-open 경로로 수렴한다.
+# =============================================================================
+
+
+class TestSizingCapKillswitch:
+    async def test_resolve_adtv_returns_none_and_skips_fetch_when_disabled(self, monkeypatch):
+        import app.core.kiwoom_singleton as kiwoom_singleton
+        import pandas as pd
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "LIQUIDITY_SIZING_CAP_ENABLED", False)
+
+        fetch_calls = []
+
+        class _FakeClient:
+            async def get_daily_chart_df(self, ticker):
+                fetch_calls.append(ticker)
+                return pd.DataFrame({"value": [3_000_000_000.0] * 20})
+
+        monkeypatch.setattr(
+            kiwoom_singleton, "get_shared_kiwoom_client_async", AsyncMock(return_value=_FakeClient())
+        )
+
+        agent = PortfolioAgent()
+        adtv = await agent._resolve_adtv("005930")
+
+        assert adtv is None, "킬스위치 off인데 ADTV가 흘러갔다 — 부분 롤백 수단 무효"
+        assert fetch_calls == [], "캡이 꺼졌으면 일봉 재조회 자체가 불필요하다"
+
+    async def test_resolve_adtv_defaults_enabled(self, monkeypatch):
+        """기본값은 on — 스위치를 건드리지 않으면 기존 동작 그대로."""
+        import app.core.kiwoom_singleton as kiwoom_singleton
+        import pandas as pd
+        from app.config import settings
+
+        assert settings.LIQUIDITY_SIZING_CAP_ENABLED is True
+
+        class _FakeClient:
+            async def get_daily_chart_df(self, ticker):
+                return pd.DataFrame({"value": [3_000_000_000.0] * 20})
+
+        monkeypatch.setattr(
+            kiwoom_singleton, "get_shared_kiwoom_client_async", AsyncMock(return_value=_FakeClient())
+        )
+
+        agent = PortfolioAgent()
+        assert await agent._resolve_adtv("005930") == 3_000_000_000.0
+
+
+# =============================================================================
+# 5) 최종 리뷰 Blocking3 — skip-floor가 무로그로 비활성화되던 경로.
+#
+# `_get_account_equity`가 예외를 완전히 삼키고(로그 0줄) 호출부가 None을
+# 0.0으로 조용히 대체해, `apply_liquidity_cap`의 skip-floor 분기가 `equity > 0`
+# 선행 조건 때문에 평가조차 되지 않은 채 통과했다. 게다가 확률적 위험이 아니라
+# 확정 경로다 — coordinator._state.account.total_equity는 _refresh_account_info
+# 전 기본값이 0이라 배포 후 /trading/start 재발행 전 구간에서는 예외 없이
+# float(0)이 그대로 흐른다.
+# =============================================================================
+
+
+class TestSkipFloorObservability:
+    async def test_get_account_equity_logs_when_lookup_fails(self, monkeypatch, caplog):
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+        import app.dependencies as deps
+
+        monkeypatch.setattr(
+            deps, "get_trading_coordinator", AsyncMock(side_effect=RuntimeError("coordinator down"))
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="agents.graph.kr_stock_nodes.decision_nodes"
+        ):
+            equity = await kr._get_account_equity()
+
+        assert equity is None
+        assert any(
+            "liquidity_skip_equity_unavailable" in record.getMessage()
+            for record in caplog.records
+        ), "예외를 삼키더라도 로그 한 줄은 남아야 한다(ADTV 실패와 동일 원칙)"
+
+    async def test_decision_node_logs_skip_floor_disabled_on_zero_equity(
+        self, monkeypatch, caplog
+    ):
+        """종단: equity=0(기본값 경로)으로 BUY 사이징이 끝나면 skip-floor가
+        비활성인 채 통과했다는 사실이 로그로 남아야 한다."""
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+        import app.dependencies as deps
+        import pandas as pd
+        from services.trading.coordinator import ExecutionCoordinator
+
+        # total_equity 기본값 0 — _refresh_account_info 전 라이브 상태 재현.
+        coordinator = ExecutionCoordinator(kiwoom_client=None)
+        assert coordinator._state.account.total_equity == 0
+        monkeypatch.setattr(
+            deps, "get_trading_coordinator", AsyncMock(return_value=coordinator)
+        )
+
+        class _FakeClient:
+            async def get_cash_balance(self):
+                return MagicMock(ord_psbl_amt=100_000_000)
+
+            async def get_daily_chart_df(self, ticker):
+                return pd.DataFrame({"value": [3_000_000_000.0] * 20})
+
+        monkeypatch.setattr(
+            kr, "get_shared_kiwoom_client_async", AsyncMock(return_value=_FakeClient())
+        )
+
+        async def fake_decide_action(llm, messages, *, rule_action, **kwargs):
+            return rule_action, "", "rule_fallback", None, None
+
+        monkeypatch.setattr(kr, "get_llm_provider", lambda: MagicMock())
+        monkeypatch.setattr(kr, "decide_action", fake_decide_action)
+
+        async def fake_notifier():
+            return MagicMock(is_ready=False)
+
+        monkeypatch.setattr("services.telegram.get_telegram_notifier", fake_notifier)
+
+        buy_analyses = {
+            f"{kind}_analysis": {
+                "agent_type": kind, "signal": "buy", "confidence": 0.8,
+                "summary": "매수", "key_factors": [],
+            }
+            for kind in ("technical", "fundamental", "sentiment")
+        }
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "market_data": {"cur_prc": 70_000},
+            **buy_analyses,
+        }
+
+        with caplog.at_level(
+            logging.WARNING, logger="agents.graph.kr_stock_nodes.decision_nodes"
+        ):
+            result = await kr.kr_stock_strategic_decision_node(state)
+
+        assert result["trade_proposal"]["action"] == "BUY"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("liquidity_skip_floor_disabled" in m for m in messages), (
+            "equity<=0이면 skip-floor가 평가조차 되지 않는다 — 무로그로 지나가면 안 된다"
+        )
+        assert any("liquidity_cap_without_skip_floor" in m for m in messages), (
+            "사유가 실제로 apply_liquidity_cap에서 구분돼 돌아와야 한다"
+        )

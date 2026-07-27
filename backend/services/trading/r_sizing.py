@@ -88,6 +88,13 @@ def apply_liquidity_cap(
     - `adtv`가 None이면 캡 미적용 + "adtv_unknown"(fail-open). 이미 발굴 A1
       게이트를 통과한 종목이고 R-cap·4% 캡이 여전히 작동하므로, 여기서
       fail-closed로 막으면 조회 실패가 곧 매매 정지가 된다.
+    - `equity`가 0 이하면 skip-floor를 평가할 자본 베이스가 없다 → 캡 결합은
+      그대로 하되 "skip_floor_disabled"를 반환한다(최종 리뷰 Blocking3).
+      이전에는 `equity > 0` 선행 조건 때문에 skip-floor 분기가 조용히
+      통과되어, 사유가 "liquidity_cap"/None으로만 보였다 — 방어선 하나가
+      빠진 상태와 정상 동작이 로그에서 구분되지 않았다. `equity=0`은
+      드문 사고가 아니라 확정 경로다(coordinator._state.account.total_equity
+      기본값 0 → _refresh_account_info 전 구간).
     - 캡이 계좌의 1% 미만이면 0.0 + "liquidity_too_thin"(진입 포기).
     - 캡이 실제로 바인딩하면 "liquidity_cap", 아니면 None.
     """
@@ -97,7 +104,12 @@ def apply_liquidity_cap(
     if liq_cap is None:
         return base_cap, "adtv_unknown"
 
-    if equity > 0 and liq_cap < equity * SKIP_MIN_EQUITY_PCT:
+    if equity <= 0:
+        # 캡 값 자체는 평소와 동일(둘 중 작은 쪽)하게 결합한다 — 안전 방향은
+        # 유지하고, 사라진 건 skip-floor뿐임을 사유로 표면화한다.
+        return min(liq_cap, base_cap), "skip_floor_disabled"
+
+    if liq_cap < equity * SKIP_MIN_EQUITY_PCT:
         return 0.0, "liquidity_too_thin"
 
     if liq_cap < base_cap:
