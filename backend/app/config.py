@@ -171,6 +171,25 @@ class Settings(BaseSettings):
     # 포지션 4%·참여율 게이트 1% 기준값(20억)과 동일하게 둔다.
     DISCOVERY_MIN_ADTV_FALLBACK: float = 2_000_000_000.0
 
+    # 유동성 인지 아크 킬스위치 2종 (설계 §6, 2026-07-27).
+    #
+    # 운용 제약이 이것들을 필수로 만든다: 실 포지션 보유 중 장중 재시작 금지,
+    # 배포는 장 마감 후 1회, 15:30~16:35 발굴창 회피. 이 스위치가 없으면 배포
+    # 후 첫 EOD에서 게이트가 과잉으로 걸려 승격 0건이 됐을 때 운영자가 쓸 수
+    # 있는 수단이 (a) DISCOVERY_ENABLED=False로 파이프라인 **전체** 정지 또는
+    # (b) revert + 장중 재시작(금기)뿐이다 — 부분 롤백 수단이 없다.
+    #
+    # A1 발굴 게이트만 무효화한다. A2/A3(momentum 스코어 수식)/B(가중
+    # 재정규화 폐기)는 롤백 단위가 달라 그대로 유지된다 — off로 두면
+    # scanner가 `_discovery_min_adtv=None`을 세팅해 기존 하위호환 스킵 경로
+    # (factors.passes_quality_filter의 `min_adtv is None` 분기)로 수렴한다.
+    DISCOVERY_LIQUIDITY_GATE_ENABLED: bool = True
+
+    # C1 사이징 캡(ADTV 0.5% 참여율)만 무효화한다. off면 두 사이징 호출부가
+    # `adtv=None`을 넘겨 기존 fail-open 경로("adtv_unknown", 캡 미적용)로
+    # 수렴한다 — R-cap과 max_single_position_pct 캡은 계속 작동한다.
+    LIQUIDITY_SIZING_CAP_ENABLED: bool = True
+
     # -------------------------------------------
     # Naver API Configuration (News Search)
     # https://developers.naver.com/apps

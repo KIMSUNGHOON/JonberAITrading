@@ -1416,3 +1416,150 @@ async def test_discovery_scan_saves_adtv20_med_in_factor_json(monkeypatch):
     assert fj["quality_filter_passed"] is True
     assert "adtv20_med" in fj
     assert fj["adtv20_med"] == pytest.approx(expected_adtv)
+
+
+# ---------------------------------------------------------------------------
+# 최종 리뷰 Blocking2: A1 게이트 킬스위치 + min_adtv 상한 클램프
+#
+# 설계 §6이 약속한 `DISCOVERY_LIQUIDITY_GATE_ENABLED`가 저장소 전체에 설계
+# 문서에만 존재했다(코드·설정·테스트 0건). 운용 제약(실 포지션 보유 중 장중
+# 재시작 금지, 배포는 장 마감 후 1회, 15:30~16:35 발굴창 회피)이 이것을
+# blocking으로 만든다 — 배포 후 첫 EOD에서 게이트가 과잉으로 걸려 승격 0건이
+# 되면 운영자에게 부분 롤백 수단이 전혀 없다.
+# ---------------------------------------------------------------------------
+
+
+async def test_liquidity_gate_killswitch_off_admits_low_liquidity_stock(monkeypatch):
+    """킬스위치 off면 A1 게이트만 무효화된다 — 위 배제 테스트와 완전히 같은
+    저ADTV 픽스처가 이번엔 통과해야 한다(A2/A3 스코어 수식은 그대로 계산됨)."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISCOVERY_LIQUIDITY_GATE_ENABLED", False)
+
+    client = FakeKiwoomClient(
+        stock_infos={"093190": _stock_info("093190", "저유동성종목")},
+        chart_dfs={"093190": _low_liquidity_chart_df()},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("093190", "저유동성종목", "코스닥")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is True, (
+        "킬스위치 off인데 A1 게이트가 여전히 배제했다 — 부분 롤백 수단 무효"
+    )
+    assert fj["skip_reason"] is None
+    # A2/A3는 롤백 단위가 다르다 — 스코어는 계속 계산돼야 한다.
+    assert fj["scores"]
+
+
+async def test_liquidity_gate_killswitch_off_skips_account_lookup(monkeypatch):
+    """게이트가 꺼졌으면 임계값 산출용 계좌 조회 자체가 불필요하다."""
+    import app.dependencies as deps
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISCOVERY_LIQUIDITY_GATE_ENABLED", False)
+
+    get_coordinator_mock = AsyncMock(
+        return_value=ExecutionCoordinator(kiwoom_client=None)
+    )
+    monkeypatch.setattr(deps, "get_trading_coordinator", get_coordinator_mock)
+
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자")},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+        mode="discovery",
+    )
+
+    assert scanner._discovery_min_adtv is None
+    assert get_coordinator_mock.call_count == 0
+
+
+async def test_liquidity_gate_killswitch_defaults_on(monkeypatch):
+    """기본값은 on(설계 §6) — 스위치를 건드리지 않은 스캔은 게이트가 산다."""
+    from app.config import settings
+
+    assert settings.DISCOVERY_LIQUIDITY_GATE_ENABLED is True
+
+    client = FakeKiwoomClient(
+        stock_infos={"093190": _stock_info("093190", "저유동성종목")},
+        chart_dfs={"093190": _low_liquidity_chart_df()},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("093190", "저유동성종목", "코스닥")],
+        mode="discovery",
+    )
+
+    assert scanner._discovery_min_adtv is not None
+
+
+async def test_resolve_min_adtv_clamps_absurd_equity(monkeypatch):
+    """상류 파싱 사고 방어: 계좌 평가액이 자릿수로 잘못 들어와도 min_adtv가
+    폭주해 2,650종 전량을 배제하지 않는다. 이 저장소에 `mrkt_tot_amt` 억원
+    오분류, `ka10131 _parse_float` 이중부호 크래시 전례가 있다."""
+    import app.dependencies as deps
+    from app.config import settings
+
+    coordinator = ExecutionCoordinator(kiwoom_client=None)
+    coordinator._state.account.total_equity = 500_000_000 * 100  # 100배 사고
+    monkeypatch.setattr(
+        deps, "get_trading_coordinator", AsyncMock(return_value=coordinator)
+    )
+
+    scanner = BackgroundScanner()
+    resolved = await scanner._resolve_min_adtv()
+
+    ceiling = max(settings.DISCOVERY_MIN_ADTV_FALLBACK, 1_000_000_000.0) * 5
+    assert resolved == pytest.approx(ceiling)
+
+
+async def test_resolve_min_adtv_normal_equity_not_clamped(monkeypatch):
+    """정상 계좌(5억)는 클램프에 걸리지 않는다 — 상한이 실제 정책을 자르면 안 된다."""
+    import app.dependencies as deps
+
+    coordinator = ExecutionCoordinator(kiwoom_client=None)
+    coordinator._state.account.total_equity = 500_000_000
+    monkeypatch.setattr(
+        deps, "get_trading_coordinator", AsyncMock(return_value=coordinator)
+    )
+
+    scanner = BackgroundScanner()
+    resolved = await scanner._resolve_min_adtv()
+
+    assert resolved == pytest.approx(500_000_000 * 0.04 / 0.01)  # 20억
+
+
+async def test_resolve_min_adtv_fallback_never_below_hard_floor(monkeypatch):
+    """폴백 하한 보호: 설정이 하드플로어(10억)보다 낮아도 게이트는 그 아래로
+    내려가지 않는다."""
+    import app.dependencies as deps
+    from app.config import settings
+    from services.discovery.liquidity import HARD_FLOOR_ADTV
+
+    monkeypatch.setattr(settings, "DISCOVERY_MIN_ADTV_FALLBACK", 1_000_000.0)  # 100만원
+    monkeypatch.setattr(
+        deps, "get_trading_coordinator", AsyncMock(side_effect=RuntimeError("down"))
+    )
+
+    scanner = BackgroundScanner()
+    resolved = await scanner._resolve_min_adtv()
+
+    assert resolved == pytest.approx(HARD_FLOOR_ADTV)

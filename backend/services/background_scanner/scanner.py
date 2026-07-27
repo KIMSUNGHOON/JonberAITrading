@@ -1205,20 +1205,39 @@ class BackgroundScanner:
 
         0.04는 현재 포지션 배분 정책(계좌 대비 %) 하드코딩 — 별도 설정 항목이
         아직 없어 상수로 둔다.
+
+        **상한 클램프(최종 리뷰 Blocking2)**: 계좌 평가액은 상류 파싱 사고에
+        취약하다 — 이 저장소에 `mrkt_tot_amt` 억원 단위 오분류, `ka10131
+        _parse_float` 이중부호 크래시 전례가 있다. equity가 100배로 잘못
+        들어오면 min_adtv가 100배가 되어 2,650종 전량이 배제되는 폭주가
+        일어난다(그리고 EOD 창에서만 드러난다). 폴백의 5배(기본 100억)를
+        상한으로 둔다 — 정상 계좌 성장은 이 안에 들어오고, 자릿수 사고만
+        잘린다. 폴백 자체도 하드플로어(10억) 미만으로는 못 내려간다.
         """
         from app.config import settings
         from app.dependencies import get_trading_coordinator
-        from services.discovery.liquidity import required_min_adtv
+        from services.discovery.liquidity import HARD_FLOOR_ADTV, required_min_adtv
 
-        fallback = float(
-            getattr(settings, "DISCOVERY_MIN_ADTV_FALLBACK", 2_000_000_000.0)
+        # 폴백 하한 보호: 설정이 하드플로어보다 낮게 잡혀도 게이트가 그
+        # 아래로는 내려가지 않는다(HARD_FLOOR_ADTV 계약).
+        fallback = max(
+            float(getattr(settings, "DISCOVERY_MIN_ADTV_FALLBACK", 2_000_000_000.0)),
+            HARD_FLOOR_ADTV,
         )
+        ceiling = fallback * 5.0
         try:
             coordinator = await get_trading_coordinator()
             equity = float(coordinator._state.account.total_equity)
             if equity <= 0:
                 raise ValueError("equity<=0")
-            return required_min_adtv(equity * 0.04)
+            resolved = required_min_adtv(equity * 0.04)
+            if resolved > ceiling:
+                logger.warning(
+                    "discovery_min_adtv_clamped",
+                    equity=equity, resolved=resolved, ceiling=ceiling,
+                )
+                return ceiling
+            return resolved
         except Exception as e:
             logger.warning(
                 "discovery_min_adtv_fallback", error=str(e), fallback=fallback
@@ -1247,9 +1266,24 @@ class BackgroundScanner:
         A1: 유동성 임계값(`_discovery_min_adtv`)은 이 메서드 진입 시 계좌
         평가액 기준으로 정확히 한 번만 산출돼 스캔 전체(종목 수천 개)가
         재사용한다 — 종목마다 계좌를 조회하지 않는다.
+
+        킬스위치(`DISCOVERY_LIQUIDITY_GATE_ENABLED`, 설계 §6): off면
+        `_discovery_min_adtv=None` — `factors.passes_quality_filter`의 기존
+        하위호환 스킵 분기(`min_adtv is None`)로 수렴해 A1 게이트만 무효화된다.
+        A2/A3 스코어 수식과 B(가중 재정규화 폐기)는 그대로 유지된다.
         """
-        self._discovery_min_adtv = await self._resolve_min_adtv()
-        logger.info("discovery_min_adtv_resolved", min_adtv=self._discovery_min_adtv)
+        from app.config import settings as _settings
+
+        if not getattr(_settings, "DISCOVERY_LIQUIDITY_GATE_ENABLED", True):
+            self._discovery_min_adtv = None
+            # 게이트가 꺼진 채 도는 스캔은 조용히 지나가면 안 된다 — 승격
+            # 분포가 이전과 달라지는 이유가 로그에 남아야 한다.
+            logger.warning("discovery_liquidity_gate_disabled")
+        else:
+            self._discovery_min_adtv = await self._resolve_min_adtv()
+            logger.info(
+                "discovery_min_adtv_resolved", min_adtv=self._discovery_min_adtv
+            )
 
         from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 
