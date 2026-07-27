@@ -1278,3 +1278,141 @@ async def test_reconcile_orphan_scan_sessions_never_raises_on_missing_db():
     # _init_db()를 호출해 테이블을 만들어야 한다(메서드 계약).
     reconciled = await scanner.reconcile_orphan_scan_sessions()
     assert reconciled == 0
+
+
+# ---------------------------------------------------------------------------
+# ⑨ A1: 유동성 게이트 scanner 배선 -- once-per-scan 계좌 조회 / 저ADTV 배제 /
+#    adtv20_med 저장. factors.py 순수 함수 단위 테스트(test_discovery_factors.py)
+#    만으로는 "스캐너가 실제로 이 인터페이스를 올바르게 소비하는가"를 증명하지
+#    못하므로, 여기서는 실 스캐너 경로(_scan_all_stocks_discovery 전체)를
+#    태운다 -- passes_quality_filter를 직접 부르지 않는다.
+# ---------------------------------------------------------------------------
+
+
+def _low_liquidity_chart_df(
+    n: int = 65, daily_value: float = 120_000_000.0, price: float = 10_000.0
+) -> pd.DataFrame:
+    """저ADTV 픽스처 -- 빅솔론(093190) 실측 대역(일평균 거래대금 1.2억원)을
+    재현한다. 종가는 2,000원 저가주 하한을 넘고 거래량은 0인 날이 없도록
+    거래대금(value)을 역산해 매일 동일하게 고정한다 -- 이 픽스처가 걸려야
+    하는 검사는 ADTV 중앙값 하나뿐이어야 하므로(다른 사유로 우연히 배제되면
+    안 됨), 저가주/거래량0/하방일관성 검사는 전부 여유 있게 통과한다."""
+    dates = pd.date_range("2026-01-01", periods=n, freq="B")
+    closes = [price] * n
+    opens = list(closes)
+    highs = [c * 1.004 for c in closes]
+    lows = [c * 0.996 for c in closes]
+    volume = daily_value / price
+    volumes = [volume] * n
+    values = [daily_value] * n
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+            "value": values,
+        }
+    )
+
+
+async def test_discovery_min_adtv_resolved_exactly_once_per_scan(monkeypatch):
+    """A1 핵심 우려(브리프 명시): 계좌 평가액 조회(get_trading_coordinator)는
+    스캔 1회당 정확히 1번만 일어나야 한다 -- 종목마다 조회하면(N=3이지만
+    실제 유니버스는 ~2,650종목) API 호출이 폭증한다. `client.flow_calls`를
+    세는 `test_flow_fetched_exactly_once_per_market`과 동일 패턴으로,
+    get_trading_coordinator 자체를 호출 횟수 추적 mock으로 교체한다."""
+    import app.dependencies as deps
+
+    coordinator = ExecutionCoordinator(kiwoom_client=None)  # total_equity=0 -> 폴백 경로
+    get_coordinator_mock = AsyncMock(return_value=coordinator)
+    monkeypatch.setattr(deps, "get_trading_coordinator", get_coordinator_mock)
+
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "삼성전자"),
+            "000660": _stock_info("000660", "SK하이닉스"),
+            "035420": _stock_info("035420", "NAVER"),
+        },
+        chart_dfs={
+            "005930": _make_chart_df(65),
+            "000660": _make_chart_df(65),
+            "035420": _make_chart_df(65),
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "삼성전자", "코스피"),
+            ("000660", "SK하이닉스", "코스피"),
+            ("035420", "NAVER", "코스닥"),
+        ],
+        mode="discovery",
+    )
+
+    assert get_coordinator_mock.call_count == 1, (
+        "종목 3개 스캔에서 계좌 조회가 1회를 넘으면 종목별 조회로 회귀한 것"
+    )
+
+
+async def test_discovery_scan_excludes_low_liquidity_stock_via_scanner_path(monkeypatch):
+    """A1 종단: 실 스캐너 경로를 통해 저ADTV 종목(빅솔론 대역 1.2억원/일,
+    설정 폴백 20억원 미만)이 quality_filter_passed=False +
+    skip_reason='liquidity_low'로 배제되는지 확인한다. `_make_chart_df`
+    (고유동성)를 쓰는 다른 테스트들은 오탐 배제가 없음만 증명했으므로,
+    여기서는 반대 방향(진짜 저유동성이 실제로 걸러지는지)을 채운다."""
+    client = FakeKiwoomClient(
+        stock_infos={"093190": _stock_info("093190", "저유동성종목")},
+        chart_dfs={"093190": _low_liquidity_chart_df()},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("093190", "저유동성종목", "코스닥")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is False
+    assert fj["skip_reason"] == "liquidity_low"
+
+
+async def test_discovery_scan_saves_adtv20_med_in_factor_json(monkeypatch):
+    """T6(사이징 캡)/T7(토론 프롬프트)가 소비할 adtv20_med가 실제로 저장되는
+    factor_json에 들어가고, 값이 픽스처의 실제 20일 중앙값(liquidity.py의
+    adtv_median -- 이미 test_discovery_factors.py에서 독립 검증됨)과
+    일치하는지 확인한다."""
+    from services.discovery.liquidity import adtv_median
+
+    passing_df = _make_chart_df(65)
+    expected_adtv = adtv_median(passing_df)
+    assert expected_adtv is not None  # 픽스처 스스로 유동성 통과 전제
+
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자")},
+        chart_dfs={"005930": passing_df},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is True
+    assert "adtv20_med" in fj
+    assert fj["adtv20_med"] == pytest.approx(expected_adtv)
