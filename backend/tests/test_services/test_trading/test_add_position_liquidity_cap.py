@@ -75,12 +75,22 @@ async def test_add_blocked_when_holding_already_exceeds_cap(coord):
     """라이브 094840 시나리오 — ADTV 5.3억(캡 265만원)인데 1,729만원 보유.
 
     이미 캡의 6.5배라 허용 ADD는 0이어야 하고, 주문이 아예 나가면 안 된다.
+
+    ⚠️ `None`이 아니라 `rejected_liquidity_cap` 상태를 돌려주는 것이 핵심이다.
+    호출자(`PositionManager._execute_add_position`)는 `None`을 오직 "코디네이터
+    원장에 포지션 없음"으로 해석해 🚨 desync Telegram을 보낸다. 유동성 차단은
+    원장 문제가 아니고, 캡 초과 보유 종목은 ADD가 매번 0이라 그대로 두면
+    토론 주기마다 허위 경보가 반복된다.
     """
+    from services.trading.coordinator import ORDER_STATUS_REJECTED_LIQUIDITY_CAP
+
     coord.portfolio_agent._resolve_adtv = AsyncMock(return_value=5.3 * 억)
 
     result = await coord._add_to_position("094840", quantity=100)
 
-    assert result is None
+    assert result is not None, "None이면 호출자가 원장 불일치로 오진한다"
+    assert result.status == ORDER_STATUS_REJECTED_LIQUIDITY_CAP
+    assert result.filled_quantity == 0
     coord._execute_order.assert_not_awaited()
 
 
@@ -88,8 +98,9 @@ async def test_add_blocked_when_holding_already_exceeds_cap(coord):
 async def test_add_clamped_to_remaining_headroom(coord):
     """여유가 있으면 그 여유만큼만 산다.
 
-    ADTV 200억 -> 캡 1억원. 보유 1,729만원이므로 여유 8,271만원.
-    현재가 13,150원이면 6,290주까지 가능한데 1,000주 요청은 그대로 통과.
+    ADTV 200억 -> 캡 1억원. 보유 17,292,250원이므로 여유 82,707,750원.
+    82,707,750 / 13,150 = 6289.56 -> int() = 6,289주까지 가능하므로
+    1,000주 요청은 그대로 통과한다.
     """
     coord.portfolio_agent._resolve_adtv = AsyncMock(return_value=200 * 억)
     coord._execute_order = AsyncMock(return_value=_fill(1000))
@@ -169,6 +180,47 @@ async def test_killswitch_off_skips_cap(coord):
 # ---------------------------------------------------------------------------
 # 기존 동작 무회귀
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_price_falls_back_to_avg_price(coord):
+    """current_price가 0이면 avg_price로 폴백한다.
+
+    `_reprice_positions`가 가격 0인 포지션을 스킵하므로 실제로 생길 수 있는
+    상태다. avg_price 13,150 기준으로 캡이 계산돼 차단되어야 한다.
+    """
+    from services.trading.coordinator import ORDER_STATUS_REJECTED_LIQUIDITY_CAP
+
+    coord._state.positions = [_position(price=13_150.0)]
+    coord._state.positions[0].current_price = 0.0
+    coord.portfolio_agent._resolve_adtv = AsyncMock(return_value=5.3 * 억)
+
+    result = await coord._add_to_position("094840", quantity=100)
+
+    assert result.status == ORDER_STATUS_REJECTED_LIQUIDITY_CAP
+    coord._execute_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_non_finite_price_does_not_crash_the_clamp(coord):
+    """가격이 NaN이면 클램프가 ValueError로 죽지 않고 수량을 그대로 돌려준다.
+
+    `not price`도 `price <= 0`도 NaN을 통과시키므로(NaN 비교는 항상 False)
+    `math.isfinite` 가드가 없으면 `int(0.0 / nan)`이 ValueError를 던져
+    docstring의 never-raise 계약이 깨진다.
+
+    참고: NaN 가격의 포지션은 이 클램프를 통과하더라도 `OrderRequest`의
+    pydantic 검증(`price >= 0`)이 주문 생성을 막으므로 실제 주문은 나가지
+    않는다 — 이 테스트는 클램프의 never-raise만 고정한다.
+    """
+    pos = _position()
+    pos.current_price = float("nan")
+    pos.avg_price = float("nan")
+    coord.portfolio_agent._resolve_adtv = AsyncMock(return_value=5.3 * 억)
+
+    result = await coord._clamp_add_for_liquidity("094840", 100, pos)
+
+    assert result == 100  # fail-open: 캡 미적용
 
 
 @pytest.mark.asyncio

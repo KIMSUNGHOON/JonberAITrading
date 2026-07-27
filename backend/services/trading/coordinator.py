@@ -8,6 +8,7 @@ Analysis → Approval → Portfolio → Order → Monitor
 import asyncio
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, date
 from typing import Optional, List, Callable, Awaitable
@@ -73,6 +74,12 @@ logger = logging.getLogger(__name__)
 # exposes no completion event/future to await directly, only ScanStatus via
 # the existing get_progress() (the same public surface
 # app/api/routes/scanner.py's own status polling already uses).
+# 자율 ADD가 유동성 천장에 막혀 0주가 됐을 때의 OrderResult.status.
+# `None`(= 코디네이터 원장에 포지션 없음)과 반드시 구별돼야 한다 — 호출자
+# (PositionManager._execute_add_position)가 None을 원장 불일치로 해석해
+# 🚨 desync 통지를 보내기 때문이다. 유동성 차단은 원장 문제가 아니다.
+ORDER_STATUS_REJECTED_LIQUIDITY_CAP = "rejected_liquidity_cap"
+
 _DISCOVERY_SCAN_TIMEOUT_SECONDS = 5400.0
 _DISCOVERY_SCAN_POLL_INTERVAL_SECONDS = 5.0
 
@@ -2447,9 +2454,12 @@ class ExecutionCoordinator:
             return quantity
 
         price = position.current_price or position.avg_price
-        if not price or price <= 0:
+        # NaN 가드: `not price`도 `price <= 0`도 NaN을 통과시키고(NaN 비교는
+        # 항상 False), 그러면 아래 int(0.0/nan)이 ValueError를 던져 docstring의
+        # never-raise 계약이 깨진다.
+        if not price or not math.isfinite(price) or price <= 0:
             logger.warning(
-                f"[Coordinator] ADD 유동성 캡 미적용 {ticker}: 가격 없음"
+                f"[Coordinator] ADD 유동성 캡 미적용 {ticker}: 가격 없음/비유한"
             )
             return quantity
 
@@ -2521,10 +2531,30 @@ class ExecutionCoordinator:
         # 0.5%를 지켜도 추가매수가 천장을 넘는 유일한 exposure-increasing
         # 경로였다. 기준은 추가분이 아니라 **총 포지션**이다: 추가분에만
         # 캡을 걸면 매번 캡만큼 더 살 수 있어 천장을 영원히 넘는다.
-        if get_settings().LIQUIDITY_SIZING_CAP_ENABLED:
-            quantity = await self._clamp_add_for_liquidity(ticker, quantity, position)
-            if quantity <= 0:
-                return None
+        if getattr(get_settings(), "LIQUIDITY_SIZING_CAP_ENABLED", True):
+            clamped = await self._clamp_add_for_liquidity(ticker, quantity, position)
+            if clamped <= 0:
+                # 원장 불일치(position not found)와 **구별되는** 결과를 돌려준다.
+                # 호출자(PositionManager._execute_add_position)는 None을 오직
+                # "코디네이터 원장에 포지션 없음"으로 해석해 🚨 desync 통지를
+                # 보내는데, 유동성 차단은 원장 문제가 아니라 정상 억제다.
+                # 이미 캡을 초과 보유한 종목은 ADD가 매번 0이 되므로, None을
+                # 돌려주면 토론 주기마다 허위 경보가 반복된다.
+                logger.warning(
+                    f"[Coordinator] ADD 유동성 차단 {ticker}: "
+                    f"{quantity}주 요청 -> 0주 (총 포지션이 이미 유동성 천장 초과)"
+                )
+                return OrderResult(
+                    order_id="",
+                    ticker=ticker,
+                    side=OrderSide.BUY,
+                    requested_quantity=quantity,
+                    filled_quantity=0,
+                    avg_price=0,
+                    status=ORDER_STATUS_REJECTED_LIQUIDITY_CAP,
+                    message="유동성 캡 — 총 포지션이 ADTV 참여율 상한을 초과",
+                )
+            quantity = clamped
 
         order = OrderRequest(
             ticker=ticker,

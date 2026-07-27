@@ -1877,6 +1877,9 @@ class PositionManager:
                 return
 
             from app.dependencies import get_trading_coordinator
+            from services.trading.coordinator import (
+                ORDER_STATUS_REJECTED_LIQUIDITY_CAP,
+            )
 
             trading_coord = await get_trading_coordinator()
             result = await trading_coord._add_to_position(
@@ -1893,6 +1896,19 @@ class PositionManager:
                     ticker=position.ticker,
                 )
                 await self._notify_add_ledger_desync(position, add_quantity)
+                return
+
+            if result.status == ORDER_STATUS_REJECTED_LIQUIDITY_CAP:
+                # 유동성 천장에 막혀 0주 — 원장은 멀쩡하다. desync 통지를
+                # 보내면 안 된다(이미 캡을 초과 보유한 종목은 ADD가 매번
+                # 0이라 토론 주기마다 허위 🚨가 반복되고, 진짜 desync 신호를
+                # 덮는다). 정상 억제이므로 로그만 남기고 조용히 끝낸다.
+                logger.info(
+                    "add_blocked_by_liquidity_cap",
+                    ticker=position.ticker,
+                    requested=add_quantity,
+                    held_quantity=position.quantity,
+                )
                 return
 
             filled = result.filled_quantity
