@@ -1331,10 +1331,19 @@ class ChatCoordinator:
             # adtv는 위에서 이미 가져온 chart_df(최신 일봉, get_kr_daily_chart)를
             # 그대로 재사용해 T2 adtv_median(순수 함수)으로 계산한다 — 별도
             # 네트워크 호출 없음, T3/T6와 동일한 kiwoom get_daily_chart_df 스키마.
-            # position_notional은 기존 보유 포지션의 실제 평가금액만 쓴다 —
-            # 신규 후보(미보유)는 이 토론 시점엔 아직 사이징이 결정되지 않아
-            # 가상 금액을 지어내지 않는다(신규 진입의 참여율은 T6 실행 직전
-            # 하드 캡이 실제 entry_price/stop_loss로 이미 계산·차단한다).
+            #
+            # position_notional:
+            # - 기존 보유 포지션이 있으면 실제 평가금액(수량 x 현재가).
+            # - 신규 후보(미보유)는 이 토론 시점엔 사이징이 아직 결정되지
+            #   않았지만, "지어내는" 값이 아니다 — T3 발굴 게이트가 이미
+            #   "신규 포지션 = 계좌의 4%"를 가정해 이 종목의 유동성 자격을
+            #   판정했다(scanner.py._resolve_min_adtv:
+            #   required_min_adtv(equity * 0.04)). 이 리뷰에서 지적된
+            #   대로 그 확립된 가정을 그대로 재사용한다 — 0.04가 바뀌면
+            #   이쪽도 같이 바꿔야 한다(아직 공유 상수가 아님, scanner.py와
+            #   동일한 상황).
+            # - total_portfolio를 못 구하거나 0 이하면 None(빈 문자열).
+            #
             # never-raise: 실패해도 로그만 남기고 빈 문자열로 진행한다.
             _liq_note = ""
             try:
@@ -1342,12 +1351,16 @@ class ChatCoordinator:
                 from services.agent_chat.liquidity_note import build_liquidity_note
 
                 _adtv = adtv_median(chart_df)
-                _position_notional = (
-                    position_quantity * stock_info.get("cur_prc", 0)
-                    if has_position and position_quantity
-                    else None
+                _is_new_entry = not (has_position and position_quantity)
+                if not _is_new_entry:
+                    _position_notional = position_quantity * stock_info.get("cur_prc", 0)
+                elif total_portfolio and total_portfolio > 0:
+                    _position_notional = total_portfolio * 0.04
+                else:
+                    _position_notional = None
+                _liq_note = build_liquidity_note(
+                    _adtv, _position_notional, is_new_entry=_is_new_entry
                 )
-                _liq_note = build_liquidity_note(_adtv, _position_notional)
             except Exception as e:
                 logger.warning("liquidity_note_failed", ticker=ticker, error=str(e))
 
