@@ -167,6 +167,10 @@ class Settings(BaseSettings):
     # -------------------------------------------
     DISCOVERY_ENABLED: bool = False
 
+    # 발굴 유동성 게이트(A1) 폴백(원) — 계좌 조회 실패 시 사용. 계좌 5억·
+    # 포지션 4%·참여율 게이트 1% 기준값(20억)과 동일하게 둔다.
+    DISCOVERY_MIN_ADTV_FALLBACK: float = 2_000_000_000.0
+
     # -------------------------------------------
     # Naver API Configuration (News Search)
     # https://developers.naver.com/apps

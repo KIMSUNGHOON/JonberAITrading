@@ -24,6 +24,11 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from services.discovery.liquidity import (
+    adtv_median,
+    downside_consistency_ok,
+    has_zero_volume_day,
+)
 from services.technical_indicators import TechnicalIndicators
 
 # ---------------------------------------------------------------------------
@@ -32,9 +37,17 @@ from services.technical_indicators import TechnicalIndicators
 REASON_PRICE_ZERO = "price_zero"
 REASON_MARKET_CAP_LOW = "market_cap_low"
 REASON_INSUFFICIENT_HISTORY = "insufficient_history"
+REASON_LIQUIDITY_LOW = "liquidity_low"
+REASON_LIQUIDITY_INCONSISTENT = "liquidity_inconsistent"
+REASON_ZERO_VOLUME_DAY = "zero_volume_day"
+REASON_PRICE_TOO_LOW = "price_too_low"
 
 DEFAULT_MIN_MARKET_CAP = 50_000_000_000  # 500억원
 DEFAULT_MIN_HISTORY = 60  # 일봉 60개(SMA60 계산 가능 최소치)
+
+# 호가단위 마찰 하한 — 2,000원 미만 구간은 최소 스프레드만으로 0.25%를 넘는다
+# (KRX 통합 호가단위: 2,000원 미만 1원). 동전주 퇴출 리스크도 함께 회피한다.
+DEFAULT_MIN_CLOSE_PRICE = 2_000.0
 
 STRATEGIES: tuple[str, ...] = ("momentum", "pullback", "flow", "meanrev")
 
@@ -101,11 +114,21 @@ def passes_quality_filter(
     *,
     min_market_cap: float = DEFAULT_MIN_MARKET_CAP,
     min_history: int = DEFAULT_MIN_HISTORY,
+    min_adtv: Optional[float] = None,
+    min_close_price: float = DEFAULT_MIN_CLOSE_PRICE,
 ) -> tuple[bool, Optional[str]]:
-    """공통 품질 필터(spec §2). (통과여부, 실패사유) 반환 — 통과 시 사유는 None.
+    """공통 품질 필터. (통과여부, 실패사유) 반환 — 통과 시 사유는 None.
 
-    검사 순서: 가격>0 → 시총 하한 → 히스토리 길이. 관리종목 제외 등 나머지
-    필터는 수집 단계(DS-2, exclude_warnings)의 몫이라 여기선 다루지 않는다.
+    검사 순서: 가격>0 → 시총 하한 → 히스토리 길이 → (min_adtv가 주어졌을 때만)
+    유동성 4종. 관리종목 제외 등은 수집 단계(DS-2, exclude_warnings)의 몫이다.
+
+    `min_adtv=None`이면 유동성 검사를 건너뛴다 — 이 함수를 유동성 맥락 없이
+    호출하는 기존 경로(테스트·구 스캔 재현)의 하위 호환을 위해서다. 발굴
+    스캐너는 반드시 값을 주입한다(scanner.py).
+
+    유동성 검사는 fail-closed다: `value` 컬럼이 없거나 표본이 부족해 ADTV를
+    계산할 수 없으면 통과가 아니라 배제한다. 유동성을 확인할 수 없는 종목에
+    2000만원을 넣는 것이 이 아크가 막으려는 바로 그 일이다.
     """
     if snap.price is None or snap.price <= 0:
         return False, REASON_PRICE_ZERO
@@ -114,6 +137,23 @@ def passes_quality_filter(
     history_len = 0 if snap.chart_df is None else len(snap.chart_df)
     if history_len < min_history:
         return False, REASON_INSUFFICIENT_HISTORY
+
+    if min_adtv is None:
+        return True, None
+
+    if snap.price < min_close_price:
+        return False, REASON_PRICE_TOO_LOW
+
+    adtv = adtv_median(snap.chart_df)
+    if adtv is None or adtv < min_adtv:
+        return False, REASON_LIQUIDITY_LOW
+
+    if has_zero_volume_day(snap.chart_df):
+        return False, REASON_ZERO_VOLUME_DAY
+
+    if not downside_consistency_ok(snap.chart_df, min_adtv):
+        return False, REASON_LIQUIDITY_INCONSISTENT
+
     return True, None
 
 

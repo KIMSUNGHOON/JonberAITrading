@@ -176,6 +176,11 @@ class BackgroundScanner:
         # stop_scan had no way to identify which row to update).
         self._current_session_id: Optional[str] = None
 
+        # A1: 발굴 스캔 1회 동안 고정되는 유동성 임계값(원, ADTV 중앙값의
+        # 최소 요구치). _scan_all_stocks_discovery 진입 시 1회만 산출된다 —
+        # 종목마다 계좌를 조회하면 2,650회 API 호출이 되어버린다.
+        self._discovery_min_adtv: Optional[float] = None
+
     async def _init_db(self):
         """Initialize SQLite database for storing scan results."""
         if self._db_initialized:
@@ -1051,7 +1056,9 @@ class BackgroundScanner:
             try:
                 snap = await self._fetch_discovery_snapshot(stk_cd, stk_nm, client)
                 breadth_direction = self._classify_breadth_direction(snap.chart_df)
-                passed, reason = passes_quality_filter(snap)
+                passed, reason = passes_quality_filter(
+                    snap, min_adtv=self._discovery_min_adtv
+                )
 
                 if passed:
                     flow = flow_map.get(stk_cd)
@@ -1074,6 +1081,10 @@ class BackgroundScanner:
                     except Exception as e:
                         logger.warning("us_crossmarket_bonus_failed", stk_cd=stk_cd, error=str(e))
 
+                    from services.discovery.liquidity import adtv_median
+
+                    _adtv = adtv_median(snap.chart_df)
+
                     factor_json = {
                         "quality_filter_passed": True,
                         "skip_reason": None,
@@ -1091,6 +1102,9 @@ class BackgroundScanner:
                         # US 신호 T5: AI밸류체인 종목 + 당일 캐시 신호 존재 시만
                         # ranker.rank_candidates가 composite에 소량 가산.
                         "us_crossmarket_bonus": _us_bonus,
+                        # 유동성 인지 아크: 사이징 캡(C1)과 토론 프롬프트(C2)가
+                        # 이 값을 소비한다. None이면 소비자가 캡/문구를 생략한다.
+                        "adtv20_med": _adtv,
                     }
                     summary = f"{stk_nm}: 발굴 수집 완료(품질필터 통과)"
                 else:
@@ -1178,6 +1192,36 @@ class BackgroundScanner:
                 session_id=session_id,
             )
 
+    async def _resolve_min_adtv(self) -> float:
+        """A1: 계좌 평가액 기반 유동성 임계값(원). 조회 실패 시 설정 폴백
+        (fail-closed — 게이트를 끄는 대신 보수적 상수로 대체한다).
+
+        min_adtv = max(equity * 0.04 / 1%, 10억) — 포지션(계좌의 4%)이 일평균
+        거래대금의 1%를 넘지 않게 하는 최소 ADTV(required_min_adtv가 하드플로어
+        10억과의 max를 처리). 계좌가 커지면 임계값도 자동으로 올라간다.
+
+        0.04는 현재 포지션 배분 정책(계좌 대비 %) 하드코딩 — 별도 설정 항목이
+        아직 없어 상수로 둔다.
+        """
+        from app.config import settings
+        from app.dependencies import get_trading_coordinator
+        from services.discovery.liquidity import required_min_adtv
+
+        fallback = float(
+            getattr(settings, "DISCOVERY_MIN_ADTV_FALLBACK", 2_000_000_000.0)
+        )
+        try:
+            coordinator = await get_trading_coordinator()
+            equity = float(coordinator._state.account.total_equity)
+            if equity <= 0:
+                raise ValueError("equity<=0")
+            return required_min_adtv(equity * 0.04)
+        except Exception as e:
+            logger.warning(
+                "discovery_min_adtv_fallback", error=str(e), fallback=fallback
+            )
+            return fallback
+
     async def _scan_all_stocks_discovery(
         self,
         stocks: List[tuple],
@@ -1196,7 +1240,14 @@ class BackgroundScanner:
         세션 buy/sell/hold_count는 종목별 advance/decline/flat breadth
         판정(`_classify_breadth_direction`)으로 집계된다 — action='WATCH'
         고정인 행 자체의 의미는 무변경(DS-2 리뷰픽스: 세션 집계만 유의미화).
+
+        A1: 유동성 임계값(`_discovery_min_adtv`)은 이 메서드 진입 시 계좌
+        평가액 기준으로 정확히 한 번만 산출돼 스캔 전체(종목 수천 개)가
+        재사용한다 — 종목마다 계좌를 조회하지 않는다.
         """
+        self._discovery_min_adtv = await self._resolve_min_adtv()
+        logger.info("discovery_min_adtv_resolved", min_adtv=self._discovery_min_adtv)
+
         from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 
         client = await get_shared_kiwoom_client_async()

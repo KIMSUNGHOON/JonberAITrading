@@ -14,8 +14,12 @@ import pytest
 from services.discovery.factors import (
     DEFAULT_MIN_HISTORY,
     REASON_INSUFFICIENT_HISTORY,
+    REASON_LIQUIDITY_INCONSISTENT,
+    REASON_LIQUIDITY_LOW,
     REASON_MARKET_CAP_LOW,
+    REASON_PRICE_TOO_LOW,
     REASON_PRICE_ZERO,
+    REASON_ZERO_VOLUME_DAY,
     STRATEGIES,
     FlowRank,
     StockSnapshot,
@@ -386,3 +390,88 @@ class TestScoreClamping:
         scores = compute_strategy_scores(snap, None)
         for strat in STRATEGIES:
             assert scores[strat] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# A1: 유동성 게이트
+# ---------------------------------------------------------------------------
+
+억 = 100_000_000.0
+
+
+def _liquid_snap(values, closes=None, volumes=None, market_cap=600 * 억):
+    """유동성 게이트 테스트용 스냅샷 — 시총/히스토리는 항상 통과하도록 고정."""
+    n = len(values)
+    cl = closes if closes is not None else [10_000.0] * n
+    vol = volumes if volumes is not None else [1000] * n
+    df = _make_chart_df(cl, vol)
+    df["value"] = [float(v) for v in values]
+    return StockSnapshot(
+        ticker="000000", name="테스트", price=cl[-1], market_cap=market_cap,
+        per=10.0, pbr=1.0, volume=vol[-1], chart_df=df,
+    )
+
+
+def test_liquidity_gate_skipped_when_min_adtv_none():
+    """하위 호환 — min_adtv를 안 주면 유동성 검사를 하지 않는다."""
+    snap = _liquid_snap([0.5 * 억] * 60)
+    passed, reason = passes_quality_filter(snap)
+    assert passed is True
+    assert reason is None
+
+
+def test_liquidity_gate_rejects_below_min_adtv():
+    snap = _liquid_snap([1.2 * 억] * 60)          # 빅솔론 대역
+    passed, reason = passes_quality_filter(snap, min_adtv=20 * 억)
+    assert passed is False
+    assert reason == REASON_LIQUIDITY_LOW
+
+
+def test_liquidity_gate_accepts_at_or_above_min_adtv():
+    snap = _liquid_snap([20 * 억] * 60)
+    passed, reason = passes_quality_filter(snap, min_adtv=20 * 억)
+    assert passed is True
+    assert reason is None
+
+
+def test_liquidity_gate_rejects_inconsistent_downside():
+    """중앙값은 통과하지만 20일 중 6일이 바닥(12억 미만)이면 배제."""
+    snap = _liquid_snap([30 * 억] * 54 + [5 * 억] * 6)
+    passed, reason = passes_quality_filter(snap, min_adtv=20 * 억)
+    assert passed is False
+    assert reason == REASON_LIQUIDITY_INCONSISTENT
+
+
+def test_liquidity_gate_rejects_zero_volume_day():
+    snap = _liquid_snap([30 * 억] * 60, volumes=[1000] * 59 + [0])
+    passed, reason = passes_quality_filter(snap, min_adtv=20 * 억)
+    assert passed is False
+    assert reason == REASON_ZERO_VOLUME_DAY
+
+
+def test_liquidity_gate_rejects_penny_stock():
+    """종가 2,000원 미만은 호가단위 마찰(0.25%+)로 배제."""
+    snap = _liquid_snap([30 * 억] * 60, closes=[1_900.0] * 60)
+    passed, reason = passes_quality_filter(snap, min_adtv=20 * 억)
+    assert passed is False
+    assert reason == REASON_PRICE_TOO_LOW
+
+
+def test_liquidity_gate_rejects_missing_value_column():
+    """value 컬럼이 없으면(구 캐시) fail-closed — 통과시키지 않는다."""
+    df = _make_chart_df([10_000.0] * 60, [1000] * 60)   # value 없음
+    snap = StockSnapshot(
+        ticker="000000", name="구캐시", price=10_000.0, market_cap=600 * 억,
+        per=10.0, pbr=1.0, volume=1000, chart_df=df,
+    )
+    passed, reason = passes_quality_filter(snap, min_adtv=20 * 억)
+    assert passed is False
+    assert reason == REASON_LIQUIDITY_LOW
+
+
+def test_existing_filters_still_run_first():
+    """검사 순서 — 시총 미달이면 유동성 사유가 아니라 시총 사유가 나와야 한다."""
+    snap = _liquid_snap([30 * 억] * 60, market_cap=100.0)
+    passed, reason = passes_quality_filter(snap, min_adtv=20 * 억)
+    assert passed is False
+    assert reason == REASON_MARKET_CAP_LOW

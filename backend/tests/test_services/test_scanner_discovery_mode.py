@@ -38,14 +38,21 @@ from services.trading.coordinator import ExecutionCoordinator
 
 
 def _make_chart_df(n: int, start: float = 50_000.0) -> pd.DataFrame:
-    """get_daily_chart_df와 동일 스키마(date/open/high/low/close/volume,
-    오름차순)의 완만한 상승 합성 OHLCV. 결정적(랜덤 없음)."""
+    """get_daily_chart_df와 동일 스키마(date/open/high/low/close/volume/value,
+    오름차순)의 완만한 상승 합성 OHLCV. 결정적(랜덤 없음).
+
+    A1: value(거래대금)는 close*volume로 근사 — close~50,000·volume~500,000
+    라 값이 약 250억원대로, 발굴 스캐너의 유동성 게이트 폴백 임계값(계좌
+    조회 실패 시 20억원, DISCOVERY_MIN_ADTV_FALLBACK)을 넉넉히 넘는다. 이
+    파일의 기존 테스트들은 유동성이 아니라 factor_json 배선/breadth/승격을
+    검증하므로, 유동성 게이트가 그 검증들을 가리지 않도록 항상 통과시킨다."""
     dates = pd.date_range("2026-01-01", periods=n, freq="B")
     closes = [start * (1 + 0.001) ** i for i in range(n)]
     opens = [closes[0]] + closes[:-1]
     highs = [c * 1.004 for c in closes]
     lows = [c * 0.996 for c in closes]
     volumes = [500_000 + i * 100 for i in range(n)]
+    values = [c * v for c, v in zip(closes, volumes)]
     return pd.DataFrame(
         {
             "date": dates,
@@ -54,6 +61,7 @@ def _make_chart_df(n: int, start: float = 50_000.0) -> pd.DataFrame:
             "low": lows,
             "close": closes,
             "volume": volumes,
+            "value": values,
         }
     )
 
