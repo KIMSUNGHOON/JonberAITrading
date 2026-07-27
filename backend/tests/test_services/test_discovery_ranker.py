@@ -408,7 +408,8 @@ async def test_rank_candidates_returns_empty_when_no_session_for_date(tmp_path, 
 
 
 # ---------------------------------------------------------------------------
-# DQ-2: flow 결측 재정규화 -- _effective_weights 순수 함수 단위 테스트
+# flow 결측 처리(구 DQ-2 재정규화는 2026-07-27 아크에서 폐기) --
+# _effective_weights 순수 함수 단위 테스트
 # ---------------------------------------------------------------------------
 
 
@@ -487,14 +488,19 @@ BULLISH = {"momentum": 0.40, "pullback": 0.25, "flow": 0.25, "meanrev": 0.10,
            "threshold": 0.55, "daily_cap": 5}
 
 
-def test_flow_present_weights_unchanged():
+# 아래 6개는 순수 동기 함수 _effective_weights만 호출하지만, 모듈 전역
+# pytestmark(asyncio)가 이 파일의 모든 테스트에 적용된다 -- 그래서
+# TestEffectiveWeights 클래스와 동일한 관용구(async def로 선언해
+# pytest-asyncio 경고 없이 자연스럽게 수렴)를 따른다(본문은 동기 호출만
+# 있고 await은 없음).
+async def test_flow_present_weights_unchanged():
     """수급 랭킹에 있는 종목은 base 가중 그대로 -- 기존 동작 유지."""
     w = _effective_weights(BULLISH, True)
     assert w["momentum"] == pytest.approx(0.40)
     assert w["flow"] == pytest.approx(0.25)
 
 
-def test_flow_missing_no_redistribution():
+async def test_flow_missing_no_redistribution():
     """핵심 회귀 -- flow 결측이어도 momentum 가중이 증폭되지 않는다.
 
     구 동작: scale=1/0.75=1.333 -> momentum 0.40 -> 0.533 (33% 증폭).
@@ -506,20 +512,20 @@ def test_flow_missing_no_redistribution():
     assert w["flow"] == 0.0
 
 
-def test_flow_missing_weights_sum_below_one():
+async def test_flow_missing_weights_sum_below_one():
     """수급 미확인은 '정보 부재'가 아니라 '검증 실패' -- composite가 자연히 낮아진다."""
     w = _effective_weights(BULLISH, False)
     total = sum(w[k] for k in ("momentum", "pullback", "flow", "meanrev"))
     assert total == pytest.approx(0.75)
 
 
-def test_non_strategy_keys_pass_through():
+async def test_non_strategy_keys_pass_through():
     w = _effective_weights(BULLISH, False)
     assert w["threshold"] == 0.55
     assert w["daily_cap"] == 5
 
 
-def test_bixolon_regression_composite_drops():
+async def test_bixolon_regression_composite_drops():
     """빅솔론 실측 재현 -- 재정규화 폐기로 0.636 -> 0.477 대역."""
     raw = {"momentum": 0.7411, "pullback": 0.7223, "flow": 0.0, "meanrev": 0.0}
     w = _effective_weights(BULLISH, False)
@@ -528,7 +534,7 @@ def test_bixolon_regression_composite_drops():
     assert composite < 0.55          # 문턱 미달 = 승격 안 됨
 
 
-def test_flow_present_high_scorer_unchanged():
+async def test_flow_present_high_scorer_unchanged():
     """자이에스앤디 실측 재현 -- flow_present 종목은 점수가 전혀 변하지 않는다."""
     raw = {"momentum": 1.0, "pullback": 0.50, "flow": 0.67, "meanrev": 0.0}
     w = _effective_weights(BULLISH, True)
@@ -538,7 +544,8 @@ def test_flow_present_high_scorer_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# DQ-2: rank_candidates 배선 -- 재정규화된 composite + 원장 _weights
+# rank_candidates 배선 -- flow 결측 composite + 원장 _weights(구 DQ-2
+# 재정규화는 2026-07-27 아크에서 폐기, 아래는 신 동작 기준)
 # ---------------------------------------------------------------------------
 
 
