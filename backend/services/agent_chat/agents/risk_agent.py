@@ -66,6 +66,13 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 - 권장 포지션 크기와 손절선
 - 최악의 시나리오와 기회비용을 함께 고려"""
 
+    # ⚠️ `{liquidity_context}` 안에 유동성 수치 줄과 그에 대한 판정 지시문이
+    # **함께** 들어온다(services/agent_chat/liquidity_note.build_liquidity_note).
+    # 판정 지시문을 이 템플릿 본문으로 다시 끌어올리지 마라 — 값이 없을 때
+    # (chart_df 빈 DF / total_portfolio 결측 / ADTV 표본 부족) 수치 줄만
+    # 사라지고 "위 참여율을 판정하라"는 지시만 남아 LLM이 존재하지 않는
+    # 수치를 지어내거나 근거 없이 반대표를 던진다(최종 리뷰 Blocking1).
+    # 보유/신규에 따라 지시문 자체가 달라지는 것도 그 함수의 책임이다.
     @property
     def analysis_prompt_template(self) -> str:
         return """## 리스크 평가 요청
@@ -86,9 +93,6 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 ---
 
 위 데이터를 바탕으로 리스크 평가 결과를 발표해주세요.
-**유동성 판정 기준: 위 참여율이 1%를 초과하면 반대표(SELL 또는 HOLD)를 던지십시오.**
-저유동성 종목은 손절이 발동하는 하락일에 매수호가가 증발해 설계된 손절가에
-체결되지 않습니다.
 반드시 포함할 내용:
 1. 주요 리스크 요인
 2. 권장 포지션 크기 (포트폴리오 대비 %)
@@ -122,6 +126,9 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 
 100자 이내로 간결하게 응답하세요."""
 
+    # `{liquidity_context}`는 analysis와 **동일한** 문자열(수치 + 판정 지시문)
+    # 이다 — 판정 지시문이 note 안으로 들어가면서 analysis에만 기준이 있던
+    # 두 단계 비대칭이 구조적으로 해소된다(최종 리뷰 Blocking1).
     @property
     def vote_prompt_template(self) -> str:
         return """## 최종 투표 요청
