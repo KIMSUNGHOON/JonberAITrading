@@ -522,9 +522,14 @@ def test_momentum_volume_component_rewards_liquid_expansion():
 
 
 def test_momentum_volume_component_blocked_by_surge_cap():
-    """5일 평균이 60일 평균의 5배 이상이면 펌프로 보고 vol 성분 0."""
+    """5일 평균이 60일 평균의 5배 이상이면 펌프로 보고 vol 성분 0.
+
+    주의: 분모 mean(value[-60:])에 서지 구간 자신이 포함돼 희석되므로,
+    surge>=5.0을 만들려면 베이스 대비 원시 배율이 약 7.86배를 넘어야 한다
+    (60V/(5500+5V)>=5 → V>=785.7). 여기 9배는 희석 후 surge=5.4다.
+    """
     closes = [10_000.0 * (1 + 0.002 * i) for i in range(60)]
-    values = [100 * 억] * 55 + [600 * 억] * 5   # surge >= 5.0
+    values = [100 * 억] * 55 + [900 * 억] * 5   # 희석 후 surge=5.4 >= 5.0
     scores = compute_strategy_scores(_momentum_snap(values, closes), None)
     atoms = scores["_atoms"]
     assert atoms["value_surge"] >= 5.0
@@ -541,11 +546,18 @@ def test_high20_proximity_rescaled_no_free_points():
     assert atoms["high20_prox_score"] == 0.0
 
 
-def test_high20_prox_score_full_at_new_high():
+def test_high20_prox_score_near_max_at_new_high():
+    """매일 신고가 + 거래량 확장이면 고가근접 성분이 구조적 상한에 도달한다.
+
+    상한이 1.0이 아닌 이유: 이 파일의 _make_chart_df가 high를 항상 close*1.004로
+    만들어 high20_proximity의 상한이 1/1.004=0.996016이고, A3 재스케일
+    (0.996016-0.90)/0.10 = 0.96016이 된다. 거래량 확장으로 confirm=1.0이 되어도
+    이 값이 천장이다.
+    """
     closes = [10_000.0 * (1 + 0.003 * i) for i in range(60)]   # 매일 신고가
-    values = [100 * 억] * 60
+    values = [100 * 억] * 55 + [150 * 억] * 5   # value_ratio=1.333>=1.2 -> confirm 1.0
     scores = compute_strategy_scores(_momentum_snap(values, closes), None)
-    assert scores["_atoms"]["high20_prox_score"] == pytest.approx(1.0, abs=0.01)
+    assert scores["_atoms"]["high20_prox_score"] == pytest.approx(0.96, abs=0.01)
 
 
 def test_high20_prox_halved_without_volume_confirmation():
