@@ -29,6 +29,7 @@ from agents.prompts import (
     KR_STOCK_RISK_ASSESSOR_PROMPT,
     KR_STOCK_STRATEGIC_DECISION_PROMPT,
 )
+from app.config import settings
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 from services.discovery.liquidity import adtv_median
 from services.trading.r_sizing import apply_liquidity_cap, r_cap_value
@@ -416,10 +417,11 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
             # 킬스위치(LIQUIDITY_SIZING_CAP_ENABLED, 설계 §6): off면 ADTV를
             # 구하지 않고 None을 넘겨 기존 fail-open 경로로 수렴한다
             # (portfolio_agent._resolve_adtv와 동일 스위치·동일 결과).
-            from app.config import settings as _settings
-
+            # settings import는 adtv_median과 같은 이유로 모듈 스코프에 둔다 —
+            # 이 try 안에서 하면 import 실패가 outer except로 새어 나가
+            # investment_amount 전체를 0으로 만든다.
             _adtv = None
-            if not getattr(_settings, "LIQUIDITY_SIZING_CAP_ENABLED", True):
+            if not getattr(settings, "LIQUIDITY_SIZING_CAP_ENABLED", True):
                 logger.warning("liquidity_sizing_cap_disabled", stk_cd=stk_cd)
             else:
                 try:
