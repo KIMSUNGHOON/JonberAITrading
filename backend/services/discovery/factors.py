@@ -28,6 +28,7 @@ from services.discovery.liquidity import (
     adtv_median,
     downside_consistency_ok,
     has_zero_volume_day,
+    liquidity_gate_score,
 )
 from services.technical_indicators import TechnicalIndicators
 
@@ -179,6 +180,10 @@ def _extract_atoms(chart_df: Optional[pd.DataFrame]) -> dict:
         "sma20_proximity_pct": None,
         "sma20_slope_pct": None,
         "touched_lower_recently": False,
+        "adtv20_med": None,
+        "value_ratio": None,
+        "value_surge": None,
+        "high20_prox_score": None,
     }
 
     if chart_df is None or len(chart_df) == 0:
@@ -249,11 +254,41 @@ def _extract_atoms(chart_df: Optional[pd.DataFrame]) -> dict:
         if sma20_5d_ago and sma20 is not None:
             atoms["sma20_slope_pct"] = (sma20 - sma20_5d_ago) / sma20_5d_ago
 
+    # 유동성 인지 아크(A2): 거래'대금' 기준 원자. `value` 컬럼이 없는 구 캐시
+    # DataFrame에서는 전부 None으로 남고, 스코어 함수가 0 성분으로 처리한다.
+    if chart_df is not None and "value" in chart_df.columns:
+        atoms["adtv20_med"] = adtv_median(chart_df)
+        vals = pd.to_numeric(chart_df["value"], errors="coerce").dropna()
+        if len(vals) >= 20:
+            v5 = _safe(vals.tail(5).mean())
+            v20 = _safe(vals.tail(20).mean())
+            if v5 is not None and v20:
+                atoms["value_ratio"] = v5 / v20
+            v60 = _safe(vals.tail(min(60, len(vals))).mean())
+            if v5 is not None and v60:
+                atoms["value_surge"] = v5 / v60
+
+    # A3: 고가근접 재스케일 + 거래량 확인. 구 high20_proximity는 관측용으로
+    # 남기고(다른 소비자·로그 호환), 스코어는 이 파생값을 쓴다.
+    prox = atoms["high20_proximity"]
+    if prox is not None:
+        base = _clamp01((prox - 0.90) / 0.10)
+        vr = atoms["value_ratio"]
+        confirm = 1.0 if (vr is not None and vr >= 1.2) else 0.5
+        atoms["high20_prox_score"] = _clamp01(base * confirm)
+
     return atoms
 
 
 def _score_momentum(atoms: dict) -> float:
-    """MA 정배열 + MACD>시그널 + 20일 고가 근접도 + 거래량 증가율(5d/20d)."""
+    """MA 정배열 + MACD>시그널 + 20일 고가근접(재스케일·거래량확인) + 유동성
+    인지 거래대금 성분.
+
+    거래대금 성분(A2)이 곱셈 게이트인 것이 핵심이다 — 절대 유동성(liq_gate)이
+    0이면 상대 확장이 아무리 커도 0점이다. 구 수식 clamp01(vol5/vol20 - 1.0)은
+    스케일 불변이라 ADTV 3억 종목과 3000억 종목을 동일하게 채점했고, 분모가
+    작을수록 만점을 받기 쉬워 저유동성을 능동적으로 선호했다.
+    """
     sma5, sma20, sma60 = atoms["sma5"], atoms["sma20"], atoms["sma60"]
     align_checks = []
     if sma5 is not None and sma20 is not None:
@@ -267,12 +302,16 @@ def _score_momentum(atoms: dict) -> float:
     macd_diff = atoms["macd_diff"]
     macd_bullish = 1.0 if (macd_diff is not None and macd_diff > 0) else 0.0
 
-    high20_proximity = _clamp01(atoms["high20_proximity"])
+    high20_component = _clamp01(atoms.get("high20_prox_score"))
 
-    vol_ratio = atoms["vol_ratio"]
-    vol_component = _clamp01((vol_ratio - 1.0) / 1.0) if vol_ratio is not None else 0.0
+    liq_gate = liquidity_gate_score(atoms.get("adtv20_med"))
+    value_ratio = atoms.get("value_ratio")
+    rel = _clamp01(value_ratio - 1.0) if value_ratio is not None else 0.0
+    surge = atoms.get("value_surge")
+    surge_ok = 0.0 if (surge is not None and surge >= 5.0) else 1.0
+    vol_component = _clamp01(liq_gate * rel * surge_ok)
 
-    return _clamp01((ma_alignment + macd_bullish + high20_proximity + vol_component) / 4.0)
+    return _clamp01((ma_alignment + macd_bullish + high20_component + vol_component) / 4.0)
 
 
 def _score_pullback(atoms: dict) -> float:

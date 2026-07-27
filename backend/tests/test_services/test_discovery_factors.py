@@ -92,11 +92,19 @@ def _valid_history_df(n=DEFAULT_MIN_HISTORY):
 
 
 def _uptrend_df():
-    """정배열 상승: SMA5>20>60, MACD 상향, 20일 신고가 근접, 거래량 급증 → momentum."""
+    """정배열 상승: SMA5>20>60, MACD 상향, 20일 신고가 근접, 거래량 급증 → momentum.
+
+    거래대금(value) 컬럼: 유동성 인지 아크(A2) 이전에 작성된 픽스처라 원래
+    없었다. `value` 없이는 momentum의 거래대금 성분이 전부 0으로 수렴해
+    (fail-closed) 이 테스트가 기대하는 "유동성 충분한 정배열 상승"을 더 이상
+    표현하지 못하므로, 구 수식 롤백이 아니라 픽스처를 새 스키마에 맞춰 갱신한다.
+    """
     n = 80
     closes = [10000.0 * (1.006**i) for i in range(n)]
     volumes = [100_000.0] * (n - 5) + [300_000.0] * 5  # 최근 5일 거래량 급증
-    return _make_chart_df(closes, volumes)
+    df = _make_chart_df(closes, volumes)
+    df["value"] = [150 * 억] * (n - 5) + [300 * 억] * 5  # ADTV 충분(>100억) + 거래대금 확장
+    return df
 
 
 def _sideways_df():
@@ -475,3 +483,89 @@ def test_existing_filters_still_run_first():
     passed, reason = passes_quality_filter(snap, min_adtv=20 * 억)
     assert passed is False
     assert reason == REASON_MARKET_CAP_LOW
+
+
+# ---------------------------------------------------------------------------
+# A2/A3: momentum 거래량 성분 + 고가근접
+# ---------------------------------------------------------------------------
+
+
+def _momentum_snap(values, closes, volumes=None):
+    n = len(closes)
+    vol = volumes if volumes is not None else [1000] * n
+    df = _make_chart_df(closes, vol)
+    df["value"] = [float(v) for v in values]
+    return StockSnapshot(
+        ticker="000000", name="테스트", price=closes[-1], market_cap=200 * 억,
+        per=10.0, pbr=1.0, volume=vol[-1], chart_df=df,
+    )
+
+
+def test_momentum_volume_component_zero_when_illiquid():
+    """빅솔론 구조 — 거래대금이 10억 미만이면 상대 확장이 커도 vol 성분 0.
+
+    구 수식(vol5/vol20)에서는 만점을 받던 패턴이다."""
+    closes = [10_000.0 * (1 + 0.002 * i) for i in range(60)]   # 완만한 상승(정배열)
+    values = [1 * 억] * 55 + [3 * 억] * 5                        # 상대 3배 확장, 절대는 빈약
+    scores = compute_strategy_scores(_momentum_snap(values, closes), None)
+    atoms = scores["_atoms"]
+    assert atoms["adtv20_med"] is not None
+    # liq_gate=0 -> 곱셈 게이트로 vol 성분이 0 -> momentum 상한 0.75
+    assert scores["momentum"] <= 0.76
+
+
+def test_momentum_volume_component_rewards_liquid_expansion():
+    closes = [10_000.0 * (1 + 0.002 * i) for i in range(60)]
+    values = [100 * 억] * 55 + [200 * 억] * 5   # 절대 유동성 충분 + 상대 2배
+    scores = compute_strategy_scores(_momentum_snap(values, closes), None)
+    assert scores["momentum"] > 0.85
+
+
+def test_momentum_volume_component_blocked_by_surge_cap():
+    """5일 평균이 60일 평균의 5배 이상이면 펌프로 보고 vol 성분 0."""
+    closes = [10_000.0 * (1 + 0.002 * i) for i in range(60)]
+    values = [100 * 억] * 55 + [600 * 억] * 5   # surge >= 5.0
+    scores = compute_strategy_scores(_momentum_snap(values, closes), None)
+    atoms = scores["_atoms"]
+    assert atoms["value_surge"] >= 5.0
+    assert scores["momentum"] <= 0.76
+
+
+def test_high20_proximity_rescaled_no_free_points():
+    """20일 고가의 90% 미만이면 고가근접 성분이 0 — 무상 바닥점수 제거."""
+    closes = [10_000.0] * 40 + [12_000.0] + [10_000.0] * 19   # 현재가/high20 ≈ 0.833
+    values = [100 * 억] * 60
+    scores = compute_strategy_scores(_momentum_snap(values, closes), None)
+    atoms = scores["_atoms"]
+    assert atoms["high20_proximity"] < 0.90
+    assert atoms["high20_prox_score"] == 0.0
+
+
+def test_high20_prox_score_full_at_new_high():
+    closes = [10_000.0 * (1 + 0.003 * i) for i in range(60)]   # 매일 신고가
+    values = [100 * 억] * 60
+    scores = compute_strategy_scores(_momentum_snap(values, closes), None)
+    assert scores["_atoms"]["high20_prox_score"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_high20_prox_halved_without_volume_confirmation():
+    """거래량 확장(value_ratio>=1.2) 없는 고가근접은 절반 페널티."""
+    closes = [10_000.0 * (1 + 0.003 * i) for i in range(60)]
+    flat = [100 * 억] * 60                       # value_ratio ≈ 1.0
+    s_flat = compute_strategy_scores(_momentum_snap(flat, closes), None)
+    expanding = [100 * 억] * 55 + [150 * 억] * 5   # value_ratio >= 1.2
+    s_exp = compute_strategy_scores(_momentum_snap(expanding, closes), None)
+    assert s_flat["_atoms"]["high20_prox_score"] < s_exp["_atoms"]["high20_prox_score"]
+
+
+def test_atoms_none_safe_without_value_column():
+    """value 컬럼이 없어도 NaN 전파 없이 0 성분으로 수렴한다."""
+    closes = [10_000.0] * 60
+    df = _make_chart_df(closes, [1000] * 60)     # value 없음
+    snap = StockSnapshot(
+        ticker="000000", name="구캐시", price=10_000.0, market_cap=200 * 억,
+        per=10.0, pbr=1.0, volume=1000, chart_df=df,
+    )
+    scores = compute_strategy_scores(snap, None)
+    assert scores["_atoms"]["adtv20_med"] is None
+    assert not math.isnan(scores["momentum"])
