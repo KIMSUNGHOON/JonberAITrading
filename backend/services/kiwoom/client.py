@@ -135,6 +135,38 @@ _ETF_ETN_NAME_RE = re.compile(
 # 않도록 두는 스페이싱(초) — 연속 대량 조회로 인한 유량제한 재유발 예방.
 _INTER_MARKET_DELAY = 1.0
 
+_CHART_DF_COLUMNS = ["date", "open", "high", "low", "close", "volume", "value"]
+
+
+def _charts_to_df(charts) -> pd.DataFrame:
+    """ChartData 리스트 → OHLCV+거래대금 DataFrame (순수 함수, 테스트 가능).
+
+    `value`(거래대금, 원)는 ka10081의 trde_prica를 client._parse_signed_price가
+    백만원→원으로 환산해 담은 ChartData.acml_tr_pbmn을 그대로 쓴다. 이 필드가
+    None인 구 캐시/미제공 응답에서만 close*volume로 근사한다 — 근사는 폴백일
+    뿐이며 정상 경로는 거래소 실측값이다.
+    """
+    if not charts:
+        return pd.DataFrame(columns=_CHART_DF_COLUMNS)
+
+    data = [
+        {
+            "date": c.dt,
+            "open": c.open_prc,
+            "high": c.high_prc,
+            "low": c.low_prc,
+            "close": c.clos_prc,
+            "volume": c.acml_vol,
+            "value": float(
+                c.acml_tr_pbmn
+                if c.acml_tr_pbmn is not None
+                else (c.clos_prc or 0) * (c.acml_vol or 0)
+            ),
+        }
+        for c in charts
+    ]
+    return pd.DataFrame(data)
+
 
 class KiwoomClient:
     """
@@ -780,28 +812,12 @@ class KiwoomClient:
             OHLCV DataFrame
         """
         charts = await self.get_daily_chart(stk_cd, base_dt, upd_stkpc_tp)
-
-        if not charts:
-            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
-
-        data = [
-            {
-                "date": c.dt,
-                "open": c.open_prc,
-                "high": c.high_prc,
-                "low": c.low_prc,
-                "close": c.clos_prc,
-                "volume": c.acml_vol,
-            }
-            for c in charts
-        ]
-
-        df = pd.DataFrame(data)
+        df = _charts_to_df(charts)
 
         # Filter out rows with invalid dates before parsing
         df = df[df["date"].str.len() == 8]  # YYYYMMDD format
         if df.empty:
-            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(columns=_CHART_DF_COLUMNS)
 
         df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
         df = df.dropna(subset=["date"])  # Remove rows with unparseable dates
