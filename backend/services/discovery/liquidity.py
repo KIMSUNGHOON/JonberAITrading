@@ -68,8 +68,15 @@ def adtv_median(
 
 
 def required_min_adtv(position_notional: float) -> float:
-    """이 포지션 규모가 요구하는 최소 ADTV — 참여율 게이트와 하드플로어의 max."""
-    if position_notional is None or position_notional <= 0:
+    """이 포지션 규모가 요구하는 최소 ADTV — 참여율 게이트와 하드플로어의 max.
+
+    position_notional이 None/NaN/Inf/0 이하면 하드플로어로 fail-closed —
+    비유한 입력을 나눗셈에 그대로 태우면 NaN이 하류로 전파된다."""
+    if (
+        position_notional is None
+        or not math.isfinite(position_notional)
+        or position_notional <= 0
+    ):
         return HARD_FLOOR_ADTV
     return max(position_notional / GATE_PARTICIPATION_PCT, HARD_FLOOR_ADTV)
 
@@ -77,15 +84,20 @@ def required_min_adtv(position_notional: float) -> float:
 def participation_rate(
     position_notional: float, adtv: Optional[float]
 ) -> Optional[float]:
-    """포지션이 일평균 거래대금에서 차지하는 비율(0~1). ADTV 결측이면 None."""
-    if adtv is None or adtv <= 0:
+    """포지션이 일평균 거래대금에서 차지하는 비율(0~1). ADTV 결측이면 None.
+
+    adtv가 NaN/Inf여도 None — `nan <= 0`이 False라는 파이썬 함정 때문에
+    비유한 체크를 따로 하지 않으면 NaN이 비율로 그대로 새어나간다."""
+    if adtv is None or not math.isfinite(adtv) or adtv <= 0:
         return None
     return float(position_notional) / float(adtv)
 
 
 def liquidity_cap_value(adtv: Optional[float]) -> Optional[float]:
-    """유동성이 허용하는 최대 포지션 금액(원). ADTV 결측이면 None(캡 미적용)."""
-    if adtv is None or adtv <= 0:
+    """유동성이 허용하는 최대 포지션 금액(원). ADTV 결측이면 None(캡 미적용).
+
+    adtv가 NaN/Inf여도 None — 비유한 ADTV로 계산한 캡은 의미가 없다."""
+    if adtv is None or not math.isfinite(adtv) or adtv <= 0:
         return None
     return float(adtv) * SIZING_PARTICIPATION_PCT
 
@@ -96,14 +108,21 @@ def liquidity_gate_score(adtv: Optional[float]) -> float:
     momentum 거래량 성분의 곱셈 게이트로 쓰인다. 선형이 아니라 로그인 이유는
     거래대금 분포가 극단적으로 편중돼 있어(상위 6%가 전체의 88%) 선형 스케일이면
     중형주가 전부 0에 붙기 때문이다.
+
+    adtv가 NaN/Inf면 0.0(최소 점수)으로 fail-closed한다 — `min(1.0, nan)`이
+    `1.0`을 반환하는 파이썬 동작을 가드 없이 그대로 두면 NaN이 "최대 유동성"
+    으로 오분류돼 이 아크가 막으려는 방향(과소유동성 종목의 오탐 통과)으로
+    새어나간다.
     """
-    if adtv is None or adtv <= 0:
+    if adtv is None or not math.isfinite(adtv) or adtv <= 0:
         return 0.0
     ratio = float(adtv) / _GATE_SCORE_MIN_ADTV
     if ratio <= 1.0:
         return 0.0
     span = math.log10(_GATE_SCORE_MAX_ADTV / _GATE_SCORE_MIN_ADTV)
     score = math.log10(ratio) / span
+    if not math.isfinite(score):
+        return 0.0
     return max(0.0, min(1.0, score))
 
 
@@ -121,8 +140,12 @@ def downside_consistency_ok(
     중앙값만 보면 '평소 말라 있다가 며칠 폭발'한 종목을 못 거른다.
 
     데이터가 없으면 False(fail-closed) — 유동성을 확인할 수 없는 종목은
-    통과시키지 않는다.
+    통과시키지 않는다. min_adtv가 None/NaN/Inf/0 이하일 때도 마찬가지로
+    False다 — `(s < nan).sum()`이 pandas에서 항상 0이 되어 위반이 전부
+    사라지는 함정을 막는다.
     """
+    if min_adtv is None or not math.isfinite(min_adtv) or min_adtv <= 0:
+        return False
     s = _value_series(chart_df, window)
     if s is None:
         return False

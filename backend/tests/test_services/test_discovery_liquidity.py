@@ -77,6 +77,12 @@ def test_required_min_adtv_respects_hard_floor():
     assert required_min_adtv(1_000_000) == HARD_FLOOR_ADTV
 
 
+def test_required_min_adtv_nan_is_fail_closed():
+    """NaN 포지션 규모는 하드플로어로 떨어진다 — `nan <= 0`이 False라 가드를
+    빠져나가 나눗셈이 NaN을 전파하던 회귀 방지."""
+    assert required_min_adtv(float("nan")) == HARD_FLOOR_ADTV
+
+
 def test_participation_rate_bixolon():
     assert participation_rate(20_000_000, 1.24 * 억) == pytest.approx(0.1613, abs=1e-3)
 
@@ -84,6 +90,11 @@ def test_participation_rate_bixolon():
 def test_participation_rate_none_on_zero_adtv():
     assert participation_rate(20_000_000, 0) is None
     assert participation_rate(20_000_000, None) is None
+
+
+def test_participation_rate_none_on_nan_adtv():
+    """NaN ADTV는 None — 가드 없이는 NaN 비율이 그대로 새어나간다."""
+    assert participation_rate(20_000_000, float("nan")) is None
 
 
 # --- liquidity_cap_value ---
@@ -95,6 +106,11 @@ def test_liquidity_cap_is_half_percent():
 
 def test_liquidity_cap_none_when_adtv_missing():
     assert liquidity_cap_value(None) is None
+
+
+def test_liquidity_cap_none_on_nan_adtv():
+    """NaN ADTV는 캡 없음(None) — 비유한 값으로 계산한 캡은 의미가 없다."""
+    assert liquidity_cap_value(float("nan")) is None
 
 
 # --- liquidity_gate_score (로그 스케일) ---
@@ -115,6 +131,18 @@ def test_gate_score_a1_survivor_floor():
     assert liquidity_gate_score(20 * 억) >= 0.30
 
 
+def test_gate_score_nan_is_fail_closed():
+    """NaN ADTV는 최소 점수 — min(1.0, nan)이 1.0을 뱉는 Python 동작으로
+    '최대 유동성'이 되던 fail-open 회귀 방지.
+
+    Inf는 NaN과 별개로 다룬다: 물리적으로 ADTV가 무한할 수 없으므로 '무한
+    유동성'이 아니라 상류의 오염된/잘못된 값으로 취급해 마찬가지로 0.0으로
+    fail-closed한다(이 모듈의 다른 4개 가드와 동일하게 '비유한 = 무효'로
+    일관 처리)."""
+    assert liquidity_gate_score(float("nan")) == 0.0
+    assert liquidity_gate_score(float("inf")) == 0.0
+
+
 # --- downside_consistency / zero volume ---
 
 def test_downside_consistency_allows_five_violations():
@@ -131,6 +159,13 @@ def test_downside_consistency_floor_ratio_is_60_percent():
     """min_adtv의 60% 이상이면 위반이 아니다 (20억 기준 12억)."""
     values = [12.1 * 억] * 20
     assert downside_consistency_ok(_df(values), 20 * 억) is True
+
+
+def test_downside_consistency_nan_min_adtv_is_fail_closed():
+    """min_adtv가 NaN이면 False — pandas의 `(s < nan).sum()`이 항상 0이 되어
+    위반이 전부 사라지던 fail-open 회귀 방지."""
+    values = [20 * 억] * 20
+    assert downside_consistency_ok(_df(values), float("nan")) is False
 
 
 def test_zero_volume_day_detected():
