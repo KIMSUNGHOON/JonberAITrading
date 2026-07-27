@@ -29,7 +29,7 @@ from agents.prompts import (
     KR_STOCK_STRATEGIC_DECISION_PROMPT,
 )
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
-from services.trading.r_sizing import r_cap_value
+from services.trading.r_sizing import apply_liquidity_cap, r_cap_value
 from services.trading.strategy_consensus import clamp_knob
 from .helpers import (
     _get_stk_cd_safely,
@@ -369,6 +369,30 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
                     risk_budget_pct=risk_budget_pct,
                 )
                 investment_amount = int(r_cap)
+
+            # C1(유동성 인지): R-cap 결합 직후 유동성 참여율 캡을 적용한다.
+            # equity 베이스는 이 경로가 원래 쓰는 orderable_amount 그대로 —
+            # r_cap_value와 동일한 기준을 쓴다. ADTV 재조회는 별도 try/except로
+            # 감싼다(never-raise) — 실패해도 R-cap까지 산정된 investment_amount를
+            # 그대로 살리고 캡만 건너뛴다(fail-open); 바깥 큰 try에 맡기면
+            # ADTV 조회 실패만으로 quantity가 통째로 0이 되어버린다.
+            _adtv = None
+            try:
+                from services.discovery.liquidity import adtv_median
+                _adtv = adtv_median(await client.get_daily_chart_df(stk_cd))
+            except Exception as e:
+                logger.warning("liquidity_adtv_fetch_failed", stk_cd=stk_cd, error=str(e))
+
+            investment_amount, _liq_reason = apply_liquidity_cap(
+                investment_amount, _adtv, orderable_amount
+            )
+            investment_amount = int(investment_amount)
+            if _liq_reason in ("liquidity_cap", "liquidity_too_thin"):
+                logger.info(
+                    "liquidity_cap_applied",
+                    stk_cd=stk_cd, reason=_liq_reason,
+                    adtv=_adtv, investment_amount=investment_amount,
+                )
 
             quantity = investment_amount // current_price
 

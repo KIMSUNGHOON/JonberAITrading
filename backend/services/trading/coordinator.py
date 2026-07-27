@@ -616,6 +616,16 @@ class ExecutionCoordinator:
 
         # Calculate allocation
         side = _order_side_for_action(action)
+
+        # C1(유동성 인지): 주문 직전 ADTV 재계산 — 발굴(EOD)~진입(수일 후) 사이
+        # 유동성이 바뀔 수 있어 최신 일봉으로 다시 구한다. BUY에서만 의미
+        # 있다(SELL은 _calculate_max_position_value를 타지 않는다).
+        # never-raise: 실패하면 None -> apply_liquidity_cap이 캡
+        # 미적용(fail-open)으로 처리한다.
+        adtv = None
+        if side == OrderSide.BUY:
+            adtv = await self.portfolio_agent._resolve_adtv(ticker)
+
         allocation = self.portfolio_agent.calculate_allocation(
             account=self._state.account,
             ticker=ticker,
@@ -626,6 +636,7 @@ class ExecutionCoordinator:
             stop_loss=stop_loss,
             take_profit=take_profit,
             current_positions=self._state.positions,
+            adtv=adtv,
         )
 
         # H2: quantity_override를 allocation 캡(calculate_allocation이 산정한 R-사이징/

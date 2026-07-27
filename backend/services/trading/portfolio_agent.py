@@ -19,7 +19,7 @@ from .models import (
     RiskParameters,
     TradingState,
 )
-from .r_sizing import r_cap_value
+from .r_sizing import apply_liquidity_cap, r_cap_value
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ class PortfolioAgent:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         current_positions: Optional[List[ManagedPosition]] = None,
+        adtv: Optional[float] = None,
     ) -> AllocationPlan:
         """
         Calculate optimal allocation for a new trade.
@@ -69,6 +70,10 @@ class PortfolioAgent:
             stop_loss: Stop-loss price
             take_profit: Take-profit price
             current_positions: Existing positions
+            adtv: 일평균 거래대금(원). C1(유동성 인지) 사이징 캡의 입력 —
+                None(기본)이면 캡 미적용(fail-open). 호출자(coordinator)가
+                주문 직전 재계산해 넘긴다; 이 메서드 자체는 동기라 네트워크
+                조회를 하지 않는다.
 
         Returns:
             AllocationPlan with quantity and any needed rebalancing
@@ -102,6 +107,7 @@ class PortfolioAgent:
             take_profit=take_profit,
             existing_position=existing_position,
             current_positions=current_positions,
+            adtv=adtv,
         )
 
     def _calculate_buy_allocation(
@@ -115,6 +121,7 @@ class PortfolioAgent:
         take_profit: Optional[float],
         existing_position: Optional[ManagedPosition],
         current_positions: List[ManagedPosition],
+        adtv: Optional[float] = None,
     ) -> AllocationPlan:
         """Calculate allocation for a BUY order."""
 
@@ -142,6 +149,7 @@ class PortfolioAgent:
         max_position_value = self._calculate_max_position_value(
             account.total_equity, risk_score,
             entry_price=entry_price, stop_loss=stop_loss,
+            adtv=adtv,
         )
 
         # 3. Consider existing position
@@ -282,6 +290,7 @@ class PortfolioAgent:
         risk_score: int,
         entry_price: Optional[float] = None,
         stop_loss: Optional[float] = None,
+        adtv: Optional[float] = None,
     ) -> float:
         """
         Calculate maximum position value based on risk.
@@ -293,6 +302,10 @@ class PortfolioAgent:
         it. entry_price/stop_loss default to None so existing callers that
         don't have a stop yet stay call-compatible; r_cap_value's own guard
         then simply doesn't apply (returns None -> no change here).
+
+        C1 (유동성 인지, 2026-07-27): R-cap 결합 다음으로 유동성 참여율 캡을
+        추가로 결합한다. `adtv`도 기본값 None이라 기존 호출부는 캡 미적용
+        (fail-open)으로 동작이 완전히 그대로다.
         """
         base_max = total_equity * self.risk_params.max_single_position_pct
 
@@ -323,7 +336,41 @@ class PortfolioAgent:
             )
             max_value = r_cap
 
+        # C1(유동성 인지): 유동성 참여율 캡을 마지막에 결합한다. adtv=None이면
+        # 캡 미적용(fail-open) — A1 게이트를 이미 통과한 종목이다.
+        max_value, liq_reason = apply_liquidity_cap(max_value, adtv, total_equity)
+        if liq_reason in ("liquidity_cap", "liquidity_too_thin"):
+            logger.info(
+                f"[PortfolioAgent] 유동성 캡 적용: reason={liq_reason} "
+                f"adtv={adtv} max_value={max_value:,.0f}"
+            )
+
         return max_value
+
+    async def _resolve_adtv(self, ticker: str) -> Optional[float]:
+        """사이징 시점의 ADTV(원). 승격(EOD)과 진입(수일 후) 사이 유동성이
+        바뀔 수 있어 최신 일봉으로 재계산한다.
+
+        never-raise: 조회/계산이 실패하면 None을 반환하고
+        `apply_liquidity_cap`이 캡 미적용(fail-open)으로 처리한다.
+
+        저장된 승격 당시 ADTV(factor_json.adtv20_med)로의 폴백은 두지
+        않았다 — Task 6 조사 결과, `discovery_candidates` 테이블에는
+        factor_json이 저장되지 않고(strategy_scores_json/llm_verdict_json
+        뿐), 워치 레코드(`WatchedStock`)에도 해당 필드가 없어 조회 경로
+        자체가 존재하지 않는다. 폴백 부재는 캡 미적용으로 이어지므로
+        안전하다(fail-open은 이 함수의 의도된 동작).
+        """
+        from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+        from services.discovery.liquidity import adtv_median
+
+        try:
+            client = await get_shared_kiwoom_client_async()
+            df = await client.get_daily_chart_df(ticker)
+            return adtv_median(df)
+        except Exception as e:
+            logger.warning(f"[PortfolioAgent] ADTV 재계산 실패 {ticker}: {e}")
+            return None
 
     def _check_rebalancing_needed(
         self,

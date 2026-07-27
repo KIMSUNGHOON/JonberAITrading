@@ -65,3 +65,42 @@ def r_cap_value(
         return None
 
     return equity * (risk_budget_pct / 100.0) / stop_distance_pct
+
+
+# 유동성 캡이 계좌의 이 비율 미만으로 포지션을 밀어내면 진입 자체를 포기한다.
+# 소액 포지션은 체결단위 미달 + 고정 수수료·호가단위 마찰로 실효 비용률이
+# 오히려 올라간다.
+SKIP_MIN_EQUITY_PCT = 0.01
+
+
+def apply_liquidity_cap(
+    base_cap: float,
+    adtv: Optional[float],
+    equity: float,
+) -> tuple[float, Optional[str]]:
+    """유동성 참여율 캡을 기존 캡에 결합한다.
+
+    포지션은 일평균 거래대금의 `SIZING_PARTICIPATION_PCT`(0.5%)를 넘지 않는다 —
+    한국 퀀트 실무 표준. 계좌 5억 기준 ADTV 40억이면 풀사이즈(2000만원), 20억이면
+    1000만원으로 자동 축소된다.
+
+    Returns (적용 캡, 사유):
+    - `adtv`가 None이면 캡 미적용 + "adtv_unknown"(fail-open). 이미 발굴 A1
+      게이트를 통과한 종목이고 R-cap·4% 캡이 여전히 작동하므로, 여기서
+      fail-closed로 막으면 조회 실패가 곧 매매 정지가 된다.
+    - 캡이 계좌의 1% 미만이면 0.0 + "liquidity_too_thin"(진입 포기).
+    - 캡이 실제로 바인딩하면 "liquidity_cap", 아니면 None.
+    """
+    from services.discovery.liquidity import liquidity_cap_value
+
+    liq_cap = liquidity_cap_value(adtv)
+    if liq_cap is None:
+        return base_cap, "adtv_unknown"
+
+    if equity > 0 and liq_cap < equity * SKIP_MIN_EQUITY_PCT:
+        return 0.0, "liquidity_too_thin"
+
+    if liq_cap < base_cap:
+        return liq_cap, "liquidity_cap"
+
+    return base_cap, None
