@@ -6,6 +6,7 @@ Contains Risk Assessment, Strategic Decision, Human Approval, and Re-analyze nod
 
 import time
 import uuid
+from typing import Optional
 
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -29,6 +30,7 @@ from agents.prompts import (
     KR_STOCK_STRATEGIC_DECISION_PROMPT,
 )
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+from services.discovery.liquidity import adtv_median
 from services.trading.r_sizing import apply_liquidity_cap, r_cap_value
 from services.trading.strategy_consensus import clamp_knob
 from .helpers import (
@@ -70,6 +72,25 @@ async def _get_risk_budget_pct() -> float:
         return coordinator.risk_params.risk_budget_pct
     except Exception:
         return default
+
+
+async def _get_account_equity() -> Optional[float]:
+    """C1(유동성 인지) 유동성 skip-floor 전용 계좌 총평가액 조회 (best-effort
+    — 실패/coordinator 미가동 시 None, 그래프 노드를 절대 막지 않는다).
+
+    r_sizing.SKIP_MIN_EQUITY_PCT는 정의상 "계좌의 1%"다. 이 경로의 R-cap은
+    의도적으로 orderable_amount(가용현금)를 자본 베이스로 쓰지만(기존 주석
+    참조), skip-floor까지 그 베이스를 따라가면 계좌가 상당 부분 투자돼
+    가용현금이 작을 때 floor가 비례해 낮아져 사실상 무력화된다(리뷰
+    Important3) — 그래서 이 조회만 별도로 분리한다. lazy import는
+    _get_active_strategy와 동일 패턴."""
+    try:
+        from app.dependencies import get_trading_coordinator
+
+        coordinator = await get_trading_coordinator()
+        return float(coordinator._state.account.total_equity)
+    except Exception:
+        return None
 
 
 def _strategy_stop_params(strategy, risk_score: float) -> tuple[float, float, float]:
@@ -371,20 +392,29 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
                 investment_amount = int(r_cap)
 
             # C1(유동성 인지): R-cap 결합 직후 유동성 참여율 캡을 적용한다.
-            # equity 베이스는 이 경로가 원래 쓰는 orderable_amount 그대로 —
-            # r_cap_value와 동일한 기준을 쓴다. ADTV 재조회는 별도 try/except로
-            # 감싼다(never-raise) — 실패해도 R-cap까지 산정된 investment_amount를
-            # 그대로 살리고 캡만 건너뛴다(fail-open); 바깥 큰 try에 맡기면
-            # ADTV 조회 실패만으로 quantity가 통째로 0이 되어버린다.
+            # 캡 바인딩 자체(liq_cap vs base_cap)의 notional 베이스는 이 경로가
+            # 원래 쓰는 orderable_amount(가용현금) 그대로 — r_cap_value와 동일
+            # 기준. 다만 apply_liquidity_cap의 skip-floor 비교(SKIP_MIN_EQUITY_PCT)는
+            # r_sizing.py 정의상 "계좌의 1%"이므로 orderable_amount가 아니라
+            # 계좌 총평가액을 별도로 넘긴다 — 리뷰 Important3: 계좌가 상당 부분
+            # 투자돼 가용현금이 작을 때 orderable_amount 기준이면 floor가
+            # 비례해 낮아져 사실상 무력화된다(라이브가 그 상태였다). ADTV
+            # 재조회는 별도 try/except로 감싼다(never-raise) — 실패해도 R-cap
+            # 까지 산정된 investment_amount를 그대로 살리고 캡만 건너뛴다
+            # (fail-open); 바깥 큰 try에 맡기면 ADTV 조회 실패만으로 quantity가
+            # 통째로 0이 되어버린다. adtv_median의 import는 모듈 스코프로 옮겼다
+            # (inner try 안에서 하면 import 실패가 outer try로 새어 나가
+            # investment_amount 전체를 0으로 만들 수 있었다).
             _adtv = None
             try:
-                from services.discovery.liquidity import adtv_median
                 _adtv = adtv_median(await client.get_daily_chart_df(stk_cd))
             except Exception as e:
                 logger.warning("liquidity_adtv_fetch_failed", stk_cd=stk_cd, error=str(e))
 
+            _skip_equity = await _get_account_equity()
             investment_amount, _liq_reason = apply_liquidity_cap(
-                investment_amount, _adtv, orderable_amount
+                investment_amount, _adtv,
+                _skip_equity if _skip_equity is not None else 0.0,
             )
             investment_amount = int(investment_amount)
             if _liq_reason in ("liquidity_cap", "liquidity_too_thin"):
@@ -392,6 +422,13 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
                     "liquidity_cap_applied",
                     stk_cd=stk_cd, reason=_liq_reason,
                     adtv=_adtv, investment_amount=investment_amount,
+                )
+            elif _liq_reason == "adtv_unknown":
+                # 리뷰 Important2(b): 캡이 전 주문에서 비활성인데 아무 로그도
+                # 없으면 데이터 품질 저하를 아무도 알아채지 못한다.
+                logger.warning(
+                    "liquidity_cap_adtv_unknown",
+                    stk_cd=stk_cd, investment_amount=investment_amount,
                 )
 
             quantity = investment_amount // current_price

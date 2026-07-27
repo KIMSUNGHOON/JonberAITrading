@@ -30,6 +30,7 @@ and the P4-T2 report):
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pandas as pd
 import pytest
 
 pytestmark = pytest.mark.asyncio
@@ -246,14 +247,24 @@ class TestRCapSizingDecisionNodes:
         }
 
     @staticmethod
-    def _fake_kiwoom_client(orderable_amount: int):
+    def _fake_kiwoom_client(orderable_amount: int, adtv: float | None = None):
         client = MagicMock()
         client.get_cash_balance = AsyncMock(
             return_value=MagicMock(ord_psbl_amt=orderable_amount)
         )
+        if adtv is not None:
+            # 20행 constant -> adtv_median(중앙값) == adtv 그대로.
+            df = pd.DataFrame({"value": [adtv] * 20})
+            client.get_daily_chart_df = AsyncMock(return_value=df)
         return client
 
-    def _wire_common_mocks(self, monkeypatch, kr, *, orderable_amount: int, risk_budget_pct: float = 0.75):
+    def _wire_common_mocks(
+        self, monkeypatch, kr, *,
+        orderable_amount: int,
+        risk_budget_pct: float = 0.75,
+        adtv: float | None = None,
+        account_equity: float | None = None,
+    ):
         async def fake_decide_action(llm, messages, *, rule_action, **kwargs):
             return rule_action, "", "rule_fallback", None, None
 
@@ -266,8 +277,13 @@ class TestRCapSizingDecisionNodes:
         monkeypatch.setattr(kr, "_get_risk_budget_pct", AsyncMock(return_value=risk_budget_pct))
         monkeypatch.setattr(
             kr, "get_shared_kiwoom_client_async",
-            AsyncMock(return_value=self._fake_kiwoom_client(orderable_amount)),
+            AsyncMock(return_value=self._fake_kiwoom_client(orderable_amount, adtv=adtv)),
         )
+        # C1 Important3(리뷰): skip-floor는 계좌 총평가액 기준 — 지정되지
+        # 않으면 조회 실패(None)를 흉내내 기존 테스트의 결정론성을 유지한다
+        # (실제 _get_account_equity도 coordinator 미가동 시 None -> equity=0.0
+        # -> skip-floor 미적용, 캡 바인딩 자체는 영향 없음).
+        monkeypatch.setattr(kr, "_get_account_equity", AsyncMock(return_value=account_equity))
         _quiet_kr_telegram(monkeypatch)
 
     async def test_r_cap_tightens_quantity_when_binding(self, monkeypatch):
@@ -363,6 +379,109 @@ class TestRCapSizingDecisionNodes:
         # position_size_pct 기본값 5.0 -> investment_amount=500,000.
         # distance=(70000-66500)/70000=5% -> r_cap=1,500,000 (느슨) -> 미채택.
         assert proposal["quantity"] == 500_000 // 70_000  # 7
+
+    # =========================================================================
+    # C1 (유동성 인지, 2026-07-27) — 리뷰 수정.
+    #
+    # Important1: 기존 3개 R-cap 테스트는 client가 plain MagicMock이라
+    # get_daily_chart_df가 TypeError를 내고 캡이 항상 "adtv_unknown"으로
+    # fail-open했다 — 캡을 통째로 지워도 그린이었다. 아래 두 테스트는
+    # `adtv=`로 실제 값을 흘려보내 decision_nodes 엔진의 캡이 실제로
+    # 바인딩한다는 것을 증명한다.
+    #
+    # Important3: skip-floor(계좌의 1%)가 orderable_amount(가용현금) 기준
+    # 이면 계좌가 상당 부분 투자된 상태에서 사실상 무력화된다 — 아래
+    # `test_decision_node_skip_floor_uses_account_equity_not_orderable_amount`
+    # 가 그 회귀를 핀한다.
+    # =========================================================================
+
+    async def test_decision_node_liquidity_cap_binds_with_real_adtv(self, monkeypatch):
+        """ADTV 6억(real 값, mock 우회 없음) -> liquidity cap = 0.5% =
+        300만원. orderable=10,000,000, position_size_pct=50 ->
+        investment_amount(사전 캡)=5,000,000. stop 0.5% 거리로 r_cap을
+        느슨하게 유지(15,000,000 > 5,000,000, 미채택)해 유동성 캡만 단독
+        바인딩하게 한다. account_equity=1억 -> skip-floor=100만원 <
+        liq_cap(300만원)이라 skip은 발동하지 않는다(캡 바인딩만 검증)."""
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+
+        self._wire_common_mocks(
+            monkeypatch, kr, orderable_amount=10_000_000,
+            adtv=600_000_000.0, account_equity=100_000_000.0,
+        )
+
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "market_data": {"cur_prc": 100_000},
+            "risk_assessment": {
+                "signals": {
+                    "max_position_pct": 50.0,
+                    "suggested_stop_loss": 99_500,  # 0.5% distance -> r_cap 느슨
+                    "suggested_take_profit": 120_000,
+                    "risk_score": 0.5,
+                }
+            },
+            **self._buy_leaning_analyses(),
+        }
+
+        result = await kr.kr_stock_strategic_decision_node(state)
+        proposal = result["trade_proposal"]
+
+        assert proposal["action"] == "BUY"
+        # liq_cap = 600,000,000 * 0.005 = 3,000,000 < investment_amount
+        # (5,000,000) -> 바인딩. quantity = 3,000,000 // 100,000 = 30.
+        assert proposal["quantity"] == 30
+
+    async def test_decision_node_skip_floor_uses_account_equity_not_orderable_amount(
+        self, monkeypatch
+    ):
+        """리뷰 Important3 회귀 핀: skip-floor는 정의상(r_sizing.
+        SKIP_MIN_EQUITY_PCT) "계좌의 1%"다 — R-cap의 자본 베이스인
+        orderable_amount(가용현금)와는 분리해야 한다.
+
+        orderable_amount=5,000,000(계좌가 상당 부분 투자돼 현금이 적은
+        상태), account_equity=500,000,000(계좌 총평가액은 그대로 큼).
+        adtv=5억 -> liq_cap=2,500,000.
+
+        - 버그 상태(고친 전, orderable_amount를 skip 비교에 썼을 때):
+          floor = 5,000,000 * 1% = 50,000. liq_cap(2,500,000) >= floor ->
+          skip 미발동 -> 캡이 2,500,000으로 "바인딩"만 하고 25주가 체결됐을
+          것 — 실측 빅솔론 케이스(ADTV 1.2억에 얇은 종목 참여율 16%)와
+          같은 패턴.
+        - 수정 후(계좌 총평가액 기준): floor = 500,000,000 * 1% =
+          5,000,000. liq_cap(2,500,000) < floor -> skip 발동 ->
+          investment_amount=0 -> quantity=0. 진입 자체를 포기한다.
+        """
+        import agents.graph.kr_stock_nodes.decision_nodes as kr
+
+        self._wire_common_mocks(
+            monkeypatch, kr, orderable_amount=5_000_000,
+            adtv=500_000_000.0, account_equity=500_000_000.0,
+        )
+
+        state = {
+            "stk_cd": "005930",
+            "stk_nm": "삼성전자",
+            "market_data": {"cur_prc": 100_000},
+            "risk_assessment": {
+                "signals": {
+                    "max_position_pct": 100.0,
+                    "suggested_stop_loss": 99_500,  # 0.5% distance -> r_cap 느슨(7,500,000)
+                    "suggested_take_profit": 120_000,
+                    "risk_score": 0.5,
+                }
+            },
+            **self._buy_leaning_analyses(),
+        }
+
+        result = await kr.kr_stock_strategic_decision_node(state)
+        proposal = result["trade_proposal"]
+
+        assert proposal["quantity"] == 0, (
+            "skip-floor가 orderable_amount(가용현금) 기준으로 새면 캡이 "
+            "2,500,000으로만 바인딩해 25주가 나간다 — 계좌 총평가액 기준"
+            "이어야 skip이 발동해 진입을 포기한다"
+        )
 
 
 # =============================================================================

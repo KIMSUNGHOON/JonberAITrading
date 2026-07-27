@@ -344,22 +344,31 @@ class PortfolioAgent:
                 f"[PortfolioAgent] 유동성 캡 적용: reason={liq_reason} "
                 f"adtv={adtv} max_value={max_value:,.0f}"
             )
+        elif liq_reason == "adtv_unknown":
+            # 리뷰 Important2(b): 캡이 전 주문에서 비활성인데 아무 로그도
+            # 없으면 데이터 품질 저하(ADTV 조회 실패/부족)를 아무도 알아채지
+            # 못한다 — 여기서만 발생하는 게 아니라 사이징 시점마다 반복되면
+            # 그게 바로 알아야 할 신호다.
+            logger.warning(
+                f"[PortfolioAgent] 유동성 캡 미적용(adtv_unknown): "
+                f"max_value={max_value:,.0f} — R-cap/포지션 캡만 적용됨"
+            )
 
         return max_value
 
     async def _resolve_adtv(self, ticker: str) -> Optional[float]:
         """사이징 시점의 ADTV(원). 승격(EOD)과 진입(수일 후) 사이 유동성이
-        바뀔 수 있어 최신 일봉으로 재계산한다.
+        바뀔 수 있어 최신 일봉으로 재계산하고, 실패하면 승격 당시
+        `scan_results.factor_json.adtv20_med`(T3가 저장)로 폴백한다.
 
-        never-raise: 조회/계산이 실패하면 None을 반환하고
-        `apply_liquidity_cap`이 캡 미적용(fail-open)으로 처리한다.
+        never-raise: 둘 다 실패하면 None을 반환하고 `apply_liquidity_cap`이
+        캡 미적용(fail-open)으로 처리한다.
 
-        저장된 승격 당시 ADTV(factor_json.adtv20_med)로의 폴백은 두지
-        않았다 — Task 6 조사 결과, `discovery_candidates` 테이블에는
-        factor_json이 저장되지 않고(strategy_scores_json/llm_verdict_json
-        뿐), 워치 레코드(`WatchedStock`)에도 해당 필드가 없어 조회 경로
-        자체가 존재하지 않는다. 폴백 부재는 캡 미적용으로 이어지므로
-        안전하다(fail-open은 이 함수의 의도된 동작).
+        (2026-07-27 리뷰 수정: 최초 구현 당시 `discovery_candidates`/
+        `WatchedStock`에 factor_json 저장 경로가 없어 폴백이 불가능하다고
+        판단했었다. 그 판단은 틀렸다 — T3는 `scan_results` 테이블에
+        저장하고 있었다(`stk_cd` 인덱스 有). `_stored_adtv`가 그 경로를
+        조회한다.)
         """
         from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
         from services.discovery.liquidity import adtv_median
@@ -367,10 +376,31 @@ class PortfolioAgent:
         try:
             client = await get_shared_kiwoom_client_async()
             df = await client.get_daily_chart_df(ticker)
-            return adtv_median(df)
+            adtv = adtv_median(df)
+            if adtv is not None:
+                return adtv
+            logger.info(
+                f"[PortfolioAgent] ADTV 재계산이 None을 반환({ticker}) — "
+                f"표본 부족/거래대금 결측. 저장값 폴백을 시도한다."
+            )
         except Exception as e:
             logger.warning(f"[PortfolioAgent] ADTV 재계산 실패 {ticker}: {e}")
+
+        try:
+            return await self._stored_adtv(ticker)
+        except Exception as e:
+            logger.warning(f"[PortfolioAgent] 저장 ADTV 폴백 실패 {ticker}: {e}")
             return None
+
+    async def _stored_adtv(self, ticker: str) -> Optional[float]:
+        """승격(EOD) 당시 `scan_results.factor_json.adtv20_med`로의 폴백 조회
+        (T3가 씀 — `services/background_scanner/scanner.py`). `_resolve_adtv`
+        의 라이브 재계산이 실패했을 때만 호출된다. never-raise(호출부인
+        `BackgroundScanner.get_latest_adtv` 자체가 never-raise)."""
+        from services.background_scanner.scanner import get_background_scanner
+
+        scanner = await get_background_scanner()
+        return await scanner.get_latest_adtv(ticker)
 
     def _check_rebalancing_needed(
         self,

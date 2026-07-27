@@ -150,6 +150,32 @@ def test_calculate_max_position_value_unaffected_when_stop_loss_none():
     assert value_no_kwargs == 75_000_000
 
 
+# =============================================================================
+# C1 (유동성 인지, 2026-07-27) — 리뷰 Important1 수정: 기존 그린 스위트는
+# `apply_liquidity_cap`을 두 호출부에서 통째로 삭제해도 동일했다(mock client가
+# TypeError를 내고 inner handler가 삼켜 adtv=None -> "adtv_unknown"으로만
+# 흘렀기 때문). 아래는 mock 없이 adtv를 직접 인자로 넘겨 캡이 실제로
+# 값을 바꾼다는 것을 증명한다.
+# =============================================================================
+
+
+def test_calculate_max_position_value_applies_liquidity_cap_when_binding():
+    """adtv=20억(2e9) -> liquidity cap = 0.5% = 1000만원. 리스크버킷 캡
+    (75,000,000)보다 훨씬 작아 캡이 실제로 바인딩해 반환값을 바꾼다.
+    adtv=None 대조군은 캡 미적용(fail-open)으로 그대로 75,000,000."""
+    agent = _agent()  # max_single_position_pct=0.15 기본
+
+    capped = agent._calculate_max_position_value(
+        total_equity=500_000_000, risk_score=1, adtv=2_000_000_000.0
+    )
+    assert capped == 10_000_000
+
+    uncapped = agent._calculate_max_position_value(
+        total_equity=500_000_000, risk_score=1, adtv=None
+    )
+    assert uncapped == 75_000_000
+
+
 # -------------------------------------------
 # End-to-end via calculate_allocation (public API) — proves the wiring, not
 # just the private helper.

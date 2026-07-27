@@ -2156,6 +2156,43 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
                 row = await cursor.fetchone()
                 return row[0] if row else None
 
+    async def get_latest_adtv(self, stk_cd: str) -> Optional[float]:
+        """T6(유동성 인지 사이징 캡) 폴백: 이 종목의 가장 최근 scan_results.
+        factor_json에 저장된 adtv20_med(원, T3가 씀 — scanner.py의 발굴 수집
+        루프 참조).
+
+        `portfolio_agent._resolve_adtv`가 진입 직전 라이브 재계산에 실패했을
+        때만 쓰인다. 승격(EOD) 당시 값이라 며칠 지난 값일 수 있지만, 캡이
+        완전히 꺼지는(fail-open) 것보다는 낫다 — 리뷰 Important2(a): 애초
+        `discovery_candidates`/`WatchedStock`에는 factor_json 저장 경로가
+        없어(Task 6 조사) 폴백이 불가능하다고 판단했었으나, 실제로는
+        `scan_results`(이 테이블, stk_cd 인덱스 idx_scan_results_stk_cd 有)에
+        T3가 이미 저장하고 있었다.
+
+        never-raise: 조회/파싱 실패는 전부 None(호출자가 fail-open으로
+        처리)."""
+        try:
+            await self._init_db()
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT factor_json FROM scan_results WHERE stk_cd = ? "
+                    "ORDER BY scanned_at DESC LIMIT 1",
+                    (stk_cd,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+        except Exception as e:
+            logger.warning("scan_results_adtv_lookup_failed", stk_cd=stk_cd, error=str(e))
+            return None
+
+        if not row or not row[0]:
+            return None
+        try:
+            factor_json = json.loads(row[0])
+            adtv = factor_json.get("adtv20_med")
+            return float(adtv) if adtv is not None else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
     async def get_results_from_db(
         self,
         action_filter: Optional[str] = None,
