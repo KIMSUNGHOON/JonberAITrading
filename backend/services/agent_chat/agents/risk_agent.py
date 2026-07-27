@@ -81,10 +81,14 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 ### 변동성 데이터
 - 일일 변동: {price_change_pct:+.2f}%
 {us_market_context}
+{liquidity_context}
 
 ---
 
 위 데이터를 바탕으로 리스크 평가 결과를 발표해주세요.
+**유동성 판정 기준: 위 참여율이 1%를 초과하면 반대표(SELL 또는 HOLD)를 던지십시오.**
+저유동성 종목은 손절이 발동하는 하락일에 매수호가가 증발해 설계된 손절가에
+체결되지 않습니다.
 반드시 포함할 내용:
 1. 주요 리스크 요인
 2. 권장 포지션 크기 (포트폴리오 대비 %)
@@ -133,6 +137,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 - 투자 가능: {available_cash}
 - 기존 포지션: {position_info}
 {us_market_context}
+{liquidity_context}
 
 ---
 
@@ -184,6 +189,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             total_portfolio=total_portfolio,
             position_info=position_info,
             us_market_context=context.us_market_context or "",
+            liquidity_context=context.liquidity_context or "",
         )
 
         response = await self._call_llm(self._effective_system_prompt(), prompt)
@@ -284,6 +290,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             available_cash=available_cash,
             position_info=position_info,
             us_market_context=context.us_market_context or "",
+            liquidity_context=context.liquidity_context or "",
         )
 
         risk_level = self._calculate_risk_level(context)

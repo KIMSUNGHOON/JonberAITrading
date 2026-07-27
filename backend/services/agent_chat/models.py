@@ -223,6 +223,10 @@ class MarketContext(BaseModel):
     # 넛지 전용, 투표/confidence 로직에는 관여하지 않는다).
     us_market_context: Optional[str] = Field(default=None)
 
+    # C2(유동성 인지): 리스크 에이전트 프롬프트에 주입할 유동성 한 줄.
+    # None/빈 문자열이면 프롬프트에서 해당 섹션이 사라진다(us_market_context 패턴).
+    liquidity_context: Optional[str] = Field(default=None)
+
     # E-3: 활성 전략의 entry_conditions.consensus_threshold (best-effort —
     # coordinator._build_strategy_context가 채움. 조회 실패/전략 없음=0.75
     # 기본값 그대로 — 배포 직후 거동 불변). ChatRoom 생성 시 이 값을 그대로

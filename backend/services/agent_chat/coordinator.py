@@ -1327,6 +1327,30 @@ class ChatCoordinator:
             except Exception as e:
                 logger.warning("us_market_context_build_failed", ticker=ticker, error=str(e))
 
+            # C2(유동성 인지): 리스크 에이전트 프롬프트에 주입할 유동성 한 줄.
+            # adtv는 위에서 이미 가져온 chart_df(최신 일봉, get_kr_daily_chart)를
+            # 그대로 재사용해 T2 adtv_median(순수 함수)으로 계산한다 — 별도
+            # 네트워크 호출 없음, T3/T6와 동일한 kiwoom get_daily_chart_df 스키마.
+            # position_notional은 기존 보유 포지션의 실제 평가금액만 쓴다 —
+            # 신규 후보(미보유)는 이 토론 시점엔 아직 사이징이 결정되지 않아
+            # 가상 금액을 지어내지 않는다(신규 진입의 참여율은 T6 실행 직전
+            # 하드 캡이 실제 entry_price/stop_loss로 이미 계산·차단한다).
+            # never-raise: 실패해도 로그만 남기고 빈 문자열로 진행한다.
+            _liq_note = ""
+            try:
+                from services.discovery.liquidity import adtv_median
+                from services.agent_chat.liquidity_note import build_liquidity_note
+
+                _adtv = adtv_median(chart_df)
+                _position_notional = (
+                    position_quantity * stock_info.get("cur_prc", 0)
+                    if has_position and position_quantity
+                    else None
+                )
+                _liq_note = build_liquidity_note(_adtv, _position_notional)
+            except Exception as e:
+                logger.warning("liquidity_note_failed", ticker=ticker, error=str(e))
+
             # ka10001 mrkt_tot_amt 단위=억원 (scanner.py:852-856과 동일 근거,
             # 라이브 실측 2026-07-18: 005930 -> 14,908,010억 ≈ 1,490조).
             # 무보정이면 fundamental_agent 표시가 왜곡돼 LLM이 "데이터
@@ -1361,6 +1385,7 @@ class ChatCoordinator:
                 strategy_knobs=strategy_knobs,
                 consensus_threshold=consensus_threshold,
                 us_market_context=us_market_context,
+                liquidity_context=_liq_note,
             )
 
         except Exception as e:
