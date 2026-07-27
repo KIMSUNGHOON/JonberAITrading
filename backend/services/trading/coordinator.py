@@ -2410,6 +2410,61 @@ class ExecutionCoordinator:
         finally:
             self._release_defensive_exit_guard(ticker)
 
+    async def _clamp_add_for_liquidity(
+        self, ticker: str, quantity: int, position: ManagedPosition
+    ) -> int:
+        """자율 ADD 수량을 유동성 천장 안으로 깎는다(총 포지션 기준).
+
+            allowed_notional = max(0, ADTV * SIZING_PARTICIPATION_PCT - 보유평가액)
+
+        **추가분이 아니라 총 포지션이 기준인 이유**: 추가분에만 캡을 걸면 매번
+        캡만큼 더 살 수 있어 천장을 영원히 넘는다. 라이브 실측(094840)에서
+        ADTV 5.3억 -> 캡 265만원인데 이미 1,729만원(6.5배)을 보유 중이었다 —
+        이 경우 허용 ADD는 0이어야 한다.
+
+        **ADTV 미상은 fail-open**(C1 `apply_liquidity_cap`과 동일 규약):
+        ADD는 이미 `check_autonomy(BUY)` 게이트를 통과한 요청이고, 여기서
+        fail-closed로 막으면 조회 실패가 곧 포지션 관리 정지가 된다. 대신
+        경고를 남겨 캡이 조용히 꺼진 것을 관측할 수 있게 한다.
+
+        never-raise — 유동성 조회 실패가 ADD 경로를 죽이면 안 된다.
+        """
+        from services.discovery.liquidity import liquidity_cap_value
+
+        try:
+            adtv = await self.portfolio_agent._resolve_adtv(ticker)
+        except Exception as e:
+            logger.warning(
+                f"[Coordinator] ADD 유동성 조회 실패 {ticker}: {e} — 캡 미적용"
+            )
+            return quantity
+
+        cap = liquidity_cap_value(adtv)
+        if cap is None:
+            logger.warning(
+                f"[Coordinator] ADD 유동성 캡 미적용 {ticker}: adtv_unknown"
+            )
+            return quantity
+
+        price = position.current_price or position.avg_price
+        if not price or price <= 0:
+            logger.warning(
+                f"[Coordinator] ADD 유동성 캡 미적용 {ticker}: 가격 없음"
+            )
+            return quantity
+
+        held_notional = position.quantity * price
+        allowed = int(max(0.0, cap - held_notional) / price)
+
+        if allowed < quantity:
+            logger.info(
+                f"[Coordinator] ADD 유동성 캡 적용 {ticker}: "
+                f"{quantity}주 -> {allowed}주 "
+                f"(ADTV {adtv / 1e8:,.1f}억, 캡 {cap / 1e4:,.0f}만원, "
+                f"보유 {held_notional / 1e4:,.0f}만원)"
+            )
+        return min(quantity, allowed)
+
     async def _add_to_position(
         self, ticker: str, quantity: int, decision_id: Optional[str] = None
     ) -> Optional[OrderResult]:
@@ -2460,6 +2515,16 @@ class ExecutionCoordinator:
                 f"quantity ({quantity})"
             )
             return None
+
+        # 유동성 캡 (2026-07-27 유동성 인지 아크 후속). 진입 BUY는 C1 사이징
+        # 캡(ADTV의 0.5%)을 받는데 이 ADD 경로만 우회하고 있었다 — 진입이
+        # 0.5%를 지켜도 추가매수가 천장을 넘는 유일한 exposure-increasing
+        # 경로였다. 기준은 추가분이 아니라 **총 포지션**이다: 추가분에만
+        # 캡을 걸면 매번 캡만큼 더 살 수 있어 천장을 영원히 넘는다.
+        if get_settings().LIQUIDITY_SIZING_CAP_ENABLED:
+            quantity = await self._clamp_add_for_liquidity(ticker, quantity, position)
+            if quantity <= 0:
+                return None
 
         order = OrderRequest(
             ticker=ticker,
