@@ -43,7 +43,10 @@ class Settings(BaseSettings):
     # -------------------------------------------
     OPENROUTER_API_KEY: SecretStr | None = None
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
-    OPENROUTER_MODEL: str = "deepseek-v4-flash"
+    # OpenRouter 모델 ID는 `provider/model` 형식이어야 한다. 접두사 없는
+    # "deepseek-v4-flash"는 실재하지 않아 호출이 실패한다(2026-07-28 확인:
+    # /api/v1/models 341개 중 정확 일치 0건, 실제 ID는 deepseek/deepseek-v4-flash).
+    OPENROUTER_MODEL: str = "deepseek/deepseek-v4-flash"
     OPENROUTER_DAILY_BUDGET_USD: float | None = 5.0
 
     # Local backend (Ollama/vLLM) — retired from default chains; opt-in for Windows GPU.
