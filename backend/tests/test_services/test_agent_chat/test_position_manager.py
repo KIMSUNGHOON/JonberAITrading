@@ -1486,6 +1486,53 @@ class TestStopSanity:
         notifier.send_message.assert_awaited_once()
         assert "결정 스탑 기각" in notifier.send_message.await_args.args[0]
 
+    # ---- 손절 단조성 (2026-07-28) ----
+
+    @pytest.mark.asyncio
+    async def test_decision_stop_cannot_be_lowered(self, config):
+        """에이전트 결정은 손절을 **낮추지 못한다**.
+
+        라이브 사고(094840, 2026-07-28): 30분 주기 전략 재평가마다 LLM이
+        현재가 기준으로 손절을 새로 제안했고, 주가가 빠지자 손절이 따라
+        내려갔다(12,492 → 12,238 → 12,173). 포지션 수량은 그대로인데 손절만
+        넓어져 리스크가 +56%, 손익비가 2.36 → 1.19로 붕괴했다.
+
+        `_stops_sane`은 "손절이 현재가보다 위"인 명백한 오류만 잡을 뿐
+        하향은 검사하지 않았다. 익절 락인(`max(...)`)과 트레일링
+        (`raise_stop`) 경로는 이미 상향만 허용하므로, 결정 경로도 같은
+        규율을 따르게 한다.
+        """
+        pm, pos = self._pm_and_position(config)      # stop 1,700,000, price 1,845,000
+        await pm._apply_decision(pos, self._decision(stop_loss=1_600_000))
+        assert pos.stop_loss == 1_700_000, "손절 하향은 무시되어야 한다"
+
+    @pytest.mark.asyncio
+    async def test_decision_stop_can_be_raised(self, config):
+        """상향은 허용된다 — 이익 보호(트레일링)와 같은 방향이다."""
+        pm, pos = self._pm_and_position(config)
+        await pm._apply_decision(pos, self._decision(stop_loss=1_750_000))
+        assert pos.stop_loss == 1_750_000
+
+    @pytest.mark.asyncio
+    async def test_decision_stop_set_when_none(self, config):
+        """기존 손절이 없으면 값을 설정한다(하향 판정 대상이 아니다)."""
+        pm, pos = self._pm_and_position(config)
+        pm.update_position(pos.ticker, stop_loss=None)
+        pos.stop_loss = None
+        await pm._apply_decision(pos, self._decision(stop_loss=1_600_000))
+        assert pos.stop_loss == 1_600_000
+
+    @pytest.mark.asyncio
+    async def test_take_profit_still_free_to_move_down(self, config):
+        """익절은 단조성 대상이 아니다 — 손절만 고정하면 손익비는 보호된다.
+
+        익절 하향은 "빨리 팔자"라 손실 위험을 키우지 않으므로 기존 동작을
+        유지한다(과도한 제약은 YAGNI)."""
+        pm, pos = self._pm_and_position(config)
+        pm.update_position(pos.ticker, take_profit=2_000_000)
+        await pm._apply_decision(pos, self._decision(take_profit=1_900_000))
+        assert pos.take_profit == 1_900_000
+
     @pytest.mark.asyncio
     async def test_decision_take_below_price_rejected(self, config):
         """(ii) take_profit <= current price → instant take-profit → rejected."""

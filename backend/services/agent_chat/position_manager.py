@@ -2044,8 +2044,34 @@ class PositionManager:
                         )
                     else:
                         if new_stop is not None:
-                            self.update_position(position.ticker, stop_loss=new_stop)
+                            # 손절 단조성(2026-07-28): 에이전트 결정은 손절을
+                            # **올리기만** 할 수 있다. 익절 락인(`max(...)`)과
+                            # 트레일링(`raise_stop`) 경로는 이미 같은 규율을
+                            # 강제하는데 이 경로만 무제한이었다.
+                            #
+                            # 라이브 사고(094840): 30분 주기 재평가마다 LLM이
+                            # 현재가 기준으로 손절을 새로 제안했고, 주가가
+                            # 빠지자 손절이 따라 내려갔다(12,492→12,238→12,173).
+                            # R-사이징은 손절 거리로 수량을 정하므로, 수량이
+                            # 고정된 채 손절만 넓어지면 리스크가 그대로 커진다
+                            # (실측 +56%, 손익비 2.36→1.19).
+                            #
+                            # "손절을 시장 반대 방향으로 옮기지 않는다"는 매매
+                            # 규율을 코드로 고정한다. 상향(이익 보호)은 허용.
+                            if position.stop_loss is None or new_stop > position.stop_loss:
+                                self.update_position(position.ticker, stop_loss=new_stop)
+                            else:
+                                logger.info(
+                                    "decision_stop_not_lowered",
+                                    ticker=position.ticker,
+                                    current_stop=position.stop_loss,
+                                    proposed_stop=new_stop,
+                                    current_price=position.current_price,
+                                )
                         if new_take is not None:
+                            # 익절은 단조성 대상이 아니다 — 하향은 "빨리 팔자"라
+                            # 손실 위험을 키우지 않고, 손절이 고정되면 손익비는
+                            # 자동으로 보호된다.
                             self.update_position(position.ticker, take_profit=new_take)
 
             # Notify decision callbacks
