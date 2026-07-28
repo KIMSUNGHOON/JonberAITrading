@@ -46,7 +46,12 @@ ROUTING_POLICY: dict[TaskType, list[BackendName]] = {
     TaskType.TECHNICAL_ANALYSIS: [BackendName.OPENROUTER, BackendName.CLAUDE_CLI],
     TaskType.FUNDAMENTAL_ANALYSIS: [BackendName.OPENROUTER, BackendName.CLAUDE_CLI],
     TaskType.SENTIMENT_ANALYSIS: [BackendName.OPENROUTER, BackendName.CLAUDE_CLI],
-    TaskType.GROUP_CHAT: [BackendName.OPENROUTER, BackendName.CLAUDE_CLI],
+    # 토론 4에이전트는 Claude로 (2026-07-28, 사용자 지시: "토론 4에이전트는
+    # Claude로, 스캐너·발굴은 OpenRouter로"). RISK는 이미 CLAUDE_CLI 우선이고,
+    # 나머지 3명(기술적/펀더멘털/심리)이 base_agent의 기본값인 이 GROUP_CHAT을
+    # 타므로 여기만 뒤집으면 4명 전원이 Claude를 1순위로 쓴다.
+    # OpenRouter는 폴백으로 남긴다(Claude CLI 장애 시 토론이 멈추지 않게).
+    TaskType.GROUP_CHAT: [BackendName.CLAUDE_CLI, BackendName.OPENROUTER],
     TaskType.SCANNER: [BackendName.OPENROUTER],
     TaskType.TRANSLATION: [BackendName.OPENROUTER, BackendName.CLAUDE_CLI],
     TaskType.CHAT: [BackendName.OPENROUTER],

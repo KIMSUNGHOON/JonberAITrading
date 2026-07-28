@@ -114,10 +114,18 @@ async def test_open_circuit_skips_backend():
 # ---------- budget ----------
 
 @pytest.mark.asyncio
-async def test_budget_exhaustion_drops_openrouter():
+async def test_budget_exhaustion_drops_openrouter(monkeypatch):
+    """예산을 넘기면 SCANNER 체인이 비고(폴백 없음) 호출이 실패한다.
+
+    `Router`는 모듈 전역 `settings`를 읽으므로 운영자가 `.env`에서 예산을
+    올리면 이 테스트가 조용히 무의미해진다(2026-07-28 실제 발생: 예산을
+    100000으로 올리자 spend 1000이 한도를 못 넘겨 실패). 테스트가 환경에
+    의존하지 않도록 예산을 이 테스트 안에서 고정한다.
+    """
     good = FakeBackend(BackendName.OPENROUTER, result="ok")
     r = _router({BackendName.OPENROUTER: good})
-    r.add_openrouter_spend(1000.0)  # far over the default $5/day budget
+    monkeypatch.setattr(r.settings, "OPENROUTER_DAILY_BUDGET_USD", 5.0, raising=False)
+    r.add_openrouter_spend(1000.0)  # far over the pinned $5/day budget
     assert r.resolve(TaskType.SCANNER, streaming=False) == []
     with pytest.raises(LLMAllBackendsFailed):
         await r.generate([HumanMessage(content="x")], task=TaskType.SCANNER)
