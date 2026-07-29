@@ -53,7 +53,12 @@ async def test_killswitch_off_touches_nothing():
 
 async def test_exception_never_propagates_and_alerts():
     """트레이딩 재개가 터져도 부팅은 계속되고, 실패 사실이 Telegram으로
-    나간다 — 방어를 못 켠 것은 조용히 넘어갈 일이 아니다."""
+    나간다 — 방어를 못 켠 것은 조용히 넘어갈 일이 아니다.
+
+    에이전트챗의 resume도 반드시 시도됐어야 한다 — 트레이딩(키움) 장애가
+    키움과 무관한 에이전트챗 감시까지 막아선 안 된다. 이 assertion이 없으면
+    한쪽 실패가 다른 쪽 시도 자체를 막는 회귀가 조용히 통과한다.
+    """
     trading = MagicMock()
     trading.resume_if_persisted = AsyncMock(side_effect=RuntimeError("kiwoom down"))
     chat = MagicMock()
@@ -73,7 +78,54 @@ async def test_exception_never_propagates_and_alerts():
         s.BOOT_AUTO_RESUME_ENABLED = True
         await _boot_auto_resume()  # raise하지 않아야 한다
 
+    trading.resume_if_persisted.assert_awaited_once()
+    chat.resume_if_persisted.assert_awaited_once()
     notifier.send_system_status.assert_awaited_once()
+
+    # 알림이 "무엇이" 실패했는지 밝혀야 한다 — 트레이딩만 뭉뚱그려 실패라고
+    # 하면 운영자가 에이전트챗은 무사하다고 오인할 수 있다.
+    message = notifier.send_system_status.await_args.args[1]
+    assert "trading" in message
+    assert "kiwoom down" in message
+
+
+async def test_chat_failure_does_not_block_trading_resume():
+    """반대 방향: 에이전트챗 재개가 터져도 트레이딩 재개는 그대로 성공해야
+    한다 — 비대칭 실패 어느 쪽으로도 서로를 막지 않는다.
+
+    알림 메시지도 실제로 실패한 쪽(agent_chat)만 가리켜야 한다 — 이미
+    성공한 트레이딩의 복구 명령까지 같이 나오면 운영자가 정상인 트레이딩을
+    괜히 재확인하게 된다.
+    """
+    trading = MagicMock()
+    trading.resume_if_persisted = AsyncMock(return_value=True)
+    chat = MagicMock()
+    chat.resume_if_persisted = AsyncMock(side_effect=RuntimeError("chat db down"))
+
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_system_status = AsyncMock()
+
+    with patch("app.dependencies.get_trading_coordinator",
+               new=AsyncMock(return_value=trading)), \
+         patch("services.agent_chat.coordinator.get_chat_coordinator",
+               new=AsyncMock(return_value=chat)), \
+         patch("app.main.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)), \
+         patch("app.main.settings") as s:
+        s.BOOT_AUTO_RESUME_ENABLED = True
+        await _boot_auto_resume()  # raise하지 않아야 한다
+
+    trading.resume_if_persisted.assert_awaited_once()
+    chat.resume_if_persisted.assert_awaited_once()
+    notifier.send_system_status.assert_awaited_once()
+
+    message = notifier.send_system_status.await_args.args[1]
+    assert "agent_chat" in message
+    assert "chat db down" in message
+    assert "/api/agent-chat/start" in message
+    # 트레이딩은 성공했으니 트레이딩 복구 명령은 나오면 안 된다.
+    assert "/api/trading/start" not in message
 
 
 async def test_telegram_failure_does_not_propagate():
@@ -127,3 +179,8 @@ async def test_timeout_does_not_block_boot():
         await asyncio.wait_for(_boot_auto_resume(), timeout=5)
 
     notifier.send_system_status.assert_awaited_once()
+
+    # asyncio.TimeoutError는 str(e)가 보통 빈 문자열이라, 타입명이 같이
+    # 안 남으면 알림이 "trading 실패() — ..."처럼 원인 없는 문구가 된다.
+    message = notifier.send_system_status.await_args.args[1]
+    assert "TimeoutError" in message

@@ -42,8 +42,36 @@ logger = structlog.get_logger()
 _background_tasks: set[asyncio.Task] = set()
 
 # 부팅 자동 방어 복원의 상한. start()가 _refresh_account_info()로 키움을
-# 부르므로, API가 죽어 있으면 부팅이 영영 멈출 수 있다.
+# 부르므로, API가 죽어 있으면 부팅이 영영 멈출 수 있다. 코디네이터마다
+# 독립된 예산이다 — 하나가 이 시간을 다 써도 다른 하나는 자기 몫의
+# BOOT_AUTO_RESUME_TIMEOUT_S를 그대로 받는다(공유 예산이 아니다).
 BOOT_AUTO_RESUME_TIMEOUT_S = 60
+
+# 코디네이터별 실패 시 안내할 수동 복구 명령 — 어느 감시가 꺼졌는지뿐
+# 아니라 무엇을 눌러야 하는지까지 알림에 정확히 남기기 위해서다.
+_BOOT_RESUME_REMEDIATION = {
+    "trading": "POST /api/trading/start",
+    "agent_chat": "POST /api/agent-chat/start",
+}
+
+
+async def _resume_one(label: str, get_coordinator) -> tuple[str, bool, Exception | None]:
+    """코디네이터 하나만 되살린다. (label, resumed, error)를 돌려준다 — raise하지 않는다.
+
+    예외를 여기서 잡는 이유: 한쪽 장애가 다른 쪽 복원을 막으면 안 된다 —
+    키움 장애가 키움과 무관한 에이전트챗 감시까지 꺼버릴 이유가 없다.
+    타임아웃도 코디네이터마다 따로 건다(전체를 하나로 묶으면 앞선
+    코디네이터가 예산을 다 써버려 뒤 코디네이터가 사실상 시도조차 못
+    한다).
+    """
+    try:
+        coordinator = await get_coordinator()
+        resumed = await asyncio.wait_for(
+            coordinator.resume_if_persisted(), timeout=BOOT_AUTO_RESUME_TIMEOUT_S
+        )
+        return label, resumed, None
+    except Exception as e:
+        return label, False, e
 
 
 async def _boot_auto_resume() -> None:
@@ -56,11 +84,17 @@ async def _boot_auto_resume() -> None:
     코디네이터의 resume_if_persisted()가 저장된 상태를 보고 내린다.
 
     fire-and-forget이 아니라 await로 부른다(US 신호 갱신과 의도적으로
-    다르다). 부팅 몇 초 지연이 무방비 몇 분보다 낫다. 대신 전체에
-    타임아웃을 걸어 키움 장애가 부팅을 영영 막지 못하게 한다.
+    다르다). 부팅 몇 초 지연이 무방비 몇 분보다 낫다.
+
+    트레이딩을 먼저 시도한다 — 실 포지션 방어가 우선순위다. 하지만
+    트레이딩이 터지거나 타임아웃 나도 에이전트챗은 결과와 무관하게 반드시
+    시도한다(_resume_one이 예외를 삼키므로 여기서 순서대로 불러도 한쪽
+    장애가 다른 쪽을 막지 않는다) — 키움과 무관한 감시까지 같이 꺼질
+    이유가 없다.
 
     절대 raise하지 않는다 — 방어 복원 실패가 서버 부팅을 막아선 안 된다.
-    다만 무성 실패도 금지라, 실패는 로그와 Telegram 양쪽에 남긴다.
+    다만 무성 실패도 금지라, 실패는 코디네이터별로 로그와 Telegram 양쪽에
+    남긴다.
     """
     if not settings.BOOT_AUTO_RESUME_ENABLED:
         logger.info("boot_auto_resume_disabled")
@@ -70,32 +104,66 @@ async def _boot_auto_resume() -> None:
         from app.dependencies import get_trading_coordinator
         from services.agent_chat.coordinator import get_chat_coordinator
 
-        async def _resume_all():
-            trading = await get_trading_coordinator()
-            trading_resumed = await trading.resume_if_persisted()
-            chat = await get_chat_coordinator()
-            chat_resumed = await chat.resume_if_persisted()
-            return trading_resumed, chat_resumed
+        results = [
+            await _resume_one("trading", get_trading_coordinator),
+            await _resume_one("agent_chat", get_chat_coordinator),
+        ]
 
-        trading_resumed, chat_resumed = await asyncio.wait_for(
-            _resume_all(), timeout=BOOT_AUTO_RESUME_TIMEOUT_S
-        )
         logger.info(
             "boot_auto_resume_complete",
-            trading=trading_resumed,
-            agent_chat=chat_resumed,
+            trading=results[0][1],
+            agent_chat=results[1][1],
         )
+
+        failures = [(label, error) for label, _resumed, error in results if error is not None]
+        if not failures:
+            return
+
+        for label, error in failures:
+            # asyncio.TimeoutError 등은 str(e)가 대개 빈 문자열이라 타입명을
+            # 같이 남긴다 — 안 그러면 로그가 error=""로만 남아 원인을 잃는다.
+            logger.error(
+                "boot_auto_resume_failed",
+                coordinator=label,
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+
+        # 무성 실패 금지 — 방어를 못 켰다는 사실은 폰까지 가야 한다. 실패한
+        # 코디네이터별로 원인과 복구 명령을 남긴다 — 뭉뚱그리면(예: 트레이딩만
+        # 재개 성공, 에이전트챗 실패) 운영자가 트레이딩 명령만 실행하고 다
+        # 됐다고 믿을 수 있다. 알림 실패가 부팅을 막지 않도록 이 호출도
+        # 따로 감싼다.
+        try:
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                detail = " / ".join(
+                    f"{label} 실패({type(error).__name__}: {error}) — 수동으로 "
+                    f"{_BOOT_RESUME_REMEDIATION.get(label, label)} 를 실행하세요."
+                    for label, error in failures
+                )
+                await notifier.send_system_status(
+                    "error",
+                    f"부팅 자동 방어 복원 실패 — 감시 일부가 꺼져 있습니다. {detail}",
+                )
+        except Exception:
+            logger.error("boot_auto_resume_alert_failed")
     except Exception as e:
-        logger.error("boot_auto_resume_failed", error=str(e))
-        # 무성 실패 금지 — 방어를 못 켰다는 사실은 폰까지 가야 한다.
-        # 알림 실패가 부팅을 막지 않도록 이 호출도 따로 감싼다.
+        # 최후 방어선. _resume_one이 코디네이터별 예외를 이미 삼키므로 여기까지
+        # 오는 건 get_trading_coordinator/get_chat_coordinator의 import 실패 같은
+        # 상상 밖의 상황뿐이지만, 그래도 raise는 절대 안 된다.
+        logger.error(
+            "boot_auto_resume_unexpected_failure",
+            error_type=type(e).__name__,
+            error=str(e),
+        )
         try:
             notifier = await get_telegram_notifier()
             if notifier.is_ready:
                 await notifier.send_system_status(
                     "error",
-                    f"부팅 자동 방어 복원 실패 — 손절 감시가 꺼져 있습니다. "
-                    f"수동으로 POST /api/trading/start 를 실행하세요. ({e})",
+                    f"부팅 자동 방어 복원 중 예상 밖 오류 — 수동으로 상태를 "
+                    f"확인하세요. ({type(e).__name__}: {e})",
                 )
         except Exception:
             logger.error("boot_auto_resume_alert_failed")
