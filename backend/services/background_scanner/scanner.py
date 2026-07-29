@@ -987,6 +987,10 @@ class BackgroundScanner:
         )
         per = float(stock_info.per) if stock_info.per is not None else 0.0
         pbr = float(stock_info.pbr) if stock_info.pbr is not None else 0.0
+        # 적자 배제 게이트용. per/pbr과 달리 0.0 폴백을 쓰지 않는다 — EPS 0은
+        # "이익 없음"이라 게이트가 배제해야 하는 실제 값이고, 결측(None)은
+        # "모름"이라 통과시켜야 하므로 둘을 구분해야 한다.
+        eps = float(stock_info.eps) if stock_info.eps is not None else None
         volume = float(stock_info.acml_vol) if stock_info.acml_vol is not None else 0.0
 
         return StockSnapshot(
@@ -998,6 +1002,7 @@ class BackgroundScanner:
             pbr=pbr,
             volume=volume,
             chart_df=chart_df,
+            eps=eps,
         )
 
     @staticmethod
@@ -1056,8 +1061,14 @@ class BackgroundScanner:
             try:
                 snap = await self._fetch_discovery_snapshot(stk_cd, stk_nm, client)
                 breadth_direction = self._classify_breadth_direction(snap.chart_df)
+                from app.config import settings as _s
+
                 passed, reason = passes_quality_filter(
-                    snap, min_adtv=self._discovery_min_adtv
+                    snap,
+                    min_adtv=self._discovery_min_adtv,
+                    exclude_negative_eps=getattr(
+                        _s, "DISCOVERY_EXCLUDE_NEGATIVE_EPS", True
+                    ),
                 )
 
                 if passed:

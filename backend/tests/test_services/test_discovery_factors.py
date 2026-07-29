@@ -18,6 +18,7 @@ from services.discovery.factors import (
     REASON_LIQUIDITY_LOW,
     REASON_MARKET_CAP_LOW,
     REASON_PRICE_TOO_LOW,
+    REASON_NEGATIVE_EPS,
     REASON_PRICE_ZERO,
     REASON_ZERO_VOLUME_DAY,
     STRATEGIES,
@@ -581,3 +582,82 @@ def test_atoms_none_safe_without_value_column():
     scores = compute_strategy_scores(snap, None)
     assert scores["_atoms"]["adtv20_med"] is None
     assert not math.isnan(scores["momentum"])
+
+
+# ---------------------------------------------------------------------------
+# 적자 배제 게이트 (2026-07-29)
+# ---------------------------------------------------------------------------
+
+
+def _eps_snap(eps, values=None, market_cap=600 * 억):
+    """적자 배제 테스트용 — 유동성·시총·히스토리는 항상 통과하도록 고정."""
+    n = 60
+    vals = values if values is not None else [30 * 억] * n
+    df = _make_chart_df([10_000.0] * n, [1000] * n)
+    df["value"] = [float(v) for v in vals]
+    return StockSnapshot(
+        ticker="000000", name="테스트", price=10_000.0, market_cap=market_cap,
+        per=10.0, pbr=1.0, volume=1000, chart_df=df, eps=eps,
+    )
+
+
+def test_negative_eps_rejected_when_enabled():
+    """적자 기업(EPS<0)은 배제된다.
+
+    2026-07-28 EOD 실물: composite 1위 코오롱티슈진(0.501)이 EPS -2,317원
+    적자에 PBR 17.05였다. 문턱에 못 미쳐 매수되진 않았으나, 문턱이 조금만
+    낮았다면 랭킹 1순위가 적자기업이었을 것이다 — Asness et al.(2018)이
+    말한 "퀄리티 통제 없는 소형주 선별 = junk 매수"의 실물 사례.
+    """
+    passed, reason = passes_quality_filter(
+        _eps_snap(eps=-2317), min_adtv=20 * 억, exclude_negative_eps=True
+    )
+    assert passed is False
+    assert reason == REASON_NEGATIVE_EPS
+
+
+def test_zero_eps_rejected():
+    """EPS 0도 배제 — 이익이 없다는 점에서 적자와 같다."""
+    passed, reason = passes_quality_filter(
+        _eps_snap(eps=0), min_adtv=20 * 억, exclude_negative_eps=True
+    )
+    assert passed is False
+    assert reason == REASON_NEGATIVE_EPS
+
+
+def test_positive_eps_passes():
+    passed, reason = passes_quality_filter(
+        _eps_snap(eps=1278), min_adtv=20 * 억, exclude_negative_eps=True
+    )
+    assert passed is True
+    assert reason is None
+
+
+def test_missing_eps_is_fail_open():
+    """EPS 결측은 통과시킨다(fail-open).
+
+    유동성 게이트는 fail-closed지만 EPS는 다르다 — 결측이 곧 '적자'를
+    뜻하지 않고(신규상장·데이터 누락), 적자 기업은 실제로 음수 값을 준다
+    (코오롱티슈진 -2,317 실측). fail-closed로 두면 데이터 누락 종목이
+    통째로 사라져 후보만 고갈된다.
+    """
+    passed, reason = passes_quality_filter(
+        _eps_snap(eps=None), min_adtv=20 * 억, exclude_negative_eps=True
+    )
+    assert passed is True
+    assert reason is None
+
+
+def test_negative_eps_ignored_when_disabled():
+    """킬스위치 off(기본값)면 적자여도 통과 — 하위 호환."""
+    passed, reason = passes_quality_filter(_eps_snap(eps=-2317), min_adtv=20 * 억)
+    assert passed is True
+
+
+def test_eps_gate_runs_after_existing_filters():
+    """시총 미달이면 EPS 사유가 아니라 시총 사유가 나와야 한다."""
+    passed, reason = passes_quality_filter(
+        _eps_snap(eps=-2317, market_cap=100.0), min_adtv=20 * 억,
+        exclude_negative_eps=True,
+    )
+    assert reason == REASON_MARKET_CAP_LOW

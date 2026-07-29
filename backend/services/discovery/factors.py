@@ -38,6 +38,7 @@ from services.technical_indicators import TechnicalIndicators
 REASON_PRICE_ZERO = "price_zero"
 REASON_MARKET_CAP_LOW = "market_cap_low"
 REASON_INSUFFICIENT_HISTORY = "insufficient_history"
+REASON_NEGATIVE_EPS = "negative_eps"
 REASON_LIQUIDITY_LOW = "liquidity_low"
 REASON_LIQUIDITY_INCONSISTENT = "liquidity_inconsistent"
 REASON_ZERO_VOLUME_DAY = "zero_volume_day"
@@ -70,6 +71,10 @@ class StockSnapshot:
     pbr: float
     volume: float
     chart_df: pd.DataFrame
+    # 주당순이익(원). 적자 배제 게이트(2026-07-29)가 소비한다. 키움 ka10001이
+    # 주는 값이며, 결측(None)은 "적자"가 아니라 "모름"이다 — 게이트는 결측을
+    # 통과시킨다(fail-open). 기본값 None이라 기존 호출자는 무영향.
+    eps: Optional[float] = None
 
 
 @dataclass
@@ -117,6 +122,7 @@ def passes_quality_filter(
     min_history: int = DEFAULT_MIN_HISTORY,
     min_adtv: Optional[float] = None,
     min_close_price: float = DEFAULT_MIN_CLOSE_PRICE,
+    exclude_negative_eps: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """공통 품질 필터. (통과여부, 실패사유) 반환 — 통과 시 사유는 None.
 
@@ -138,6 +144,19 @@ def passes_quality_filter(
     history_len = 0 if snap.chart_df is None else len(snap.chart_df)
     if history_len < min_history:
         return False, REASON_INSUFFICIENT_HISTORY
+
+    # 적자 배제(2026-07-29). 4전략은 전부 기술적 지표라 재무 축이 전혀 없었고,
+    # PER/PBR/EPS를 수집만 하고 아무도 쓰지 않았다. 그 결과 2026-07-28 EOD의
+    # composite 1위가 EPS -2,317원·PBR 17.05인 적자기업(코오롱티슈진)이었다.
+    # 문턱 미달로 매수되진 않았으나 문턱이 조금만 낮았다면 1순위였다.
+    # Asness et al.(2018) "Size Matters, If You Control Your Junk": 퀄리티를
+    # 통제하지 않은 소형주 선별은 junk를 사는 것과 같다.
+    #
+    # 결측은 fail-open — 유동성과 달리 EPS 결측은 "적자"가 아니라 "모름"이고
+    # (신규상장·데이터 누락), 실제 적자기업은 음수 값을 준다. fail-closed면
+    # 데이터 누락 종목이 통째로 사라져 후보만 고갈된다.
+    if exclude_negative_eps and snap.eps is not None and snap.eps <= 0:
+        return False, REASON_NEGATIVE_EPS
 
     if min_adtv is None:
         return True, None

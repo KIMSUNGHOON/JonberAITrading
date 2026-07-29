@@ -188,6 +188,11 @@ class Settings(BaseSettings):
     # (factors.passes_quality_filter의 `min_adtv is None` 분기)로 수렴한다.
     DISCOVERY_LIQUIDITY_GATE_ENABLED: bool = True
 
+    # 적자(EPS<=0) 기업을 발굴 후보에서 배제한다(2026-07-29). 4전략이 전부
+    # 기술적 지표라 재무 축이 없었고, 그 결과 07-28 EOD composite 1위가
+    # EPS -2,317원인 적자기업이었다. off면 기존처럼 재무 무관하게 랭킹한다.
+    DISCOVERY_EXCLUDE_NEGATIVE_EPS: bool = True
+
     # C1 사이징 캡(ADTV 0.5% 참여율)만 무효화한다. off면 두 사이징 호출부가
     # `adtv=None`을 넘겨 기존 fail-open 경로("adtv_unknown", 캡 미적용)로
     # 수렴한다 — R-cap과 max_single_position_pct 캡은 계속 작동한다.
