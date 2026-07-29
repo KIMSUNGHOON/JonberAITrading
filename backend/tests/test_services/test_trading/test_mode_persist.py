@@ -282,6 +282,95 @@ async def test_pause_persists_full_snapshot_when_started(tmp_path):
     assert blob["positions"][0]["stop_loss"] == 12492.0
 
 
+async def test_persist_fields_leaves_corrupt_blob_untouched(tmp_path):
+    """일반화된 `_persist_fields`의 안전성(2026-07-29 리뷰: "읽어보면 맞다"로만
+    확인되고 테스트가 없다고 지적된 속성). 기존 블롭이 파싱 불가능한
+    JSON이면 `json.loads`가 try 안에서 실패해 아무것도 쓰지 않는다 --
+    부분 블롭으로 원본을 덮어쓰는 것보다, 손상된 원본이라도 그대로 남는
+    편이 낫다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+    corrupt = "{not json"
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        await storage.set_app_setting(coord._STATE_KEY, corrupt)
+
+        await coord._persist_fields(mode="stopped")
+
+        blob = await storage.get_app_setting(coord._STATE_KEY)
+
+    assert blob == corrupt
+
+
+async def test_persist_fields_no_write_when_parsed_blob_is_not_a_dict(tmp_path):
+    """파싱은 되지만 dict가 아닌 블롭(JSON 배열, `null` 등)도 마찬가지로
+    아무것도 쓰지 않는다 -- 원본을 dict가 아닌 값으로 오염시킬 수 없다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+    not_a_dict = json.dumps([1, 2, 3])
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        await storage.set_app_setting(coord._STATE_KEY, not_a_dict)
+
+        await coord._persist_fields(mode="stopped")
+
+        blob = await storage.get_app_setting(coord._STATE_KEY)
+
+    assert blob == not_a_dict
+
+
+async def test_persist_fields_null_blob_also_results_in_no_write(tmp_path):
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+    null_blob = json.dumps(None)
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        await storage.set_app_setting(coord._STATE_KEY, null_blob)
+
+        await coord._persist_fields(mode="stopped")
+
+        blob = await storage.get_app_setting(coord._STATE_KEY)
+
+    assert blob == null_blob
+
+
+async def test_persist_fields_writes_only_passed_keys_when_blob_absent(tmp_path):
+    """블롭이 아직 없으면 넘겨받은 필드만 담은 새 블롭을 쓴다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        await coord._persist_fields(mode="stopped")
+        blob = json.loads(await storage.get_app_setting(coord._STATE_KEY))
+
+    assert blob == {"mode": "stopped"}
+
+
+async def test_persist_fields_arbitrary_key_preserves_untouched_fields(tmp_path):
+    """mode 외 임의 키(예: risk_params)로도 동작하고, 건드리지 않은 다른
+    필드는 그대로 남는다 -- PUT /risk-params 라우트가 실제로 쓰는 모양."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        await storage.set_app_setting(
+            coord._STATE_KEY, json.dumps(_seed_nonempty_blob("active"))
+        )
+
+        await coord._persist_fields(risk_params={"max_trade_notional_pct": 22.0})
+
+        blob = json.loads(await storage.get_app_setting(coord._STATE_KEY))
+
+    assert blob["risk_params"] == {"max_trade_notional_pct": 22.0}
+    assert blob["mode"] == "active"
+    assert blob["positions"] == _seed_nonempty_blob()["positions"]
+
+
 async def test_restore_ignores_mode_and_survives_blob_without_it(tmp_path):
     """이 기능 이전에 저장된 블롭(mode 키 없음)을 복원해도 터지지 않아야
     하고, _restore_state는 mode를 적용하지 않는다 — 재개 판단은

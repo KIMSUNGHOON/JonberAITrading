@@ -371,7 +371,21 @@ async def update_risk_params(
         params.take_profit_mode = StopLossMode(request.take_profit_mode)
 
     try:
-        await coordinator._persist_state()
+        # 재시작 안전(2026-07-29 리뷰): 이 프로세스에서 한 번도 start()를
+        # 거치지 않은(_persistence_active=False) 코디네이터에 무조건
+        # `_persist_state()`(전체 스냅샷)를 부르면, 메모리 상 빈
+        # positions/trade_queue/watch_list가 블롭의 실제 데이터를 덮어써
+        # 지워 버린다 — coordinator.py의 stop/pause/resume이 이미 봉합한
+        # 것과 동일한 REGRESSION이 이 라우트에도 있었다. mode-only
+        # persist가 일반화된 `_persist_fields()`로 risk_params 필드만
+        # 부분 갱신한다. 키/직렬화 모양은 `_persist_state`와 반드시 같아야
+        # 나중의 전체 persist와 어긋나지 않는다.
+        if coordinator._persistence_active:
+            await coordinator._persist_state()
+        else:
+            await coordinator._persist_fields(
+                risk_params=coordinator.risk_params.model_dump()
+            )
     except Exception:
         logger.warning("Failed to persist risk_params after update", exc_info=True)
 

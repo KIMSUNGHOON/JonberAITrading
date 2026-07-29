@@ -546,12 +546,12 @@ class ExecutionCoordinator:
         # 없어서 메모리 상 positions/trade_queue/watch_list가 블롭의 실제
         # 내용이 아니라 전부 빈 기본값이고, 그대로 직렬화하면 진짜 데이터를
         # 지워 버린다(REGRESSION, 2026-07-29 리뷰). mode만은 여전히
-        # 영속돼야 하므로 그 경우엔 `_persist_mode_only()`로 mode 키만
+        # 영속돼야 하므로 그 경우엔 `_persist_fields()`로 mode 키만
         # read-modify-write한다. 둘 다 never-raise라 셧다운을 깨지 않는다.
         if self._persistence_active:
             await self._persist_state()
         else:
-            await self._persist_mode_only()
+            await self._persist_fields(mode=self._mode_value())
         self._persistence_active = False
 
         self._log_activity(
@@ -589,7 +589,7 @@ class ExecutionCoordinator:
         if self._persistence_active:
             await self._persist_state()
         else:
-            await self._persist_mode_only()
+            await self._persist_fields(mode=self._mode_value())
 
     async def resume(self):
         """Resume auto-trading."""
@@ -613,7 +613,7 @@ class ExecutionCoordinator:
         if self._persistence_active:
             await self._persist_state()
         else:
-            await self._persist_mode_only()
+            await self._persist_fields(mode=self._mode_value())
 
         # Process any pending trades in queue (if market is open)
         market_session = self._market_hours.get_market_session(MarketType.KRX)
@@ -1743,6 +1743,16 @@ class ExecutionCoordinator:
 
     _STATE_KEY = "trading:coordinator_state"
 
+    def _mode_value(self) -> str:
+        """`_state.mode`를 블롭에 쓸 문자열로 정규화한다. `_persist_state`와
+        `_persist_fields(mode=...)` 호출부(stop/pause/resume) 양쪽에서
+        같은 규칙을 쓰도록 공유한다."""
+        return (
+            self._state.mode.value
+            if hasattr(self._state.mode, "value")
+            else str(self._state.mode)
+        )
+
     async def _persist_state(self) -> None:
         """Best-effort persist of restart-critical state. Never raises — a storage
         failure must not break trading."""
@@ -1774,9 +1784,7 @@ class ExecutionCoordinator:
                     # 이 값만 보고 방어를 되살릴지 정한다. _restore_state는
                     # 이 필드를 읽지 않는다 — 수동 start()는 기존대로
                     # 무조건 ACTIVE로 간다.
-                    "mode": self._state.mode.value
-                    if hasattr(self._state.mode, "value")
-                    else str(self._state.mode),
+                    "mode": self._mode_value(),
                 }
             )
             storage = await get_storage_service()
@@ -1784,9 +1792,15 @@ class ExecutionCoordinator:
         except Exception as e:
             logger.error(f"[Coordinator] Failed to persist state: {e}")
 
-    async def _persist_mode_only(self) -> None:
-        """`mode` 키만 read-modify-write로 갱신한다. Never-raise — `_persist_state`와
-        동일 계약.
+    async def _persist_fields(self, **kv) -> None:
+        """임의 key/value 묶음만 read-modify-write로 갱신한다. Never-raise —
+        `_persist_state`와 동일 계약.
+
+        `_persist_mode_only()`의 일반화(2026-07-29 리뷰: `PUT
+        /api/trading/risk-params` 라우트도 `_persist_state()`를 무조건
+        호출해 미시작 코디네이터의 빈 상태로 블롭을 덮어쓰는 동일한
+        REGRESSION을 갖고 있었다 — mode 하나에 특화된 헬퍼를 또 복제하는
+        대신 임의 필드를 다루도록 일반화한다).
 
         `_persistence_active`가 False인 코디네이터(이 프로세스에서
         `_restore_state()`가 한 번도 안 돈, 즉 `start()`를 거치지 않은
@@ -1797,11 +1811,16 @@ class ExecutionCoordinator:
         재시작 안전 브랜치 자신의 첫 배포 창에서 stop/pause/resume 중 아무거나
         한 번만 호출돼도 보유 포지션의 손절가가 통째로 사라짐).
 
-        그래도 mode는 여전히 즉시 영속돼야 한다 — 부팅 재개가 신뢰하는
-        유일한 신호이기 때문이다. 그래서 전체 persist를 건너뛰는 대신, 기존
-        블롭을 읽어 mode 필드만 바꿔 쓴다. 블롭이 아직 없으면 mode 하나만
-        담은 블롭을 새로 쓴다 — 이후 진짜 `_persist_state()`가 나머지 필드를
-        채운다.
+        그래도 넘겨받은 필드는 여전히 즉시 영속돼야 한다. 그래서 전체
+        persist를 건너뛰는 대신, 기존 블롭을 읽어 넘겨받은 키만 바꿔 쓴다.
+
+        - `json.loads`는 try 안에 있다 — 기존 블롭이 깨져 있으면(파싱 실패)
+          아무것도 쓰지 않는다. 부분 블롭으로 원본을 덮어쓰는 것보다, 손상된
+          원본이라도 그대로 남는 편이 낫다.
+        - 파싱 결과가 dict가 아니면(예: `"null"`, JSON 배열) 마찬가지로
+          아무것도 쓰지 않는다 — 원본을 dict가 아닌 값으로 오염시킬 수 없다.
+        - 블롭이 없거나 비어 있으면 넘겨받은 필드만 담은 새 블롭을 쓴다.
+          이후 진짜 `_persist_state()`가 나머지 필드를 채운다.
         """
         try:
             from services.storage_service import get_storage_service
@@ -1809,14 +1828,15 @@ class ExecutionCoordinator:
             storage = await get_storage_service()
             blob = await storage.get_app_setting(self._STATE_KEY)
             data = json.loads(blob) if blob else {}
-            data["mode"] = (
-                self._state.mode.value
-                if hasattr(self._state.mode, "value")
-                else str(self._state.mode)
-            )
+            if not isinstance(data, dict):
+                raise TypeError(
+                    "Persisted state blob is not a JSON object "
+                    f"(got {type(data).__name__}) — refusing partial write"
+                )
+            data.update(kv)
             await storage.set_app_setting(self._STATE_KEY, json.dumps(data))
         except Exception as e:
-            logger.error(f"[Coordinator] Failed to persist mode: {e}")
+            logger.error(f"[Coordinator] Failed to persist fields {sorted(kv)}: {e}")
 
     async def _restore_state(self) -> None:
         """Reload restart-critical state. Positions (with stops) are re-registered
