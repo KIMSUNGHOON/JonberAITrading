@@ -533,15 +533,25 @@ class ExecutionCoordinator:
             self._watch_refresh_task.cancel()
             self._watch_refresh_task = None
 
-        # Persist restart-critical state on shutdown -- unconditional
-        # (IMPORTANT 3, 2026-07-29). A stop() on a coordinator that never
-        # start()ed in THIS process (e.g. the very first API call after a
-        # fresh boot being /trading/stop) must still write mode=stopped, or
-        # a stale mode=active left over from a previous session survives in
-        # the blob and the next boot's resume_if_persisted() arms trading
-        # the operator explicitly switched off. _persist_state is
-        # never-raise, so this cannot break shutdown.
-        await self._persist_state()
+        # Persist mode on shutdown -- unconditional (IMPORTANT 3, 2026-07-29).
+        # A stop() on a coordinator that never start()ed in THIS process
+        # (e.g. the very first API call after a fresh boot being
+        # /trading/stop) must still write mode=stopped, or a stale
+        # mode=active left over from a previous session survives in the
+        # blob and the next boot's resume_if_persisted() arms trading the
+        # operator explicitly switched off.
+        #
+        # 단, 전체 스냅샷(_persist_state)은 _persistence_active가 True일
+        # 때만 부른다 -- False면 이 프로세스는 _restore_state()를 돈 적이
+        # 없어서 메모리 상 positions/trade_queue/watch_list가 블롭의 실제
+        # 내용이 아니라 전부 빈 기본값이고, 그대로 직렬화하면 진짜 데이터를
+        # 지워 버린다(REGRESSION, 2026-07-29 리뷰). mode만은 여전히
+        # 영속돼야 하므로 그 경우엔 `_persist_mode_only()`로 mode 키만
+        # read-modify-write한다. 둘 다 never-raise라 셧다운을 깨지 않는다.
+        if self._persistence_active:
+            await self._persist_state()
+        else:
+            await self._persist_mode_only()
         self._persistence_active = False
 
         self._log_activity(
@@ -570,8 +580,16 @@ class ExecutionCoordinator:
         # 10:05 with no intervening persist -> blob still says "active" ->
         # boot resume calls start(drain_queue=False), NOT pause() ->
         # autonomous new entries unlock against the operator's explicit
-        # intent on a live account. _persist_state is never-raise.
-        await self._persist_state()
+        # intent on a live account.
+        #
+        # `_persistence_active`가 False(이 프로세스에서 start()를 거친 적
+        # 없음)면 전체 `_persist_state()` 대신 mode 키만 갱신한다 -- 이유는
+        # stop()의 동일 분기 주석 참고(REGRESSION, 2026-07-29 리뷰). 둘 다
+        # never-raise.
+        if self._persistence_active:
+            await self._persist_state()
+        else:
+            await self._persist_mode_only()
 
     async def resume(self):
         """Resume auto-trading."""
@@ -589,7 +607,13 @@ class ExecutionCoordinator:
         # must be durable the moment it changes, not only when some other
         # mutator happens to persist. Placed before the queue drain below so
         # the mode is on disk even if process_trade_queue hangs or fails.
-        await self._persist_state()
+        #
+        # `_persistence_active`가 False면 mode 키만 갱신한다 -- stop()의
+        # 동일 분기 주석 참고(REGRESSION, 2026-07-29 리뷰). 둘 다 never-raise.
+        if self._persistence_active:
+            await self._persist_state()
+        else:
+            await self._persist_mode_only()
 
         # Process any pending trades in queue (if market is open)
         market_session = self._market_hours.get_market_session(MarketType.KRX)
@@ -1759,6 +1783,40 @@ class ExecutionCoordinator:
             await storage.set_app_setting(self._STATE_KEY, blob)
         except Exception as e:
             logger.error(f"[Coordinator] Failed to persist state: {e}")
+
+    async def _persist_mode_only(self) -> None:
+        """`mode` 키만 read-modify-write로 갱신한다. Never-raise — `_persist_state`와
+        동일 계약.
+
+        `_persistence_active`가 False인 코디네이터(이 프로세스에서
+        `_restore_state()`가 한 번도 안 돈, 즉 `start()`를 거치지 않은
+        인스턴스)의 메모리 상 `_state`는 positions/trade_queue/watch_list/
+        tracked_orders가 전부 기본값(빈 값)이다 — 블롭의 실제 내용을 반영하지
+        않는다. 이 상태에서 `_persist_state()`(전체 스냅샷 직렬화)를 부르면
+        진짜 데이터를 빈 값으로 덮어써 버린다(REGRESSION, 2026-07-29 리뷰:
+        재시작 안전 브랜치 자신의 첫 배포 창에서 stop/pause/resume 중 아무거나
+        한 번만 호출돼도 보유 포지션의 손절가가 통째로 사라짐).
+
+        그래도 mode는 여전히 즉시 영속돼야 한다 — 부팅 재개가 신뢰하는
+        유일한 신호이기 때문이다. 그래서 전체 persist를 건너뛰는 대신, 기존
+        블롭을 읽어 mode 필드만 바꿔 쓴다. 블롭이 아직 없으면 mode 하나만
+        담은 블롭을 새로 쓴다 — 이후 진짜 `_persist_state()`가 나머지 필드를
+        채운다.
+        """
+        try:
+            from services.storage_service import get_storage_service
+
+            storage = await get_storage_service()
+            blob = await storage.get_app_setting(self._STATE_KEY)
+            data = json.loads(blob) if blob else {}
+            data["mode"] = (
+                self._state.mode.value
+                if hasattr(self._state.mode, "value")
+                else str(self._state.mode)
+            )
+            await storage.set_app_setting(self._STATE_KEY, json.dumps(data))
+        except Exception as e:
+            logger.error(f"[Coordinator] Failed to persist mode: {e}")
 
     async def _restore_state(self) -> None:
         """Reload restart-critical state. Positions (with stops) are re-registered
