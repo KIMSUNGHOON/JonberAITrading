@@ -138,6 +138,29 @@ _INTER_MARKET_DELAY = 1.0
 _CHART_DF_COLUMNS = ["date", "open", "high", "low", "close", "volume", "value"]
 
 
+def _val_or_none(raw, *, as_int: bool = False):
+    """밸류에이션 필드(per/pbr/eps/bps)를 파싱하되 **0과 결측을 구분**한다.
+
+    `if raw` 진위값 검사를 쓰면 숫자 0이 falsy라 None이 되는데, EPS 0은
+    실재하는 값(이익이 정확히 0)이라 "모름"으로 오분류된다. 적자 배제
+    게이트는 EPS<=0을 배제하도록 설계됐으므로 그 오분류가 게이트를 뚫는다.
+
+    결측으로 보는 것은 `None`과 빈 문자열뿐이다(키움이 미제공 시 ""를 준다).
+    파싱 실패도 결측으로 떨어뜨린다 — 예외를 올려 스캔 전체를 죽이지 않는다.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
+        return None
+    try:
+        parsed = KiwoomClient._parse_float(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed is None:
+        return None
+    return int(parsed) if as_int else parsed
+
+
 def _charts_to_df(charts) -> pd.DataFrame:
     """ChartData 리스트 → OHLCV+거래대금 DataFrame (순수 함수, 테스트 가능).
 
@@ -579,10 +602,16 @@ class KiwoomClient:
             low_prc=self._parse_signed_price(output.get("low_pric", output.get("low_prc", 0))),
             stk_hgpr=self._parse_signed_price(output.get("upl_pric", output.get("stk_hgpr", 0))),
             stk_lwpr=self._parse_signed_price(output.get("lst_pric", output.get("stk_lwpr", 0))),
-            per=self._parse_float(output.get("per")) if output.get("per") else None,
-            pbr=self._parse_float(output.get("pbr")) if output.get("pbr") else None,
-            eps=int(self._parse_float(output.get("eps"))) if output.get("eps") else None,
-            bps=int(self._parse_float(output.get("bps"))) if output.get("bps") else None,
+            # 진위값(`if output.get(...)`)이 아니라 결측/빈문자열만 걸러낸다.
+            # 진위값 검사는 숫자 0을 falsy로 보고 None을 만드는데, **EPS 0은
+            # 실재하는 값**(이익이 정확히 0)이라 "모름"으로 오분류된다. 적자
+            # 배제 게이트(factors.passes_quality_filter)는 EPS<=0을 배제하도록
+            # 설계됐으므로, 0이 None이 되면 fail-open으로 통과해 게이트가 조용히
+            # 뚫린다. PER/PBR 0은 실재하지 않지만 계약을 일관되게 둔다.
+            per=_val_or_none(output.get("per")),
+            pbr=_val_or_none(output.get("pbr")),
+            eps=_val_or_none(output.get("eps"), as_int=True),
+            bps=_val_or_none(output.get("bps"), as_int=True),
             # 상장주식수의 스펙 키는 flo_stk (감사 M2 — lstg_stqt는 미존재 키)
             lstg_stqt=self._parse_signed_price(output.get("flo_stk")) if output.get("flo_stk") else None,
             mrkt_tot_amt=self._parse_signed_price(output.get("mac", output.get("mrkt_tot_amt"))) if output.get("mac") or output.get("mrkt_tot_amt") else None,

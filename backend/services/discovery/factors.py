@@ -67,8 +67,12 @@ class StockSnapshot:
     name: str
     price: float
     market_cap: float
-    per: float
-    pbr: float
+    # per/pbr은 **결측 가능**이다. 0.0 폴백을 쓰면 안 된다 — 밸류 축을 랭킹에
+    # 붙이는 순간 PER 오름차순·E/P 내림차순 어느 쪽으로 정렬해도 "결측=0.0"
+    # 종목이 "무한히 싸다"로 최상위를 싹쓸이한다(2026-07-29 리서치 지적).
+    # PER 0·PBR 0은 실재하지 않는 값이므로 0.0은 곧 결측의 다른 표현이었다.
+    per: Optional[float]
+    pbr: Optional[float]
     volume: float
     chart_df: pd.DataFrame
     # 주당순이익(원). 적자 배제 게이트(2026-07-29)가 소비한다. 키움 ka10001이

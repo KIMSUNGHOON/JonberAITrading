@@ -108,3 +108,57 @@ class TestDailyChartContract:
             }]}
             candles = await client.get_daily_chart("005930")
         assert candles[0].acml_tr_pbmn == 825_000 * 1_000_000
+
+    # ---- 밸류에이션 필드 결측/0 구분 (2026-07-29) ----
+
+    @pytest.mark.asyncio
+    async def test_zero_eps_is_preserved_not_collapsed_to_none(self, client):
+        """EPS 0은 실재하는 값(이익이 정확히 0)이므로 None으로 붕괴하면 안 된다.
+
+        `if output.get("eps")` 진위값 검사는 숫자 0을 falsy로 보고 None을
+        만든다. 적자 배제 게이트(factors.passes_quality_filter)는 EPS<=0을
+        배제하도록 설계됐는데, 0이 None이 되면 "모름"으로 분류돼 fail-open으로
+        통과한다 — 게이트가 조용히 뚫린다.
+        """
+        with patch.object(client, "_request", new_callable=AsyncMock) as m:
+            m.return_value = {
+                "return_code": 0,
+                "output": {
+                    "stk_cd": "005930", "stk_nm": "삼성전자",
+                    "cur_prc": "70000", "eps": 0, "bps": 0,
+                },
+            }
+            info = await client.get_stock_info("005930")
+        assert info.eps == 0, "EPS 0이 None으로 붕괴하면 적자 게이트가 뚫린다"
+        assert info.bps == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_valuation_fields_stay_none(self, client):
+        """필드가 아예 없으면 None — '모름'과 '0'은 다른 상태다."""
+        with patch.object(client, "_request", new_callable=AsyncMock) as m:
+            m.return_value = {
+                "return_code": 0,
+                "output": {"stk_cd": "005930", "stk_nm": "삼성전자", "cur_prc": "70000"},
+            }
+            info = await client.get_stock_info("005930")
+        assert info.eps is None
+        assert info.bps is None
+        assert info.per is None
+        assert info.pbr is None
+
+    @pytest.mark.asyncio
+    async def test_empty_string_valuation_is_none(self, client):
+        """빈 문자열은 결측으로 취급한다(키움이 미제공 시 ""를 주는 경우)."""
+        with patch.object(client, "_request", new_callable=AsyncMock) as m:
+            m.return_value = {
+                "return_code": 0,
+                "output": {
+                    "stk_cd": "005930", "stk_nm": "삼성전자",
+                    "cur_prc": "70000", "eps": "", "per": "", "pbr": "", "bps": "",
+                },
+            }
+            info = await client.get_stock_info("005930")
+        assert info.eps is None
+        assert info.per is None
+        assert info.pbr is None
+        assert info.bps is None

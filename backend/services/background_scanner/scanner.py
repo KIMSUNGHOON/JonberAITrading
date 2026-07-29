@@ -985,8 +985,11 @@ class BackgroundScanner:
             if stock_info.mrkt_tot_amt is not None
             else 0.0
         )
-        per = float(stock_info.per) if stock_info.per is not None else 0.0
-        pbr = float(stock_info.pbr) if stock_info.pbr is not None else 0.0
+        # 0.0 폴백 금지 — 결측을 0.0으로 붕괴시키면 밸류 축 도입 시 "결측 =
+        # 무한히 싸다"가 되어 랭킹 최상위를 싹쓸이한다. PER 0·PBR 0은 실재하지
+        # 않으므로 0.0은 곧 결측의 다른 표현이었다.
+        per = float(stock_info.per) if stock_info.per is not None else None
+        pbr = float(stock_info.pbr) if stock_info.pbr is not None else None
         # 적자 배제 게이트용. per/pbr과 달리 0.0 폴백을 쓰지 않는다 — EPS 0은
         # "이익 없음"이라 게이트가 배제해야 하는 실제 값이고, 결측(None)은
         # "모름"이라 통과시켜야 하므로 둘을 구분해야 한다.
@@ -1073,13 +1076,12 @@ class BackgroundScanner:
                     ),
                 )
 
-                # 통과/탈락 두 분기가 공유하는 멀티플 적재분. per/pbr은 0.0
-                # 폴백을 쓰는 스냅샷 값이라 0.0과 결측이 섞이는데, 시계열에서는
-                # 그 둘을 구분해야 하므로 0.0을 None으로 되돌린다(PER 0·PBR 0은
-                # 실재하지 않는 값이다).
+                # 통과/탈락 두 분기가 공유하는 멀티플 적재분. per/pbr이 이제
+                # Optional이라 스냅샷 값을 그대로 넘긴다 — 0.0→None 되돌림이
+                # 필요했던 것은 스냅샷이 결측을 0.0으로 붕괴시키던 시절 얘기다.
                 _multiples = {
-                    "per": snap.per if snap.per else None,
-                    "pbr": snap.pbr if snap.pbr else None,
+                    "per": snap.per,
+                    "pbr": snap.pbr,
                     "eps": snap.eps,
                     "bps": snap.bps,
                 }
