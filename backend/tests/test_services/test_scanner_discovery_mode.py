@@ -92,6 +92,8 @@ def _stock_info(
     per: Optional[float] = 10.0,
     pbr: Optional[float] = 1.2,
     acml_vol: int = 500_000,
+    eps: Optional[int] = 7_000,   # 기본 흑자 — 적자 배제 게이트 통과
+    bps: Optional[int] = 58_000,
 ) -> StockBasicInfo:
     return StockBasicInfo(
         stk_cd=stk_cd,
@@ -101,6 +103,8 @@ def _stock_info(
         per=per,
         pbr=pbr,
         acml_vol=acml_vol,
+        eps=eps,
+        bps=bps,
     )
 
 
@@ -1563,3 +1567,81 @@ async def test_resolve_min_adtv_fallback_never_below_hard_floor(monkeypatch):
     resolved = await scanner._resolve_min_adtv()
 
     assert resolved == pytest.approx(HARD_FLOOR_ADTV)
+
+
+# ---------------------------------------------------------------------------
+# 멀티플 시계열 축적 (2026-07-29)
+#
+# rerating("멀티플이 어디에서 어디로 움직였나")은 당일 스냅샷으로 판정할 수
+# 없고 시계열이 필요하다. 지금까지 ka10001에서 per/pbr/eps를 받아 계산에만
+# 쓰고 버려왔다. 순수 적재이며 아직 아무도 소비하지 않는다.
+# ---------------------------------------------------------------------------
+
+
+async def test_multiples_saved_for_passing_stock(monkeypatch):
+    """품질필터 통과 종목의 factor_json에 per/pbr/eps/bps가 적재된다."""
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자", per=12.5, pbr=1.8,
+                                           eps=6_564, bps=63_976)},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=[("005930", "삼성전자", "코스피")], mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is True
+    assert fj["per"] == pytest.approx(12.5)
+    assert fj["pbr"] == pytest.approx(1.8)
+    assert fj["eps"] == pytest.approx(6_564)
+    assert fj["bps"] == pytest.approx(63_976)
+
+
+async def test_multiples_saved_for_rejected_stock(monkeypatch):
+    """탈락 종목도 멀티플을 남긴다.
+
+    통과분만 쌓으면 게이트에 편향된 시계열이 되어 "적자였다가 흑자 전환"이나
+    "유동성이 개선된 종목" 같은 상태 변화를 추적할 수 없다. 여기서는 적자
+    배제 게이트에 걸린 종목이 대상이다."""
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "적자기업", per=None, pbr=17.0,
+                                           eps=-2_317, bps=770)},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=[("005930", "적자기업", "코스피")], mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is False
+    assert fj["skip_reason"] == "negative_eps"
+    assert fj["eps"] == pytest.approx(-2_317)   # 탈락해도 적재됨
+    assert fj["bps"] == pytest.approx(770)
+    assert fj["pbr"] == pytest.approx(17.0)
+
+
+async def test_zero_multiples_stored_as_null(monkeypatch):
+    """per/pbr의 0.0 폴백은 None으로 되돌려 적재한다.
+
+    스냅샷은 결측을 0.0으로 채우는데, 시계열에서는 "PER 0"과 "PER 모름"을
+    구분해야 한다(PER 0·PBR 0은 실재하지 않는 값이다)."""
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자", per=None, pbr=None)},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=[("005930", "삼성전자", "코스피")], mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["per"] is None
+    assert fj["pbr"] is None

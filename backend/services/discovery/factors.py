@@ -75,6 +75,10 @@ class StockSnapshot:
     # 주는 값이며, 결측(None)은 "적자"가 아니라 "모름"이다 — 게이트는 결측을
     # 통과시킨다(fail-open). 기본값 None이라 기존 호출자는 무영향.
     eps: Optional[float] = None
+    # 주당순자산(원). 이 모듈은 소비하지 않지만 스캐너가 factor_json에 적재해
+    # 멀티플 시계열을 축적한다(2026-07-29). EPS/BPS가 있으면 일봉 60개와 결합해
+    # PER/PBR 밴드를 재구성할 수 있다 — PER_t ≈ price_t / EPS, PBR_t ≈ price_t / BPS.
+    bps: Optional[float] = None
 
 
 @dataclass

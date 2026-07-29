@@ -991,6 +991,7 @@ class BackgroundScanner:
         # "이익 없음"이라 게이트가 배제해야 하는 실제 값이고, 결측(None)은
         # "모름"이라 통과시켜야 하므로 둘을 구분해야 한다.
         eps = float(stock_info.eps) if stock_info.eps is not None else None
+        bps = float(stock_info.bps) if stock_info.bps is not None else None
         volume = float(stock_info.acml_vol) if stock_info.acml_vol is not None else 0.0
 
         return StockSnapshot(
@@ -1003,6 +1004,7 @@ class BackgroundScanner:
             volume=volume,
             chart_df=chart_df,
             eps=eps,
+            bps=bps,
         )
 
     @staticmethod
@@ -1071,6 +1073,17 @@ class BackgroundScanner:
                     ),
                 )
 
+                # 통과/탈락 두 분기가 공유하는 멀티플 적재분. per/pbr은 0.0
+                # 폴백을 쓰는 스냅샷 값이라 0.0과 결측이 섞이는데, 시계열에서는
+                # 그 둘을 구분해야 하므로 0.0을 None으로 되돌린다(PER 0·PBR 0은
+                # 실재하지 않는 값이다).
+                _multiples = {
+                    "per": snap.per if snap.per else None,
+                    "pbr": snap.pbr if snap.pbr else None,
+                    "eps": snap.eps,
+                    "bps": snap.bps,
+                }
+
                 if passed:
                     flow = flow_map.get(stk_cd)
                     scores = compute_strategy_scores(snap, flow)
@@ -1119,12 +1132,27 @@ class BackgroundScanner:
                         # 유동성 인지 아크: 사이징 캡(C1)과 토론 프롬프트(C2)가
                         # 이 값을 소비한다. None이면 소비자가 캡/문구를 생략한다.
                         "adtv20_med": _adtv,
+                        # 멀티플 시계열 축적(2026-07-29). 지금은 아무도 소비하지
+                        # 않는다 — 순수 적재다. 밸류에이션 rerating("멀티플이
+                        # 어디에서 어디로 움직였나")은 당일 스냅샷으로는 판정할
+                        # 수 없고 시계열이 필요한데, 지금까지 ka10001에서 받아
+                        # 계산에만 쓰고 버려왔다.
+                        #
+                        # EPS/BPS를 함께 남기는 이유: 일봉 60개와 결합하면
+                        # 밴드를 재구성할 수 있다(PER_t ≈ price_t/EPS,
+                        # PBR_t ≈ price_t/BPS). PER/PBR만 저장하면 관측일의
+                        # 점 하나씩만 남는다.
+                        **_multiples,
                     }
                     summary = f"{stk_nm}: 발굴 수집 완료(품질필터 통과)"
                 else:
                     factor_json = {
                         "quality_filter_passed": False,
                         "skip_reason": reason,
+                        # 탈락 종목도 멀티플을 남긴다 — 통과분만 쌓으면 게이트에
+                        # 편향된 시계열이 되고, "적자였다가 흑자 전환"이나
+                        # "유동성이 개선된 종목" 같은 상태 변화를 추적할 수 없다.
+                        **_multiples,
                     }
                     summary = f"{stk_nm}: 발굴 수집 완료(품질필터 탈락: {reason})"
 
