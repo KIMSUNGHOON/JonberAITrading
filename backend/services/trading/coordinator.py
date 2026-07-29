@@ -362,8 +362,20 @@ class ExecutionCoordinator:
     # Lifecycle
     # -------------------------------------------
 
-    async def start(self):
-        """Start the auto-trading system."""
+    async def start(self, drain_queue: bool = True, boot_resume: bool = False):
+        """Start the auto-trading system.
+
+        Args:
+            drain_queue: 장이 열려 있고 큐가 비어 있지 않을 때 즉시
+                process_trade_queue()를 돌릴지. 수동 /trading/start는
+                True(기존 동작)이고, **부팅 자동 재개만 False**를 넘긴다 —
+                QueuedTrade에 만료가 없고 process_trade_queue에 신선도
+                검사가 없어서, 사람이 앞에 없는 장중 재시작이 몇 시간 묵은
+                가격으로 주문을 낼 수 있다. 방어(손절/익절)는 이 값과
+                무관하게 즉시 살아난다.
+            boot_resume: 이 시작이 부팅 자동 재개인지. 활동 로그를 수동
+                시작과 구별하기 위한 표식일 뿐 동작을 바꾸지 않는다.
+        """
         logger.info("[Coordinator] Starting auto-trading system")
 
         # Fetch initial account info
@@ -395,17 +407,28 @@ class ExecutionCoordinator:
 
         self._log_activity(
             ActivityType.SYSTEM_START,
-            f"Auto-trading system started. Account: ₩{self._state.account.total_equity:,.0f}",
-            details={"account": self._state.account.model_dump()},
+            (
+                f"Auto-trading system {'auto-resumed after restart' if boot_resume else 'started'}. "
+                f"Account: ₩{self._state.account.total_equity:,.0f}"
+            ),
+            details={
+                "account": self._state.account.model_dump(),
+                "boot_resume": boot_resume,
+            },
         )
 
         await self._notify_state_change()
 
         # Process any pending trades in queue (if market is open)
         market_session = self._market_hours.get_market_session(MarketType.KRX)
-        if market_session.is_open and self.get_trade_queue():
+        if drain_queue and market_session.is_open and self.get_trade_queue():
             logger.info("[Coordinator] Processing pending trade queue after start")
             await self.process_trade_queue()
+        elif not drain_queue:
+            logger.info(
+                "[Coordinator] Boot resume — skipping startup queue drain "
+                "(stale-price guard)"
+            )
 
         # Seed the scheduler's edge state and start watching for the KRX
         # closed→open transition so a queue built overnight processes at open.
@@ -421,6 +444,46 @@ class ExecutionCoordinator:
             self._watch_refresh_task = asyncio.create_task(
                 self._watch_refresh_loop()
             )
+
+    async def resume_if_persisted(self) -> bool:
+        """부팅 시 호출 — 마지막으로 저장된 mode가 active/paused면 방어를
+        되살린다. 실제로 재개했으면 True, no-op이면 False.
+
+        복원 기계 자체는 start() 안의 _restore_state()가 이미 갖고 있다.
+        이 메서드가 하는 일은 "되살려도 되는가"의 판단뿐이다.
+
+        규칙:
+          active → start(drain_queue=False)
+          paused → start(drain_queue=False) 후 pause() — pause는 감시를
+                   유지하므로 손절은 살고 신규 진입만 잠긴다
+          stopped / mode 필드 없음 / 블롭 없음 → 아무것도 안 함
+
+        mode 필드가 없는 블롭(이 기능 이전에 저장된 것)에서 재개하지 않는
+        것은 의도다 — 추측해서 되살리는 것보다 안전하다. 배포 후 첫 수동
+        start()가 mode를 기록하고, 그 다음 재시작부터 자동으로 동작한다.
+
+        예외는 삼키지 않는다. 호출자(app.main._boot_auto_resume)가 잡아서
+        로그와 Telegram에 남긴다 — 방어를 못 켠 것은 조용히 넘어갈 일이
+        아니다.
+        """
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
+        blob = await storage.get_app_setting(self._STATE_KEY)
+        if not blob:
+            logger.info("[Coordinator] Boot resume: no persisted state")
+            return False
+
+        mode = (json.loads(blob) or {}).get("mode")
+        if mode not in (TradingMode.ACTIVE.value, TradingMode.PAUSED.value):
+            logger.info(f"[Coordinator] Boot resume skipped (mode={mode!r})")
+            return False
+
+        logger.info(f"[Coordinator] Boot resume: restoring mode={mode}")
+        await self.start(drain_queue=False, boot_resume=True)
+        if mode == TradingMode.PAUSED.value:
+            await self.pause("restart resume")
+        return True
 
     async def stop(self):
         """Stop the auto-trading system."""
