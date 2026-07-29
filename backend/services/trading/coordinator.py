@@ -474,9 +474,18 @@ class ExecutionCoordinator:
             logger.info("[Coordinator] Boot resume: no persisted state")
             return False
 
-        mode = (json.loads(blob) or {}).get("mode")
+        data = json.loads(blob) or {}
+        mode = data.get("mode")
         if mode not in (TradingMode.ACTIVE.value, TradingMode.PAUSED.value):
             logger.info(f"[Coordinator] Boot resume skipped (mode={mode!r})")
+            # RECOMMENDATION 8 (2026-07-29): this no-op is correct and stays
+            # correct -- a blob without a valid mode should never guess its
+            # way into resuming. But it lands the operator in exactly the
+            # pre-branch hole (positions with no defense) with only an info
+            # log, and it fires on THIS branch's very first deploy (no blob
+            # has a "mode" field yet). If positions are sitting in the same
+            # blob we just parsed, say so on the phone.
+            await self._alert_defense_not_armed(data)
             return False
 
         logger.info(f"[Coordinator] Boot resume: restoring mode={mode}")
@@ -484,6 +493,28 @@ class ExecutionCoordinator:
         if mode == TradingMode.PAUSED.value:
             await self.pause("restart resume")
         return True
+
+    async def _alert_defense_not_armed(self, data: dict) -> None:
+        """RECOMMENDATION 8 (2026-07-29): resume_if_persisted()이 재개를
+        건너뛰었는데 같은 블롭에 보유 포지션이 남아 있으면, 방어가 꺼진 채
+        부팅됐다는 사실을 알린다. Best-effort — 알림 실패가 부팅을 막지
+        않는다."""
+        positions = data.get("positions") or []
+        if not positions:
+            return
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_system_status(
+                    "error",
+                    f"부팅 자동 방어 복원 건너뜀 — 보유 포지션 {len(positions)}건이 "
+                    f"무방비 상태입니다. 수동으로 POST /api/trading/start 를 "
+                    f"실행하세요.",
+                )
+        except Exception as e:
+            logger.error(f"[Coordinator] Failed to alert unarmed defense: {e}")
 
     async def stop(self):
         """Stop the auto-trading system."""
@@ -502,9 +533,15 @@ class ExecutionCoordinator:
             self._watch_refresh_task.cancel()
             self._watch_refresh_task = None
 
-        # Persist restart-critical state on graceful shutdown, then deactivate.
-        if self._persistence_active:
-            await self._persist_state()
+        # Persist restart-critical state on shutdown -- unconditional
+        # (IMPORTANT 3, 2026-07-29). A stop() on a coordinator that never
+        # start()ed in THIS process (e.g. the very first API call after a
+        # fresh boot being /trading/stop) must still write mode=stopped, or
+        # a stale mode=active left over from a previous session survives in
+        # the blob and the next boot's resume_if_persisted() arms trading
+        # the operator explicitly switched off. _persist_state is
+        # never-raise, so this cannot break shutdown.
+        await self._persist_state()
         self._persistence_active = False
 
         self._log_activity(
@@ -527,6 +564,15 @@ class ExecutionCoordinator:
 
         await self._notify_state_change()
 
+        # IMPORTANT 3 (2026-07-29): persist mode immediately, don't wait for
+        # some unrelated mutator to happen to fire a persist. Otherwise:
+        # operator pauses at 10:00 to stop new entries -> process dies at
+        # 10:05 with no intervening persist -> blob still says "active" ->
+        # boot resume calls start(drain_queue=False), NOT pause() ->
+        # autonomous new entries unlock against the operator's explicit
+        # intent on a live account. _persist_state is never-raise.
+        await self._persist_state()
+
     async def resume(self):
         """Resume auto-trading."""
         await self.risk_monitor.resume()
@@ -538,6 +584,12 @@ class ExecutionCoordinator:
         )
 
         await self._notify_state_change()
+
+        # IMPORTANT 3 (2026-07-29): same reasoning as pause() above -- mode
+        # must be durable the moment it changes, not only when some other
+        # mutator happens to persist. Placed before the queue drain below so
+        # the mode is on disk even if process_trade_queue hangs or fails.
+        await self._persist_state()
 
         # Process any pending trades in queue (if market is open)
         market_session = self._market_hours.get_market_session(MarketType.KRX)

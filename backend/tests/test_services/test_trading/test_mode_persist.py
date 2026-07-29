@@ -93,6 +93,69 @@ async def test_mode_is_active_before_persistence_is_armed(tmp_path):
     assert seen["persistence_active"] is True
 
 
+async def test_pause_persists_mode(tmp_path):
+    """IMPORTANT 3 (2026-07-29): pause()가 mode 변경을 즉시 영속해야 한다.
+    다른 뮤테이터가 우연히 persist를 트리거할 때까지 기다리면, 그 사이
+    프로세스가 죽었을 때 블롭이 여전히 active로 남고, 부팅 재개가
+    pause()로 잠갔던 신규 진입을 무시한 채 켠다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+    coord._persistence_active = True
+    coord._state.mode = TradingMode.ACTIVE
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        await coord.pause("operator pause")
+        blob = await storage.get_app_setting(coord._STATE_KEY)
+
+    assert json.loads(blob)["mode"] == "paused"
+
+
+async def test_resume_persists_mode(tmp_path):
+    """IMPORTANT 3: resume()도 동일하게 즉시 영속해야 한다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+    coord._persistence_active = True
+    coord._state.mode = TradingMode.PAUSED
+    coord._market_hours.get_market_session = lambda _m: type(
+        "S", (), {"is_open": False}
+    )()
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        await coord.resume()
+        blob = await storage.get_app_setting(coord._STATE_KEY)
+
+    assert json.loads(blob)["mode"] == "active"
+
+
+async def test_stop_persists_mode_unconditionally_even_if_never_started(tmp_path):
+    """IMPORTANT 3: stop()의 persist는 무조건이어야 한다. 이 프로세스에서
+    한 번도 start()된 적 없는(_persistence_active=False인) 코디네이터의
+    stop()도 mode=stopped를 반드시 써야 한다 — 그렇지 않으면 이전 세션이
+    남긴 stale "active"가 다음 부팅에서 트레이딩을 무단으로 켠다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+    assert coord._persistence_active is False  # bare construction, never start()ed
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        # 이전 세션이 남긴 stale "active" 블롭을 흉내낸다.
+        await storage.set_app_setting(
+            coord._STATE_KEY,
+            json.dumps({
+                "positions": [], "trade_queue": [], "watch_list": [],
+                "daily_trades_count": 0, "daily_count_date": "2026-07-29",
+                "mode": "active",
+            }),
+        )
+
+        await coord.stop()
+        blob = await storage.get_app_setting(coord._STATE_KEY)
+
+    assert json.loads(blob)["mode"] == "stopped"
+
+
 async def test_restore_ignores_mode_and_survives_blob_without_it(tmp_path):
     """이 기능 이전에 저장된 블롭(mode 키 없음)을 복원해도 터지지 않아야
     하고, _restore_state는 mode를 적용하지 않는다 — 재개 판단은

@@ -456,31 +456,46 @@ class ChatCoordinator:
         logger.info("chat_coordinator_starting")
 
         self._running = True
-        self._scheduler = AsyncIOScheduler()
+        try:
+            self._scheduler = AsyncIOScheduler()
 
-        # Initialize and start position manager
-        self._position_manager = await get_position_manager()
-        self._position_manager.set_chat_coordinator(self)
-        await self._position_manager.start()
+            # Initialize and start position manager
+            self._position_manager = await get_position_manager()
+            self._position_manager.set_chat_coordinator(self)
+            await self._position_manager.start()
 
-        # Sync positions from account
-        await self._position_manager.sync_from_account()
+            # Sync positions from account
+            await self._position_manager.sync_from_account()
 
-        # Restore persisted stop levels (F3 Task 7) — must run AFTER the sync
-        # above so it only ever restores stops onto tickers the broker still
-        # confirms are held.
-        await self._position_manager.restore_stop_overlay()
+            # Restore persisted stop levels (F3 Task 7) — must run AFTER the sync
+            # above so it only ever restores stops onto tickers the broker still
+            # confirms are held.
+            await self._position_manager.restore_stop_overlay()
 
-        # Schedule periodic watch list check
-        self._scheduler.add_job(
-            self._check_watch_list,
-            'interval',
-            minutes=self.check_interval,
-            id='watch_list_check',
-            next_run_time=datetime.now(),  # Run immediately
-        )
+            # Schedule periodic watch list check
+            self._scheduler.add_job(
+                self._check_watch_list,
+                'interval',
+                minutes=self.check_interval,
+                id='watch_list_check',
+                next_run_time=datetime.now(),  # Run immediately
+            )
 
-        self._scheduler.start()
+            self._scheduler.start()
+        except BaseException:
+            # CRITICAL 2 (2026-07-29): _running was already flipped True above,
+            # before every await that can hang or fail (position manager
+            # start/sync, Kiwoom sync, stop-overlay restore). If any of them
+            # raises -- or the boot path's wait_for times out and cancels this
+            # coroutine mid-flight (CancelledError, a BaseException, not an
+            # Exception) -- _running must NOT stay True: resume_if_persisted()
+            # has no try/except of its own, so leaving it True means a later
+            # manual POST /agent-chat/start hits `if self._running: return`
+            # and reports HTTP 200 "started" while nothing actually restarted
+            # (scheduler never started, stop overlay never restored). Roll
+            # back and re-raise so the caller still sees the real failure.
+            self._running = False
+            raise
 
         logger.info(
             "chat_coordinator_started",
@@ -498,22 +513,33 @@ class ChatCoordinator:
 
         self._running = False
 
-        if self._scheduler:
-            self._scheduler.shutdown(wait=False)
-            self._scheduler = None
+        # IMPORTANT 4 (2026-07-29): the persist below must run even if
+        # shutdown/stop/cancel raises mid-body -- e.g. a half-started
+        # coordinator (CRITICAL 2: _scheduler constructed but never
+        # .start()ed) makes shutdown() raise SchedulerNotRunningError before
+        # ever reaching the old unconditional persist call. Without the
+        # `finally`, memory says _running=False but the persisted blob still
+        # says running: True, and the next boot resurrects a coordinator the
+        # operator explicitly stopped -- one that runs discussions, votes,
+        # and autonomous BUY execution, not just a passive watcher.
+        try:
+            if self._scheduler:
+                self._scheduler.shutdown(wait=False)
+                self._scheduler = None
 
-        # Stop position manager
-        if self._position_manager:
-            await self._position_manager.stop()
+            # Stop position manager
+            if self._position_manager:
+                await self._position_manager.stop()
 
-        # Cancel active rooms
-        for ticker, room in list(self._active_rooms.items()):
-            await room.cancel()
+            # Cancel active rooms
+            for ticker, room in list(self._active_rooms.items()):
+                await room.cancel()
 
-        self._active_rooms.clear()
+            self._active_rooms.clear()
 
-        logger.info("chat_coordinator_stopped")
-        await self._persist_runtime_state()
+            logger.info("chat_coordinator_stopped")
+        finally:
+            await self._persist_runtime_state()
 
     async def _persist_runtime_state(self) -> None:
         """running/check_interval/max_concurrent를 SQLite에 남긴다.

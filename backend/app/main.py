@@ -23,7 +23,7 @@ from app.core.analysis_limiter import cleanup_old_sessions
 from app.logging_config import configure_logging, RequestLoggingMiddleware
 from services.realtime_service import close_realtime_service, get_realtime_service
 from services.storage_service import close_storage_service, get_storage_service
-from services.telegram import get_telegram_notifier
+from services.telegram import get_telegram_notifier, TelegramNotifier
 from services.telegram.receiver import start_telegram_receiver, stop_telegram_receiver
 from services.krx_holiday import get_holiday_service
 from services.session_manager import get_session_manager
@@ -63,12 +63,18 @@ async def _resume_one(label: str, get_coordinator) -> tuple[str, bool, Exception
     타임아웃도 코디네이터마다 따로 건다(전체를 하나로 묶으면 앞선
     코디네이터가 예산을 다 써버려 뒤 코디네이터가 사실상 시도조차 못
     한다).
+
+    get_coordinator() 자체도 wait_for 안에서 부른다(MINOR 5) —
+    get_shared_kiwoom_client_async()가 잡는 모듈 전역 asyncio.Lock이 걸려
+    있으면 코디네이터 획득 자체가 예산 밖에서 무한정 멈출 수 있었다.
     """
-    try:
+
+    async def _do() -> bool:
         coordinator = await get_coordinator()
-        resumed = await asyncio.wait_for(
-            coordinator.resume_if_persisted(), timeout=BOOT_AUTO_RESUME_TIMEOUT_S
-        )
+        return await coordinator.resume_if_persisted()
+
+    try:
+        resumed = await asyncio.wait_for(_do(), timeout=BOOT_AUTO_RESUME_TIMEOUT_S)
         return label, resumed, None
     except Exception as e:
         return label, False, e
@@ -134,20 +140,40 @@ async def _boot_auto_resume() -> None:
         # 재개 성공, 에이전트챗 실패) 운영자가 트레이딩 명령만 실행하고 다
         # 됐다고 믿을 수 있다. 알림 실패가 부팅을 막지 않도록 이 호출도
         # 따로 감싼다.
+        #
+        # CRITICAL 1 (2026-07-29): label/타입명/str(error)는 전부 자유텍스트다.
+        # send_system_status가 legacy Markdown으로 보내므로 이스케이프 없이
+        # 넣으면 "_"(예: agent_chat) 하나로도 Telegram이 400을 뱉고
+        # _send_message가 그 실패를 조용히 삼킨다 — 방어가 안 켜졌다는 알림
+        # 자체가 유실된다(service.py:728의 daily_cap 사고와 동일 패턴).
+        # TelegramNotifier._md_escape로 자유텍스트 부분만 이스케이프한다
+        # (복구 명령 문자열은 고정 상수라 이스케이프 대상이 아니다).
         try:
             notifier = await get_telegram_notifier()
             if notifier.is_ready:
                 detail = " / ".join(
-                    f"{label} 실패({type(error).__name__}: {error}) — 수동으로 "
+                    f"{TelegramNotifier._md_escape(label)} 실패("
+                    f"{TelegramNotifier._md_escape(type(error).__name__)}: "
+                    f"{TelegramNotifier._md_escape(str(error))}) — 수동으로 "
                     f"{_BOOT_RESUME_REMEDIATION.get(label, label)} 를 실행하세요."
                     for label, error in failures
                 )
-                await notifier.send_system_status(
+                sent = await notifier.send_system_status(
                     "error",
                     f"부팅 자동 방어 복원 실패 — 감시 일부가 꺼져 있습니다. {detail}",
                 )
-        except Exception:
-            logger.error("boot_auto_resume_alert_failed")
+                # MINOR 6: send_system_status는 설정으로 꺼져 있거나 발송이
+                # 실패하면 조용히 False를 돌려준다 — 미발송 알림이 발송된
+                # 것처럼 보이면 안 된다.
+                if not sent:
+                    logger.error("boot_auto_resume_alert_not_sent")
+        except Exception as e:
+            # MINOR 7: 원인 없이는 로그가 "그냥 실패"로만 남는다.
+            logger.error(
+                "boot_auto_resume_alert_failed",
+                error_type=type(e).__name__,
+                error=str(e),
+            )
     except Exception as e:
         # 최후 방어선. _resume_one이 코디네이터별 예외를 이미 삼키므로 여기까지
         # 오는 건 get_trading_coordinator/get_chat_coordinator의 import 실패 같은
@@ -160,13 +186,20 @@ async def _boot_auto_resume() -> None:
         try:
             notifier = await get_telegram_notifier()
             if notifier.is_ready:
-                await notifier.send_system_status(
+                sent = await notifier.send_system_status(
                     "error",
                     f"부팅 자동 방어 복원 중 예상 밖 오류 — 수동으로 상태를 "
-                    f"확인하세요. ({type(e).__name__}: {e})",
+                    f"확인하세요. ({TelegramNotifier._md_escape(type(e).__name__)}: "
+                    f"{TelegramNotifier._md_escape(str(e))})",
                 )
-        except Exception:
-            logger.error("boot_auto_resume_alert_failed")
+                if not sent:
+                    logger.error("boot_auto_resume_alert_not_sent")
+        except Exception as alert_error:
+            logger.error(
+                "boot_auto_resume_alert_failed",
+                error_type=type(alert_error).__name__,
+                error=str(alert_error),
+            )
 
 
 @asynccontextmanager

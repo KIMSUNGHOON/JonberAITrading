@@ -7,7 +7,7 @@ process_trade_queue에 신선도 검사가 없다).
 """
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -21,11 +21,14 @@ def _make_coordinator() -> ExecutionCoordinator:
     return ExecutionCoordinator(kiwoom_client=None)
 
 
-async def _seed(storage: StorageService, coord: ExecutionCoordinator, mode) -> None:
+async def _seed(
+    storage: StorageService, coord: ExecutionCoordinator, mode, positions=None
+) -> None:
     """mode 필드만 있는 최소 블롭을 심는다. mode=None이면 필드를 아예 뺀다
-    (이 기능 이전에 저장된 블롭 모양)."""
+    (이 기능 이전에 저장된 블롭 모양). positions는 RECOMMENDATION 8
+    (보유 포지션 있는데 재개 안 함 알림) 테스트용 -- 기본은 빈 리스트."""
     payload = {
-        "positions": [],
+        "positions": positions if positions is not None else [],
         "trade_queue": [],
         "watch_list": [],
         "daily_trades_count": 0,
@@ -76,17 +79,83 @@ async def test_paused_resumes_then_pauses(tmp_path):
 async def test_stopped_or_missing_mode_is_noop(tmp_path, mode):
     storage = StorageService(db_path=str(tmp_path / "storage.db"))
     coord = _make_coordinator()
-    await _seed(storage, coord, mode)
+    await _seed(storage, coord, mode)  # positions=[] by default
 
     coord.start = AsyncMock()
     coord.pause = AsyncMock()
 
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_system_status = AsyncMock()
+
     with patch("services.storage_service.get_storage_service",
-               new=AsyncMock(return_value=storage)):
+               new=AsyncMock(return_value=storage)), \
+         patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
         resumed = await coord.resume_if_persisted()
 
     assert resumed is False
     coord.start.assert_not_awaited()
+    # RECOMMENDATION 8: 포지션이 없으면 (아무것도 무방비가 아니므로) 알림도
+    # 없어야 한다.
+    notifier.send_system_status.assert_not_awaited()
+
+
+@pytest.mark.parametrize("mode", ["stopped", None])
+async def test_noop_with_open_positions_alerts_defense_not_armed(tmp_path, mode):
+    """RECOMMENDATION 8 (2026-07-29): mode 없음/stopped라 재개를
+    건너뛰었는데 같은 블롭에 보유 포지션이 남아 있으면, 방어가 꺼진 채
+    부팅됐다는 사실이 폰까지 가야 한다. mode=None은 이 브랜치의 첫 배포가
+    정확히 타는 경로다 — 어떤 블롭에도 아직 mode 필드가 없다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+    await _seed(
+        storage, coord, mode,
+        positions=[{"ticker": "005930", "quantity": 10, "avg_price": 70000}],
+    )
+
+    coord.start = AsyncMock()
+    coord.pause = AsyncMock()
+
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_system_status = AsyncMock()
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)), \
+         patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        resumed = await coord.resume_if_persisted()
+
+    assert resumed is False
+    coord.start.assert_not_awaited()
+    notifier.send_system_status.assert_awaited_once()
+
+    message = notifier.send_system_status.await_args.args[1]
+    assert "1" in message  # 포지션 건수
+    assert "POST /api/trading/start" in message
+
+
+async def test_noop_alert_failure_does_not_propagate(tmp_path):
+    """알림 전송 자체가 터져도 resume_if_persisted()는 raise하면 안 된다
+    (best-effort) -- 방어를 못 켰다는 사실을 못 알렸다고 부팅 재개 판단
+    자체가 죽어서는 안 된다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+    await _seed(
+        storage, coord, "stopped",
+        positions=[{"ticker": "005930", "quantity": 10, "avg_price": 70000}],
+    )
+
+    coord.start = AsyncMock()
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)), \
+         patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(side_effect=RuntimeError("telegram down"))):
+        resumed = await coord.resume_if_persisted()  # raise하지 않아야 한다
+
+    assert resumed is False
 
 
 async def test_no_blob_at_all_is_noop(tmp_path):
