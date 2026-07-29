@@ -364,6 +364,11 @@ class ChatCoordinator:
     _WEIGHT_TILT_MIN = 0.5   # base 대비 하한 배수 (RISK 0.30→최소 0.15, 소거 불가)
     _WEIGHT_TILT_MAX = 1.5
 
+    # 재시작 안전(2026-07-29): _running/check_interval/max_concurrent는 전부
+    # 인메모리라 재시작이 생성자 기본값(1분 / 동시 3)으로 되돌렸다. 이
+    # 세 개만 SQLite에 남겨 부팅 시 그대로 복원한다.
+    _RUNTIME_KEY = "agent_chat:coordinator_state"
+
     def __init__(
         self,
         check_interval_minutes: int = 1,
@@ -482,6 +487,7 @@ class ChatCoordinator:
             check_interval=self.check_interval,
             positions_monitored=len(self._position_manager.get_all_positions()),
         )
+        await self._persist_runtime_state()
 
     async def stop(self) -> None:
         """Stop the coordinator."""
@@ -507,6 +513,67 @@ class ChatCoordinator:
         self._active_rooms.clear()
 
         logger.info("chat_coordinator_stopped")
+        await self._persist_runtime_state()
+
+    async def _persist_runtime_state(self) -> None:
+        """running/check_interval/max_concurrent를 SQLite에 남긴다.
+
+        Best-effort — 저장 실패가 start/stop을 깨뜨려선 안 된다(방어를
+        켜는 것이 설정을 기록하는 것보다 중요하다)."""
+        try:
+            from services.storage_service import get_storage_service
+
+            storage = await get_storage_service()
+            await storage.set_app_setting(
+                self._RUNTIME_KEY,
+                json.dumps(
+                    {
+                        "running": self._running,
+                        "check_interval": self.check_interval,
+                        "max_concurrent": self.max_concurrent,
+                    }
+                ),
+            )
+        except Exception as e:
+            logger.error("chat_coordinator_persist_failed", error=str(e))
+
+    async def resume_if_persisted(self) -> bool:
+        """부팅 시 호출 — 마지막으로 running이었으면 저장된 설정으로
+        되살린다. 실제로 재개했으면 True, no-op이면 False.
+
+        설정값은 검증한다: check_interval이 0이면 APScheduler가 매초 도는
+        폭주가 되고, max_concurrent가 0이면 토론이 영영 안 열린다. 이상한
+        값은 무시하고 현재 값(생성자 기본값)을 지킨다.
+
+        예외는 삼키지 않는다 — 호출자(app.main._boot_auto_resume)가 잡아서
+        로그와 Telegram에 남긴다."""
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
+        blob = await storage.get_app_setting(self._RUNTIME_KEY)
+        if not blob:
+            logger.info("chat_coordinator_boot_resume_skipped", reason="no_state")
+            return False
+
+        data = json.loads(blob) or {}
+        if not data.get("running"):
+            logger.info("chat_coordinator_boot_resume_skipped", reason="not_running")
+            return False
+
+        interval = data.get("check_interval")
+        if isinstance(interval, int) and not isinstance(interval, bool) and interval > 0:
+            self.check_interval = interval
+        concurrent = data.get("max_concurrent")
+        if isinstance(concurrent, int) and not isinstance(concurrent, bool) and concurrent > 0:
+            self.max_concurrent = concurrent
+
+        logger.info(
+            "chat_coordinator_boot_resume",
+            check_interval=self.check_interval,
+            max_concurrent=self.max_concurrent,
+        )
+        await self.start()
+        return True
 
     @property
     def position_manager(self) -> Optional[PositionManager]:
