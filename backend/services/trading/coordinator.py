@@ -378,6 +378,13 @@ class ExecutionCoordinator:
         # restore failure must never block the state restore above.
         await self._restore_strategy()
 
+        # Update state — persist 활성화보다 **앞**이어야 한다. 순서가
+        # 반대면 그 사이에 트리거된 persist가 직전 mode(보통 STOPPED)를
+        # 저장하고, 다음 부팅의 자동 방어 복원이 그 값을 보고 재개를
+        # 건너뛴다(2026-07-29 재시작 안전).
+        self._state.mode = TradingMode.ACTIVE
+        self._state.started_at = datetime.now()
+
         # Activate persistence BEFORE the startup queue drain below, so trades
         # executed at open are persisted — otherwise a crash before the next
         # persist re-executes them and loses their stop defense (review #3).
@@ -385,10 +392,6 @@ class ExecutionCoordinator:
 
         # Start risk monitor
         await self.risk_monitor.start()
-
-        # Update state
-        self._state.mode = TradingMode.ACTIVE
-        self._state.started_at = datetime.now()
 
         self._log_activity(
             ActivityType.SYSTEM_START,
@@ -1627,6 +1630,14 @@ class ExecutionCoordinator:
                     "daily_count_date": date.today().isoformat(),
                     "tracked_orders": self.fill_tracker.to_payload(),
                     "risk_params": self.risk_params.model_dump(),
+                    # 재시작 안전(2026-07-29): 부팅 시 "꺼져 있었나 켜져
+                    # 있었나"를 알 유일한 근거다. resume_if_persisted()가
+                    # 이 값만 보고 방어를 되살릴지 정한다. _restore_state는
+                    # 이 필드를 읽지 않는다 — 수동 start()는 기존대로
+                    # 무조건 ACTIVE로 간다.
+                    "mode": self._state.mode.value
+                    if hasattr(self._state.mode, "value")
+                    else str(self._state.mode),
                 }
             )
             storage = await get_storage_service()
