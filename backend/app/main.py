@@ -41,6 +41,65 @@ logger = structlog.get_logger()
 # discarded via add_done_callback once the task completes.
 _background_tasks: set[asyncio.Task] = set()
 
+# 부팅 자동 방어 복원의 상한. start()가 _refresh_account_info()로 키움을
+# 부르므로, API가 죽어 있으면 부팅이 영영 멈출 수 있다.
+BOOT_AUTO_RESUME_TIMEOUT_S = 60
+
+
+async def _boot_auto_resume() -> None:
+    """재시작 후 사람이 /trading/start를 칠 때까지 손절·익절이 무방비인
+    창을 없앤다.
+
+    복원 기계는 이미 각 코디네이터의 start() 안에 다 있었고(_restore_state,
+    restore_stop_overlay), 부팅 시 그것을 부를 사람이 없던 것이 유일한
+    갭이었다. 여기서는 "되살릴지 말지"만 정한다 — 판단 자체는 각
+    코디네이터의 resume_if_persisted()가 저장된 상태를 보고 내린다.
+
+    fire-and-forget이 아니라 await로 부른다(US 신호 갱신과 의도적으로
+    다르다). 부팅 몇 초 지연이 무방비 몇 분보다 낫다. 대신 전체에
+    타임아웃을 걸어 키움 장애가 부팅을 영영 막지 못하게 한다.
+
+    절대 raise하지 않는다 — 방어 복원 실패가 서버 부팅을 막아선 안 된다.
+    다만 무성 실패도 금지라, 실패는 로그와 Telegram 양쪽에 남긴다.
+    """
+    if not settings.BOOT_AUTO_RESUME_ENABLED:
+        logger.info("boot_auto_resume_disabled")
+        return
+
+    try:
+        from app.dependencies import get_trading_coordinator
+        from services.agent_chat.coordinator import get_chat_coordinator
+
+        async def _resume_all():
+            trading = await get_trading_coordinator()
+            trading_resumed = await trading.resume_if_persisted()
+            chat = await get_chat_coordinator()
+            chat_resumed = await chat.resume_if_persisted()
+            return trading_resumed, chat_resumed
+
+        trading_resumed, chat_resumed = await asyncio.wait_for(
+            _resume_all(), timeout=BOOT_AUTO_RESUME_TIMEOUT_S
+        )
+        logger.info(
+            "boot_auto_resume_complete",
+            trading=trading_resumed,
+            agent_chat=chat_resumed,
+        )
+    except Exception as e:
+        logger.error("boot_auto_resume_failed", error=str(e))
+        # 무성 실패 금지 — 방어를 못 켰다는 사실은 폰까지 가야 한다.
+        # 알림 실패가 부팅을 막지 않도록 이 호출도 따로 감싼다.
+        try:
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_system_status(
+                    "error",
+                    f"부팅 자동 방어 복원 실패 — 손절 감시가 꺼져 있습니다. "
+                    f"수동으로 POST /api/trading/start 를 실행하세요. ({e})",
+                )
+        except Exception:
+            logger.error("boot_auto_resume_alert_failed")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -169,6 +228,12 @@ async def lifespan(app: FastAPI):
     # Start session cleanup background task
     asyncio.create_task(cleanup_old_sessions())
     logger.info("session_cleanup_task_started")
+
+    # 재시작 안전(2026-07-29): 마지막으로 저장된 mode가 active/paused면
+    # 트레이딩·에이전트챗 코디네이터를 자동으로 되살린다. autonomy rearm
+    # 뒤에 둔다 — 승인 대기 세션이 카운트다운을 먼저 받아야 하고
+    # SessionManager도 초기화돼 있어야 한다. never-raise.
+    await _boot_auto_resume()
 
     # Initialize Telegram notifications (if configured)
     try:

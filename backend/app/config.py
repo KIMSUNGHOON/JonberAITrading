@@ -198,6 +198,12 @@ class Settings(BaseSettings):
     # 수렴한다 — R-cap과 max_single_position_pct 캡은 계속 작동한다.
     LIQUIDITY_SIZING_CAP_ENABLED: bool = True
 
+    # 재시작 안전(2026-07-29): 부팅 시 마지막으로 저장된 mode가 active/
+    # paused면 트레이딩·에이전트챗 코디네이터를 자동으로 되살린다. 끄면
+    # 재시작 후 사람이 POST /api/trading/start를 칠 때까지 손절·익절이
+    # 무방비인 기존 동작으로 돌아간다.
+    BOOT_AUTO_RESUME_ENABLED: bool = True
+
     # -------------------------------------------
     # Naver API Configuration (News Search)
     # https://developers.naver.com/apps
