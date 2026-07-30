@@ -13,7 +13,7 @@ from typing import Optional
 
 import structlog
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 
 from services.telegram.config import get_telegram_config, TelegramConfig
 
@@ -141,8 +141,49 @@ class TelegramNotifier:
 
             return True
         except TelegramError as e:
-            logger.error("telegram_send_failed", error=str(e))
-            return False
+            # Markdown 파싱 실패는 재시도 가치가 있다 — 이 레포는 같은 원인으로
+            # 라이브 통지를 두 번 잃었고(51227ca), 세 번째가 진행 중이었다
+            # (_notify_decision의 'NO_ACTION' 밑줄, 07-30 하루 18건+).
+            # 파싱 외 실패(네트워크·권한)는 재시도하면 중복 발송이 되므로 제외.
+            reason = str(e)
+            # BadRequest는 Telegram이 요청을 동기적으로 거부했다는 뜻이라
+            # 메시지가 실제로 발송된 적이 없다 — 재시도해도 중복 발송 위험이
+            # 없다. TimedOut/NetworkError/Forbidden 등 그 외 TelegramError는
+            # 전송 여부가 불확실하므로(응답만 유실됐을 수 있음) 재시도하지
+            # 않는다. 메시지 문자열(parse/entity 등)만으로 판별하면 Telegram
+            # API가 문구를 바꿀 때마다 조용히 깨지므로 예외 타입으로 판별한다.
+            is_parse_error = isinstance(e, BadRequest)
+            logger.error(
+                "telegram_send_failed",
+                parse_mode=parse_mode,
+                error_type=type(e).__name__,
+                error=reason,
+                # 본문 앞부분만 — 무엇이 유실됐는지 알 수 있어야 한다.
+                # 토큰은 본문에 실리지 않으므로 안전하다.
+                text_head=text[:120],
+                will_retry_plain=bool(is_parse_error and parse_mode),
+            )
+            if not (is_parse_error and parse_mode):
+                return False
+
+            try:
+                for i, chunk in enumerate(self._split_message(text)):
+                    await self._bot.send_message(
+                        chat_id=self._config.TELEGRAM_CHAT_ID,
+                        text=chunk,
+                        parse_mode=None,
+                        reply_markup=reply_markup if i == 0 else None,
+                    )
+                logger.warning("telegram_send_plain_fallback_ok", text_head=text[:120])
+                return True
+            except TelegramError as e2:
+                logger.error(
+                    "telegram_send_plain_fallback_failed",
+                    error_type=type(e2).__name__,
+                    error=str(e2),
+                    text_head=text[:120],
+                )
+                return False
 
     async def send_message(self, text: str, parse_mode: str = "Markdown") -> bool:
         """
