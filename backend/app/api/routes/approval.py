@@ -712,14 +712,10 @@ async def _submit_decision_locked(
                                 reason=state.get("error") or "주문 실행 실패",
                             )
                         else:
-                            await telegram.send_trade_executed(
-                                ticker=ticker,
-                                stock_name=stock_name,
-                                action=action,
-                                quantity=proposal.get("quantity", 0),
-                                price=proposal.get("entry_price", 0),
-                                total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
-                            )
+                            # 체결 통지는 ExecutionCoordinator._record_fill_ledger가
+                            # 던진다(2026-07-30). 승인 경로도 같은 초크포인트를
+                            # 지나므로 여기서 또 보내면 두 번 통지된다.
+                            pass
                 elif decision == "rejected":
                     await telegram.send_trade_rejected(
                         ticker=ticker,

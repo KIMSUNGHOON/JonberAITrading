@@ -368,25 +368,44 @@ _승인 대기 중..._
         quantity: int,
         price: int,
         total_amount: int,
+        *,
+        realized_pnl: Optional[float] = None,
+        realized_pnl_pct: Optional[float] = None,
+        source: Optional[str] = None,
+        partial: Optional[bool] = None,
     ) -> bool:
-        """Send trade execution notification."""
+        """체결 통지.
+
+        청산(SELL)에는 실현손익을 함께 싣는다 — 그게 없으면 "437주 9,126원에
+        매도됨"만 알려주고 얼마 벌었는지는 모른다(07-27 익절이 +350,033원
+        +9.62%였다).
+        """
         if not self._config.TELEGRAM_NOTIFY_TRADE_ALERTS:
             return False
 
+        from services.telegram.formatting import fmt_pct, fmt_pnl, fmt_price, stock_label
+
         emoji = "✅" if action in ("BUY", "ADD") else "🔴"
+        lines = [
+            f"{emoji} *거래 체결*",
+            "",
+            f"*종목:* {self._md_escape(stock_label(stock_name, ticker))}",
+            f"*행동:* {action}" + (" (부분)" if partial else ""),
+            f"*수량:* {quantity:,}주",
+            f"*체결가:* ₩{fmt_price(price)}",
+            f"*총액:* ₩{fmt_price(total_amount)}",
+        ]
+        if realized_pnl is not None:
+            pnl_line = f"*실현손익:* {fmt_pnl(realized_pnl)}원"
+            if realized_pnl_pct is not None:
+                pnl_line += f" ({fmt_pct(realized_pnl_pct)})"
+            lines.append(pnl_line)
+        if source:
+            lines.append(f"*경로:* {self._md_escape(source)}")
+        lines.append("")
+        lines.append(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        message = f"""
-{emoji} *거래 체결*
-
-*종목:* {stock_name} ({ticker})
-*행동:* {action}
-*수량:* {quantity:,}주
-*체결가:* ₩{price:,}
-*총액:* ₩{total_amount:,}
-
-⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-"""
-        return await self._send_message(message.strip())
+        return await self._send_message("\n".join(lines))
 
     async def send_trade_pending(
         self,

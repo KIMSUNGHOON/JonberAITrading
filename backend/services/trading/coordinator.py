@@ -257,6 +257,10 @@ class ExecutionCoordinator:
         # explicit _persist_state/_restore_state helpers ignore this flag.
         self._persistence_active = False
 
+        # 체결 통지 태스크 강참조. create_task 결과를 붙들지 않으면 GC가
+        # 태스크를 수거해 통지가 조용히 사라진다.
+        self._notify_tasks: set = set()
+
         # F3 (audit 2026-07-13): a BUY that didn't (fully) fill at placement
         # time previously vanished from tracking — the coordinator only
         # registered a position on the filled portion, so any broker-side
@@ -1334,6 +1338,8 @@ class ExecutionCoordinator:
         *,
         side: str,
         entry_or_exit: str,
+        realized_pnl: Optional[float] = None,
+        realized_pnl_pct: Optional[float] = None,
     ) -> None:
         """Shared ledger-write half of both fill choke points (BUY in
         `_execute_order`, SELL in `_apply_sell_fill`) — split-order aware
@@ -1364,7 +1370,17 @@ class ExecutionCoordinator:
         realized P&L stay total-based in `_apply_sell_position_delta` (the
         existing semantics: one matched exit against the position's
         blended average, not a per-part breakdown).
+
+        통지(2026-07-30): 체결 통지를 여기서 던진다. 이 함수가 BUY/SELL 두
+        초크포인트가 공유하는 지점이라 자율·HITL·PM 방어청산이 전부 덮인다.
+        `_persistence_active` 게이트 **앞**에서 던지는 것은 의도다 — 체결
+        사실이 원장 기록 여부에 종속되면 안 된다.
         """
+        self._schedule_fill_notification(
+            order, result, side=side,
+            realized_pnl=realized_pnl, realized_pnl_pct=realized_pnl_pct,
+        )
+
         if not self._persistence_active:
             return
         for part in (result.parts or [result]):
@@ -1388,6 +1404,88 @@ class ExecutionCoordinator:
                 decision_id=order.session_id,
                 entry_or_exit=entry_or_exit,
             )
+
+    def _schedule_fill_notification(
+        self,
+        order: OrderRequest,
+        result: OrderResult,
+        *,
+        side: str,
+        realized_pnl: Optional[float] = None,
+        realized_pnl_pct: Optional[float] = None,
+    ) -> None:
+        """동기 문맥에서 체결 통지를 던진다(never-raise).
+
+        `_record_fill_ledger`가 `def`라 await를 쓸 수 없다. 레포 기존 패턴과
+        같이 create_task로 던지되 강참조를 보관한다.
+        """
+        try:
+            from services.telegram.config import get_telegram_config
+
+            if not getattr(get_telegram_config(), "TELEGRAM_NOTIFY_FILL_ENABLED", True):
+                return
+        except Exception:
+            pass  # 설정을 못 읽으면 통지를 막지 않는다 — 체결은 알려야 한다
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(
+            self._notify_fill(
+                order, result, side=side,
+                realized_pnl=realized_pnl, realized_pnl_pct=realized_pnl_pct,
+            )
+        )
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
+
+    async def _notify_fill(
+        self,
+        order: OrderRequest,
+        result: OrderResult,
+        *,
+        side: str,
+        realized_pnl: Optional[float] = None,
+        realized_pnl_pct: Optional[float] = None,
+    ) -> None:
+        """체결 통지 본체. 실패해도 절대 밖으로 새지 않는다."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                return
+            filled = int(getattr(result, "filled_quantity", 0) or 0)
+            if filled <= 0:
+                return
+            requested = int(getattr(result, "requested_quantity", 0) or 0)
+            avg = getattr(result, "avg_price", None) or order.price or 0
+            await notifier.send_trade_executed(
+                ticker=order.ticker,
+                stock_name=order.stock_name or order.ticker,
+                action="BUY" if side in ("buy", OrderSide.BUY) else "SELL",
+                quantity=filled,
+                price=int(round(float(avg))),
+                total_amount=int(round(float(avg) * filled)),
+                realized_pnl=realized_pnl,
+                realized_pnl_pct=realized_pnl_pct,
+                source=getattr(order, "reason", None),
+                partial=bool(requested and filled < requested),
+            )
+        except Exception as e:
+            # structlog 스타일 kwargs가 아니라 f-string을 쓴다 — 이 모듈은
+            # stdlib logging.getLogger라 logger.error(msg, ticker=...) 같은
+            # 임의 kwargs는 TypeError로 죽는다(never-raise 위반이 되어버림).
+            logger.error(f"[Coordinator] fill_notification_failed ticker={order.ticker} error={e}")
+
+    async def _drain_notify_tasks(self) -> None:
+        """테스트용 — 던져둔 통지 태스크가 끝날 때까지 기다린다."""
+        pending = list(self._notify_tasks)
+        for task in pending:
+            try:
+                await task
+            except Exception:
+                pass
 
     async def _execute_order(self, order: OrderRequest) -> OrderResult:
         """Execute an order and update state."""
@@ -1659,8 +1757,22 @@ class ExecutionCoordinator:
             # every current call site passes `result.filled_quantity`, and
             # the per-part loop derives each row's executed_quantity from
             # `result.parts` directly.
+            #
+            # 실현손익은 포지션 감소 **전에** 계산해야 한다 —
+            # _apply_sell_position_delta가 포지션을 줄이거나 지우고 나면
+            # 진입가를 읽을 수 없다.
+            _pos = next((p for p in self._state.positions if p.ticker == ticker), None)
+            _entry = getattr(_pos, "avg_price", None) if _pos else None
+            _exit = getattr(result, "avg_price", None) if result is not None else None
+            _pnl = None
+            _pnl_pct = None
+            if _entry and _exit and filled_quantity:
+                _pnl = (float(_exit) - float(_entry)) * int(filled_quantity)
+                _pnl_pct = (float(_exit) / float(_entry) - 1.0) * 100.0
+
             self._record_fill_ledger(
-                order, result, side="sell", entry_or_exit="exit"
+                order, result, side="sell", entry_or_exit="exit",
+                realized_pnl=_pnl, realized_pnl_pct=_pnl_pct,
             )
 
         # `avg_price=None` (order/result missing) tells the delta helper below

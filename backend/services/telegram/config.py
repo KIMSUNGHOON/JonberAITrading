@@ -60,6 +60,10 @@ class TelegramConfig(BaseSettings):
         default=True,
         description="Send autonomous discovery promotion notifications (concise, one-way)"
     )
+    # 체결 통지만 따로 끌 수 있게 한다 — TELEGRAM_NOTIFY_TRADE_ALERTS와 별도.
+    TELEGRAM_NOTIFY_FILL_ENABLED: bool = Field(
+        default=True, description="자율·승인 체결 통지 발송 여부"
+    )
 
     # 상태 변경 명령(/halt, /auto)에만 적용되는 발신자 화이트리스트.
     # 미설정이면 현행 동작(chat_id 검증만) 유지 — 새 설정을 강제해 기존
