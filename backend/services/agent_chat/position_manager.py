@@ -114,8 +114,11 @@ def event_notify_enabled(event_type) -> bool:
         allowed = {k.strip() for k in raw.split(",") if k.strip()}
         value = getattr(event_type, "value", str(event_type))
         return value in allowed
-    except Exception:
-        # 설정을 못 읽으면 조용히 막는다 — 스팸이 무통지보다 나쁘다는 결정.
+    except Exception as e:
+        # 설정을 못 읽으면 막는다 — 스팸이 무통지보다 나쁘다는 결정. 다만
+        # 원인 없이 조용히 막으면 "의도된 무음"과 "설정 오류로 인한 무음"을
+        # 구별할 수 없으므로 리뷰 지적대로 흔적은 남긴다.
+        logger.warning("event_notify_gate_failed", error=str(e))
         return False
 
 

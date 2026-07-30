@@ -12,7 +12,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.agent_chat.position_manager import PositionEventType
+from services.agent_chat.position_manager import (
+    PositionEventType,
+    event_notify_enabled,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -58,3 +61,15 @@ async def test_stop_loss_hit_still_sent():
 async def test_near_events_suppressed_by_default():
     notifier = await _run(PositionEventType.STOP_LOSS_NEAR, {})
     notifier.send_message.assert_not_awaited()
+
+
+async def test_real_gate_matches_real_default_config():
+    """리뷰 지적(Important 2): 위 세 테스트는 전부 event_notify_enabled 자체를
+    patch하므로 실제 구현이 실제 기본 CSV와 맞는지는 아무 것도 검증하지 않는다.
+    enum 값 리네임이나 기본 CSV 오타가 생겨도 잡아낼 테스트가 없었다 — 이 테스트는
+    patch 없이 진짜 함수를 진짜 기본 설정(TELEGRAM_NOTIFY_EVENT_KINDS 기본값)에
+    대고 돌려 stop_loss_hit/take_profit_hit만 허용됨을 고정한다.
+    """
+    assert event_notify_enabled(PositionEventType.STOP_LOSS_HIT) is True
+    assert event_notify_enabled(PositionEventType.TAKE_PROFIT_HIT) is True
+    assert event_notify_enabled(PositionEventType.TRAILING_STOP_UPDATE) is False
