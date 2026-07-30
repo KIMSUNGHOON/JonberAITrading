@@ -65,6 +65,14 @@ class TelegramConfig(BaseSettings):
         default=True, description="자율·승인 체결 통지 발송 여부"
     )
 
+    # 이벤트 통지 화이트리스트. 기본은 '체결·실패만'(2026-07-30 결정) —
+    # _notify_event가 게이트를 전혀 거치지 않아 07-30 2시간에 13건,
+    # trailing_stop만 7건(스탑 이동폭 ₩124에 4건)이 스팸으로 나갔다.
+    TELEGRAM_NOTIFY_EVENT_KINDS: str = Field(
+        default="stop_loss_hit,take_profit_hit",
+        description="폰으로 보낼 PositionEventType 값 CSV",
+    )
+
     # 상태 변경 명령(/halt, /auto)에만 적용되는 발신자 화이트리스트.
     # 미설정이면 현행 동작(chat_id 검증만) 유지 — 새 설정을 강제해 기존
     # 운용을 갑자기 막지 않는다. TELEGRAM_CHAT_ID를 그룹으로 바꾸는 순간

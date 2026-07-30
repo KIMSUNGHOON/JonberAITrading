@@ -101,6 +101,24 @@ def get_event_korean(event_type: PositionEventType) -> dict:
     })
 
 
+def event_notify_enabled(event_type) -> bool:
+    """이 이벤트를 폰으로 보낼지. 기본은 체결성 이벤트만이다.
+
+    `_notify_event`가 원래 게이트를 전혀 거치지 않아 트레일링 갱신 같은
+    저가치 알림이 스팸으로 나갔다(07-30 2시간에 13건).
+    """
+    try:
+        from services.telegram.config import get_telegram_config
+
+        raw = getattr(get_telegram_config(), "TELEGRAM_NOTIFY_EVENT_KINDS", "") or ""
+        allowed = {k.strip() for k in raw.split(",") if k.strip()}
+        value = getattr(event_type, "value", str(event_type))
+        return value in allowed
+    except Exception:
+        # 설정을 못 읽으면 조용히 막는다 — 스팸이 무통지보다 나쁘다는 결정.
+        return False
+
+
 # Minor review fix (S-2): `_execute_close_position`/`_execute_reduce_position`
 # pass one of these `reason` strings through. Used by
 # `_fallback_to_discussion_on_hitl_deny` to label its reconstructed event
@@ -2191,6 +2209,9 @@ class PositionManager:
             telegram = await get_telegram_notifier()
 
             if not telegram.is_ready:
+                return
+
+            if not event_notify_enabled(event.event_type):
                 return
 
             event_emoji = {
