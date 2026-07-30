@@ -136,13 +136,23 @@ async def _reply(update: Update, text: str) -> None:
         await message.reply_text(_truncate(text))
 
 
-def source_status(value, error: Optional[str] = None) -> str:
-    """빈값 / 조회 실패 / 미설정을 구별한다.
+def source_status(value, error: Optional[str] = None, *, unconfigured: bool = False) -> str:
+    """빈값 / 조회 실패 / 미설정 세 상태를 서로 겹치지 않게 구별한다.
 
     `데이터 없음` 단일 문자열을 쓰면 안 된다 — 현재 `_format_positions(None)`
     (API 예외)과 `holding=null`(정상 빈값)이 바이트 동일해서 운영자가
     "시스템이 죽었나 데이터가 없나"를 구별할 수 없다.
+
+    리뷰 Important 1: 애초 이 함수는 '미설정'을 자체 상태로 내지 않고
+    `error="미설정"`을 통해 `조회 실패(미설정)`로만 냈다 — "조회를
+    시도했는데 실패했다: 설정 안 됨"으로 읽혀 자기모순이고, 조회를 시도한
+    적도 없는데 시도했다고 운영자에게 알리는 셈이었다. 호출자가 소스가
+    애초에 설정되지 않았음을 알고 있다면(예: TELEGRAM_BOT_TOKEN 미설정)
+    조회를 시도했다는 신호(`error=`) 없이 `unconfigured=True`로 이 상태를
+    직접 알린다 — `조회 실패(...)` 안에 절대 중첩되지 않는다.
     """
+    if unconfigured:
+        return "미설정"
     if value is None:
         return f"조회 실패({error})" if error else "조회 실패"
     try:
@@ -323,6 +333,13 @@ async def _send_pending_button(item) -> bool:
         return False
 
 
+# Telegram은 동일 채팅 초당 1건을 권고한다. 0.4초(초당 ~2.5건)로 처음
+# 배포했다가 리뷰에서 그 권고를 정면으로 어긴다는 지적을 받고 1.0초로
+# 올렸다(Important 3) -- 승인 대기열은 보통 짧아서, 429로 항목을 잃는
+# 것보다 1초 기다리는 편이 낫다.
+_PENDING_SEND_INTERVAL = 1.0
+
+
 async def handle_pending(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
     operations = await _safe("operations_pending", _fetch_operations())
     awaiting = operations.awaiting if operations is not None else None
@@ -338,11 +355,20 @@ async def handle_pending(update: Update, context: "ContextTypes.DEFAULT_TYPE") -
     for item in awaiting:
         sent = await _send_pending_button(item)
         if not sent:
+            # 리뷰 Important 2: 버튼 발송 실패는 방금 그 발송이 429로
+            # 스로틀됐다는 신호일 수 있다. 그 직후 간격 없이 두 번째 발송
+            # (텍스트 폴백)을 붙이면, 이 태스크가 막으려는 제로갭 쌍이
+            # 반복 한 단계 아래에서 재현된다 — 그 폴백이 또 실패하면
+            # _wrap_command가 잡아 루프 전체가 끊기고 남은 항목이 전부
+            # 조용히 유실된다. 폴백 앞에도 같은 간격을 둔다.
+            await asyncio.sleep(_PENDING_SEND_INTERVAL)
             await _reply(update, _format_pending_line(item))
         # Telegram은 동일 채팅 초당 1건을 권고하고 초과 시 429를 낸다.
         # 그 429는 _send_message가 조용히 삼켜서 뒷항목이 통째로
-        # 유실된다 — 지연이 유일한 방어다.
-        await asyncio.sleep(0.4)
+        # 유실된다 — 지연이 유일한 방어다. 리뷰 Important 3: 0.4초는
+        # 초당 ~2.5건 페이싱이라 그 권고를 그대로 어겼다. 승인 대기열은
+        # 보통 짧으니 429로 항목을 잃는 것보다 1초 기다리는 편이 낫다.
+        await asyncio.sleep(_PENDING_SEND_INTERVAL)
 
 
 # -------------------------------------------
