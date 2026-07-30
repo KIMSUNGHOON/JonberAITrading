@@ -83,6 +83,17 @@ CallbackHandlerFn = Callable[[Update, "ContextTypes.DEFAULT_TYPE"], Awaitable[No
 _COMMAND_REGISTRY: Dict[str, CommandHandlerFn] = {}
 _CALLBACK_REGISTRY: Dict[str, CallbackHandlerFn] = {}
 
+# 리뷰 픽스(Critical): 상태를 바꾸는 콜백 프리픽스 집합 -- _MUTATE_COMMANDS의
+# 콜백판. /auto는 2단계라 실제 모드 플립은 명령이 아니라 확인 버튼 콜백
+# (callbacks.py의 auto_confirm:)에서 일어나므로, _wrap_command만 막으면
+# 그룹 안의 admin 아닌 사용자가 admin이 띄운 버튼을 눌러 우회할 수 있다.
+# register_callback(..., mutate=True)로 등록 시점에 표시한다 -- 문자열
+# 프리픽스를 receiver.py에 따로 하드코딩하면 commands.py/callbacks.py가
+# 이미 단일 출처로 합의해둔 AUTO_CONFIRM_CALLBACK_PREFIX와 다시 갈라질
+# 위험이 있고(callbacks.py 모듈독스트링 참고), receiver.py가 commands.py를
+# 직접 import하면 순환 임포트가 된다. Task 5에서 레지스트리 메타로 옮긴다.
+_MUTATE_CALLBACK_PREFIXES: set[str] = set()
+
 # The single receiver Application, set by start_telegram_receiver() and
 # cleared by stop_telegram_receiver(). None means "not currently running"
 # (never started, start failed, or already stopped) -- stop is a no-op in
@@ -103,15 +114,28 @@ def register_command(name: str, handler: CommandHandlerFn) -> None:
     _COMMAND_REGISTRY[name] = handler
 
 
-def register_callback(pattern_prefix: str, handler: CallbackHandlerFn) -> None:
+def register_callback(
+    pattern_prefix: str, handler: CallbackHandlerFn, mutate: bool = False
+) -> None:
     """Register a callback_data prefix handler (inline keyboard buttons).
 
     `pattern_prefix` is matched against the start of the incoming
     `callback_query.data` (e.g. "a:" for an approval button, "r:" for a
     rejection button -- see spec F1). Like `register_command`, the shared
     security wrapper is applied automatically at dispatch time.
+
+    `mutate=True` marks a prefix as state-changing (리뷰 픽스: currently only
+    "auto_confirm:", /auto step-2's confirm button, which actually flips
+    `trading_mode:kiwoom` to autonomous -- see `_MUTATE_CALLBACK_PREFIXES`).
+    Such prefixes get the same extra per-user gate as `_MUTATE_COMMANDS`
+    (`_user_allowed_for_mutate`) on top of the ordinary chat_id check --
+    necessary because `_authorized` only verifies the chat, and a group
+    member other than the admin who typed `/auto` could otherwise tap the
+    button the admin's message posted into that shared chat.
     """
     _CALLBACK_REGISTRY[pattern_prefix] = handler
+    if mutate:
+        _MUTATE_CALLBACK_PREFIXES.add(pattern_prefix)
 
 
 def _authorized(update: Update) -> bool:
@@ -210,7 +234,14 @@ def _wrap_command(name: str, handler: CommandHandlerFn) -> CommandHandlerFn:
 def _wrap_callback(prefix: str, handler: CallbackHandlerFn) -> CallbackHandlerFn:
     """Same contract as `_wrap_command`, for a single registered callback
     prefix handler (used by `_dispatch_callback` once it has matched
-    `callback_query.data` against a registered prefix)."""
+    `callback_query.data` against a registered prefix).
+
+    리뷰 픽스(Critical): `prefix`가 `_MUTATE_CALLBACK_PREFIXES`에 있으면
+    `_wrap_command`와 동일한 추가 관문(`_user_allowed_for_mutate`)을 chat_id
+    검사 직후에 적용한다. /auto의 실제 상태 변경(모드 플립)은 명령이 아니라
+    확인 버튼 콜백에서 일어나므로, 이 관문이 없으면 그룹 안에서 admin이
+    아닌 사용자도 admin이 띄운 버튼을 눌러 자율 모드를 재무장시킬 수 있다.
+    """
 
     async def _wrapped(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
         if not _authorized(update):
@@ -219,6 +250,14 @@ def _wrap_callback(prefix: str, handler: CallbackHandlerFn) -> CallbackHandlerFn
                 "telegram_unauthorized_chat",
                 chat_id=getattr(chat, "id", None),
                 command=prefix,
+            )
+            return
+        if prefix in _MUTATE_CALLBACK_PREFIXES and not _user_allowed_for_mutate(update):
+            user = getattr(update, "effective_user", None)
+            logger.warning(
+                "telegram_mutate_denied",
+                command=prefix,
+                user_id=getattr(user, "id", None),
             )
             return
         try:

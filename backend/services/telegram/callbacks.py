@@ -370,4 +370,10 @@ async def handle_auto_confirm_callback(update: Update, context: "ContextTypes.DE
 
 register_callback("a:", handle_approve_callback)
 register_callback("r:", handle_reject_callback)
-register_callback(AUTO_CONFIRM_CALLBACK_PREFIX, handle_auto_confirm_callback)
+# 리뷰 픽스(Critical): mutate=True -- 이 콜백이 /auto의 실제 상태 변경(모드
+# 플립)이 일어나는 지점이다. commands.handle_auto는 확인 버튼만 보내고
+# _set_kiwoom_autonomous/_rearm_awaiting_approvals는 여기서만 호출되므로,
+# receiver._wrap_command에 건 _MUTATE_COMMANDS 관문만으로는 이 경로가
+# 막히지 않는다 -- 그룹 채팅에서 admin이 아닌 사용자가 admin이 띄운 버튼을
+# 누르는 시나리오를 닫는다.
+register_callback(AUTO_CONFIRM_CALLBACK_PREFIX, handle_auto_confirm_callback, mutate=True)
