@@ -48,6 +48,15 @@ def test_fmt_money_short_abbreviates_aggregates():
     assert fmt_money_short(None) == "―"
 
 
+def test_fmt_money_short_rounding_does_not_overflow_into_10000_man():
+    """99,999,999는 억 문턱(1억) 미만이라 만 분기로 가지만 n/10_000을 반올림하면
+    10,000이 나온다 — "10,000만"은 곧 1억이라는 자기모순 표기다. 반올림 후
+    10,000에 도달하면 억 분기로 승격해야 한다."""
+    result = fmt_money_short(99_999_999)
+    assert "10,000만" not in result
+    assert result == "1.00억"
+
+
 def test_fmt_pnl_forces_sign():
     """손익만 부호를 강제한다."""
     assert fmt_pnl(644350) == "+644,350"
@@ -86,6 +95,17 @@ def test_strip_markers_removes_unbalanced_llm_markup():
 def test_display_width_counts_hangul_as_two():
     assert display_width("abc") == 3
     assert display_width("가나다") == 6
+    assert display_width("🟢 보유") == 2 + 1 + 4
+
+
+def test_display_width_handles_variation_selector_emoji():
+    """'⚠️'는 코드포인트 2개(U+26A0 본체 + U+FE0F 변형 선택자)다. 선택자는
+    폭 없는 결합 문자(category='Mn')라 폭 판정에서 걸러내지 않으면 +1이
+    더 붙어 폰에서 실제로 차지하는 폭(2)보다 과다계산된다. 이 프로젝트의
+    고정 이모지 어휘에 '⚠️'가 실재해(경고·엔진 불일치 라벨) 상시 영향을 준다."""
+    assert display_width("⚠️") == 2
+    assert display_width("⚠️ 손절") == 7
+    # 변형 선택자 없는 단일 코드포인트 이모지도 계속 폭 2로 처리돼야 한다
     assert display_width("🟢 보유") == 2 + 1 + 4
 
 

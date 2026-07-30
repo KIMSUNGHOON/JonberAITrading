@@ -55,7 +55,12 @@ def fmt_price(value) -> str:
 
 
 def fmt_money_short(value) -> str:
-    """집계 금액. 억/만 축약."""
+    """집계 금액. 억/만 축약.
+
+    99,999,999는 억 문턱(1억) 미만이라 만 분기로 가지만, `n/10_000`을
+    반올림하면 10,000만이 나온다 — 이는 곧 1억이라 "10,000만"이라는
+    자기모순 표기가 된다. 반올림 후 10,000에 도달하면 억 분기로 승격한다.
+    """
     parsed = _to_float(value)
     if parsed is None:
         return _EMPTY
@@ -64,7 +69,10 @@ def fmt_money_short(value) -> str:
     if n >= 100_000_000:
         return f"{sign}{n / 100_000_000:.2f}억"
     if n >= 10_000:
-        return f"{sign}{int(round(n / 10_000)):,}만"
+        man = int(round(n / 10_000))
+        if man >= 10_000:
+            return f"{sign}{n / 100_000_000:.2f}억"
+        return f"{sign}{man:,}만"
     return f"{sign}{int(round(n)):,}원"
 
 
@@ -135,14 +143,21 @@ def strip_markers(text: Optional[str]) -> str:
 
 
 def display_width(text: Optional[str]) -> int:
-    """폰 표시폭. 한글·이모지 2, ASCII 1.
+    """폰 표시폭. 한글·이모지 2, ASCII 1, 결합 문자(변형 선택자 등) 0.
 
     한 줄 44를 넘으면 폰에서 접히고 접힘에 들여쓰기가 없어 다음 항목과 섞인다.
+
+    `⚠️`는 코드포인트 2개다: U+26A0(경고 기호 본체) + U+FE0F(이모지 변형
+    선택자). 선택자는 폭이 없는 결합 문자(category="Mn")로, 폭 판정 전에
+    걸러내지 않으면 else 분기로 떨어져 +1이 더 붙는다 — 이 프로젝트의
+    고정 이모지 어휘에 `⚠️`가 실재해 그냥 두면 상시 과다계산된다.
     """
     if not text:
         return 0
     width = 0
     for ch in text:
+        if unicodedata.combining(ch) or unicodedata.category(ch) == "Mn":
+            continue  # 결합 문자(변형 선택자 등)는 폭 0
         if unicodedata.east_asian_width(ch) in ("W", "F"):
             width += 2
         elif unicodedata.category(ch) == "So":  # 기타 기호(이모지 다수)
