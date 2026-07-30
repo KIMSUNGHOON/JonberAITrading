@@ -1139,6 +1139,7 @@ class ExecutionCoordinator:
                     },
                 )
                 self._complete_agent_task("order", success=False)
+                self._schedule_order_failure_alert(order, result.message or "브로커 거부")
         finally:
             if is_sell_main:
                 self._release_defensive_exit_guard(ticker)
@@ -1477,6 +1478,38 @@ class ExecutionCoordinator:
             # stdlib logging.getLogger라 logger.error(msg, ticker=...) 같은
             # 임의 kwargs는 TypeError로 죽는다(never-raise 위반이 되어버림).
             logger.error(f"[Coordinator] fill_notification_failed ticker={order.ticker} error={e}")
+
+    def _schedule_order_failure_alert(self, order: OrderRequest, reason: str) -> None:
+        """자율 주문이 브로커 단계에서 실패했음을 알린다(never-raise)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._notify_order_failed(order, reason))
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
+
+    async def _notify_order_failed(self, order: OrderRequest, reason: str) -> None:
+        try:
+            from services.telegram import get_telegram_notifier
+            from services.telegram.formatting import stock_label
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                return
+            side = getattr(order.side, "value", order.side)
+            await notifier.send_message(
+                f"⛔ 주문 실패 ({side})\n"
+                f"{stock_label(order.stock_name, order.ticker)}\n"
+                f"사유: {reason}\n"
+                f"→ 체결되지 않았습니다. 수동으로 확인하세요.",
+                parse_mode=None,
+            )
+        except Exception as e:
+            # 이 모듈은 stdlib logging이라 structlog 스타일 kwargs는
+            # TypeError로 죽는다 — never-raise 핸들러 안에서 로거가 죽으면
+            # 안 되므로 f-string을 쓴다(위 _notify_fill과 동일 패턴).
+            logger.error(f"[Coordinator] order_failure_alert_failed ticker={order.ticker} error={e}")
 
     async def _drain_notify_tasks(self) -> None:
         """테스트용 — 던져둔 통지 태스크가 끝날 때까지 기다린다."""

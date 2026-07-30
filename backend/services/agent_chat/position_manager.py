@@ -1233,6 +1233,52 @@ class PositionManager:
                 ticker=event.ticker,
                 error=str(e),
             )
+            # 손절 집행 실패는 포지션을 무방비로 남긴다 — 로그만 남기면
+            # 아무도 모른다. 조치 지시를 함께 담는다.
+            await self._alert_execution_failed(position, event, e)
+
+    async def _alert_execution_failed(self, position, event, error: Exception) -> None:
+        """집행 실패를 폰으로 알린다. Best-effort — 통지 실패가 집행 경로를
+        죽여선 안 된다."""
+        try:
+            from services.telegram import get_telegram_notifier
+            from services.telegram.formatting import stock_label
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                return
+            kind = "손절" if "STOP_LOSS" in str(getattr(event, "event_type", "")) else "익절"
+            label = stock_label(
+                getattr(position, "stock_name", None), getattr(position, "ticker", "")
+            )
+            await notifier.send_message(
+                f"⛔ 자동 {kind} 집행 실패\n"
+                f"{label}\n"
+                f"사유: {type(error).__name__}: {error}\n"
+                f"→ 포지션이 무방비입니다. 수동으로 확인하세요.",
+                parse_mode=None,
+            )
+        except Exception as e:
+            logger.error("execution_failure_alert_failed", error=str(e))
+
+    async def _alert_execution_blocked(self, position, check: str, detail: str) -> None:
+        """집행이 차단됐음을 알린다(실패와 구별 — 시스템은 정상이나 정책이 막았다)."""
+        try:
+            from services.telegram import get_telegram_notifier
+            from services.telegram.formatting import stock_label
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                return
+            label = stock_label(
+                getattr(position, "stock_name", None), getattr(position, "ticker", "")
+            )
+            await notifier.send_message(
+                f"⛔ 자동 집행 차단 ({check})\n{label}\n{detail}",
+                parse_mode=None,
+            )
+        except Exception as e:
+            logger.error("execution_blocked_alert_failed", error=str(e))
 
     async def _execute_close_position(
         self,
@@ -1902,12 +1948,16 @@ class PositionManager:
                 # 유동성 천장에 막혀 0주 — 원장은 멀쩡하다. desync 통지를
                 # 보내면 안 된다(이미 캡을 초과 보유한 종목은 ADD가 매번
                 # 0이라 토론 주기마다 허위 🚨가 반복되고, 진짜 desync 신호를
-                # 덮는다). 정상 억제이므로 로그만 남기고 조용히 끝낸다.
+                # 덮는다). 정상 억제이므로 desync 취급은 하지 않되, 실패와
+                # 구별되는 "차단" 통지는 한 번 보낸다(Task 7).
                 logger.info(
                     "add_blocked_by_liquidity_cap",
                     ticker=position.ticker,
                     requested=add_quantity,
                     held_quantity=position.quantity,
+                )
+                await self._alert_execution_blocked(
+                    position, "유동성 캡", "주문 수량이 0으로 클램프됐습니다"
                 )
                 return
 
