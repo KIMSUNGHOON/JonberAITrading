@@ -146,3 +146,6 @@ backend/2025-*
 
 # Official Kiwoom REST API reference clone (separate repo, not ours)
 Kiwoom-REST-API/
+
+# .env 백업 사본 (실 API 키 포함) — *.env 패턴이 .env.bak-* 를 못 잡는다
+.env.bak*
