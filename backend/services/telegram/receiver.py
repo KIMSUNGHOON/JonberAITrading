@@ -133,6 +133,32 @@ def _authorized(update: Update) -> bool:
     return str(chat_id) == str(config.TELEGRAM_CHAT_ID)
 
 
+# 상태를 바꾸는 명령. Task 5에서 레지스트리 메타(risk="mutate")로 옮긴다.
+_MUTATE_COMMANDS = {"halt", "auto"}
+
+
+def _user_allowed_for_mutate(update: Update) -> bool:
+    """상태 변경 명령의 추가 관문 — 발신 '사용자'까지 확인한다.
+
+    _authorized는 chat만 본다. TELEGRAM_CHAT_ID를 그룹(음수 id)으로 바꾸면
+    그룹원 전원이 /halt를 칠 수 있는데, /halt는 신규 매수 차단이 아니라
+    자동 손절 무장해제라(gate.py:279 + position_manager.py:1255) 오조작
+    비용이 비대칭이다.
+
+    TELEGRAM_ADMIN_USER_ID 미설정이면 True — 새 설정을 강제해 기존 운용을
+    갑자기 막지 않는다. 설정돼 있는데 발신자를 알 수 없으면 fail-closed.
+    """
+    config = get_telegram_config()
+    admin = getattr(config, "TELEGRAM_ADMIN_USER_ID", None)
+    if not admin:
+        return True
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None) if user is not None else None
+    if user_id is None:
+        return False
+    return str(user_id) == str(admin)
+
+
 async def _reply_error(update: Update, error: Exception) -> None:
     """Best-effort '오류: {message}' reply -- swallows its own failures so a
     broken reply path can never turn into a second unhandled exception."""
@@ -162,6 +188,14 @@ def _wrap_command(name: str, handler: CommandHandlerFn) -> CommandHandlerFn:
                 "telegram_unauthorized_chat",
                 chat_id=getattr(chat, "id", None),
                 command=name,
+            )
+            return
+        if name in _MUTATE_COMMANDS and not _user_allowed_for_mutate(update):
+            user = getattr(update, "effective_user", None)
+            logger.warning(
+                "telegram_mutate_denied",
+                command=name,
+                user_id=getattr(user, "id", None),
             )
             return
         try:

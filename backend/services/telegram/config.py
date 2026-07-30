@@ -61,6 +61,14 @@ class TelegramConfig(BaseSettings):
         description="Send autonomous discovery promotion notifications (concise, one-way)"
     )
 
+    # 상태 변경 명령(/halt, /auto)에만 적용되는 발신자 화이트리스트.
+    # 미설정이면 현행 동작(chat_id 검증만) 유지 — 새 설정을 강제해 기존
+    # 운용을 갑자기 막지 않는다. TELEGRAM_CHAT_ID를 그룹으로 바꾸는 순간
+    # 그룹원 전원이 /halt(=자동 손절 무장해제)를 칠 수 있어 필요하다.
+    TELEGRAM_ADMIN_USER_ID: Optional[str] = Field(
+        default=None, description="상태 변경 명령을 칠 수 있는 Telegram user id"
+    )
+
     @property
     def is_configured(self) -> bool:
         """Check if Telegram is properly configured."""
