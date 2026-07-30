@@ -384,6 +384,14 @@ class ManagedPosition(BaseModel):
     # positions restore cleanly.
     monitor_gate_denied_notified: bool = False
 
+    # 통지 광역화 최종 리뷰 Important 4: 방어적 SELL(_close_position/
+    # _reduce_position/_execute_order_from_monitor)이 브로커에서 거부되면
+    # 예외가 아니라 정상 OrderResult(status="rejected")로 돌아온다 — 위
+    # monitor_gate_denied_notified와 같은 형태로, 거부가 매 감시 틱마다
+    # 반복돼도 사람에게는 거부 에피소드당 한 번만 통지한다(동일 이유로
+    # 기본 False — 구 영속 포지션도 깨끗이 복원).
+    close_order_rejected_notified: bool = False
+
     model_config = ConfigDict(use_enum_values=True)
 
 

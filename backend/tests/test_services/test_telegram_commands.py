@@ -330,6 +330,31 @@ async def test_pending_falls_back_to_text_line_when_button_send_fails(monkeypatc
     assert "BUY" in fallback_text
 
 
+async def test_pending_does_not_sleep_after_the_last_item(monkeypatch):
+    """최종 전체 브랜치 리뷰 Minor 7: 루프 끝의 무조건 sleep이 마지막 항목
+    뒤에도 걸려 max_concurrent_updates=1인 receiver를 그만큼 더 묶어
+    `/halt`·승인 버튼 탭을 굶겼다. RED(회귀 전): 항목 3개 처리 후 sleep이
+    3번(항목 사이 2번 + 마지막 뒤 1번) 불렸다. GREEN: 항목 "사이"에만
+    불려 2번(N-1)이어야 한다."""
+    awaiting = [_pending_item(), _pending_item(), _pending_item()]
+    monkeypatch.setattr(
+        commands, "_fetch_operations", AsyncMock(return_value=_operations(awaiting=awaiting))
+    )
+    monkeypatch.setattr(commands, "_send_pending_button", AsyncMock(return_value=True))
+
+    sleep_calls = []
+
+    async def _fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(commands.asyncio, "sleep", _fake_sleep)
+
+    update, message = _make_update()
+    await commands.handle_pending(update, MagicMock())
+
+    assert len(sleep_calls) == len(awaiting) - 1  # 항목 사이에만, 마지막 뒤는 없음
+
+
 async def test_pending_reports_zero_pending_distinctly_from_no_data(monkeypatch):
     monkeypatch.setattr(
         commands, "_fetch_operations", AsyncMock(return_value=_operations(awaiting=[]))

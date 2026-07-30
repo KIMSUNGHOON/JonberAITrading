@@ -502,8 +502,22 @@ async def start_telegram_receiver() -> Optional[Application]:
         # 폰에서 `/`를 쳤을 때 뜨는 자동완성. 코드베이스에 set_my_commands가
         # 0건이라 지금은 목록이 비어 있고 /help가 그 역할을 100% 혼자 진다.
         # 실패는 로그만 -- 자동완성이 없다고 수신이 죽어선 안 된다.
+        #
+        # Minor 6 (최종 전체 브랜치 리뷰): scope를 명시하지 않으면 기본
+        # scope(BotCommandScopeDefault)로 등록되는데, 이건 "이 봇을 연 모든
+        # 텔레그램 사용자"에게 전체 명령 표면과 한국어 설명이 자동완성으로
+        # 노출된다는 뜻이다. 실행 자체는 `_authorized`(receiver.py)가
+        # fail-closed로 막으므로 이건 접근이 아니라 노출(disclosure) 문제지만,
+        # 스펙이 요구한 BotCommandScopeChat(운영자 채팅으로만 한정)과는
+        # 다르다. TELEGRAM_CHAT_ID가 이미 `_authorized`가 비교하는 그
+        # 채팅이므로 그대로 재사용한다.
         try:
-            await application.bot.set_my_commands(_build_bot_commands())
+            from telegram import BotCommandScopeChat
+
+            await application.bot.set_my_commands(
+                _build_bot_commands(),
+                scope=BotCommandScopeChat(chat_id=config.TELEGRAM_CHAT_ID),
+            )
             logger.info("telegram_set_my_commands_ok", count=len(_COMMAND_REGISTRY))
         except Exception as e:
             logger.warning("telegram_set_my_commands_failed", error=str(e))

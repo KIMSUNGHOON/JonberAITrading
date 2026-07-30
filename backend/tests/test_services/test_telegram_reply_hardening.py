@@ -114,7 +114,15 @@ async def test_pending_delay_separates_the_fallback_send_from_the_button_send(mo
     """버튼 발송이 실패(=429였을 수 있음)한 직후 텍스트 폴백을 간격 없이
     붙이면, 첫 발송이 막 스로틀된 바로 그 시점에 두 번째 발송이 나간다 —
     이 태스크가 막으려는 실패 모드가 반복 한 단계 아래에서 재현된다
-    (Important 2). 폴백 앞에도 지연이 있어야 한다."""
+    (Important 2). 폴백 앞에도 지연이 있어야 한다.
+
+    최종 전체 브랜치 리뷰 Minor 7: 마지막(그리고 유일한) 항목 뒤에는 더 이상
+    sleep이 없다 — 루프 끝의 무조건 sleep이 max_concurrent_updates=1인
+    receiver를 그만큼 더 묶어 `/halt`·승인 버튼 탭을 굶겼다. 항목 "사이"에만
+    페이싱 sleep이 들어가므로(i>0 가드), 항목이 1개뿐인 이 시나리오에는
+    페이싱 sleep 자체가 없다 — 폴백 앞 sleep(Important 2, 별개 목적)만
+    남는다.
+    """
     item = _pending_item()
     monkeypatch.setattr(
         commands, "_fetch_operations", AsyncMock(return_value=_operations(awaiting=[item]))
@@ -143,5 +151,4 @@ async def test_pending_delay_separates_the_fallback_send_from_the_button_send(mo
         "button",
         ("sleep", 1.0),
         ("reply", commands._format_pending_line(item)),
-        ("sleep", 1.0),
     ]

@@ -290,3 +290,48 @@ async def test_start_receiver_wires_tg2_commands_via_explicit_import(monkeypatch
     assert result is mock_application
     for name in ("status", "positions", "pending", "report"):
         assert name in receiver._COMMAND_REGISTRY
+
+
+# -------------------------------------------
+# 9. start_telegram_receiver — setMyCommands scoped to the configured chat
+#    (최종 전체 브랜치 리뷰 Minor 6)
+# -------------------------------------------
+#
+# scope 미지정이면 기본 scope(BotCommandScopeDefault)로 등록돼 전체 명령
+# 표면 + 한국어 설명이 이 봇을 연 아무 텔레그램 사용자에게나 자동완성으로
+# 노출된다. 실행 자체는 `_authorized`가 fail-closed로 막으므로 접근이 아니라
+# 노출 문제지만, 스펙이 요구한 BotCommandScopeChat과 다르다.
+
+
+async def test_start_receiver_scopes_set_my_commands_to_configured_chat(monkeypatch):
+    """RED(회귀 전): set_my_commands가 scope 없이 불려 기본(전역) scope로
+    등록됐다. GREEN: TELEGRAM_CHAT_ID로 한정된 BotCommandScopeChat을
+    넘긴다."""
+    from telegram import BotCommandScopeChat
+
+    monkeypatch.setattr(receiver, "get_telegram_config", lambda: _config(chat_id="98765"))
+
+    mock_updater = MagicMock()
+    mock_updater.start_polling = AsyncMock(return_value=None)
+    mock_updater.stop = AsyncMock(return_value=None)
+
+    mock_application = MagicMock()
+    mock_application.updater = mock_updater
+    mock_application.initialize = AsyncMock(return_value=None)
+    mock_application.start = AsyncMock(return_value=None)
+    mock_application.add_handler = MagicMock()
+    mock_application.bot.set_my_commands = AsyncMock(return_value=True)
+
+    mock_builder = MagicMock()
+    mock_builder.token.return_value.build.return_value = mock_application
+    monkeypatch.setattr(receiver.Application, "builder", lambda: mock_builder)
+
+    result = await receiver.start_telegram_receiver()
+
+    assert result is mock_application
+    mock_application.bot.set_my_commands.assert_awaited_once()
+    _, kwargs = mock_application.bot.set_my_commands.await_args
+    assert "scope" in kwargs
+    scope = kwargs["scope"]
+    assert isinstance(scope, BotCommandScopeChat)
+    assert scope.chat_id == 98765

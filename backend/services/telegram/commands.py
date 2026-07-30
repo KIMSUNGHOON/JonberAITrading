@@ -352,7 +352,21 @@ async def handle_pending(update: Update, context: "ContextTypes.DEFAULT_TYPE") -
         return
 
     await _reply(update, f"[승인 대기] {len(awaiting)}건")
-    for item in awaiting:
+    for i, item in enumerate(awaiting):
+        if i > 0:
+            # Telegram은 동일 채팅 초당 1건을 권고하고 초과 시 429를 낸다.
+            # 그 429는 _send_message가 조용히 삼켜서 뒷항목이 통째로
+            # 유실된다 — 지연이 유일한 방어다. 리뷰 Important 3: 0.4초는
+            # 초당 ~2.5건 페이싱이라 그 권고를 그대로 어겼다. 승인 대기열은
+            # 보통 짧으니 429로 항목을 잃는 것보다 1초 기다리는 편이 낫다.
+            #
+            # 최종 전체 브랜치 리뷰 Minor 7: 항목 "사이"에만 넣는다 — 첫
+            # 항목 앞에는 지연이 필요 없고(발송할 게 아직 없다), 마지막
+            # 항목 뒤에 거는 구코드는(루프 끝의 무조건 sleep)
+            # max_concurrent_updates=1인 receiver를 그만큼 더 묶어
+            # `/halt`와 승인 버튼 탭을 굶긴다.
+            await asyncio.sleep(_PENDING_SEND_INTERVAL)
+
         sent = await _send_pending_button(item)
         if not sent:
             # 리뷰 Important 2: 버튼 발송 실패는 방금 그 발송이 429로
@@ -363,12 +377,6 @@ async def handle_pending(update: Update, context: "ContextTypes.DEFAULT_TYPE") -
             # 조용히 유실된다. 폴백 앞에도 같은 간격을 둔다.
             await asyncio.sleep(_PENDING_SEND_INTERVAL)
             await _reply(update, _format_pending_line(item))
-        # Telegram은 동일 채팅 초당 1건을 권고하고 초과 시 429를 낸다.
-        # 그 429는 _send_message가 조용히 삼켜서 뒷항목이 통째로
-        # 유실된다 — 지연이 유일한 방어다. 리뷰 Important 3: 0.4초는
-        # 초당 ~2.5건 페이싱이라 그 권고를 그대로 어겼다. 승인 대기열은
-        # 보통 짧으니 429로 항목을 잃는 것보다 1초 기다리는 편이 낫다.
-        await asyncio.sleep(_PENDING_SEND_INTERVAL)
 
 
 # -------------------------------------------

@@ -137,6 +137,23 @@ _EXIT_REASON_TO_EVENT_TYPE: Dict[str, PositionEventType] = {
 }
 
 
+# 통지 광역화 최종 전체 브랜치 리뷰 Important 2: `_execute_close_position`/
+# `_execute_reduce_position`이 이미 갖고 있는 `reason` 상수를 체결 통지의
+# "경로"(source) 필드로 사람이 읽을 수 있게 매핑한다. 이전에는
+# `trading_coord._close_position`이 호출자와 무관하게 reason을
+# "User-initiated close"로 하드코딩해, 이 통지 아크가 드러내려던 07-24 자율
+# 손절·07-27 자율 익절 체결이 전부 폰에 "사람이 한 것"으로 표시됐다(스펙 A2가
+# 요구하는 자율/승인/방어청산 구분과 정반대). 알려지지 않은 reason은
+# "사람이 아니다"라는 사실만은 안전하게 보존해 "방어청산"으로 강등한다.
+_EXIT_REASON_TO_SOURCE_LABEL: Dict[str, str] = {
+    "stop_loss": "방어청산(손절)",
+    "take_profit": "방어청산(익절)",
+    "agent_decision": "자율(에이전트 합의)",
+    "agent_decision_reduce": "자율(에이전트 합의)",
+    "agent_decision_reduce_partial": "자율(에이전트 합의)",
+}
+
+
 class PositionAction(str, Enum):
     """Actions that can be taken on positions."""
     HOLD = "hold"                    # Keep position
@@ -1374,7 +1391,12 @@ class PositionManager:
             trading_coord = await get_trading_coordinator()
 
             result = await trading_coord._close_position(
-                position.ticker, decision_id=decision_id
+                position.ticker, decision_id=decision_id,
+                # Important 2: 이 청산이 실제로 왜 일어났는지(손절/익절/에이전트
+                # 합의) 정확한 "경로" 라벨을 넘긴다 — 미전달 시 코디네이터의
+                # 기본값("User-initiated close")으로 떨어지는데, 그 기본값은
+                # handle_alert_action의 진짜 사람 조작 전용이다.
+                reason=_EXIT_REASON_TO_SOURCE_LABEL.get(reason, "방어청산"),
             )
 
             if result is None:
@@ -1748,7 +1770,11 @@ class PositionManager:
 
             trading_coord = await get_trading_coordinator()
             result = await trading_coord._reduce_position(
-                position.ticker, clamped_quantity, decision_id=decision_id
+                position.ticker, clamped_quantity, decision_id=decision_id,
+                # Important 2: _execute_close_position과 동일한 이유로 정확한
+                # 경로 라벨을 넘긴다 — 미전달 시 코디네이터 기본값
+                # ("Autonomous partial reduce")로 떨어진다.
+                reason=_EXIT_REASON_TO_SOURCE_LABEL.get(reason, "방어청산"),
             )
 
             if result is None:
@@ -1800,6 +1826,14 @@ class PositionManager:
                 ticker=position.ticker,
                 error=str(e),
             )
+            # 최종 전체 브랜치 리뷰 Important 4와 같은 결의 갭(형제 메서드):
+            # `_execute_close_position`은 Task 7에서 자기 except에
+            # `_alert_execution_failed`를 달았는데(check_autonomy/
+            # trading_coord._close_position 예외를 여기서 진짜로 잡는다),
+            # 이 메서드는 예외 발생 지점(check_autonomy/
+            # trading_coord._reduce_position)이 정확히 같은 모양인데도 로그만
+            # 남기고 끝났다 — 부분청산 시도가 무방비로 실패해도 무통지였다.
+            await self._alert_execution_failed(position, reason, e)
 
     async def _notify_add_not_executed(
         self, position: MonitoredPosition, computed_quantity: int

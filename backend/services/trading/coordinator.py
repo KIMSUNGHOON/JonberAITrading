@@ -1139,7 +1139,18 @@ class ExecutionCoordinator:
                     },
                 )
                 self._complete_agent_task("order", success=False)
-                self._schedule_order_failure_alert(order, result.message or "브로커 거부")
+                # Critical 1 (최종 전체 브랜치 리뷰): 이 else 분기는 "브로커 거부"가
+                # 아니라 status in {pending, rejected} 전체다 — 자율 BUY는 LIMIT
+                # 주문이고 order_agent가 3폴×0.5초만 기다린 뒤 미체결이면
+                # status="pending", filled_quantity=0으로 "정상" 반환한다(주문은
+                # 브로커에 살아있고, 9줄 아래 _track_unfilled가 바로 그 살아있는
+                # 주문을 ka10076 추적에 등록한다). pending을 "주문 실패, 수동
+                # 확인하세요" 알림으로 보내면 운영자가 이미 작동 중인 지정가
+                # 주문에 중복 매수를 시도할 위험이 생긴다. 실제 거부(status ==
+                # "rejected")만 알린다 — pending은 의도적으로 무통지다(체결이
+                # 나중에 잡히면 _poll_tracked_fills의 사후 체결 통지가 알린다).
+                if result.status == "rejected":
+                    self._schedule_order_failure_alert(order, result.message or "브로커 거부")
         finally:
             if is_sell_main:
                 self._release_defensive_exit_guard(ticker)
@@ -1625,6 +1636,11 @@ class ExecutionCoordinator:
                 position.monitor_gate_denied_notified = False
 
             result = await self._execute_order(order)
+            # Important 4: 브로커 거부는 예외가 아니라 정상 결과로 온다 —
+            # _apply_sell_fill의 filled_quantity<=0 가드는 무통지이므로
+            # 여기서 명시적으로 실패를 알린다(_close_position/_reduce_position과
+            # 동일 처리).
+            self._handle_defensive_sell_rejection(position, order, result)
             # Track the ACTUAL fill: full → remove, partial → reduce, none → retain.
             self._apply_sell_fill(order.ticker, result.filled_quantity, order=order, result=result)
             # E1-3: register any unfilled remainder of this AGENT_AUTO defensive
@@ -1653,6 +1669,41 @@ class ExecutionCoordinator:
                 )
         except Exception as e:
             logger.warning(f"[Coordinator] Failed to notify gate denial: {e}")
+
+    def _handle_defensive_sell_rejection(
+        self,
+        position: Optional[ManagedPosition],
+        order: OrderRequest,
+        result: OrderResult,
+    ) -> None:
+        """Important 4 (최종 전체 브랜치 리뷰): 방어적 SELL(_close_position/
+        _reduce_position/_execute_order_from_monitor)이 브로커에서 거부되면
+        예외가 아니라 정상 OrderResult(status="rejected")로 돌아온다 —
+        on_trade_approved의 else 분기(Critical 1)와 달리 이 세 진입점은
+        `_execute_order` 뒤 곧장 `_apply_sell_fill`로 가고, 그 함수는
+        filled_quantity<=0이면 경고 로그만 남기고 반환한다. 그 결과 손절/
+        익절/청산/축소가 브로커 단에서 거부돼도 통지가 전혀 나가지 않았다
+        (on_trade_approved가 이미 갖고 있던 `_schedule_order_failure_alert`를
+        여기서도 재사용한다 — "실패 통지가 없다"는 같은 결함의 다른 얼굴).
+
+        이 세 진입점은 PositionManager의 30초 감시 틱에서 반복 호출될 수
+        있어 브로커가 계속 거부하면(예: 거래정지 종목) 매 틱마다 재통지할
+        위험이 있다 — `monitor_gate_denied_notified`와 같은 형태의 래치
+        (`close_order_rejected_notified`)로 거부 에피소드당 한 번만 알리고,
+        거부가 아닌 상태로 돌아오면 래치를 풀어 다음 거부가 다시 통지되게
+        한다.
+        """
+        if result.status != "rejected":
+            if position is not None and position.close_order_rejected_notified:
+                position.close_order_rejected_notified = False
+            return
+
+        if position is not None:
+            if position.close_order_rejected_notified:
+                return
+            position.close_order_rejected_notified = True
+
+        self._schedule_order_failure_alert(order, result.message or "브로커 거부")
 
     # -------------------------------------------
     # Position Management
@@ -2607,6 +2658,7 @@ class ExecutionCoordinator:
         ticker: str,
         decision_id: Optional[str] = None,
         _skip_inflight_guard: bool = False,
+        reason: Optional[str] = None,
     ) -> Optional[OrderResult]:
         """Close a position at market price.
 
@@ -2626,6 +2678,16 @@ class ExecutionCoordinator:
         `_reduce_position` delegation with no id of its own) is byte-for-byte
         unchanged. NULL here is correct, not a gap, for callers with no
         upstream decision to cite.
+
+        `reason` (Important 2, 최종 전체 브랜치 리뷰): the fill notification's
+        "경로"(source) field — defaults to "User-initiated close" for a
+        caller that has no more specific label of its own (`handle_alert_action`
+        CLOSE_POSITION, a genuine human tap). Before this fix EVERY caller
+        got that same hardcoded string, so PositionManager's autonomous
+        stop-loss/take-profit close (`_execute_close_position`, which passes
+        its own accurate label through this param) reported to the phone as
+        "사람이 한 것" — exactly the two fills this notification arc exists
+        to surface (07-24 stop-loss, 07-27 take-profit) arrived mislabeled.
 
         S-2 review fix: guarded by the coordinator-wide in-flight
         defensive-exit set (`_acquire_defensive_exit_guard`) so a concurrent
@@ -2670,11 +2732,15 @@ class ExecutionCoordinator:
                 # send it to the broker (order_agent.py only tick-rounds/
                 # sends price for LIMIT).
                 order_type=OrderType.MARKET,
-                reason="User-initiated close",
+                reason=reason or "User-initiated close",
                 session_id=decision_id,
             )
 
             result = await self._execute_order(order)
+            # Important 4: 브로커 거부는 예외가 아니라 정상 결과로 온다 —
+            # 아래 _apply_sell_fill의 filled_quantity<=0 가드는 무통지이므로
+            # 여기서 명시적으로 실패를 알린다.
+            self._handle_defensive_sell_rejection(position, order, result)
             # Only drop/reduce tracking by the ACTUAL fill — a rejected or unfilled
             # sell must keep the position under defense (A3).
             self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
@@ -2691,11 +2757,22 @@ class ExecutionCoordinator:
                 self._release_defensive_exit_guard(ticker)
 
     async def _reduce_position(
-        self, ticker: str, quantity: int, decision_id: Optional[str] = None
+        self,
+        ticker: str,
+        quantity: int,
+        decision_id: Optional[str] = None,
+        reason: Optional[str] = None,
     ) -> Optional[OrderResult]:
         """Place a SELL order for a SPECIFIC quantity — a partial reduce, not
         a full close (P1, 2026-07-15,
         docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+
+        `reason` (Important 2, 최종 전체 브랜치 리뷰): same source-label
+        threading as `_close_position` — forwarded to the delegated full
+        close below and used verbatim on the direct-partial order; defaults
+        to "Autonomous partial reduce" for a caller with no more specific
+        label (today's only caller, `_execute_reduce_position`, always
+        passes one).
 
         `PositionManager._execute_reduce_position` is the (only) autonomous
         caller today: it already passes the request through
@@ -2757,7 +2834,8 @@ class ExecutionCoordinator:
                 # re-acquiring would self-deny (see _close_position's guard
                 # docstring) and a second release here would double-discard.
                 return await self._close_position(
-                    ticker, decision_id=decision_id, _skip_inflight_guard=True
+                    ticker, decision_id=decision_id, _skip_inflight_guard=True,
+                    reason=reason,
                 )
 
             order = OrderRequest(
@@ -2769,11 +2847,15 @@ class ExecutionCoordinator:
                 # S-3: same MARKET rationale as _close_position above — a
                 # partial defensive reduce must report the true fill too.
                 order_type=OrderType.MARKET,
-                reason="Autonomous partial reduce",
+                reason=reason or "Autonomous partial reduce",
                 session_id=decision_id,
             )
 
             result = await self._execute_order(order)
+            # Important 4: 브로커 거부는 예외가 아니라 정상 결과로 온다 —
+            # 아래 _apply_sell_fill의 filled_quantity<=0 가드는 무통지이므로
+            # 여기서 명시적으로 실패를 알린다.
+            self._handle_defensive_sell_rejection(position, order, result)
             # Reconcile by the ACTUAL fill, not the requested quantity — same
             # choke point every other SELL path uses (full → remove, partial →
             # decrement, none → retain).
@@ -3679,6 +3761,37 @@ class ExecutionCoordinator:
                     entry_or_exit="entry" if order.side == "buy" else "exit",
                 )
 
+            # Important 3 (최종 전체 브랜치 리뷰): 이 폴이 발견하는 체결은
+            # `_record_fill_ledger`를 거치지 않는다(원장 기록은 위에서
+            # `record_trade_fill`을 직접 부른다 — 중복 방지) — 그래서
+            # 지연 체결(placed_pending_fill → 나중에 이 폴이 발견)이 전부
+            # 무통지였다. 자율 손절/익절도 지연 체결될 수 있어 실질적이다.
+            # 안전성: 이 델타는 이번 틱에 새로 발견된 "증분"만이라 —
+            # placement 시점 통지(있었다면)와 절대 겹치지 않는다. `order`
+            # (TrackedOrder)/`delta`(FillDelta)에는 OrderRequest.reason이
+            # 없으므로 "사후 체결 확인"으로 명시해, 이게 즉시체결이 아니라
+            # 나중에 발견된 체결이라는 것 자체를 경로로 남긴다.
+            synthetic_order = OrderRequest(
+                ticker=order.ticker,
+                stock_name=order.stock_name or order.ticker,
+                side=order.side,
+                quantity=delta.new_fill_qty,
+                price=order.limit_price,
+                reason="사후 체결 확인",
+                session_id=order.source_session_id,
+            )
+            synthetic_result = OrderResult(
+                order_id=order.ord_no,
+                ticker=order.ticker,
+                side=synthetic_order.side,
+                # requested_quantity는 주문 전체 수량 — cumulative filled이
+                # 아직 total에 못 미치면 "(부분)" 표시가 정직하게 붙는다.
+                requested_quantity=order.total_quantity,
+                filled_quantity=delta.new_fill_qty,
+                avg_price=delta.avg_fill_price,
+                status="filled" if order.filled_quantity >= order.total_quantity else "partial",
+            )
+
             # E1-2: a SELL's fill delta must NOT flow into
             # register_fill_as_position below — that call only ever GROWS a
             # position, so an unguarded sell fill here would double-count it
@@ -3686,6 +3799,23 @@ class ExecutionCoordinator:
             # helper `_apply_sell_fill` uses (decrement/remove + realized
             # P&L; the ledger row was already recorded above, side-aware).
             if order.side == "sell":
+                # 실현손익은 포지션이 줄어들기/사라지기 전에 계산해야
+                # 진입가를 읽을 수 있다 — _apply_sell_fill과 같은 이유
+                # (coordinator.py의 realized-P&L 클램프 주석 참고).
+                _pos = next(
+                    (p for p in self._state.positions if p.ticker == order.ticker), None
+                )
+                _pnl = None
+                _pnl_pct = None
+                if _pos is not None and _pos.avg_price and delta.avg_fill_price:
+                    _matched_qty = min(int(delta.new_fill_qty), int(_pos.quantity))
+                    _pnl = (float(delta.avg_fill_price) - float(_pos.avg_price)) * _matched_qty
+                    _pnl_pct = (float(delta.avg_fill_price) / float(_pos.avg_price) - 1.0) * 100.0
+                self._schedule_fill_notification(
+                    synthetic_order, synthetic_result, side="sell",
+                    realized_pnl=_pnl, realized_pnl_pct=_pnl_pct,
+                )
+
                 self._apply_sell_position_delta(
                     order.ticker,
                     delta.new_fill_qty,
@@ -3725,6 +3855,15 @@ class ExecutionCoordinator:
                     )
                 )
             else:
+                # Important 3: 지연 체결된 BUY(가장 흔한 사례 — LIMIT 주문이
+                # 3폴×0.5초 창을 넘겨 pending으로 등록된 뒤 나중에 이 폴이
+                # 체결을 발견)도 placement 시점엔 통지가 없었으므로(Critical 1
+                # 수정으로 이제 pending은 의도적으로 무통지) 여기서 반드시
+                # 알려야 그 루프가 닫힌다.
+                self._schedule_fill_notification(
+                    synthetic_order, synthetic_result, side="buy",
+                )
+
                 await register_fill_as_position(
                     self,
                     ticker=order.ticker,
