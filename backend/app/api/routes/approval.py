@@ -712,10 +712,23 @@ async def _submit_decision_locked(
                                 reason=state.get("error") or "주문 실행 실패",
                             )
                         else:
-                            # 체결 통지는 ExecutionCoordinator._record_fill_ledger가
-                            # 던진다(2026-07-30). 승인 경로도 같은 초크포인트를
-                            # 지나므로 여기서 또 보내면 두 번 통지된다.
-                            pass
+                            # 정정(2026-07-30 리뷰): 이 브랜치는 그래프 실행
+                            # 노드(agents/graph/kr_stock_nodes/execution.py)가
+                            # 직접 record_trade_fill을 호출하는 경로다(위
+                            # 461행 주석대로 코디네이터는 이중 실행을 피하려고
+                            # 여기서 의도적으로 호출되지 않는다) —
+                            # ExecutionCoordinator._record_fill_ledger를 전혀
+                            # 거치지 않으므로 여기서 지우면 HITL 승인 체결이
+                            # 무통지가 된다. 제거했던 호출을 복원한다.
+                            await telegram.send_trade_executed(
+                                ticker=ticker,
+                                stock_name=stock_name,
+                                action=action,
+                                quantity=proposal.get("quantity", 0),
+                                price=proposal.get("entry_price", 0),
+                                total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
+                                source="HITL 승인",
+                            )
                 elif decision == "rejected":
                     await telegram.send_trade_rejected(
                         ticker=ticker,

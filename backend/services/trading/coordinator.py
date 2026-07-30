@@ -1752,22 +1752,29 @@ class ExecutionCoordinator:
 
         if order is not None and result is not None:
             # Critical 1 (final review): per-part ledger rows for split
-            # orders — see `_record_fill_ledger` docstring. `filled_quantity`
-            # (the caller-supplied aggregate) is intentionally unused here;
-            # every current call site passes `result.filled_quantity`, and
-            # the per-part loop derives each row's executed_quantity from
-            # `result.parts` directly.
+            # orders — see `_record_fill_ledger` docstring. The per-part loop
+            # derives each row's executed_quantity from `result.parts`
+            # directly; `filled_quantity` (the caller-supplied aggregate) IS
+            # used below, for the notification's realized-P&L estimate.
             #
             # 실현손익은 포지션 감소 **전에** 계산해야 한다 —
             # _apply_sell_position_delta가 포지션을 줄이거나 지우고 나면
             # 진입가를 읽을 수 없다.
+            #
+            # 리뷰 Important 1: _apply_sell_position_delta(아래)는
+            # `_matched = min(quantity, position.quantity)`로 클램프한 뒤
+            # realized_amount를 계산한다(원장의 정답). 여기서 클램프 없이
+            # filled_quantity 그대로 곱하면 오버셀/부분 리컨실 상황에서
+            # 통지 금액이 원장 금액보다 커진다 — 같은 클램프를 그대로
+            # 맞춘다.
             _pos = next((p for p in self._state.positions if p.ticker == ticker), None)
             _entry = getattr(_pos, "avg_price", None) if _pos else None
             _exit = getattr(result, "avg_price", None) if result is not None else None
             _pnl = None
             _pnl_pct = None
-            if _entry and _exit and filled_quantity:
-                _pnl = (float(_exit) - float(_entry)) * int(filled_quantity)
+            if _entry and _exit and filled_quantity and _pos is not None:
+                _matched_qty = min(int(filled_quantity), int(_pos.quantity))
+                _pnl = (float(_exit) - float(_entry)) * _matched_qty
                 _pnl_pct = (float(_exit) / float(_entry) - 1.0) * 100.0
 
             self._record_fill_ledger(

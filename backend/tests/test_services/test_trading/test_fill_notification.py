@@ -13,6 +13,7 @@ _record_fill_ledger는 BUY/SELL 초크포인트가 공유하는 지점이라(doc
    **앞**에 둔다. 체결됐으면 원장 기록 여부와 무관하게 알려야 한다.
 """
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -117,8 +118,17 @@ async def test_partial_fill_is_flagged():
     assert notifier.send_trade_executed.await_args.kwargs["partial"] is True
 
 
-async def test_notification_failure_never_breaks_ledger():
-    """통지가 터져도 원장 쓰기는 정상 완료된다."""
+async def test_notification_failure_never_breaks_ledger(caplog):
+    """통지가 터져도 원장 쓰기는 정상 완료된다.
+
+    리뷰 Important 2: `_drain_notify_tasks`는 태스크 예외를 bare
+    `except Exception: pass`로 삼키고, `record_trade_fill`은 태스크가
+    스케줄되기 전에 이미 동기로 끝난다 — 그래서 원래 이 테스트는
+    `_notify_fill` 내부에서 무슨 예외가 나든(예: structlog kwargs를
+    stdlib logger에 넣어 TypeError) 통과했다. `_notify_fill`을 직접
+    await해 예외가 새지 않는지, 그리고 caplog로 실제 로그가 남는지까지
+    확인한다.
+    """
     coord = _coord()
     coord._persistence_active = True
 
@@ -126,9 +136,19 @@ async def test_notification_failure_never_breaks_ledger():
                new=AsyncMock(side_effect=RuntimeError("telegram down"))), \
          patch("services.trading.coordinator.record_trade_fill") as rec:
         coord._record_fill_ledger(_order(), _result(), side="sell", entry_or_exit="exit")
+        rec.assert_called_once()  # 원장 쓰기는 통지 스케줄과 무관하게 이미 끝났다
+
+        with caplog.at_level(logging.ERROR):
+            # raise 없이 반환되면 never-raise 계약은 지켜진 것 — 예외가
+            # 새면 이 await 자체가 테스트를 실패시킨다.
+            await coord._notify_fill(_order(), _result(), side="sell")
+
+        # _record_fill_ledger가 스케줄해둔 태스크(위)도 같은 mock으로
+        # 실패하므로, 여기서 마저 비워 "Task exception was never retrieved"
+        # 경고 없이 정리한다.
         await coord._drain_notify_tasks()
 
-    rec.assert_called_once()
+    assert "fill_notification_failed" in caplog.text
 
 
 async def test_killswitch_off_suppresses_notification():
