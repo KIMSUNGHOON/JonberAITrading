@@ -96,6 +96,56 @@ class TelegramNotifier:
 
         return chunks
 
+    async def _send_chunks(
+        self,
+        chunks: list[str],
+        parse_mode: Optional[str],
+        reply_markup: Optional["InlineKeyboardMarkup"],
+        start_index: int = 0,
+    ) -> tuple[int, Optional[TelegramError]]:
+        """`chunks[start_index:]`를 순서대로 발송한다.
+
+        primary 발송(마크다운 재시도 전 원본)과 평문 폴백이 이 한 곳을
+        공유한다 — 청크 분할·연속 표시(`_(계속...)_`)·청크 간 지연·
+        `reply_markup`을 첫 청크에만 붙이는 규칙이 두 곳에 따로 있으면
+        어긋나기 쉽다.
+
+        연속 표시는 `parse_mode`가 있을 때만 붙인다 — `_(계속...)_` 자체가
+        밑줄로 시작하는 Markdown 마커라 평문(`parse_mode=None`) 경로에서는
+        리터럴로 노출되기 때문이다.
+
+        반환값은 (다음에 재개할 인덱스, 실패 시 그 예외 또는 성공 시 None).
+        도중 실패하면 그 지점에서 멈추고 실패한 인덱스를 반환한다 — 호출부가
+        이미 보낸 청크를 폴백에서 처음부터 다시 보내 중복 발송하는 일을
+        막기 위함이다.
+        """
+        total = len(chunks)
+        for i in range(start_index, total):
+            chunk = chunks[i]
+            if parse_mode and total > 1:
+                if i == 0:
+                    chunk = chunk + "\n\n_(계속...)_"
+                elif i < total - 1:
+                    chunk = f"_(...계속)_\n\n{chunk}\n\n_(계속...)_"
+                else:
+                    chunk = f"_(...계속)_\n\n{chunk}"
+
+            try:
+                await self._bot.send_message(
+                    chat_id=self._config.TELEGRAM_CHAT_ID,
+                    text=chunk,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup if i == 0 else None,
+                )
+            except TelegramError as e:
+                return i, e
+
+            # Small delay between chunks to maintain order
+            if i < total - 1:
+                await asyncio.sleep(0.3)
+
+        return total, None
+
     async def _send_message(
         self,
         text: str,
@@ -114,76 +164,52 @@ class TelegramNotifier:
         if not self._initialized or not self._bot:
             return False
 
-        try:
-            # Split long messages
-            chunks = self._split_message(text)
-
-            for i, chunk in enumerate(chunks):
-                # Add continuation indicator for multi-part messages
-                if len(chunks) > 1:
-                    if i == 0:
-                        chunk = chunk + "\n\n_(계속...)_"
-                    elif i < len(chunks) - 1:
-                        chunk = f"_(...계속)_\n\n{chunk}\n\n_(계속...)_"
-                    else:
-                        chunk = f"_(...계속)_\n\n{chunk}"
-
-                await self._bot.send_message(
-                    chat_id=self._config.TELEGRAM_CHAT_ID,
-                    text=chunk,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup if i == 0 else None,
-                )
-
-                # Small delay between chunks to maintain order
-                if i < len(chunks) - 1:
-                    await asyncio.sleep(0.3)
-
+        chunks = self._split_message(text)
+        sent_index, error = await self._send_chunks(chunks, parse_mode, reply_markup)
+        if error is None:
             return True
-        except TelegramError as e:
-            # Markdown 파싱 실패는 재시도 가치가 있다 — 이 레포는 같은 원인으로
-            # 라이브 통지를 두 번 잃었고(51227ca), 세 번째가 진행 중이었다
-            # (_notify_decision의 'NO_ACTION' 밑줄, 07-30 하루 18건+).
-            # 파싱 외 실패(네트워크·권한)는 재시도하면 중복 발송이 되므로 제외.
-            reason = str(e)
-            # BadRequest는 Telegram이 요청을 동기적으로 거부했다는 뜻이라
-            # 메시지가 실제로 발송된 적이 없다 — 재시도해도 중복 발송 위험이
-            # 없다. TimedOut/NetworkError/Forbidden 등 그 외 TelegramError는
-            # 전송 여부가 불확실하므로(응답만 유실됐을 수 있음) 재시도하지
-            # 않는다. 메시지 문자열(parse/entity 등)만으로 판별하면 Telegram
-            # API가 문구를 바꿀 때마다 조용히 깨지므로 예외 타입으로 판별한다.
-            is_parse_error = isinstance(e, BadRequest)
-            logger.error(
-                "telegram_send_failed",
-                parse_mode=parse_mode,
-                error_type=type(e).__name__,
-                error=reason,
-                # 본문 앞부분만 — 무엇이 유실됐는지 알 수 있어야 한다.
-                # 토큰은 본문에 실리지 않으므로 안전하다.
-                text_head=text[:120],
-                will_retry_plain=bool(is_parse_error and parse_mode),
-            )
-            if not (is_parse_error and parse_mode):
-                return False
 
-            try:
-                for i, chunk in enumerate(self._split_message(text)):
-                    await self._bot.send_message(
-                        chat_id=self._config.TELEGRAM_CHAT_ID,
-                        text=chunk,
-                        parse_mode=None,
-                        reply_markup=reply_markup if i == 0 else None,
-                    )
-                logger.warning("telegram_send_plain_fallback_ok", text_head=text[:120])
-                return True
-            except TelegramError as e2:
-                logger.error(
-                    "telegram_send_plain_fallback_failed",
-                    error_type=type(e2).__name__,
-                    error=str(e2),
-                    text_head=text[:120],
-                )
-                return False
+        # Markdown 파싱 실패는 재시도 가치가 있다 — 이 레포는 같은 원인으로
+        # 라이브 통지를 두 번 잃었고(51227ca), 세 번째가 진행 중이었다
+        # (_notify_decision의 'NO_ACTION' 밑줄, 07-30 하루 18건+).
+        # 파싱 외 실패(네트워크·권한)는 재시도하면 중복 발송이 되므로 제외.
+        reason = str(error)
+        # BadRequest는 Telegram이 요청을 동기적으로 거부했다는 뜻이라
+        # 메시지가 실제로 발송된 적이 없다 — 재시도해도 중복 발송 위험이
+        # 없다. TimedOut/NetworkError/Forbidden 등 그 외 TelegramError는
+        # 전송 여부가 불확실하므로(응답만 유실됐을 수 있음) 재시도하지
+        # 않는다. 메시지 문자열(parse/entity 등)만으로 판별하면 Telegram
+        # API가 문구를 바꿀 때마다 조용히 깨지므로 예외 타입으로 판별한다.
+        is_parse_error = isinstance(error, BadRequest)
+        logger.error(
+            "telegram_send_failed",
+            parse_mode=parse_mode,
+            error_type=type(error).__name__,
+            error=reason,
+            # 본문 앞부분만 — 무엇이 유실됐는지 알 수 있어야 한다.
+            # 토큰은 본문에 실리지 않으므로 안전하다.
+            text_head=text[:120],
+            will_retry_plain=bool(is_parse_error and parse_mode),
+        )
+        if not (is_parse_error and parse_mode):
+            return False
+
+        # sent_index부터 재개한다 — 이미 성공한 청크(예: 긴 메시지의 1번
+        # 청크)를 처음부터 다시 보내면 그 청크만 두 번 발송되는 사고가 된다.
+        _, error2 = await self._send_chunks(
+            chunks, None, reply_markup, start_index=sent_index
+        )
+        if error2 is None:
+            logger.warning("telegram_send_plain_fallback_ok", text_head=text[:120])
+            return True
+
+        logger.error(
+            "telegram_send_plain_fallback_failed",
+            error_type=type(error2).__name__,
+            error=str(error2),
+            text_head=text[:120],
+        )
+        return False
 
     async def send_message(self, text: str, parse_mode: str = "Markdown") -> bool:
         """

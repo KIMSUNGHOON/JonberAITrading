@@ -7,6 +7,11 @@
 
 폴백은 '한 번 더 보낸다'가 전부가 아니다 — 실패 사실이 로그에 남아야 다음
 사고를 조기에 잡는다. 단 토큰은 절대 로그에 넣지 않는다.
+
+코디네이터 리뷰 지적(중요): 긴 메시지는 여러 청크로 쪼개져 순차 발송되는데,
+1번 청크가 성공한 뒤 2번 청크에서 BadRequest가 나면 폴백이 처음부터 다시
+보내면 1번 청크가 중복 발송된다. 이 재발송 회피 여부를 아래 멀티청크
+테스트 2개가 확인한다.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -85,6 +90,47 @@ async def test_failure_logs_context_without_secrets():
     joined = " ".join(str(c) for c in calls)
     assert "parse_mode" in joined
     assert "bot" not in joined.lower() or ":" not in joined  # 토큰 형태가 없어야 한다
+
+
+async def test_multi_chunk_mid_failure_fallback_resumes_after_sent_chunk():
+    """긴 메시지가 2청크로 쪼개지고 1번 청크는 성공, 2번 청크에서 BadRequest면
+    폴백은 2번 청크부터만 평문으로 재발송한다 — 1번 청크를 두 번 보내면
+    안 된다(코디네이터 리뷰 지적: 중복 발송)."""
+    svc = _make_service()
+    long_text = "가" * 4500  # _split_message 기준 정확히 2청크(4000+500자)
+    svc._bot.send_message = AsyncMock(
+        side_effect=[None, BadRequest("Can't parse entities"), None]
+    )
+
+    ok = await svc._send_message(long_text)
+
+    assert ok is True
+    assert svc._bot.send_message.await_count == 3
+    calls = svc._bot.send_message.await_args_list
+    first_chunk_text = calls[0].kwargs["text"]
+    # 1번 청크(성공분)의 텍스트가 폴백에서 다시 등장하지 않는다 — 딱 한 번만.
+    sent_texts = [c.kwargs["text"] for c in calls]
+    assert sent_texts.count(first_chunk_text) == 1
+    # 세 번째 호출(폴백)은 평문으로, 2번 청크 자리를 재발송한다.
+    assert calls[2].kwargs.get("parse_mode") is None
+
+
+async def test_multi_chunk_first_chunk_failure_fallback_resends_from_start():
+    """긴 메시지의 1번 청크 자체가 BadRequest면(아직 아무것도 발송되지
+    않았다) 폴백은 처음부터 다시 보낸다 — 이 경우엔 전체 재발송이 맞다."""
+    svc = _make_service()
+    long_text = "가" * 4500
+    svc._bot.send_message = AsyncMock(
+        side_effect=[BadRequest("Can't parse entities"), None, None]
+    )
+
+    ok = await svc._send_message(long_text)
+
+    assert ok is True
+    assert svc._bot.send_message.await_count == 3
+    fallback_calls = svc._bot.send_message.await_args_list[1:]
+    assert len(fallback_calls) == 2
+    assert all(c.kwargs.get("parse_mode") is None for c in fallback_calls)
 
 
 async def test_md_escape_covers_all_legacy_markers():
