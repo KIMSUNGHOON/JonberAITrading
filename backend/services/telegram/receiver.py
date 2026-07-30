@@ -40,9 +40,11 @@ This module owns:
   - `_authorized(update)`: `effective_chat.id == TELEGRAM_CHAT_ID`
     (normalized to str on both sides -- the wire value is always an int,
     the configured value may be entered as either str or int).
-  - A built-in `/help` command that lists every currently-registered
-    command name (dynamic -- reflects whatever TG-2/3/4 have registered
-    by the time it runs).
+  - A built-in `/help` command backed by `_COMMAND_META` (Task 5) -- the
+    same registry entry `register_command()` fills is the single source
+    for both `/help`'s grouped overview / per-command detail and
+    `setMyCommands`'s autocomplete list, so a command registered without
+    metadata can no longer silently vanish from one but not the other.
 
 `run_polling()` is intentionally NOT used -- it drives its own event loop
 and would collide with FastAPI's (see spec S1 / PTB 22.5
@@ -60,6 +62,7 @@ non-blocking lifespan sequence:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, Optional
 
 import structlog
@@ -83,16 +86,48 @@ CallbackHandlerFn = Callable[[Update, "ContextTypes.DEFAULT_TYPE"], Awaitable[No
 _COMMAND_REGISTRY: Dict[str, CommandHandlerFn] = {}
 _CALLBACK_REGISTRY: Dict[str, CallbackHandlerFn] = {}
 
-# 리뷰 픽스(Critical): 상태를 바꾸는 콜백 프리픽스 집합 -- _MUTATE_COMMANDS의
-# 콜백판. /auto는 2단계라 실제 모드 플립은 명령이 아니라 확인 버튼 콜백
+# 리뷰 픽스(Critical): 상태를 바꾸는 콜백 프리픽스 집합 -- CommandMeta.risk
+# ("read"|"mutate")의 콜백판. /auto는 2단계라 실제 모드 플립은 명령이 아니라
+# 확인 버튼 콜백
 # (callbacks.py의 auto_confirm:)에서 일어나므로, _wrap_command만 막으면
 # 그룹 안의 admin 아닌 사용자가 admin이 띄운 버튼을 눌러 우회할 수 있다.
 # register_callback(..., mutate=True)로 등록 시점에 표시한다 -- 문자열
 # 프리픽스를 receiver.py에 따로 하드코딩하면 commands.py/callbacks.py가
 # 이미 단일 출처로 합의해둔 AUTO_CONFIRM_CALLBACK_PREFIX와 다시 갈라질
 # 위험이 있고(callbacks.py 모듈독스트링 참고), receiver.py가 commands.py를
-# 직접 import하면 순환 임포트가 된다. Task 5에서 레지스트리 메타로 옮긴다.
+# 직접 import하면 순환 임포트가 된다.
+#
+# Task 5 note: 이 집합은 CommandMeta로 흡수하지 *않는다*. CommandMeta는
+# /help·setMyCommands가 함께 쓰는 "명령어" 메타(summary/group/usage/detail/
+# caution)인데, 콜백 프리픽스("a:", "r:", "auto_confirm:")는 슬래시 명령이
+# 아니라서 /help에도 자동완성에도 실리지 않는다 -- 담을 곳 없는 필드를
+# CommandMeta에 얹으면 오히려 "명령/콜백" 두 개념이 한 dataclass에 섞여
+# 헷갈린다. register_callback(mutate=True) 배선은 그대로 두고, /help의
+# 대상인 명령어 쪽만 레지스트리 메타로 옮긴다.
 _MUTATE_CALLBACK_PREFIXES: set[str] = set()
+
+
+@dataclass(frozen=True)
+class CommandMeta:
+    """/help와 setMyCommands가 함께 쓰는 명령어 설명.
+
+    별도 설명 dict를 두면 '등록됐지만 /help에 없는 명령'이 반드시 생긴다 --
+    레지스트리를 단일 출처로 삼는다.
+    """
+
+    summary: str = ""
+    group: str = "기타"
+    risk: str = "read"  # read | mutate
+    usage: str = ""
+    detail: str = ""
+    caution: str = ""
+
+
+_COMMAND_META: Dict[str, CommandMeta] = {}
+
+# /help 섹션 순서. 미등록 그룹은 이 뒤에 붙고, mutate 섹션은 항상 맨 아래다.
+_HELP_GROUP_ORDER = ["지금 상태", "종목 판단", "성과", "승인 대기"]
+_MUTATE_GROUP = "상태를 바꿈"
 
 # The single receiver Application, set by start_telegram_receiver() and
 # cleared by stop_telegram_receiver(). None means "not currently running"
@@ -101,17 +136,35 @@ _MUTATE_CALLBACK_PREFIXES: set[str] = set()
 _application: Optional[Application] = None
 
 
-def register_command(name: str, handler: CommandHandlerFn) -> None:
-    """Register a `/name` command handler.
+def register_command(
+    name: str,
+    handler: CommandHandlerFn,
+    *,
+    summary: str = "",
+    group: str = "기타",
+    risk: str = "read",
+    usage: str = "",
+    detail: str = "",
+    caution: str = "",
+) -> None:
+    """`/name` 명령 핸들러를 등록한다.
 
-    Call at import time so the handler is present by the time
-    `start_telegram_receiver()` builds the Application. `name` excludes the
-    leading slash (e.g. "status", not "/status"). The shared security
-    wrapper (chat_id check + never-raise) is applied automatically at
-    wiring time -- handlers registered here should NOT re-check chat_id
-    themselves.
+    새 키워드 인자는 전부 optional이라 기존 호출부가 깨지지 않는다. 다만
+    신규 명령은 summary/group/risk를 채워야 /help와 setMyCommands에 제대로
+    실린다 -- 누락 시 기동 로그에 warning을 남기되 예외는 던지지 않는다
+    (receiver의 never-raise 계약).
+
+    import 시점에 호출한다. `name`은 슬래시를 뺀 이름이다("status", not
+    "/status"). 공유 보안 래퍼(chat_id 검증 + never-raise)는 배선 시점에
+    자동 적용되므로 핸들러가 직접 재검사하면 안 된다.
     """
     _COMMAND_REGISTRY[name] = handler
+    _COMMAND_META[name] = CommandMeta(
+        summary=summary, group=group, risk=risk,
+        usage=usage or f"/{name}", detail=detail, caution=caution,
+    )
+    if not summary:
+        logger.warning("telegram_command_meta_missing", command=name)
 
 
 def register_callback(
@@ -124,14 +177,19 @@ def register_callback(
     rejection button -- see spec F1). Like `register_command`, the shared
     security wrapper is applied automatically at dispatch time.
 
-    `mutate=True` marks a prefix as state-changing (리뷰 픽스: currently only
-    "auto_confirm:", /auto step-2's confirm button, which actually flips
-    `trading_mode:kiwoom` to autonomous -- see `_MUTATE_CALLBACK_PREFIXES`).
-    Such prefixes get the same extra per-user gate as `_MUTATE_COMMANDS`
+    `mutate=True` marks a prefix as state-changing (리뷰 픽스: "auto_confirm:",
+    /auto step-2's confirm button, which actually flips `trading_mode:kiwoom`
+    to autonomous; and Task 5's extension to "a:"/"r:", the approve/reject
+    buttons -- `expected_proposal_id` pins WHICH proposal a tap decides, not
+    WHO may decide it, so under a group `TELEGRAM_CHAT_ID` any member could
+    otherwise approve/reject a proposal that isn't theirs to decide -- see
+    `_MUTATE_CALLBACK_PREFIXES`). Such prefixes get the same extra per-user
+    gate as a command registered with `risk="mutate"`
     (`_user_allowed_for_mutate`) on top of the ordinary chat_id check --
     necessary because `_authorized` only verifies the chat, and a group
-    member other than the admin who typed `/auto` could otherwise tap the
-    button the admin's message posted into that shared chat.
+    member other than the admin who typed `/auto` (or who wasn't even
+    consulted on an approve/reject decision) could otherwise tap the button
+    posted into that shared chat.
     """
     _CALLBACK_REGISTRY[pattern_prefix] = handler
     if mutate:
@@ -155,10 +213,6 @@ def _authorized(update: Update) -> bool:
     if chat_id is None:
         return False
     return str(chat_id) == str(config.TELEGRAM_CHAT_ID)
-
-
-# 상태를 바꾸는 명령. Task 5에서 레지스트리 메타(risk="mutate")로 옮긴다.
-_MUTATE_COMMANDS = {"halt", "auto"}
 
 
 def _user_allowed_for_mutate(update: Update) -> bool:
@@ -214,7 +268,7 @@ def _wrap_command(name: str, handler: CommandHandlerFn) -> CommandHandlerFn:
                 command=name,
             )
             return
-        if name in _MUTATE_COMMANDS and not _user_allowed_for_mutate(update):
+        if _COMMAND_META.get(name, CommandMeta()).risk == "mutate" and not _user_allowed_for_mutate(update):
             user = getattr(update, "effective_user", None)
             logger.warning(
                 "telegram_mutate_denied",
@@ -293,17 +347,87 @@ async def _dispatch_callback(update: Update, context: "ContextTypes.DEFAULT_TYPE
     await wrapped(update, context)
 
 
+def _help_overview() -> str:
+    """그룹별 1행 요약. 평문 -- 현행 `*사용 가능한 명령어*`는 parse_mode가
+    없어 별표가 리터럴로 노출되는 버그다."""
+    reads = [n for n, m in _COMMAND_META.items() if m.risk != "mutate"]
+    mutates = [n for n, m in _COMMAND_META.items() if m.risk == "mutate"]
+    lines = [f"[명령어] 조회 {len(reads)} · 실행 {len(mutates)}"]
+
+    groups = list(_HELP_GROUP_ORDER)
+    for name in sorted(reads):
+        g = _COMMAND_META[name].group
+        if g not in groups:
+            groups.append(g)
+
+    for g in groups:
+        members = sorted(n for n in reads if _COMMAND_META[n].group == g)
+        if not members:
+            continue
+        lines.append(f"── {g}")
+        for n in members:
+            lines.append(f"/{n}  {_COMMAND_META[n].summary}")
+
+    if mutates:
+        lines.append(f"── ⚠️ {_MUTATE_GROUP}")
+        for n in sorted(mutates):
+            lines.append(f"/{n}  {_COMMAND_META[n].summary}")
+
+    lines.append("")
+    lines.append("상세는 /help positions 처럼")
+    return "\n".join(lines)
+
+
+def _help_detail(name: str) -> str:
+    meta = _COMMAND_META.get(name)
+    if meta is None:
+        candidates = sorted(
+            _COMMAND_META, key=lambda n: (0 if n.startswith(name[:3]) else 1, n)
+        )[:3]
+        hint = " ".join(f"/{c}" for c in candidates)
+        return f"'{name}' 명령이 없습니다.\n비슷한 것: {hint}"
+    risk_ko = "⚠️ 상태를 바꿈" if meta.risk == "mutate" else "읽기 전용 (아무것도 바꾸지 않음)"
+    lines = [f"[/{name}] {meta.summary}"]
+    if meta.detail:
+        lines.append(meta.detail)
+    lines.append(f"인자: {meta.usage}")
+    lines.append(f"위험도: {risk_ko}")
+    if meta.caution:
+        lines.append(f"주의: {meta.caution}")
+    return "\n".join(lines)
+
+
 async def _handle_help(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
-    """Built-in /help -- lists every currently-registered command name."""
-    lines = ["*사용 가능한 명령어*", ""]
-    for cmd_name in sorted(_COMMAND_REGISTRY):
-        lines.append(f"/{cmd_name}")
+    """내장 /help -- 2단 구조.
+
+    `/help`는 그룹별 1행 요약, `/help <명령>`은 상세. 명령어가 6→14개가 되면
+    상세를 한 통에 담을 수 없다(4,096자).
+    """
+    args = list(getattr(context, "args", None) or [])
+    text = _help_detail(args[0].lstrip("/")) if args else _help_overview()
     message = getattr(update, "effective_message", None) or getattr(update, "message", None)
     if message is not None:
-        await message.reply_text("\n".join(lines))
+        await message.reply_text(text)
 
 
-register_command("help", _handle_help)
+register_command(
+    "help", _handle_help,
+    summary="명령어 목록과 사용법",
+    group="지금 상태",
+    risk="read",
+    usage="/help 또는 /help <명령>",
+    detail="목적: 어떤 명령이 있고 무엇을 하는지",
+)
+
+
+def _build_bot_commands() -> list:
+    """setMyCommands에 보낼 목록. 설명이 비면 Telegram이 거부하므로 폴백을 둔다."""
+    from telegram import BotCommand
+
+    return [
+        BotCommand(name, (_COMMAND_META.get(name, CommandMeta()).summary or name)[:256])
+        for name in sorted(_COMMAND_REGISTRY)
+    ]
 
 
 def _on_polling_error(error: Exception) -> None:
@@ -374,6 +498,16 @@ async def start_telegram_receiver() -> Optional[Application]:
         application.add_handler(CallbackQueryHandler(_dispatch_callback))
 
         await application.initialize()
+
+        # 폰에서 `/`를 쳤을 때 뜨는 자동완성. 코드베이스에 set_my_commands가
+        # 0건이라 지금은 목록이 비어 있고 /help가 그 역할을 100% 혼자 진다.
+        # 실패는 로그만 -- 자동완성이 없다고 수신이 죽어선 안 된다.
+        try:
+            await application.bot.set_my_commands(_build_bot_commands())
+            logger.info("telegram_set_my_commands_ok", count=len(_COMMAND_REGISTRY))
+        except Exception as e:
+            logger.warning("telegram_set_my_commands_failed", error=str(e))
+
         await application.updater.start_polling(error_callback=_on_polling_error)
         await application.start()
 

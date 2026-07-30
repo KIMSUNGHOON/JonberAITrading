@@ -22,7 +22,13 @@ structurally guaranteed, not incidental (TG-1 carryover finding).
 
 Security (chat_id check + never-raise) is applied once, uniformly, by
 receiver._wrap_callback at dispatch time -- this module must NOT re-check
-chat_id itself. Handler order per spec F1 (chat_id already cleared by the
+chat_id itself. Task 5: `a:`/`r:` are also registered `mutate=True` (see the
+registration block at the bottom of this file), so the same per-user gate
+`_wrap_callback` applies to `auto_confirm:` also runs here -- the
+`expected_proposal_id` pin below only constrains WHICH proposal a tap
+decides, never WHO may decide it, and under a group `TELEGRAM_CHAT_ID` that
+gap would let any chat member approve/reject a proposal that isn't theirs.
+Handler order per spec F1 (chat_id + mutate gate already cleared by the
 wrapper by the time a handler here runs):
 
   1. `await query.answer()` -- stop the client-side spinner immediately,
@@ -368,12 +374,21 @@ async def handle_auto_confirm_callback(update: Update, context: "ContextTypes.DE
 # Registration (import-time side effect -- see module docstring)
 # -------------------------------------------
 
-register_callback("a:", handle_approve_callback)
-register_callback("r:", handle_reject_callback)
+# Task 5 review 요구사항: a:/r: 승인·거부 버튼도 mutate=True로 표시한다.
+# expected_proposal_id 핀은 탭이 "어느 제안"을 결정하는지만 고정할 뿐
+# "누가" 결정하는지는 전혀 검사하지 않는다 -- 그룹 TELEGRAM_CHAT_ID 아래서는
+# 그 chat의 누구든 승인 버튼을 눌러 submit_decision(..., actor="telegram")을
+# 트리거해 그래프를 재개시키고 실거래를 낼 수 있다(HITL 모드에서는 완전
+# 미승인 주문, 자율 모드에서는 60초 검토 유예를 붕괴). 거부 버튼도 LLM
+# 재분석 사이클을 강제할 수 있어 동일하게 막는다. TELEGRAM_ADMIN_USER_ID가
+# 비어 있으면 _user_allowed_for_mutate가 True를 반환하므로 기존 배포엔
+# 영향이 없다.
+register_callback("a:", handle_approve_callback, mutate=True)
+register_callback("r:", handle_reject_callback, mutate=True)
 # 리뷰 픽스(Critical): mutate=True -- 이 콜백이 /auto의 실제 상태 변경(모드
 # 플립)이 일어나는 지점이다. commands.handle_auto는 확인 버튼만 보내고
 # _set_kiwoom_autonomous/_rearm_awaiting_approvals는 여기서만 호출되므로,
-# receiver._wrap_command에 건 _MUTATE_COMMANDS 관문만으로는 이 경로가
+# receiver._wrap_command의 명령어 risk="mutate" 관문만으로는 이 경로가
 # 막히지 않는다 -- 그룹 채팅에서 admin이 아닌 사용자가 admin이 띄운 버튼을
 # 누르는 시나리오를 닫는다.
 register_callback(AUTO_CONFIRM_CALLBACK_PREFIX, handle_auto_confirm_callback, mutate=True)

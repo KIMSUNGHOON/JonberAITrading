@@ -621,9 +621,40 @@ async def handle_auto(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> N
 # Registration (import-time side effect -- see module docstring)
 # -------------------------------------------
 
-register_command("status", handle_status)
-register_command("positions", handle_positions)
-register_command("pending", handle_pending)
-register_command("report", handle_report)
-register_command("halt", handle_halt)
-register_command("auto", handle_auto)
+register_command(
+    "status", handle_status,
+    summary="자율 가능 여부·계좌·한도 여유", group="지금 상태",
+    detail="목적: 지금 자율 실행이 가능한 상태인가",
+)
+register_command(
+    "positions", handle_positions,
+    summary="보유 종목·실효 손절 여유", group="지금 상태",
+    detail="목적: 지금 손절까지 얼마 남았나",
+    caution="손절이 엔진마다 다르면 둘 다 표시. 실제 발동은 값이 높은 쪽",
+)
+register_command(
+    "pending", handle_pending,
+    summary="승인 대기 제안 + 버튼", group="승인 대기",
+    detail="목적: 사람 승인을 기다리는 제안 확인",
+)
+register_command(
+    "report", handle_report,
+    summary="장마감 요약", group="성과",
+    usage="/report 또는 /report 2026-07-29",
+    detail="목적: 하루가 어떻게 끝났나",
+)
+register_command(
+    "halt", handle_halt,
+    summary="자율 정지 (자동 손절도 수동 전환)", group="상태를 바꿈", risk="mutate",
+    detail=(
+        "목적: 자율 실행을 즉시 멈춘다\n"
+        "위험: 신규 매수만 막는 것이 아니다 — 자동 손절도 함께 멈춘다"
+    ),
+    caution="정지 중에는 손절가에 닿아도 사람이 승인해야 청산된다",
+)
+register_command(
+    "auto", handle_auto,
+    summary="자율 재개 (버튼 확인 5분)", group="상태를 바꿈", risk="mutate",
+    detail="목적: /halt로 멈춘 자율 실행을 되살린다",
+    caution="확인 버튼은 1회용이며 5분 뒤 만료된다",
+)

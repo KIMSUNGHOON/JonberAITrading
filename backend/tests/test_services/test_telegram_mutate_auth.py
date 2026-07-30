@@ -228,3 +228,66 @@ async def test_dispatch_callback_allows_admin_auto_confirm_tap(monkeypatch):
 
     query.answer.assert_awaited_once()
     assert rearm_calls == [True]
+
+
+# -------------------------------------------
+# Task 5 요구사항: a:/r: 승인·거부 콜백도 mutate=True다. expected_proposal_id
+# 핀은 탭이 '어느 제안'을 결정하는지만 고정할 뿐 '누가' 결정하는지는 전혀
+# 검사하지 않는다 -- 그룹 TELEGRAM_CHAT_ID 아래서는 admin이 아닌 구성원도
+# 승인 버튼을 눌러 submit_decision(actor="telegram")을 트리거해 그래프를
+# 재개시키고(HITL 모드면 완전 미승인 주문 실행, 자율 모드면 60초 검토
+# 유예 붕괴) 실거래를 낼 수 있었다. auto_confirm: 검증과 동일하게 실제
+# 프로덕션 경로(receiver._dispatch_callback)로 핀한다.
+# -------------------------------------------
+
+
+async def test_dispatch_callback_blocks_non_admin_approve_tap(monkeypatch):
+    """a:(승인) 콜백은 명령이 아니라 콜백이라 _wrap_command가 아니라
+    _wrap_callback을 거친다 -- register_callback("a:", ..., mutate=True)로
+    표시가 실제로 배선됐는지까지 핀한다. 관문에서 막히므로 세션 조회조차
+    일어나지 않아야 한다(핸들러 로직에 도달하지 못했다는 증거)."""
+    monkeypatch.setattr(receiver, "get_telegram_config", lambda: _tg_config("6857067846"))
+
+    fetch_calls = []
+
+    async def fake_fetch_live_session(session_id):
+        fetch_calls.append(session_id)
+        return None
+
+    monkeypatch.setattr(callbacks, "_fetch_live_session", fake_fetch_live_session)
+
+    update, query = _make_callback_update(12345, 111, "a:sess-1:pid12345")
+
+    with structlog.testing.capture_logs() as logs:
+        await receiver._dispatch_callback(update, MagicMock())
+
+    query.answer.assert_not_awaited()
+    query.edit_message_text.assert_not_awaited()
+    assert fetch_calls == []
+    denied = [log for log in logs if log.get("event") == "telegram_mutate_denied"]
+    assert len(denied) == 1
+    assert denied[0]["command"] == "a:"
+    assert denied[0]["user_id"] == 111
+
+
+async def test_dispatch_callback_allows_admin_approve_tap(monkeypatch):
+    """대조군: admin 본인이 승인 버튼을 누르면 여전히 핸들러까지 도달한다
+    (mutate 관문이 admin 자신까지 막는 회귀가 없는지 확인)."""
+    monkeypatch.setattr(receiver, "get_telegram_config", lambda: _tg_config("6857067846"))
+
+    fetch_calls = []
+
+    async def fake_fetch_live_session(session_id):
+        fetch_calls.append(session_id)
+        return None  # 세션 없음 -> stale 처리, 관문 통과 여부만 확인하면 충분
+
+    monkeypatch.setattr(callbacks, "_fetch_live_session", fake_fetch_live_session)
+
+    update, query = _make_callback_update(
+        12345, 6857067846, "a:sess-1:pid12345"
+    )
+
+    await receiver._dispatch_callback(update, MagicMock())
+
+    query.answer.assert_awaited_once()
+    assert fetch_calls == ["sess-1"]
