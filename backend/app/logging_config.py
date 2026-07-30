@@ -13,12 +13,13 @@ Provides:
 import io
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime
 from contextvars import ContextVar
 from functools import wraps
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
@@ -49,6 +50,84 @@ LOG_LEVELS = {
 }
 
 
+# -------------------------------------------
+# 비밀 마스킹 (로그에 토큰/API키가 남지 않게)
+# -------------------------------------------
+
+REDACTED = "<REDACTED>"
+
+# 실측으로 '값이 URL에 실려 나간다'고 확인된 형태에만 앵커를 건다.
+# 과잉 마스킹 방지: 경로형은 '/bot<숫자>:' 접두 필수, 쿼리형은 '[?&]이름=' 앵커 필수
+# (그래서 max_tokens=4096, ?symbol=SMH 같은 정상 로그는 건드리지 않는다).
+_SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
+    # Telegram 봇 토큰: https://api.telegram.org/bot<TOKEN>/sendMessage,
+    # /file/bot<TOKEN>/..., 그리고 PTB의 'Set Bot API URL: .../bot<TOKEN>'(뒤에 / 없음).
+    # 후행 슬래시를 요구하면 안 된다 — 줄 끝에 토큰이 오는 변종을 놓친다.
+    (re.compile(r"(/(?:file/)?bot)\d+:[A-Za-z0-9_-]+"), r"\g<1>" + REDACTED),
+    # 쿼리스트링 비밀: Finnhub ?token=<KEY> 등
+    (re.compile(
+        r"([?&](?:token|api_key|apikey|access_key|secret_key|access_token|crtfc_key)=)"
+        r"[^&\s\"'<>]+",
+        re.IGNORECASE,
+    ), r"\g<1>" + REDACTED),
+    # 방어적: Authorization 헤더가 어딘가에서 문자열화되는 경우 (현재 로그 0건이지만
+    # 키움 24시간 거래 토큰이 실릴 수 있는 형태라 비용 0으로 덮어둔다)
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}"), r"\g<1>" + REDACTED),
+)
+
+# 값싼 게이트: 아래 힌트가 없으면 정규식을 아예 돌리지 않는다
+_SECRET_HINTS = ("bot", "token", "key=", "bearer")
+
+
+def mask_secrets(text: str) -> str:
+    """로그 문자열에서 비밀을 <REDACTED>로 치환한다. 멱등하다."""
+    low = text.lower()
+    if not any(h in low for h in _SECRET_HINTS):
+        return text
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+class SecretRedactingFilter(logging.Filter):
+    """핸들러에 붙는 비밀 마스킹 필터.
+
+    반드시 **핸들러**에 붙일 것 — 로거(root 포함)에 붙이면 자식 로거에서 전파된
+    레코드를 보지 못한다(Logger.callHandlers는 조상의 handlers만 호출하고 조상의
+    filters는 평가하지 않는다). 누출 전량이 자식 로거 httpx 발생분이므로
+    root_logger.addFilter()는 0건을 마스킹한다.
+
+    httpx는 URL을 record.msg가 아니라 record.args에 담고(args[1]이 httpx.URL 객체라
+    args에 re.sub을 돌리면 TypeError로 로깅이 깨진다), 그래서 getMessage()로 한 번
+    조립한 뒤 치환하고 args를 비운다. 이 형태는 멱등이라 같은 record가 여러 핸들러를
+    순차 통과해도 안전하다.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            original = record.getMessage()
+            masked = mask_secrets(original)
+            if masked != original:
+                record.msg = masked
+                record.args = None
+                if hasattr(record, "message"):
+                    record.message = masked
+            # 트레이스백 경로(uvicorn.error 등): 예외 문자열에 URL이 실릴 수 있다.
+            # 아직 렌더되지 않았다면 우리가 먼저 마스킹해서 넣어둔다
+            # (Formatter는 exc_text가 이미 있으면 재계산하지 않는다).
+            if record.exc_info and not record.exc_text:
+                record.exc_text = mask_secrets(
+                    logging.Formatter().formatException(record.exc_info)
+                )
+            elif record.exc_text:
+                record.exc_text = mask_secrets(record.exc_text)
+        except Exception:
+            # 마스킹 실패가 로깅을 죽이면 안 된다 — 단, 실패 시 레코드를 버려
+            # 마스킹되지 않은 비밀이 새는 것을 막는다(fail-closed).
+            return False
+        return True
+
+
 def _get_log_directory() -> Path:
     """Get or create the log directory."""
     # Use debug/log relative to the backend directory
@@ -57,14 +136,23 @@ def _get_log_directory() -> Path:
     return log_dir
 
 
-def _create_debug_file_handler() -> logging.FileHandler:
-    """Create a file handler for debug logs with date-time filename."""
+def _create_debug_file_handler() -> logging.Handler:
+    """Create a rotating file handler for debug logs with date-time filename.
+
+    파일명이 기동 시 1회만 계산되므로 '시간별 파일'은 실제로는 프로세스 수명당
+    1파일 무한 성장이었다(2026-07-13-19.log 35GB, 2026-07-23-17.log는 4일치
+    479MB). 디스크 98%(여유 20Gi) 상황에서 실 포지션을 보유한 라이브 백엔드가
+    디스크 고갈로 죽을 수 있어, 회전 없는 FileHandler를 RotatingFileHandler로
+    바꿔 파일당 50MB * 10백업 = 총량 상한 ~550MB로 묶는다.
+    """
     log_dir = _get_log_directory()
     now = datetime.now()
     log_filename = now.strftime("%Y-%m-%d-%H") + ".log"
     log_path = log_dir / log_filename
 
-    handler = logging.FileHandler(log_path, encoding='utf-8')
+    handler = RotatingFileHandler(
+        log_path, maxBytes=50 * 1024 * 1024, backupCount=10, encoding="utf-8"
+    )
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -97,16 +185,22 @@ def configure_logging(
     # Clear existing handlers
     root_logger.handlers.clear()
 
+    # 비밀 마스킹 필터 — 반드시 핸들러마다 붙인다(로거에 붙이면 자식 로거인 httpx
+    # 등에서 전파된 레코드를 못 본다. SecretRedactingFilter 클래스 docstring 참고).
+    secret_filter = SecretRedactingFilter()
+
     # Console handler - only INFO and above for cleaner output
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(LOG_LEVELS.get(console_level.upper(), logging.INFO))
     console_handler.setFormatter(logging.Formatter("%(message)s"))
+    console_handler.addFilter(secret_filter)
     root_logger.addHandler(console_handler)
 
     # File handler for debug logs
     if debug_to_file:
         try:
             file_handler = _create_debug_file_handler()
+            file_handler.addFilter(secret_filter)
             root_logger.addHandler(file_handler)
         except Exception as e:
             print(f"Warning: Could not create debug log file: {e}")
@@ -120,6 +214,7 @@ def configure_logging(
                 "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S"
             ))
+            custom_handler.addFilter(secret_filter)
             root_logger.addHandler(custom_handler)
         except Exception as e:
             print(f"Warning: Could not create log file {log_file}: {e}")
@@ -128,6 +223,14 @@ def configure_logging(
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
     logging.getLogger("websockets.client").setLevel(logging.WARNING)
+    # 비밀 유출 원천 차단: httpx가 요청 URL 전문을 INFO로 남겨 Telegram 봇 토큰
+    # (URL 경로)과 Finnhub 키(쿼리스트링)가 평문으로 쌓였다. httpcore는 비밀을
+    # 담지 않지만 DEBUG trace가 파일당 수십만 행이라 함께 내린다(부모 하나로
+    # connection/http11/http2/proxy 전부 커버).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # python-telegram-bot이 DEBUG로 'Set Bot API URL: .../bot<TOKEN>'을 직접 남긴다
+    logging.getLogger("telegram.Bot").setLevel(logging.INFO)
 
     # Configure structlog processors
     shared_processors = [
@@ -167,6 +270,13 @@ def configure_logging(
         cache_logger_on_first_use=True,
     )
 
+    # uvicorn 로거는 propagate=False + 자체 핸들러라 root 핸들러 필터를 우회한다.
+    # uvicorn.error의 트레이스백이 httpx 예외 문자열(토큰 URL 포함)을 실을 수 있어
+    # 같은 필터를 그쪽 핸들러에도 붙인다.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        for handler in logging.getLogger(name).handlers:
+            handler.addFilter(secret_filter)
+
 
 def add_request_context(
     logger: logging.Logger,
@@ -201,17 +311,25 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     Middleware for logging HTTP request/response lifecycle.
 
     Logs:
-    - Request start with method, path, headers
+    - Request start with method, path
     - Request body (for POST/PUT/PATCH)
     - Response status and timing
     - Response body (for errors)
     """
+
+    # 비밀을 평문 바디로 받는 라우트(POST /api/settings/upbit, /api/settings/kiwoom 등)는
+    # body_preview 500바이트가 바디 전체를 덮으므로 아예 읽지 않는다.
+    _SENSITIVE_BODY_PATHS = ("/settings",)
 
     def __init__(self, app, log_request_body: bool = True, log_response_body: bool = False):
         super().__init__(app)
         self.log_request_body = log_request_body
         self.log_response_body = log_response_body
         self.logger = structlog.get_logger("http")
+
+    def _is_sensitive_path(self, path: str) -> bool:
+        low = path.lower()
+        return any(p in low for p in self._SENSITIVE_BODY_PATHS)
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         # Generate request ID
@@ -230,8 +348,12 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             client_ip=request.client.host if request.client else None,
         )
 
-        # Log request body for mutations
-        if self.log_request_body and request.method in ("POST", "PUT", "PATCH"):
+        # Log request body for mutations (민감 경로는 바디를 아예 읽지 않는다)
+        if (
+            self.log_request_body
+            and request.method in ("POST", "PUT", "PATCH")
+            and not self._is_sensitive_path(request.url.path)
+        ):
             try:
                 body = await request.body()
                 if body:
