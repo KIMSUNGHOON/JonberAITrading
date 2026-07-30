@@ -405,6 +405,20 @@ class ExecutionCoordinator:
         # Start risk monitor
         await self.risk_monitor.start()
 
+        # 재시작 안전(2026-07-30): 방어(risk_monitor)가 실제로 켜진 뒤에야
+        # mode=active를 디스크에 남긴다 -- 그 전에 두면 risk_monitor.start()
+        # 실패 시 "방어는 안 켜졌는데 블롭은 active"인 거짓 기록이 남는다.
+        # 이 persist가 없으면(REGRESSION, 라이브에서 실측: 장 마감 중
+        # POST /trading/start 후 블롭 mode가 계속 null) mutation 훅
+        # (_schedule_persist)이나 stop/pause/resume의 persist만으로는 부족하다
+        # -- 장중 뮤테이션이 하나도 없으면 이 시작을 기록할 다른 경로가 없어서,
+        # 다음 재시작의 resume_if_persisted()가 영원히 건너뛴다.
+        # _persistence_active는 이미 True, _restore_state()도 이미 끝난
+        # 뒤라 메모리 스냅샷이 실제 내용이다 -- 부분 쓰기(_persist_fields)가
+        # 아니라 전체 _persist_state()가 맞다. never-raise라 start()를 깰
+        # 수 없다.
+        await self._persist_state()
+
         self._log_activity(
             ActivityType.SYSTEM_START,
             (

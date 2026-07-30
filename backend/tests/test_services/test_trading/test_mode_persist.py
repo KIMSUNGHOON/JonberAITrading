@@ -117,6 +117,82 @@ async def test_mode_is_active_before_persistence_is_armed(tmp_path):
     assert seen["persistence_active"] is True
 
 
+async def test_start_persists_mode_without_manual_persist_call(tmp_path):
+    """라이브 배포에서 실제로 터진 결함의 재현(2026-07-30). start()가
+    self._state.mode = ACTIVE / self._persistence_active = True를 세팅할
+    뿐 persist를 호출하지 않아서, 장 마감 중(뮤테이션 없음 -> 어떤
+    _schedule_persist도 안 붙음)에는 수동 /trading/start 이후에도 블롭의
+    mode가 계속 null이었다 -- 다음 재시작의 resume_if_persisted()가 영원히
+    건너뛴다.
+
+    기존 테스트는 전부 `_persist_state()`를 직접 부르거나(test_mode_is_
+    persisted 등) start()가 만든 in-memory state만 봤다(test_mode_is_
+    active_before_persistence_is_armed) -- start() 자체가 디스크에 쓰는지는
+    아무도 검증하지 않았다. 이 테스트는 수동 _persist_state() 호출 없이
+    start()만 부르고 블롭을 읽는다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    coord = _make_coordinator()
+
+    coord._refresh_account_info = AsyncMock()
+    coord._restore_state = AsyncMock()
+    coord._restore_strategy = AsyncMock()
+    coord.risk_monitor.start = AsyncMock()
+    coord._notify_state_change = AsyncMock()
+    coord.process_trade_queue = AsyncMock()
+    coord.get_trade_queue = lambda: []
+    coord._market_hours.get_market_session = lambda _m: type(
+        "S", (), {"is_open": False}
+    )()
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        await coord.start()
+        blob = await storage.get_app_setting(coord._STATE_KEY)
+        await coord.stop()  # patch 안에서 정리 -- 위 테스트들과 같은 이유
+
+    assert blob is not None
+    assert json.loads(blob)["mode"] == "active"
+
+
+async def test_start_then_resume_if_persisted_round_trip(tmp_path):
+    """스펙이 약속하는 것 그 자체: "배포 후 첫 수동 start()가 mode를 기록하고,
+    그 다음 재시작부터 자동으로 동작한다"(resume_if_persisted 문서화 주석).
+    coord1.start()가 쓴 블롭을, 완전히 새로 만든 coord2(= 재시작 이후의
+    새 프로세스를 흉내낸)가 resume_if_persisted()로 읽어 실제로 재개하는지
+    끝까지 확인한다 -- 지금까지 아무 테스트도 이 왕복을 검증하지 않았다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+
+    def _wire(coord):
+        coord._refresh_account_info = AsyncMock()
+        coord._restore_state = AsyncMock()
+        coord._restore_strategy = AsyncMock()
+        coord.risk_monitor.start = AsyncMock()
+        coord._notify_state_change = AsyncMock()
+        coord.process_trade_queue = AsyncMock()
+        coord.get_trade_queue = lambda: []
+        coord._market_hours.get_market_session = lambda _m: type(
+            "S", (), {"is_open": False}
+        )()
+
+    coord1 = _make_coordinator()
+    _wire(coord1)
+    coord2 = _make_coordinator()
+    _wire(coord2)
+
+    with patch("services.storage_service.get_storage_service",
+               new=AsyncMock(return_value=storage)):
+        await coord1.start()  # 배포 후 첫 수동 /trading/start
+
+        # coord1.stop()은 아직 부르지 않는다 -- 부르면 mode=stopped로 되써서
+        # 재개할 게 없어진다. 재시작을 흉내내는 것은 새 coord2 인스턴스다.
+        resumed = await coord2.resume_if_persisted()
+
+        await coord2.stop()  # 두 코디네이터 모두 patch 안에서 정리
+        await coord1.stop()
+
+    assert resumed is True
+
+
 async def test_pause_persists_mode(tmp_path):
     """IMPORTANT 3 (2026-07-29): pause()가 mode 변경을 즉시 영속해야 한다.
     다른 뮤테이터가 우연히 persist를 트리거할 때까지 기다리면, 그 사이
