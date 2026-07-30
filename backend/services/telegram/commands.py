@@ -78,6 +78,7 @@ now replies "만료" instead of re-arming autonomous mode.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
@@ -107,10 +108,47 @@ async def _safe(label: str, coro: Awaitable[T]) -> Optional[T]:
         return None
 
 
+# Telegram 한 메시지 상한은 4,096자다. 3,900에서 자르는 이유는 절단 꼬리와
+# 멀티바이트 여유를 남기기 위해서다. 분할하지 않는 것은 의도다 — 폰에서
+# 3연속 메시지는 읽히지 않고, 청크 연속 발송이 동일 채팅 초당 1건 권고를
+# 넘겨 429를 유발하며 그 429는 _send_message가 조용히 삼킨다. 게다가 분할은
+# 기존 테스트 약 20곳의 assert_awaited_once 계약을 깬다.
+_REPLY_LIMIT = 3900
+_TRUNCATE_TAIL = "\n…이하 생략 (웹에서 확인)"
+
+
+def _truncate(text: str) -> str:
+    """줄 경계에서 자른다 — 현재 300자 하드컷이 '...breadth br'처럼 단어
+    중간을 자른다."""
+    if len(text) <= _REPLY_LIMIT:
+        return text
+    budget = _REPLY_LIMIT - len(_TRUNCATE_TAIL)
+    head = text[:budget]
+    cut = head.rfind("\n")
+    if cut > budget // 2:
+        head = head[:cut]
+    return head + _TRUNCATE_TAIL
+
+
 async def _reply(update: Update, text: str) -> None:
     message = getattr(update, "effective_message", None) or getattr(update, "message", None)
     if message is not None:
-        await message.reply_text(text)
+        await message.reply_text(_truncate(text))
+
+
+def source_status(value, error: Optional[str] = None) -> str:
+    """빈값 / 조회 실패 / 미설정을 구별한다.
+
+    `데이터 없음` 단일 문자열을 쓰면 안 된다 — 현재 `_format_positions(None)`
+    (API 예외)과 `holding=null`(정상 빈값)이 바이트 동일해서 운영자가
+    "시스템이 죽었나 데이터가 없나"를 구별할 수 없다.
+    """
+    if value is None:
+        return f"조회 실패({error})" if error else "조회 실패"
+    try:
+        return f"{len(value)}건"
+    except TypeError:
+        return "1건"
 
 
 # -------------------------------------------
@@ -301,6 +339,10 @@ async def handle_pending(update: Update, context: "ContextTypes.DEFAULT_TYPE") -
         sent = await _send_pending_button(item)
         if not sent:
             await _reply(update, _format_pending_line(item))
+        # Telegram은 동일 채팅 초당 1건을 권고하고 초과 시 429를 낸다.
+        # 그 429는 _send_message가 조용히 삼켜서 뒷항목이 통째로
+        # 유실된다 — 지연이 유일한 방어다.
+        await asyncio.sleep(0.4)
 
 
 # -------------------------------------------
