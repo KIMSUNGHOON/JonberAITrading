@@ -8,7 +8,7 @@
 실 포지션을 보유한 채 백엔드를 재시작하면, 사람이 `POST /api/trading/start`를
 칠 때까지 **손절·익절 방어가 전혀 없는 창**이 열린다.
 
-복원 기계는 이미 전부 존재한다. `TradingCoordinator.start()`가
+복원 기계는 이미 전부 존재한다. `ExecutionCoordinator.start()`가
 `_restore_state()`로 포지션과 손절을 `risk_monitor`에 재등록하고,
 `ChatCoordinator.start()`가 `PositionManager.restore_stop_overlay()`로 스탑
 오버레이를 되살린다. **없는 것은 단 하나 — 부팅 시 아무도 `start()`를
@@ -82,7 +82,7 @@ app/main.py  lifespan
 (`services/trading/models.py:17-21` — `ACTIVE="active"`, `PAUSED="paused"`,
 `STOPPED="stopped"`).
 
-`TradingCoordinator._persist_state()`는 이미 상태 변경마다 호출되므로
+`ExecutionCoordinator._persist_state()`는 이미 상태 변경마다 호출되므로
 blob에 `mode` 필드를 추가하는 것만으로 저장 경로가 따라온다.
 `ChatCoordinator`는 `start()`/`stop()` 끝에서만 쓴다 — 설정이 그때만 바뀐다.
 
@@ -114,7 +114,7 @@ monitoring)") 일시정지 상태로 껐어도 손절 방어는 되살아나고 
 
 ### 4. 큐 드레인 스킵
 
-`TradingCoordinator.start()`에 `drain_queue: bool = True` 인자를 추가한다.
+`ExecutionCoordinator.start()`에 `drain_queue: bool = True` 인자를 추가한다.
 `True`(기본)면 현재 동작 그대로 — 장중이고 큐가 비어 있지 않으면 즉시
 `process_trade_queue()`. **부팅 재개 경로만 `False`**를 넘긴다.
 
@@ -152,7 +152,7 @@ monitoring)") 일시정지 상태로 껐어도 손절 방어는 되살아나고 
 
 ### 6. 부수 수정 — mode 설정 순서
 
-현재 `TradingCoordinator.start()`는 `_persistence_active = True`(:384)를
+현재 `ExecutionCoordinator.start()`는 `_persistence_active = True`(:384)를
 `_state.mode = TradingMode.ACTIVE`(:390)보다 **먼저** 실행한다. 그 사이에
 persist가 트리거되면 직전 mode(보통 `STOPPED`)가 저장돼, 다음 부팅이 재개를
 건너뛴다.
