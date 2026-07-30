@@ -184,6 +184,12 @@ class MonitoredPosition(BaseModel):
     # (the *_HIT events are not de-duped). Reset when the gate next allows.
     close_gate_denied_notified: bool = False
 
+    # 통지 광역화 Task 7 리뷰 Important 2: close_gate_denied_notified와 동일한
+    # 이유로 필요하다 — 유동성 캡에 막힌 종목은 토론 주기마다 ADD가 매번
+    # 0주로 클램프되므로, 래치 없이 매번 통지하면 캡을 초과 보유한 종목이
+    # 채널을 매 토론 주기마다 도배한다. 캡에 안 걸린 다음 시도에서 리셋.
+    liquidity_cap_blocked_notified: bool = False
+
     # S-5 (survival discipline, 2026-07-19,
     # docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2):
     # timestamp of the FIRST tick this position's take-profit was reached
@@ -1228,18 +1234,31 @@ class PositionManager:
             elif event.event_type == PositionEventType.TAKE_PROFIT_HIT:
                 await self._execute_close_position(position, "take_profit")
         except Exception as e:
+            # 리뷰 Critical (2026-07-30): 이 except는 사실상 도달 불가능하다
+            # — 아래에서 부르는 `_execute_close_position`이 자기 자신의
+            # try/except로 모든 예외를 삼키고 절대 re-raise하지 않기
+            # 때문이다(그 메서드의 except 참고). 통지는 예외가 실제로
+            # 착지하는 그쪽에서 보낸다. 여기 로그는 향후 그 계약이
+            # 바뀌더라도 조용히 사라지지 않도록 남겨두는 방어망이다.
             logger.error(
                 "auto_execute_failed",
                 ticker=event.ticker,
                 error=str(e),
             )
-            # 손절 집행 실패는 포지션을 무방비로 남긴다 — 로그만 남기면
-            # 아무도 모른다. 조치 지시를 함께 담는다.
-            await self._alert_execution_failed(position, event, e)
 
-    async def _alert_execution_failed(self, position, event, error: Exception) -> None:
+    async def _alert_execution_failed(self, position, reason: str, error: Exception) -> None:
         """집행 실패를 폰으로 알린다. Best-effort — 통지 실패가 집행 경로를
-        죽여선 안 된다."""
+        죽여선 안 된다.
+
+        `reason`은 호출자(`_execute_close_position`)가 이미 갖고 있는
+        문자열 상수(`"stop_loss"`/`"take_profit"`/`"agent_decision"`/
+        `"agent_decision_reduce"`)다. 예전에는 `event.event_type`을 문자열로
+        바꿔 `"STOP_LOSS" in str(...)` 부분 문자열로 판별했는데(리뷰 Minor),
+        이는 event_type이 정확히 두 가지뿐이라 우연히 안전했을 뿐 — 세 번째
+        auto_execute 이벤트 타입이 생기면 조용히 "익절"로 오분류된다. 여기는
+        정확한 문자열 상수와의 직접 비교이고, 알려지지 않은 reason은
+        "익절"로 잘못 단정하지 않고 중립적인 "청산"으로 표시한다.
+        """
         try:
             from services.telegram import get_telegram_notifier
             from services.telegram.formatting import stock_label
@@ -1247,7 +1266,7 @@ class PositionManager:
             notifier = await get_telegram_notifier()
             if not notifier.is_ready:
                 return
-            kind = "손절" if "STOP_LOSS" in str(getattr(event, "event_type", "")) else "익절"
+            kind = {"stop_loss": "손절", "take_profit": "익절"}.get(reason, "청산")
             label = stock_label(
                 getattr(position, "stock_name", None), getattr(position, "ticker", "")
             )
@@ -1372,6 +1391,16 @@ class PositionManager:
                 ticker=position.ticker,
                 error=str(e),
             )
+            # 리뷰 Critical (2026-07-30): 실제 집행 실패(check_autonomy 또는
+            # trading_coord._close_position이 던지는 예외)는 전부 여기서
+            # 잡힌다 — 게이트 거부/스킵 분기는 각각 return으로 여기 오기
+            # 전에 빠지므로 건드리지 않는다. `_auto_execute_event`의
+            # try/except에 통지를 달았던 최초 구현은 이 메서드가 절대
+            # re-raise하지 않아 도달 불가능했다(테스트가
+            # `_execute_close_position` 자체를 통째로 모킹해 이 catch를
+            # 우회했기 때문에 통과했을 뿐). 손절 집행 실패는 포지션을
+            # 무방비로 남긴다 — 조치 지시를 함께 담는다.
+            await self._alert_execution_failed(position, reason, e)
 
     async def _notify_close_gate_denied(
         self, position: MonitoredPosition, reason: str, gate_reason: str
@@ -1949,17 +1978,31 @@ class PositionManager:
                 # 보내면 안 된다(이미 캡을 초과 보유한 종목은 ADD가 매번
                 # 0이라 토론 주기마다 허위 🚨가 반복되고, 진짜 desync 신호를
                 # 덮는다). 정상 억제이므로 desync 취급은 하지 않되, 실패와
-                # 구별되는 "차단" 통지는 한 번 보낸다(Task 7).
+                # 구별되는 "차단" 통지는 한다 — 단, `close_gate_denied_notified`와
+                # 같은 이유로 래치를 건다(리뷰 Important 2): 캡을 초과
+                # 보유한 종목은 이 분기가 토론 주기마다 재진입하므로,
+                # 래치가 없으면 매번 재통지돼 채널이 도배된다.
                 logger.info(
                     "add_blocked_by_liquidity_cap",
                     ticker=position.ticker,
                     requested=add_quantity,
                     held_quantity=position.quantity,
                 )
-                await self._alert_execution_blocked(
-                    position, "유동성 캡", "주문 수량이 0으로 클램프됐습니다"
-                )
+                if not position.liquidity_cap_blocked_notified:
+                    position.liquidity_cap_blocked_notified = True
+                    await self._alert_execution_blocked(
+                        position,
+                        "유동성 캡",
+                        "주문 수량이 0으로 클램프됐습니다. "
+                        "→ 조치 불필요: 정책이 의도대로 추가매수를 억제했습니다"
+                        "(시스템 이상 아님). 기존 포지션은 정상 보유 중입니다.",
+                    )
                 return
+
+            # 이번엔 캡에 걸리지 않고 여기까지 왔다 — 다음 차단 시 다시
+            # 통지되도록 래치를 푼다(`close_gate_denied_notified`가 게이트
+            # 통과 시 리셋되는 것과 동일한 패턴).
+            position.liquidity_cap_blocked_notified = False
 
             filled = result.filled_quantity
             if filled <= 0:
