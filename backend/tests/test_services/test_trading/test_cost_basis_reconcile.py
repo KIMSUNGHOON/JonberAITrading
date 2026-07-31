@@ -157,7 +157,15 @@ async def test_drift_sends_alert_once():
     with patch("services.telegram.get_telegram_notifier",
                new=AsyncMock(return_value=notifier)):
         await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
-        # 두 번째 패스 — 이미 교정됐어도 래치가 재발송을 막는다
+        # 두 번째 패스도 여전히 재통지 후보다: pm은 MagicMock이라
+        # `pm.update_position(...)` 호출이 `pm_pos.avg_price`를 실제로
+        # 바꾸지 않는다 — PM은 매 패스 "37,950 vs 브로커 38,091"로 계속
+        # 드리프트된 것처럼 보여 `cost_fixed`가 다시 True가 된다(coordinator
+        # 쪽은 실제 ManagedPosition이라 첫 패스에서 이미 38,091로 고쳐졌다).
+        # 즉 이 케이스에서 두 번째 패스가 재발송되지 않는 이유는 "이미
+        # 교정돼서"가 아니라 "래치가 아직 걸려 있어서"다 — 원가가 실제로
+        # 임계 이내로 확인돼 래치가 풀리는 경로는
+        # test_drift_alert_relatches_after_episode_resolves가 별도로 검증한다.
         await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
 
     notifier.send_message.assert_awaited_once()
@@ -202,3 +210,53 @@ async def test_no_alert_below_threshold():
         await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
 
     notifier.send_message.assert_not_awaited()
+
+
+async def test_drift_alert_relatches_after_episode_resolves():
+    """래치는 영구가 아니라 에피소드당 1회다 — 드리프트가 해소되면 풀리고,
+    같은 종목이 나중에 다시 드리프트하면 재통지한다.
+
+    position_manager.py의 close_gate_denied_notified/liquidity_cap_blocked_notified와
+    같은 형태: 가드 조건을 통과하면(=원가가 임계 이내로 확인되면) 플래그를
+    되돌린다. pm은 MagicMock이라 `update_position` 호출이 pm_pos를 실제로
+    바꾸지 않으므로, "해소"를 흉내 내려면 두 엔진의 값을 테스트에서 직접
+    맞춰줘야 한다.
+    """
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=37_950.0)
+    pm = _pm(pm_pos)
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        # 1패스 — 드리프트 발견 → 교정 → 통지 1회.
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+        assert notifier.send_message.await_count == 1
+        assert "089860" in R._COST_DRIFT_NOTIFIED
+
+        # 두 엔진 모두 브로커 값으로 실제로 맞춰졌다고 가정한다(pm은 mock이라
+        # update_position이 pm_pos를 안 바꾸므로 여기서 직접 맞춘다) —
+        # 이 상태에서 다음 패스는 "임계 이내로 확인됨"이어야 한다.
+        pos.avg_price = 38_091.0
+        pm_pos.avg_price = 38_091.0
+
+        # 2패스 — 원가가 임계 이내로 확인됨 → 통지 없음, 래치 해제.
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+        assert notifier.send_message.await_count == 1, "해소된 패스는 재통지하지 않는다"
+        assert "089860" not in R._COST_DRIFT_NOTIFIED, "임계 이내 확인 시 래치가 풀린다"
+
+        # 새 체결이 평단을 다시 밀어냈다 — 완전히 새로운 드리프트 에피소드.
+        pos.avg_price = 37_500.0
+        pm_pos.avg_price = 37_500.0
+
+        # 3패스 — 같은 종목이 다시 드리프트 → 재통지.
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    assert notifier.send_message.await_count == 2, "해소 후 재발한 드리프트는 다시 알려야 한다"

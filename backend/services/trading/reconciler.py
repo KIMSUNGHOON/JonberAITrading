@@ -333,9 +333,13 @@ def _cost_basis_drift_pct(internal_avg: float, broker_avg: float) -> float:
     return abs(internal_avg - broker_avg) / broker_avg * 100.0
 
 
-# 원가 편차 통지 래치(종목별). reconcile은 주기적으로 돌므로 래치가 없으면
-# 같은 불일치를 매 패스마다 재발송한다. 이 레포의 liquidity_cap_blocked_notified /
-# close_gate_denied_notified와 같은 형태다.
+# 원가 편차 통지 래치(종목별, 에피소드당 1회). reconcile은 주기적으로 돌므로
+# 래치가 없으면 같은 불일치를 매 패스마다 재발송한다. 이 레포의
+# liquidity_cap_blocked_notified / close_gate_denied_notified와 같은 형태다 —
+# 그 두 패턴 모두 가드 조건을 통과하면(=문제가 해소되면) 플래그를 되돌려
+# 다음 재발 시 다시 통지되게 한다. 여기서는 `_fix_positions`가 이번 패스에서
+# 원가가 임계 이내로 확인된 티커를 `_COST_DRIFT_NOTIFIED`에서 discard한다 —
+# 영구 래치가 아니다.
 _COST_DRIFT_NOTIFIED: set = set()
 
 
@@ -384,6 +388,13 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
         broker_avg = float(getattr(holding, "avg_buy_prc", 0) or 0)
         qty_fixed = False
         cost_fixed = False
+        # 이번 패스에서 원가가 임계 이내로 '확인'됐는지(브로커 평단이 쓸 수
+        # 있고 실제로 비교가 이뤄진 경우만). 리뷰 Important: 래치는 영구가
+        # 아니라 에피소드당 1회여야 하므로, 드리프트가 없었던 것으로 확인되면
+        # 래치를 풀어 다음 에피소드에 다시 통지되게 한다
+        # (position_manager.close_gate_denied_notified/liquidity_cap_blocked_notified
+        # 와 같은 형태).
+        cost_in_tolerance = False
 
         # 통지용 — 교정 '전' 원가와 편차. coordinator/PM 중 먼저 관측된 쪽을 쓴다.
         drift_from_avg: float | None = None
@@ -399,6 +410,8 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
             if needs_cost and drift_from_avg is None:
                 drift_from_avg = coordinator_pos.avg_price
                 drift_pct = _cost_basis_drift_pct(coordinator_pos.avg_price, broker_avg)
+            elif not needs_cost and broker_avg:
+                cost_in_tolerance = True
 
             if needs_qty or needs_cost:
                 if needs_qty:
@@ -429,6 +442,8 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
                 if pm_needs_cost and drift_from_avg is None:
                     drift_from_avg = pm_pos.avg_price
                     drift_pct = _cost_basis_drift_pct(pm_pos.avg_price, broker_avg)
+                elif not pm_needs_cost and broker_avg:
+                    cost_in_tolerance = True
 
                 if pm_needs_qty or pm_needs_cost:
                     try:
@@ -451,6 +466,13 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
 
         if cost_fixed and drift_from_avg is not None:
             await _alert_cost_basis_drift(ticker, drift_from_avg, broker_avg, drift_pct)
+        elif cost_in_tolerance:
+            # 이번 패스에서 원가가 임계 이내로 확인됐다 — 다음 드리프트 때
+            # 다시 통지되도록 래치를 푼다(`close_gate_denied_notified`가
+            # 게이트 통과 시 리셋되는 것과 동일한 패턴). set.discard는
+            # 원소가 없어도 raise하지 않으므로 latch 체크/해제 자체는
+            # try 밖에 둬도 never-raise를 깨지 않는다.
+            _COST_DRIFT_NOTIFIED.discard(ticker)
 
         if qty_fixed or cost_fixed:
             parts = []
