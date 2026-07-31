@@ -274,3 +274,114 @@ class TestDailyPnlSeries:
         points = daily_pnl_series(daily)
         assert [p["dt"] for p in points] == ["20260706", "20260708", ""]
         assert [p["cumulative_pnl"] for p in points] == [50_000, 60_000, 65_000]
+
+
+from datetime import date
+
+from services.trading.paper_performance import (
+    equity_return_for_period,
+    period_bounds,
+    realized_for_period,
+)
+
+
+def _snap(trade_date: str, equity: float) -> dict:
+    """daily_perf_snapshot 행 모양 (trade_date는 하이픈 포함이 실제 저장 형식)."""
+    return {"trade_date": trade_date, "equity": equity}
+
+
+class TestPeriodBounds:
+    def test_week_starts_on_monday_and_month_on_first(self):
+        # 2026-07-31은 금요일 -> 그 주 월요일은 07-27
+        bounds = period_bounds(date(2026, 7, 31), data_start="20260716")
+        assert bounds["day"] == ("20260731", "20260731")
+        assert bounds["week"] == ("20260727", "20260731")
+        assert bounds["month"] == ("20260701", "20260731")
+        assert bounds["total"] == ("20260716", "20260731")
+
+    def test_monday_week_start_is_today_itself(self):
+        # 2026-07-27은 월요일 -> 주 시작이 그날 자신
+        bounds = period_bounds(date(2026, 7, 27), data_start="20260716")
+        assert bounds["week"] == ("20260727", "20260727")
+
+    def test_total_falls_back_to_month_start_without_data_start(self):
+        bounds = period_bounds(date(2026, 7, 31), data_start=None)
+        assert bounds["total"] == ("20260701", "20260731")
+
+
+class TestEquityReturnForPeriod:
+    # 2026-07-31 실측 스냅샷 (설계 문서의 검증표와 같은 값)
+    SNAPS = [
+        _snap("2026-07-24", 495_435_889),
+        _snap("2026-07-27", 496_547_086),
+        _snap("2026-07-28", 496_468_186),
+        _snap("2026-07-29", 496_468_186),
+        _snap("2026-07-30", 497_691_136),
+        _snap("2026-07-31", 497_760_401),
+    ]
+
+    def test_day_uses_prior_close_as_denominator(self):
+        res = equity_return_for_period(
+            self.SNAPS, "20260731", "20260731", base_asset=500_000_000
+        )
+        assert res["basis"] == "prior_close"
+        assert round(res["pct"], 4) == 0.0139
+
+    def test_week_denominator_is_the_close_before_monday_not_monday_itself(self):
+        # 주 시작 07-27(월)이지만 분모는 07-24 종가 495,435,889다.
+        # 07-27 행을 분모로 쓰면 그 주 월요일 성과가 통째로 빠진다.
+        res = equity_return_for_period(
+            self.SNAPS, "20260727", "20260731", base_asset=500_000_000
+        )
+        assert res["basis"] == "prior_close"
+        assert round(res["pct"], 4) == 0.4692
+
+    def test_month_falls_back_to_base_asset_when_no_prior_row(self):
+        res = equity_return_for_period(
+            self.SNAPS, "20260701", "20260731", base_asset=500_000_000
+        )
+        assert res["basis"] == "base_asset"
+        assert round(res["pct"], 4) == -0.4479
+
+    def test_gap_day_carries_forward(self):
+        # 07-21 행이 없어도 07-20 -> 07-22 구간이 끊기지 않는다
+        snaps = [_snap("2026-07-20", 100_000), _snap("2026-07-22", 110_000)]
+        res = equity_return_for_period(snaps, "20260722", "20260722", base_asset=None)
+        assert res["basis"] == "prior_close"
+        assert round(res["pct"], 4) == 10.0
+
+    def test_returns_none_when_no_usable_rows(self):
+        assert equity_return_for_period([], "20260731", "20260731", 500_000_000) is None
+
+    def test_returns_none_when_no_prior_row_and_no_base(self):
+        snaps = [_snap("2026-07-31", 497_760_401)]
+        assert equity_return_for_period(snaps, "20260731", "20260731", None) is None
+
+    def test_ignores_malformed_rows(self):
+        snaps = [
+            {"trade_date": None, "equity": 1},
+            {"trade_date": "2026-07-30", "equity": 0},
+            _snap("2026-07-30", 100_000),
+            _snap("2026-07-31", 101_000),
+        ]
+        res = equity_return_for_period(snaps, "20260731", "20260731", None)
+        assert round(res["pct"], 4) == 1.0
+
+
+class TestRealizedForPeriod:
+    POINTS = [
+        {"dt": "20260727", "pnl": 418_950, "cumulative_pnl": 418_950},
+        {"dt": "20260730", "pnl": 0, "cumulative_pnl": 418_950},
+        {"dt": "20260731", "pnl": 984_533, "cumulative_pnl": 1_403_483},
+    ]
+
+    def test_sums_only_points_inside_the_window(self):
+        assert realized_for_period(self.POINTS, "20260731", "20260731") == 984_533
+        assert realized_for_period(self.POINTS, "20260727", "20260731") == 1_403_483
+
+    def test_empty_window_is_zero_not_none(self):
+        assert realized_for_period(self.POINTS, "20260701", "20260726") == 0
+
+    def test_ignores_unparseable_dt(self):
+        points = [{"dt": "bogus", "pnl": 999, "cumulative_pnl": 999}] + self.POINTS
+        assert realized_for_period(points, "20260731", "20260731") == 984_533

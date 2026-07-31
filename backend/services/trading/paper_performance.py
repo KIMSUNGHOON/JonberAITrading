@@ -8,6 +8,7 @@ ka10074 기간 실현손익(RealizedPnl)과 계좌 스냅샷으로 관찰 운용
 운용 중 필요해지면 ka10072/73으로 확장).
 """
 
+from datetime import date, timedelta
 from typing import Optional, TypedDict
 
 from pydantic import BaseModel, Field
@@ -200,3 +201,95 @@ def build_performance_report(
             for d in pnl.daily
         ],
     )
+
+
+def period_bounds(
+    today: date, data_start: Optional[str]
+) -> dict[str, tuple[str, str]]:
+    """일/주/월/누적 버킷의 (start, end) YYYYMMDD. end는 모두 `today`.
+
+    캘린더 기준이다 — 주는 이번 주 **월요일**부터, 월은 이번 달 **1일**부터.
+    누적의 시작은 `data_start`(가장 이른 스냅샷 일자, YYYYMMDD)이며 없으면
+    이번 달 1일로 물러선다.
+
+    `day`의 start를 `today`로 두는 것은 두 소비자 모두에게 옳다: 실현손익은
+    [today, today] 구간 합이고, 평가금 수익률은 start '직전' 종가를 분모로
+    쓰므로 자연히 전일 종가가 잡힌다.
+    """
+    end = today.strftime("%Y%m%d")
+    monday = today - timedelta(days=today.weekday())
+    month_start = today.replace(day=1).strftime("%Y%m%d")
+    return {
+        "day": (end, end),
+        "week": (monday.strftime("%Y%m%d"), end),
+        "month": (month_start, end),
+        "total": (data_start or month_start, end),
+    }
+
+
+def equity_return_for_period(
+    snapshots: list[dict], start: str, end: str, base_asset: Optional[int]
+) -> Optional[dict]:
+    """평가금(equity) 변화 기준 기간 수익률.
+
+    Args:
+        snapshots: `daily_perf_snapshot` 행들. `trade_date`는 '2026-07-31'
+            형식(하이픈 포함)이고 `start`/`end`는 '20260731' 형식이라
+            비교 전에 하이픈을 제거해 정규화한다.
+        start/end: YYYYMMDD.
+        base_asset: 기간 시작 이전 행이 없을 때 쓸 분모.
+
+    Returns:
+        {"pct": float, "basis": "prior_close" | "base_asset"} 또는
+        계산 불가 시 None (0.0으로 위장하지 않는다).
+    """
+    rows: list[tuple[str, float]] = []
+    for row in snapshots:
+        raw_dt = row.get("trade_date")
+        equity = row.get("equity")
+        if not isinstance(raw_dt, str):
+            continue
+        dt = raw_dt.replace("-", "")
+        if len(dt) != 8 or not dt.isdigit():
+            continue
+        if not isinstance(equity, (int, float)) or equity <= 0:
+            continue
+        rows.append((dt, float(equity)))
+    rows.sort(key=lambda pair: pair[0])
+    if not rows:
+        return None
+
+    end_equity: Optional[float] = None
+    start_equity: Optional[float] = None
+    for dt, equity in rows:
+        if dt <= end:
+            end_equity = equity
+        if dt < start:
+            start_equity = equity
+    if end_equity is None:
+        return None
+
+    if start_equity is not None:
+        basis = "prior_close"
+    elif base_asset is not None and base_asset > 0:
+        start_equity, basis = float(base_asset), "base_asset"
+    else:
+        return None
+
+    return {"pct": (end_equity / start_equity - 1.0) * 100.0, "basis": basis}
+
+
+def realized_for_period(points: list[DailyPnlPoint], start: str, end: str) -> int:
+    """[start, end] 안에 드는 일별 실현손익 합 (YYYYMMDD 문자열 비교).
+
+    `daily_pnl_series`의 출력을 그대로 먹는다. ka10074의 값은 이미 세후이므로
+    수수료·세금을 여기서 다시 빼지 않는다. 구간에 거래가 없으면 0 (None 아님).
+    """
+    total = 0
+    for point in points:
+        dt = point.get("dt")
+        if not isinstance(dt, str) or len(dt) != 8 or not dt.isdigit():
+            continue
+        if start <= dt <= end:
+            total += point.get("pnl", 0)
+    return total
