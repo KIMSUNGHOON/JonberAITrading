@@ -16,6 +16,8 @@ coordinator._add_position은 자체적으로 평균 합산하지만 PM.update_po
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from services.agent_chat.position_manager import MonitoredPosition, PositionManager
 from services.trading.coordinator import ExecutionCoordinator
 from services.trading.market_hours import MarketSession
@@ -132,10 +134,16 @@ async def test_existing_pm_stop_is_preserved_but_quantity_updates(monkeypatch):
     # take_profit은 기존 None이었으므로 신규값 전달, quantity는 증분 합산(5+15=20).
     # session_id 미전달(None) + 기존 entry_decision_id도 None → coalesce 결과 None
     # (L3: 값이 없으니 백필할 것도 없음).
+    # C2(2026-07-31): merge 분기가 이제 avg_price도 가중평균으로 넘긴다
+    # (5주@68,000 + 15주@69,000)/20 = 68,750.0. 이 값 검증은 이 테스트의
+    # 원래 취지(스탑 coalesce)가 아니라 새 인자가 호출부에 추가됐다는
+    # 사실만 반영한다 — 가중평균 자체의 상세 검증은
+    # test_merge_updates_avg_price_with_weighted_average가 전담한다.
     pm.add_position.assert_not_called()
     pm.update_position.assert_called_once_with(
         ticker="005930",
         quantity=20,
+        avg_price=68_750.0,
         stop_loss=None,
         take_profit=77000.0,
         entry_decision_id=None,
@@ -175,11 +183,15 @@ async def test_incremental_fill_delta_sums_into_existing_pm_quantity(monkeypatch
         take_profit=289440.0,
     )
 
+    # C2(2026-07-31): avg_price도 함께 넘어간다. 이 테스트는 두 트랜치가 같은
+    # 가격(260,000.0)이라 가중평균도 260,000.0 그대로 — quantity 합산이
+    # 이 시나리오의 핵심이라는 원래 취지는 그대로 유지된다.
     assert coordinator._add_position.call_count == 1
     pm.add_position.assert_not_called()
     pm.update_position.assert_called_once_with(
         ticker="005930",
         quantity=48,
+        avg_price=260000.0,
         stop_loss=246560.0,
         take_profit=289440.0,
         entry_decision_id=None,
@@ -323,9 +335,13 @@ async def test_existing_pm_entry_decision_id_never_backfilled_on_merge(monkeypat
         session_id="sess-should-not-backfill",
     )
 
+    # C2(2026-07-31): avg_price도 가중평균으로 함께 넘어간다
+    # (5주@68,000 + 15주@69,000)/20 = 68,750.0 — 이 테스트의 초점은
+    # entry_decision_id지만 merge 분기 호출 형태가 바뀌었으므로 반영한다.
     pm.update_position.assert_called_once_with(
         ticker="005930",
         quantity=20,
+        avg_price=68_750.0,
         stop_loss=None,
         take_profit=None,
         entry_decision_id=None,
@@ -365,9 +381,12 @@ async def test_existing_pm_entry_decision_id_not_overwritten_once_set(monkeypatc
         session_id="sess-second-tranche",
     )
 
+    # C2(2026-07-31): avg_price도 가중평균으로 함께 넘어간다(동일 시나리오,
+    # 초점은 entry_decision_id 불변식).
     pm.update_position.assert_called_once_with(
         ticker="005930",
         quantity=20,
+        avg_price=68_750.0,
         stop_loss=None,
         take_profit=None,
         entry_decision_id=None,
@@ -513,3 +532,130 @@ def test_mirror_sell_never_raises_on_pm_error(monkeypatch):
         "services.agent_chat.coordinator.get_chat_coordinator_sync", lambda: chat
     )
     pr.mirror_sell_to_position_manager("005930", 0)  # 예외 전파 안 함
+
+
+# ---------------------------------------------------------------
+# 원가 단일화 C2 (2026-07-31): merge 분기가 avg_price를 갱신한다
+#
+# 지금까지 merge 분기는 quantity만 합산하고 avg_price를 넘기지 않아
+# PM 평단이 첫 체결 트랜치에 영구 동결됐다. 그 평단은 표시가 아니라
+# 손절·익절 거리의 기준선이라, 낮게 고정되면 손절가도 낮게 잡혀
+# 실제 손실 허용폭이 설계보다 커진다.
+#
+# NOTE: 브리프 원문의 예시 코드는 register_fill_as_position을 동기 호출로,
+# position_manager를 직접 인자로 넘기는 형태로 적어 두었으나, 이 저장소의
+# 실제 시그니처는 async이고 PM은 함수 내부에서 get_chat_coordinator()로
+# 지연 조회한다(F3 설계, 위 헬퍼 docstring 참조). 시나리오·수치·검증 내용은
+# 브리프와 동일하게 유지하고, 호출부만 파일 상단의 기존 비동기 테스트들과
+# 같은 방식(await + monkeypatch)으로 맞췄다.
+# ---------------------------------------------------------------
+
+
+async def test_merge_updates_avg_price_with_weighted_average(monkeypatch):
+    """2트랜치 체결: 20주@10,000 보유 + 28주@11,000 체결 → 평단 10,583.33"""
+    existing = MonitoredPosition(
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=20,
+        avg_price=10_000.0,
+        current_price=11_000.0,
+    )
+    pm = _pm(existing)
+    coordinator = _coordinator()
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(pm)),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930",
+        stock_name="삼성전자",
+        quantity=28,
+        avg_price=11_000.0,
+        stop_loss=9_000.0,
+        take_profit=13_000.0,
+        session_id="sess-1",
+        source="test",
+    )
+
+    pm.update_position.assert_called_once()
+    kwargs = pm.update_position.call_args.kwargs
+    assert kwargs["quantity"] == 48
+    expected = (20 * 10_000.0 + 28 * 11_000.0) / 48
+    assert kwargs["avg_price"] == pytest.approx(expected)
+    assert kwargs["avg_price"] == pytest.approx(10_583.3333, abs=0.001)
+
+
+async def test_merge_preserves_existing_stops(monkeypatch):
+    """원가를 갱신해도 기존 손절·익절은 덮어쓰지 않는다(coalesce 불변)."""
+    existing = MonitoredPosition(
+        ticker="005930", stock_name="삼성전자",
+        quantity=20, avg_price=10_000.0, current_price=11_000.0,
+        stop_loss=9_500.0, take_profit=12_000.0,
+    )
+    pm = _pm(existing)
+    coordinator = _coordinator()
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(pm)),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930", stock_name="삼성전자",
+        quantity=28, avg_price=11_000.0,
+        stop_loss=8_000.0, take_profit=14_000.0,
+        session_id="sess-1", source="test",
+    )
+
+    kwargs = pm.update_position.call_args.kwargs
+    assert kwargs["stop_loss"] is None, "기존 스탑이 있으면 None을 넘겨 coalesce"
+    assert kwargs["take_profit"] is None
+    assert kwargs["avg_price"] is not None, "원가는 갱신한다"
+
+
+async def test_merge_never_touches_entry_decision_id(monkeypatch):
+    """merge 분기는 entry_decision_id를 절대 건드리지 않는다(고아 채택 보호)."""
+    existing = MonitoredPosition(
+        ticker="005930", stock_name="삼성전자",
+        quantity=20, avg_price=10_000.0, current_price=11_000.0,
+    )
+    pm = _pm(existing)
+    coordinator = _coordinator()
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(pm)),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930", stock_name="삼성전자",
+        quantity=28, avg_price=11_000.0,
+        stop_loss=None, take_profit=None,
+        session_id="sess-2", source="test",
+    )
+
+    assert pm.update_position.call_args.kwargs["entry_decision_id"] is None
+
+
+async def test_new_position_still_uses_add_position(monkeypatch):
+    """기존 포지션이 없으면 add_position 경로 그대로 — merge 변경의 영향 없음."""
+    pm = _pm(None)
+    coordinator = _coordinator()
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(pm)),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930", stock_name="삼성전자",
+        quantity=28, avg_price=11_000.0,
+        stop_loss=9_000.0, take_profit=13_000.0,
+        session_id="sess-1", source="test",
+    )
+
+    pm.add_position.assert_called_once()
+    pm.update_position.assert_not_called()
+    assert pm.add_position.call_args.kwargs["avg_price"] == 11_000.0

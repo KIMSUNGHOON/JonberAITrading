@@ -124,9 +124,23 @@ async def register_fill_as_position(
             # 그 무관 세션이 "진입 결정"으로 오귀속되어 캘리브레이션을
             # 오염시킨다. entry_decision_id는 신규 등록(add_position) 시에만
             # 설정된다.
+            # 원가 단일화 C2(2026-07-31): 지금까지 merge는 quantity만 합산하고
+            # avg_price를 넘기지 않아 PM 평단이 첫 체결 트랜치에 영구 동결됐다.
+            # 그 평단은 표시가 아니라 손절·익절 거리의 기준선이라, 낮게 고정되면
+            # 손절가도 낮게 잡혀 실제 손실 허용폭이 설계보다 커진다.
+            # 식은 _execute_add_position(position_manager.py)의 가중평균과 동일.
+            # 이 값은 다음 reconcile이 브로커 avg_buy_prc로 최종 교정한다.
+            merged_quantity = existing.quantity + quantity
+            merged_avg_price = None
+            if merged_quantity > 0 and avg_price:
+                merged_avg_price = (
+                    existing.quantity * existing.avg_price + quantity * avg_price
+                ) / merged_quantity
+
             position_manager.update_position(
                 ticker=ticker,
-                quantity=existing.quantity + quantity,
+                quantity=merged_quantity,
+                avg_price=merged_avg_price,
                 stop_loss=stop_loss if existing.stop_loss is None else None,
                 take_profit=take_profit if existing.take_profit is None else None,
                 entry_decision_id=None,
