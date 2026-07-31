@@ -333,6 +333,42 @@ def _cost_basis_drift_pct(internal_avg: float, broker_avg: float) -> float:
     return abs(internal_avg - broker_avg) / broker_avg * 100.0
 
 
+# 원가 편차 통지 래치(종목별). reconcile은 주기적으로 돌므로 래치가 없으면
+# 같은 불일치를 매 패스마다 재발송한다. 이 레포의 liquidity_cap_blocked_notified /
+# close_gate_denied_notified와 같은 형태다.
+_COST_DRIFT_NOTIFIED: set = set()
+
+
+async def _alert_cost_basis_drift(
+    ticker: str, internal_avg: float, broker_avg: float, drift_pct: float
+) -> None:
+    """원가가 브로커와 어긋났음을 알린다. Best-effort — 통지 실패가
+    교정 경로를 깨뜨려선 안 된다.
+
+    손익이 아니라 원가만 알리는 이유: 브로커 손익과 내부 손익의 절대차는
+    모의투자 수수료율 차이(왕복 0.90% vs 앱 모델 0.27%)로 상시 벌어져
+    감시하면 영구 오탐이 된다. 원가는 정의가 하나뿐이라 어긋나면 결함이다.
+    """
+    if ticker in _COST_DRIFT_NOTIFIED:
+        return
+    _COST_DRIFT_NOTIFIED.add(ticker)
+    try:
+        from services.telegram import get_telegram_notifier
+
+        notifier = await get_telegram_notifier()
+        if not notifier.is_ready:
+            return
+        await notifier.send_message(
+            f"⚠️ 원가 불일치 교정 {ticker}\n"
+            f"내부 {internal_avg:,.0f} → 브로커 {broker_avg:,.0f} "
+            f"(편차 {drift_pct:.2f}%)\n"
+            f"→ 조치 불필요: 자동 교정됐습니다. 반복되면 체결 기록을 확인하세요.",
+            parse_mode=None,
+        )
+    except Exception as e:
+        logger.warning(f"[Reconciler] cost drift alert failed for {ticker}: {e}")
+
+
 async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: ReconcileReport) -> None:
     """브로커를 진실로 삼아 수량과 **원가**를 맞춘다.
 
@@ -349,12 +385,20 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
         qty_fixed = False
         cost_fixed = False
 
+        # 통지용 — 교정 '전' 원가와 편차. coordinator/PM 중 먼저 관측된 쪽을 쓴다.
+        drift_from_avg: float | None = None
+        drift_pct: float = 0.0
+
         coordinator_pos = _find_position(coordinator.state.positions, ticker)
         if coordinator_pos is not None:
             needs_qty = coordinator_pos.quantity != broker_qty
             needs_cost = bool(broker_avg) and _cost_basis_drift_pct(
                 coordinator_pos.avg_price, broker_avg
             ) > COST_BASIS_TOLERANCE_PCT
+
+            if needs_cost and drift_from_avg is None:
+                drift_from_avg = coordinator_pos.avg_price
+                drift_pct = _cost_basis_drift_pct(coordinator_pos.avg_price, broker_avg)
 
             if needs_qty or needs_cost:
                 if needs_qty:
@@ -381,6 +425,11 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
                 pm_needs_cost = bool(broker_avg) and _cost_basis_drift_pct(
                     pm_pos.avg_price, broker_avg
                 ) > COST_BASIS_TOLERANCE_PCT
+
+                if pm_needs_cost and drift_from_avg is None:
+                    drift_from_avg = pm_pos.avg_price
+                    drift_pct = _cost_basis_drift_pct(pm_pos.avg_price, broker_avg)
+
                 if pm_needs_qty or pm_needs_cost:
                     try:
                         # stop_loss/take_profit은 넘기지 않는다 — update_position은
@@ -399,6 +448,9 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
             report.quantity_fixed += 1
         if cost_fixed:
             report.cost_basis_fixed += 1
+
+        if cost_fixed and drift_from_avg is not None:
+            await _alert_cost_basis_drift(ticker, drift_from_avg, broker_avg, drift_pct)
 
         if qty_fixed or cost_fixed:
             parts = []

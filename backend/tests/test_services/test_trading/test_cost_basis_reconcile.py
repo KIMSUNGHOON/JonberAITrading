@@ -8,7 +8,7 @@ _fix_quantities는 quantity != broker_qty일 때만 진입해 수량과 current_
 0.5원 절삭을 불일치로 오판하지 않기 위한 값이다.
 """
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -134,3 +134,71 @@ async def test_zero_broker_avg_is_ignored():
 
     assert pos.avg_price == 37_950.0
     assert report.cost_basis_fixed == 0
+
+
+# ---------------------------------------------------------------
+# C3: 원가 정합성 감시
+# ---------------------------------------------------------------
+
+
+async def test_drift_sends_alert_once():
+    """편차를 발견하면 알리고, 같은 종목은 다시 알리지 않는다."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=37_950.0))
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+        # 두 번째 패스 — 이미 교정됐어도 래치가 재발송을 막는다
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    notifier.send_message.assert_awaited_once()
+    body = notifier.send_message.await_args.args[0]
+    assert "089860" in body
+    assert "원가" in body
+
+
+async def test_alert_never_raises():
+    """통지 실패가 교정 경로를 깨뜨리지 않는다."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=37_950.0))
+    report = ReconcileReport()
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(side_effect=RuntimeError("telegram down"))):
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, report)
+
+    assert pos.avg_price == 38_091.0, "통지가 터져도 교정은 완료된다"
+    assert report.cost_basis_fixed == 1
+
+
+async def test_no_alert_below_threshold():
+    """임계 미만이면 알리지 않는다 — 오탐 방지."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=38_072.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=38_072.0))
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    notifier.send_message.assert_not_awaited()
