@@ -209,21 +209,35 @@ def period_bounds(
     """일/주/월/누적 버킷의 (start, end) YYYYMMDD. end는 모두 `today`.
 
     캘린더 기준이다 — 주는 이번 주 **월요일**부터, 월은 이번 달 **1일**부터.
-    누적의 시작은 `data_start`(가장 이른 스냅샷 일자, YYYYMMDD)이며 없으면
-    이번 달 1일로 물러선다.
+
+    누적(`total`)은 day/week/month의 시작과 `data_start`(가장 이른 스냅샷
+    일자, YYYYMMDD) 중 **가장 이른** 값이다 — 그래서 항상 다른 세 버킷을
+    모두 포함하는 가장 넓은 창이 된다. `data_start`만 썼을 때(예전 구현)는
+    운용 첫 달처럼 `data_start`가 이번 달 1일보다 늦으면 `total`이
+    `month`보다 좁아져 "월간 실현손익 > 누적 실현손익"이라는 모순이
+    생겼다 — 리뷰 지적. `total`은 정의상 그 어떤 하위 구간보다도 작을 수
+    없어야 한다. 엔드포인트가 이 네 버킷을 한 번의 브로커 호출로 덮을 때도
+    `total`의 시작이 곧 그 호출의 창 시작이 되므로(다른 버킷을 포함하는
+    가장 이른 값이라서) 실제로 요청한 창과 "누적" 라벨이 항상 일치한다.
 
     `day`의 start를 `today`로 두는 것은 두 소비자 모두에게 옳다: 실현손익은
     [today, today] 구간 합이고, 평가금 수익률은 start '직전' 종가를 분모로
     쓰므로 자연히 전일 종가가 잡힌다.
     """
     end = today.strftime("%Y%m%d")
-    monday = today - timedelta(days=today.weekday())
+    monday_str = (today - timedelta(days=today.weekday())).strftime("%Y%m%d")
     month_start = today.replace(day=1).strftime("%Y%m%d")
+
+    total_candidates = [end, monday_str, month_start]
+    if data_start is not None:
+        total_candidates.append(data_start)
+    total_start = min(total_candidates)
+
     return {
         "day": (end, end),
-        "week": (monday.strftime("%Y%m%d"), end),
+        "week": (monday_str, end),
         "month": (month_start, end),
-        "total": (data_start or month_start, end),
+        "total": (total_start, end),
     }
 
 
@@ -240,8 +254,17 @@ def equity_return_for_period(
         base_asset: 기간 시작 이전 행이 없을 때 쓸 분모.
 
     Returns:
-        {"pct": float, "basis": "prior_close" | "base_asset"} 또는
-        계산 불가 시 None (0.0으로 위장하지 않는다).
+        {"pct": float, "basis": "prior_close" | "base_asset",
+        "trade_date": "YYYY-MM-DD"} 또는 계산 불가 시 None (0.0으로
+        위장하지 않는다).
+
+        `daily_perf_snapshot`은 장마감에만(coordinator.py의 EOD 스냅샷
+        기록) 한 번 쓰인다 — 장중에는 오늘자 행이 없다. 옛 구현은
+        `end_equity`를 "end 이하 아무 행"에서 뽑아, 오늘 행이 없으면 어제
+        행을 오늘 것인 양 써서 `end_equity == start_equity`가 되어
+        `pct=0.0`을 계산해 냈다 — 데이터가 없다는 신호가 아니라 계산된
+        값처럼 보이는 것이 문제였다(리뷰 지적). 이제는 [start, end] **구간
+        안**에 실제 행이 하나도 없으면 무조건 None을 반환한다.
     """
     rows: list[tuple[str, float]] = []
     for row in snapshots:
@@ -260,13 +283,17 @@ def equity_return_for_period(
         return None
 
     end_equity: Optional[float] = None
+    end_equity_dt: Optional[str] = None
     start_equity: Optional[float] = None
     for dt, equity in rows:
-        if dt <= end:
+        # end_equity는 구간 [start, end] **안**의 행에서만 뽑는다 — 구간
+        # 밖(더 이른) 행을 오늘 값인 척 재사용하지 않는다.
+        if start <= dt <= end:
             end_equity = equity
+            end_equity_dt = dt
         if dt < start:
             start_equity = equity
-    if end_equity is None:
+    if end_equity is None or end_equity_dt is None:
         return None
 
     if start_equity is not None:
@@ -276,7 +303,11 @@ def equity_return_for_period(
     else:
         return None
 
-    return {"pct": (end_equity / start_equity - 1.0) * 100.0, "basis": basis}
+    return {
+        "pct": (end_equity / start_equity - 1.0) * 100.0,
+        "basis": basis,
+        "trade_date": f"{end_equity_dt[:4]}-{end_equity_dt[4:6]}-{end_equity_dt[6:8]}",
+    }
 
 
 def realized_for_period(points: list[DailyPnlPoint], start: str, end: str) -> int:

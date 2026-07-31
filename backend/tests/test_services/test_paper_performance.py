@@ -292,12 +292,16 @@ def _snap(trade_date: str, equity: float) -> dict:
 
 class TestPeriodBounds:
     def test_week_starts_on_monday_and_month_on_first(self):
-        # 2026-07-31은 금요일 -> 그 주 월요일은 07-27
+        # 2026-07-31은 금요일 -> 그 주 월요일은 07-27.
+        # data_start(07-16)가 이번 달 1일(07-01)보다 늦으므로 total은
+        # data_start가 아니라 month_start(07-01)를 쓴다 — total은 항상
+        # month를 포함하는 가장 넓은 창이어야 한다(아래
+        # TestTotalNeverNarrowerThanMonth 참조, 리뷰 항목 6).
         bounds = period_bounds(date(2026, 7, 31), data_start="20260716")
         assert bounds["day"] == ("20260731", "20260731")
         assert bounds["week"] == ("20260727", "20260731")
         assert bounds["month"] == ("20260701", "20260731")
-        assert bounds["total"] == ("20260716", "20260731")
+        assert bounds["total"] == ("20260701", "20260731")
 
     def test_monday_week_start_is_today_itself(self):
         # 2026-07-27은 월요일 -> 주 시작이 그날 자신
@@ -307,6 +311,24 @@ class TestPeriodBounds:
     def test_total_falls_back_to_month_start_without_data_start(self):
         bounds = period_bounds(date(2026, 7, 31), data_start=None)
         assert bounds["total"] == ("20260701", "20260731")
+
+
+class TestTotalNeverNarrowerThanMonth:
+    """리뷰 항목 6: 운용 첫 달처럼 data_start가 이번 달 1일보다 늦으면,
+    예전 구현(`data_start or month_start`)은 total이 month보다 좁아져서
+    "월간 실현손익 > 누적 실현손익"이라는 모순을 만들었다. total은 정의상
+    그 어떤 하위 구간보다도 좁을 수 없어야 한다."""
+
+    def test_total_widens_to_month_start_when_data_start_is_later(self):
+        bounds = period_bounds(date(2026, 7, 31), data_start="20260716")
+        assert bounds["total"] == bounds["month"] == ("20260701", "20260731")
+
+    def test_total_still_uses_data_start_when_earlier_than_month_start(self):
+        # 여러 달 운용해 온 정상 케이스 — data_start가 이번 달보다 훨씬
+        # 이르면 total은 여전히 data_start부터 시작해야 한다(장기 누적
+        # 보존, 회귀 방지).
+        bounds = period_bounds(date(2026, 7, 31), data_start="20260610")
+        assert bounds["total"] == ("20260610", "20260731")
 
 
 class TestEquityReturnForPeriod:
@@ -366,6 +388,36 @@ class TestEquityReturnForPeriod:
         ]
         res = equity_return_for_period(snaps, "20260731", "20260731", None)
         assert round(res["pct"], 4) == 1.0
+
+    def test_returns_trade_date_of_the_row_used_for_end_equity(self):
+        res = equity_return_for_period(
+            self.SNAPS, "20260727", "20260731", base_asset=500_000_000
+        )
+        assert res["trade_date"] == "2026-07-31"
+
+    def test_no_row_inside_window_returns_none_not_fabricated_zero(self):
+        """리뷰 CRITICAL 재현: `daily_perf_snapshot`은 장마감에만 한 번
+        쓰인다(coordinator.py -> eod_snapshot.write_daily_snapshot) —
+        그래서 장중에는 오늘자 행이 없다. 옛 구현은 end_equity를 "end
+        이하 아무 행"에서 뽑아, 오늘 행이 없으면 어제 종가를 오늘 값인
+        척 재사용해서 end_equity == start_equity가 되고 pct=0.0을
+        "계산"해 냈다 — 데이터 없음이 아니라 계산된 값처럼 보였다. 이제는
+        [start, end] 구간 안에 행이 하나도 없으면 None이어야 한다(프론트는
+        None을 '—'로, 0.0은 '+0.00%'로 렌더해 완전히 다른 뜻이 된다)."""
+        # 최신 스냅샷이 07-31뿐인데 오늘(장중)은 08-01이라고 가정 —
+        # day 버킷 [20260801, 20260801] 안에는 행이 없다.
+        res = equity_return_for_period(
+            self.SNAPS, "20260801", "20260801", base_asset=500_000_000
+        )
+        assert res is None
+
+    def test_no_row_inside_window_returns_none_even_with_older_data(self):
+        """구간보다 훨씬 이른 행만 있어도(예전엔 그걸 end_equity로 오인)
+        구간 안에 행이 없으면 여전히 None — base_asset 폴백도 구제하지
+        않는다(end_equity 자체가 없으므로)."""
+        snaps = [_snap("2026-01-01", 400_000_000)]
+        res = equity_return_for_period(snaps, "20260731", "20260731", base_asset=500_000_000)
+        assert res is None
 
 
 class TestRealizedForPeriod:

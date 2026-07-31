@@ -2200,6 +2200,14 @@ class PnlSummaryEquityReturn(BaseModel):
     basis: str = Field(
         ..., description='분모 출처: "prior_close"(기간 시작 직전 종가) 또는 "base_asset"(기준자산)'
     )
+    trade_date: str = Field(
+        ...,
+        description=(
+            "이 수익률의 분자(end_equity)를 만든 스냅샷의 거래일(YYYY-MM-DD). "
+            "장중에는 오늘자 스냅샷이 아직 없어 직전 영업일 종가 기준이므로 "
+            "화면에 함께 표시해 프론트가 신선도를 알 수 있게 한다."
+        ),
+    )
 
 
 class PnlSummaryResponse(BaseModel):
@@ -2236,11 +2244,18 @@ async def get_pnl_summary(base: Optional[int] = DEFAULT_BASE_ASSET_KRW):
         errors["equity_return"] = str(e)
 
     # get_daily_perf_snapshots는 최신순이라 가장 이른 일자는 마지막 행이다.
+    # trade_date가 YYYYMMDD 8자리로 정규화되는 값이 아니면(예: 손상된 행이
+    # ISO datetime 문자열을 담고 있는 경우) data_start로 채택하지 않는다 —
+    # equity_return_for_period가 스냅샷 행을 거를 때 쓰는 것과 같은 가드.
+    # 이 가드 없이 문자열을 그대로 넘기면 이후 문자열 비교(`dt < start` 등)가
+    # 의미 없는 값과 뒤섞여 total 버킷의 basis/수익률이 조용히 틀어진다.
     data_start: Optional[str] = None
     if snapshots:
         raw = snapshots[-1].get("trade_date")
         if isinstance(raw, str):
-            data_start = raw.replace("-", "")
+            candidate = raw.replace("-", "")
+            if len(candidate) == 8 and candidate.isdigit():
+                data_start = candidate
 
     bounds = period_bounds(today, data_start)
 
@@ -2253,8 +2268,18 @@ async def get_pnl_summary(base: Optional[int] = DEFAULT_BASE_ASSET_KRW):
                 computed[bucket] = PnlSummaryEquityReturn(**point)
         if computed:
             equity_return = computed
+        elif snapshots:
+            # 스냅샷은 있지만 어느 버킷도 계산 가능한 구간을 못 찾은
+            # 경우 — 드물지만 "행이 없다"와는 다른 사실이므로 구분해 보고한다.
+            errors["equity_return"] = "평가금 스냅샷은 있으나 계산 가능한 구간 없음"
         else:
-            errors["equity_return"] = "평가금 스냅샷 없음"
+            # storage.get_daily_perf_snapshots는 내부에서 예외를 모두
+            # 삼키고 빈 리스트를 반환한다(storage_service.py) — 그래서
+            # "아직 기록된 행이 없음"과 "조회 자체가 실패함"을 여기서
+            # 구분할 수 없다. 확인하지 않은 원인을 단정하지 않는다.
+            errors["equity_return"] = (
+                "평가금 스냅샷 없음 (또는 조회 실패 — 원인 구분 불가)"
+            )
 
     realized: Optional[Dict[str, int]] = None
     try:
@@ -2268,12 +2293,31 @@ async def get_pnl_summary(base: Optional[int] = DEFAULT_BASE_ASSET_KRW):
             bucket: realized_for_period(points, start, end)
             for bucket, (start, end) in bounds.items()
         }
+        if data_start is None:
+            # data_start(가장 이른 평가금 스냅샷)를 모르면 bounds()의
+            # `total`은 이번 달 1일로 물러선 값이다 — "누적"이라는 라벨과
+            # 달리 실제로는 월간과 같은 창일 수 있다는 사실을 표시해 둔다.
+            errors["realized_total_scope"] = (
+                "데이터 시작일 불명 — 누적이 이번 달로 제한됨"
+            )
     except Exception as e:  # noqa: BLE001 — 섹션 독립 강등
         errors["realized"] = str(e)
+
+    # as_of는 가능하면 "실제로 반영된 데이터가 어느 날짜 것인지"를 보여준다
+    # — 장중에는 평가금 수익률이 전부 직전 종가 기준이므로, 오늘 날짜
+    # (datetime.now 기반)를 그대로 as_of로 쓰면 마치 오늘자 데이터처럼
+    # 보인다. 평가금 버킷이 하나라도 살아 있으면 그중 가장 최신
+    # trade_date를 as_of로 쓰고, 없으면(평가금 섹션 자체가 죽었을 때)
+    # 오늘 날짜로 물러선다.
+    as_of = (
+        max(v.trade_date for v in equity_return.values())
+        if equity_return
+        else today.strftime("%Y-%m-%d")
+    )
 
     return PnlSummaryResponse(
         realized=realized,
         equity_return=equity_return,
-        as_of=today.strftime("%Y-%m-%d"),
+        as_of=as_of,
         errors=errors,
     )
