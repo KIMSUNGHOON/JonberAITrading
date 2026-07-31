@@ -132,6 +132,15 @@ async def register_fill_as_position(
             # 이 값은 다음 reconcile이 브로커 avg_buy_prc로 최종 교정한다.
             merged_quantity = existing.quantity + quantity
             merged_avg_price = None
+            # 리뷰 Minor(최종 리뷰 item7): `avg_price`가 0/None으로 들어오는
+            # 체결 델타(브로커가 avg_fill_price를 아직 못 채운 극히 드문 케이스)
+            # 는 `and avg_price`가 걸려 merged_avg_price=None으로 남는다 —
+            # 그러면 아래 update_position이 avg_price=None을 넘겨(coalesce)
+            # 기존 원가를 그대로 두면서 quantity만 키운다. 이는 C2가 고치는
+            # 결함(오래된 원가가 더 큰 수량에 적용됨)과 형태가 같지만, 여기서는
+            # 의도적인 선택이다 — 0을 원가로 합산하면 원가를 실제보다 낮춰
+            # 더 위험한 방향으로 왜곡한다. 어느 쪽이든 다음 reconcile이 브로커
+            # avg_buy_prc로 최종 교정한다(위 132행 주석과 동일 안전망).
             if merged_quantity > 0 and avg_price:
                 merged_avg_price = (
                     existing.quantity * existing.avg_price + quantity * avg_price
