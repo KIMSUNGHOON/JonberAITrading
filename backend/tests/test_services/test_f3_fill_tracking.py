@@ -914,13 +914,21 @@ class _FakePM:
         self._positions[ticker] = position
         return position
 
-    def update_position(self, ticker, quantity=None, current_price=None,
-                         stop_loss=None, take_profit=None, trailing_stop_pct=None):
+    def update_position(self, ticker, quantity=None, avg_price=None,
+                         current_price=None, stop_loss=None, take_profit=None,
+                         trailing_stop_pct=None):
+        # 원가 단일화 C1(2026-07-31): reconciler가 quantity 옆에 avg_price도
+        # 넘기게 되면서(coalesce — None이면 무시) 이 fake도 실제
+        # PositionManager.update_position(position_manager.py:577)의 시그니처를
+        # 따라잡아야 한다. 안 그러면 avg_price=None 키워드만으로도
+        # TypeError가 나 quantity 보정까지 통째로 실패한다.
         position = self._positions.get(ticker)
         if position is None:
             return None
         if quantity is not None:
             position.quantity = quantity
+        if avg_price is not None:
+            position.avg_price = avg_price
         if current_price is not None:
             position.current_price = current_price
         if stop_loss is not None:

@@ -47,14 +47,20 @@ another client entirely.
    kt00004 payload parses to an empty list, and that must never mass-remove
    every local defense in one tick.
 
-3. **Quantity fix** — broker quantity is truth. For any ticker still present
-   at the broker whose managed quantity disagrees, the coordinator's
-   `ManagedPosition.quantity` is set directly (and the risk monitor
-   re-registered so the watched size follows) and PM's quantity is set via
-   `update_position(quantity=...)`, which assigns absolutely — the correct
-   operation here regardless of how either side drifted (including the
-   PM-absolute-vs-fill-tracker-incremental double-count race described
-   above: whichever side over/under-counted converges to the broker value).
+3. **Position fix** — broker quantity AND cost basis are truth (원가 단일화
+   C1, 2026-07-31). For any ticker still present at the broker whose managed
+   quantity or `avg_price` disagrees (independently — a position can have the
+   right quantity and a drifted cost basis, or vice versa), the coordinator's
+   `ManagedPosition.quantity`/`avg_price` are set directly (and the risk
+   monitor re-registered so the watched size follows) and PM's fields are set
+   via `update_position(quantity=..., avg_price=...)`, which assigns
+   absolutely — the correct operation here regardless of how either side
+   drifted (including the PM-absolute-vs-fill-tracker-incremental
+   double-count race described above: whichever side over/under-counted
+   converges to the broker value). Cost-basis drift under
+   `COST_BASIS_TOLERANCE_PCT` (0.1%) is left alone — it's within the broker's
+   `avg_buy_prc` `int` truncation, not a real mismatch. Stop-loss/take-profit
+   are never touched by this pass.
 
 The balance is always fetched with `use_cache=False` (review M1): the
 client's 30s TTL entry can predate a fill the tracker poll registered
@@ -85,6 +91,9 @@ class ReconcileReport(BaseModel):
     orphans_adopted: int = 0
     externally_closed: int = 0
     quantity_fixed: int = 0
+    # 원가 단일화 C1(2026-07-31): 수량과 별개로 세는 이유는 07-31 실측에서
+    # **수량은 맞고 원가만** 어긋난 종목이 둘이었기 때문이다.
+    cost_basis_fixed: int = 0
 
 
 def _find_position(positions, ticker: str) -> Optional[ManagedPosition]:
@@ -312,48 +321,102 @@ async def _detect_external_closes(coordinator, pm, holdings_by_ticker: dict, rep
         )
 
 
-async def _fix_quantities(coordinator, pm, holdings_by_ticker: dict, report: ReconcileReport) -> None:
+# 원가 편차 임계. 브로커 avg_buy_prc가 int라(kiwoom/models.py:202) 주당 최대
+# 0.5원 절삭이 생기는데, 그것을 불일치로 오판하지 않기 위한 값이다.
+COST_BASIS_TOLERANCE_PCT = 0.1
+
+
+def _cost_basis_drift_pct(internal_avg: float, broker_avg: float) -> float:
+    """내부 원가가 브로커 대비 몇 % 어긋났는지. 브로커가 0이면 0(판정 불가)."""
+    if not broker_avg:
+        return 0.0
+    return abs(internal_avg - broker_avg) / broker_avg * 100.0
+
+
+async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: ReconcileReport) -> None:
+    """브로커를 진실로 삼아 수량과 **원가**를 맞춘다.
+
+    이름이 `_fix_quantities`였을 때는 수량만 고쳤고, 진입 조건도
+    `quantity != broker_qty` 하나였다. 그런데 07-31 실측에서 089860·317400은
+    수량이 맞는 상태에서 원가만 어긋나 있었다(-0.370%, +0.120%) — 그 조건으로는
+    영원히 교정되지 않는다. 원가 비교를 독립 조건으로 둔다.
+
+    손절·익절은 절대 재계산하지 않는다(원가 단일화 아크의 소급 원칙).
+    """
     for ticker, holding in holdings_by_ticker.items():
         broker_qty = holding.hldg_qty
-        fixed = False
+        broker_avg = float(getattr(holding, "avg_buy_prc", 0) or 0)
+        qty_fixed = False
+        cost_fixed = False
 
         coordinator_pos = _find_position(coordinator.state.positions, ticker)
-        if coordinator_pos is not None and coordinator_pos.quantity != broker_qty:
-            coordinator_pos.quantity = broker_qty
-            # Refresh current_price from the broker BEFORE re-registering
-            # (review m2): RiskMonitor.add_position seeds last_price from
-            # position.current_price, and a stale price there can trip the
-            # sudden-move detector on the next real quote (PAUSED → all stop
-            # checks skipped).
-            coordinator_pos.current_price = float(holding.cur_prc)
-            coordinator_pos.last_updated = datetime.now()
-            coordinator.risk_monitor.remove_position(ticker)
-            coordinator.risk_monitor.add_position(coordinator_pos)
-            coordinator._schedule_persist()
-            fixed = True
+        if coordinator_pos is not None:
+            needs_qty = coordinator_pos.quantity != broker_qty
+            needs_cost = bool(broker_avg) and _cost_basis_drift_pct(
+                coordinator_pos.avg_price, broker_avg
+            ) > COST_BASIS_TOLERANCE_PCT
+
+            if needs_qty or needs_cost:
+                if needs_qty:
+                    coordinator_pos.quantity = broker_qty
+                if needs_cost:
+                    coordinator_pos.avg_price = broker_avg
+                # Refresh current_price from the broker BEFORE re-registering
+                # (review m2): RiskMonitor.add_position seeds last_price from
+                # position.current_price, and a stale price there can trip the
+                # sudden-move detector on the next real quote (PAUSED → all stop
+                # checks skipped).
+                coordinator_pos.current_price = float(holding.cur_prc)
+                coordinator_pos.last_updated = datetime.now()
+                coordinator.risk_monitor.remove_position(ticker)
+                coordinator.risk_monitor.add_position(coordinator_pos)
+                coordinator._schedule_persist()
+                qty_fixed = qty_fixed or needs_qty
+                cost_fixed = cost_fixed or needs_cost
 
         if pm is not None:
             pm_pos = pm.get_position(ticker)
-            if pm_pos is not None and pm_pos.quantity != broker_qty:
-                try:
-                    pm.update_position(ticker=ticker, quantity=broker_qty)
-                    fixed = True
-                except Exception as e:
-                    logger.warning(f"[Reconciler] PM quantity fix failed for {ticker}: {e}")
+            if pm_pos is not None:
+                pm_needs_qty = pm_pos.quantity != broker_qty
+                pm_needs_cost = bool(broker_avg) and _cost_basis_drift_pct(
+                    pm_pos.avg_price, broker_avg
+                ) > COST_BASIS_TOLERANCE_PCT
+                if pm_needs_qty or pm_needs_cost:
+                    try:
+                        # stop_loss/take_profit은 넘기지 않는다 — update_position은
+                        # None 인자를 무시(coalesce)하므로 기존 방어선이 보존된다.
+                        pm.update_position(
+                            ticker=ticker,
+                            quantity=broker_qty if pm_needs_qty else None,
+                            avg_price=broker_avg if pm_needs_cost else None,
+                        )
+                        qty_fixed = qty_fixed or pm_needs_qty
+                        cost_fixed = cost_fixed or pm_needs_cost
+                    except Exception as e:
+                        logger.warning(f"[Reconciler] PM fix failed for {ticker}: {e}")
 
-        if fixed:
+        if qty_fixed:
             report.quantity_fixed += 1
+        if cost_fixed:
+            report.cost_basis_fixed += 1
+
+        if qty_fixed or cost_fixed:
+            parts = []
+            if qty_fixed:
+                parts.append(f"보유수량({broker_qty}주)")
+            if cost_fixed:
+                parts.append(f"평균단가({broker_avg:,.0f}원)")
             await coordinator._on_alert(
                 TradingAlert(
                     id=str(uuid.uuid4())[:8],
                     alert_type=AlertType.REBALANCE_SUGGESTED,
                     ticker=ticker,
-                    title="보유수량 보정",
+                    title="포지션 보정",
                     message=(
-                        f"{holding.stk_nm or ticker} 관리 수량을 브로커 보유수량"
-                        f"({broker_qty}주)으로 보정했습니다"
+                        f"{holding.stk_nm or ticker} 관리 정보를 브로커 "
+                        f"{' / '.join(parts)}으로 보정했습니다"
                     ),
-                    data={"broker_quantity": broker_qty},
+                    data={"broker_quantity": broker_qty, "broker_avg_price": broker_avg},
                 )
             )
 
@@ -383,6 +446,6 @@ async def reconcile(coordinator) -> ReconcileReport:
 
     await _adopt_orphans(coordinator, pm, holdings_by_ticker, report)
     await _detect_external_closes(coordinator, pm, holdings_by_ticker, report)
-    await _fix_quantities(coordinator, pm, holdings_by_ticker, report)
+    await _fix_positions(coordinator, pm, holdings_by_ticker, report)
 
     return report
