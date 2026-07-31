@@ -333,4 +333,18 @@ describe('손익 요약 스트립 배치', () => {
       expect.objectContaining({ unrealized: null, holdings: 0 }),
     );
   });
+
+  // activeMarket === 'kiwoom' 게이트 회귀 방지: PnlSummaryStrip은 KR 전용
+  // 수치(실현손익 ka10074, 평가금 수익률)라 코인 시장에서 렌더되면 코인
+  // 포지션 옆에 무관한 KR 숫자가 뜬다. 이 게이트가 없으면 아무 테스트도
+  // 실패하지 않는 채로 조용히 사라질 수 있었다.
+  it('코인 시장에서는 손익 요약 스트립이 렌더되지 않는다(KR 전용 게이트)', async () => {
+    useStore.setState({ activeMarket: 'coin', chartSymbol: null } as never);
+    getCoinPositions.mockResolvedValue(positionsResponse([coinPosition()]));
+    render(<PositionsPanel />);
+
+    await screen.findByLabelText('전량청산 KRW-BTC'); // 포지션 렌더 대기
+    expect(PnlSummaryStrip).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('pnl-strip')).not.toBeInTheDocument();
+  });
 });
