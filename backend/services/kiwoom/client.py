@@ -1061,12 +1061,25 @@ class KiwoomClient:
         스펙 주의: 실현손익이 발생한 일자만 데이터가 채워진다 — 무거래
         기간이면 합계 0 + 빈 리스트가 정상이다. 손익은 부호를 보존한다.
 
+        연속조회(cont-yn/next-key, 계좌.md:296-312): 조회 기간의 손익
+        발생 일수가 한 페이지를 넘으면 응답 헤더에 cont-yn=Y가 온다.
+        get_stock_list(ka10099, 이 파일 내 다른 연속조회 콜사이트)와 같은
+        루프 패턴을 따라 모든 페이지의 dt_rlzt_pl을 모아야 한다 — 1페이지만
+        읽으면 계정이 오래될수록(조회 창이 넓어질수록) 일별 실현손익 목록이
+        조용히 잘려 누적 실현손익이 실제보다 작게 나온다(에러도, 표시도
+        없이 — 발굴 유니버스가 유량제한 오분류로 조용히 축소됐던 사고와
+        같은 형태). tot_buy_amt/tot_sell_amt/rlzt_pl/trde_cmsn/trde_tax
+        같은 합계 필드는 매 페이지가 이미 전체 조회 기간 기준으로 채워
+        보내므로(페이지별 부분합이 아님) 굳이 우리가 다시 합산하지 않고
+        마지막 페이지의 값을 그대로 쓴다 — daily 리스트만 페이지마다
+        이어붙인다.
+
         Args:
             strt_dt: 시작일자 YYYYMMDD (기본: 오늘 KST)
             end_dt: 종료일자 YYYYMMDD (기본: strt_dt)
 
         Returns:
-            RealizedPnl 객체
+            RealizedPnl 객체 (daily는 전 페이지를 합친 목록)
         """
         if strt_dt is None:
             strt_dt = datetime.now(KST).strftime("%Y%m%d")
@@ -1080,15 +1093,35 @@ class KiwoomClient:
             if cached is not None:
                 return cached
 
-        result = await self._request(
-            api_id="ka10074",
-            endpoint="/api/dostk/acnt",
-            data={"strt_dt": strt_dt, "end_dt": end_dt},
-        )
+        result: dict = {}
+        all_rows: list[dict] = []
+        cont_yn = "N"
+        next_key = ""
 
-        rows = result.get("dt_rlzt_pl", [])
-        if not isinstance(rows, list):
-            rows = [rows] if rows else []
+        while True:
+            result, continuation = await self._request(
+                api_id="ka10074",
+                endpoint="/api/dostk/acnt",
+                data={"strt_dt": strt_dt, "end_dt": end_dt},
+                cont_yn=cont_yn if cont_yn == "Y" else "",
+                next_key=next_key if cont_yn == "Y" else "",
+                with_continuation=True,
+            )
+
+            rows = result.get("dt_rlzt_pl", [])
+            if not isinstance(rows, list):
+                rows = [rows] if rows else []
+            all_rows.extend(rows)
+
+            cont_yn = continuation["cont_yn"]
+            next_key = continuation["next_key"]
+
+            if cont_yn != "Y":
+                break
+
+            # Rate limit 대기 (get_stock_list와 동일 패턴 — Kiwoom 초당 약
+            # 1.4요청 제한)
+            await asyncio.sleep(0.3)
 
         pnl = RealizedPnl(
             strt_dt=strt_dt,
@@ -1107,7 +1140,7 @@ class KiwoomClient:
                     commission=self._parse_signed_price(row.get("tdy_trde_cmsn")),
                     tax=self._parse_signed_price(row.get("tdy_trde_tax")),
                 )
-                for row in rows
+                for row in all_rows
             ],
         )
 
