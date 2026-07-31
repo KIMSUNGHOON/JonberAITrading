@@ -1,7 +1,7 @@
 # 원가(cost basis) 단일화 설계 — 브로커를 진실로
 
 **작성일**: 2026-07-31
-**상태**: 승인됨 (설계 확정, 구현 대기)
+**상태**: 구현 완료 (배포 대기 — 장 마감 후, 15:30~16:35 EOD 창 제외)
 
 ## 문제
 
@@ -92,6 +92,14 @@ coordinator와 PM 양쪽 모두.
 통지는 이번 아크에서 만든 never-raise 패턴을 따르고, 종목당 1회로 래치한다
 (`liquidity_cap_blocked_notified`와 같은 형태) — reconcile은 주기적으로 돌므로 래치가 없으면
 같은 불일치를 반복 발송한다.
+
+> **구현 시 정정(Task 4)**: 위 문장의 "종목당 1회"와 "`liquidity_cap_blocked_notified`와
+> 같은 형태"는 서로 모순이었다 — 인용된 전례(`liquidity_cap_blocked_notified`,
+> `close_gate_denied_notified`)는 모두 가드 조건을 통과하면(문제가 해소되면) 플래그를
+> 되돌려 재발 시 다시 통지한다. 즉 "영구 1회"가 아니라 "에피소드당 1회"다. 사람 파트너가
+> **에피소드당 1회**로 확정했다 — `_COST_DRIFT_NOTIFIED` 래치는 원가 편차가 임계 이내로
+> 확인되는 순간 해당 티커를 discard하고, 그 뒤 새로운 편차가 다시 임계를 넘으면 재통지한다.
+> `services/trading/reconciler.py`의 `_fix_positions`/`_alert_cost_basis_drift` 참조.
 
 ## 소급 적용 — 원가만, 손절가는 불변
 
