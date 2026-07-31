@@ -7,7 +7,7 @@ Provides endpoints for auto-trading system control and monitoring.
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -46,6 +46,9 @@ from services.trading.paper_performance import (
     compute_cumulative_return_pct,
     compute_daily_win_loss,
     daily_pnl_series,
+    period_bounds,
+    equity_return_for_period,
+    realized_for_period,
 )
 # P2-4 Task P1: display-layer cost helper for the live holdings tile below
 # (get_operations) — net-of-cost projection only, never fed back into the
@@ -2178,3 +2181,99 @@ async def get_performance(
             errors["asset"] = str(e)
 
     return PerformanceResponse(pnl=pnl_summary, asset=asset_summary, errors=errors)
+
+
+# ─── 기간 손익 요약 (NAV 손익 표시) ───
+#
+# `realized`(브로커 ka10074)와 `equity_return`(로컬 daily_perf_snapshot)은
+# 서로 다른 소스라 독립적으로 강등된다. 미실현손익은 여기 없다 — PositionsPanel이
+# 이미 폴링 중인 /operations 데이터에서 프론트가 합산한다(브로커 중복 호출 회피).
+
+
+def _pnl_summary_today() -> date:
+    """오늘(KST). 테스트가 시간을 고정할 수 있도록 분리해 둔다."""
+    return datetime.now(KST).date()
+
+
+class PnlSummaryEquityReturn(BaseModel):
+    pct: float = Field(..., description="기간 수익률 %")
+    basis: str = Field(
+        ..., description='분모 출처: "prior_close"(기간 시작 직전 종가) 또는 "base_asset"(기준자산)'
+    )
+
+
+class PnlSummaryResponse(BaseModel):
+    realized: Optional[Dict[str, int]] = Field(
+        None, description="버킷별 실현손익 (day/week/month/total), 이미 세후"
+    )
+    equity_return: Optional[Dict[str, PnlSummaryEquityReturn]] = Field(
+        None, description="버킷별 평가금 기준 수익률"
+    )
+    as_of: str = Field(..., description="기준일 YYYY-MM-DD (KST)")
+    errors: Dict[str, str] = {}
+
+
+@router.get("/pnl-summary", response_model=PnlSummaryResponse)
+async def get_pnl_summary(base: Optional[int] = DEFAULT_BASE_ASSET_KRW):
+    """일/주/월/누적 실현손익과 평가금 기준 수익률.
+
+    버킷 경계는 캘린더 기준이다 — 주는 이번 주 월요일부터, 월은 이번 달 1일부터.
+    평가금 수익률의 분모는 기간 시작 **직전** 종가이고, 그런 행이 없으면
+    `base`(기준자산)로 물러서며 `basis`가 어느 쪽이었는지 드러낸다.
+
+    브로커는 **한 번만** 호출한다 — 버킷마다 부르면 Kiwoom 레이트리밋(초당 약
+    1.4요청)에 걸린다. 그래서 스냅샷을 먼저 읽어 누적 버킷의 시작을 정한 뒤
+    가장 넓은 창으로 1회 조회하고 그 일별 시리즈를 버킷별로 합산한다.
+    """
+    errors: Dict[str, str] = {}
+    today = _pnl_summary_today()
+
+    snapshots: list = []
+    try:
+        storage = await get_storage_service()
+        snapshots = await storage.get_daily_perf_snapshots(limit=400)
+    except Exception as e:  # noqa: BLE001 — 섹션 독립 강등
+        errors["equity_return"] = str(e)
+
+    # get_daily_perf_snapshots는 최신순이라 가장 이른 일자는 마지막 행이다.
+    data_start: Optional[str] = None
+    if snapshots:
+        raw = snapshots[-1].get("trade_date")
+        if isinstance(raw, str):
+            data_start = raw.replace("-", "")
+
+    bounds = period_bounds(today, data_start)
+
+    equity_return: Optional[Dict[str, PnlSummaryEquityReturn]] = None
+    if "equity_return" not in errors:
+        computed = {}
+        for bucket, (start, end) in bounds.items():
+            point = equity_return_for_period(snapshots, start, end, base)
+            if point is not None:
+                computed[bucket] = PnlSummaryEquityReturn(**point)
+        if computed:
+            equity_return = computed
+        else:
+            errors["equity_return"] = "평가금 스냅샷 없음"
+
+    realized: Optional[Dict[str, int]] = None
+    try:
+        client = await get_shared_kiwoom_client_async()
+        window_start = min(start for start, _ in bounds.values())
+        pnl = await client.get_realized_pnl(
+            strt_dt=window_start, end_dt=today.strftime("%Y%m%d")
+        )
+        points = daily_pnl_series(pnl.daily)
+        realized = {
+            bucket: realized_for_period(points, start, end)
+            for bucket, (start, end) in bounds.items()
+        }
+    except Exception as e:  # noqa: BLE001 — 섹션 독립 강등
+        errors["realized"] = str(e)
+
+    return PnlSummaryResponse(
+        realized=realized,
+        equity_return=equity_return,
+        as_of=today.strftime("%Y-%m-%d"),
+        errors=errors,
+    )
