@@ -589,8 +589,14 @@ class PositionManager:
         """Update a monitored position.
 
         ``avg_price`` (P2, 2026-07-15): distinct from ``current_price`` — the
-        cost basis, only ever recomputed by an ADD's weighted-average merge
-        (`_execute_add_position`). No other caller passes it.
+        cost basis. 원가 단일화 아크(2026-07-31) 이후로는 더 이상 ADD의
+        가중평균 merge(`_execute_add_position`) 혼자 이 인자를 넘기지 않는다
+        — 지금은 넷이다: ADD 외에 체결 미러의 merge 분기
+        (`position_registration.register_fill_as_position`), 브로커 대사
+        (`reconciler._fix_positions`), 그리고 `sync_from_account`의 기존
+        포지션 갱신 분기. 넷 다 "관측된 새 원가로 절대 치환"이라는 동일
+        의미로 이 인자를 쓴다 — 증분 합산이 필요하면(ADD·체결 미러처럼)
+        호출부가 미리 가중평균을 계산해서 넘긴다.
         """
         if ticker not in self._positions:
             return None
@@ -2368,10 +2374,17 @@ class PositionManager:
                     continue
 
                 if holding.stk_cd in self._positions:
-                    # Update existing
+                    # Update existing.
+                    # 원가 단일화 최종 리뷰 item2: quantity/current_price만
+                    # 밀어넣고 avg_price를 빠뜨리면 "148주 원가가 185주에
+                    # 그대로 적용"되는 정확히 그 결함이 여기서도 재현된다 —
+                    # reconciler.py 모듈독스트링이 드리프트 원인으로 지목하는
+                    # 함수가 바로 이 sync_from_account다. 브로커 값을 그대로
+                    # 절대 치환한다(reconciler의 브로커=진실 원칙과 동일).
                     self.update_position(
                         ticker=holding.stk_cd,
                         quantity=holding.hldg_qty,
+                        avg_price=holding.avg_buy_prc,
                         current_price=holding.cur_prc,
                     )
                 else:

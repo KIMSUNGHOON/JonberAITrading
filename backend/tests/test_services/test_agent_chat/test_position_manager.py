@@ -990,6 +990,40 @@ def _fake_kiwoom_client(holdings):
     return client
 
 
+class TestSyncFromAccountCostBasis:
+    """최종 리뷰 item2: `sync_from_account`의 "기존 갱신" 분기가 브로커의
+    quantity/current_price만 밀어넣고 avg_price는 넘기지 않아 148주 원가가
+    185주에 그대로 적용되는 정확히 그 결함(reconciler.py 모듈독스트링이 드리프트
+    원인으로 지목하는 함수) — POST /api/agent-chat/positions/sync로 라이브
+    도달 가능하고, 그 원가가 `_apply_take_profit_lock_in`의 락인 스탑 계산에도
+    쓰인다."""
+
+    @pytest.mark.asyncio
+    async def test_sync_updates_existing_position_avg_price_to_broker_value(self, config):
+        pm = PositionManager(config=config)
+        pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=148,
+            avg_price=37_950.0,
+        )
+
+        holdings = [_fake_holding("005930", "삼성전자", 185, 38_091, 38_750)]
+        with patch(
+            "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+            AsyncMock(return_value=_fake_kiwoom_client(holdings)),
+        ):
+            await pm.sync_from_account()
+
+        position = pm.get_position("005930")
+        assert position.quantity == 185
+        assert position.avg_price == 38_091, (
+            "브로커 원가가 반영돼야 한다 — 이전엔 37,950(148주 원가)에 "
+            "동결된 채 수량만 185주로 커졌다"
+        )
+        assert position.current_price == 38_750
+
+
 class TestStopLevelPersistence:
     """Tests for stop-level persist/restore across a simulated restart."""
 
