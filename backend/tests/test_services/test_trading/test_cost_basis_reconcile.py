@@ -8,6 +8,7 @@ _fix_quantities는 quantity != broker_qty일 때만 진입해 수량과 current_
 0.5원 절삭을 불일치로 오판하지 않기 위한 값이다.
 """
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -260,3 +261,112 @@ async def test_drift_alert_relatches_after_episode_resolves():
         await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
 
     assert notifier.send_message.await_count == 2, "해소 후 재발한 드리프트는 다시 알려야 한다"
+
+
+# ---------------------------------------------------------------
+# 최종 리뷰 item3(Minor): 알림/래치는 '교정 성공'과 독립이어야 하고, 래치
+# 해제는 비교된 모든 엔진이 임계 이내일 때만 일어나야 한다(이전엔 한쪽만
+# 확인돼도 풀리는 OR였다).
+# ---------------------------------------------------------------
+
+
+async def test_persistently_failing_pm_still_alerts_despite_fix_failure():
+    """PM만 드리프트한 상태에서 pm.update_position이 매번 예외를 던지면
+    (coordinator는 이미 브로커 값과 일치, 교정 영구 실패) — 리뷰 실측으로는
+    3연속 패스에 cost_fixed=0, alerts=0, latch=[]였다(사람이 들어야 할
+    순간에 조용했다). drift_detected를 cost_fixed와 분리한 뒤에는 교정
+    실패와 무관하게 드리프트가 실재하는 한 최소 1회는 통지되고, 미해소인
+    동안 래치가 유지된다(에피소드가 아직 안 끝났으므로 반복 재통지는 아님
+    — 반복 통지 억제는 원래 설계다. 로그는 매 패스 남는다 — item6 별도
+    검증)."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=38_091.0)  # coordinator는 이미 브로커 값과 일치
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=37_950.0)  # PM만 0.37% 드리프트
+    pm = _pm(pm_pos)
+    pm.update_position = MagicMock(side_effect=RuntimeError("PM 잠김"))
+
+    reports = []
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        for _ in range(3):
+            report = ReconcileReport()
+            await _fix_positions(coordinator, pm, {"089860": _holding()}, report)
+            reports.append(report)
+
+    assert all(r.cost_basis_fixed == 0 for r in reports), (
+        "PM 교정은 매 패스 계속 실패한다 — cost_fixed는 절대 True가 되지 않는다"
+    )
+    assert notifier.send_message.await_count >= 1, (
+        "교정이 실패해도 드리프트가 실재하는 한 최소 1회는 통지돼야 한다 "
+        "(이전엔 cost_fixed=False라 alerts=0으로 조용히 묻혔다)"
+    )
+    assert "089860" in R._COST_DRIFT_NOTIFIED, "미해소 드리프트는 래치가 유지된다"
+
+
+async def test_latch_requires_all_compared_engines_in_tolerance():
+    """coordinator는 임계 이내, PM은 드리프트 — 이전엔 coordinator 쪽만 보고
+    `cost_in_tolerance=True`가 돼(OR) 래치가 풀렸다. 지금은 비교된 엔진
+    전부가 임계 이내여야 풀린다."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    R._COST_DRIFT_NOTIFIED.add("089860")  # 이전 에피소드에서 이미 통지됨
+
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=38_091.0)  # coordinator: 임계 이내
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=37_950.0)  # PM: 0.37% 드리프트
+    pm = _pm(pm_pos)
+    pm.update_position = MagicMock(side_effect=RuntimeError("PM 잠김"))
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    assert "089860" in R._COST_DRIFT_NOTIFIED, (
+        "coordinator만 임계 이내라고 래치를 풀면 안 된다 — PM 쪽 미해소 "
+        "드리프트가 아직 남아있다"
+    )
+
+
+# ---------------------------------------------------------------
+# 최종 리뷰 item6(Minor): C3의 "로그" 반쪽 — 래치가 텔레그램을 잠근 뒤에도
+# 반복되는 드리프트는 로그에 흔적을 남겨야 한다(래치는 텔레그램 전용).
+# ---------------------------------------------------------------
+
+
+async def test_drift_log_emitted_every_pass_even_when_telegram_latched(caplog):
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=37_950.0))
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        with caplog.at_level(logging.WARNING, logger="services.trading.reconciler"):
+            # 1패스 — 드리프트 발견, 통지 1회, 래치 걸림.
+            await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+            # 2패스 — pm은 MagicMock이라 pm_pos.avg_price가 안 바뀌므로 여전히
+            # 드리프트로 보인다. 래치는 걸려 있어 텔레그램은 조용해야 하지만
+            # 로그는 남아야 한다.
+            await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    assert notifier.send_message.await_count == 1, "래치는 텔레그램만 잠근다"
+    drift_logs = [r for r in caplog.records if "cost drift 089860" in r.message]
+    assert len(drift_logs) == 2, "로그는 래치와 무관하게 드리프트를 발견한 모든 패스에 남는다"

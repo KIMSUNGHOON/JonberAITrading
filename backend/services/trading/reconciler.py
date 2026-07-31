@@ -388,13 +388,17 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
         broker_avg = float(getattr(holding, "avg_buy_prc", 0) or 0)
         qty_fixed = False
         cost_fixed = False
-        # 이번 패스에서 원가가 임계 이내로 '확인'됐는지(브로커 평단이 쓸 수
-        # 있고 실제로 비교가 이뤄진 경우만). 리뷰 Important: 래치는 영구가
-        # 아니라 에피소드당 1회여야 하므로, 드리프트가 없었던 것으로 확인되면
-        # 래치를 풀어 다음 에피소드에 다시 통지되게 한다
-        # (position_manager.close_gate_denied_notified/liquidity_cap_blocked_notified
-        # 와 같은 형태).
-        cost_in_tolerance = False
+        # 리뷰 Minor(최종 리뷰 item3): 통지/래치 판정을 '교정 성공'과 분리한다.
+        # PM 쪽만 드리프트했는데 pm.update_position이 예외를 던지면 cost_fixed는
+        # False로 남지만, 드리프트 자체는 실재했으므로 사람에게는 알려야 한다
+        # — drift_detected가 그 독립 플래그다. any_compared는 이번 패스에서
+        # 실제로 원가 비교가 한 번이라도 이뤄졌는지(브로커 평단이 0이면 애초에
+        # 비교 불가이므로 래치를 풀면 안 된다). 래치 해제는 드리프트가 없고
+        # (drift_detected=False) 동시에 최소 한 엔진은 실제로 비교됐을 때만
+        # 일어난다 — 비교된 엔진이 여럿이면 전부 임계 이내여야 한다(이전엔
+        # 한쪽만 임계 이내여도 풀리는 OR였다).
+        drift_detected = False
+        any_compared = False
 
         # 통지용 — 교정 '전' 원가와 편차. coordinator/PM 중 먼저 관측된 쪽을 쓴다.
         drift_from_avg: float | None = None
@@ -407,11 +411,13 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
                 coordinator_pos.avg_price, broker_avg
             ) > COST_BASIS_TOLERANCE_PCT
 
-            if needs_cost and drift_from_avg is None:
-                drift_from_avg = coordinator_pos.avg_price
-                drift_pct = _cost_basis_drift_pct(coordinator_pos.avg_price, broker_avg)
-            elif not needs_cost and broker_avg:
-                cost_in_tolerance = True
+            if broker_avg:
+                any_compared = True
+            if needs_cost:
+                drift_detected = True
+                if drift_from_avg is None:
+                    drift_from_avg = coordinator_pos.avg_price
+                    drift_pct = _cost_basis_drift_pct(coordinator_pos.avg_price, broker_avg)
 
             if needs_qty or needs_cost:
                 if needs_qty:
@@ -439,11 +445,13 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
                     pm_pos.avg_price, broker_avg
                 ) > COST_BASIS_TOLERANCE_PCT
 
-                if pm_needs_cost and drift_from_avg is None:
-                    drift_from_avg = pm_pos.avg_price
-                    drift_pct = _cost_basis_drift_pct(pm_pos.avg_price, broker_avg)
-                elif not pm_needs_cost and broker_avg:
-                    cost_in_tolerance = True
+                if broker_avg:
+                    any_compared = True
+                if pm_needs_cost:
+                    drift_detected = True
+                    if drift_from_avg is None:
+                        drift_from_avg = pm_pos.avg_price
+                        drift_pct = _cost_basis_drift_pct(pm_pos.avg_price, broker_avg)
 
                 if pm_needs_qty or pm_needs_cost:
                     try:
@@ -458,20 +466,40 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
                         cost_fixed = cost_fixed or pm_needs_cost
                     except Exception as e:
                         logger.warning(f"[Reconciler] PM fix failed for {ticker}: {e}")
+                        # drift_detected/any_compared는 위에서 이미 확정됐다 —
+                        # 교정이 실패해도 되돌리지 않는다. 알림·래치는 드리프트가
+                        # 실재했는지로만 판정하고, 교정 성공 여부와는 독립이다
+                        # (리뷰 Minor item3).
 
         if qty_fixed:
             report.quantity_fixed += 1
         if cost_fixed:
             report.cost_basis_fixed += 1
 
-        if cost_fixed and drift_from_avg is not None:
+        # 리뷰 Minor(최종 리뷰 item6): "로그" 반쪽 — 래치가 걸려 텔레그램이
+        # 조용해진 뒤에도 반복되는 드리프트가 흔적을 남기도록, 래치와 무관하게
+        # 드리프트를 발견한 모든 패스에 로그를 남긴다(래치는 텔레그램 전용).
+        if drift_detected:
+            logger.warning(
+                f"[Reconciler] cost drift {ticker} 내부 {drift_from_avg:,.0f} → "
+                f"브로커 {broker_avg:,.0f} (편차 {drift_pct:.2f}%)"
+            )
+            # drift_detected는 교정 성공 여부(cost_fixed)와 독립이다 — PM만
+            # 드리프트했는데 update_position이 실패해도 사람에게는 알린다
+            # (리뷰 Minor item3). 래치 자체는 `_alert_cost_basis_drift` 내부에서
+            # 관리한다.
             await _alert_cost_basis_drift(ticker, drift_from_avg, broker_avg, drift_pct)
-        elif cost_in_tolerance:
-            # 이번 패스에서 원가가 임계 이내로 확인됐다 — 다음 드리프트 때
-            # 다시 통지되도록 래치를 푼다(`close_gate_denied_notified`가
-            # 게이트 통과 시 리셋되는 것과 동일한 패턴). set.discard는
-            # 원소가 없어도 raise하지 않으므로 latch 체크/해제 자체는
-            # try 밖에 둬도 never-raise를 깨지 않는다.
+        elif any_compared:
+            # 이번 패스에서 실제로 비교된 엔진이 있었고(브로커 평단이 0이 아니라
+            # 비교 자체가 가능했고) 그중 드리프트가 하나도 없었다 — 다음 드리프트
+            # 때 다시 통지되도록 래치를 푼다(`close_gate_denied_notified`가 게이트
+            # 통과 시 리셋되는 것과 동일한 패턴). 비교된 엔진이 여럿이면(예:
+            # coordinator+PM) drift_detected가 False인 시점에 이미 전부 임계
+            # 이내임이 보장된다(하나라도 어긋났다면 drift_detected=True였을
+            # 것이므로) — 그래서 "전부 임계 이내"를 별도 AND로 추적할 필요가
+            # 없다(리뷰 Minor item3: 이전엔 한쪽만 확인돼도 풀리는 OR였다).
+            # set.discard는 원소가 없어도 raise하지 않으므로 latch 체크/해제
+            # 자체는 try 밖에 둬도 never-raise를 깨지 않는다.
             _COST_DRIFT_NOTIFIED.discard(ticker)
 
         if qty_fixed or cost_fixed:
@@ -521,5 +549,16 @@ async def reconcile(coordinator) -> ReconcileReport:
     await _adopt_orphans(coordinator, pm, holdings_by_ticker, report)
     await _detect_external_closes(coordinator, pm, holdings_by_ticker, report)
     await _fix_positions(coordinator, pm, holdings_by_ticker, report)
+
+    # 리뷰 Important(최종 리뷰 item1): _COST_DRIFT_NOTIFIED는 종목별 래치인데,
+    # `_fix_positions`의 해제는 `holdings_by_ticker`(현재 브로커 보유 종목)만
+    # 순회하며 이뤄진다. 포지션이 청산되면(SELL 경로든 위 _detect_external_closes
+    # 든) 그 티커는 이 dict에서 아예 사라지므로 래치가 영원히 걸린 채 남는다 —
+    # 같은 종목을 재진입해 새로운 드리프트가 생겨도 자동 교정만 되고 텔레그램은
+    # 조용하다(사람이 놓친다). 여기서 이번 패스의 브로커 보유 종목에 없는
+    # 티커는 일괄 해제한다 — _detect_external_closes가 처리한 종목은 물론,
+    # SELL 경로가 이미 양쪽 엔진에서 제거해버려 _detect_external_closes조차
+    # 보지 못하는 종목까지 함께 커버된다.
+    _COST_DRIFT_NOTIFIED.intersection_update(holdings_by_ticker)
 
     return report

@@ -1392,6 +1392,91 @@ async def test_reconcile_quantity_fix_refreshes_price_and_risk_monitor(temp_stor
     assert config.take_profit == 289_440
 
 
+# 최종 리뷰 item1 (Important): _COST_DRIFT_NOTIFIED 래치가 포지션 청산을 넘어
+# 샌다. `_fix_positions`의 래치 해제는 `holdings_by_ticker`(이번 패스의 브로커
+# 보유 종목)만 순회해서 이뤄지므로, 포지션이 청산되면(SELL 경로든
+# `_detect_external_closes`든) 그 티커는 그 dict에서 사라져 래치가 절대
+# 풀리지 않는다 — 같은 종목을 재진입해 새 드리프트가 생겨도 자동으로만
+# 교정되고 텔레그램은 조용히 남는다(리뷰가 실측한 결함: alerts=1 latch=['089860']
+# 5회 청산 패스 뒤에도 latch=['089860'], 재진입 2.87% 드리프트에도 alerts_total=1).
+# 수정은 `reconcile()`이 매 패스 끝에 `_COST_DRIFT_NOTIFIED.intersection_update
+# (holdings_by_ticker)`로 이번 패스의 브로커 보유 종목 밖의 래치를 전부 씻어내는
+# 것 — 이 테스트는 청산→재진입 시퀀스가 다시 통지됨을 실제 `reconcile()` 경로로
+# 증명한다.
+async def test_reconcile_drift_latch_clears_on_close_and_realerts_on_reentry(
+    temp_storage, monkeypatch
+):
+    import services.trading.reconciler as reconciler_module
+
+    reconciler_module._COST_DRIFT_NOTIFIED.clear()
+
+    notifier = AsyncMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)
+    )
+
+    # 089860은 드리프트/청산/재진입 대상. 000660은 브로커 보유목록을 계속
+    # 비지 않게 붙잡아두는 상시 보유 종목(M2 mass-removal guard 회피 — 089860만
+    # 있는 상태에서 089860이 사라지면 보유목록이 통째로 비어 removal pass
+    # 전체가 스킵된다).
+    kiwoom = _BalanceKiwoomClient(
+        holdings=[
+            _holding(stk_cd="089860", stk_nm="롯데렌탈", qty=185, avg=38_091, cur=38_750),
+            _holding(stk_cd="000660", stk_nm="SK하이닉스", qty=10, avg=115_000, cur=115_000),
+        ]
+    )
+    coord = ExecutionCoordinator(kiwoom_client=kiwoom)
+    coord._add_position(
+        _managed_position(ticker="089860", quantity=185, avg=37_950.0)  # 0.37% 드리프트
+    )
+    coord._add_position(
+        _managed_position(
+            ticker="000660", quantity=10, avg=115_000, stop_loss=None, take_profit=None
+        )
+    )
+    _patch_pm(monkeypatch, None)
+
+    # 1패스 — 드리프트 발견 → 교정 + 통지 1회, 래치 걸림.
+    report1 = await reconcile(coord)
+    assert report1.cost_basis_fixed == 1
+    assert notifier.send_message.await_count == 1
+    assert "089860" in reconciler_module._COST_DRIFT_NOTIFIED
+
+    # 089860 청산 — 브로커 보유목록에서 제거(000660만 남겨 mass-removal 가드는
+    # 건드리지 않는다).
+    kiwoom._holdings = [
+        _holding(stk_cd="000660", stk_nm="SK하이닉스", qty=10, avg=115_000, cur=115_000),
+    ]
+
+    # 청산 감지 패스 + 그 뒤로도 5회 더(리뷰의 실측 재현) — 이번 수정으로
+    # 래치는 첫 청산 패스에서 이미 씻겨나가야 하고, 이후 패스에도 계속
+    # 비어 있어야 한다.
+    for _ in range(5):
+        await reconcile(coord)
+    assert "089860" not in reconciler_module._COST_DRIFT_NOTIFIED, (
+        "청산된 티커의 래치가 반복 패스에도 남아있으면 안 된다"
+    )
+    assert not any(p.ticker == "089860" for p in coord._state.positions)
+
+    # 재진입 — 다시 매수됐고, 이번엔 원가가 2.87%가량 드리프트된 채로
+    # 등록됐다고 가정한다(실운영에서는 체결 미러가 등록하지만, 여기선
+    # "재진입 그 자체"만 재현한다).
+    coord._add_position(_managed_position(ticker="089860", quantity=185, avg=37_000.0))
+    kiwoom._holdings = [
+        _holding(stk_cd="089860", stk_nm="롯데렌탈", qty=185, avg=38_091, cur=38_750),
+        _holding(stk_cd="000660", stk_nm="SK하이닉스", qty=10, avg=115_000, cur=115_000),
+    ]
+
+    report_reentry = await reconcile(coord)
+
+    assert report_reentry.cost_basis_fixed == 1
+    assert notifier.send_message.await_count == 2, (
+        "재진입 후 새 드리프트는 다시 통지돼야 한다 — 래치가 새지 않으면 "
+        "여기서 조용히 묻힌다(리뷰가 실측한 결함)"
+    )
+
 
 # -------------------------------------------
 # E3-3: market-close edge appends _notify_eod_summary after
