@@ -40,6 +40,13 @@ vi.mock('@/api/client', () => ({
   closeCoinPosition: (...a: unknown[]) => closeCoinPosition(...a),
 }));
 
+// PnlSummaryStrip은 자체 폴링(getPnlSummary, 30초 주기)을 하는 자식 컴포넌트다 —
+// mock하지 않으면 이 파일의 기존 13건까지 네트워크를 탄다.
+const PnlSummaryStrip = vi.fn((_p: unknown) => <div data-testid="pnl-strip" />);
+vi.mock('./PnlSummaryStrip', () => ({
+  PnlSummaryStrip: (p: unknown) => PnlSummaryStrip(p),
+}));
+
 import { useStore } from '@/store';
 import { PositionsPanel } from './PositionsPanel';
 
@@ -286,5 +293,44 @@ describe('PositionsPanel — full close only (C2: partial close removed)', () =>
     fireEvent.click(btn);
 
     await waitFor(() => expect(screen.getByText(/청산 실패/)).toBeInTheDocument());
+  });
+});
+
+describe('손익 요약 스트립 배치', () => {
+  const HOLDING = {
+    ticker: '089860', name: '롯데렌탈', quantity: 185,
+    avg_price: 38091, current_price: 39600, pnl: 213306, pnl_pct: 3.7,
+    stop_loss: 36425, take_profit: 41462,
+  };
+
+  it('보유 포지션의 pnl 합을 미실현손익으로 내려준다', async () => {
+    getOperations.mockResolvedValue(operationsResponse([HOLDING]));
+    render(<PositionsPanel />);
+
+    await waitFor(() => expect(PnlSummaryStrip).toHaveBeenCalled());
+    expect(PnlSummaryStrip).toHaveBeenLastCalledWith(
+      expect.objectContaining({ unrealized: 213306, holdings: 1 }),
+    );
+  });
+
+  it('보유 포지션이 0건이어도 요약 스트립은 남는다', async () => {
+    getOperations.mockResolvedValue(operationsResponse([]));
+    render(<PositionsPanel />);
+
+    await waitFor(() => expect(screen.getByTestId('pnl-strip')).toBeInTheDocument());
+    expect(screen.getByText(/보유 포지션 없음/)).toBeInTheDocument();
+    expect(PnlSummaryStrip).toHaveBeenLastCalledWith(
+      expect.objectContaining({ unrealized: 0, holdings: 0 }),
+    );
+  });
+
+  it('브로커 조회가 실패하면 미실현손익만 null로 내려준다', async () => {
+    getOperations.mockResolvedValue(operationsResponse(null, { holding: '조회 실패' }));
+    render(<PositionsPanel />);
+
+    await waitFor(() => expect(screen.getByTestId('pnl-strip')).toBeInTheDocument());
+    expect(PnlSummaryStrip).toHaveBeenLastCalledWith(
+      expect.objectContaining({ unrealized: null, holdings: 0 }),
+    );
   });
 });

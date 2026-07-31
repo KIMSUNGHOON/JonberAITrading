@@ -58,6 +58,7 @@ import {
 } from '@/api/client';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting, TH, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
+import { PnlSummaryStrip } from './PnlSummaryStrip';
 
 interface Row {
   sym: string;
@@ -272,115 +273,135 @@ export function PositionsPanel() {
     }
   }
 
-  if (state === 'loading') return <Awaiting label="포지션 로드 중…" />;
-  if (state === 'error') return <Awaiting label={`포지션 오류 · ${err ?? '연결 실패'}`} />;
-  if (rows.length === 0) return <Awaiting label="보유 포지션 없음 · 체결 시 표시" />;
+  // 요약 스트립은 표의 상태와 무관하게 항상 먼저 렌더한다 — 보유 0건일 때
+  // 사라지면 "이번 주 얼마 벌었나"를 확인하려는 바로 그 순간에 없어진다.
+  // 미실현손익은 표가 준비됐을 때만 값이 있고, 로딩·에러면 null로 강등한다.
+  const summary =
+    activeMarket === 'kiwoom' ? (
+      <PnlSummaryStrip
+        unrealized={state === 'ready' ? rows.reduce((sum, r) => sum + r.pnl, 0) : null}
+        holdings={state === 'ready' ? rows.length : 0}
+      />
+    ) : null;
+
+  if (state === 'loading') {
+    return <>{summary}<Awaiting label="포지션 로드 중…" /></>;
+  }
+  if (state === 'error') {
+    return <>{summary}<Awaiting label={`포지션 오류 · ${err ?? '연결 실패'}`} /></>;
+  }
+  if (rows.length === 0) {
+    return <>{summary}<Awaiting label="보유 포지션 없음 · 체결 시 표시" /></>;
+  }
 
   return (
-    <table className="w-full text-[12px] tabular-nums">
-      <thead>
-        <tr>
-          <th className={`${TH} text-left`}>SYM</th>
-          <th className={TH}>QTY</th>
-          <th className={TH}>ENTRY</th>
-          <th className={TH}>CUR</th>
-          <th className={TH}>P&amp;L</th>
-          <th className={TH}>%</th>
-          <th className={TH}>STOP</th>
-          <th className={TH}>TAKE</th>
-          <th className={TH} title="부분청산은 지원되지 않습니다 — 전량 매도만 가능합니다 (두 번 클릭하여 확인)">청산</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((r, i) => {
-          const rowEdit = edits[r.code];
-          const stopVal = editValue(r, rowEdit, 'stop');
-          const takeVal = editValue(r, rowEdit, 'take');
-          const busy = busyRow === r.code;
-          const armed = confirmClose === r.code;
-          return (
-            <Fragment key={`${r.code}-${i}`}>
-              <tr
-                onClick={() => setChartSymbol(r.code)}
-                title="차트에 표시"
-                className={`border-b border-hairline/60 cursor-pointer hover:bg-elevated/40 ${
-                  chartSymbol === r.code ? 'bg-elevated/60' : ''
-                }`}
-              >
-                <td className="text-left px-2.5 py-1 font-semibold truncate max-w-[120px]">{r.sym}</td>
-                <td className="text-right px-2.5 py-1">{fmtInt(r.qty)}</td>
-                <td className="text-right px-2.5 py-1 text-muted">{fmtPrice(r.entry, activeMarket)}</td>
-                <td className="text-right px-2.5 py-1">{fmtPrice(r.cur, activeMarket)}</td>
-                <td className={`text-right px-2.5 py-1 ${pnlColor(r.pnl)}`}>{fmtInt(r.pnl)}</td>
-                <td className={`text-right px-2.5 py-1 ${pnlColor(r.pnlPct)}`}>{fmtPct(r.pnlPct)}</td>
-                <td className="text-right px-1.5 py-1 text-dim" onClick={(e) => e.stopPropagation()}>
-                  <div className="flex items-center gap-1 justify-end">
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      aria-label={`손절가 편집 ${r.code}`}
-                      value={stopVal}
-                      onChange={(e) => setField(r.code, 'stop', e.target.value)}
-                      placeholder={r.stop != null ? undefined : DASH}
-                      className="w-16 bg-canvas border border-hairline rounded px-1 py-0.5 text-right text-[11px] tabular-nums text-ink"
-                    />
+    <>
+      {summary}
+      <table className="w-full text-[12px] tabular-nums">
+        <thead>
+          <tr>
+            <th className={`${TH} text-left`}>SYM</th>
+            <th className={TH}>QTY</th>
+            <th className={TH}>ENTRY</th>
+            <th className={TH}>CUR</th>
+            <th className={TH}>P&amp;L</th>
+            <th className={TH}>%</th>
+            <th className={TH}>STOP</th>
+            <th className={TH}>TAKE</th>
+            <th className={TH} title="부분청산은 지원되지 않습니다 — 전량 매도만 가능합니다 (두 번 클릭하여 확인)">청산</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => {
+            const rowEdit = edits[r.code];
+            const stopVal = editValue(r, rowEdit, 'stop');
+            const takeVal = editValue(r, rowEdit, 'take');
+            const busy = busyRow === r.code;
+            const armed = confirmClose === r.code;
+            return (
+              <Fragment key={`${r.code}-${i}`}>
+                <tr
+                  onClick={() => setChartSymbol(r.code)}
+                  title="차트에 표시"
+                  className={`border-b border-hairline/60 cursor-pointer hover:bg-elevated/40 ${
+                    chartSymbol === r.code ? 'bg-elevated/60' : ''
+                  }`}
+                >
+                  <td className="text-left px-2.5 py-1 font-semibold truncate max-w-[120px]">{r.sym}</td>
+                  <td className="text-right px-2.5 py-1">{fmtInt(r.qty)}</td>
+                  <td className="text-right px-2.5 py-1 text-muted">{fmtPrice(r.entry, activeMarket)}</td>
+                  <td className="text-right px-2.5 py-1">{fmtPrice(r.cur, activeMarket)}</td>
+                  <td className={`text-right px-2.5 py-1 ${pnlColor(r.pnl)}`}>{fmtInt(r.pnl)}</td>
+                  <td className={`text-right px-2.5 py-1 ${pnlColor(r.pnlPct)}`}>{fmtPct(r.pnlPct)}</td>
+                  <td className="text-right px-1.5 py-1 text-dim" onClick={(e) => e.stopPropagation()}>
+                    <div className="flex items-center gap-1 justify-end">
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        aria-label={`손절가 편집 ${r.code}`}
+                        value={stopVal}
+                        onChange={(e) => setField(r.code, 'stop', e.target.value)}
+                        placeholder={r.stop != null ? undefined : DASH}
+                        className="w-16 bg-canvas border border-hairline rounded px-1 py-0.5 text-right text-[11px] tabular-nums text-ink"
+                      />
+                      <button
+                        type="button"
+                        aria-label={`손절가 저장 ${r.code}`}
+                        disabled={busy}
+                        onClick={() => handleSaveStop(r)}
+                        className="text-accent text-[10px] font-medium disabled:opacity-50"
+                      >
+                        저장
+                      </button>
+                    </div>
+                  </td>
+                  <td className="text-right px-1.5 py-1 text-dim" onClick={(e) => e.stopPropagation()}>
+                    <div className="flex items-center gap-1 justify-end">
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        aria-label={`익절가 편집 ${r.code}`}
+                        value={takeVal}
+                        onChange={(e) => setField(r.code, 'take', e.target.value)}
+                        placeholder={r.take != null ? undefined : DASH}
+                        className="w-16 bg-canvas border border-hairline rounded px-1 py-0.5 text-right text-[11px] tabular-nums text-ink"
+                      />
+                      <button
+                        type="button"
+                        aria-label={`익절가 저장 ${r.code}`}
+                        disabled={busy}
+                        onClick={() => handleSaveTake(r)}
+                        className="text-accent text-[10px] font-medium disabled:opacity-50"
+                      >
+                        저장
+                      </button>
+                    </div>
+                  </td>
+                  <td className="text-right px-1.5 py-1" onClick={(e) => e.stopPropagation()}>
                     <button
                       type="button"
-                      aria-label={`손절가 저장 ${r.code}`}
+                      aria-label={`전량청산 ${r.code}`}
+                      title="부분청산 미지원 — 전량 매도만 가능합니다"
                       disabled={busy}
-                      onClick={() => handleSaveStop(r)}
-                      className="text-accent text-[10px] font-medium disabled:opacity-50"
+                      onClick={() => handleFullClose(r)}
+                      className="text-warn text-[10px] font-medium disabled:opacity-50"
                     >
-                      저장
+                      {armed ? '확인?' : '청산'}
                     </button>
-                  </div>
-                </td>
-                <td className="text-right px-1.5 py-1 text-dim" onClick={(e) => e.stopPropagation()}>
-                  <div className="flex items-center gap-1 justify-end">
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      aria-label={`익절가 편집 ${r.code}`}
-                      value={takeVal}
-                      onChange={(e) => setField(r.code, 'take', e.target.value)}
-                      placeholder={r.take != null ? undefined : DASH}
-                      className="w-16 bg-canvas border border-hairline rounded px-1 py-0.5 text-right text-[11px] tabular-nums text-ink"
-                    />
-                    <button
-                      type="button"
-                      aria-label={`익절가 저장 ${r.code}`}
-                      disabled={busy}
-                      onClick={() => handleSaveTake(r)}
-                      className="text-accent text-[10px] font-medium disabled:opacity-50"
-                    >
-                      저장
-                    </button>
-                  </div>
-                </td>
-                <td className="text-right px-1.5 py-1" onClick={(e) => e.stopPropagation()}>
-                  <button
-                    type="button"
-                    aria-label={`전량청산 ${r.code}`}
-                    title="부분청산 미지원 — 전량 매도만 가능합니다"
-                    disabled={busy}
-                    onClick={() => handleFullClose(r)}
-                    className="text-warn text-[10px] font-medium disabled:opacity-50"
-                  >
-                    {armed ? '확인?' : '청산'}
-                  </button>
-                </td>
-              </tr>
-              {rowError[r.code] && (
-                <tr>
-                  <td colSpan={9} className="px-2.5 py-1 text-[11px] text-down bg-down/5">
-                    {rowError[r.code]}
                   </td>
                 </tr>
-              )}
-            </Fragment>
-          );
-        })}
-      </tbody>
-    </table>
+                {rowError[r.code] && (
+                  <tr>
+                    <td colSpan={9} className="px-2.5 py-1 text-[11px] text-down bg-down/5">
+                      {rowError[r.code]}
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+    </>
   );
 }
