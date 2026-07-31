@@ -1783,6 +1783,12 @@ export interface PnlSummaryEquityReturn {
   pct: number;
   /** 분모 출처: 기간 시작 직전 종가 / 기준자산 */
   basis: 'prior_close' | 'base_asset';
+  /**
+   * 이 수익률의 분자(end_equity)를 만든 스냅샷의 거래일 (YYYY-MM-DD).
+   * 장중에는 오늘자 스냅샷이 아직 없어 직전 영업일 종가 기준이므로, 화면에
+   * 함께 표시해 "이 %가 언제 것인지" 드러낸다.
+   */
+  trade_date: string;
 }
 
 /**

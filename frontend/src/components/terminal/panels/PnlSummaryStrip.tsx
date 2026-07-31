@@ -13,7 +13,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getPnlSummary } from '@/api/client';
 import type { PnlSummaryResponse } from '@/types';
 import { pnlColor } from '@/utils/pnl';
-import { DASH } from './shared';
+import { DASH, fmtPct } from './shared';
 
 const POLL_MS = 30_000;
 
@@ -28,10 +28,6 @@ const FAIL = '조회 실패';
 
 function fmtSigned(n: number): string {
   return `${n > 0 ? '+' : ''}${n.toLocaleString('ko-KR')}`;
-}
-
-function fmtSignedPct(n: number): string {
-  return `${n > 0 ? '+' : ''}${n.toFixed(2)}%`;
 }
 
 function Cell({ label, children }: { label: string; children: React.ReactNode }) {
@@ -83,6 +79,7 @@ export function PnlSummaryStrip({
   const settled = phase !== 'loading';
   const ret = data?.equity_return ?? null;
   const realized = data?.realized ?? null;
+  const errors = data?.errors ?? {};
 
   return (
     <div className="mb-2 flex flex-wrap items-stretch divide-x divide-border border border-border text-[12px] tabular-nums">
@@ -100,19 +97,37 @@ export function PnlSummaryStrip({
       {BUCKETS.map(({ key, label }) => {
         const r = ret?.[key];
         const amount = realized?.[key];
+        const retFailed = ret === null && settled;
+        const realizedFailed = realized === null && settled;
         return (
           <Cell key={key} label={label}>
             {r ? (
-              <span className={pnlColor(r.pct)}>{fmtSignedPct(r.pct)}</span>
+              <span className={pnlColor(r.pct)}>{fmtPct(r.pct)}</span>
+            ) : retFailed ? (
+              // PerformancePanel의 Kpi 관례를 따른다: 실패는 회색이 아니라
+              // text-down이고, title로 사유를 보여준다(errors[section]).
+              <span className="text-down" title={errors.equity_return}>{FAIL}</span>
             ) : (
-              <span className="text-muted">{ret === null && settled ? FAIL : DASH}</span>
+              <span className="text-muted">{DASH}</span>
             )}
             {amount === undefined ? (
-              <span className="text-[10px] text-muted">
-                {realized === null && settled ? FAIL : DASH}
-              </span>
+              realizedFailed ? (
+                <span className="text-[10px] text-down" title={errors.realized}>{FAIL}</span>
+              ) : (
+                <span className="text-[10px] text-muted">{DASH}</span>
+              )
             ) : (
-              <span className={`text-[10px] ${pnlColor(amount)}`}>{fmtSigned(amount)}</span>
+              <span
+                className={`text-[10px] ${pnlColor(amount)}`}
+                title={key === 'total' ? errors.realized_total_scope : undefined}
+              >
+                {fmtSigned(amount)}
+              </span>
+            )}
+            {r && (
+              // 이 %가 어느 스냅샷(거래일) 기준인지 — 장중에는 항상 전일
+              // 이전 종가라 오늘 값처럼 보이지 않게 명시한다.
+              <span className="text-[9px] text-dim">{r.trade_date}</span>
             )}
             {r?.basis === 'base_asset' && (
               <span className="text-[10px] text-muted">기준자산</span>
