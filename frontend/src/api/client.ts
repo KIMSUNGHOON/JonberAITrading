@@ -59,6 +59,8 @@ import type {
   OperationsResponse,
   // Performance Types
   PerformanceResponse,
+  // Pnl Summary Types
+  PnlSummaryResponse,
   // EOD Report Types (E3-5)
   EodReportResponse,
   // Discovery Ledger Types (FI-4)
@@ -1488,6 +1490,17 @@ class ApiClient {
   }
 
   /**
+   * 기간 손익 요약 — 일/주/월/누적 실현손익과 평가금 기준 수익률.
+   * `base`는 누적 수익률 분모 override (기본: 운용 개시 기준 자산).
+   */
+  async getPnlSummary(params?: { base?: number }): Promise<PnlSummaryResponse> {
+    const response = await this.client.get<PnlSummaryResponse>('/trading/pnl-summary', {
+      params,
+    });
+    return response.data;
+  }
+
+  /**
    * Get the latest (or a specific date's) EOD report -- digest + optional
    * LLM narrative (E3-4's GET /trading/eod-report). `date` omitted means
    * "the newest row in the table" (backend default).
@@ -2190,6 +2203,10 @@ export const getOperations = (market: 'kiwoom' | 'coin' = 'kiwoom') =>
 // Performance API
 export const getPerformance = (params?: { base?: number; start?: string; end?: string }) =>
   apiClient.getPerformance(params);
+
+// Pnl Summary API
+export const getPnlSummary = (params?: { base?: number }) =>
+  apiClient.getPnlSummary(params);
 
 // EOD Report API (E3-5)
 export const getEodReport = (date?: string) => apiClient.getEodReport(date);

@@ -1777,3 +1777,24 @@ export interface UsSignalResponse {
   curation: UsSignalCurationItem[];
   sub_signals?: { memory?: UsSubSignal; accel?: UsSubSignal; demand?: UsSubSignal } | null;
 }
+
+/** GET /api/trading/pnl-summary — 버킷별 평가금 수익률의 한 칸. */
+export interface PnlSummaryEquityReturn {
+  pct: number;
+  /** 분모 출처: 기간 시작 직전 종가 / 기준자산 */
+  basis: 'prior_close' | 'base_asset';
+}
+
+/**
+ * GET /api/trading/pnl-summary.
+ *
+ * `realized`(브로커 ka10074)와 `equity_return`(로컬 스냅샷)은 독립 소스라
+ * 각각 null이 될 수 있고, 그때 `errors`에 사유가 담긴다. 미실현손익은 이
+ * 응답에 없다 — PositionsPanel이 이미 가진 /operations 데이터에서 합산한다.
+ */
+export interface PnlSummaryResponse {
+  realized: Record<string, number> | null;
+  equity_return: Record<string, PnlSummaryEquityReturn> | null;
+  as_of: string;
+  errors: Record<string, string>;
+}
