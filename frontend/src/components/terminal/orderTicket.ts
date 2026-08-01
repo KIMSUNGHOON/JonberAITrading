@@ -3,29 +3,24 @@
  * Symbol/market/currency helpers are ported from the retired ApprovalDialog.
  */
 import type {
-  CoinTradeProposal, KRStockTradeProposal,
+  KRStockTradeProposal,
   ApprovalRequest, ApprovalDecision,
 } from '@/types';
 
-export type AnyTradeProposal = CoinTradeProposal | KRStockTradeProposal;
+export type AnyTradeProposal = KRStockTradeProposal;
 
 export function getProposalSymbol(proposal: AnyTradeProposal): string {
-  if ('stk_cd' in proposal && proposal.stk_cd) {
-    const k = proposal as KRStockTradeProposal;
-    return k.stk_nm || k.stk_cd;
-  }
-  if ('market' in proposal && proposal.market) return proposal.market;
+  if (proposal.stk_cd) return proposal.stk_nm || proposal.stk_cd;
   return 'UNKNOWN';
 }
 
-export function getProposalMarketType(proposal: AnyTradeProposal): 'coin' | 'kiwoom' {
-  if ('stk_cd' in proposal) return 'kiwoom';
-  return 'coin';
+export function getProposalMarketType(_proposal: AnyTradeProposal): 'kiwoom' {
+  return 'kiwoom';
 }
 
 export function formatCurrency(
   value: number | null | undefined,
-  _marketType: 'coin' | 'kiwoom',
+  _marketType: 'kiwoom',
 ): string {
   if (value === null || value === undefined) return 'N/A';
   return `₩${value.toLocaleString('ko-KR')}`;

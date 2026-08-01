@@ -204,7 +204,7 @@ export interface AnalysisHistoryItem {
   analyses: AnalysisSummary[];
 
   // Trade proposal
-  tradeProposal: CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal: KRStockTradeProposal | null;
 
   // Reasoning summary (condensed from full log)
   reasoningSummary: string | null;
@@ -272,8 +272,8 @@ export interface WSCompleteMessage {
 
 export type ChatMessageRole = 'user' | 'assistant' | 'system' | 'proposal';
 
-// Union type for all proposal types
-export type AnyTradeProposal = CoinTradeProposal | KRStockTradeProposal;
+// Union type for all proposal types (single-market union — see MarketType)
+export type AnyTradeProposal = KRStockTradeProposal;
 
 export interface ChatMessage {
   id: string;
@@ -349,68 +349,6 @@ export interface ApprovalResponse {
 }
 
 // -------------------------------------------
-// Coin (Cryptocurrency) Types
-// -------------------------------------------
-
-export interface CoinMarketInfo {
-  market: string;
-  korean_name: string;
-  english_name: string;
-  market_warning: string | null;
-}
-
-export interface CoinAnalysisRequest {
-  market: string;
-  query?: string;
-}
-
-export interface CoinAnalysisResponse {
-  session_id: string;
-  market: string;
-  status: string;
-  message: string;
-  // P4: additive dedup + position-awareness flags (backend
-  // services/analysis dedup — commits 52eadd0/f0c18bf). `duplicate` means
-  // this response reuses an already in-progress session for `market`
-  // instead of starting a new one; `position_exists` means `market` is
-  // already held (position-aware ADD/REDUCE/HOLD analysis, not a fresh
-  // BUY entry). Optional so callers/tests built against the pre-P4
-  // response shape keep compiling.
-  duplicate?: boolean;
-  position_exists?: boolean;
-}
-
-export interface CoinTradeProposal {
-  id: string;
-  market: string;
-  korean_name: string | null;
-  action: TradeAction;
-  quantity: number;
-  entry_price: number | null;
-  stop_loss: number | null;
-  take_profit: number | null;
-  risk_score: number;
-  position_size_pct: number;
-  rationale: string;
-  bull_case: string;
-  bear_case: string;
-  created_at: string;
-}
-
-export interface CoinAnalysisStatus {
-  session_id: string;
-  market: string;
-  korean_name: string | null;
-  status: SessionStatus;
-  current_stage: string | null;
-  awaiting_approval: boolean;
-  trade_proposal: CoinTradeProposal | null;
-  analyses: AnalysisSummary[];
-  reasoning_log: string[];
-  error: string | null;
-}
-
-// -------------------------------------------
 // Settings Types
 // -------------------------------------------
 
@@ -444,116 +382,6 @@ export interface SettingsStatus {
   llm_provider: string;
   llm_model: string;
   market_data_mode: string;
-}
-
-// -------------------------------------------
-// Coin Trading Types
-// -------------------------------------------
-
-export interface CoinAccount {
-  currency: string;
-  balance: number;
-  locked: number;
-  avg_buy_price: number;
-  avg_buy_price_modified: boolean;
-  unit_currency: string;
-}
-
-export interface CoinAccountListResponse {
-  accounts: CoinAccount[];
-  total_krw_value: number | null;
-}
-
-export interface CoinPosition {
-  market: string;
-  currency: string;
-  quantity: number;
-  avg_entry_price: number;
-  current_price: number;
-  unrealized_pnl: number;
-  unrealized_pnl_pct: number;
-  stop_loss: number | null;
-  take_profit: number | null;
-  session_id: string | null;
-  created_at: string;
-}
-
-export interface CoinPositionListResponse {
-  positions: CoinPosition[];
-  total_value_krw: number;
-  total_pnl: number;
-  total_pnl_pct: number;
-}
-
-export type OrderSide = 'bid' | 'ask';
-export type OrderType = 'limit' | 'price' | 'market';
-export type OrderState = 'wait' | 'watch' | 'done' | 'cancel';
-
-export interface CoinOrder {
-  uuid: string;
-  side: OrderSide;
-  ord_type: OrderType;
-  price: number | null;
-  state: OrderState;
-  market: string;
-  created_at: string;
-  volume: number | null;
-  remaining_volume: number | null;
-  reserved_fee: number | null;
-  remaining_fee: number | null;
-  paid_fee: number | null;
-  locked: number | null;
-  executed_volume: number | null;
-  trades_count: number | null;
-}
-
-export interface CoinOrderListResponse {
-  orders: CoinOrder[];
-  total: number;
-}
-
-export interface CoinOrderRequest {
-  market: string;
-  side: OrderSide;
-  ord_type: OrderType;
-  price?: number;
-  volume?: number;
-}
-
-export interface CoinTradeRecord {
-  id: string;
-  session_id: string | null;
-  market: string;
-  side: OrderSide;
-  order_type: string;
-  price: number;
-  volume: number;
-  executed_volume: number;
-  fee: number;
-  total_krw: number;
-  state: string;
-  order_uuid: string | null;
-  created_at: string;
-}
-
-export interface CoinTradeListResponse {
-  trades: CoinTradeRecord[];
-  total: number;
-  page: number;
-  limit: number;
-}
-
-export interface CoinTicker {
-  market: string;
-  trade_price: number;
-  change: string;
-  change_rate: number;
-  change_price: number;
-  high_price: number;
-  low_price: number;
-  trade_volume: number;
-  acc_trade_price_24h: number;
-  timestamp: string;
 }
 
 // -------------------------------------------
@@ -604,9 +432,12 @@ export interface KRStockAnalysisResponse {
   stk_nm: string | null;
   status: string;
   message: string;
-  // P4: additive dedup + position-awareness flags — see
-  // CoinAnalysisResponse.duplicate/position_exists doc comment above (same
-  // contract, KR side).
+  // P4: additive dedup + position-awareness flags (backend
+  // services/analysis dedup). `duplicate` means this response reuses an
+  // already in-progress session for `stk_cd` instead of starting a new
+  // one; `position_exists` means `stk_cd` is already held (position-aware
+  // ADD/REDUCE/HOLD analysis, not a fresh BUY entry). Optional so
+  // callers/tests built against the pre-P4 response shape keep compiling.
   duplicate?: boolean;
   position_exists?: boolean;
 }
@@ -746,7 +577,7 @@ export interface KRStockAccountResponse {
 // Multi-Session Support Types
 // -------------------------------------------
 
-export type MarketType = 'coin' | 'kiwoom';
+export type MarketType = 'kiwoom';
 
 /**
  * Unified session data for multi-session support.
@@ -754,14 +585,14 @@ export type MarketType = 'coin' | 'kiwoom';
  */
 export interface SessionData {
   sessionId: string;
-  ticker: string;           // coin: market, kiwoom: stk_cd
+  ticker: string;           // kiwoom: stk_cd
   displayName: string;      // Human-readable name (종목명)
   marketType: MarketType;
   status: SessionStatus;
   currentStage: string | null;
   reasoningLog: string[];
   analyses: AnalysisSummary[];
-  tradeProposal: CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal: KRStockTradeProposal | null;
   awaitingApproval: boolean;
   // R3 autonomous mode: ISO timestamp of the pending auto-approve deadline
   // (from WS status frames while an autonomous approval grace window is open).

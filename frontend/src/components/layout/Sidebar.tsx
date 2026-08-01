@@ -93,29 +93,17 @@ export function Sidebar({ collapsed = false }: SidebarProps) {
   const language = useStore((state) => state.language);
   const t = useTranslations(language);
 
-  const activeMarket = useStore((state) => state.activeMarket);
-  const coinPosition = useStore((state) => state.coin.activePosition);
-  const kiwoomPosition = useStore((state) => state.kiwoom.activePosition);
+  const activePosition = useStore((state) => state.kiwoom.activePosition);
 
-  // Get running session counts from each market
-  const coinStatus = useStore((state) => state.coin.status);
+  // Get running session count
   const kiwoomSessions = useStore((state) => state.kiwoom.sessions);
-
-  // Calculate active position based on current market
-  const activePosition = useMemo(() => {
-    if (activeMarket === 'coin') return coinPosition;
-    return kiwoomPosition;
-  }, [activeMarket, coinPosition, kiwoomPosition]);
 
   // Calculate running analyses count
   const runningCount = useMemo(() => {
-    let count = 0;
-    if (coinStatus === 'running' || coinStatus === 'awaiting_approval') count++;
-    count += kiwoomSessions.filter(
+    return kiwoomSessions.filter(
       s => s.status === 'running' || s.status === 'awaiting_approval'
     ).length;
-    return count;
-  }, [coinStatus, kiwoomSessions]);
+  }, [kiwoomSessions]);
 
   // Only 'analysis' (running session count) and 'positions' (active
   // position present) carry a badge.

@@ -4,9 +4,10 @@
  * Owns the connection skeleton every FE WS client used to hand-roll:
  * URL building, connect/close with a clean-shutdown guard, exponential
  * reconnect backoff, the text 'ping'/'pong' heartbeat, connection-state
- * tracking, and timer cleanup. Clients (TradingWebSocket, TickerWebSocket,
+ * tracking, and timer cleanup. Clients (TradingWebSocket,
  * useAgentChatWebSocket, useTradeNotifications) are thin adapters that pass
- * their own policy values — behavior per client is unchanged.
+ * their own policy values — behavior per client is unchanged. (The coin
+ * TickerWebSocket client was removed with the coin stack, 2026-08-01.)
  */
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';

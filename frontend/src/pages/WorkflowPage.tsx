@@ -36,12 +36,7 @@ interface WorkflowPageProps {
 
 export function WorkflowPage({ onBack }: WorkflowPageProps) {
   const { ticker, status } = useStore(useShallow(selectSession));
-  const currentStage = useStore((state) => {
-    switch (state.activeMarket) {
-      case 'coin': return state.coin.currentStage;
-      case 'kiwoom': return state.kiwoom.currentStage;
-    }
-  });
+  const currentStage = useStore((state) => state.kiwoom.currentStage);
   const reasoningLog = useStore(selectReasoningLog);
   const reasoningRunning = useStore(selectStatus) === 'running';
   const { analyses } = useStore(useShallow(selectAnalysis));

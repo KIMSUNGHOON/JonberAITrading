@@ -52,12 +52,7 @@ function App() {
   const setChatPopupPosition = useStore((state) => state.setChatPopupPosition);
 
   // Check if there's a notification (awaiting approval or new messages)
-  const awaitingApproval = useStore((state) => {
-    switch (state.activeMarket) {
-      case 'coin': return state.coin.awaitingApproval;
-      case 'kiwoom': return state.kiwoom.awaitingApproval;
-    }
-  });
+  const awaitingApproval = useStore((state) => state.kiwoom.awaitingApproval);
   const hasMessages = useStore((state) => state.messages.length > 0);
   const hasNotification = !chatPopupOpen && (awaitingApproval || hasMessages);
 
@@ -95,12 +90,6 @@ function App() {
       } catch {
         // silent
       }
-      // 코인 동결(freeze) fix round 1: rehydrateCoinSessions() 호출 제거.
-      // 이 호출이 백엔드에 남아있는 coin 세션을 store.coin에 채우면 activeMarket
-      // 없이도 AnalysisQueueWidget의 코인 세션 카드·WorkflowPage의 CoinInfo(티커
-      // 형식 기반, activeMarket 무관)가 열려 언마운트된 /coin/* 라우트를 칠 수
-      // 있었다(리뷰 발견, 브리프 미기재). 함수 자체는 kiwoomSessionHandlers.ts에
-      // 그대로 남아 있다 — 부팅 시 호출만 끊는다.
     }
     checkApiStatus();
   }, [setUpbitApiConfigured, setKiwoomApiConfigured, setTradingModes]);

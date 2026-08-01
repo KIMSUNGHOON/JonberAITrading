@@ -16,7 +16,7 @@
 import { useStore } from '@/store';
 import { wsManager, type WebSocketHandlers, type CompleteMessage } from '@/api/websocket';
 import { getOperations } from '@/api/client';
-import type { CoinTradeProposal, KRStockTradeProposal, SessionData, SessionStatus } from '@/types';
+import type { KRStockTradeProposal, SessionData, SessionStatus } from '@/types';
 
 // -------------------------------------------
 // Reasoning delta batching
@@ -170,10 +170,10 @@ export function createKiwoomWebSocketHandlers(sessionId: string): WebSocketHandl
         // ticker/display_name; KRStockTradeProposal: stk_cd/stk_nm) so the
         // frame is mapped, not reused verbatim.
         //
-        // This module only ever handles kiwoom sessions, so the shared
-        // SessionData union (CoinTradeProposal | KRStockTradeProposal | null)
-        // narrows to KRStockTradeProposal here — same precedent as the
-        // KRStockTradeProposal casts in rehydrateKiwoomSessions below.
+        // This module only ever handles kiwoom sessions, so
+        // SessionData.tradeProposal (KRStockTradeProposal | null) is already
+        // the right shape here — same precedent as the KRStockTradeProposal
+        // casts in rehydrateKiwoomSessions below.
         const liveProposal = (session?.tradeProposal as KRStockTradeProposal | null) ?? null;
         const tradeProposal = liveProposal ?? normalizeCompleteProposal(data.trade_proposal);
         store().completeKiwoomSession(sessionId, {
@@ -364,106 +364,6 @@ export async function rehydrateKiwoomSessions(): Promise<void> {
       if (isNonTerminal && !serverKnown.has(session.sessionId)) {
         store.removeKiwoomSession(session.sessionId);
       }
-    }
-  }
-}
-
-/**
- * Rehydrate a running/awaiting coin session from the server (session_manager
- * SQLite) into the store after a page refresh.
- *
- * Unlike Kiwoom, the coin store slice tracks at most ONE session at a time —
- * `CoinState` (store/index.ts) holds flat `activeSessionId`/`status`/
- * `tradeProposal`/... fields, not a `sessions: SessionData[]` array. So this
- * mirrors rehydrateKiwoomSessions' add + purge-absent pattern but adapted to
- * that single-session shape:
- *   - Purge: if the store's current coin session is non-terminal (running/
- *     awaiting_approval) and the server no longer lists it at all, reset it
- *     (resetCoin) — same zombie-card problem the Kiwoom purge guards against.
- *     Gated on the same sessionsSectionAuthoritative check: a degraded
- *     sessions section (backend restart mid-init) must never mass-clear a
- *     live session.
- *   - Add: if the store isn't already tracking a server-known session, restore
- *     ONE from the server (an awaiting session wins over an analyzing one —
- *     it needs its HITL proposal card back). Coin has no per-session
- *     WebSocket wiring today (unlike Kiwoom's wsManager.connect via
- *     createKiwoomWebSocketHandlers/ensureKiwoomSessionStreaming) — start
- *     restores the store's session bookkeeping, not a live stream connection.
- *
- * Silent on failure, same as rehydrateKiwoomSessions: a broken
- * /trading/operations call must not crash the app on load.
- */
-export async function rehydrateCoinSessions(): Promise<void> {
-  let ops;
-  try {
-    ops = await getOperations('coin');
-  } catch {
-    return;
-  }
-  const store = useStore.getState();
-
-  const analyzing = ops.analyzing ?? [];
-  const awaiting = ops.awaiting ?? [];
-  const serverKnown = new Set<string>([
-    ...analyzing.map((a) => a.session_id),
-    ...awaiting.map((w) => w.session_id),
-  ]);
-
-  const sessionsSectionAuthoritative =
-    !ops.errors?.sessions && (ops.analyzing != null || ops.awaiting != null);
-
-  const currentSessionId = store.coin.activeSessionId;
-  const currentStatus = store.coin.status;
-  const isCurrentNonTerminal = currentStatus === 'running' || currentStatus === 'awaiting_approval';
-
-  if (
-    sessionsSectionAuthoritative &&
-    currentSessionId &&
-    isCurrentNonTerminal &&
-    !serverKnown.has(currentSessionId)
-  ) {
-    store.resetCoin();
-  }
-
-  // Re-read after a possible purge above — if the (possibly-cleared) current
-  // session is still server-known, there's nothing left to add.
-  const activeAfterPurge = useStore.getState().coin.activeSessionId;
-  if (activeAfterPurge && serverKnown.has(activeAfterPurge)) {
-    return;
-  }
-
-  const w = awaiting[0];
-  const a = analyzing[0];
-
-  if (w) {
-    store.startCoinSession(w.session_id, w.ticker, w.name || undefined);
-    store.setCoinStatus('awaiting_approval');
-    store.setCoinAwaitingApproval(true);
-    if (w.proposal) {
-      const p = w.proposal as Record<string, unknown>;
-      const proposal: CoinTradeProposal = {
-        id: String(p.id ?? w.session_id),
-        market: w.ticker,
-        korean_name: w.name,
-        action: String(p.action ?? 'HOLD') as CoinTradeProposal['action'],
-        quantity: Number(p.quantity ?? 0),
-        entry_price: p.entry_price != null ? Number(p.entry_price) : null,
-        stop_loss: p.stop_loss != null ? Number(p.stop_loss) : null,
-        take_profit: p.take_profit != null ? Number(p.take_profit) : null,
-        risk_score: Number(p.risk_score ?? 0),
-        position_size_pct: Number(p.position_size_pct ?? 0),
-        rationale: String(p.rationale ?? ''),
-        bull_case: String(p.bull_case ?? ''),
-        bear_case: String(p.bear_case ?? ''),
-        created_at: String(p.created_at ?? new Date().toISOString()),
-      };
-      store.setCoinProposal(proposal);
-    }
-  } else if (a) {
-    store.startCoinSession(a.session_id, a.ticker, a.name || undefined);
-    store.setCoinStatus('running');
-    if (a.current_stage) {
-      store.setCoinStage(a.current_stage);
     }
   }
 }

@@ -60,11 +60,10 @@ describe('buildApprovalRequest', () => {
 
 describe('helpers ported from ApprovalDialog', () => {
   it('getProposalSymbol resolves symbols', () => {
-    expect(getProposalSymbol({ market: 'KRW-BTC' } as any)).toBe('KRW-BTC');
     expect(getProposalSymbol({ stk_cd: '005930', stk_nm: '삼성전자' } as any)).toBe('삼성전자');
+    expect(getProposalSymbol({} as any)).toBe('UNKNOWN');
   });
   it('formatCurrency: KR won', () => {
-    expect(formatCurrency(1000, 'coin')).toBe('₩1,000');
     expect(formatCurrency(1234567, 'kiwoom')).toBe('₩1,234,567');
     expect(formatCurrency(null, 'kiwoom')).toBe('N/A');
   });

@@ -1,11 +1,12 @@
 /**
  * P7 Phase 3: shared WebSocket core.
  *
- * All four FE WS clients (TradingWebSocket, TickerWebSocket,
- * useAgentChatWebSocket, useTradeNotifications) hand-rolled the same
- * URL-building / reconnect / heartbeat / cleanup skeleton with divergent
- * policies. ManagedSocket owns that skeleton once; each client passes its
- * CURRENT policy values so behavior is preserved.
+ * All FE WS clients (TradingWebSocket, useAgentChatWebSocket,
+ * useTradeNotifications) hand-rolled the same URL-building / reconnect /
+ * heartbeat / cleanup skeleton with divergent policies. ManagedSocket owns
+ * that skeleton once; each client passes its CURRENT policy values so
+ * behavior is preserved. (The coin TickerWebSocket client was removed with
+ * the coin stack, 2026-08-01.)
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -263,15 +264,15 @@ describe('ManagedSocket', () => {
   });
 
   it('delivers onOpen/onError/onClose, with onOpen fired while the socket is sendable', () => {
-    // All four adapters hang resume logic on these callbacks (buffer flush,
-    // pending-subscription flush, isConnected state) — dropping or reordering
-    // any of them must fail a test.
+    // All adapters hang resume logic on these callbacks (buffer flush,
+    // isConnected state) — dropping or reordering any of them must fail a
+    // test.
     const events: string[] = [];
     const socket: ManagedSocket = new ManagedSocket({
       path: '/ws/test',
       onOpen: () => {
-        // e.g. TickerWebSocket flushes queued subscriptions from onOpen —
-        // the socket must already be open when it fires.
+        // e.g. TradingWebSocket flushes its buffered message queue from
+        // onOpen — the socket must already be open when it fires.
         events.push(socket.send('sub') ? 'open:sendable' : 'open:not-sendable');
       },
       onClose: () => events.push('close'),
@@ -292,8 +293,8 @@ describe('ManagedSocket', () => {
   });
 
   it('a reused instance reconnects on server drops after disconnect() → connect()', () => {
-    // TradingWebSocket/TickerWebSocket embed ONE ManagedSocket for their
-    // lifetime and forward connect()/disconnect() — the clean-shutdown latch
+    // TradingWebSocket embeds ONE ManagedSocket for its lifetime and
+    // forwards connect()/disconnect() — the clean-shutdown latch
     // must reset on reuse or a reused socket would ignore server drops forever.
     const socket = new ManagedSocket({ path: '/ws/test', baseReconnectDelayMs: 1000 });
     socket.connect();

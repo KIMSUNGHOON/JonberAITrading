@@ -1,16 +1,11 @@
 /**
  * Zustand Store for Agentic Trading
  *
- * Manages global application state with COMPLETE ISOLATION between:
- * - Kiwoom analysis (Korean stocks via Kiwoom)
- * - Coin analysis (cryptocurrency via Upbit)
- *
- * Each market type has its own:
- * - Session state
- * - Analysis results
- * - Trade proposals
- * - Positions
- * - History
+ * Manages global application state for Kiwoom analysis (Korean stocks via
+ * Kiwoom). The coin (Upbit) slice was removed 2026-08-01 — see
+ * docs/superpowers/specs/2026-08-01-upbit-removal-design.md. `MarketType`
+ * stays a single-member union rather than being deleted outright, so the
+ * `market` parameter/route shapes elsewhere in the app don't have to change.
  */
 
 import { create } from 'zustand';
@@ -22,7 +17,6 @@ import type {
   SessionStatus,
   ChartConfig,
   TimeFrame,
-  CoinTradeProposal,
   KRStockTradeProposal,
   SessionData,
   DetailedAnalysisResults,
@@ -61,15 +55,14 @@ function generateUUID(): string {
 // sends a slimmed proposal Record per session that carries every field the
 // OrderTicketRail actually renders (action/qty/entry/stop/take/risk/
 // rationale/bull/bear/id/created_at) but omits the proposal's OWN symbol
-// fields for BOTH markets (kiwoom stk_cd/stk_nm, coin market/korean_name —
-// neither pair is in the backend's slim allowlist). The row's OWN top-level
-// ticker/name (populated from the SESSION, not the proposal) fill that gap,
-// so a clicked row can always be turned into a rail-renderable proposal
-// without a round-trip — even for a session never cached locally.
+// fields (stk_cd/stk_nm — not in the backend's slim allowlist). The row's
+// OWN top-level ticker/name (populated from the SESSION, not the proposal)
+// fill that gap, so a clicked row can always be turned into a
+// rail-renderable proposal without a round-trip — even for a session never
+// cached locally.
 function buildProposalFromAwaitingRow(
   row: { sessionId: string; ticker: string; name: string | null; proposal: Record<string, unknown> | null },
-  marketType: 'kiwoom' | 'coin',
-): KRStockTradeProposal | CoinTradeProposal | null {
+): KRStockTradeProposal | null {
   const p = row.proposal;
   if (!p) return null;
   const base = {
@@ -86,17 +79,13 @@ function buildProposalFromAwaitingRow(
     bear_case: typeof p.bear_case === 'string' ? p.bear_case : '',
     created_at: typeof p.created_at === 'string' ? p.created_at : new Date().toISOString(),
   };
-  if (marketType === 'kiwoom') {
-    return { ...base, stk_cd: row.ticker, stk_nm: row.name };
-  }
-  return { ...base, market: row.ticker, korean_name: row.name };
+  return { ...base, stk_cd: row.ticker, stk_nm: row.name };
 }
 
 /** Shape a click on an AwaitingColumn row carries — the SAME shape as the
  * server /operations `awaiting[]` entry (camelCased), never the local
- * sessions[] cache. Both `injectAwaitingKiwoomSession` and
- * `focusAwaitingCoinSession` take this so neither market ever needs the
- * clicked session to already be cached locally. */
+ * sessions[] cache. `injectAwaitingKiwoomSession` takes this so a session
+ * never needs to already be cached locally. */
 export interface AwaitingRowSeed {
   sessionId: string;
   ticker: string;
@@ -110,7 +99,7 @@ export interface AwaitingRowSeed {
 // -------------------------------------------
 
 interface HistoryItem {
-  ticker: string;  // Stock ticker or coin market code
+  ticker: string;  // Stock ticker (stk_cd)
   sessionId: string;
   timestamp: Date;
   status: SessionStatus | 'idle';
@@ -120,16 +109,10 @@ interface HistoryItem {
   completedAt?: Date | null;
   analysisResults?: DetailedAnalysisResults | null;
   analyses?: AnalysisSummary[];
-  tradeProposal?: CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal?: KRStockTradeProposal | null;
   reasoningSummary?: string | null;
   duration?: number | null;  // Analysis duration in ms
   dataVersion?: string;  // Schema version: '1.0' = legacy, '2.0' = with detailed results
-}
-
-// Coin-specific history
-interface CoinHistoryItem extends HistoryItem {
-  type: 'coin';
-  koreanName?: string;
 }
 
 // Kiwoom (Korean stock) specific history
@@ -141,8 +124,10 @@ interface KiwoomHistoryItem extends HistoryItem {
   action?: string;  // 'BUY' | 'SELL' | 'HOLD' | 'ADD' | 'REDUCE' | 'WATCH' | 'AVOID'
 }
 
-// Combined ticker history (for backward compatibility)
-type TickerHistoryItem = CoinHistoryItem | KiwoomHistoryItem;
+// Ticker history (for backward compatibility — was a union with the removed
+// coin slice's history item; single-market now, alias kept so callers that
+// still import `TickerHistoryItem` don't all need updating in this pass).
+type TickerHistoryItem = KiwoomHistoryItem;
 
 // -------------------------------------------
 // Notification Center (P1-3)
@@ -157,26 +142,6 @@ export interface StoredNotification {
   data: TradeNotification['data'];
   receivedAt: string;  // ISO string — set at capture time
   read: boolean;
-}
-
-// Base analysis state (shared structure)
-interface BaseAnalysisState {
-  activeSessionId: string | null;
-  status: SessionStatus | 'idle';
-  currentStage: string | null;
-  reasoningLog: string[];
-  analyses: AnalysisSummary[];
-  awaitingApproval: boolean;
-  error: string | null;
-}
-
-// Coin-specific state
-interface CoinState extends BaseAnalysisState {
-  market: string;           // e.g., "KRW-BTC"
-  koreanName: string | null;
-  tradeProposal: CoinTradeProposal | null;
-  activePosition: Position | null;
-  history: CoinHistoryItem[];
 }
 
 // Kiwoom (Korean stock) specific state - Multi-session support
@@ -210,7 +175,7 @@ interface NotificationState {
   notifications: StoredNotification[];
 }
 
-type MarketType = 'coin' | 'kiwoom';
+type MarketType = 'kiwoom';
 type Language = 'en' | 'ko';
 
 type ChatPopupSize = 'small' | 'medium' | 'large';
@@ -267,9 +232,9 @@ interface UIState {
   // P4 T3: brief, app-wide informational toast (e.g. "이미 보유 중 · 포지션
   // 관리 분석" when useStartAnalysis's start() sees position_exists=true).
   // Deliberately a SEPARATE slot from the per-session `error` field/
-  // selectError/setError: setError routes through setKiwoomError/
-  // setCoinError, which ALSO flip that session's status to 'error' — wrong
-  // for a benign advisory note. Ephemeral, NOT persisted.
+  // selectError/setError: setError routes through setKiwoomError, which
+  // ALSO flips that session's status to 'error' — wrong for a benign
+  // advisory note. Ephemeral, NOT persisted.
   infoNotice: string | null;
 }
 
@@ -313,34 +278,6 @@ interface BasketActions {
   updateBasketItemPrice: (ticker: string, price: number, changeRate: number, change: 'RISE' | 'FALL' | 'EVEN') => void;
   setBasketItemLoading: (ticker: string, loading: boolean) => void;
   setBasketItemError: (ticker: string, error: string | null) => void;
-}
-
-interface CoinActions {
-  // Coin session actions
-  startCoinSession: (sessionId: string, market: string, koreanName?: string) => void;
-  setCoinStatus: (status: SessionStatus) => void;
-  setCoinStage: (stage: string) => void;
-  addCoinReasoning: (entry: string) => void;
-  setCoinAnalyses: (analyses: AnalysisSummary[]) => void;
-  addCoinAnalysis: (analysis: AnalysisSummary) => void;
-  setCoinProposal: (proposal: CoinTradeProposal | null) => void;
-  setCoinAwaitingApproval: (awaiting: boolean) => void;
-  setCoinPosition: (position: Position | null) => void;
-  setCoinError: (error: string | null) => void;
-  resetCoin: () => void;
-  // History management
-  removeCoinHistoryItem: (sessionId: string) => void;
-
-  /**
-   * Approval-reachability fix (T7 review HIGH #2): coin has no sessions[]
-   * array — a single active-session slot. Two concurrent AWAITING_APPROVAL
-   * coin sessions both render a row in AwaitingColumn, but only one can ever
-   * be reflected here at once. This retargets the single slot to the
-   * CLICKED row's own data (id/ticker/name/proposal) rather than trusting
-   * whatever the slot already held, so clicking either row reaches it — one
-   * at a time, but neither is ever permanently unreachable.
-   */
-  focusAwaitingCoinSession: (row: AwaitingRowSeed) => void;
 }
 
 interface KiwoomActions {
@@ -462,30 +399,14 @@ interface LegacyActions {
 }
 
 type Store = {
-  coin: CoinState;
   kiwoom: KiwoomState;
   basket: BasketState;
-} & ChatState & NotificationState & UIState & CoinActions & KiwoomActions & ChatActions &
+} & ChatState & NotificationState & UIState & KiwoomActions & ChatActions &
   NotificationActions & UIActions & BasketActions & LegacyActions;
 
 // -------------------------------------------
 // Initial States
 // -------------------------------------------
-
-const initialCoinState: CoinState = {
-  activeSessionId: null,
-  market: '',
-  koreanName: null,
-  status: 'idle',
-  currentStage: null,
-  reasoningLog: [],
-  analyses: [],
-  tradeProposal: null,
-  awaitingApproval: false,
-  activePosition: null,
-  error: null,
-  history: [],
-};
 
 const initialKiwoomState: KiwoomState = {
   // Multi-session support
@@ -561,7 +482,6 @@ const initialUIState: UIState = {
 
 // Type for persisted state (partial)
 interface PersistedState {
-  coin: { history: CoinHistoryItem[] };
   kiwoom: { history: KiwoomHistoryItem[] };
   basket: BasketState;
   hasVisited: boolean;
@@ -576,171 +496,11 @@ export const useStore = create<Store>()(
     persist(
       (set, get) => ({
       // Initial states
-      coin: initialCoinState,
       kiwoom: initialKiwoomState,
       basket: initialBasketState,
       ...initialChatState,
       ...initialNotificationState,
       ...initialUIState,
-
-      // -------------------------------------------
-      // Coin Actions
-      // -------------------------------------------
-      startCoinSession: (sessionId, market, koreanName) =>
-        set((state) => {
-          const upperMarket = market.toUpperCase();
-          const existingIndex = state.coin.history.findIndex(
-            (h) => h.sessionId === sessionId
-          );
-          let newHistory = [...state.coin.history];
-          if (existingIndex === -1) {
-            newHistory = [
-              {
-                type: 'coin' as const,
-                ticker: upperMarket,
-                koreanName,
-                sessionId,
-                timestamp: new Date(),
-                status: 'running' as const,
-              },
-              ...state.coin.history,
-            ].slice(0, 20);
-          }
-          return {
-            coin: {
-              ...initialCoinState,
-              activeSessionId: sessionId,
-              market: upperMarket,
-              koreanName: koreanName || null,
-              status: 'running',
-              history: newHistory,
-            },
-          };
-        }),
-
-      setCoinStatus: (status) =>
-        set((state) => {
-          const newHistory = state.coin.history.map((h) =>
-            h.sessionId === state.coin.activeSessionId ? { ...h, status } : h
-          );
-          return {
-            coin: { ...state.coin, status, history: newHistory },
-          };
-        }),
-
-      setCoinStage: (stage) =>
-        set((state) => ({
-          coin: { ...state.coin, currentStage: stage },
-        })),
-
-      addCoinReasoning: (entry) =>
-        set((state) => ({
-          coin: {
-            ...state.coin,
-            reasoningLog: [...state.coin.reasoningLog, entry],
-          },
-        })),
-
-      setCoinAnalyses: (analyses) =>
-        set((state) => ({
-          coin: { ...state.coin, analyses },
-        })),
-
-      addCoinAnalysis: (analysis) =>
-        set((state) => ({
-          coin: {
-            ...state.coin,
-            analyses: [...state.coin.analyses, analysis],
-          },
-        })),
-
-      setCoinProposal: (proposal) =>
-        set((state) => {
-          // Add proposal message to chat if proposal exists
-          const newMessages = proposal
-            ? [
-                ...state.messages,
-                {
-                  id: generateUUID(),
-                  role: 'proposal' as const,
-                  content: `Trade Proposal for ${proposal.korean_name || proposal.market}`,
-                  timestamp: new Date(),
-                  metadata: { proposal },
-                },
-              ]
-            : state.messages;
-
-          return {
-            coin: { ...state.coin, tradeProposal: proposal },
-            messages: newMessages,
-            chatPopupOpen: proposal !== null ? true : state.chatPopupOpen,
-          };
-        }),
-
-      setCoinAwaitingApproval: (awaiting) =>
-        set((state) => {
-          // NOTE: Dialog opening is handled ONLY by setCoinProposal to prevent race conditions
-          // When both status and proposal messages arrive close together, only proposal setter opens dialog
-          return {
-            coin: { ...state.coin, awaitingApproval: awaiting },
-          };
-        }),
-
-      // T7 review HIGH #2 — see interface doc comment. Reusing the same
-      // session (already the active one) only patches the fields the row
-      // carries; switching to a DIFFERENT session resets the rest of the
-      // slot (reasoningLog/analyses/activePosition) exactly like
-      // startCoinSession already does, since this single-slot state was
-      // never designed to hold two sessions' data at once — that's the very
-      // limitation this fix works around by re-targeting the slot per click
-      // instead of leaving the second session's row un-clickable.
-      focusAwaitingCoinSession: (row) =>
-        set((state) => {
-          const proposal = buildProposalFromAwaitingRow(row, 'coin') as CoinTradeProposal | null;
-          const sameSession = state.coin.activeSessionId === row.sessionId;
-          const base = sameSession ? state.coin : { ...initialCoinState, history: state.coin.history };
-          return {
-            coin: {
-              ...base,
-              activeSessionId: row.sessionId,
-              market: row.ticker,
-              koreanName: row.name,
-              status: 'awaiting_approval',
-              tradeProposal: proposal ?? base.tradeProposal,
-              awaitingApproval: true,
-            },
-          };
-        }),
-
-      setCoinPosition: (position) =>
-        set((state) => ({
-          coin: { ...state.coin, activePosition: position },
-        })),
-
-      setCoinError: (error) =>
-        set((state) => ({
-          coin: {
-            ...state.coin,
-            error,
-            status: error ? 'error' : state.coin.status,
-          },
-        })),
-
-      resetCoin: () =>
-        set((state) => ({
-          coin: {
-            ...initialCoinState,
-            history: state.coin.history,
-          },
-        })),
-
-      removeCoinHistoryItem: (sessionId) =>
-        set((state) => ({
-          coin: {
-            ...state.coin,
-            history: state.coin.history.filter(h => h.sessionId !== sessionId),
-          },
-        })),
 
       // -------------------------------------------
       // Kiwoom (Korean Stock) Actions
@@ -1157,7 +917,7 @@ export const useStore = create<Store>()(
       injectAwaitingKiwoomSession: (row) =>
         set((state) => {
           const idx = state.kiwoom.sessions.findIndex(s => s.sessionId === row.sessionId);
-          const proposal = buildProposalFromAwaitingRow(row, 'kiwoom') as KRStockTradeProposal | null;
+          const proposal = buildProposalFromAwaitingRow(row);
           const now = new Date();
           let session: SessionData;
           let newSessions: SessionData[];
@@ -1686,96 +1446,48 @@ export const useStore = create<Store>()(
 
       // -------------------------------------------
       // Legacy Actions (for backward compatibility)
-      // These delegate to coin or kiwoom based on activeMarket
+      // MarketType is a single-member ('kiwoom') union post-coin-removal —
+      // these no longer branch on activeMarket, they delegate straight to
+      // the kiwoom action.
       // -------------------------------------------
       startSession: (sessionId, ticker) => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().startCoinSession(sessionId, ticker);
-        } else {
-          get().startKiwoomSession(sessionId, ticker);
-        }
+        get().startKiwoomSession(sessionId, ticker);
       },
 
       setStatus: (status) => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().setCoinStatus(status);
-        } else {
-          get().setKiwoomStatus(status);
-        }
+        get().setKiwoomStatus(status);
       },
 
       setCurrentStage: (stage) => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().setCoinStage(stage);
-        } else {
-          get().setKiwoomStage(stage);
-        }
+        get().setKiwoomStage(stage);
       },
 
       addReasoningEntry: (entry) => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().addCoinReasoning(entry);
-        } else {
-          get().addKiwoomReasoning(entry);
-        }
+        get().addKiwoomReasoning(entry);
       },
 
       setAnalyses: (analyses) => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().setCoinAnalyses(analyses);
-        } else {
-          get().setKiwoomAnalyses(analyses);
-        }
+        get().setKiwoomAnalyses(analyses);
       },
 
       addAnalysis: (analysis) => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().addCoinAnalysis(analysis);
-        } else {
-          get().addKiwoomAnalysis(analysis);
-        }
+        get().addKiwoomAnalysis(analysis);
       },
 
       setAwaitingApproval: (awaiting) => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().setCoinAwaitingApproval(awaiting);
-        } else {
-          get().setKiwoomAwaitingApproval(awaiting);
-        }
+        get().setKiwoomAwaitingApproval(awaiting);
       },
 
       setActivePosition: (position) => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().setCoinPosition(position);
-        } else {
-          get().setKiwoomPosition(position);
-        }
+        get().setKiwoomPosition(position);
       },
 
       setError: (error) => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().setCoinError(error);
-        } else {
-          get().setKiwoomError(error);
-        }
+        get().setKiwoomError(error);
       },
 
       reset: () => {
-        const market = get().activeMarket;
-        if (market === 'coin') {
-          get().resetCoin();
-        } else {
-          get().resetKiwoom();
-        }
+        get().resetKiwoom();
       },
       }),
       {
@@ -1787,7 +1499,6 @@ export const useStore = create<Store>()(
         // only picks known keys — so a stale `stock` slice (or a 'stock'
         // activeMarket) left in localStorage by old sessions is ignored.
         partialize: (state): PersistedState => ({
-          coin: { history: state.coin.history },
           kiwoom: { history: state.kiwoom.history },
           basket: state.basket,
           hasVisited: state.hasVisited,
@@ -1811,12 +1522,6 @@ export const useStore = create<Store>()(
 
           return {
             ...currentState,
-            coin: {
-              ...currentState.coin,
-              history: persisted.coin?.history
-                ? parseHistoryDates(persisted.coin.history as CoinHistoryItem[])
-                : [],
-            },
             kiwoom: {
               ...currentState.kiwoom,
               history: persisted.kiwoom?.history
@@ -1864,25 +1569,17 @@ export const useStore = create<Store>()(
 // Selectors
 // -------------------------------------------
 
-// Helper to get current market data
-const getMarketData = (state: Store) => {
-  if (state.activeMarket === 'coin') return state.coin;
-  return state.kiwoom;
-};
+// Helper to get current market data. A thin indirection now that MarketType
+// is single-member ('kiwoom') — kept so the many selectors below don't all
+// need to change shape if the abstraction is ever widened again.
+const getMarketData = (state: Store) => state.kiwoom;
 
 // Get current market's session info
 export const selectSession = (state: Store) => {
-  const market = state.activeMarket;
   const data = getMarketData(state);
-  let ticker: string;
-  if (market === 'coin') {
-    ticker = state.coin.market;
-  } else {
-    ticker = state.kiwoom.stk_cd;
-  }
   return {
     sessionId: data.activeSessionId,
-    ticker,
+    ticker: state.kiwoom.stk_cd,
     status: data.status,
   };
 };
@@ -1921,12 +1618,8 @@ export const selectChartSymbol = (state: Store) => state.chartSymbol;
 
 // Get current market's history
 export const selectTickerHistory = (state: Store): TickerHistoryItem[] => {
-  if (state.activeMarket === 'coin') return state.coin.history;
   return state.kiwoom.history;
 };
-
-// Select coin-specific state
-export const selectCoin = (state: Store) => state.coin;
 
 // Select kiwoom-specific state
 export const selectKiwoom = (state: Store) => state.kiwoom;
@@ -1997,7 +1690,6 @@ export const selectActiveSessionId = (state: Store) => {
 };
 
 export const selectTicker = (state: Store) => {
-  if (state.activeMarket === 'coin') return state.coin.market;
   return state.kiwoom.stk_cd;
 };
 
@@ -2048,19 +1740,6 @@ export interface ActiveSession {
 export const selectAllActiveSessions = (state: Store): ActiveSession[] => {
   const sessions: ActiveSession[] = [];
 
-  // Coin session
-  if (state.coin.activeSessionId && state.coin.status !== 'idle') {
-    sessions.push({
-      sessionId: state.coin.activeSessionId,
-      ticker: state.coin.market,
-      displayName: state.coin.koreanName || state.coin.market.replace('KRW-', ''),
-      marketType: 'coin',
-      status: state.coin.status,
-      currentStage: state.coin.currentStage,
-      reasoningLog: state.coin.reasoningLog,
-    });
-  }
-
   // Kiwoom sessions (multi-session support)
   // Include ALL running/active sessions, not just the active one
   state.kiwoom.sessions.forEach((s) => {
@@ -2102,26 +1781,11 @@ export interface RecentAnalysisItem {
   marketType: MarketType;
   timestamp: Date;
   status: SessionStatus | 'idle';
-  tradeProposal: CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal: KRStockTradeProposal | null;
 }
 
 export const selectRecentCompletedAnalyses = (state: Store): RecentAnalysisItem[] => {
   const allHistory: RecentAnalysisItem[] = [];
-
-  // Coin history - include completed, awaiting_approval, and cancelled
-  state.coin.history.forEach((h) => {
-    if (h.status === 'completed' || h.status === 'awaiting_approval' || h.status === 'cancelled') {
-      allHistory.push({
-        sessionId: h.sessionId,
-        ticker: h.ticker,
-        displayName: h.koreanName || h.ticker.replace('KRW-', ''),
-        marketType: 'coin',
-        timestamp: h.timestamp,
-        status: h.status,
-        tradeProposal: h.sessionId === state.coin.activeSessionId ? state.coin.tradeProposal : null,
-      });
-    }
-  });
 
   // Kiwoom history - include completed, awaiting_approval, and cancelled
   state.kiwoom.history.forEach((h) => {
@@ -2145,5 +1809,5 @@ export const selectRecentCompletedAnalyses = (state: Store): RecentAnalysisItem[
 };
 
 // Export types
-export type { TickerHistoryItem, CoinHistoryItem, KiwoomHistoryItem, MarketType, ChatPopupSize, Language };
+export type { TickerHistoryItem, KiwoomHistoryItem, MarketType, ChatPopupSize, Language };
 export type { SessionData, TradingMode } from '@/types';

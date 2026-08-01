@@ -6,7 +6,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '@/store';
 import { useGoTo } from '@/hooks/useNav';
 import { useStartAnalysis } from '@/hooks/useStartAnalysis';
-import { startScan, startAgentChatDiscussion, createKRStockOrder, createCoinOrder } from '@/api/client';
+import { startScan, startAgentChatDiscussion, createKRStockOrder } from '@/api/client';
 import { Toast } from '@/components/ui/Toast';
 import { buildCommands, filterCommands, type CommandCtx } from './commands';
 
@@ -59,13 +59,9 @@ export function CommandPalette({ open, onClose }: Props) {
         startDebate: (t) => {
           startAgentChatDiscussion({ ticker: t, stock_name: t }).catch(fail(`토론 시작 실패 (${t})`));
         },
-        // P1-4 discretionary control surface: manual :buy/:sell. Resolves the
-        // market from activeMarket at call time (same convention as
-        // startAnalysis) and calls the SAME order-create endpoint the rest of
-        // the app uses — no separate/bypassing execution path. Upbit has no
-        // qty-based market-buy (its market-buy semantics take a KRW amount,
-        // not a coin volume) so a coin :buy with no price is rejected instead
-        // of silently reinterpreting qty as a KRW amount.
+        // P1-4 discretionary control surface: manual :buy/:sell. Calls the
+        // SAME order-create endpoint the rest of the app uses — no separate/
+        // bypassing execution path.
         //
         // M1 (T7 review): previously fire-and-forget (`.catch` only, no
         // success path) — a filled order gave the operator no visible
@@ -74,24 +70,13 @@ export function CommandPalette({ open, onClose }: Props) {
         // see task-7-fix-findings.md C2/M1), so the success message says so
         // honestly instead of implying the position list will reflect it.
         placeOrder: (side, sym, qty, px) => {
-          const m = useStore.getState().activeMarket;
-          const promise = m === 'coin'
-            ? side === 'buy' && px == null
-              ? Promise.reject(new Error('코인 시장가 매수는 미지원 — 가격을 지정하세요: :buy SYM QTY PX'))
-              : createCoinOrder({
-                  market: sym,
-                  side: side === 'buy' ? 'bid' : 'ask',
-                  ord_type: px != null ? 'limit' : 'market',
-                  price: px,
-                  volume: qty,
-                })
-            : createKRStockOrder({
-                stk_cd: sym,
-                side,
-                ord_type: px != null ? 'limit' : 'market',
-                price: px,
-                quantity: qty,
-              });
+          const promise = createKRStockOrder({
+            stk_cd: sym,
+            side,
+            ord_type: px != null ? 'limit' : 'market',
+            price: px,
+            quantity: qty,
+          });
           promise.then(
             () => {
               setOrderResult({

@@ -4,7 +4,7 @@
  * active analysis session's ticker. So the chart works WITHOUT a running session
  * (candles need only ticker+timeframe).
  *
- * TradingChart is h-full and self-fetches candles (coin → Upbit, 6-digit → KR).
+ * TradingChart is h-full and self-fetches candles (6-digit ticker → Kiwoom).
  * HONESTY GATE: unknown symbols have no live data source, so we render an
  * explicit awaiting state instead of charting fabricated data.
  */
@@ -12,9 +12,9 @@ import { useStore, selectTicker, selectChartConfig, selectChartSymbol } from '@/
 import { TradingChart } from '@/components/chart/TradingChart';
 import { Awaiting } from './shared';
 
-/** Real data exists only for coin markets (contain '-') or 6-digit KR codes. */
+/** Real data exists only for 6-digit KR codes. */
 function hasRealCandles(symbol: string): boolean {
-  return symbol.includes('-') || /^\d{6}$/.test(symbol);
+  return /^\d{6}$/.test(symbol);
 }
 
 export function ChartTile() {

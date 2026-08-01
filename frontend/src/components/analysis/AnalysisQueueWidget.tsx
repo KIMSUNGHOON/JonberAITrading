@@ -20,14 +20,13 @@ import {
   Clock,
   Eye,
   X,
-  Bitcoin,
   Building2,
 } from 'lucide-react';
 import { useStore, type ActiveSession } from '@/store';
 import { useGoTo } from '@/hooks/useNav';
 import type { SessionStatus } from '@/types';
 import type { MarketType } from '@/store';
-import { cancelKRStockSession, cancelCoinSession } from '@/api/client';
+import { cancelKRStockSession } from '@/api/client';
 import { wsManager } from '@/api/websocket';
 
 // Workflow stages for progress tracking
@@ -54,14 +53,11 @@ interface AnalysisQueueItemProps {
   onViewDetails: () => void;
 }
 
-// Market type icon component
-function MarketIcon({ marketType }: { marketType: MarketType }) {
-  switch (marketType) {
-    case 'coin':
-      return <Bitcoin className="w-3 h-3 text-yellow-400" />;
-    case 'kiwoom':
-      return <Building2 className="w-3 h-3 text-blue-400" />;
-  }
+// Market type icon component (MarketType is a single-member 'kiwoom' union
+// post-coin-removal — kept as a component rather than inlined so widening
+// the union later doesn't require touching every call site).
+function MarketIcon({ marketType: _marketType }: { marketType: MarketType }) {
+  return <Building2 className="w-3 h-3 text-blue-400" />;
 }
 
 function AnalysisQueueItem({
@@ -236,8 +232,6 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set());
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
 
-  // Get individual state for each market to avoid infinite loop from selector returning new array
-  const coinSession = useStore((state) => state.coin);
   const kiwoomState = useStore((state) => state.kiwoom);
 
   // Navigation and market actions
@@ -247,7 +241,6 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
 
   // Session removal actions
   const removeKiwoomSession = useStore((state) => state.removeKiwoomSession);
-  const resetCoin = useStore((state) => state.resetCoin);
 
   // Build active sessions with useMemo for stable reference
   // Only include sessions that are actively running or awaiting approval
@@ -259,23 +252,7 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
     console.log('[AnalysisQueueWidget] Building active sessions:', {
       kiwoomSessions: kiwoomState.sessions.map(s => ({ id: s.sessionId, ticker: s.ticker, status: s.status })),
       kiwoomLegacy: { activeSessionId: kiwoomState.activeSessionId, status: kiwoomState.status },
-      coinSession: { activeSessionId: coinSession.activeSessionId, status: coinSession.status },
     });
-
-    // Coin session - only running or awaiting_approval
-    if (coinSession.activeSessionId &&
-        (coinSession.status === 'running' || coinSession.status === 'awaiting_approval')) {
-      sessions.push({
-        sessionId: coinSession.activeSessionId,
-        ticker: coinSession.market,
-        displayName: coinSession.koreanName || coinSession.market.replace('KRW-', ''),
-        marketType: 'coin',
-        status: coinSession.status,
-        currentStage: coinSession.currentStage,
-        reasoningLog: coinSession.reasoningLog,
-      });
-      addedSessionIds.add(coinSession.activeSessionId);
-    }
 
     // Kiwoom multi-sessions - only running or awaiting_approval
     kiwoomState.sessions.forEach((s) => {
@@ -312,7 +289,7 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
 
     console.log('[AnalysisQueueWidget] Active sessions result:', sessions.length, sessions.map(s => ({ id: s.sessionId, ticker: s.ticker, status: s.status })));
     return sessions;
-  }, [coinSession, kiwoomState]);
+  }, [kiwoomState]);
 
   const toggleExpand = (sessionId: string) => {
     setExpandedSessions((prev) => {
@@ -343,11 +320,7 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
       // 1. Cancel the session on backend if it's still running/awaiting
       if (status === 'running' || status === 'awaiting_approval') {
         try {
-          if (marketType === 'kiwoom') {
-            await cancelKRStockSession(sessionId);
-          } else {
-            await cancelCoinSession(sessionId);
-          }
+          await cancelKRStockSession(sessionId);
         } catch (error) {
           // Log but don't block removal - session might already be cancelled/completed
           console.warn(`[AnalysisQueue] Failed to cancel session ${sessionId}:`, error);
@@ -360,11 +333,7 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
       }
 
       // 3. Remove session from store
-      if (marketType === 'kiwoom') {
-        removeKiwoomSession(sessionId);
-      } else {
-        resetCoin();
-      }
+      removeKiwoomSession(sessionId);
 
       // 4. Clear from expanded sessions UI state
       setExpandedSessions((prev) => {
@@ -382,7 +351,7 @@ export function AnalysisQueueWidget({ onViewDetails }: AnalysisQueueWidgetProps)
     } catch (error) {
       console.error(`[AnalysisQueue] Error removing session ${sessionId}:`, error);
     }
-  }, [removeKiwoomSession, resetCoin, selectedSessionId]);
+  }, [removeKiwoomSession, selectedSessionId]);
 
   // Handle session selection - navigate to Analysis page
   const handleSelectSession = (session: ActiveSession) => {

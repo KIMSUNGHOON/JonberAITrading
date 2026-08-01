@@ -23,7 +23,6 @@ import {
   CheckCircle2,
   XCircle,
   Clock,
-  Bitcoin,
   Building2,
   Activity,
   DollarSign,
@@ -57,21 +56,16 @@ interface AnalysisDetailPageProps {
 
 // Market type icon component. Colors are market IDENTITY (which market this
 // analysis belongs to), not a P&L/direction value, so they stay raw — same
-// precedent as AnalysisPage's MarketIcon/getMarketColor.
-function MarketIcon({ marketType, size = 16 }: { marketType: MarketType; size?: number }) {
-  switch (marketType) {
-    case 'coin':
-      return <Bitcoin size={size} className="text-yellow-400" />;
-    case 'kiwoom':
-      return <Building2 size={size} className="text-blue-400" />;
-  }
+// precedent as AnalysisPage's MarketIcon/getMarketColor. MarketType is a
+// single-member 'kiwoom' union post-coin-removal — kept as a component
+// rather than inlined so widening the union later doesn't require touching
+// every call site.
+function MarketIcon({ marketType: _marketType, size = 16 }: { marketType: MarketType; size?: number }) {
+  return <Building2 size={size} className="text-blue-400" />;
 }
 
-function getMarketLabel(marketType: MarketType): string {
-  switch (marketType) {
-    case 'coin': return 'Crypto';
-    case 'kiwoom': return 'KR Stock';
-  }
+function getMarketLabel(_marketType: MarketType): string {
+  return 'KR Stock';
 }
 
 function formatDate(date: Date): string {
@@ -87,13 +81,7 @@ function formatDate(date: Date): string {
 
 // Helper to get display name from history item
 function getDisplayName(item: TickerHistoryItem): string {
-  if ('stk_nm' in item && (item as { stk_nm?: string }).stk_nm) {
-    return (item as { stk_nm: string }).stk_nm;
-  }
-  if ('koreanName' in item && (item as { koreanName?: string }).koreanName) {
-    return (item as { koreanName: string }).koreanName;
-  }
-  return item.ticker;
+  return item.stk_nm || item.ticker;
 }
 
 // Helper to get action from history item
@@ -460,7 +448,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
     if (!analysis) return;
 
     // Get required data
-    const ticker = 'stk_cd' in analysis ? (analysis as { stk_cd: string }).stk_cd : analysis.ticker;
+    const ticker = analysis.stk_cd;
     const stockName = getDisplayName(analysis);
     const action = getAction(analysis);
 
@@ -532,7 +520,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
 
   const displayName = getDisplayName(analysis);
   const action = getAction(analysis);
-  const marketType: MarketType = 'market' in analysis ? 'coin' : 'kiwoom';
+  const marketType: MarketType = 'kiwoom';
 
   // Get analysis results from the new structure (Phase 9)
   const analysisResults = 'analysisResults' in analysis

@@ -16,7 +16,6 @@ import {
   XCircle,
   AlertCircle,
   ChevronRight,
-  Bitcoin,
   Building2,
   Clock,
   Eye,
@@ -31,32 +30,22 @@ interface AnalysisPageProps {
   // No props needed - navigation handled by sidebar
 }
 
-// Market type icon component
-function MarketIcon({ marketType, size = 16 }: { marketType: MarketType; size?: number }) {
-  const className = `text-current`;
-  switch (marketType) {
-    case 'coin':
-      return <Bitcoin size={size} className={className} />;
-    case 'kiwoom':
-      return <Building2 size={size} className={className} />;
-  }
+// Market type icon component (MarketType is a single-member 'kiwoom' union
+// post-coin-removal — kept as a component rather than inlined so widening
+// the union later doesn't require touching every call site).
+function MarketIcon({ marketType: _marketType, size = 16 }: { marketType: MarketType; size?: number }) {
+  return <Building2 size={size} className="text-current" />;
 }
 
 // Market identity color — not a P&L/direction value (analogous to the
-// per-agent-category colors kept as-is elsewhere in the reskin), so these stay
-// their distinct hues rather than routing through pnlColor.
-function getMarketColor(marketType: MarketType): string {
-  switch (marketType) {
-    case 'coin': return 'text-yellow-400';
-    case 'kiwoom': return 'text-blue-400';
-  }
+// per-agent-category colors kept as-is elsewhere in the reskin), so this
+// stays its distinct hue rather than routing through pnlColor.
+function getMarketColor(_marketType: MarketType): string {
+  return 'text-blue-400';
 }
 
-function getMarketLabel(marketType: MarketType): string {
-  switch (marketType) {
-    case 'coin': return 'Crypto';
-    case 'kiwoom': return 'KR Stock';
-  }
+function getMarketLabel(_marketType: MarketType): string {
+  return 'KR Stock';
 }
 
 // Session-status color — running/complete/error map to the semantic
@@ -115,13 +104,7 @@ function formatDate(date: Date): string {
 
 // Helper to get display name from history item
 function getDisplayName(item: TickerHistoryItem): string {
-  if ('stk_nm' in item && (item as { stk_nm?: string }).stk_nm) {
-    return (item as { stk_nm: string }).stk_nm;
-  }
-  if ('koreanName' in item && (item as { koreanName?: string }).koreanName) {
-    return (item as { koreanName: string }).koreanName;
-  }
-  return item.ticker;
+  return item.stk_nm || item.ticker;
 }
 
 // Helper to get action from history item
@@ -145,36 +128,18 @@ export function AnalysisPage(_props: AnalysisPageProps) {
   const setActiveKiwoomSession = useStore((state) => state.setActiveKiwoomSession);
   const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
 
-  // Get individual market states
-  const coinSession = useStore((state) => state.coin);
   const kiwoomState = useStore((state) => state.kiwoom);
 
   // Get history
   const history = useStore(selectTickerHistory);
 
   // Get remove actions for delete functionality
-  const removeCoinHistoryItem = useStore((state) => state.removeCoinHistoryItem);
   const removeKiwoomHistoryItem = useStore((state) => state.removeKiwoomHistoryItem);
 
   // Build active sessions list
   const activeSessions = useMemo((): ActiveSession[] => {
     const sessions: ActiveSession[] = [];
     const addedSessionIds = new Set<string>();
-
-    // Coin session - only include running or awaiting_approval
-    if (coinSession.activeSessionId &&
-        (coinSession.status === 'running' || coinSession.status === 'awaiting_approval')) {
-      sessions.push({
-        sessionId: coinSession.activeSessionId,
-        ticker: coinSession.market,
-        displayName: coinSession.koreanName || coinSession.market.replace('KRW-', ''),
-        marketType: 'coin',
-        status: coinSession.status,
-        currentStage: coinSession.currentStage,
-        reasoningLog: coinSession.reasoningLog,
-      });
-      addedSessionIds.add(coinSession.activeSessionId);
-    }
 
     // Kiwoom multi-sessions - only include running or awaiting_approval
     kiwoomState.sessions.forEach((s) => {
@@ -211,7 +176,7 @@ export function AnalysisPage(_props: AnalysisPageProps) {
     }
 
     return sessions;
-  }, [coinSession, kiwoomState]);
+  }, [kiwoomState]);
 
   // Filter sessions based on status filter
   const filteredActiveSessions = useMemo(() => {
@@ -266,14 +231,7 @@ export function AnalysisPage(_props: AnalysisPageProps) {
       return;
     }
 
-    // Determine market type and call appropriate remove action
-    if ('market' in item) {
-      // Coin history item
-      removeCoinHistoryItem(item.sessionId);
-    } else {
-      // Kiwoom history item
-      removeKiwoomHistoryItem(item.sessionId);
-    }
+    removeKiwoomHistoryItem(item.sessionId);
   };
 
   // Count running vs completed
@@ -410,7 +368,7 @@ export function AnalysisPage(_props: AnalysisPageProps) {
                 {completedAnalyses.map((item) => {
                   const displayName = getDisplayName(item);
                   const action = getAction(item);
-                  const itemMarket: MarketType = 'market' in item ? 'coin' : 'kiwoom';
+                  const itemMarket: MarketType = 'kiwoom';
 
                   return (
                     <button

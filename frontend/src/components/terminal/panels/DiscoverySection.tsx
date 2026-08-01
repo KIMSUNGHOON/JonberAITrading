@@ -20,9 +20,10 @@
  * label "Scratchpad" since P2-T3) via the existing store, so T5 can drop
  * <DiscoverySection /> into the funnel panel with nothing else wired up.
  *
- * The server watch-list (ExecutionCoordinator) is KR-only, so the
- * [승격▲] action is disabled for coin Scratchpad rows (scan results are
- * always KR — the background scanner covers only KOSPI/KOSDAQ).
+ * The server watch-list (ExecutionCoordinator) is KR-only — scan results
+ * are always KR (the background scanner covers only KOSPI/KOSDAQ), and
+ * since the coin stack's removal (2026-08-01) the Scratchpad itself can
+ * only ever hold KR rows too (`BasketItem.marketType` is 'kiwoom'-only).
  *
  * Nav-rationalize (2026-07-14, docs/superpowers/audits/2026-07-14-dashboard-
  * widget-cull.md, user-approved "ABSORB"): the standalone Scratchpad page
@@ -42,7 +43,7 @@ import {
 import {
   startScan, pauseScan, resumeScan, stopScan,
   getScanProgress, getScanResults, addToWatchList, searchKRStocks,
-  getCoinTickers, getKRStockTickers,
+  getKRStockTickers,
 } from '@/api/client';
 import { useStartAnalysis } from '@/hooks/useStartAnalysis';
 import { changeColor } from '@/utils/pnl';
@@ -197,26 +198,16 @@ function useScratchpadAdd(basketItems: BasketItem[]) {
     for (const token of tokens) {
       if (basketItems.length + added >= 10) break;
 
-      if (market === 'kiwoom') {
-        if (!/^\d{6}$/.test(token)) {
-          invalid.push(token);
-          continue;
-        }
-        if (basketItems.some((i) => i.ticker === token)) continue;
-        addToBasket({
-          marketType: 'kiwoom', ticker: token, displayName: token,
-          price: 0, prevPrice: 0, changeRate: 0, change: 'EVEN',
-        });
-        added++;
-      } else {
-        const ticker = token.startsWith('KRW-') ? token : `KRW-${token}`;
-        if (basketItems.some((i) => i.ticker === ticker)) continue;
-        addToBasket({
-          marketType: 'coin', ticker, displayName: token.replace('KRW-', ''),
-          price: 0, prevPrice: 0, changeRate: 0, change: 'EVEN',
-        });
-        added++;
+      if (!/^\d{6}$/.test(token)) {
+        invalid.push(token);
+        continue;
       }
+      if (basketItems.some((i) => i.ticker === token)) continue;
+      addToBasket({
+        marketType: 'kiwoom', ticker: token, displayName: token,
+        price: 0, prevPrice: 0, changeRate: 0, change: 'EVEN',
+      });
+      added++;
     }
 
     setAddError(invalid.length > 0 ? `잘못된 종목코드: ${invalid.join(', ')} (6자리 숫자 필요)` : null);
@@ -257,58 +248,17 @@ function useScratchpadAdd(basketItems: BasketItem[]) {
 
 // -------------------------------------------
 // Scratchpad price polling — re-homed from the former standalone Watchlist
-// tile (merged in, P2 dashboard-cull). Batched (ONE request per market per
-// poll, not one-per-symbol), 30s cadence, gated on the relevant API being
-// configured. Unlike the old tile, the Scratchpad shows items from BOTH
-// markets at once (no activeMarket filter) — so both effects run
-// independently, each keyed on its own ticker subset, rather than one effect
-// gated on a single activeMarket.
+// tile (merged in, P2 dashboard-cull). Batched (ONE request per poll, not
+// one-per-symbol), 30s cadence, gated on the Kiwoom API being configured.
+// The coin side of this (Upbit tickers) was removed with the coin stack
+// (2026-08-01) — `BasketItem.marketType` is 'kiwoom'-only now.
 // -------------------------------------------
 
 function useScratchpadPricePolling(basketItems: BasketItem[]) {
-  const upbitApiConfigured = useStore((s) => s.upbitApiConfigured);
   const kiwoomApiConfigured = useStore((s) => s.kiwoomApiConfigured);
   const updateBasketItemPrice = useStore((s) => s.updateBasketItemPrice);
 
-  // 코인 동결(freeze) fix round 2: coin 시세 폴링은 영구 비활성화한다. 정상 경로로는
-  // basket에 coin 항목이 존재할 수 없다 — round 1에서 select의 COIN 옵션을 지웠고,
-  // merge()가 rehydrate 시 marketType!=='kiwoom' 항목을 전부 걸러낸다(store/index.ts).
-  // 그래도 어떤 경로로든(예: setState 직접 호출) coin 항목이 basket에 들어오면 이
-  // 이펙트가 언마운트된 GET /coin/tickers를 칠 수 있으므로, basketItems 내용과
-  // 무관하게 하드코딩해 방어한다(리뷰 발견).
-  const coinTickers: string[] = [];
   const krTickers = basketItems.filter((i) => i.marketType === 'kiwoom').map((i) => i.ticker);
-
-  // Coin prices (batched, gated on Upbit config).
-  useEffect(() => {
-    if (!upbitApiConfigured || coinTickers.length === 0) return;
-
-    let alive = true;
-    async function run() {
-      try {
-        const res = await getCoinTickers(coinTickers);
-        if (!alive) return;
-        res.tickers.forEach((t) => {
-          updateBasketItemPrice(
-            t.market,
-            t.trade_price,
-            t.change_rate * 100,
-            t.change as 'RISE' | 'FALL' | 'EVEN',
-          );
-        });
-      } catch {
-        /* keep last known prices; do not fabricate */
-      }
-    }
-    run();
-    const id = setInterval(run, 30_000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
-    // ticker identity changes each render; key on the joined ticker set instead.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [upbitApiConfigured, coinTickers.join(','), updateBasketItemPrice]);
 
   // KR prices in ONE batch call (P1-7) instead of one request per symbol. A
   // code that fails to fetch maps to `null` in the response — that item MUST
@@ -359,7 +309,6 @@ export function DiscoverySection() {
   const removeFromBasket = useStore((s) => s.removeFromBasket);
   const clearBasket = useStore((s) => s.clearBasket);
   const setShowSettingsModal = useStore((s) => s.setShowSettingsModal);
-  const upbitApiConfigured = useStore((s) => s.upbitApiConfigured);
   const kiwoomApiConfigured = useStore((s) => s.kiwoomApiConfigured);
   const startAnalysis = useStartAnalysis();
   const scratchpad = useScratchpadAdd(basketItems);
@@ -370,9 +319,7 @@ export function DiscoverySection() {
   const [bulkAnalyzing, setBulkAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const hasCoinItems = basketItems.some((i) => i.marketType === 'coin');
   const hasKiwoomItems = basketItems.some((i) => i.marketType === 'kiwoom');
-  const showCoinApiWarning = hasCoinItems && !upbitApiConfigured;
   const showKiwoomApiWarning = hasKiwoomItems && !kiwoomApiConfigured;
 
   const status = progress?.status ?? 'idle';
@@ -436,7 +383,6 @@ export function DiscoverySection() {
   }, [startAnalysis]);
 
   const handlePromoteItem = useCallback((item: BasketItem) => {
-    if (item.marketType !== 'kiwoom') return; // server watch-list is KR-only (ExecutionCoordinator)
     runPromote(() => addToWatchList({
       ticker: item.ticker,
       stock_name: item.displayName,
@@ -445,11 +391,6 @@ export function DiscoverySection() {
   }, [runPromote]);
 
   const handleAnalyzeItem = useCallback((item: BasketItem) => {
-    // 코인 동결(freeze) fix round 2: handlePromoteItem과 동일한 방어 — 정상
-    // 경로로는 basket에 coin 항목이 있을 수 없지만(merge()가 걸러냄), 어떤
-    // 경로로든 존재하면 이 호출이 setActiveMarket('coin') 후 언마운트된
-    // /coin/analysis/start를 치므로 marketType으로 차단한다(리뷰 발견).
-    if (item.marketType !== 'kiwoom') return;
     startAnalysis(item.marketType, item.ticker, item.displayName).catch((e) => {
       setError(`분석 시작 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
     });
@@ -466,13 +407,9 @@ export function DiscoverySection() {
     setBulkAnalyzing(true);
     setError(null);
 
-    // 코인 동결(freeze) fix round 2: handleAnalyzeItem과 동일한 이유로 kiwoom
-    // 항목만 대상으로 삼는다 — availableSlots도 kiwoom 세션 슬롯 기준이라 원래도
-    // coin 항목엔 의미가 없었다.
-    const kiwoomItems = basketItems.filter((item) => item.marketType === 'kiwoom');
     const availableSlots = selectKiwoomAvailableSlots(useStore.getState());
-    const maxItems = Math.min(kiwoomItems.length, availableSlots, 3);
-    const itemsToAnalyze = kiwoomItems.slice(0, maxItems);
+    const maxItems = Math.min(basketItems.length, availableSlots, 3);
+    const itemsToAnalyze = basketItems.slice(0, maxItems);
 
     if (maxItems === 0) {
       setError('분석 슬롯이 모두 사용 중입니다');
@@ -647,9 +584,10 @@ export function DiscoverySection() {
           )}
         </div>
         <div className="flex items-center gap-1.5 px-2.5 py-1.5 flex-none relative">
-          {/* 코인 동결(freeze) 이후 마켓은 KR 하나뿐 — COIN 옵션은 fix round 1에서
-              제거됐다(scratchpad에서 market:'coin'으로 startCoinAnalysis까지 도달하던
-              배선, 리뷰 발견). select 자체는 남겨 최소 변경으로 유지한다. */}
+          {/* MarketType is 'kiwoom'-only since the coin stack's removal
+              (2026-08-01) — this select has a single option accordingly.
+              Kept as a <select> (not a plain label) for minimal-diff parity
+              with pre-removal markup. */}
           <select
             value={scratchpad.market}
             onChange={(e) => scratchpad.setMarket(e.target.value as MarketType)}
@@ -692,15 +630,9 @@ export function DiscoverySection() {
         {scratchpad.addError && (
           <div className="px-2.5 pb-1 text-down text-[10px] flex-none">{scratchpad.addError}</div>
         )}
-        {(showCoinApiWarning || showKiwoomApiWarning) && (
+        {showKiwoomApiWarning && (
           <div className="flex-none flex items-center justify-between gap-2 px-2.5 py-1 border-b border-hairline bg-warn/10 text-warn text-[10px]">
-            <span>
-              {showCoinApiWarning && showKiwoomApiWarning
-                ? 'Upbit·Kiwoom API 미등록 — 실시간 시세 없음'
-                : showCoinApiWarning
-                ? 'Upbit API 미등록 — 실시간 시세 없음'
-                : 'Kiwoom API 미등록 — 실시간 시세 없음'}
-            </span>
+            <span>Kiwoom API 미등록 — 실시간 시세 없음</span>
             <button type="button" onClick={() => setShowSettingsModal(true)} className="underline flex-none">
               설정으로 이동
             </button>

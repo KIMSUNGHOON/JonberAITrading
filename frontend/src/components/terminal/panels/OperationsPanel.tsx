@@ -3,8 +3,8 @@
  * operations flow in one glance: 분석중 → 승인대기 → 감시 → 매수대기 → 보유 →
  * 오늘체결. Each column is independently sourced server-side (Task 1); a
  * section that failed renders "조회 실패" honestly rather than faking a 0
- * count, and a section that's genuinely non-applicable (coin queue/broker
- * columns) is hidden outright. Polls every 5s and refetches immediately on
+ * count, and a section that's genuinely non-applicable is hidden outright.
+ * Polls every 5s and refetches immediately on
  * any trade-notification push so the board tracks live state without a
  * manual refresh.
  *
@@ -62,7 +62,7 @@ export function useOperations() {
   const refetch = useCallback(async (showLoading = false) => {
     if (showLoading) setState('loading');
     try {
-      const res = await getOperations(activeMarket === 'coin' ? 'coin' : 'kiwoom');
+      const res = await getOperations('kiwoom');
       if (!aliveRef.current) return;
       setData(res);
       setState('ready');
@@ -72,7 +72,7 @@ export function useOperations() {
       setErr(e instanceof Error ? e.message : '로드 실패');
       setState('error');
     }
-  }, [activeMarket]);
+  }, []);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -124,7 +124,7 @@ function ColumnHeader({
   );
 }
 
-/** Column is hidden outright when its data is null with NO errors entry (non-applicable, e.g. coin). */
+/** Column is hidden outright when its data is null with NO errors entry (non-applicable). */
 function columnVisible(items: unknown[] | null, errorKey: string, errors: Record<string, string>): boolean {
   return items !== null || errors[errorKey] != null;
 }
@@ -213,21 +213,19 @@ function AwaitingCountdown({ autoApproveAt }: { autoApproveAt: string }) {
 // action (approve/reject/cancel) is lost — all three remain reachable, just
 // from a single place.
 //
-// T7 review HIGH #1/#2 fix: `onFocus` takes the FULL row (not just
-// session_id). This column's rows come from the server /operations poll —
-// a session can land here without ever touching this tab's local FE cache
-// (kiwoom.sessions[], only populated by rehydrateKiwoomSessions at mount +
-// this tab's own WS handlers; coin has no per-session cache at all, just one
-// active slot). Passing only the id let the old handler silently no-op on a
-// cache miss (kiwoom) or clobber-vs-ignore a second concurrent session
-// (coin) — see handleFocusAwaiting below, which now seeds the store
-// straight from this row so the click is NEVER a no-op.
+// T7 review HIGH #1 fix: `onFocus` takes the FULL row (not just session_id).
+// This column's rows come from the server /operations poll — a session can
+// land here without ever touching this tab's local FE cache (kiwoom.
+// sessions[], only populated by rehydrateKiwoomSessions at mount + this
+// tab's own WS handlers). Passing only the id let the old handler silently
+// no-op on a cache miss — see handleFocusAwaiting below, which now seeds
+// the store straight from this row so the click is NEVER a no-op.
 export function AwaitingColumn({
   items, errors, activeMarket, onFocus,
 }: {
   items: OperationsResponse['awaiting'];
   errors: Record<string, string>;
-  activeMarket: 'kiwoom' | 'coin';
+  activeMarket: 'kiwoom';
   onFocus: (row: OperationsAwaiting) => void;
 }) {
   if (!columnVisible(items, 'sessions', errors)) return null;
@@ -367,7 +365,7 @@ export function PendingBuyColumn({
 }: {
   pendingBuy: OperationsResponse['pending_buy'];
   errors: Record<string, string>;
-  activeMarket: 'kiwoom' | 'coin';
+  activeMarket: 'kiwoom';
   /**
    * Task 8b: backported from the /trading TradeQueueWidget — cancels a
    * PENDING queued trade (DELETE /trading/queue/{id}). Distinct from
@@ -462,7 +460,7 @@ export function HoldingColumn({
 }: {
   items: OperationsResponse['holding'];
   errors: Record<string, string>;
-  activeMarket: 'kiwoom' | 'coin';
+  activeMarket: 'kiwoom';
   navigate: (path: string) => void;
 }) {
   if (!columnVisible(items, 'holding', errors)) return null;
@@ -505,7 +503,7 @@ export function TodayFillsColumn({
 }: {
   items: OperationsResponse['today_fills'];
   errors: Record<string, string>;
-  activeMarket: 'kiwoom' | 'coin';
+  activeMarket: 'kiwoom';
   navigate: (path: string) => void;
 }) {
   if (!columnVisible(items, 'today_fills', errors)) return null;
@@ -547,9 +545,7 @@ export function TodayFillsColumn({
 // -------------------------------------------
 
 export function useOperationsActions(refetch: () => void, navigate: (path: string) => void) {
-  const activeMarket = useStore((s) => s.activeMarket);
   const injectAwaitingKiwoomSession = useStore((s) => s.injectAwaitingKiwoomSession);
-  const focusAwaitingCoinSession = useStore((s) => s.focusAwaitingCoinSession);
   const startAnalysis = useStartAnalysis();
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -568,20 +564,17 @@ export function useOperationsActions(refetch: () => void, navigate: (path: strin
   // surface (OrderTicketRail) instead of submitting approve/reject/cancel
   // directly from this read-only summary column.
   //
-  // T7 review HIGH #1/#2 fix: this used to only switch the ACTIVE session id
+  // T7 review HIGH #1 fix: this used to only switch the ACTIVE session id
   // and trust that session's own local cache to already carry the right
-  // tradeProposal/awaitingApproval — which silently no-ops for kiwoom on a
-  // cache miss (setActiveKiwoomSession returns unchanged state when the
-  // session isn't in kiwoom.sessions[], stranding the approval with NO
-  // error) and can't even represent a second concurrent coin session at all
-  // (coin has no sessions[] array, just one slot). Both fixed the same way:
-  // seed the store straight from the ROW's own data (id/ticker/name/
+  // tradeProposal/awaitingApproval — which silently no-ops on a cache miss
+  // (setActiveKiwoomSession returns unchanged state when the session isn't
+  // in kiwoom.sessions[], stranding the approval with NO error). Fixed by
+  // seeding the store straight from the ROW's own data (id/ticker/name/
   // proposal/auto_approve_at — everything the poll already gave us) via
-  // injectAwaitingKiwoomSession/focusAwaitingCoinSession, so the click NEVER
-  // depends on local cache state. If the row itself lacks a proposal (a
-  // genuine state-inconsistency case — see `actionable`), focusing can't
-  // produce a renderable ticket; surface that honestly instead of pretending
-  // it worked.
+  // injectAwaitingKiwoomSession, so the click NEVER depends on local cache
+  // state. If the row itself lacks a proposal (a genuine state-inconsistency
+  // case — see `actionable`), focusing can't produce a renderable ticket;
+  // surface that honestly instead of pretending it worked.
   const handleFocusAwaiting = useCallback((row: OperationsAwaiting) => {
     if (!row.proposal) {
       setActionError('제안 데이터가 없어 주문 레일에 표시할 수 없습니다 (취소는 워크플로 화면에서 가능)');
@@ -590,14 +583,10 @@ export function useOperationsActions(refetch: () => void, navigate: (path: strin
         sessionId: row.session_id, ticker: row.ticker, name: row.name,
         proposal: row.proposal, autoApproveAt: row.auto_approve_at,
       };
-      if (activeMarket === 'kiwoom') {
-        injectAwaitingKiwoomSession(seed);
-      } else {
-        focusAwaitingCoinSession(seed);
-      }
+      injectAwaitingKiwoomSession(seed);
     }
     navigate(`/workflow/${row.session_id}`);
-  }, [activeMarket, injectAwaitingKiwoomSession, focusAwaitingCoinSession, navigate, setActionError]);
+  }, [injectAwaitingKiwoomSession, navigate, setActionError]);
 
   const handleConvertWatch = useCallback(async (watchId: string) => {
     try {
@@ -707,8 +696,6 @@ export function OperationsPanel() {
   if (state === 'error') return <Awaiting label={`운용 현황 오류 · ${err}`} />;
   if (!data) return <Awaiting label="운용 현황 로드 중…" />;
 
-  const market = activeMarket === 'coin' ? 'coin' : 'kiwoom';
-
   return (
     <div className="flex flex-col h-full min-h-0">
       {actionError && (
@@ -734,7 +721,7 @@ export function OperationsPanel() {
         <AwaitingColumn
           items={data.awaiting}
           errors={data.errors}
-          activeMarket={market}
+          activeMarket={activeMarket}
           onFocus={handleFocusAwaiting}
         />
         <WatchingColumn
@@ -747,7 +734,7 @@ export function OperationsPanel() {
         <PendingBuyColumn
           pendingBuy={data.pending_buy}
           errors={data.errors}
-          activeMarket={market}
+          activeMarket={activeMarket}
           onCancelQueued={handleCancelQueued}
           onCancelOrder={handleCancelOrder}
           onProcessQueue={handleProcessQueue}
@@ -755,13 +742,13 @@ export function OperationsPanel() {
         <HoldingColumn
           items={data.holding}
           errors={data.errors}
-          activeMarket={market}
+          activeMarket={activeMarket}
           navigate={navigate}
         />
         <TodayFillsColumn
           items={data.today_fills}
           errors={data.errors}
-          activeMarket={market}
+          activeMarket={activeMarket}
           navigate={navigate}
         />
       </div>

@@ -3,7 +3,7 @@
  *
  * TradingView Lightweight Charts implementation.
  * Supports candlestick, moving averages, and volume.
- * Connects to real Upbit API for coin markets.
+ * Connects to the real Kiwoom API for Korean stocks.
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -18,7 +18,7 @@ import {
 } from 'lightweight-charts';
 import { Loader2 } from 'lucide-react';
 import type { TimeFrame } from '@/types';
-import { getCoinCandles, getKRStockCandles } from '@/api/client';
+import { getKRStockCandles } from '@/api/client';
 
 interface TradingChartProps {
   ticker: string;
@@ -137,56 +137,12 @@ export function TradingChart({
       setError(null);
 
       try {
-        // Check if ticker is a coin market (e.g., KRW-BTC)
-        const isCoinMarket = ticker.includes('-');
         // Check if ticker is a Korean stock (6-digit numeric code)
         const isKRStock = /^\d{6}$/.test(ticker);
 
         let candles: CandlestickData[];
 
-        if (isCoinMarket) {
-          // Fetch real data from Upbit API for coin markets
-          const intervalMap: Record<TimeFrame, string> = {
-            '1m': '1m',
-            '5m': '5m',
-            '15m': '15m',
-            '1h': '1h',
-            '1d': '1d',
-            '1w': '1w',
-            '1M': '1M',
-          };
-
-          const interval = intervalMap[timeframe] || '1d';
-          const response = await getCoinCandles(ticker, interval, 200);
-
-          // Check if we got valid data
-          if (!response.candles || response.candles.length === 0) {
-            throw new Error('No candle data available');
-          }
-
-          // Transform API response to lightweight-charts format
-          // Upbit returns newest first, so reverse for chronological order
-          const transformedCandles = response.candles
-            .filter((c) => c.datetime && c.open && c.high && c.low && c.close)
-            .map((c) => ({
-              time: Math.floor(new Date(c.datetime).getTime() / 1000) as any,
-              open: c.open,
-              high: c.high,
-              low: c.low,
-              close: c.close,
-              volume: c.volume,
-            }))
-            .reverse();
-
-          if (transformedCandles.length === 0) {
-            throw new Error('Invalid candle data received');
-          }
-
-          // Cache candle data for volume chart (avoid duplicate API call)
-          candleDataRef.current = transformedCandles;
-
-          candles = transformedCandles.map(({ volume, ...rest }) => rest);
-        } else if (isKRStock) {
+        if (isKRStock) {
           // Fetch real data from Kiwoom API for Korean stocks
           // Currently only daily candles are supported by Kiwoom API
           const response = await getKRStockCandles(ticker, 'D', 100);
@@ -327,11 +283,10 @@ export function TradingChart({
         volumeSeriesRef.current = volumeSeries;
       }
 
-      // Check if coin market or Korean stock - use cached data (already fetched for candlestick)
-      const isCoinMarket = ticker.includes('-');
+      // Korean stock - use cached data (already fetched for candlestick)
       const isKRStock = /^\d{6}$/.test(ticker);
 
-      if ((isCoinMarket || isKRStock) && candleDataRef.current.length > 0) {
+      if (isKRStock && candleDataRef.current.length > 0) {
         // Use cached candle data for volume (avoid duplicate API call)
         const volumeData = candleDataRef.current.map((c) => ({
           time: c.time,

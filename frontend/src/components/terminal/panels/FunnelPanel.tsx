@@ -59,8 +59,6 @@ export function FunnelPanel() {
     handleReanalyzeWatch, handleCancelQueued, handleCancelOrder, handleProcessQueue,
   } = useOperationsActions(refetch, navigate);
 
-  const market = activeMarket === 'coin' ? 'coin' : 'kiwoom';
-
   return (
     <div className="flex flex-col h-full min-h-0 text-[11px]">
       {/* actionError is panel-wide (not WATCHLIST-only): it's set by handlers
@@ -124,13 +122,13 @@ export function FunnelPanel() {
             <AwaitingColumn
               items={data.awaiting}
               errors={data.errors}
-              activeMarket={market}
+              activeMarket={activeMarket}
               onFocus={handleFocusAwaiting}
             />
             <PendingBuyColumn
               pendingBuy={data.pending_buy}
               errors={data.errors}
-              activeMarket={market}
+              activeMarket={activeMarket}
               onCancelQueued={handleCancelQueued}
               onCancelOrder={handleCancelOrder}
               onProcessQueue={handleProcessQueue}
@@ -138,13 +136,13 @@ export function FunnelPanel() {
             <HoldingColumn
               items={data.holding}
               errors={data.errors}
-              activeMarket={market}
+              activeMarket={activeMarket}
               navigate={navigate}
             />
             <TodayFillsColumn
               items={data.today_fills}
               errors={data.errors}
-              activeMarket={market}
+              activeMarket={activeMarket}
               navigate={navigate}
             />
           </div>

@@ -12,7 +12,7 @@
  *    actions per row.
  *  - Scratchpad price polling + row-click chart link (re-homed from the
  *    deleted standalone WatchlistPanel tile, dashboard-widget-cull
- *    2026-07-14 §C-1/§C-2): batched getCoinTickers/getKRStockTickers →
+ *    2026-07-14 §C-1/§C-2): batched getKRStockTickers →
  *    updateBasketItemPrice, including the KR early-return-skip guard for a
  *    per-code null in the batch response.
  */
@@ -27,7 +27,6 @@ const getScanProgress = vi.fn();
 const getScanResults = vi.fn();
 const addToWatchList = vi.fn();
 const searchKRStocks = vi.fn();
-const getCoinTickers = vi.fn();
 const getKRStockTickers = vi.fn();
 
 vi.mock('@/api/client', () => ({
@@ -39,7 +38,6 @@ vi.mock('@/api/client', () => ({
   getScanResults: (...a: unknown[]) => getScanResults(...a),
   addToWatchList: (...a: unknown[]) => addToWatchList(...a),
   searchKRStocks: (...a: unknown[]) => searchKRStocks(...a),
-  getCoinTickers: (...a: unknown[]) => getCoinTickers(...a),
   getKRStockTickers: (...a: unknown[]) => getKRStockTickers(...a),
 }));
 
@@ -234,20 +232,6 @@ describe('DiscoverySection — Scratchpad', () => {
     );
   });
 
-  it('coin 항목의 [승격▲]은 비활성화된다 (서버 워치리스트는 KR 전용)', async () => {
-    useStore.setState({
-      basket: {
-        items: [krItem({ id: 'item-coin', marketType: 'coin', ticker: 'KRW-BTC', displayName: '비트코인' })],
-        maxItems: 10,
-        isUpdating: false,
-      },
-    });
-    render(<DiscoverySection />);
-    fireEvent.click(screen.getByRole('button', { name: /승격.*KRW-BTC/ }));
-    expect(addToWatchList).not.toHaveBeenCalled();
-    await waitFor(() => expect(getScanProgress).toHaveBeenCalled());
-  });
-
   it('6자리 종목코드 입력 후 추가 버튼이 스크래치패드에 항목을 추가한다', async () => {
     render(<DiscoverySection />);
     fireEvent.change(screen.getByPlaceholderText(/종목코드/), { target: { value: '000660' } });
@@ -321,24 +305,6 @@ describe('DiscoverySection — Scratchpad price polling (re-homed KR-price-fallb
       marketType: 'kiwoom' as const,
       ticker: '005930',
       displayName: '삼성전자',
-      price: 0,
-      prevPrice: 0,
-      changeRate: 0,
-      change: 'EVEN' as const,
-      addedAt: new Date(),
-      lastUpdated: null,
-      isLoading: false,
-      error: null,
-      ...overrides,
-    };
-  }
-
-  function coinItem(overrides: Record<string, unknown> = {}) {
-    return {
-      id: `item-${overrides.ticker ?? 'KRW-BTC'}`,
-      marketType: 'coin' as const,
-      ticker: 'KRW-BTC',
-      displayName: '비트코인',
       price: 0,
       prevPrice: 0,
       changeRate: 0,
@@ -472,40 +438,6 @@ describe('DiscoverySection — Scratchpad price polling (re-homed KR-price-fallb
     expect(screen.getByText('삼성전자')).toBeInTheDocument();
   });
 
-  // 코인 동결(freeze) fix round 2 (코디네이터 리뷰): round 1까지는 스크래치패드
-  // select에서 COIN을 고를 수 있었으므로, localStorage에 coin 항목이 남아있는
-  // 사용자가 실재할 수 있다 — 가상의 시나리오가 아니다. merge()가 이제 rehydrate
-  // 시 이런 항목을 걸러내지만(store/basket-rehydrate.test.ts가 그 불변식을
-  // 고정한다), 아래 테스트들은 그 필터를 완전히 우회하는 setState로 coin 항목을
-  // 직접 주입해 DiscoverySection 컴포넌트 자체의 방어(가격 폴링 하드코딩 차단 +
-  // 분석▶ marketType 가드)를 검증한다 — 두 겹의 방어라 어느 한쪽이 뚫려도 나머지가
-  // 언마운트된 /coin/tickers·/coin/analysis/start 호출을 막는다.
-  it('coin 항목이 basket에 있어도(레거시 상태) 가격 폴링이 /coin/tickers를 치지 않는다', async () => {
-    useStore.setState({
-      upbitApiConfigured: true,
-      basket: { items: [coinItem()], maxItems: 10, isUpdating: false },
-    });
-
-    render(<DiscoverySection />);
-
-    await waitFor(() => expect(screen.getByText('비트코인')).toBeInTheDocument());
-    expect(getCoinTickers).not.toHaveBeenCalled();
-    expect(getKRStockTickers).not.toHaveBeenCalled();
-  });
-
-  it('coin 항목의 [분석▶]은 비활성화되어 있고 클릭해도 useStartAnalysis를 호출하지 않는다', async () => {
-    useStore.setState({
-      upbitApiConfigured: true,
-      basket: { items: [coinItem()], maxItems: 10, isUpdating: false },
-    });
-
-    render(<DiscoverySection />);
-
-    const analyzeBtn = await screen.findByRole('button', { name: '분석 KRW-BTC' });
-    expect(analyzeBtn).toBeDisabled();
-    fireEvent.click(analyzeBtn);
-    expect(mockStart).not.toHaveBeenCalled();
-  });
 });
 
 // -------------------------------------------------------------------------
@@ -557,25 +489,7 @@ describe('DiscoverySection — Scratchpad power features folded in from BasketWi
       expect(screen.getByText(/잘못된 종목코드.*BAD/)).toBeInTheDocument();
     });
 
-    // 코인 동결(freeze) fix round 1: <select>에서 COIN <option>은 제거됐다(리뷰
-    // 발견 — market:'coin'으로 startCoinAnalysis까지 도달하던 배선). 이 테스트는
-    // fireEvent.change로 DOM value를 직접 주입하므로 실제 사용자가 드롭다운을 열어
-    // 고를 수 있는 옵션과 무관하게 통과한다 — market:'coin' 이후의 토큰 파싱 로직
-    // 자체(레거시 상태 방어용으로 코드는 남겨둠)를 검증하는 것이지, COIN이 여전히
-    // 선택 가능하다는 뜻이 아니다. 진짜 도달 불가능성은 아래
-    // 'select에 COIN 옵션이 없다' 테스트가 고정한다.
-    it('(레거시) market:coin 상태에서는 콤마로 구분된 여러 티커를 KRW- 접두로 추가한다', async () => {
-      render(<DiscoverySection />);
-      fireEvent.change(screen.getByRole('combobox'), { target: { value: 'coin' } });
-      fireEvent.change(screen.getByPlaceholderText(/종목코드/), { target: { value: 'BTC,ETH' } });
-      fireEvent.click(screen.getByRole('button', { name: '추가' }));
-      await waitFor(() => {
-        const tickers = useStore.getState().basket.items.map((i) => i.ticker);
-        expect(tickers).toEqual(expect.arrayContaining(['KRW-BTC', 'KRW-ETH']));
-      });
-    });
-
-    it('select에 COIN 옵션이 없다 — 동결 이후 사용자가 실제로 고를 수 있는 값은 KR뿐', () => {
+    it('select에 COIN 옵션이 없다 — 코인 스택 제거 이후 사용자가 실제로 고를 수 있는 값은 KR뿐', () => {
       render(<DiscoverySection />);
       const select = screen.getByRole('combobox') as HTMLSelectElement;
       const optionValues = Array.from(select.options).map((o) => o.value);
@@ -702,24 +616,7 @@ describe('DiscoverySection — Scratchpad power features folded in from BasketWi
   });
 
   describe('API-not-configured warning banner', () => {
-    it('coin 항목이 있고 Upbit API 미등록이면 경고 배너를 보여주고, 클릭 시 설정 모달을 연다', () => {
-      useStore.setState({
-        upbitApiConfigured: false,
-        kiwoomApiConfigured: true,
-        basket: {
-          items: [krItem({ id: 'item-coin', marketType: 'coin', ticker: 'KRW-BTC', displayName: '비트코인' })],
-          maxItems: 10,
-          isUpdating: false,
-        },
-      });
-      render(<DiscoverySection />);
-      expect(screen.getByText(/Upbit API 미등록/)).toBeInTheDocument();
-
-      fireEvent.click(screen.getByText('설정으로 이동'));
-      expect(useStore.getState().showSettingsModal).toBe(true);
-    });
-
-    it('KR 항목이 있고 Kiwoom API 미등록이면 경고 배너를 보여준다', () => {
+    it('KR 항목이 있고 Kiwoom API 미등록이면 경고 배너를 보여주고, 클릭 시 설정 모달을 연다', () => {
       useStore.setState({
         upbitApiConfigured: true,
         kiwoomApiConfigured: false,
@@ -727,6 +624,9 @@ describe('DiscoverySection — Scratchpad power features folded in from BasketWi
       });
       render(<DiscoverySection />);
       expect(screen.getByText(/Kiwoom API 미등록/)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText('설정으로 이동'));
+      expect(useStore.getState().showSettingsModal).toBe(true);
     });
 
     it('필요한 API가 모두 등록되어 있으면 경고 배너를 보여주지 않는다', () => {

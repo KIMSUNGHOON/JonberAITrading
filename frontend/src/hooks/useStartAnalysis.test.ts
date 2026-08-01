@@ -1,16 +1,14 @@
 /**
  * useStartAnalysis — P4 T3 dedup routing + held-position notice.
  *
- * Backend /analysis/start (KR + coin) now additively returns `duplicate`
- * (an active session for the ticker already existed — the response IS that
- * existing session, no new graph run) and `position_exists` (the ticker is
- * already held — the run is position-aware ADD/REDUCE/HOLD, not a fresh
- * BUY entry). These tests pin:
+ * Backend /analysis/start now additively returns `duplicate` (an active
+ * session for the ticker already existed — the response IS that existing
+ * session, no new graph run) and `position_exists` (the ticker is already
+ * held — the run is position-aware ADD/REDUCE/HOLD, not a fresh BUY entry).
+ * These tests pin:
  *  - duplicate:true focuses the existing session instead of adding a
- *    second store session (kiwoom: addKiwoomSession/wsManager.connect only
- *    fire when the session wasn't already cached locally; coin: the
- *    single-session slot's startCoinSession only fires when it isn't
- *    already the active session).
+ *    second store session (addKiwoomSession/wsManager.connect only fire
+ *    when the session wasn't already cached locally).
  *  - position_exists:true surfaces the held-position toast via
  *    setInfoNotice.
  *  - the pre-P4 (both flags false/absent) path is unchanged.
@@ -28,13 +26,11 @@ const { mockWsManager } = vi.hoisted(() => ({
 }));
 vi.mock('@/api/websocket', () => ({ wsManager: mockWsManager }));
 
-const { startKRStockAnalysis, startCoinAnalysis } = vi.hoisted(() => ({
+const { startKRStockAnalysis } = vi.hoisted(() => ({
   startKRStockAnalysis: vi.fn(),
-  startCoinAnalysis: vi.fn(),
 }));
 vi.mock('@/api/client', () => ({
   startKRStockAnalysis: (...a: unknown[]) => startKRStockAnalysis(...a),
-  startCoinAnalysis: (...a: unknown[]) => startCoinAnalysis(...a),
 }));
 
 const { createKiwoomWebSocketHandlers } = vi.hoisted(() => ({
@@ -57,13 +53,10 @@ import { useStartAnalysis } from './useStartAnalysis';
 function baseState() {
   return {
     setActiveMarket: vi.fn(),
-    startCoinSession: vi.fn(),
-    setCoinAwaitingApproval: vi.fn(),
     addKiwoomSession: vi.fn(() => true),
     setActiveKiwoomSession: vi.fn(),
     setInfoNotice: vi.fn(),
     kiwoom: { sessions: [] as Array<{ sessionId: string }> },
-    coin: { activeSessionId: null as string | null },
   };
 }
 
@@ -159,64 +152,5 @@ describe('useStartAnalysis — kiwoom', () => {
     await result.current('kiwoom', '005930', '삼성전자');
 
     expect(mockWsManager.connect).not.toHaveBeenCalled();
-  });
-});
-
-describe('useStartAnalysis — coin', () => {
-  it('fresh start (both flags false) starts the single-session slot and does not toast', async () => {
-    startCoinAnalysis.mockResolvedValue({
-      session_id: 'C1', market: 'KRW-BTC', status: 'started', message: 'ok',
-      duplicate: false, position_exists: false,
-    });
-    const { result } = renderHook(() => useStartAnalysis());
-
-    const out = await result.current('coin', 'KRW-BTC', '비트코인');
-
-    expect(out).toEqual({ sessionId: 'C1', duplicate: false, positionExists: false });
-    expect(mockState.startCoinSession).toHaveBeenCalledWith('C1', 'KRW-BTC', '비트코인');
-    expect(mockState.setInfoNotice).not.toHaveBeenCalled();
-  });
-
-  it('duplicate:true when the dedup session is ALREADY the active one leaves the single-session slot untouched', async () => {
-    mockState.coin.activeSessionId = 'C1';
-    startCoinAnalysis.mockResolvedValue({
-      session_id: 'C1', market: 'KRW-BTC', status: 'running', message: 'dup',
-      duplicate: true, position_exists: false,
-    });
-    const { result } = renderHook(() => useStartAnalysis());
-
-    const out = await result.current('coin', 'KRW-BTC', '비트코인');
-
-    expect(out).toEqual({ sessionId: 'C1', duplicate: true, positionExists: false });
-    // Must NOT reset/refocus a session that's already the active one — that
-    // would wipe any locally-held reasoningLog/tradeProposal for no reason.
-    expect(mockState.startCoinSession).not.toHaveBeenCalled();
-  });
-
-  it('duplicate:true for a DIFFERENT session than currently active re-targets the single-session slot', async () => {
-    mockState.coin.activeSessionId = 'OTHER';
-    startCoinAnalysis.mockResolvedValue({
-      session_id: 'C2', market: 'KRW-ETH', status: 'awaiting_approval', message: 'dup',
-      duplicate: true, position_exists: false,
-    });
-    const { result } = renderHook(() => useStartAnalysis());
-
-    await result.current('coin', 'KRW-ETH', '이더리움');
-
-    expect(mockState.startCoinSession).toHaveBeenCalledWith('C2', 'KRW-ETH', '이더리움');
-    expect(mockState.setCoinAwaitingApproval).toHaveBeenCalledWith(true);
-  });
-
-  it('position_exists:true surfaces the held-position notice for coin too', async () => {
-    startCoinAnalysis.mockResolvedValue({
-      session_id: 'C1', market: 'KRW-BTC', status: 'started', message: 'ok',
-      duplicate: false, position_exists: true,
-    });
-    const { result } = renderHook(() => useStartAnalysis());
-
-    const out = await result.current('coin', 'KRW-BTC', '비트코인');
-
-    expect(out.positionExists).toBe(true);
-    expect(mockState.setInfoNotice).toHaveBeenCalledWith(expect.stringContaining('이미 보유 중'));
   });
 });

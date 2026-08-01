@@ -20,13 +20,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 
 const getKRStockAccount = vi.fn();
-const getCoinAccounts = vi.fn();
-const getCoinPositions = vi.fn();
 const getOperations = vi.fn();
 vi.mock('@/api/client', () => ({
   getKRStockAccount: (...a: unknown[]) => getKRStockAccount(...a),
-  getCoinAccounts: (...a: unknown[]) => getCoinAccounts(...a),
-  getCoinPositions: (...a: unknown[]) => getCoinPositions(...a),
   getOperations: (...a: unknown[]) => getOperations(...a),
 }));
 
@@ -79,43 +75,11 @@ function krAccount(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function coinPositionsResponse(overrides: Record<string, unknown> = {}) {
-  return {
-    positions: [
-      {
-        market: 'KRW-BTC', currency: 'BTC', quantity: 0.5,
-        avg_entry_price: 50_000_000, current_price: 51_000_000,
-        unrealized_pnl: 480_000, unrealized_pnl_pct: 1.92,
-        stop_loss: null, take_profit: null, session_id: null,
-        created_at: '2026-07-13T00:00:00Z',
-      },
-    ],
-    total_value_krw: 25_500_000,
-    // Net-of-fee total, consistent with the (net) position above.
-    total_pnl: 480_000,
-    total_pnl_pct: 1.92,
-    ...overrides,
-  };
-}
-
-function coinAccountsResponse(overrides: Record<string, unknown> = {}) {
-  return {
-    accounts: [
-      { currency: 'KRW', balance: 5_000_000, locked: 0, avg_buy_price: 0, avg_buy_price_modified: false, unit_currency: 'KRW' },
-      { currency: 'BTC', balance: 0.5, locked: 0, avg_buy_price: 50_000_000, avg_buy_price_modified: false, unit_currency: 'KRW' },
-    ],
-    total_krw_value: 30_500_000,
-    ...overrides,
-  };
-}
-
 beforeEach(() => {
   vi.clearAllMocks();
   useStore.setState({ activeMarket: 'kiwoom' } as never);
   getKRStockAccount.mockResolvedValue(krAccount());
   getOperations.mockResolvedValue(operationsResponse([krHolding()]));
-  getCoinAccounts.mockResolvedValue(coinAccountsResponse());
-  getCoinPositions.mockResolvedValue(coinPositionsResponse());
 });
 
 describe('PortfolioPanel — KR 평가손익 net-of-cost consistency (P2-4 M1)', () => {
@@ -182,20 +146,5 @@ describe('PortfolioPanel — KR 평가손익 net-of-cost consistency (P2-4 M1)',
     expect(await screen.findByText('보유')).toBeInTheDocument();
     const holdingsTile = screen.getByText('보유').parentElement;
     await waitFor(() => expect(holdingsTile?.querySelector('.text-\\[14px\\]')?.textContent).toBe('1'));
-  });
-});
-
-describe('PortfolioPanel — coin 평가손익 consistency', () => {
-  beforeEach(() => {
-    useStore.setState({ activeMarket: 'coin' } as never);
-  });
-
-  it('coin 평가손익은 getCoinPositions().total_pnl(각 포지션 unrealized_pnl의 합, 이미 net)과 일치한다', async () => {
-    render(<PortfolioPanel />);
-
-    const tile = await screen.findByText('평가손익');
-    const valueEl = tile.parentElement?.querySelector('.text-\\[14px\\]');
-    // total_pnl=480_000 -> compact '₩48만'
-    await waitFor(() => expect(valueEl?.textContent).toContain('₩48만'));
   });
 });

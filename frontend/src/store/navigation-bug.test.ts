@@ -154,12 +154,13 @@ describe('Navigation Bug Investigation', () => {
   });
 
   describe('Market switching should not affect sessions', () => {
-    it('should preserve sessions when switching markets', () => {
+    it('should preserve sessions across setActiveMarket calls', () => {
       const session = createMockSession({ sessionId: 'test-session' });
       useStore.getState().addKiwoomSession(session);
 
-      // Switch markets
-      useStore.getState().setActiveMarket('coin');
+      // MarketType is 'kiwoom'-only since the coin stack's removal
+      // (2026-08-01) — this still exercises that setActiveMarket itself
+      // never touches kiwoom.sessions.
       useStore.getState().setActiveMarket('kiwoom');
 
       // Session should still exist

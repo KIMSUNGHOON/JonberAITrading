@@ -1,13 +1,12 @@
 /**
  * MarketTabs Component
  *
- * 코인 동결(freeze) 이후 유일한 마켓: Stock (KR · Kiwoom).
- * The US stock stack is FROZEN (no broker, sim-only) — the Stock tab routes
- * straight to the Korean market.
+ * 유일한 마켓: Stock (KR · Kiwoom). The US stock stack is FROZEN (no broker,
+ * sim-only) — the Stock tab routes straight to the Korean market.
  *
- * Crypto 탭은 코인 동결 fix round 1에서 제거됐다 — 사이드바/모바일 내비를 통해
- * `setActiveMarket('coin')`을 호출할 수 있는 배선이었다(리뷰 발견, 브리프 Step 미기재).
- * 코인 구현 자체는 그대로 둔다.
+ * Crypto 탭은 코인 동결 fix round 1에서 제거됐고(사이드바/모바일 내비를 통해
+ * `setActiveMarket('coin')`을 호출할 수 있는 배선이었다), 코인 스택 자체도
+ * 이후 완전히 제거됐다(2026-08-01, `MarketType`은 `'kiwoom'` 단일 유니온).
  */
 
 import { TrendingUp, Lock } from 'lucide-react';

@@ -10,10 +10,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
 const createKRStockOrder = vi.fn();
-const createCoinOrder = vi.fn();
 vi.mock('@/api/client', () => ({
   createKRStockOrder: (...a: unknown[]) => createKRStockOrder(...a),
-  createCoinOrder: (...a: unknown[]) => createCoinOrder(...a),
   startScan: vi.fn(),
   startAgentChatDiscussion: vi.fn(),
 }));
@@ -59,17 +57,6 @@ describe('CommandPalette — :buy/:sell result feedback', () => {
 
     await waitFor(() => expect(createKRStockOrder).toHaveBeenCalled());
     await waitFor(() => expect(screen.getByText(/:sell 005930 주문 실패: 잔고 부족/)).toBeInTheDocument());
-  });
-
-  it('코인 시장에서도 주문 결과를 보여준다', async () => {
-    useStore.setState({ activeMarket: 'coin' } as never);
-    createCoinOrder.mockResolvedValue({});
-    render(<CommandPalette open onClose={() => {}} />);
-
-    typeAndRun(':sell KRW-BTC 0.5 50000000');
-
-    await waitFor(() => expect(createCoinOrder).toHaveBeenCalled());
-    await waitFor(() => expect(screen.getByText(/:sell KRW-BTC 0\.5 @ 50000000 주문 접수 완료/)).toBeInTheDocument());
   });
 
   it('팔레트가 닫힌 후에도(onClose가 동기 호출됨) 주문 결과 토스트는 살아남는다', async () => {

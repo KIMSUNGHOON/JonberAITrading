@@ -1,15 +1,13 @@
 /**
- * Positions tile — live broker holdings for the active market.
+ * Positions tile — live Kiwoom broker holdings.
  *
- * Data comes from REST (per-market), NOT the store: the store's activePosition
- * is a single analysis-derived object with no stop/take. Polls every 10s,
- * keyed on activeMarket so switching the market tab re-fetches (the tile
- * never remounts).
+ * Data comes from REST, NOT the store: the store's activePosition is a
+ * single analysis-derived object with no stop/take. Polls every 10s.
  *
  * P1-4 discretionary control surface: inline STOP/TAKE edit + full close.
  * These are OPERATOR-INITIATED manual actions, not autonomous ones.
  *
- * Cleanup Task B (dashboard-widget-cull audit §C-5, 2026-07-14): KR rows are
+ * Cleanup Task B (dashboard-widget-cull audit §C-5, 2026-07-14): rows are
  * sourced from `getOperations('kiwoom')` -> `GET /trading/operations`, NOT
  * `getKRStockPositions()` -> `GET /kr_stocks/positions`. The latter
  * hardcodes `stop_loss=None, take_profit=None`
@@ -20,14 +18,11 @@
  * KiwoomPositionPanel.tsx (fixed first, commit 04597ff / 대안2 A2) for the
  * same rationale — `/operations` enriches SL/TP from the trading
  * coordinator/risk_monitor before returning it (trading.py `get_operations`),
- * so the field now reflects what was actually saved. Coin rows are
- * unaffected (getCoinPositions() is storage-based and never had this bug).
+ * so the field now reflects what was actually saved.
  *
- * `/operations` holding===null for market='kiwoom' only happens alongside an
- * `errors.holding` entry (broker fetch failed) — the "non-applicable"
- * null-with-no-error case is coin-only (get_operations' `market != "kiwoom"`
- * early return), so a null holding here is always treated as a real failure
- * (honest-degrade, mirroring KiwoomPositionPanel.tsx).
+ * `/operations` holding===null only happens alongside an `errors.holding`
+ * entry (broker fetch failed), so a null holding here is always treated as
+ * a real failure (honest-degrade, mirroring KiwoomPositionPanel.tsx).
  *
  * T7 review fixes (see .superpowers/sdd/task-7-fix-findings.md):
  * - C1: SL/TP save surfaces the backend's real outcome (including an honest
@@ -39,29 +34,28 @@
  *   the field reverts to the freshly-refetched server value instead of
  *   echoing the typed value forever (which would hide a no-op).
  * - C2: 청산 is now FULL CLOSE ONLY via the dedicated
- *   `/positions/{id}/close` endpoints (closeKRStockPosition/
- *   closeCoinPosition) — these are the only routes that actually reduce
- *   the stored position (delete it, in this case). The previous
- *   qty/%-based "partial close" fired a raw sell order that never touched
- *   the position store, so a refetch kept showing the pre-close quantity
- *   while a real sell had gone out — a stale-state oversell hazard. Rather
- *   than add a new partial-reduce backend endpoint (higher-risk surface
- *   for a safety-adjacent control), partial close is disabled; a two-click
- *   confirm guards the destructive full close.
+ *   `/positions/{id}/close` endpoint (closeKRStockPosition) — the only
+ *   route that actually reduces the stored position (deletes it, in this
+ *   case). The previous qty/%-based "partial close" fired a raw sell order
+ *   that never touched the position store, so a refetch kept showing the
+ *   pre-close quantity while a real sell had gone out — a stale-state
+ *   oversell hazard. Rather than add a new partial-reduce backend endpoint
+ *   (higher-risk surface for a safety-adjacent control), partial close is
+ *   disabled; a two-click confirm guards the destructive full close.
  */
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { useStore, selectChartSymbol } from '@/store';
 import {
-  getOperations, getCoinPositions,
+  getOperations,
   updatePositionStopLoss, updatePositionTakeProfit,
-  closeKRStockPosition, closeCoinPosition,
+  closeKRStockPosition,
 } from '@/api/client';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting, TH, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
 
 interface Row {
   sym: string;
-  code: string; // chartable symbol: KR 6-digit code or coin KRW-XXX market
+  code: string; // chartable symbol: KR 6-digit code
   qty: number;
   entry: number;
   cur: number;
@@ -84,54 +78,36 @@ function usePositions() {
     if (showLoading) setState('loading');
     setErr(null);
     try {
-      if (activeMarket === 'kiwoom') {
-        const res = await getOperations('kiwoom');
-        if (!aliveRef.current) return;
-        if (res.holding === null) {
-          // Honest degrade: for market='kiwoom' a null holding always means
-          // the broker fetch failed (see file-header note above) — never
-          // silently show zero positions.
-          setErr(res.errors.holding ?? '로드 실패');
-          setState('error');
-          return;
-        }
-        setRows(
-          res.holding.map((p) => ({
-            sym: p.name || p.ticker,
-            code: p.ticker,
-            qty: p.quantity,
-            entry: p.avg_price,
-            cur: p.current_price,
-            pnl: p.pnl,
-            pnlPct: p.pnl_pct,
-            stop: p.stop_loss,
-            take: p.take_profit,
-          })),
-        );
-      } else {
-        const res = await getCoinPositions();
-        if (!aliveRef.current) return;
-        setRows(
-          res.positions.map((p) => ({
-            sym: p.currency || p.market,
-            code: p.market,
-            qty: p.quantity,
-            entry: p.avg_entry_price,
-            cur: p.current_price,
-            pnl: p.unrealized_pnl,
-            pnlPct: p.unrealized_pnl_pct,
-            stop: p.stop_loss,
-            take: p.take_profit,
-          })),
-        );
+      const res = await getOperations('kiwoom');
+      if (!aliveRef.current) return;
+      if (res.holding === null) {
+        // Honest degrade: a null holding always means the broker fetch
+        // failed (see file-header note above) — never silently show zero
+        // positions.
+        setErr(res.errors.holding ?? '로드 실패');
+        setState('error');
+        return;
       }
+      setRows(
+        res.holding.map((p) => ({
+          sym: p.name || p.ticker,
+          code: p.ticker,
+          qty: p.quantity,
+          entry: p.avg_price,
+          cur: p.current_price,
+          pnl: p.pnl,
+          pnlPct: p.pnl_pct,
+          stop: p.stop_loss,
+          take: p.take_profit,
+        })),
+      );
       setState('ready');
     } catch (e) {
       if (!aliveRef.current) return;
       setErr(e instanceof Error ? e.message : '로드 실패');
       setState('error');
     }
-  }, [activeMarket]);
+  }, []);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -209,10 +185,9 @@ export function PositionsPanel() {
       await updatePositionStopLoss(row.code, val);
       setRowErr(row.code, null);
       // C1/M2: only treat this as a real change once the backend confirms
-      // it took effect somewhere (risk_monitor OR the coin position store —
-      // see trading.py). refetch() BEFORE clearing the override so the
-      // field flips straight to the true post-save server value with no
-      // flash of a stale one.
+      // it took effect (risk_monitor — see trading.py). refetch() BEFORE
+      // clearing the override so the field flips straight to the true
+      // post-save server value with no flash of a stale one.
       await refetch();
       clearField(row.code, 'stop');
     } catch (e) {
@@ -242,14 +217,14 @@ export function PositionsPanel() {
     }
   }
 
-  // C2: full close ONLY. The dedicated /positions/{id}/close endpoints are
-  // the only routes that actually reduce the stored position (they delete
+  // C2: full close ONLY. The dedicated /positions/{id}/close endpoint is
+  // the only route that actually reduces the stored position (it deletes
   // it on success), so this is the one action guaranteed not to leave a
   // stale, too-large quantity behind. A raw sell order for a partial
   // amount does NOT touch the position store — see task-7-fix-findings.md
   // C2 — so partial close is intentionally not offered here. Two-click
   // confirm guards the destructive action (mirrors the existing
-  // CoinPositionPanel/KiwoomPositionPanel convention).
+  // KiwoomPositionPanel convention).
   async function handleFullClose(row: Row) {
     if (confirmClose !== row.code) {
       setConfirmClose(row.code);
@@ -258,11 +233,7 @@ export function PositionsPanel() {
     setConfirmClose(null);
     setBusyRow(row.code);
     try {
-      if (activeMarket === 'kiwoom') {
-        await closeKRStockPosition(row.code);
-      } else {
-        await closeCoinPosition(row.code);
-      }
+      await closeKRStockPosition(row.code);
       setRowErr(row.code, null);
       await refetch();
     } catch (e) {

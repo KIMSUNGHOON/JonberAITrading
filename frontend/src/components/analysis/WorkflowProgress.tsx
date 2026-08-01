@@ -35,26 +35,13 @@ const STOCK_WORKFLOW_STAGES = [
   { id: 'execution', label: '체결', icon: Rocket, description: 'Trade execution' },
 ] as const;
 
-// Workflow stages for Coin analysis (matching backend CoinAnalysisStage enum)
-const COIN_WORKFLOW_STAGES = [
-  { id: 'data_collection', label: 'Data Collection', icon: GitBranch, description: 'Collecting market data' },
-  { id: 'technical', label: 'Technical Analysis', icon: LineChart, description: 'Price patterns & indicators' },
-  { id: 'market_analysis', label: 'Market Analysis', icon: Building2, description: 'Market trends & orderbook' },
-  { id: 'sentiment', label: 'Sentiment Analysis', icon: MessageSquare, description: 'Market sentiment & news' },
-  { id: 'risk', label: 'Risk Assessment', icon: Shield, description: 'Risk evaluation & position sizing' },
-  { id: 'synthesis', label: 'Synthesis', icon: Brain, description: 'Combining all analyses' },
-  { id: 'approval', label: 'Human Approval', icon: UserCheck, description: 'Awaiting your decision' },
-  { id: 'execution', label: 'Execution', icon: Rocket, description: 'Trade execution' },
-] as const;
-
-// Helper to detect if ticker is coin market (contains '-')
-function isCoinMarket(ticker: string): boolean {
-  return ticker.includes('-');
-}
-
-// Get appropriate workflow stages based on ticker
-function getWorkflowStages(ticker: string) {
-  return isCoinMarket(ticker) ? COIN_WORKFLOW_STAGES : STOCK_WORKFLOW_STAGES;
+// Get workflow stages for a ticker. Was a coin/stock branch pre-coin-removal
+// (2026-08-01) — MarketType is 'kiwoom'-only now, so this always resolves
+// to the stock stages; kept as a function (rather than inlining
+// STOCK_WORKFLOW_STAGES at each call site) so a future market addition
+// doesn't require touching every caller.
+function getWorkflowStages(_ticker: string) {
+  return STOCK_WORKFLOW_STAGES;
 }
 
 type StageStatus = 'pending' | 'in_progress' | 'completed';

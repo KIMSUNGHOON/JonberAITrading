@@ -30,12 +30,11 @@ vi.mock('@/hooks/useStartAnalysis', () => ({
 const navigate = vi.fn();
 vi.mock('react-router-dom', () => ({ useNavigate: () => navigate }));
 
-// T7 review HIGH #1/#2 fix: the REAL store is used (not a bare-vi.fn()
-// mock of setActiveKiwoomSession/setAwaitingApproval) so the reachability
-// tests below actually exercise setActiveKiwoomSession's cache-miss no-op /
-// coin's single-slot limitation instead of masking them behind a mock that
-// always "succeeds". See store/index.ts injectAwaitingKiwoomSession /
-// focusAwaitingCoinSession.
+// T7 review HIGH #1 fix: the REAL store is used (not a bare-vi.fn() mock of
+// setActiveKiwoomSession/setAwaitingApproval) so the reachability tests
+// below actually exercise setActiveKiwoomSession's cache-miss no-op instead
+// of masking it behind a mock that always "succeeds". See store/index.ts
+// injectAwaitingKiwoomSession.
 import { useStore } from '@/store';
 import { OperationsPanel, useOperations } from './OperationsPanel';
 
@@ -58,11 +57,6 @@ beforeEach(() => {
       stk_cd: '', stk_nm: null, status: 'idle', currentStage: null,
       reasoningLog: [], analyses: [], tradeProposal: null, awaitingApproval: false,
       activePosition: null, error: null, history: [],
-    },
-    coin: {
-      activeSessionId: null, market: '', koreanName: null, status: 'idle',
-      currentStage: null, reasoningLog: [], analyses: [], tradeProposal: null,
-      awaitingApproval: false, activePosition: null, error: null, history: [],
     },
   });
 });
@@ -395,49 +389,6 @@ it('감시 항목에 source가 아예 없으면(레거시) manual과 동일하�
   render(<OperationsPanel />);
   await waitFor(() => expect(screen.getByText('삼성전자')).toBeInTheDocument());
   expect(screen.queryByText('발굴')).not.toBeInTheDocument();
-});
-
-// -------------------------------------------
-// T7 review HIGH #2: coin has no sessions[] array — a single active-session
-// slot. Two concurrent AWAITING_APPROVAL coin sessions both render a row,
-// but the slot can only ever reflect one. Before this fix, clicking the
-// row that ISN'T the currently-focused one was a pure no-op (no store
-// action existed to retarget the slot from a row the FE never started/
-// streamed itself) — the second session's approval had no path. This pins
-// that BOTH are individually reachable (one at a time, per the spec).
-// -------------------------------------------
-
-it('coin: 두 개의 동시 승인대기 세션이 있어도 각 행 클릭이 그 세션을 레일에 포커스한다 (두 번째 세션도 도달 가능)', async () => {
-  useStore.setState({ activeMarket: 'coin' });
-  getOperations.mockResolvedValue({
-    ...BASE,
-    awaiting: [
-      { session_id: 'c1', ticker: 'KRW-BTC', name: '비트코인',
-        proposal: { action: 'BUY', entry_price: 100_000_000, stop_loss: 95_000_000, take_profit: 110_000_000, risk_score: 4 },
-        auto_approve_at: null },
-      { session_id: 'c2', ticker: 'KRW-ETH', name: '이더리움',
-        proposal: { action: 'BUY', entry_price: 4_000_000, stop_loss: 3_800_000, take_profit: 4_400_000, risk_score: 3 },
-        auto_approve_at: null },
-    ],
-  });
-  render(<OperationsPanel />);
-  await waitFor(() => expect(screen.getByText(/승인대기 · 2/)).toBeInTheDocument());
-
-  fireEvent.click(screen.getByText('비트코인'));
-  expect(useStore.getState().coin.activeSessionId).toBe('c1');
-  expect(useStore.getState().coin.tradeProposal).toMatchObject({ market: 'KRW-BTC', korean_name: '비트코인', entry_price: 100_000_000 });
-  expect(useStore.getState().coin.awaitingApproval).toBe(true);
-  expect(navigate).toHaveBeenCalledWith('/workflow/c1');
-
-  fireEvent.click(screen.getByText('이더리움'));
-  expect(useStore.getState().coin.activeSessionId).toBe('c2');
-  expect(useStore.getState().coin.tradeProposal).toMatchObject({ market: 'KRW-ETH', korean_name: '이더리움', entry_price: 4_000_000 });
-  expect(useStore.getState().coin.awaitingApproval).toBe(true);
-  expect(navigate).toHaveBeenCalledWith('/workflow/c2');
-
-  // Switching back to the first must retarget again (proves it's not stuck).
-  fireEvent.click(screen.getByText('비트코인'));
-  expect(useStore.getState().coin.activeSessionId).toBe('c1');
 });
 
 // -------------------------------------------

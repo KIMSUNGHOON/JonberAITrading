@@ -90,19 +90,14 @@ beforeEach(() => {
   useStore.setState({
     basket: { items: [], maxItems: 10, isUpdating: false },
     activeMarket: 'kiwoom',
-    // T7 review HIGH #1/#2: reset both market slices so each test starts
-    // from a clean sessions[]/activeSessionId — a real singleton store
-    // otherwise carries a prior test's injected/focused session forward.
+    // T7 review HIGH #1: reset the kiwoom slice so each test starts from a
+    // clean sessions[]/activeSessionId — a real singleton store otherwise
+    // carries a prior test's injected/focused session forward.
     kiwoom: {
       sessions: [], activeSessionId: null, maxConcurrentSessions: 3,
       stk_cd: '', stk_nm: null, status: 'idle', currentStage: null,
       reasoningLog: [], analyses: [], tradeProposal: null, awaitingApproval: false,
       activePosition: null, error: null, history: [],
-    },
-    coin: {
-      activeSessionId: null, market: '', koreanName: null, status: 'idle',
-      currentStage: null, reasoningLog: [], analyses: [], tradeProposal: null,
-      awaitingApproval: false, activePosition: null, error: null, history: [],
     },
   });
 });

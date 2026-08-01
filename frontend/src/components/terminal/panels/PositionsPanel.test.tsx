@@ -8,10 +8,10 @@
  * - M2: after a successful save, the field reverts to the server-fetched
  *   value on the next refetch — this is what reveals a no-op, instead of
  *   the input echoing the typed value forever.
- * - C2: 청산 is full-close only (closeKRStockPosition/closeCoinPosition, the
- *   only routes that actually reduce/delete the stored position), guarded
- *   by a two-click confirm. The old qty/%-based partial close (a raw sell
- *   order that never touched the position store) is gone.
+ * - C2: 청산 is full-close only (closeKRStockPosition, the only route that
+ *   actually reduces/deletes the stored position), guarded by a two-click
+ *   confirm. The old qty/%-based partial close (a raw sell order that never
+ *   touched the position store) is gone.
  *
  * Cleanup Task B (dashboard-widget-cull audit §C-5, 2026-07-14): KR rows now
  * come from `getOperations('kiwoom')`, NOT `getKRStockPositions()` (the
@@ -26,18 +26,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
 const getOperations = vi.fn();
-const getCoinPositions = vi.fn();
 const updatePositionStopLoss = vi.fn();
 const updatePositionTakeProfit = vi.fn();
 const closeKRStockPosition = vi.fn();
-const closeCoinPosition = vi.fn();
 vi.mock('@/api/client', () => ({
   getOperations: (...a: unknown[]) => getOperations(...a),
-  getCoinPositions: (...a: unknown[]) => getCoinPositions(...a),
   updatePositionStopLoss: (...a: unknown[]) => updatePositionStopLoss(...a),
   updatePositionTakeProfit: (...a: unknown[]) => updatePositionTakeProfit(...a),
   closeKRStockPosition: (...a: unknown[]) => closeKRStockPosition(...a),
-  closeCoinPosition: (...a: unknown[]) => closeCoinPosition(...a),
 }));
 
 
@@ -59,31 +55,10 @@ function krHolding(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function coinPosition(overrides: Record<string, unknown> = {}) {
-  return {
-    market: 'KRW-BTC',
-    currency: 'BTC',
-    quantity: 0.5,
-    avg_entry_price: 50_000_000,
-    current_price: 51_000_000,
-    unrealized_pnl: 500_000,
-    unrealized_pnl_pct: 2.0,
-    stop_loss: null,
-    take_profit: null,
-    session_id: null,
-    created_at: '2026-07-13T00:00:00Z',
-    ...overrides,
-  };
-}
-
-function positionsResponse(positions: Array<Record<string, unknown>>) {
-  return { positions, total_value_krw: 0, total_pnl: 0, total_pnl_pct: 0 };
-}
-
 // Mirrors OperationsResponse (frontend/src/types/index.ts) — `holding: null`
-// with no `errors.holding` entry only happens for market='coin' (see
-// get_operations' market != "kiwoom" early return), so for these
-// market='kiwoom' tests a null `holding` is always paired with an error.
+// with no `errors.holding` entry never happens for market='kiwoom' (see
+// get_operations' market != "kiwoom" early return), so for these tests a
+// null `holding` is always paired with an error.
 function operationsResponse(
   holding: Array<Record<string, unknown>> | null,
   errors: Record<string, string> = {},
@@ -103,7 +78,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   useStore.setState({ activeMarket: 'kiwoom', chartSymbol: null } as never);
   getOperations.mockResolvedValue(operationsResponse([]));
-  getCoinPositions.mockResolvedValue(positionsResponse([]));
 });
 
 describe('PositionsPanel — inline STOP/TAKE edit', () => {
@@ -144,7 +118,7 @@ describe('PositionsPanel — inline STOP/TAKE edit', () => {
   it('C1: 백엔드가 저장 실패를 반환하면(예: 미배선 종목) 성공으로 위장하지 않고 오류를 그대로 보여준다', async () => {
     getOperations.mockResolvedValue(operationsResponse([krHolding()]));
     updatePositionStopLoss.mockRejectedValue(
-      new Error('활성 리스크 관리 대상이 아니며 저장된 포지션도 없습니다: 005930')
+      new Error('활성 리스크 관리 대상이 아닙니다: 005930')
     );
     render(<PositionsPanel />);
 
@@ -153,7 +127,7 @@ describe('PositionsPanel — inline STOP/TAKE edit', () => {
     fireEvent.click(screen.getByLabelText('손절가 저장 005930'));
 
     await waitFor(() =>
-      expect(screen.getByText(/활성 리스크 관리 대상이 아니며 저장된 포지션도 없습니다/)).toBeInTheDocument()
+      expect(screen.getByText(/활성 리스크 관리 대상이 아닙니다/)).toBeInTheDocument()
     );
     // The row must not have been silently marked as saved — the typed value
     // stays visible (it was never confirmed), not reverted as if it worked.
@@ -247,19 +221,6 @@ describe('PositionsPanel — full close only (C2: partial close removed)', () =>
 
     fireEvent.click(btn);
     await waitFor(() => expect(closeKRStockPosition).toHaveBeenCalledWith('005930'));
-  });
-
-  it('코인 시장에서는 closeCoinPosition이 호출된다', async () => {
-    useStore.setState({ activeMarket: 'coin', chartSymbol: null } as never);
-    getCoinPositions.mockResolvedValue(positionsResponse([coinPosition()]));
-    closeCoinPosition.mockResolvedValue({});
-    render(<PositionsPanel />);
-
-    const btn = await screen.findByLabelText('전량청산 KRW-BTC');
-    fireEvent.click(btn);
-    fireEvent.click(btn);
-
-    await waitFor(() => expect(closeCoinPosition).toHaveBeenCalledWith('KRW-BTC'));
   });
 
   it('청산 성공 후 refetch로 포지션이 사라지면 낡은 수량이 남지 않는다(오버셀 방지)', async () => {
