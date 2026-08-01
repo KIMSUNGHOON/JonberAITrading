@@ -5,10 +5,13 @@ returning an ExecutionResult, isolating the incompatible broker order models:
 
 - Kiwoom: place_buy_order / place_sell_order + OrderResponse; mock-vs-live is
   handled inside the client (KIWOOM_IS_MOCK base URL).
-- Upbit: place_order(side="bid"/"ask", ord_type="limit"/"price"/"market") + Order.
 
 Leaf-ish module: imports only the execution models at top level; broker model
 imports are local to keep the dependency surface small.
+
+(2026-08-01 Upbit 제거: `UpbitExecutionAdapter`를 제거했다 — UpbitClient가
+더 이상 존재하지 않고, 실제 주문 4개 호출부는 전부 KiwoomExecutionAdapter를
+직접 생성해 ExecutionService의 market-분기 자체가 프로덕션에서 도달 불가능했다.)
 """
 
 from __future__ import annotations
@@ -63,42 +66,4 @@ class KiwoomExecutionAdapter:
             status="pending" if resp.is_success else "rejected",
             message=resp.return_msg or "",
             raw=resp,
-        )
-
-
-class UpbitExecutionAdapter:
-    """Adapt the Upbit client to the broker-agnostic execution interface."""
-
-    def __init__(self, client):
-        self.client = client
-
-    async def place(
-        self,
-        *,
-        ticker: str,
-        side: ExecutionSide,
-        qty,
-        price=None,
-        order_type: ExecutionOrderType = ExecutionOrderType.LIMIT,
-    ) -> ExecutionResult:
-        upbit_side = "bid" if side == ExecutionSide.BUY else "ask"
-        # Upbit ord_type: limit (price+volume); market buy = "price" (KRW total);
-        # market sell = "market" (volume).
-        if order_type == ExecutionOrderType.MARKET:
-            ord_type = "price" if side == ExecutionSide.BUY else "market"
-        else:
-            ord_type = "limit"
-
-        order = await self.client.place_order(
-            market=ticker,
-            side=upbit_side,
-            volume=qty,
-            price=price,
-            ord_type=ord_type,
-        )
-        return ExecutionResult(
-            success=True,
-            order_id=getattr(order, "uuid", "") or "",
-            status=getattr(order, "state", "pending") or "pending",
-            raw=order,
         )

@@ -13,8 +13,11 @@ from typing import Any
 
 
 class MarketKind(str, Enum):
+    """(2026-08-01 Upbit 제거: `COIN` 멤버를 제거했다. `MarketType`(session_manager)
+    ·`MarketType`(market_hours)와 같은 원칙 — 열거형과 `market` 파라미터는 남기고
+    멤버만 줄인다. 라우트/서비스 시그니처를 붕괴시키지 않기 위함.)"""
+
     KR_STOCK = "kr_stock"
-    COIN = "coin"
 
 
 class ExecutionSide(str, Enum):

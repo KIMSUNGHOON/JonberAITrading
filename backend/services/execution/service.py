@@ -9,10 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from services.execution.adapters import (
-    KiwoomExecutionAdapter,
-    UpbitExecutionAdapter,
-)
+from services.execution.adapters import KiwoomExecutionAdapter
 from services.execution.models import (
     ExecutionOrderType,
     ExecutionResult,
@@ -29,13 +26,10 @@ class ExecutionService:
         self,
         *,
         kr_stock: Optional[KiwoomExecutionAdapter] = None,
-        coin: Optional[UpbitExecutionAdapter] = None,
     ):
         self._by_market = {}
         if kr_stock is not None:
             self._by_market[MarketKind.KR_STOCK] = kr_stock
-        if coin is not None:
-            self._by_market[MarketKind.COIN] = coin
 
     async def place_order(
         self,
