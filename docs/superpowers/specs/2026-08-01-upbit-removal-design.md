@@ -1,7 +1,7 @@
 # Upbit(코인) 스택 제거 설계
 
 **작성일**: 2026-08-01
-**상태**: 승인됨 (설계 확정, 구현 대기)
+**상태**: 구현 완료
 **선례**: R2 US/yfinance 스택 제거 (2026-07-11) — `9effca3` 동결 → `3cf6743` 백엔드 → `570f5e1` 프론트
 
 ## 문제
@@ -114,7 +114,8 @@ API 키에 현재 IP가 등록돼 있지 않아 조회는 401로 실패하고, �
 국내 AI 밸류체인을 판단하는 별개 기능이고 지금도 살아 있다. **건드리지 않는다.**
 
 **`.env`의 `UPBIT_ACCESS_KEY`·`UPBIT_SECRET_KEY`** — 사용자 소유 gitignored 파일이라
-직접 수정하지 않는다. 3단계 완료 후 수동 제거를 안내한다. `.env.example`에서는 제거한다.
+직접 수정하지 않는다. 완료 후 수동 제거를 안내한다. `.env.example`에는 애초에
+`UPBIT` 참조가 없어(실측 0건) 할 일이 없었다.
 
 **기존 빈 `coin_*` 테이블** — 남긴다(위 참조).
 
@@ -140,3 +141,40 @@ API 키에 현재 IP가 등록돼 있지 않아 조회는 401로 실패하고, �
 세 단계를 **각각 별도 커밋**으로 남기되(되돌림 단위), 배포는 **월요일 개장 전 1회**다.
 지금은 토요일이라 장중도 EOD 발굴 창(15:30~16:35)도 아니다.
 문제가 생기면 3단계 전체가 아니라 해당 커밋만 되돌린다.
+
+## 구현이 설계를 넘어선 지점 (Task 7 기준 정직한 기록)
+
+이 설계 문서가 애초에 적지 않았던, 그러나 실제로 필요해서 구현 중 추가된 범위다.
+전부 설계의 "3단계" 틀 안에서 나온 후속이지 별개 계획이 아니다 — 리뷰가 실사용
+경로를 따라가며 찾아낸 것들이다.
+
+- **설정 표면 제거** (Task 6 리뷰 라운드 1, `a72f0ed`·`7756dd7`) — 설계는 "백엔드
+  Upbit 키 CRUD는 살아있으니 건드리지 않는다"고 전제했으나, 실제로는 그 전제가
+  절반만 맞았다: `GET/POST/DELETE /settings/upbit`는 동작했지만
+  `POST /settings/upbit/validate`는 이미 410 Gone이었고, `SettingsModal`의 기본
+  탭이 `'upbit'`라 사용자가 설정을 열면 검증이 항상 실패하는 Upbit 폼이 가장
+  먼저 보였다. 프런트 먼저(`upbitApiConfigured` write-only 상태 제거·
+  `SettingsModal`의 Upbit 탭 제거) 백엔드 나중(Upbit 키 CRUD 4개 라우트·검증
+  라우트·헬퍼 4종 제거) 순서로 전부 걷어냈고, `TradingModeResponse.coin`·
+  `TradingModeUpdate.market`의 `"coin"` 옵션도 함께 제거했다(kiwoom 단일).
+- **`app/config.py`의 `UPBIT_ACCESS_KEY`·`UPBIT_SECRET_KEY`·`UPBIT_TRADING_MODE`
+  필드 제거** (`a72f0ed`) — 소비자 0(위 설정 라우트 제거로 발생)이 된 뒤 정리.
+  `.env`의 사용자 키 자체는 건드리지 않는다(`extra="ignore"`라 남아 있어도 안전).
+- **`services/realtime_service.py` 삭제 + `/ws/ticker` 엔드포인트 제거**
+  (`1aa9c84`, `4729b8b` 후속 정리) — 2단계 "백엔드 제거"의 일부로 진행됐지만
+  설계 본문 목록엔 없었다. Upbit 실시간 시세 WebSocket을 구동하던 380줄짜리
+  서비스와 그 엔드포인트로, 코인 그래프·라우트와 마찬가지로 실사용 0.
+- **Telegram `/status` 수정** (`a72f0ed`) — `services/telegram/commands.py`가
+  `mode.coin`을 참조하고 있어, 설계대로 `TradingModeResponse.coin`을 지우면
+  `AttributeError`로 라이브 `/status` 명령이 죽는 경로였다. 리뷰가 코드
+  추적으로 직접 찾아 봉합(사전 테스트가 못 잡은 실사용 의존성).
+- **Task 7 스윕에서 추가로 잡은 것들** (본 커밋) — `PaperFillSettings.coin_fee_bps`
+  (유일한 소비처가 삭제된 코인 그래프였던 죽은 설정 필드), `services/execution/`의
+  `UpbitExecutionAdapter`·`coin=` 파라미터·`MarketKind.COIN`(설계 문서가 예상하지
+  못한 완전히 새로운 죽은 코드 계열 — Task 2의 파일 목록이 `services/execution/`을
+  아예 언급하지 않았다), `agents/prompts.py`의 코인 전용 프롬프트 상수 6개(약
+  120줄, import 0건인 고아 코드), `app/api/routes/chat.py`의 `market_label`/통화
+  추정 죽은 분기(저가 KR 종목을 `$`로 오분류할 수 있던 잠재 버그), 그 외
+  `TerminalShell.tsx`·`OrderTicketRail.tsx`의 죽은 삼항 분기와 다수의 파일에 남은
+  삭제된 파일(`coin.py`, `shared_extractors.py` 등)을 향한 낡은 주석. 상세는
+  `task-7-report.md` 참조.
