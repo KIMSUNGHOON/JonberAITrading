@@ -553,7 +553,9 @@ async def get_market_status(market: str = "krx"):
     This endpoint is optimized for frontend use with countdown_seconds.
 
     Args:
-        market: Market type (krx, crypto). Default: krx
+        market: Market type (krx). Default: krx. Any other value falls back
+            to krx — the only market this app trades (코인 스택 제거,
+            2026-08-01).
 
     Returns:
         Market status with countdown in seconds.
@@ -577,7 +579,7 @@ async def get_market_status(market: str = "krx"):
 
     return MarketStatusResponse(
         market=market_type.value.upper(),
-        name="Korea Exchange" if market_type == MarketType.KRX else "Cryptocurrency",
+        name="Korea Exchange",
         is_open=session.is_open,
         message=session.message,
         current_time=session.current_time.isoformat(),
@@ -599,7 +601,6 @@ async def get_market_hours():
     market_hours = get_market_hours_service()
 
     krx_session = market_hours.get_market_session(MarketType.KRX)
-    crypto_session = market_hours.get_market_session(MarketType.CRYPTO)
 
     return {
         "krx": {
@@ -614,13 +615,6 @@ async def get_market_hours():
                 krx_session.next_close if krx_session.is_open else krx_session.next_open,
                 krx_session.current_time
             ),
-        },
-        "crypto": {
-            "market": "CRYPTO",
-            "name": "Cryptocurrency",
-            "is_open": crypto_session.is_open,
-            "message": crypto_session.message,
-            "current_time": crypto_session.current_time.isoformat(),
         },
     }
 
@@ -1893,37 +1887,40 @@ async def get_operations(
         "today_fills": None, "errors": errors,
     }
 
-    # 1) 세션 (분석중 / 승인대기) — SQLite 영속이라 재시작도 견딤
-    try:
-        sm = await get_session_manager()
-        mt = SessionMarketType.COIN if market == "coin" else SessionMarketType.KIWOOM
-        # P4-1: kind='analysis' only -- a discussion (or other non-analysis
-        # producer) session sharing the SM store must never surface as a
-        # ghost "analyzing"/"awaiting" card on the operations board.
-        sessions = await sm.get_all_sessions(market_type=mt, kind=KIND_ANALYSIS)
-        analyzing, awaiting = [], []
-        for s in sessions.values():
-            if s.status == SessionStatus.RUNNING:
-                analyzing.append(OperationsAnalyzing(
-                    session_id=s.session_id, ticker=s.ticker,
-                    name=s.display_name, status=s.status.value,
-                    current_stage=s.state.get("current_stage"),
-                    started_at=s.created_at.isoformat() if s.created_at else None,
-                ))
-            elif s.status == SessionStatus.AWAITING_APPROVAL:
-                awaiting.append(OperationsAwaiting(
-                    session_id=s.session_id, ticker=s.ticker,
-                    name=s.display_name,
-                    proposal=_slim_proposal(s.state.get("trade_proposal")),
-                    auto_approve_at=s.state.get("auto_approve_at"),
-                    actionable=bool(s.state.get("awaiting_approval")),
-                ))
-        res["analyzing"], res["awaiting"] = analyzing, awaiting
-    except Exception as e:  # noqa: BLE001 — 섹션 독립 강등
-        errors["sessions"] = str(e)
+    # 1) 세션 (분석중 / 승인대기) — SQLite 영속이라 재시작도 견딤. 코인 스택
+    # 제거(2026-08-01) 이후 SessionMarketType은 KIWOOM 하나뿐이라 kiwoom 외
+    # market 요청(예: 프리즈 이전 프런트가 아직 보내는 ?market=coin)은 세션
+    # 조회조차 하지 않는다 -- 그 market으로는 애초에 세션이 존재할 수 없다.
+    if market == "kiwoom":
+        try:
+            sm = await get_session_manager()
+            # P4-1: kind='analysis' only -- a discussion (or other non-analysis
+            # producer) session sharing the SM store must never surface as a
+            # ghost "analyzing"/"awaiting" card on the operations board.
+            sessions = await sm.get_all_sessions(market_type=SessionMarketType.KIWOOM, kind=KIND_ANALYSIS)
+            analyzing, awaiting = [], []
+            for s in sessions.values():
+                if s.status == SessionStatus.RUNNING:
+                    analyzing.append(OperationsAnalyzing(
+                        session_id=s.session_id, ticker=s.ticker,
+                        name=s.display_name, status=s.status.value,
+                        current_stage=s.state.get("current_stage"),
+                        started_at=s.created_at.isoformat() if s.created_at else None,
+                    ))
+                elif s.status == SessionStatus.AWAITING_APPROVAL:
+                    awaiting.append(OperationsAwaiting(
+                        session_id=s.session_id, ticker=s.ticker,
+                        name=s.display_name,
+                        proposal=_slim_proposal(s.state.get("trade_proposal")),
+                        auto_approve_at=s.state.get("auto_approve_at"),
+                        actionable=bool(s.state.get("awaiting_approval")),
+                    ))
+            res["analyzing"], res["awaiting"] = analyzing, awaiting
+        except Exception as e:  # noqa: BLE001 — 섹션 독립 강등
+            errors["sessions"] = str(e)
 
     if market != "kiwoom":
-        # 코인: 큐/감시/브로커 섹션은 비해당(null, errors 없음)
+        # 코인 등 kiwoom 외 시장: 전 섹션 비해당(null, errors 없음)
         return OperationsResponse(**res)
 
     # 2) 감시 / 큐 (코디네이터 인메모리 — 실패 가능성 낮음, 그래도 독립)

@@ -228,7 +228,7 @@ async def test_get_all_sessions_kind_none_is_unfiltered_backcompat(sm):
     every existing caller that doesn't pass kind keeps seeing every kind."""
     await sm.create_session("p41-c1", MarketType.KIWOOM, "005930", "삼성전자")
     await sm.create_session(
-        "p41-c2", MarketType.COIN, "KRW-BTC", "비트코인", kind="discussion"
+        "p41-c2", MarketType.KIWOOM, "000660", "SK하이닉스", kind="discussion"
     )
     all_sessions = await sm.get_all_sessions()
     assert set(all_sessions.keys()) == {"p41-c1", "p41-c2"}

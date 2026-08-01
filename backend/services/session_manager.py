@@ -1,7 +1,7 @@
 """
 Unified Session Manager Service
 
-Provides centralized session management for all analysis types (US Stock, Coin, Korean Stock).
+Provides centralized session management for Korean Stock analysis (Kiwoom).
 
 Features:
 - Single source of truth for all sessions
@@ -12,8 +12,6 @@ Features:
 - WebSocket integration support
 
 Session Types:
-- stock: US Stock analysis (analysis.py)
-- coin: Cryptocurrency analysis (coin.py)
 - kiwoom: Korean Stock analysis (kr_stocks.py)
 """
 
@@ -101,8 +99,6 @@ _FLUSH_DEBOUNCE_SECONDS = 1.0
 
 class MarketType(str, Enum):
     """Supported market types."""
-    STOCK = "stock"      # US stocks
-    COIN = "coin"        # Cryptocurrency (Upbit)
     KIWOOM = "kiwoom"    # Korean stocks (Kiwoom)
 
 
@@ -157,7 +153,9 @@ class AnalysisSession:
     # For Korean stocks (kiwoom)
     stk_cd: Optional[str] = None
     stk_nm: Optional[str] = None
-    # For coins
+    # 코인 스택 제거(2026-08-01) 이후 신규로 채워지지 않는 휴면 필드다 --
+    # SQLite 컬럼·스키마 정리는 Task 4(저장소 배선) 몫이라 여기서는 필드
+    # 자체는 남긴다.
     market: Optional[str] = None
     korean_name: Optional[str] = None
 
@@ -196,12 +194,7 @@ class AnalysisSession:
             "kind": self.kind,
         }
 
-        if self.market_type == MarketType.STOCK:
-            base["ticker"] = self.ticker
-        elif self.market_type == MarketType.COIN:
-            base["market"] = self.market or self.ticker
-            base["korean_name"] = self.korean_name or self.display_name
-        elif self.market_type == MarketType.KIWOOM:
+        if self.market_type == MarketType.KIWOOM:
             base["stk_cd"] = self.stk_cd or self.ticker
             base["stk_nm"] = self.stk_nm or self.display_name
 
@@ -470,9 +463,23 @@ class SessionManager:
         created_at = datetime.fromisoformat(row["created_at"]) if row["created_at"] else datetime.now(timezone.utc)
         updated_at = datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else datetime.now(timezone.utc)
 
+        try:
+            market_type = MarketType(row["market_type"])
+        except ValueError:
+            # 코인 스택 제거(2026-08-01) 이후 KIWOOM만 유효하다 -- 동결 이전에
+            # 만들어진 "coin"/"stock" 행이 sessions.db에 남아 있으면 (드물지만
+            # RUNNING/AWAITING_APPROVAL 상태로 재시작을 맞을 수 있다) 여기서
+            # 예외를 던지는 대신 원본 문자열을 그대로 보존한다. 이 메서드는
+            # _load_active_sessions()를 통해 **매 재시작마다** 호출되므로,
+            # 여기서 죽으면 KIWOOM 세션까지 통째로 로드에 실패한다 -- 다른
+            # 곳(to_dict/to_legacy_dict/시장 필터 비교)이 이미
+            # isinstance(x, MarketType) 방어 패턴을 쓰고 있어 원본 문자열도
+            # 안전하게 흘러간다(문자열 Enum 비교라 != 필터링도 그대로 동작).
+            market_type = row["market_type"]
+
         return AnalysisSession(
             session_id=row["session_id"],
-            market_type=MarketType(row["market_type"]),
+            market_type=market_type,
             ticker=row["ticker"],
             display_name=row["display_name"],
             status=SessionStatus(row["status"]),
@@ -1627,8 +1634,6 @@ class SessionManager:
         }
 
         market_counts = {
-            "stock": 0,
-            "coin": 0,
             "kiwoom": 0,
         }
 
@@ -1920,11 +1925,13 @@ async def register_session(
     """
     manager = await get_session_manager()
 
-    # Convert string market_type to enum
+    # Convert string market_type to enum. 코인 스택 제거(2026-08-01) 이후
+    # KIWOOM이 유일한 시장이라 인식 실패는 KIWOOM으로 갈음한다(이전에는
+    # MarketType.STOCK으로 갈음했으나 그 멤버도 함께 제거됐다).
     try:
         mt = MarketType(market_type)
     except ValueError:
-        mt = MarketType.STOCK
+        mt = MarketType.KIWOOM
 
     session = await manager.create_session(
         session_id=session_id,

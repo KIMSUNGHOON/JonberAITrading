@@ -119,8 +119,6 @@ async def _default_paper_provider(market: str) -> bool:
             return False
 
         return True
-    if market == "coin":
-        return settings.UPBIT_TRADING_MODE == "paper"
     return False  # unknown market: not provably paper → deny
 
 
@@ -131,8 +129,7 @@ async def _default_daily_loss_provider(market: str) -> float:
     예수금) 대비 %로 환산한다 (Phase B2). 조회 실패·평가액 0은 예외로
     전파한다 — 게이트의 breaker 랩이 deny 처리하므로 fail-closed.
 
-    coin: 실현 P&L 소스가 아직 없어(coin_trades에 pnl 컬럼 없음) 0 반환 —
-    브레이커 비활성. coin 운용을 시작할 때 배선한다.
+    kiwoom 외 시장은 범위 밖 — 0 반환(브레이커 비활성).
     """
     if market == "kiwoom":
         import app.core.kiwoom_singleton as kiwoom_singleton
@@ -152,11 +149,6 @@ async def _default_daily_loss_provider(market: str) -> float:
 
 
 async def _default_positions_count_provider(market: str) -> int:
-    if market == "coin":
-        from services.storage_service import get_storage_service
-
-        storage = await get_storage_service()
-        return len(await storage.get_coin_positions())
     if market == "kiwoom":
         # Storage has no KR position store — count from the broker (the mock
         # server in paper mode). Errors bubble to the gate's fail-closed wrap.
@@ -219,7 +211,7 @@ async def _default_coordinator_active_provider(market: str) -> bool:
 async def _default_account_equity_provider(market: str) -> Optional[float]:
     """총평가액 = evlu_amt + d2_ord_psbl_amt (daily-loss breaker와 동일 소스, F4b/B2)."""
     if market != "kiwoom":
-        return None  # coin은 범위 밖 (notional %상한 미적용)
+        return None  # kiwoom 외 시장은 범위 밖 (notional %상한 미적용)
     from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 
     client = await get_shared_kiwoom_client_async()
@@ -321,11 +313,10 @@ async def check_autonomy(
                 f"daily loss {loss_pct:.2f}% >= limit {params.max_daily_loss_pct:.2f}%",
             )
 
-        # 5. Coordinator must be active (kiwoom only — coin has no equivalent
-        # fill-tracker/coordinator; scoped here, not in the provider, in case
-        # a caller ever swaps a coin-specific default in). See
-        # _default_coordinator_active_provider for why an inactive/None
-        # coordinator must deny a BUY/ADD.
+        # 5. Coordinator must be active (kiwoom only; scoped here, not in the
+        # provider, in case a caller ever swaps a market-specific default
+        # in). See _default_coordinator_active_provider for why an
+        # inactive/None coordinator must deny a BUY/ADD.
         if market == "kiwoom":
             try:
                 coordinator_ok = bool(await coordinator_active_provider(market))

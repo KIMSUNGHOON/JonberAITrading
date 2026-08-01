@@ -517,36 +517,39 @@ async def test_rearm_continues_after_one_session_errors(
     assert submit_recorder[0]["session_id"] == ok_id
 
 
-async def test_rearm_covers_both_markets_gate_can_deny_coin_only(
-    sm, fast_grace, monkeypatch, submit_recorder
-):
-    """coin is HITL-only in this codebase's default posture -- the gate
-    denies it, but the pass must still attempt it (not skip coin entirely),
-    while kiwoom (allowed) gets scheduled normally."""
+async def test_rearm_skips_non_kiwoom_session_entirely(sm, monkeypatch):
+    """코인 스택 제거(2026-08-01) 이후: MarketType은 KIWOOM 하나뿐이다 --
+    재무장 스캔에 KIWOOM 아닌 세션이 섞여 들어와도(예: 재시작 시
+    services/session_manager.py._row_to_session의 열거형 파싱 실패 폴백이
+    남길 수 있는 동결 이전의 레거시 coin 체크포인트) 재무장을 시도조차
+    하지 않고 건너뛴다. (이 테스트가 대체한 이전 버전은 "coin은 게이트가
+    거부하지만 그래도 시도는 한다"는 대칭성을 검증했다 -- 코인 분기 자체가
+    사라진 지금은 그 대칭성이 성립하지 않는다: 게이트까지도 가지 않는다.)
+    """
+    kr_id = "rearm-kr-only"
+    legacy_id = "rearm-legacy-non-kiwoom"
+    await _seed_awaiting_sm(sm, kr_id)
+    # create_session()/_seed_awaiting_sm 모두 market_type.value를 호출해
+    # 진짜 MarketType 멤버만 받는다 -- 레거시 비-KIWOOM 모양은 내부
+    # 딕셔너리에 직접 주입해 재현한다(재시작 시 _row_to_session이 남길 수
+    # 있는 것과 같은 모양: market_type이 원본 문자열로 남는다).
+    from dataclasses import replace
+
+    kr_sm_session = await sm.get_session(kr_id)
+    sm._sessions[legacy_id] = replace(
+        kr_sm_session, session_id=legacy_id, market_type="coin"
+    )
+
     calls = []
 
-    async def per_market_gate(market, **kwargs):
-        calls.append(market)
-        if market == "coin":
-            return GateDecision(allowed=False, reason="coin is hitl", check="market_mode")
-        return GateDecision(allowed=True, reason="ok", check="all")
+    async def recorder(sid, market):
+        calls.append((sid, market))
 
-    monkeypatch.setattr(injector_module, "check_autonomy", per_market_gate)
-
-    kr_id = "rearm-kr-both"
-    coin_id = "rearm-coin-both"
-    await _seed_awaiting_sm(sm, kr_id, market_type=MarketType.KIWOOM)
-    await _seed_awaiting_sm(sm, coin_id, market_type=MarketType.COIN)
+    monkeypatch.setattr(injector_module, "maybe_schedule_auto_approve", recorder)
 
     await injector_module.rearm_awaiting_approvals()
-    await asyncio.sleep(0.1)
 
-    assert "kiwoom" in calls and "coin" in calls
-    coin_sm = await sm.get_session(coin_id)
-    assert coin_sm.state.get("auto_approve_at") is None  # denied -> stays HITL
-
-    await _wait_for(lambda: len(submit_recorder) == 1)
-    assert submit_recorder[0]["session_id"] == kr_id
+    assert calls == [(kr_id, "kiwoom")]  # legacy row never reached rearm scheduling
 
 
 async def test_rearm_scans_sm_only(sm, monkeypatch):

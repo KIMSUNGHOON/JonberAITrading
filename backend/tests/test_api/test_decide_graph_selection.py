@@ -31,7 +31,7 @@ class _StopResume(Exception):
 def _sm_session(
     session_id: str,
     *,
-    market_type: MarketType = MarketType.KIWOOM,
+    market_type: "MarketType | str" = MarketType.KIWOOM,
     status: SessionStatus = SessionStatus.AWAITING_APPROVAL,
 ) -> AnalysisSession:
     if market_type == MarketType.KIWOOM:
@@ -41,15 +41,12 @@ def _sm_session(
             "stk_cd": "005930",
             "stk_nm": "삼성전자",
         }
-    elif market_type == MarketType.COIN:
-        kwargs = {
-            "ticker": "KRW-BTC",
-            "display_name": "비트코인",
-            "market": "KRW-BTC",
-            "korean_name": "비트코인",
-        }
     else:
-        kwargs = {"ticker": "AAPL", "display_name": "Apple Inc"}
+        # 코인 스택 제거(2026-08-01) 이후 KIWOOM 외 값은 전부 레거시/미지원
+        # 취급이다 -- market_type을 굳이 MarketType 인스턴스로 강제하지 않는다
+        # (services/session_manager.py._row_to_session의 열거형 파싱 실패
+        # 폴백이 원본 문자열을 그대로 남기는 것과 같은 모양).
+        kwargs = {"ticker": "KRW-BTC", "display_name": "비트코인"}
     state = {
         "awaiting_approval": True,
         "approval_status": None,
@@ -149,14 +146,15 @@ async def test_kr_session_decide_resumes_kr_graph(wired):
 @pytest.mark.asyncio
 async def test_coin_session_rejected_with_410_at_graph_selection(wired):
     """코인 스택 제거(2026-08-01) 이후 회귀 핀: 이 테스트는 원래 COIN SM
-    세션이 coin 그래프를 고른다는 대칭성을 검증했다 — coin 그래프가 삭제된
-    지금은 그 대신, 남아 있는 비-KIWOOM 체크포인트(MarketType.COIN은 아직
-    열거형에 남아 있다 — Task 3이 정리)가 KR 그래프로 조용히 흘러들지 않고
-    명시적으로 410 거부되는지 핀한다."""
+    세션이 coin 그래프를 고른다는 대칭성을 검증했다 — coin 그래프도, COIN
+    열거형 멤버도 삭제된 지금은 그 대신, 남아 있는 비-KIWOOM 체크포인트
+    (동결 이전의 레거시 coin 세션 — market_type이 문자열 "coin"으로 남아
+    있을 수 있다)가 KR 그래프로 조용히 흘러들지 않고 명시적으로 410
+    거부되는지 핀한다."""
     from fastapi import HTTPException
 
     session_id = "b-empty-coin-1"
-    wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.COIN))
+    wired["set_sm_session"](_sm_session(session_id, market_type="coin"))
 
     def boom():
         raise AssertionError("kr graph factory must not be called for a non-KIWOOM session")
@@ -167,17 +165,22 @@ async def test_coin_session_rejected_with_410_at_graph_selection(wired):
         await approval_module.submit_decision(session_id, "approved")
 
     assert exc_info.value.status_code == 410
+    assert "coin" in exc_info.value.detail
 
 
 @pytest.mark.asyncio
-async def test_unknown_market_type_fails_closed_400_at_graph_selection(wired):
-    """A market_type outside {KIWOOM, COIN} reaching the graph-selection site
-    must 400 fail-closed -- never silently default to either graph.
+async def test_unrecognized_market_type_fails_closed_410_at_graph_selection(wired):
+    """Task 3(코인 스택 제거) 이후 MarketType은 KIWOOM 하나뿐이다 -- 예전엔
+    "인식되지만 아직 거절"(coin, 410)과 "아예 모르는 값"(stock, 400) 두
+    단으로 나뉘어 있었으나 그 구분이 사라졌다: KIWOOM이 아닌 값은 무엇이든
+    (여기서는 한 번도 유효했던 적 없는 값도 포함) 그래프 선택 이전에
+    동일하게 410 fail-closed 되어야 한다 -- 절대 어느 쪽 그래프로도 조용히
+    넘어가지 않는다.
     """
     from fastapi import HTTPException
 
     session_id = "b-empty-stock-1"
-    wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.STOCK))
+    wired["set_sm_session"](_sm_session(session_id, market_type="stock"))
 
     def boom():
         raise AssertionError("graph factory must not be called for an unknown market")
@@ -187,5 +190,5 @@ async def test_unknown_market_type_fails_closed_400_at_graph_selection(wired):
     with pytest.raises(HTTPException) as exc_info:
         await approval_module.submit_decision(session_id, "approved")
 
-    assert exc_info.value.status_code == 400
-    assert "unknown session market" in exc_info.value.detail
+    assert exc_info.value.status_code == 410
+    assert "stock" in exc_info.value.detail

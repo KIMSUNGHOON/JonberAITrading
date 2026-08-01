@@ -340,17 +340,18 @@ async def test_operations_excludes_non_analysis_kind_sessions():
     assert res.awaiting == []
 
 
-async def test_operations_coin_market_returns_sessions_only():
-    """coin: 세션만 채우고 KR 전용 섹션은 null + errors 없음(비해당)."""
-    coin_sess = AnalysisSession(session_id="c1", market_type=MarketType.COIN,
-                                ticker="KRW-BTC", display_name="비트코인",
-                                status=SessionStatus.RUNNING, state={})
+async def test_operations_non_kiwoom_market_returns_no_sections():
+    """코인 스택 제거(2026-08-01) 이후: SessionMarketType에 KIWOOM 외 값이
+    없으므로 market="coin" 같은 요청은 세션 조회 자체를 건너뛴다(존재할 수
+    없는 market의 세션을 찾으려 들지 않는다) -- 전 섹션 null, errors 없음
+    (비해당, 실패 아님). 프리즈 이전 프런트가 아직 보낼 수 있는
+    ?market=coin 요청이 여기서 죽지 않는지도 함께 확인한다."""
     with patch.object(trading_mod, "get_session_manager",
-                      AsyncMock(return_value=_sm([coin_sess]))):
+                      AsyncMock(return_value=_sm([]))):
         res = await trading_mod.get_operations(
             market="coin", coordinator=_coordinator())
 
-    assert res.analyzing[0].session_id == "c1"
+    assert res.analyzing is None and res.awaiting is None
     assert res.watching is None and res.pending_buy.queue is None
     assert res.pending_buy.open_orders is None and res.holding is None
     assert res.errors == {}

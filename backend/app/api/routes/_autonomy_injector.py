@@ -473,10 +473,8 @@ async def rearm_awaiting_approvals() -> None:
             continue  # already have a candidate for this session_id
         if sm_session.market_type == MarketType.KIWOOM:
             market = "kiwoom"
-        elif sm_session.market_type == MarketType.COIN:
-            market = "coin"
         else:
-            continue  # US stock stack removed (R2) — nothing to re-arm there
+            continue  # 코인 스택 제거(2026-08-01) 이후 KIWOOM 외 시장은 재무장 대상 아님
         candidates[session_id] = market
 
     if not candidates:

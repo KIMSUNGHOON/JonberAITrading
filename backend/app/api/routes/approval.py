@@ -358,19 +358,25 @@ async def _submit_decision_locked(
     # P2 (spec §P2, review CRITICAL): market discrimination must come from the
     # SM record's market_type, NOT legacy-dict (B) membership. sm_session was
     # already fetched above and is guaranteed non-None (the 404 branch
-    # returned earlier otherwise) -- fail-closed (no B-membership fallback,
-    # no guessing) for any market_type this branch doesn't recognize.
-    if sm_session.market_type not in (MarketType.KIWOOM, MarketType.COIN):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="unknown session market — refusing to resume",
-        )
+    # returned earlier otherwise) -- fail-closed (no guessing) for any
+    # market_type this branch doesn't recognize.
+    #
+    # Task 3 (코인 스택 제거, 2026-08-01): MarketType은 이제 KIWOOM 하나뿐이다
+    # -- 예전에는 "인식은 되지만 코인이라 아직 거절"(410)과 "아예 모르는
+    # 시장"(400) 두 단으로 나뉘어 있었으나, 인식 가능한 값이 KIWOOM 하나로
+    # 줄어든 지금은 그 구분 자체가 사라졌다. 단일 가드로 합친다: KIWOOM이
+    # 아닌 모든 값(과거 coin 세션, 혹은 열거형 파싱에 실패해 원본 문자열로
+    # 남은 레거시 행 -- services/session_manager.py._row_to_session 참고)은
+    # 동일하게 410로 거절하고, KR 그래프는 절대 선택되지 않는다.
     if sm_session.market_type != MarketType.KIWOOM:
-        # 코인 스택 제거(2026-08-01) 이후 KIWOOM이 유일한 시장이다. 남아 있던
-        # 비-KIWOOM 체크포인트가 KR 그래프로 조용히 흘러드는 것을 막는다.
+        market_label = (
+            sm_session.market_type.value
+            if isinstance(sm_session.market_type, MarketType)
+            else sm_session.market_type
+        )
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
-            detail=f"지원하지 않는 시장입니다: {sm_session.market_type.value}",
+            detail=f"지원하지 않는 시장입니다: {market_label}",
         )
     graph = get_kr_stock_trading_graph()
     market = "kiwoom"

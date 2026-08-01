@@ -1,8 +1,7 @@
 """
 Market Hours Service
 
-Provides market open/close time checking for different markets.
-Supports Korean stocks (KRX) and cryptocurrency (24/7).
+Provides market open/close time checking for Korean stocks (KRX).
 
 Updated to use dynamic KRX holiday data from KRXHolidayService.
 
@@ -22,9 +21,6 @@ logger = structlog.get_logger()
 class MarketType(str, Enum):
     """Supported market types"""
     KRX = "krx"          # Korea Exchange (Korean stocks)
-    CRYPTO = "crypto"    # Cryptocurrency (24/7)
-    NYSE = "nyse"        # New York Stock Exchange
-    NASDAQ = "nasdaq"    # NASDAQ
 
 
 class MarketSession(NamedTuple):
@@ -47,8 +43,6 @@ class MarketHoursService:
 
     Supports:
     - KRX: 09:00-15:30 KST (Mon-Fri, excluding holidays)
-    - Crypto: 24/7
-    - NYSE/NASDAQ: 09:30-16:00 EST (Mon-Fri, excluding holidays)
 
     Note: KRX holidays are now dynamically loaded from KRXHolidayService.
     Fallback to hardcoded holidays if service is unavailable.
@@ -180,12 +174,8 @@ class MarketHoursService:
         """
         now = datetime.now(KST)
 
-        if market == MarketType.CRYPTO:
-            return self._get_crypto_session(now)
-        elif market == MarketType.KRX:
+        if market == MarketType.KRX:
             return self._get_krx_session(now)
-        elif market in (MarketType.NYSE, MarketType.NASDAQ):
-            return self._get_us_session(now, market)
         else:
             return MarketSession(
                 is_open=False,
