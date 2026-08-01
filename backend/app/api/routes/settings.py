@@ -205,7 +205,7 @@ async def validate_upbit_api_keys():
     불가능하다 — 조용히 무언가를 반환하는 대신 명시적으로 거부한다.
     """
     raise HTTPException(
-        status_code=410,
+        status_code=status.HTTP_410_GONE,
         detail="코인(Upbit) 연동이 제거되어 더 이상 지원하지 않습니다.",
     )
 

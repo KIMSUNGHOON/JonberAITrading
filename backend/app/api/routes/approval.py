@@ -369,8 +369,8 @@ async def _submit_decision_locked(
         # 코인 스택 제거(2026-08-01) 이후 KIWOOM이 유일한 시장이다. 남아 있던
         # 비-KIWOOM 체크포인트가 KR 그래프로 조용히 흘러드는 것을 막는다.
         raise HTTPException(
-            status_code=410,
-            detail=f"지원하지 않는 시장입니다: {sm_session.market_type}",
+            status_code=status.HTTP_410_GONE,
+            detail=f"지원하지 않는 시장입니다: {sm_session.market_type.value}",
         )
     graph = get_kr_stock_trading_graph()
     market = "kiwoom"

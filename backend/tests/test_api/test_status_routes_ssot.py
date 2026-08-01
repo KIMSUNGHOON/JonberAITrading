@@ -1,10 +1,11 @@
-"""P1-3: KR·coin GET /analysis/status/{id} 가 SM 단독으로 읽는다.
+"""P1-3: KR GET /analysis/status/{id} 가 SM 단독으로 읽는다.
 
-두 status 라우트는 SessionManager(SQLite 영속)만 읽는다(legacy in-memory
-dict는 P3-1에서 완전 삭제됨). coin은 이전까지 `get_coin_session` 헬퍼로
-legacy dict 단독 조회였기 때문에(재시작 후 legacy dict가 비면 404), 이
-태스크가 coin 라우트에 처음으로 재시작 내성을 부여했다. 응답 스키마 구성
-코드와 404 시맨틱은 무변경.
+status 라우트는 SessionManager(SQLite 영속)만 읽는다(legacy in-memory
+dict는 P3-1에서 완전 삭제됨). 응답 스키마 구성 코드와 404 시맨틱은 무변경.
+
+코인 스택 제거(2026-08-01) 이전에는 이 파일에 coin status 라우트용 대칭
+테스트 2건(재시작 생존/부재 404)도 있었다 — coin 라우트 구현체 자체가
+삭제돼 더는 테스트할 대상이 없어 제거했다.
 
 DB 격리: SessionManager는 모듈 싱글턴(services.session_manager.
 _session_manager) + 기본 DB_PATH="data/sessions.db"(라이브 파일)를 쓴다.
@@ -49,22 +50,6 @@ def client(_isolated_sm_db):
 
 
 @pytest.mark.asyncio
-async def test_coin_status_route_survives_restart(client):
-    """legacy dict에 없는(=재시작 후) SM 세션이 coin status 라우트에서 200."""
-    from services.session_manager import MarketType, SessionStatus, get_session_manager
-    sm = await get_session_manager()
-    s = await sm.create_session(
-        "ssot-p13-coin", MarketType.COIN, "KRW-BTC", "비트코인",
-        market="KRW-BTC", korean_name="비트코인",
-        state={"reasoning_log": [], "current_stage": "done"},
-    )
-    s.status = SessionStatus.COMPLETED
-    resp = client.get("/api/coin/analysis/status/ssot-p13-coin")
-    assert resp.status_code == 200
-    assert resp.json()["session_id"] == "ssot-p13-coin"
-
-
-@pytest.mark.asyncio
 async def test_kr_status_route_sm_only(client):
     """legacy dict에 없는 SM 세션이 KR status 라우트에서 200 (기존에도 폴백은
     있었지만, True 분기에서는 legacy dict를 아예 스캔하지 않는다)."""
@@ -84,12 +69,5 @@ async def test_kr_status_route_sm_only(client):
 async def test_kr_status_route_404_when_absent(client):
     """SM에도 legacy dict에도 없는 세션은 여전히 404 (시맨틱 보존)."""
     resp = client.get("/api/kr_stocks/analysis/status/ssot-p13-kr-missing")
-    assert resp.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_coin_status_route_404_when_absent(client):
-    """SM에도 legacy dict에도 없는 세션은 여전히 404 (시맨틱 보존)."""
-    resp = client.get("/api/coin/analysis/status/ssot-p13-coin-missing")
     assert resp.status_code == 404
 

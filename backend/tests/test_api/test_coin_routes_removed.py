@@ -22,6 +22,7 @@ def test_kr_and_trading_routes_survive():
 
 
 import importlib
+import re
 
 import pytest
 
@@ -38,7 +39,10 @@ import pytest
     ],
 )
 def test_coin_modules_are_gone(module):
-    with pytest.raises(ModuleNotFoundError):
+    # match= 없이는 부모 패키지(app.api.routes 등)가 무관한 이유로 깨져도
+    # ModuleNotFoundError라는 타입만 보고 통과해버린다 — 정확히 그 모듈
+    # 자체가 없다는 메시지인지까지 고정한다(이 태스크가 실제로 겪은 함정).
+    with pytest.raises(ModuleNotFoundError, match=rf"^No module named '{re.escape(module)}'$"):
         importlib.import_module(module)
 
 

@@ -6,11 +6,9 @@ Provides real-time streaming of:
 - Status updates
 - Trade proposals
 - Position updates
-- Real-time market data (ticker, trade)
 """
 
 import asyncio
-import json
 import time
 from datetime import datetime, timezone
 from typing import Optional, Any
