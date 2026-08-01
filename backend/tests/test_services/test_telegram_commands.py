@@ -78,7 +78,9 @@ async def _reply_text(message) -> str:
 
 
 async def test_status_reports_core_fields_when_sources_succeed(monkeypatch):
-    mode = SimpleNamespace(kiwoom="autonomous", coin="hitl", master_enabled=True)
+    # upbit-removal Task 6 fix round 1: TradingModeResponse dropped `coin`
+    # (2026-08-01) — `_format_status` only ever renders `kiwoom` now.
+    mode = SimpleNamespace(kiwoom="autonomous", master_enabled=True)
     trading_status = SimpleNamespace(
         mode="autonomous", is_active=True, started_at=None,
         daily_trades=3, max_daily_trades=10, pending_alerts_count=2,
@@ -105,7 +107,6 @@ async def test_status_reports_core_fields_when_sources_succeed(monkeypatch):
     text = await _reply_text(message)
     assert "모드" in text
     assert "autonomous" in text
-    assert "hitl" in text
     assert "개장" in text
     assert "가동중" in text
 
@@ -136,7 +137,7 @@ async def test_fetch_trading_mode_wires_to_settings_response_builder(monkeypatch
     settings.py:125-133 response builder, not some other source."""
     import app.api.routes.settings as settings_routes
 
-    sentinel = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=False)
+    sentinel = SimpleNamespace(kiwoom="hitl", master_enabled=False)
     monkeypatch.setattr(
         settings_routes, "_trading_mode_response", AsyncMock(return_value=sentinel)
     )
@@ -611,7 +612,7 @@ async def test_set_trading_mode_wires_to_settings_put_handler(monkeypatch):
     async def fake_set_trading_mode(update):
         captured["market"] = update.market
         captured["mode"] = update.mode
-        return SimpleNamespace(kiwoom=update.mode, coin="hitl", master_enabled=True)
+        return SimpleNamespace(kiwoom=update.mode, master_enabled=True)
 
     monkeypatch.setattr(settings_routes, "set_trading_mode", fake_set_trading_mode)
 
@@ -654,7 +655,7 @@ def _auto_button_data(message) -> str:
 
 
 async def test_auto_master_gate_off_replies_honestly_with_no_button(monkeypatch):
-    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=False)
+    mode = SimpleNamespace(kiwoom="hitl", master_enabled=False)
     monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
 
     update, message = _make_update()
@@ -668,7 +669,7 @@ async def test_auto_master_gate_off_replies_honestly_with_no_button(monkeypatch)
 
 
 async def test_auto_master_gate_on_sends_confirm_button(monkeypatch):
-    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=True)
+    mode = SimpleNamespace(kiwoom="hitl", master_enabled=True)
     monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
 
     update, message = _make_update()
@@ -692,7 +693,7 @@ async def test_auto_master_gate_on_sends_confirm_button(monkeypatch):
 async def test_auto_issues_a_fresh_nonce_every_call_rotating_out_the_previous(monkeypatch):
     """TDD ①: /auto 2회 -> 두 버튼의 callback_data 상이(논스 회전), 이전
     논스 콜백=만료 처리(모드 무변경·rearm 미호출)."""
-    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=True)
+    mode = SimpleNamespace(kiwoom="hitl", master_enabled=True)
     monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
 
     update1, message1 = _make_update()
@@ -758,7 +759,7 @@ def _tg_config(chat_id: str = "12345") -> TelegramConfig:
 
 async def test_auto_confirm_callback_saves_autonomous_mode_and_rearms_and_edits(monkeypatch):
     """TDD ④ (정상 경로): 발급 -> TTL 내 일치 콜백 -> 모드 저장+rearm+편집."""
-    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=True)
+    mode = SimpleNamespace(kiwoom="hitl", master_enabled=True)
     monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
     update0, message0 = _make_update()
     await commands.handle_auto(update0, MagicMock())
@@ -793,7 +794,7 @@ async def test_auto_confirm_callback_saves_autonomous_mode_and_rearms_and_edits(
 async def test_auto_confirm_callback_replay_after_success_is_expired(monkeypatch):
     """TDD ④ 후반부: 성공 소모 후 재클릭 = 만료 (1회성 -- 같은 버튼을 두 번
     눌러도 두 번째 자율 재전환은 일어나지 않는다)."""
-    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=True)
+    mode = SimpleNamespace(kiwoom="hitl", master_enabled=True)
     monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
     update0, message0 = _make_update()
     await commands.handle_auto(update0, MagicMock())
@@ -835,7 +836,7 @@ async def test_auto_confirm_callback_replay_after_success_is_expired(monkeypatch
 async def test_auto_confirm_callback_expired_after_ttl(monkeypatch):
     """TDD ②: TTL 경과(monkeypatch) 후 콜백 = 만료 처리."""
     monkeypatch.setattr(commands, "AUTO_CONFIRM_TTL_SECONDS", 0.05)
-    mode = SimpleNamespace(kiwoom="hitl", coin="hitl", master_enabled=True)
+    mode = SimpleNamespace(kiwoom="hitl", master_enabled=True)
     monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
 
     update0, message0 = _make_update()
@@ -900,7 +901,7 @@ async def test_halt_invalidates_outstanding_auto_confirm_nonce_then_stale_callba
     /halt(긴급 정지) -> 나중에 그 오래된 확인 버튼을 오클릭 -> 아무 재확인
     없이 autonomous 재전환+rearm이 일어나서는 안 된다 (리뷰 결함이 직격하는
     시나리오)."""
-    mode = SimpleNamespace(kiwoom="autonomous", coin="hitl", master_enabled=True)
+    mode = SimpleNamespace(kiwoom="autonomous", master_enabled=True)
     monkeypatch.setattr(commands, "_fetch_trading_mode", AsyncMock(return_value=mode))
 
     update0, message0 = _make_update()
@@ -945,7 +946,7 @@ async def test_set_kiwoom_autonomous_wires_to_settings_put_handler(monkeypatch):
     async def fake_set_trading_mode(update):
         captured["market"] = update.market
         captured["mode"] = update.mode
-        return SimpleNamespace(kiwoom=update.mode, coin="hitl", master_enabled=True)
+        return SimpleNamespace(kiwoom=update.mode, master_enabled=True)
 
     monkeypatch.setattr(settings_routes, "set_trading_mode", fake_set_trading_mode)
 

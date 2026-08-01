@@ -201,7 +201,7 @@ def _format_status(mode, trading_status, market_status, heartbeat) -> str:
 
     if mode is not None:
         master = "ON" if mode.master_enabled else "OFF"
-        lines.append(f"모드: 키움={mode.kiwoom} 코인={mode.coin} (마스터 {master})")
+        lines.append(f"모드: 키움={mode.kiwoom} (마스터 {master})")
     else:
         lines.append(f"모드: {_NO_DATA}")
 

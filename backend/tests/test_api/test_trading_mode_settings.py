@@ -1,8 +1,13 @@
 """R3 t2: per-market trading_mode settings API + autonomy limits.
 
 GET/PUT /api/settings/trading-mode backed by the persisted app_settings store
-(R3 t1). Defaults: both markets 'hitl', master gate (AUTONOMY_ENABLED env)
-False. RiskParameters gains the autonomy safety-rail defaults.
+(R3 t1). Defaults: kiwoom 'hitl', master gate (AUTONOMY_ENABLED env) False.
+RiskParameters gains the autonomy safety-rail defaults.
+
+upbit-removal Task 6 fix round 1: the `coin` field/market option was removed
+from TradingModeResponse/TradingModeUpdate (2026-08-01) — the coin trading
+stack is gone, so a per-market mode for a market that can't trade was dead
+surface. `kiwoom` is now the only accepted market.
 """
 
 import os
@@ -41,7 +46,6 @@ def test_get_defaults_hitl_and_master_disabled(client: TestClient, isolated_stor
     assert response.status_code == 200
     data = response.json()
     assert data["kiwoom"] == "hitl"
-    assert data["coin"] == "hitl"
     assert data["master_enabled"] is False  # AUTONOMY_ENABLED defaults False
 
 
@@ -53,7 +57,6 @@ def test_put_updates_one_market_and_persists(client: TestClient, isolated_storag
     assert response.status_code == 200
     data = response.json()
     assert data["kiwoom"] == "autonomous"
-    assert data["coin"] == "hitl"
 
     # Reflected on subsequent GET (read from the persisted store)
     data = client.get("/api/settings/trading-mode").json()
@@ -61,6 +64,9 @@ def test_put_updates_one_market_and_persists(client: TestClient, isolated_storag
 
 
 def test_put_rejects_invalid_values(client: TestClient, isolated_storage):
+    assert client.put(
+        "/api/settings/trading-mode", json={"market": "coin", "mode": "hitl"}
+    ).status_code == 422
     assert client.put(
         "/api/settings/trading-mode", json={"market": "stock", "mode": "hitl"}
     ).status_code == 422

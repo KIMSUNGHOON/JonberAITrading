@@ -78,13 +78,6 @@ class Settings(BaseSettings):
     STORAGE_DB_PATH: str = "data/storage.db"
 
     # -------------------------------------------
-    # Upbit API Configuration (Cryptocurrency)
-    # -------------------------------------------
-    UPBIT_ACCESS_KEY: str | None = None
-    UPBIT_SECRET_KEY: str | None = None
-    UPBIT_TRADING_MODE: Literal["paper", "live"] = "paper"
-
-    # -------------------------------------------
     # Kiwoom REST API Configuration (Korean Stocks)
     # -------------------------------------------
     KIWOOM_APP_KEY: str | None = None
