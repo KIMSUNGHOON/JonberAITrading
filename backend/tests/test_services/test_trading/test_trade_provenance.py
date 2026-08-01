@@ -66,25 +66,6 @@ async def legacy_db_path(tmp_path):
             )
             """
         )
-        await conn.execute(
-            """
-            CREATE TABLE coin_trades (
-                id TEXT PRIMARY KEY,
-                session_id TEXT,
-                market TEXT NOT NULL,
-                side TEXT NOT NULL,
-                order_type TEXT NOT NULL,
-                price REAL NOT NULL,
-                volume REAL NOT NULL,
-                executed_volume REAL NOT NULL,
-                fee REAL DEFAULT 0,
-                total_krw REAL NOT NULL,
-                state TEXT NOT NULL,
-                order_uuid TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
         await conn.commit()
 
     return db_path
@@ -102,19 +83,6 @@ async def test_initialize_alters_legacy_kr_stock_trades_table(legacy_db_path):
 
     async with aiosqlite.connect(str(legacy_db_path)) as conn:
         cursor = await conn.execute("PRAGMA table_info(kr_stock_trades)")
-        columns = {row[1] for row in await cursor.fetchall()}
-
-    assert {"decision_id", "strategy_id", "entry_or_exit"} <= columns
-
-
-async def test_initialize_alters_legacy_coin_trades_table(legacy_db_path):
-    import aiosqlite
-
-    storage = ss.StorageService(db_path=legacy_db_path)
-    await storage.initialize()
-
-    async with aiosqlite.connect(str(legacy_db_path)) as conn:
-        cursor = await conn.execute("PRAGMA table_info(coin_trades)")
         columns = {row[1] for row in await cursor.fetchall()}
 
     assert {"decision_id", "strategy_id", "entry_or_exit"} <= columns

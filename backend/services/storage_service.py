@@ -80,64 +80,14 @@ class StorageService:
                     )
                 """)
 
-                # Coin trades table
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS coin_trades (
-                        id TEXT PRIMARY KEY,
-                        session_id TEXT,
-                        market TEXT NOT NULL,
-                        side TEXT NOT NULL,
-                        order_type TEXT NOT NULL,
-                        price REAL NOT NULL,
-                        volume REAL NOT NULL,
-                        executed_volume REAL NOT NULL,
-                        fee REAL DEFAULT 0,
-                        total_krw REAL NOT NULL,
-                        state TEXT NOT NULL,
-                        order_uuid TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-
-                # Coin positions table
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS coin_positions (
-                        market TEXT PRIMARY KEY,
-                        currency TEXT NOT NULL,
-                        quantity REAL NOT NULL,
-                        avg_entry_price REAL NOT NULL,
-                        stop_loss REAL,
-                        take_profit REAL,
-                        session_id TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-
-                # Coin realized P&L table (P2-4 Task P0: coin had no
-                # realized-P&L record at all — paper_performance is KR-only.
-                # Minimal shape: one row per close/reduce, mirroring
-                # coin_trades' style rather than trying to reuse it (a trade
-                # row is a single execution; a realized row is a matched
-                # entry/exit pair with the resulting P&L).
-                await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS coin_realized_pnl (
-                        id TEXT PRIMARY KEY,
-                        session_id TEXT,
-                        market TEXT NOT NULL,
-                        entry_price REAL NOT NULL,
-                        exit_price REAL NOT NULL,
-                        quantity REAL NOT NULL,
-                        realized_amount REAL NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-
                 # KR stock trades table (P1-1: the /trades tab had no backing
                 # storage — nothing recorded a fill anywhere, and the route
                 # masked the missing methods as an empty list via
-                # `except AttributeError`). Mirrors coin_trades' shape,
-                # adapted to KRStockTradeRecord's field names.
+                # `except AttributeError`). (2026-08-01 Upbit 제거: 이 표는
+                # 원래 coin_trades를 본떠 만들었다 — 그 원본과 coin_positions/
+                # coin_realized_pnl은 이제 이 파일에서 생성하지 않는다. 기존
+                # 운영 DB의 빈 coin_* 테이블 3개는 라이브 마이그레이션 위험을
+                # 피하기 위해 DROP하지 않고 그대로 남겨둔다.)
                 await conn.execute("""
                     CREATE TABLE IF NOT EXISTS kr_stock_trades (
                         id TEXT PRIMARY KEY,
@@ -430,22 +380,16 @@ class StorageService:
                 )
 
                 # Trade <-> decision provenance (Phase1 C2): kr_stock_trades
-                # and coin_trades predate decision_id/strategy_id/
-                # entry_or_exit -- there is no migration mechanism in this
-                # project, so an already-deployed DB only ever gets these
-                # columns via this ALTER path on the next initialize().
+                # predates decision_id/strategy_id/entry_or_exit -- there is
+                # no migration mechanism in this project, so an
+                # already-deployed DB only ever gets these columns via this
+                # ALTER path on the next initialize(). (2026-08-01 Upbit
+                # 제거: coin_trades에 대한 동일 ALTER 호출은 이제 없다 —
+                # 그 테이블은 이 파일에서 더 이상 생성되지 않고, 기존 운영
+                # DB의 coin_trades는 0행이라 컬럼 추가가 의미 없다.)
                 await self._ensure_columns(
                     conn,
                     "kr_stock_trades",
-                    {
-                        "decision_id": "TEXT",
-                        "strategy_id": "TEXT",
-                        "entry_or_exit": "TEXT",
-                    },
-                )
-                await self._ensure_columns(
-                    conn,
-                    "coin_trades",
                     {
                         "decision_id": "TEXT",
                         "strategy_id": "TEXT",
@@ -514,29 +458,9 @@ class StorageService:
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at)"
                 )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_market ON coin_trades(market)"
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_session ON coin_trades(session_id)"
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_created ON coin_trades(created_at DESC)"
-                )
-                # Composite index for market + time sorting (frequently used together)
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_market_created ON coin_trades(market, created_at DESC)"
-                )
-                # Index for state filtering
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_state ON coin_trades(state)"
-                )
-                # Index for side filtering (buy/sell statistics)
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_side ON coin_trades(side)"
-                )
-
-                # KR stock trades indexes (mirrors coin_trades' set above)
+                # KR stock trades indexes (2026-08-01 Upbit 제거 이전에는
+                # coin_trades의 인덱스 세트를 본떠 만들었다 — 그 원본 인덱스
+                # 6개는 이제 이 파일에 없다)
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_kr_stock_trades_stk_cd ON kr_stock_trades(stk_cd)"
                 )
@@ -553,21 +477,6 @@ class StorageService:
                 # Additional indexes for common query patterns
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)"
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_positions_quantity ON coin_positions(quantity)"
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_positions_updated ON coin_positions(updated_at DESC)"
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_positions_session ON coin_positions(session_id)"
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_realized_pnl_market ON coin_realized_pnl(market)"
-                )
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_realized_pnl_created ON coin_realized_pnl(created_at DESC)"
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_kr_realized_pnl_stk_cd ON kr_realized_pnl(stk_cd)"
@@ -1020,421 +929,6 @@ class StorageService:
             logger.error("cleanup_failed", error=str(e))
             return 0
 
-    # -------------------------------------------
-    # Coin Trading Operations
-    # -------------------------------------------
-
-    async def save_coin_trade(self, trade: dict[str, Any]) -> bool:
-        """
-        Save a coin trade record.
-
-        Args:
-            trade: Trade data dictionary with keys:
-                - id, session_id, market, side, order_type, price,
-                - volume, executed_volume, fee, total_krw, state, order_uuid
-
-        Returns:
-            True if saved successfully
-        """
-        await self.initialize()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO coin_trades
-                    (id, session_id, market, side, order_type, price, volume,
-                     executed_volume, fee, total_krw, state, order_uuid, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        trade["id"],
-                        trade.get("session_id"),
-                        trade["market"],
-                        trade["side"],
-                        trade["order_type"],
-                        trade["price"],
-                        trade["volume"],
-                        trade["executed_volume"],
-                        trade.get("fee", 0),
-                        trade["total_krw"],
-                        trade["state"],
-                        trade.get("order_uuid"),
-                        trade.get("created_at", datetime.now()),
-                    ),
-                )
-                await conn.commit()
-                logger.debug("coin_trade_saved", trade_id=trade["id"])
-                return True
-        except Exception as e:
-            logger.error("coin_trade_save_failed", trade_id=trade.get("id"), error=str(e))
-            return False
-
-    async def get_coin_trades(
-        self,
-        market: Optional[str] = None,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        """
-        Get coin trade history.
-
-        Args:
-            market: Filter by market code (optional)
-            limit: Maximum records to return
-            offset: Offset for pagination
-
-        Returns:
-            List of trade records
-        """
-        await self.initialize()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                conn.row_factory = aiosqlite.Row
-
-                if market:
-                    cursor = await conn.execute(
-                        """
-                        SELECT * FROM coin_trades
-                        WHERE market = ?
-                        ORDER BY created_at DESC
-                        LIMIT ? OFFSET ?
-                        """,
-                        (market.upper(), limit, offset),
-                    )
-                else:
-                    cursor = await conn.execute(
-                        """
-                        SELECT * FROM coin_trades
-                        ORDER BY created_at DESC
-                        LIMIT ? OFFSET ?
-                        """,
-                        (limit, offset),
-                    )
-
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error("coin_trades_get_failed", error=str(e))
-            return []
-
-    async def get_coin_trade(self, trade_id: str) -> Optional[dict[str, Any]]:
-        """Get a single trade by ID."""
-        await self.initialize()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute(
-                    "SELECT * FROM coin_trades WHERE id = ?",
-                    (trade_id,),
-                )
-                row = await cursor.fetchone()
-                return dict(row) if row else None
-        except Exception as e:
-            logger.error("coin_trade_get_failed", trade_id=trade_id, error=str(e))
-            return None
-
-    async def get_coin_trades_count(self, market: Optional[str] = None) -> int:
-        """Get total count of trades for pagination."""
-        await self.initialize()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                if market:
-                    cursor = await conn.execute(
-                        "SELECT COUNT(*) FROM coin_trades WHERE market = ?",
-                        (market.upper(),),
-                    )
-                else:
-                    cursor = await conn.execute("SELECT COUNT(*) FROM coin_trades")
-                row = await cursor.fetchone()
-                return row[0] if row else 0
-        except Exception as e:
-            logger.error("coin_trades_count_failed", error=str(e))
-            return 0
-
-    async def save_coin_position(self, position: dict[str, Any]) -> bool:
-        """
-        Save or update a coin position, weighted-averaging repeat buys.
-
-        `position["quantity"]`/`["avg_entry_price"]` are treated as the
-        INCREMENTAL buy being added, not the total position — every caller
-        (paper + live BUY execution) passes this trade's own qty/price. If a
-        position already exists for the market, the stored quantity/avg
-        entry price are combined with the incoming values via a
-        quantity-weighted average; otherwise this is just the first buy.
-
-        (P2-4 Task P0 fix: this used to be `INSERT OR REPLACE`, so a second
-        BUY of the same market overwrote avg_entry_price/quantity with only
-        the last buy's values instead of averaging — repeated buys silently
-        discarded all prior cost basis.)
-
-        Args:
-            position: Position data with keys:
-                - market, currency, quantity, avg_entry_price,
-                - stop_loss, take_profit, session_id
-
-        Returns:
-            True if saved successfully
-        """
-        await self.initialize()
-
-        market = position["market"].upper()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute(
-                    "SELECT quantity, avg_entry_price FROM coin_positions WHERE market = ?",
-                    (market,),
-                )
-                existing = await cursor.fetchone()
-
-                incoming_quantity = float(position["quantity"])
-                incoming_price = float(position["avg_entry_price"])
-
-                final_quantity = incoming_quantity
-                final_avg_entry_price = incoming_price
-
-                if existing and float(existing["quantity"]) > 0:
-                    old_quantity = float(existing["quantity"])
-                    old_avg_entry_price = float(existing["avg_entry_price"])
-                    combined_quantity = old_quantity + incoming_quantity
-
-                    if combined_quantity > 0:
-                        final_avg_entry_price = (
-                            old_quantity * old_avg_entry_price
-                            + incoming_quantity * incoming_price
-                        ) / combined_quantity
-                    final_quantity = combined_quantity
-
-                await conn.execute(
-                    """
-                    INSERT OR REPLACE INTO coin_positions
-                    (market, currency, quantity, avg_entry_price, stop_loss,
-                     take_profit, session_id, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?,
-                            COALESCE((SELECT created_at FROM coin_positions WHERE market = ?), ?),
-                            ?)
-                    """,
-                    (
-                        market,
-                        position["currency"],
-                        final_quantity,
-                        final_avg_entry_price,
-                        position.get("stop_loss"),
-                        position.get("take_profit"),
-                        position.get("session_id"),
-                        market,
-                        datetime.now(),
-                        datetime.now(),
-                    ),
-                )
-                await conn.commit()
-                logger.debug(
-                    "coin_position_saved",
-                    market=market,
-                    quantity=final_quantity,
-                    avg_entry_price=final_avg_entry_price,
-                )
-                return True
-        except Exception as e:
-            logger.error(
-                "coin_position_save_failed",
-                market=position.get("market"),
-                error=str(e),
-            )
-            return False
-
-    async def get_coin_positions(self) -> list[dict[str, Any]]:
-        """Get all open coin positions."""
-        await self.initialize()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute(
-                    """
-                    SELECT * FROM coin_positions
-                    WHERE quantity > 0
-                    ORDER BY updated_at DESC
-                    """
-                )
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error("coin_positions_get_failed", error=str(e))
-            return []
-
-    async def get_coin_position(self, market: str) -> Optional[dict[str, Any]]:
-        """Get a single position by market."""
-        await self.initialize()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                conn.row_factory = aiosqlite.Row
-                cursor = await conn.execute(
-                    "SELECT * FROM coin_positions WHERE market = ?",
-                    (market.upper(),),
-                )
-                row = await cursor.fetchone()
-                return dict(row) if row else None
-        except Exception as e:
-            logger.error("coin_position_get_failed", market=market, error=str(e))
-            return None
-
-    async def update_coin_position(
-        self, market: str, updates: dict[str, Any]
-    ) -> bool:
-        """
-        Update specific fields of a position.
-
-        Args:
-            market: Market code
-            updates: Dict of fields to update
-
-        Returns:
-            True if updated successfully
-        """
-        await self.initialize()
-
-        allowed_fields = {"quantity", "avg_entry_price", "stop_loss", "take_profit"}
-        update_fields = {k: v for k, v in updates.items() if k in allowed_fields}
-
-        if not update_fields:
-            return False
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                set_clause = ", ".join(f"{k} = ?" for k in update_fields)
-                values = list(update_fields.values()) + [datetime.now(), market.upper()]
-
-                await conn.execute(
-                    f"""
-                    UPDATE coin_positions
-                    SET {set_clause}, updated_at = ?
-                    WHERE market = ?
-                    """,
-                    values,
-                )
-                await conn.commit()
-                logger.debug("coin_position_updated", market=market)
-                return True
-        except Exception as e:
-            logger.error("coin_position_update_failed", market=market, error=str(e))
-            return False
-
-    async def delete_coin_position(self, market: str) -> bool:
-        """Delete a position (when closed)."""
-        await self.initialize()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                await conn.execute(
-                    "DELETE FROM coin_positions WHERE market = ?",
-                    (market.upper(),),
-                )
-                await conn.commit()
-                logger.debug("coin_position_deleted", market=market)
-                return True
-        except Exception as e:
-            logger.error("coin_position_delete_failed", market=market, error=str(e))
-            return False
-
-    async def save_coin_realized_pnl(self, record: dict[str, Any]) -> bool:
-        """
-        Persist a minimal realized-P&L record for a coin close/reduce.
-
-        (P2-4 Task P0: coin had no realized-P&L aggregation at all — every
-        SELL's outcome simply vanished. Kept intentionally minimal — entry/
-        exit/qty/realized only, no fees yet (that's a later fill-realism
-        task). Full performance-panel integration is out of scope here.)
-
-        Args:
-            record: dict with keys id, market, entry_price, exit_price,
-                quantity, realized_amount, and optionally session_id/created_at.
-
-        Returns:
-            True if saved successfully
-        """
-        await self.initialize()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO coin_realized_pnl
-                    (id, session_id, market, entry_price, exit_price,
-                     quantity, realized_amount, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        record["id"],
-                        record.get("session_id"),
-                        record["market"].upper(),
-                        record["entry_price"],
-                        record["exit_price"],
-                        record["quantity"],
-                        record["realized_amount"],
-                        record.get("created_at", datetime.now()),
-                    ),
-                )
-                await conn.commit()
-                logger.debug(
-                    "coin_realized_pnl_saved",
-                    market=record["market"],
-                    realized_amount=record["realized_amount"],
-                )
-                return True
-        except Exception as e:
-            logger.error(
-                "coin_realized_pnl_save_failed",
-                market=record.get("market"),
-                error=str(e),
-            )
-            return False
-
-    async def get_coin_realized_pnl(
-        self,
-        market: Optional[str] = None,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        """Get realized coin P&L records, newest first, optionally filtered by market."""
-        await self.initialize()
-
-        try:
-            async with aiosqlite.connect(str(self.db_path)) as conn:
-                conn.row_factory = aiosqlite.Row
-
-                if market:
-                    cursor = await conn.execute(
-                        """
-                        SELECT * FROM coin_realized_pnl
-                        WHERE market = ?
-                        ORDER BY created_at DESC
-                        LIMIT ? OFFSET ?
-                        """,
-                        (market.upper(), limit, offset),
-                    )
-                else:
-                    cursor = await conn.execute(
-                        """
-                        SELECT * FROM coin_realized_pnl
-                        ORDER BY created_at DESC
-                        LIMIT ? OFFSET ?
-                        """,
-                        (limit, offset),
-                    )
-
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
-        except Exception as e:
-            logger.error("coin_realized_pnl_get_failed", error=str(e))
-            return []
-
     async def save_kr_realized_pnl(self, record: dict[str, Any]) -> bool:
         """
         Persist a matched entry/exit realized-P&L record for a KR stock
@@ -1442,7 +936,7 @@ class StorageService:
 
         (Phase1 Task 4/C3a: KR had no per-trade realized-P&L record at all —
         only the broker's day-level ka10074, ephemeral and unmatched to a
-        specific entry. Mirrors save_coin_realized_pnl's shape, plus
+        specific entry. Minimal entry/exit/qty/realized shape, plus
         entry/exit decision IDs and holding_period_seconds. Derived/display
         record only — the broker ledger (ka10074) remains the source of
         truth for KR realized P&L math.)
@@ -2240,7 +1734,7 @@ class StorageService:
         (Phase2 Task 1: per-agent accuracy/avg_confidence over a trailing
         window, computed by services/trading/calibration.py::
         label_and_calibrate from the agent_chat_decisions/agent_chat_votes
-        ledger. Mirrors save_coin_realized_pnl's shape.)
+        ledger.)
 
         Args:
             record: dict with keys id, agent_type, as_of_date, window_days,
@@ -2331,7 +1825,7 @@ class StorageService:
         (Phase2 Task 2: computed by services/trading/regime.py::
         compute_regime_snapshot from the background scanner's
         scan_sessions breadth distribution — the only durable market-wide
-        artifact in this codebase. Mirrors save_coin_realized_pnl's shape.)
+        artifact in this codebase.)
 
         Args:
             record: dict with keys id, trade_date, breadth_buy,

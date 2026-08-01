@@ -1,21 +1,23 @@
-"""
-PUT /trading/positions/{ticker}/stop-loss|take-profit — honesty fix (T7 review C1).
+"""PUT /trading/positions/{ticker}/stop-loss|take-profit — honesty fix (T7 review C1).
 
 Before this fix, both routes unconditionally returned {"status": "updated"}
-even when RiskMonitor wasn't tracking `ticker` in `_watching` — which is
-ALWAYS true for coin positions (they live in the separate `coin_positions`
-storage table and never enter `_watching`). These tests pin the new
-contract:
+even when RiskMonitor wasn't tracking `ticker` in `_watching`. These tests
+pin the contract:
 
 - ticker IS watched by RiskMonitor -> update applied there, "source":
   "risk_monitor".
-- ticker is NOT watched but IS a persisted coin position -> the edit is
-  persisted directly into the coin position store instead (the surface
-  PositionsPanel actually reads), "source": "coin_position_store".
-- ticker is neither watched nor a known coin position -> honest 404, never
-  a fake "updated".
+- ticker is NOT watched -> honest 404, never a fake "updated".
+
+(2026-08-01 Upbit 제거: 이 라우트는 RiskMonitor가 모르는 티커에 대해
+`storage.coin_positions`로 폴백해 저장하는 두 번째 경로가 있었다 — 코인
+포지션은 `_watching`에 절대 들어가지 않았기 때문이다. 코인 매매가
+백엔드에서 완전히 제거되면서 그 폴백은 대상이 될 코인 포지션이 다시는
+생기지 않는 영구 사문화 코드가 됐고, 함께 제거했다. KR 티커에 대해서는
+이 폴백이 원래도 실질적으로 절대 성공하지 않았으므로("KRW-BTC" 류가
+아닌 티커는 get_coin_position이 늘 None) 아래 3-way 계약이 2-way로
+줄어드는 것 외에 동작 변화는 없다.)
 """
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -29,13 +31,6 @@ def _coordinator_with_real_risk_monitor() -> MagicMock:
     coord = MagicMock()
     coord.risk_monitor = RiskMonitor()
     return coord
-
-
-def _storage(get_position_result=None, update_result=True):
-    storage = MagicMock()
-    storage.get_coin_position = AsyncMock(return_value=get_position_result)
-    storage.update_coin_position = AsyncMock(return_value=update_result)
-    return storage
 
 
 # -------------------------------------------
@@ -56,37 +51,17 @@ async def test_stop_loss_uses_risk_monitor_when_ticker_is_watched():
     assert coordinator.risk_monitor._watching["005930"].stop_loss == 65000
 
 
-async def test_stop_loss_falls_back_to_coin_store_when_unwatched():
-    """The always-true-today case: a coin ticker never enters `_watching`."""
+async def test_stop_loss_raises_honest_404_when_ticker_unwatched():
+    """No fake 'updated' — a ticker RiskMonitor isn't tracking must surface
+    as an explicit error, never a silent no-op."""
     coordinator = _coordinator_with_real_risk_monitor()
-    storage = _storage(get_position_result={"market": "KRW-BTC", "quantity": 0.5}, update_result=True)
 
-    with patch("services.storage_service.get_storage_service", AsyncMock(return_value=storage)):
-        res = await trading_mod.update_position_stop_loss(
-            ticker="KRW-BTC", stop_loss=48_000_000, coordinator=coordinator
+    with pytest.raises(HTTPException) as exc_info:
+        await trading_mod.update_position_stop_loss(
+            ticker="999999", stop_loss=100, coordinator=coordinator
         )
 
-    assert res == {
-        "status": "updated", "ticker": "KRW-BTC", "stop_loss": 48_000_000,
-        "source": "coin_position_store",
-    }
-    storage.update_coin_position.assert_awaited_once_with("KRW-BTC", {"stop_loss": 48_000_000})
-
-
-async def test_stop_loss_raises_honest_404_when_ticker_unknown_everywhere():
-    """No fake 'updated' — a ticker that's neither watched nor a stored
-    position must surface as an explicit error, never a silent no-op."""
-    coordinator = _coordinator_with_real_risk_monitor()
-    storage = _storage(get_position_result=None)
-
-    with patch("services.storage_service.get_storage_service", AsyncMock(return_value=storage)):
-        with pytest.raises(HTTPException) as exc_info:
-            await trading_mod.update_position_stop_loss(
-                ticker="KRW-DOGE", stop_loss=100, coordinator=coordinator
-            )
-
     assert exc_info.value.status_code == 404
-    storage.update_coin_position.assert_not_awaited()
 
 
 # -------------------------------------------
@@ -106,30 +81,12 @@ async def test_take_profit_uses_risk_monitor_when_ticker_is_watched():
     assert res == {"status": "updated", "ticker": "005930", "take_profit": 80000, "source": "risk_monitor"}
 
 
-async def test_take_profit_falls_back_to_coin_store_when_unwatched():
+async def test_take_profit_raises_honest_404_when_ticker_unwatched():
     coordinator = _coordinator_with_real_risk_monitor()
-    storage = _storage(get_position_result={"market": "KRW-BTC", "quantity": 0.5}, update_result=True)
 
-    with patch("services.storage_service.get_storage_service", AsyncMock(return_value=storage)):
-        res = await trading_mod.update_position_take_profit(
-            ticker="krw-btc", take_profit=55_000_000, coordinator=coordinator
+    with pytest.raises(HTTPException) as exc_info:
+        await trading_mod.update_position_take_profit(
+            ticker="999999", take_profit=100, coordinator=coordinator
         )
-
-    assert res == {
-        "status": "updated", "ticker": "KRW-BTC", "take_profit": 55_000_000,
-        "source": "coin_position_store",
-    }
-    storage.update_coin_position.assert_awaited_once_with("KRW-BTC", {"take_profit": 55_000_000})
-
-
-async def test_take_profit_raises_honest_404_when_ticker_unknown_everywhere():
-    coordinator = _coordinator_with_real_risk_monitor()
-    storage = _storage(get_position_result=None)
-
-    with patch("services.storage_service.get_storage_service", AsyncMock(return_value=storage)):
-        with pytest.raises(HTTPException) as exc_info:
-            await trading_mod.update_position_take_profit(
-                ticker="KRW-DOGE", take_profit=100, coordinator=coordinator
-            )
 
     assert exc_info.value.status_code == 404
