@@ -40,12 +40,6 @@ vi.mock('@/api/client', () => ({
   closeCoinPosition: (...a: unknown[]) => closeCoinPosition(...a),
 }));
 
-// PnlSummaryStrip은 자체 폴링(getPnlSummary, 30초 주기)을 하는 자식 컴포넌트다 —
-// mock하지 않으면 이 파일의 기존 13건까지 네트워크를 탄다.
-const PnlSummaryStrip = vi.fn((_p: unknown) => <div data-testid="pnl-strip" />);
-vi.mock('./PnlSummaryStrip', () => ({
-  PnlSummaryStrip: (p: unknown) => PnlSummaryStrip(p),
-}));
 
 import { useStore } from '@/store';
 import { PositionsPanel } from './PositionsPanel';
@@ -293,58 +287,5 @@ describe('PositionsPanel — full close only (C2: partial close removed)', () =>
     fireEvent.click(btn);
 
     await waitFor(() => expect(screen.getByText(/청산 실패/)).toBeInTheDocument());
-  });
-});
-
-describe('손익 요약 스트립 배치', () => {
-  const HOLDING = {
-    ticker: '089860', name: '롯데렌탈', quantity: 185,
-    avg_price: 38091, current_price: 39600, pnl: 213306, pnl_pct: 3.7,
-    stop_loss: 36425, take_profit: 41462,
-  };
-
-  it('보유 포지션의 pnl 합을 미실현손익으로 내려준다', async () => {
-    getOperations.mockResolvedValue(operationsResponse([HOLDING]));
-    render(<PositionsPanel />);
-
-    await waitFor(() => expect(PnlSummaryStrip).toHaveBeenCalled());
-    expect(PnlSummaryStrip).toHaveBeenLastCalledWith(
-      expect.objectContaining({ unrealized: 213306, holdings: 1 }),
-    );
-  });
-
-  it('보유 포지션이 0건이어도 요약 스트립은 남는다', async () => {
-    getOperations.mockResolvedValue(operationsResponse([]));
-    render(<PositionsPanel />);
-
-    await waitFor(() => expect(screen.getByTestId('pnl-strip')).toBeInTheDocument());
-    expect(screen.getByText(/보유 포지션 없음/)).toBeInTheDocument();
-    expect(PnlSummaryStrip).toHaveBeenLastCalledWith(
-      expect.objectContaining({ unrealized: 0, holdings: 0 }),
-    );
-  });
-
-  it('브로커 조회가 실패하면 미실현손익만 null로 내려준다', async () => {
-    getOperations.mockResolvedValue(operationsResponse(null, { holding: '조회 실패' }));
-    render(<PositionsPanel />);
-
-    await waitFor(() => expect(screen.getByTestId('pnl-strip')).toBeInTheDocument());
-    expect(PnlSummaryStrip).toHaveBeenLastCalledWith(
-      expect.objectContaining({ unrealized: null, holdings: 0 }),
-    );
-  });
-
-  // activeMarket === 'kiwoom' 게이트 회귀 방지: PnlSummaryStrip은 KR 전용
-  // 수치(실현손익 ka10074, 평가금 수익률)라 코인 시장에서 렌더되면 코인
-  // 포지션 옆에 무관한 KR 숫자가 뜬다. 이 게이트가 없으면 아무 테스트도
-  // 실패하지 않는 채로 조용히 사라질 수 있었다.
-  it('코인 시장에서는 손익 요약 스트립이 렌더되지 않는다(KR 전용 게이트)', async () => {
-    useStore.setState({ activeMarket: 'coin', chartSymbol: null } as never);
-    getCoinPositions.mockResolvedValue(positionsResponse([coinPosition()]));
-    render(<PositionsPanel />);
-
-    await screen.findByLabelText('전량청산 KRW-BTC'); // 포지션 렌더 대기
-    expect(PnlSummaryStrip).not.toHaveBeenCalled();
-    expect(screen.queryByTestId('pnl-strip')).not.toBeInTheDocument();
   });
 });

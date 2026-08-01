@@ -14,6 +14,7 @@ import { CoinPositionPanel } from '@/components/coin/CoinPositionPanel';
 import { CoinAccountBalance } from '@/components/coin/CoinAccountBalance';
 import { CoinOpenOrders } from '@/components/coin/CoinOpenOrders';
 import { KiwoomPositionPanel, KiwoomAccountBalance, KiwoomOpenOrders } from '@/components/kiwoom';
+import { PnlSummaryStrip } from '@/components/terminal/panels/PnlSummaryStrip';
 
 interface PositionsPageProps {
   onBack?: () => void;
@@ -71,6 +72,10 @@ export function PositionsPage({ onBack }: PositionsPageProps) {
           {(activeMarket === 'kiwoom' || kiwoomApiConfigured) && (
             <section>
               <h2 className="text-[11px] font-semibold uppercase tracking-wide text-muted mb-2">Korean Stock Positions</h2>
+              {/* 기간 손익 요약 — 계좌·보유 카드 위에 전폭으로 얹는다. 미실현손익은
+                  아래 KiwoomPositionPanel의 "총 손익"이 이미 보여주므로 여기선 빼고
+                  일/주/월/누적만 그린다(같은 숫자를 한 화면에 두 번 띄우지 않는다). */}
+              <PnlSummaryStrip />
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
                 <KiwoomAccountBalance />
                 <KiwoomPositionPanel />

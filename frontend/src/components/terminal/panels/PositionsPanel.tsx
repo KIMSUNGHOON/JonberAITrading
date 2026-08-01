@@ -58,7 +58,6 @@ import {
 } from '@/api/client';
 import { pnlColor } from '@/utils/pnl';
 import { Awaiting, TH, DASH, fmtInt, fmtPct, fmtPrice } from './shared';
-import { PnlSummaryStrip } from './PnlSummaryStrip';
 
 interface Row {
   sym: string;
@@ -273,30 +272,12 @@ export function PositionsPanel() {
     }
   }
 
-  // 요약 스트립은 표의 상태와 무관하게 항상 먼저 렌더한다 — 보유 0건일 때
-  // 사라지면 "이번 주 얼마 벌었나"를 확인하려는 바로 그 순간에 없어진다.
-  // 미실현손익은 표가 준비됐을 때만 값이 있고, 로딩·에러면 null로 강등한다.
-  const summary =
-    activeMarket === 'kiwoom' ? (
-      <PnlSummaryStrip
-        unrealized={state === 'ready' ? rows.reduce((sum, r) => sum + r.pnl, 0) : null}
-        holdings={state === 'ready' ? rows.length : 0}
-      />
-    ) : null;
-
-  if (state === 'loading') {
-    return <>{summary}<Awaiting label="포지션 로드 중…" /></>;
-  }
-  if (state === 'error') {
-    return <>{summary}<Awaiting label={`포지션 오류 · ${err ?? '연결 실패'}`} /></>;
-  }
-  if (rows.length === 0) {
-    return <>{summary}<Awaiting label="보유 포지션 없음 · 체결 시 표시" /></>;
-  }
+  if (state === 'loading') return <Awaiting label="포지션 로드 중…" />;
+  if (state === 'error') return <Awaiting label={`포지션 오류 · ${err ?? '연결 실패'}`} />;
+  if (rows.length === 0) return <Awaiting label="보유 포지션 없음 · 체결 시 표시" />;
 
   return (
     <>
-      {summary}
       <table className="w-full text-[12px] tabular-nums">
         <thead>
           <tr>

@@ -1,9 +1,10 @@
 /**
- * PnlSummaryStrip — Positions 탭 상단 손익 요약.
+ * PnlSummaryStrip — Positions 페이지(`/positions`)의 기간 손익 요약.
  *
- * 미실현손익은 부모(PositionsPanel)가 이미 폴링 중인 /operations 데이터에서
- * prop으로 받는다 — 같은 브로커 조회를 30초마다 한 번 더 하지 않기 위해서다
- * (Kiwoom 초당 약 1.4요청 제한). 기간 버킷만 이 컴포넌트가 스스로 폴링한다.
+ * **기간 버킷만 보여준다.** 미실현손익은 바로 아래 `KiwoomPositionPanel`의
+ * 「보유 종목」 카드가 이미 "총 손익"으로 표시하므로 여기서 또 그리면 같은
+ * 숫자가 한 화면에 두 번 나온다. 덕분에 이 컴포넌트는 브로커 보유 조회를
+ * 하지 않고 `/trading/pnl-summary` 하나만 폴링한다(Kiwoom 초당 약 1.4요청 제한).
  *
  * 강등은 칸 단위다: 실현손익 섹션이 죽어도 평가금 수익률은 계속 보여주고,
  * 그 반대도 같다. 0이나 가짜 값으로 위장하지 않는다(/operations·/performance와
@@ -39,13 +40,7 @@ function Cell({ label, children }: { label: string; children: React.ReactNode })
   );
 }
 
-export function PnlSummaryStrip({
-  unrealized,
-  holdings,
-}: {
-  unrealized: number | null;
-  holdings: number;
-}) {
+export function PnlSummaryStrip() {
   const [data, setData] = useState<PnlSummaryResponse | null>(null);
   const [phase, setPhase] = useState<'loading' | 'ready' | 'failed'>('loading');
   const aliveRef = useRef(true);
@@ -82,18 +77,9 @@ export function PnlSummaryStrip({
   const errors = data?.errors ?? {};
 
   return (
-    <div className="mb-2 flex flex-wrap items-stretch divide-x divide-border border border-border text-[12px] tabular-nums">
-      <Cell label="미실현손익">
-        {unrealized === null ? (
-          <span className="text-muted">{FAIL}</span>
-        ) : (
-          <>
-            <span className={pnlColor(unrealized)}>{fmtSigned(unrealized)}</span>
-            <span className="text-[10px] text-muted">{holdings}종목</span>
-          </>
-        )}
-      </Cell>
-
+    // 4칸 고정 그리드다. 이전의 flex-wrap은 좁은 폭에서 마지막 칸만 다음 줄로
+    // 밀려 라벨과 값이 어긋나 보였다 — 좁아지면 2×2로 접히게 한다.
+    <div className="mb-2 grid grid-cols-2 sm:grid-cols-4 divide-x divide-border border border-border text-[12px] tabular-nums">
       {BUCKETS.map(({ key, label }) => {
         const r = ret?.[key];
         const amount = realized?.[key];
