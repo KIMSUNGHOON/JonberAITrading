@@ -475,6 +475,13 @@ class SessionManager:
             # 곳(to_dict/to_legacy_dict/시장 필터 비교)이 이미
             # isinstance(x, MarketType) 방어 패턴을 쓰고 있어 원본 문자열도
             # 안전하게 흘러간다(문자열 Enum 비교라 != 필터링도 그대로 동작).
+            # 이 폴백은 조용하면 "세션이 운영 보드에서 소리 없이 사라졌다"로만
+            # 보이므로, 진단 가능하도록 경고 로그를 남긴다.
+            logger.warning(
+                "session_row_market_type_unparsed",
+                session_id=row["session_id"],
+                raw=row["market_type"],
+            )
             market_type = row["market_type"]
 
         return AnalysisSession(
@@ -772,8 +779,8 @@ class SessionManager:
 
         Args:
             session_id: Unique session identifier
-            market_type: Type of market (stock, coin, kiwoom)
-            ticker: Stock/coin code
+            market_type: Type of market (kiwoom)
+            ticker: Stock code
             display_name: Human-readable name
             kind: Session producer kind (P4-1) -- defaults to "analysis" so
                 every existing caller is unaffected.
@@ -836,8 +843,8 @@ class SessionManager:
         Args:
             session_id: Unique session identifier for the NEW session (only
                 used if no active session for the ticker exists).
-            market_type: Type of market (stock, coin, kiwoom)
-            ticker: Stock/coin code
+            market_type: Type of market (kiwoom)
+            ticker: Stock code
             display_name: Human-readable name
             kind: Session producer kind (P4-1) -- defaults to "analysis".
                 The active-collision check below only ever compares

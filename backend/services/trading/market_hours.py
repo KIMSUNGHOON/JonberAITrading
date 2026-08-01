@@ -34,7 +34,6 @@ class MarketSession(NamedTuple):
 
 # Korea timezone
 KST = pytz.timezone("Asia/Seoul")
-EST = pytz.timezone("America/New_York")
 
 
 class MarketHoursService:
@@ -189,16 +188,6 @@ class MarketHoursService:
         """Quick check if market is currently open."""
         return self.get_market_session(market).is_open
 
-    def _get_crypto_session(self, now: datetime) -> MarketSession:
-        """Crypto market is always open."""
-        return MarketSession(
-            is_open=True,
-            current_time=now,
-            next_open=None,
-            next_close=None,
-            message="Cryptocurrency market is open 24/7"
-        )
-
     def _get_krx_session(self, now: datetime) -> MarketSession:
         """
         KRX trading hours:
@@ -278,63 +267,6 @@ class MarketHoursService:
             next_open=None,
             next_close=today_close,
             message=f"Market open. Closes at 15:30 KST ({self._time_until(now, today_close)} remaining)"
-        )
-
-    def _get_us_session(self, now: datetime, market: MarketType) -> MarketSession:
-        """
-        US market trading hours:
-        - Regular session: 09:30-16:00 EST
-        """
-        now_est = now.astimezone(EST)
-        today = now_est.date()
-        weekday = now_est.weekday()
-
-        # Weekend check
-        if weekday >= 5:
-            next_monday = today + timedelta(days=(7 - weekday))
-            next_open = datetime.combine(next_monday, time(9, 30), tzinfo=EST)
-            return MarketSession(
-                is_open=False,
-                current_time=now,
-                next_open=next_open.astimezone(KST),
-                next_close=None,
-                message=f"{market.value.upper()} closed (Weekend)"
-            )
-
-        market_open = time(9, 30)
-        market_close = time(16, 0)
-        current_time = now_est.time()
-
-        if current_time < market_open:
-            next_open = datetime.combine(today, market_open, tzinfo=EST)
-            return MarketSession(
-                is_open=False,
-                current_time=now,
-                next_open=next_open.astimezone(KST),
-                next_close=None,
-                message=f"{market.value.upper()} opens at 09:30 EST"
-            )
-
-        if current_time > market_close:
-            next_day = today + timedelta(days=1)
-            while next_day.weekday() >= 5:
-                next_day += timedelta(days=1)
-            next_open = datetime.combine(next_day, market_open, tzinfo=EST)
-            return MarketSession(
-                is_open=False,
-                current_time=now,
-                next_open=next_open.astimezone(KST),
-                next_close=None,
-                message=f"{market.value.upper()} closed (After hours)"
-            )
-
-        today_close = datetime.combine(today, market_close, tzinfo=EST)
-        return MarketSession(
-            is_open=True,
-            current_time=now,
-            next_open=None,
-            next_close=today_close.astimezone(KST),
-            message=f"{market.value.upper()} open. Closes at 16:00 EST"
         )
 
     def _time_until(self, now: datetime, target: datetime) -> str:

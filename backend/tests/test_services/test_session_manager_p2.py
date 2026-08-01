@@ -20,6 +20,7 @@ import os
 import pytest
 
 from services.session_manager import (
+    AnalysisSession,
     SessionManager,
     MarketType,
     SessionStatus,
@@ -130,13 +131,33 @@ async def test_reservation_ignores_completed_sessions_for_same_ticker(sm):
     assert created.session_id == "p21-new"
 
 
-# 코인 스택 제거(2026-08-01) 이후 MarketType은 KIWOOM 하나뿐이라
-# "같은 ticker, 다른 market_type은 충돌하지 않는다"를 실제 두 시장으로
-# 보여줄 방법이 없다(create_session_if_no_active도 market_type.value를
-# 직접 호출해 진짜 열거형 멤버만 받는다) -- 이 테스트가 지키던 시장 간
-# 비충돌 분기(services/session_manager.py의 `candidate.market_type !=
-# market_type` 비교)는 위 두 테스트가 이미 같은 market 내 충돌/비충돌을
-# 통해 충분히 커버한다.
+@pytest.mark.asyncio
+async def test_reservation_different_market_type_does_not_collide(sm):
+    """Same ticker string, different market_type -- not a collision.
+
+    코인 스택 제거(2026-08-01) 이후 create_session_if_no_active()는
+    market_type.value를 직접 호출해 진짜 MarketType 멤버(=KIWOOM)만 받는다
+    -- 공개 API로는 더 이상 두 번째 실제 market을 만들 수 없다. 하지만
+    충돌 검사(services/session_manager.py의 `create_session_if_no_active`)
+    는 self._sessions에 이미 들어 있는 candidate와 market_type을 비교할
+    뿐 그 값이 어떻게 들어왔는지는 신경 쓰지 않는다 -- 재시작 시
+    _row_to_session()의 열거형 파싱 실패 폴백이 남길 수 있는 것과 같은
+    모양(레거시 non-KIWOOM 세션)을 내부 딕셔너리에 직접 주입해 그 비교
+    분기가 여전히 살아 있음을 보인다."""
+    sm._sessions["p21-legacy-coin"] = AnalysisSession(
+        session_id="p21-legacy-coin",
+        market_type="coin",  # _row_to_session의 열거형 파싱 실패 폴백과 동일 모양
+        ticker="AAA",
+        display_name="코인A",
+        status=SessionStatus.RUNNING,
+    )
+
+    created, existing = await sm.create_session_if_no_active(
+        "p21-kiwoom", MarketType.KIWOOM, "AAA", "종목A"
+    )
+    assert existing is None
+    assert created is not None
+    assert created.session_id == "p21-kiwoom"
 
 
 # -------------------------------------------

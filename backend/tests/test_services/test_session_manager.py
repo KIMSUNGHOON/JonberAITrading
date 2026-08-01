@@ -8,6 +8,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, AsyncMock
 
+import aiosqlite
+
 from services.session_manager import (
     SessionManager,
     AnalysisSession,
@@ -265,6 +267,50 @@ class TestSessionManager:
         kiwoom_sessions = await session_manager.get_all_sessions(market_type=MarketType.KIWOOM)
         assert len(kiwoom_sessions) == 2
         assert "test-020" not in kiwoom_sessions
+
+    @pytest.mark.asyncio
+    async def test_row_to_session_unparseable_market_type_falls_back_to_raw_string(
+        self, session_manager
+    ):
+        """_row_to_session()을 직접 먹인다 -- 위 테스트를 포함해 이 파일의
+        다른 테스트들은 전부 AnalysisSession을 손수 만들어 폴백의 "결과
+        모양"만 흉내 낸다. 이 테스트는 실제 SQLite 행을 INSERT하고 SELECT해
+        얻은 aiosqlite.Row를 _row_to_session()에 그대로 넣어 파싱 경로
+        자체를 검증한다 -- 같은 관례를 쓰는
+        tests/test_services/test_session_kind.py::
+        test_row_to_session_null_kind_falls_back_to_analysis 참고.
+
+        재시작마다 _load_active_sessions()가 통과하는 바로 그 경로다: 동결
+        이전에 만들어진 market_type='coin' 행이 sessions.db에 남아 있으면
+        MarketType(row["market_type"])가 ValueError를 던지는데, 여기서
+        죽으면 KIWOOM 세션까지 통째로 로드에 실패한다.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(TEST_DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO analysis_sessions
+                (session_id, market_type, ticker, display_name, status,
+                 created_at, updated_at, state_json, kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("legacy-coin-1", "coin", "KRW-BTC", "비트코인",
+                 "awaiting_approval", now, now, "{}", "analysis"),
+            )
+            await db.commit()
+
+        async with aiosqlite.connect(TEST_DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM analysis_sessions WHERE session_id = ?",
+                ("legacy-coin-1",),
+            ) as cursor:
+                row = await cursor.fetchone()
+
+        session = session_manager._row_to_session(row)
+        assert session.market_type == "coin"  # ValueError 없이 원본 문자열 보존
+        assert session.session_id == "legacy-coin-1"
+        assert session.ticker == "KRW-BTC"
 
     @pytest.mark.asyncio
     async def test_remove_session(self, session_manager):

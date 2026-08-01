@@ -474,7 +474,16 @@ async def rearm_awaiting_approvals() -> None:
         if sm_session.market_type == MarketType.KIWOOM:
             market = "kiwoom"
         else:
-            continue  # 코인 스택 제거(2026-08-01) 이후 KIWOOM 외 시장은 재무장 대상 아님
+            # 코인 스택 제거(2026-08-01) 이후 KIWOOM 외 시장은 재무장 대상
+            # 아니다 -- 조용히 건너뛰면 "승인대기 세션이 재무장 스캔에서
+            # 소리 없이 빠졌다"로만 보이므로 진단 가능하도록 경고 로그를
+            # 남긴다(레거시 coin 체크포인트 등).
+            logger.warning(
+                "autonomy_rearm_skip_non_kiwoom_session",
+                session_id=session_id,
+                market_type=str(sm_session.market_type),
+            )
+            continue
         candidates[session_id] = market
 
     if not candidates:

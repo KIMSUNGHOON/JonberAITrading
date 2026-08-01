@@ -119,13 +119,19 @@ async def _seed_awaiting_sm(
     sm,
     session_id: str,
     *,
-    market_type: MarketType = MarketType.KIWOOM,
     auto_approve_at: str | None = None,
     proposal_id: str = "p-rearm-1",
 ) -> None:
     """Seed an AWAITING_APPROVAL session directly into the SessionManager,
     bypassing the legacy dicts entirely -- the only seeding path
-    maybe_schedule_auto_approve/rearm can observe post-P2-6."""
+    maybe_schedule_auto_approve/rearm can observe post-P2-6.
+
+    코인 스택 제거(2026-08-01) 이후 create_session()은 MarketType.KIWOOM만
+    받는다(다른 값은 .value 호출에서 AttributeError) -- market_type
+    파라미터는 항상 KIWOOM 하나였고 아무 호출부도 오버라이드하지 않았으므로
+    제거했다. 레거시 비-KIWOOM 모양이 필요한 테스트는
+    test_rearm_skips_non_kiwoom_session_entirely처럼 sm._sessions에 직접
+    주입한다."""
     state = {
         "awaiting_approval": True,
         "approval_status": None,
@@ -139,11 +145,10 @@ async def _seed_awaiting_sm(
     }
     if auto_approve_at is not None:
         state["auto_approve_at"] = auto_approve_at
-    ticker = "005930" if market_type == MarketType.KIWOOM else "KRW-BTC"
     await sm.create_session(
         session_id=session_id,
-        market_type=market_type,
-        ticker=ticker,
+        market_type=MarketType.KIWOOM,
+        ticker="005930",
         display_name="테스트",
         state=state,
     )
