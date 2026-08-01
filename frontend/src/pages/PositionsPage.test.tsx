@@ -6,7 +6,7 @@
  * 내비의 Positions가 여는 화면은 이 페이지(App.tsx의 `<Route path="positions">`)라
  * 정작 사용자가 보는 곳에는 없었다. 이 테스트가 그 회귀를 막는다.
  *
- * 코인 전용 상태에서는 KR 섹션 자체가 렌더되지 않으므로 스트립도 없어야 한다 —
+ * 키움 미설정 상태에서는 KR 섹션 자체가 렌더되지 않으므로 스트립도 없어야 한다 —
  * 이 엔드포인트는 키움 브로커 기반이다.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -15,9 +15,6 @@ import { render, screen, waitFor } from '@testing-library/react';
 vi.mock('@/components/terminal/panels/PnlSummaryStrip', () => ({
   PnlSummaryStrip: () => <div data-testid="pnl-strip" />,
 }));
-vi.mock('@/components/coin/CoinPositionPanel', () => ({ CoinPositionPanel: () => <div /> }));
-vi.mock('@/components/coin/CoinAccountBalance', () => ({ CoinAccountBalance: () => <div /> }));
-vi.mock('@/components/coin/CoinOpenOrders', () => ({ CoinOpenOrders: () => <div /> }));
 vi.mock('@/components/kiwoom', () => ({
   KiwoomPositionPanel: () => <div data-testid="kiwoom-holdings" />,
   KiwoomAccountBalance: () => <div data-testid="kiwoom-account" />,
@@ -56,11 +53,11 @@ describe('PositionsPage — 손익 요약 스트립', () => {
     expect(order.indexOf('pnl-strip')).toBeLessThan(order.indexOf('kiwoom-account'));
   });
 
-  it('KR 섹션이 없으면(코인 전용) 스트립도 없다', async () => {
+  it('키움 미설정이면 KR 섹션도 스트립도 없다', async () => {
     useStore.setState({
-      activeMarket: 'coin',
+      activeMarket: 'kiwoom',
       kiwoomApiConfigured: false,
-      upbitApiConfigured: true,
+      upbitApiConfigured: false,
     } as never);
     render(<PositionsPage />);
 

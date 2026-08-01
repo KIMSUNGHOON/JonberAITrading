@@ -467,7 +467,6 @@ if settings.DEBUG:
 _API_ROUTERS: list[tuple[APIRouter, str, str]] = [
     (translate.router, "analysis", "Translate"),
     (approval.router, "approval", "Approval"),
-    (coin.router, "coin", "Coin"),
     (kr_stocks.router, "kr_stocks", "Korean Stocks"),
     (chat.router, "chat", "Chat"),
     (settings_routes.router, "settings", "Settings"),

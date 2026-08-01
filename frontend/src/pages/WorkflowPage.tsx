@@ -26,7 +26,6 @@ import { WorkflowProgress } from '@/components/analysis/WorkflowProgress';
 import { ReasoningWire } from '@/components/common/ReasoningWire';
 import { PositionCard } from '@/components/position/PositionCard';
 import { CoinInfo } from '@/components/coin/CoinInfo';
-import { CoinMarketDashboard } from '@/components/dashboard';
 import { CoinPositionPanel } from '@/components/coin/CoinPositionPanel';
 import { CoinOpenOrders } from '@/components/coin/CoinOpenOrders';
 import {
@@ -190,13 +189,6 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
                 </>
               )}
             </div>
-
-            {/* Coin Market Overview */}
-            {activeMarket === 'coin' && status === 'running' && (
-              <section>
-                <CoinMarketDashboard compact />
-              </section>
-            )}
 
             {/* Analysis Grid */}
             {analyses.length > 0 && (

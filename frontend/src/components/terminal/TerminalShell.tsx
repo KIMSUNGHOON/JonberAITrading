@@ -33,9 +33,8 @@ const NAV_ICONS: Partial<Record<ViewKey, React.ReactNode>> = {
   trades: <Receipt size={17} />,
 };
 
-const MARKETS: { id: 'kiwoom' | 'coin'; label: string; sim?: boolean }[] = [
+const MARKETS: { id: 'kiwoom'; label: string; sim?: boolean }[] = [
   { id: 'kiwoom', label: 'KR · KRX' },
-  { id: 'coin', label: 'COIN' },
 ];
 
 function useClock() {
