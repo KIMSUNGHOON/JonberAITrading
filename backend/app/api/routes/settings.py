@@ -25,7 +25,6 @@ from app.api.schemas.kr_stocks import (
     KiwoomValidationResponse,
 )
 from app.config import settings
-from services.upbit import UpbitClient
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -200,47 +199,15 @@ async def update_upbit_api_keys(request: UpbitApiKeyRequest):
 @router.post("/upbit/validate", response_model=UpbitValidateResponse)
 async def validate_upbit_api_keys():
     """
-    Validate Upbit API keys by attempting to fetch account info.
+    코인 스택 제거(2026-08-01) 이후 Upbit 연동은 지원하지 않는다.
 
-    Returns:
-        Validation result with account count if successful
+    `services.upbit`(UpbitClient)가 삭제됐으므로 실제 계정 조회는 더 이상
+    불가능하다 — 조용히 무언가를 반환하는 대신 명시적으로 거부한다.
     """
-    access_key = get_upbit_access_key()
-    secret_key = get_upbit_secret_key()
-
-    if not access_key or not secret_key:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="API keys not configured. Set keys first.",
-        )
-
-    try:
-        async with UpbitClient(access_key=access_key, secret_key=secret_key) as client:
-            accounts = await client.get_accounts()
-
-            # Update validation status
-            _runtime_upbit_keys["is_valid"] = True
-            _runtime_upbit_keys["last_validated"] = datetime.now(timezone.utc)
-
-            logger.info("upbit_api_keys_validated", account_count=len(accounts))
-
-            return UpbitValidateResponse(
-                is_valid=True,
-                message=f"API keys validated. Found {len(accounts)} account(s).",
-                account_count=len(accounts),
-            )
-
-    except Exception as e:
-        _runtime_upbit_keys["is_valid"] = False
-        _runtime_upbit_keys["last_validated"] = datetime.now(timezone.utc)
-
-        logger.error("upbit_api_keys_invalid", error=str(e))
-
-        return UpbitValidateResponse(
-            is_valid=False,
-            message=f"API key validation failed: {str(e)}",
-            account_count=None,
-        )
+    raise HTTPException(
+        status_code=410,
+        detail="코인(Upbit) 연동이 제거되어 더 이상 지원하지 않습니다.",
+    )
 
 
 @router.delete("/upbit")

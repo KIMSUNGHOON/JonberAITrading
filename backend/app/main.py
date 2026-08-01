@@ -17,11 +17,10 @@ from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.llm_provider import get_llm_provider, reset_llm_provider
-from app.api.routes import approval, websocket, coin, kr_stocks, chat, settings as settings_routes, trading, scanner, agent_chat, translate
+from app.api.routes import approval, websocket, kr_stocks, chat, settings as settings_routes, trading, scanner, agent_chat, translate
 from app.config import settings
 from app.core.analysis_limiter import cleanup_old_sessions
 from app.logging_config import configure_logging, RequestLoggingMiddleware
-from services.realtime_service import close_realtime_service, get_realtime_service
 from services.storage_service import close_storage_service, get_storage_service
 from services.telegram import get_telegram_notifier, TelegramNotifier
 from services.telegram.receiver import start_telegram_receiver, stop_telegram_receiver
@@ -291,14 +290,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("scan_orphan_reconcile_failed", error=str(e))
 
-    # Initialize realtime service (Upbit WebSocket)
-    try:
-        realtime_service = await get_realtime_service()
-        await realtime_service.start()
-        logger.info("realtime_service_started")
-    except Exception as e:
-        logger.warning("realtime_service_start_failed", error=str(e))
-
     # Initialize unified SessionManager
     try:
         session_manager = await get_session_manager()
@@ -411,7 +402,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    await close_realtime_service()
     await llm.close()
     reset_llm_provider()
     await close_storage_service()

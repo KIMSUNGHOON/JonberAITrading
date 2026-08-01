@@ -23,6 +23,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 
 import app.api.routes.approval as approval_module
 from services.session_manager import AnalysisSession, MarketType, SessionStatus
@@ -198,14 +199,10 @@ def wired(monkeypatch):
     def set_graph(graph):
         monkeypatch.setattr(approval_module, "get_kr_stock_trading_graph", lambda: graph)
 
-    def set_coin_graph(graph):
-        monkeypatch.setattr(approval_module, "get_coin_trading_graph", lambda: graph)
-
     return {
         "reschedule_calls": reschedule_calls,
         "set_sm_session": set_sm_session,
         "set_graph": set_graph,
-        "set_coin_graph": set_coin_graph,
         "holder": holder,
     }
 
@@ -264,27 +261,21 @@ async def test_reject_after_restart_falls_back_to_session_manager(wired):
 
 
 @pytest.mark.asyncio
-async def test_coin_session_resolves_coin_graph(wired):
-    """COIN market happy path: SM row alone selects the coin graph (no
-    legacy in-memory "adoption" step exists anymore)."""
+async def test_non_kiwoom_session_rejected_with_410(wired):
+    """코인 스택 제거(2026-08-01) 이후 회귀 핀: 이 파일은 원래 COIN market이
+    SM row만으로 coin 그래프를 골랐음을 확인했다 — coin 그래프가 삭제된
+    지금은 그 대신, 남아 있는 비-KIWOOM 체크포인트(MarketType.COIN은 아직
+    열거형에 남아 있다 — Task 3이 정리)가 KR 그래프로 조용히 흘러들지 않고
+    명시적으로 410 거부되는지 핀한다."""
     session_id = "restart-coin-1"
     wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.COIN))
-    coin_graph = _FakeGraph(
-        [{"execution": {"execution_status": "completed", "awaiting_approval": False}}]
-    )
-    wired["set_coin_graph"](coin_graph)
     # If the kr graph were (wrongly) selected, this sentinel would blow up.
     wired["set_graph"](None)
 
-    result = await approval_module.submit_decision(session_id, "approved")
+    with pytest.raises(HTTPException) as exc_info:
+        await approval_module.submit_decision(session_id, "approved")
 
-    assert result.session_id == session_id
-    assert result.status == "completed"
-    # The COIN graph's resume machinery ran.
-    coin_graph.aupdate_state.assert_awaited_once()
-    resume_config, resume_update = coin_graph.aupdate_state.await_args.args
-    assert resume_config == {"configurable": {"thread_id": session_id}}
-    assert resume_update["approval_status"] == "approved"
+    assert exc_info.value.status_code == 410
 
 
 @pytest.mark.asyncio

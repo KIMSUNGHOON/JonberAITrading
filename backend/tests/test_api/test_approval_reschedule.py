@@ -151,15 +151,11 @@ def wired(monkeypatch):
             approval_module, "get_kr_stock_trading_graph", lambda: graph
         )
 
-    def set_coin_graph(graph):
-        monkeypatch.setattr(approval_module, "get_coin_trading_graph", lambda: graph)
-
     return {
         "holder": holder,
         "reschedule_calls": reschedule_calls,
         "set_sm_session": set_sm_session,
         "set_graph": set_graph,
-        "set_coin_graph": set_coin_graph,
     }
 
 
@@ -283,20 +279,22 @@ async def test_system_approve_proceeds_when_id_matches(wired):
 # mutation.
 
 @pytest.mark.asyncio
-async def test_coin_system_approve_stands_down_when_status_not_awaiting(wired):
-    """Coin analog of the stale-approve stand-down: cancel already flipped
-    sm_session.status away from AWAITING_APPROVAL while awaiting_approval/
-    approval_status remained in their pre-cancel shape (the coin route bug
-    this arc fixes) — the pin still matches (cancel didn't touch the
-    proposal), so only the status guard can catch this. No resume, no state
-    mutation beyond what cancel already did, no order."""
+async def test_system_approve_stands_down_when_status_not_awaiting(wired):
+    """cancel already flipped sm_session.status away from AWAITING_APPROVAL
+    while awaiting_approval/approval_status remained in their pre-cancel
+    shape — the pin still matches (cancel didn't touch the proposal), so
+    only the status guard can catch this. No resume, no state mutation
+    beyond what cancel already did, no order.
+
+    코인 스택 제거(2026-08-01) 이전에는 이 테스트가 COIN 시장으로 이 가드를
+    검증했다 — 이제 KIWOOM만 남아 시장을 바꿔 동일 가드를 그대로 핀한다."""
     session_id = "c1"
-    sm_session = _sm_session(session_id, market_type=MarketType.COIN, status=SessionStatus.CANCELLED)
+    sm_session = _sm_session(session_id, status=SessionStatus.CANCELLED)
     sm_session.state["trade_proposal"]["id"] = "P1"
     wired["set_sm_session"](sm_session)
 
     graph = _FakeGraph([])
-    wired["set_coin_graph"](graph)
+    wired["set_graph"](graph)
 
     result = await approval_module.submit_decision(
         session_id, "approved", actor="system", expected_proposal_id="P1"

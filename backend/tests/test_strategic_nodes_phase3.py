@@ -25,24 +25,3 @@ async def test_kr_node_passes_position_feasible_set_and_threads_result(monkeypat
     assert captured["trade_action_cls"] is kr.TradeAction
     assert result["trade_proposal"]["action"] == "HOLD"
     assert result["synthesis"]["decision_rationale"] == "LLM chose to hold"
-
-
-async def test_coin_node_passes_agnostic_set_and_threads_result(monkeypatch):
-    import agents.graph.coin_nodes as coin
-    from agents.graph.decision_policy import POSITION_AGNOSTIC_ACTIONS
-
-    captured = {}
-
-    async def fake_decide_action(llm, messages, **kwargs):
-        captured.update(kwargs)
-        return coin.TradeAction.HOLD, "coin hold rationale", "llm", None, None
-
-    monkeypatch.setattr(coin, "get_llm_provider", lambda: MagicMock())
-    monkeypatch.setattr(coin, "decide_action", fake_decide_action)
-
-    state = {"market": "KRW-BTC", "market_data": {"current_price": 90000000}}
-    result = await coin.coin_strategic_decision_node(state)
-
-    assert captured["feasible"] == POSITION_AGNOSTIC_ACTIONS
-    assert captured["trade_action_cls"] is coin.TradeAction
-    assert result["trade_proposal"]["action"] == "HOLD"

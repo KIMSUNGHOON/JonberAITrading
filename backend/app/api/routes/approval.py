@@ -12,7 +12,6 @@ from typing import Optional
 import structlog
 from fastapi import APIRouter, HTTPException, status
 
-from agents.graph.coin_trading_graph import get_coin_trading_graph
 from agents.graph.kr_stock_graph import get_kr_stock_trading_graph
 from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from app.api.schemas.approval import (
@@ -366,12 +365,15 @@ async def _submit_decision_locked(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="unknown session market — refusing to resume",
         )
-    if sm_session.market_type == MarketType.KIWOOM:
-        graph = get_kr_stock_trading_graph()
-        market = "kiwoom"
-    else:
-        graph = get_coin_trading_graph()
-        market = "coin"
+    if sm_session.market_type != MarketType.KIWOOM:
+        # 코인 스택 제거(2026-08-01) 이후 KIWOOM이 유일한 시장이다. 남아 있던
+        # 비-KIWOOM 체크포인트가 KR 그래프로 조용히 흘러드는 것을 막는다.
+        raise HTTPException(
+            status_code=410,
+            detail=f"지원하지 않는 시장입니다: {sm_session.market_type}",
+        )
+    graph = get_kr_stock_trading_graph()
+    market = "kiwoom"
     config = {"configurable": {"thread_id": session_id}}
 
     execution_status = None

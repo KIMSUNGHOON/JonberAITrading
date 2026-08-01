@@ -119,20 +119,16 @@ def wired(monkeypatch):
     def set_kr_graph(factory):
         monkeypatch.setattr(approval_module, "get_kr_stock_trading_graph", factory)
 
-    def set_coin_graph(factory):
-        monkeypatch.setattr(approval_module, "get_coin_trading_graph", factory)
-
     return {
         "set_sm_session": set_sm_session,
         "set_kr_graph": set_kr_graph,
-        "set_coin_graph": set_coin_graph,
     }
 
 
 @pytest.mark.asyncio
 async def test_kr_session_decide_resumes_kr_graph(wired):
-    """CRITICAL pin: a KIWOOM SM session -> /decide must select the KR graph,
-    never the COIN graph (no legacy dict or adoption step exists anymore)."""
+    """CRITICAL pin: a KIWOOM SM session -> /decide must select the KR graph
+    (the only graph left — the coin stack was removed 2026-08-01)."""
     session_id = "b-empty-kr-1"
     wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.KIWOOM))
 
@@ -142,12 +138,7 @@ async def test_kr_session_decide_resumes_kr_graph(wired):
         picked["graph"] = "kr"
         raise _StopResume()
 
-    def fake_coin_graph():
-        picked["graph"] = "coin"
-        raise _StopResume()
-
     wired["set_kr_graph"](fake_kr_graph)
-    wired["set_coin_graph"](fake_coin_graph)
 
     with pytest.raises(_StopResume):
         await approval_module.submit_decision(session_id, "approved")
@@ -156,28 +147,26 @@ async def test_kr_session_decide_resumes_kr_graph(wired):
 
 
 @pytest.mark.asyncio
-async def test_coin_session_decide_resumes_coin_graph(wired):
-    """Symmetric case: a COIN SM session -> COIN graph selected."""
+async def test_coin_session_rejected_with_410_at_graph_selection(wired):
+    """코인 스택 제거(2026-08-01) 이후 회귀 핀: 이 테스트는 원래 COIN SM
+    세션이 coin 그래프를 고른다는 대칭성을 검증했다 — coin 그래프가 삭제된
+    지금은 그 대신, 남아 있는 비-KIWOOM 체크포인트(MarketType.COIN은 아직
+    열거형에 남아 있다 — Task 3이 정리)가 KR 그래프로 조용히 흘러들지 않고
+    명시적으로 410 거부되는지 핀한다."""
+    from fastapi import HTTPException
+
     session_id = "b-empty-coin-1"
     wired["set_sm_session"](_sm_session(session_id, market_type=MarketType.COIN))
 
-    picked = {}
+    def boom():
+        raise AssertionError("kr graph factory must not be called for a non-KIWOOM session")
 
-    def fake_kr_graph():
-        picked["graph"] = "kr"
-        raise _StopResume()
+    wired["set_kr_graph"](boom)
 
-    def fake_coin_graph():
-        picked["graph"] = "coin"
-        raise _StopResume()
-
-    wired["set_kr_graph"](fake_kr_graph)
-    wired["set_coin_graph"](fake_coin_graph)
-
-    with pytest.raises(_StopResume):
+    with pytest.raises(HTTPException) as exc_info:
         await approval_module.submit_decision(session_id, "approved")
 
-    assert picked.get("graph") == "coin"
+    assert exc_info.value.status_code == 410
 
 
 @pytest.mark.asyncio
@@ -194,7 +183,6 @@ async def test_unknown_market_type_fails_closed_400_at_graph_selection(wired):
         raise AssertionError("graph factory must not be called for an unknown market")
 
     wired["set_kr_graph"](boom)
-    wired["set_coin_graph"](boom)
 
     with pytest.raises(HTTPException) as exc_info:
         await approval_module.submit_decision(session_id, "approved")

@@ -21,13 +21,10 @@ import pytest
 from fastapi import BackgroundTasks
 
 import services.session_manager as sm_module
-import services.storage_service as ss
 from services.session_manager import SessionManager
 
 from app.api.schemas.kr_stocks import KRStockAnalysisRequest
-from app.api.schemas.coin import CoinAnalysisRequest
 from app.api.routes.kr_stocks.analysis import start_kr_stock_analysis
-from app.api.routes.coin.analysis import start_coin_analysis
 
 TEST_DB_PATH = "data/test_analysis_position_exists_sm.db"
 
@@ -45,18 +42,6 @@ async def sm(monkeypatch):
     manager._sessions.clear()
     if os.path.exists(TEST_DB_PATH):
         os.remove(TEST_DB_PATH)
-
-
-@pytest.fixture
-async def temp_storage(tmp_path, monkeypatch):
-    """Real (temp-file) StorageService installed as the process singleton —
-    NOT a self-mocking fixture, so `storage.get_coin_position` exercises the
-    actual SQLite round-trip (same convention as test_coin_execution_ledger.py)."""
-    storage = ss.StorageService(db_path=tmp_path / "test_storage.db")
-    await storage.initialize()
-    monkeypatch.setattr(ss, "_storage_service", storage)
-    yield storage
-    monkeypatch.setattr(ss, "_storage_service", None)
 
 
 # -------------------------------------------
@@ -161,73 +146,6 @@ async def test_kr_start_position_exists_defaults_false_on_broker_failure(
     )
 
     assert response.status == "started"
-    assert response.position_exists is False
-
-
-# -------------------------------------------
-# Coin: position_exists on a fresh /analysis/start
-# -------------------------------------------
-
-
-async def test_coin_start_position_exists_true_for_held_market(
-    sm, temp_storage
-):
-    await temp_storage.save_coin_position(
-        {
-            "market": "KRW-BTC",
-            "currency": "BTC",
-            "quantity": 0.5,
-            "avg_entry_price": 100_000_000,
-        }
-    )
-
-    response = await start_coin_analysis(
-        CoinAnalysisRequest(market="KRW-BTC"), BackgroundTasks()
-    )
-
-    assert response.duplicate is False
-    assert response.position_exists is True
-    # P2-4: the flag is threaded into the sm session's state (the sole
-    # store), so /status agrees too.
-    session = await sm.get_session(response.session_id)
-    assert session.state["position_exists"] is True
-
-
-async def test_coin_start_position_exists_false_for_unheld_market(
-    sm, temp_storage
-):
-    response = await start_coin_analysis(
-        CoinAnalysisRequest(market="KRW-ETH"), BackgroundTasks()
-    )
-
-    assert response.position_exists is False
-    session = await sm.get_session(response.session_id)
-    assert session.state["position_exists"] is False
-
-
-async def test_coin_start_position_exists_false_for_zero_quantity_position(
-    sm, temp_storage
-):
-    """A stored position row with quantity<=0 must not count as held (the
-    same >0 guard `coin/positions.py` and `coin_nodes.py`'s data-collection
-    lookup use)."""
-    await temp_storage.save_coin_position(
-        {
-            "market": "KRW-XRP",
-            "currency": "XRP",
-            "quantity": 0.0,
-            "avg_entry_price": 500,
-        }
-    )
-    # save_coin_position averages on repeat inserts; delete then re-check a
-    # genuinely absent position instead (0-qty rows aren't a real code path
-    # storage produces, but the route's `> 0` guard should hold regardless).
-    await temp_storage.delete_coin_position("KRW-XRP")
-
-    response = await start_coin_analysis(
-        CoinAnalysisRequest(market="KRW-XRP"), BackgroundTasks()
-    )
-
     assert response.position_exists is False
 
 
