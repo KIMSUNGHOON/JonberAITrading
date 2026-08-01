@@ -178,3 +178,14 @@ API 키에 현재 IP가 등록돼 있지 않아 조회는 401로 실패하고, �
   `TerminalShell.tsx`·`OrderTicketRail.tsx`의 죽은 삼항 분기와 다수의 파일에 남은
   삭제된 파일(`coin.py`, `shared_extractors.py` 등)을 향한 낡은 주석. 상세는
   `task-7-report.md` 참조.
+- **`MarketKind`를 `KR_STOCK` 단일 멤버로 축소한 근거 정정** (리뷰 라운드 1) —
+  최초 근거를 `MarketType`(session_manager·market_hours)과 "동일한 원칙"이라고
+  적었으나 부정확했다. `MarketType`의 붕괴-대신-축소 결정은 스펙이 살아있는
+  라우트·스토어·컴포넌트 다수를 관통하는 **블라스트 반경**으로 정당화한다.
+  `MarketKind`/`ExecutionService`는 프로덕션 호출부가 **0개**다(실 주문 4곳이
+  전부 `KiwoomExecutionAdapter`를 직접 생성해 이 라우팅 계층을 우회한다) —
+  그 블라스트 반경 리스크가 애초에 적용되지 않는다. 실제 근거는 다르다:
+  이 계층이 원래 여러 브로커를 겨냥해 설계된 범용 라우팅 추상화이고, 지금
+  붕괴시키면 향후 두 번째 브로커가 생길 때 다시 만들어야 한다는 **재사용성**
+  판단이다. `services/execution/models.py`의 `MarketKind` docstring에 동일하게
+  반영.

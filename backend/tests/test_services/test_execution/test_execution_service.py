@@ -81,9 +81,11 @@ async def test_service_routes_by_market():
     kr_client.place_buy_order.assert_awaited_once()
 
 
-async def test_service_unknown_market_raises():
-    # No adapter registered at all (kr_stock omitted), so even the one
-    # remaining MarketKind member has nowhere to route to.
+async def test_service_raises_when_no_adapter_registered_for_market():
+    # Renamed from test_service_unknown_market_raises (리뷰 지적): with
+    # MarketKind down to one member there is no "unknown market" left to
+    # construct — this now exercises the same ValueError path via an
+    # unregistered adapter (kr_stock omitted) instead.
     service = ExecutionService()
     with pytest.raises(ValueError):
         await service.place_order(
