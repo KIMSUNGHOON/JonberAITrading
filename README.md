@@ -128,8 +128,6 @@ JonberAITrading/
 |----------|--------|-------------|
 | `/api/kr_stocks/analysis/start` | POST | Start KR stock analysis |
 | `/api/kr_stocks/analysis/status/{id}` | GET | KR analysis status |
-| `/api/coin/analysis/start` | POST | Start coin analysis |
-| `/api/coin/analysis/status/{id}` | GET | Coin analysis status |
 | `/api/analysis/translate` | POST | KO↔EN translation (LLM) |
 
 ### Approval Endpoints

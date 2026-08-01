@@ -29,13 +29,6 @@
     `KIWOOM_IS_MOCK=false` 설정 시 실제 매매가 실행됩니다.
     충분한 테스트 후 전환하세요.
 
-### Upbit API 설정
-
-| 변수 | 설명 | 필수 |
-|------|------|------|
-| `UPBIT_ACCESS_KEY` | Access Key | Yes |
-| `UPBIT_SECRET_KEY` | Secret Key | Yes |
-
 ### Telegram 설정
 
 | 변수 | 설명 | 기본값 |

@@ -176,10 +176,6 @@ KIWOOM_SECRET_KEY=your_secret_key
 KIWOOM_ACCOUNT_NO=your_account_number
 KIWOOM_IS_MOCK=true          # true: 모의투자, false: 실거래
 
-# === Upbit API (암호화폐) ===
-UPBIT_ACCESS_KEY=your_access_key
-UPBIT_SECRET_KEY=your_secret_key
-
 # === Telegram 알림 ===
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id

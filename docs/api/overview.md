@@ -30,8 +30,6 @@ JonberAI Trading은 RESTful API와 WebSocket을 통해 모든 기능을 제공�
 | `/api/kr-stocks/sessions` | GET | 세션 목록 |
 | `/api/kr-stocks/sessions/{id}` | GET | 세션 상세 |
 | `/api/kr-stocks/sessions/{id}/cancel` | POST | 세션 취소 |
-| `/api/coin/analyze` | POST | 코인 분석 시작 |
-| `/api/coin/sessions` | GET | 코인 세션 목록 |
 
 ### 자동매매 API
 

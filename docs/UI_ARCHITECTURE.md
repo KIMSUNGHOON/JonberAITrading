@@ -11,16 +11,6 @@ App
 │   │   ├── BasketWidget
 │   │   └── AnalysisQueueWidget
 │   │
-│   ├── Coin Market View
-│   │   ├── DashboardSummary / WelcomePanel
-│   │   ├── CoinAccountBalance
-│   │   ├── CoinPositionPanel
-│   │   ├── CoinOpenOrders
-│   │   ├── CoinTradeHistory
-│   │   ├── BasketWidget
-│   │   ├── AnalysisQueueWidget
-│   │   └── CoinMarketDashboard
-│   │
 │   └── Kiwoom (KR Stock) Market View
 │       ├── DashboardSummary / WelcomePanel
 │       ├── KiwoomAccountBalance
@@ -33,7 +23,7 @@ App
 ├── Analysis Page (currentView: 'analysis')
 │   ├── WorkflowProgress (분석 단계 진행률)
 │   ├── ChartPanel (종목 차트)
-│   ├── CoinInfo / PositionCard
+│   ├── PositionCard
 │   ├── Trading Panels (PositionPanel, OpenOrders)
 │   ├── AnalysisPanel (분석 결과)
 │   └── AnalysisQueueWidget
@@ -45,7 +35,6 @@ App
 │   └── Analysis History List (filterable)
 │
 ├── Positions Page (currentView: 'positions')
-│   ├── Coin Positions (CoinAccountBalance, CoinPositionPanel)
 │   └── Kiwoom Positions (KiwoomAccountBalance, KiwoomPositionPanel)
 │
 └── Charts Page (currentView: 'charts')
@@ -64,7 +53,7 @@ App
 │   │   └── Settings Button
 │   │
 │   ├── Sidebar
-│   │   ├── MarketTabs (Stock | Crypto | Korea)
+│   │   ├── MarketTabs (Stock | Korea)
 │   │   └── NavItems
 │   │       ├── Analysis → Dashboard
 │   │       ├── Charts → ChartsPage
@@ -112,13 +101,11 @@ Agentic Trading App
 │
 ├── 마켓 선택 (Market Selection)
 │   ├── US Stock (stock)
-│   ├── Crypto (coin) - Upbit API
 │   └── KR Stock (kiwoom) - Kiwoom API
 │
 ├── 분석 시작 (Start Analysis)
 │   ├── 개별 종목 분석
 │   │   ├── TickerInput (Stock)
-│   │   ├── CoinTickerInput (Coin)
 │   │   └── KiwoomTickerInput (Kiwoom)
 │   │
 │   └── 다중 종목 분석 (Basket)
@@ -155,12 +142,10 @@ Agentic Trading App
 │
 ├── 포지션 관리 (Position Management)
 │   ├── PositionCard
-│   ├── CoinPositionPanel
 │   ├── KiwoomPositionPanel
 │   └── 주문 현황 (OpenOrders)
 │
 ├── 계좌 정보 (Account Info)
-│   ├── CoinAccountBalance
 │   └── KiwoomAccountBalance
 │
 ├── 분석 기록 (History)
@@ -172,7 +157,7 @@ Agentic Trading App
 │   └── RecentAnalysisWidget (대시보드)
 │
 └── 설정 (Settings)
-    ├── API 키 설정 (Upbit, Kiwoom)
+    ├── API 키 설정 (Kiwoom)
     ├── LLM 설정
     └── 테마 설정
 ```
@@ -183,7 +168,7 @@ Agentic Trading App
 Zustand Store
 │
 ├── Market State
-│   ├── activeMarket: 'stock' | 'coin' | 'kiwoom'
+│   ├── activeMarket: 'stock' | 'kiwoom'
 │   └── stockRegion: 'us' | 'kr'
 │
 ├── Stock State
@@ -195,17 +180,6 @@ Zustand Store
 │   ├── analyses[]
 │   ├── tradeProposal
 │   ├── activePosition
-│   └── history[]
-│
-├── Coin State
-│   ├── activeSessionId
-│   ├── market
-│   ├── koreanName
-│   ├── status
-│   ├── currentStage
-│   ├── reasoningLog[]
-│   ├── analyses[]
-│   ├── tradeProposal
 │   └── history[]
 │
 ├── Kiwoom State (Multi-session)
@@ -301,9 +275,9 @@ User Action
 │ MarketTabs    │  │  Dashboard Content                     │  │
 │ ┌───────────┐ │  │  (변경: activeMarket에 따라 다른 위젯) │  │
 │ │ Stock     │ │  │                                        │  │
-│ │ Crypto    │ │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐  │  │
-│ │ Korea     │ │  │  │ Account │ │Position │ │ Orders  │  │  │
-│ └───────────┘ │  │  └─────────┘ └─────────┘ └─────────┘  │  │
+│ │ Korea     │ │  │  ┌─────────┐ ┌─────────┐ ┌─────────┐  │  │
+│ └───────────┘ │  │  │ Account │ │Position │ │ Orders  │  │  │
+│               │  │  └─────────┘ └─────────┘ └─────────┘  │  │
 │               │  │                                        │  │
 │               │  │  ┌─────────┐ ┌───────────────────────┐│  │
 │               │  │  │ Basket  │ │ AnalysisQueueWidget   ││  │

@@ -28,7 +28,7 @@ The system provides autonomous market analysis with human-in-the-loop (HITL) app
 
 - **Real-time Updates**: WebSocket connections stream reasoning logs and position updates
 
-- **Markets**: KR stocks (Kiwoom) + crypto (Upbit) only — the US/yfinance stack was removed (R2, 2026-07-11)
+- **Markets**: KR stocks (Kiwoom) only — the US/yfinance stack was removed (R2, 2026-07-11) and the Upbit crypto stack was removed (2026-08-01)
 
 ## Development Commands
 
