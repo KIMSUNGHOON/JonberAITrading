@@ -472,35 +472,39 @@ describe('DiscoverySection — Scratchpad price polling (re-homed KR-price-fallb
     expect(screen.getByText('삼성전자')).toBeInTheDocument();
   });
 
-  it('coin 종목은 기존처럼 getCoinTickers로 갱신된다', async () => {
+  // 코인 동결(freeze) fix round 2 (코디네이터 리뷰): round 1까지는 스크래치패드
+  // select에서 COIN을 고를 수 있었으므로, localStorage에 coin 항목이 남아있는
+  // 사용자가 실재할 수 있다 — 가상의 시나리오가 아니다. merge()가 이제 rehydrate
+  // 시 이런 항목을 걸러내지만(store/basket-rehydrate.test.ts가 그 불변식을
+  // 고정한다), 아래 테스트들은 그 필터를 완전히 우회하는 setState로 coin 항목을
+  // 직접 주입해 DiscoverySection 컴포넌트 자체의 방어(가격 폴링 하드코딩 차단 +
+  // 분석▶ marketType 가드)를 검증한다 — 두 겹의 방어라 어느 한쪽이 뚫려도 나머지가
+  // 언마운트된 /coin/tickers·/coin/analysis/start 호출을 막는다.
+  it('coin 항목이 basket에 있어도(레거시 상태) 가격 폴링이 /coin/tickers를 치지 않는다', async () => {
     useStore.setState({
       upbitApiConfigured: true,
       basket: { items: [coinItem()], maxItems: 10, isUpdating: false },
     });
-    getCoinTickers.mockResolvedValue({
-      tickers: [
-        {
-          market: 'KRW-BTC',
-          trade_price: 50_000_000,
-          change: 'RISE',
-          change_rate: 0.012,
-          change_price: 600_000,
-          high_price: 50_500_000,
-          low_price: 49_000_000,
-          trade_volume: 10,
-          acc_trade_price_24h: 1_000_000_000,
-          timestamp: '2026-07-13T00:00:00Z',
-        },
-      ],
-      total: 1,
+
+    render(<DiscoverySection />);
+
+    await waitFor(() => expect(screen.getByText('비트코인')).toBeInTheDocument());
+    expect(getCoinTickers).not.toHaveBeenCalled();
+    expect(getKRStockTickers).not.toHaveBeenCalled();
+  });
+
+  it('coin 항목의 [분석▶]은 비활성화되어 있고 클릭해도 useStartAnalysis를 호출하지 않는다', async () => {
+    useStore.setState({
+      upbitApiConfigured: true,
+      basket: { items: [coinItem()], maxItems: 10, isUpdating: false },
     });
 
     render(<DiscoverySection />);
 
-    await waitFor(() => expect(getCoinTickers).toHaveBeenCalledWith(['KRW-BTC']));
-    await waitFor(() => expect(screen.getByText('₩50,000,000')).toBeInTheDocument());
-    expect(screen.getByText('+1.20%')).toBeInTheDocument();
-    expect(getKRStockTickers).not.toHaveBeenCalled();
+    const analyzeBtn = await screen.findByRole('button', { name: '분석 KRW-BTC' });
+    expect(analyzeBtn).toBeDisabled();
+    fireEvent.click(analyzeBtn);
+    expect(mockStart).not.toHaveBeenCalled();
   });
 });
 

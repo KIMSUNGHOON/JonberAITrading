@@ -1823,14 +1823,22 @@ export const useStore = create<Store>()(
                 ? parseHistoryDates(persisted.kiwoom.history as KiwoomHistoryItem[])
                 : [],
             },
-            // Drop basket items whose market no longer exists (the US 'stock'
-            // market was removed; items persisted before that would misroute
-            // their Analyze action and poison activeMarket).
+            // Drop basket items whose market no longer exists. Originally this
+            // filter existed only for the removed US 'stock' market (R2, commit
+            // 9453e1f) — the coin freeze (upbit-removal task 1, fix round 2)
+            // extends it to 'coin' too. The Scratchpad's COIN <select> option was
+            // cut in round 1, but the basket persists wholesale in localStorage,
+            // so an item added BEFORE the freeze (marketType 'coin') would
+            // otherwise survive rehydration unfiltered: its "분석▶" button and
+            // the price-poll effect (DiscoverySection.tsx) would then reach the
+            // now-unmounted /coin/analysis/start and /coin/tickers routes, and
+            // setActiveMarket('coin') would fire before the request even fails
+            // (useStartAnalysis.ts) — a live-app 404 loop, not a hypothetical.
             basket: persisted.basket
               ? {
                   ...persisted.basket,
                   items: (persisted.basket.items ?? []).filter(
-                    (item) => item.marketType === 'coin' || item.marketType === 'kiwoom'
+                    (item) => item.marketType === 'kiwoom'
                   ),
                 }
               : currentState.basket,

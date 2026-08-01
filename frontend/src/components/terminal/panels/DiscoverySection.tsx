@@ -270,7 +270,13 @@ function useScratchpadPricePolling(basketItems: BasketItem[]) {
   const kiwoomApiConfigured = useStore((s) => s.kiwoomApiConfigured);
   const updateBasketItemPrice = useStore((s) => s.updateBasketItemPrice);
 
-  const coinTickers = basketItems.filter((i) => i.marketType === 'coin').map((i) => i.ticker);
+  // 코인 동결(freeze) fix round 2: coin 시세 폴링은 영구 비활성화한다. 정상 경로로는
+  // basket에 coin 항목이 존재할 수 없다 — round 1에서 select의 COIN 옵션을 지웠고,
+  // merge()가 rehydrate 시 marketType!=='kiwoom' 항목을 전부 걸러낸다(store/index.ts).
+  // 그래도 어떤 경로로든(예: setState 직접 호출) coin 항목이 basket에 들어오면 이
+  // 이펙트가 언마운트된 GET /coin/tickers를 칠 수 있으므로, basketItems 내용과
+  // 무관하게 하드코딩해 방어한다(리뷰 발견).
+  const coinTickers: string[] = [];
   const krTickers = basketItems.filter((i) => i.marketType === 'kiwoom').map((i) => i.ticker);
 
   // Coin prices (batched, gated on Upbit config).
@@ -439,6 +445,11 @@ export function DiscoverySection() {
   }, [runPromote]);
 
   const handleAnalyzeItem = useCallback((item: BasketItem) => {
+    // 코인 동결(freeze) fix round 2: handlePromoteItem과 동일한 방어 — 정상
+    // 경로로는 basket에 coin 항목이 있을 수 없지만(merge()가 걸러냄), 어떤
+    // 경로로든 존재하면 이 호출이 setActiveMarket('coin') 후 언마운트된
+    // /coin/analysis/start를 치므로 marketType으로 차단한다(리뷰 발견).
+    if (item.marketType !== 'kiwoom') return;
     startAnalysis(item.marketType, item.ticker, item.displayName).catch((e) => {
       setError(`분석 시작 실패: ${e instanceof Error ? e.message : '알 수 없는 오류'}`);
     });
@@ -455,9 +466,13 @@ export function DiscoverySection() {
     setBulkAnalyzing(true);
     setError(null);
 
+    // 코인 동결(freeze) fix round 2: handleAnalyzeItem과 동일한 이유로 kiwoom
+    // 항목만 대상으로 삼는다 — availableSlots도 kiwoom 세션 슬롯 기준이라 원래도
+    // coin 항목엔 의미가 없었다.
+    const kiwoomItems = basketItems.filter((item) => item.marketType === 'kiwoom');
     const availableSlots = selectKiwoomAvailableSlots(useStore.getState());
-    const maxItems = Math.min(basketItems.length, availableSlots, 3);
-    const itemsToAnalyze = basketItems.slice(0, maxItems);
+    const maxItems = Math.min(kiwoomItems.length, availableSlots, 3);
+    const itemsToAnalyze = kiwoomItems.slice(0, maxItems);
 
     if (maxItems === 0) {
       setError('분석 슬롯이 모두 사용 중입니다');
@@ -728,9 +743,10 @@ export function DiscoverySection() {
                   <button
                     type="button"
                     onClick={(e) => { e.stopPropagation(); handleAnalyzeItem(item); }}
+                    disabled={item.marketType !== 'kiwoom'}
                     aria-label={`분석 ${item.ticker}`}
-                    title="분석 시작"
-                    className="text-up font-medium"
+                    title={item.marketType !== 'kiwoom' ? '코인 동결 — 분석 미지원' : '분석 시작'}
+                    className="text-up font-medium disabled:opacity-30 disabled:cursor-not-allowed"
                   >
                     분석▶
                   </button>
