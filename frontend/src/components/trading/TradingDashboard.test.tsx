@@ -52,7 +52,7 @@ vi.mock('@/api/client', () => ({
 
 vi.mock('@/store', () => ({
   useStore: (selector: (s: Record<string, unknown>) => unknown) =>
-    selector({ autonomyMasterEnabled: false, tradingModes: { kiwoom: 'hitl', coin: 'hitl' } }),
+    selector({ autonomyMasterEnabled: false, tradingModes: { kiwoom: 'hitl' } }),
 }));
 
 // Out of scope for this card's behavior — stub it out so this test file

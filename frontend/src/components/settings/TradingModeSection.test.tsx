@@ -26,12 +26,12 @@ vi.mock('@/api/client', () => ({
 beforeEach(() => {
   getTradingMode.mockReset();
   setTradingMode.mockReset();
-  getTradingMode.mockResolvedValue({ kiwoom: 'hitl', coin: 'hitl', master_enabled: false });
+  getTradingMode.mockResolvedValue({ kiwoom: 'hitl', master_enabled: false });
   mockState = {
-    tradingModes: { kiwoom: 'hitl', coin: 'hitl' },
+    tradingModes: { kiwoom: 'hitl' },
     autonomyMasterEnabled: false,
     setTradingModes: vi.fn((resp) => {
-      mockState.tradingModes = { kiwoom: resp.kiwoom, coin: resp.coin };
+      mockState.tradingModes = { kiwoom: resp.kiwoom };
       mockState.autonomyMasterEnabled = resp.master_enabled;
     }),
   };
@@ -42,16 +42,17 @@ describe('TradingModeSection — master gate OFF does not disable intent-setting
     render(<TradingModeSection onError={vi.fn()} />);
     await waitFor(() => expect(getTradingMode).toHaveBeenCalled());
     const buttons = screen.getAllByRole('button', { name: /^(hitl|autonomous)$/i });
-    expect(buttons.length).toBe(4); // 2 markets x 2 modes
+    // 코인 스택 제거(2026-08-01) 이후 마켓은 kiwoom 하나뿐 — 1 market x 2 modes.
+    expect(buttons.length).toBe(2);
     buttons.forEach((btn) => expect(btn).not.toBeDisabled());
   });
 
   it('selecting a mode calls setTradingMode', async () => {
-    setTradingMode.mockResolvedValue({ kiwoom: 'autonomous', coin: 'hitl', master_enabled: false });
+    setTradingMode.mockResolvedValue({ kiwoom: 'autonomous', master_enabled: false });
     render(<TradingModeSection onError={vi.fn()} />);
     await waitFor(() => expect(getTradingMode).toHaveBeenCalled());
     const autonomousButtons = screen.getAllByRole('button', { name: /^autonomous$/i });
-    fireEvent.click(autonomousButtons[0]); // kiwoom row is first
+    fireEvent.click(autonomousButtons[0]); // kiwoom row is the only row
     await waitFor(() => expect(setTradingMode).toHaveBeenCalledWith('kiwoom', 'autonomous'));
   });
 
@@ -60,9 +61,9 @@ describe('TradingModeSection — master gate OFF does not disable intent-setting
     // fetch resolves to the same values, so this doesn't depend on a
     // same-value React state update (setLoadFailed(false)) actually forcing
     // a re-render (React bails out via Object.is when it wouldn't).
-    mockState.tradingModes = { kiwoom: 'autonomous', coin: 'hitl' };
+    mockState.tradingModes = { kiwoom: 'autonomous' };
     mockState.autonomyMasterEnabled = false;
-    getTradingMode.mockResolvedValue({ kiwoom: 'autonomous', coin: 'hitl', master_enabled: false });
+    getTradingMode.mockResolvedValue({ kiwoom: 'autonomous', master_enabled: false });
     render(<TradingModeSection onError={vi.fn()} />);
     await waitFor(() => expect(getTradingMode).toHaveBeenCalled());
     expect(
@@ -71,9 +72,9 @@ describe('TradingModeSection — master gate OFF does not disable intent-setting
   });
 
   it('does not show the env-requirement note when no market is set to autonomous', async () => {
-    mockState.tradingModes = { kiwoom: 'hitl', coin: 'hitl' };
+    mockState.tradingModes = { kiwoom: 'hitl' };
     mockState.autonomyMasterEnabled = false;
-    getTradingMode.mockResolvedValue({ kiwoom: 'hitl', coin: 'hitl', master_enabled: false });
+    getTradingMode.mockResolvedValue({ kiwoom: 'hitl', master_enabled: false });
     render(<TradingModeSection onError={vi.fn()} />);
     await waitFor(() => expect(getTradingMode).toHaveBeenCalled());
     expect(screen.queryByText(/자율 모드 설정됨/)).not.toBeInTheDocument();

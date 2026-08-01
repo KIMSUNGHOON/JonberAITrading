@@ -383,6 +383,13 @@ export function DiscoverySection() {
   }, [startAnalysis]);
 
   const handlePromoteItem = useCallback((item: BasketItem) => {
+    // BasketItem.marketType is 'kiwoom'-only by TYPE now, so this is
+    // unrepresentable at compile time and merge() (store/index.ts) already
+    // filters any stale non-kiwoom item out on rehydrate — but addToWatchList
+    // hits the LIVE server watch list, so a one-line runtime guard stays as
+    // the last line of defense against ever promoting a non-kiwoom ticker
+    // there (coordinator review, upbit-removal Task 6 fix round 1).
+    if (item.marketType !== 'kiwoom') return;
     runPromote(() => addToWatchList({
       ticker: item.ticker,
       stock_name: item.displayName,

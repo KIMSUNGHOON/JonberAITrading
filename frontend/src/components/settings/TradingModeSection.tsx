@@ -15,18 +15,18 @@ import { useEffect, useState } from 'react';
 
 import { getTradingMode, setTradingMode } from '@/api/client';
 import { useStore } from '@/store';
+import type { MarketType } from '@/store';
 import type { TradingMode } from '@/types';
 
-const TRADING_MODE_MARKETS: { id: 'kiwoom' | 'coin'; label: string }[] = [
+const TRADING_MODE_MARKETS: { id: MarketType; label: string }[] = [
   { id: 'kiwoom', label: 'KR · KRX' },
-  { id: 'coin', label: 'COIN' },
 ];
 
 export function TradingModeSection({ onError }: { onError: (message: string) => void }) {
   const tradingModes = useStore((s) => s.tradingModes);
   const masterEnabled = useStore((s) => s.autonomyMasterEnabled);
   const setStoreTradingModes = useStore((s) => s.setTradingModes);
-  const [saving, setSaving] = useState<'kiwoom' | 'coin' | null>(null);
+  const [saving, setSaving] = useState<MarketType | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
 
   // Fetch current modes on section mount.
@@ -39,7 +39,7 @@ export function TradingModeSection({ onError }: { onError: (message: string) => 
       .catch(() => setLoadFailed(true)); // modes stay null → toggles disabled
   }, [setStoreTradingModes]);
 
-  const handleSelect = async (market: 'kiwoom' | 'coin', mode: TradingMode) => {
+  const handleSelect = async (market: MarketType, mode: TradingMode) => {
     if (!tradingModes || tradingModes[market] === mode) return;
     setSaving(market);
     try {
@@ -59,7 +59,7 @@ export function TradingModeSection({ onError }: { onError: (message: string) => 
   // gate (see TradingDashboard's `fullyArmed`, which correctly still checks
   // it). Disabling the toggle here was a pure UX dead-end.
   const disabled = !tradingModes || saving !== null;
-  const anyAutonomous = !!tradingModes && (tradingModes.kiwoom === 'autonomous' || tradingModes.coin === 'autonomous');
+  const anyAutonomous = !!tradingModes && tradingModes.kiwoom === 'autonomous';
 
   return (
     <div className="bg-card border border-hairline rounded p-4 font-mono">

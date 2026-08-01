@@ -165,7 +165,7 @@ describe('OrderTicketRail — R3 autonomous mode', () => {
   function activeAutonomousState(autoApproveAt: string | null) {
     return {
       activeMarket: 'kiwoom',
-      tradingModes: { kiwoom: 'autonomous', coin: 'hitl' },
+      tradingModes: { kiwoom: 'autonomous' },
       kiwoom: {
         tradeProposal: {
           id: 'p1',
@@ -193,7 +193,7 @@ describe('OrderTicketRail — R3 autonomous mode', () => {
   }
 
   it('renders the AUTONOMOUS chip in idle state when the active market mode is autonomous', () => {
-    mockState.tradingModes = { kiwoom: 'autonomous', coin: 'hitl' };
+    mockState.tradingModes = { kiwoom: 'autonomous' };
     render(<OrderTicketRail />);
     expect(screen.getByText('AUTONOMOUS')).toBeInTheDocument();
     expect(screen.getByText('NO PENDING ORDER')).toBeInTheDocument();
@@ -206,7 +206,7 @@ describe('OrderTicketRail — R3 autonomous mode', () => {
   });
 
   it('renders no chip when the active market mode is hitl', () => {
-    mockState.tradingModes = { kiwoom: 'hitl', coin: 'autonomous' };
+    mockState.tradingModes = { kiwoom: 'hitl' };
     render(<OrderTicketRail />);
     expect(screen.queryByText('AUTONOMOUS')).not.toBeInTheDocument();
   });

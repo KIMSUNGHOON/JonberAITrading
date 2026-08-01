@@ -36,9 +36,9 @@ export function fmtPct(n: number | null | undefined): string {
 }
 
 /**
- * Market-aware price. Coin/kiwoom are KRW.
- * KRW prices under 100 keep up to 4 decimals (small-cap coins); otherwise
- * integer KRW. A 0 or missing price renders DASH (never a misleading 0.00).
+ * Market-aware price (kiwoom is KRW).
+ * KRW prices under 100 keep up to 4 decimals; otherwise integer KRW. A 0 or
+ * missing price renders DASH (never a misleading 0.00).
  */
 export function fmtPrice(n: number | null | undefined, _market: MarketType): string {
   if (n == null || !Number.isFinite(n) || n === 0) return DASH;
@@ -55,9 +55,4 @@ export function fmtMoneyCompact(n: number | null | undefined, _market: MarketTyp
   if (Math.abs(n) >= 100_000_000) return `₩${(n / 100_000_000).toFixed(2)}억`;
   if (Math.abs(n) >= 10_000) return `₩${(n / 10_000).toFixed(0)}만`;
   return `₩${Math.round(n).toLocaleString('ko-KR')}`;
-}
-
-/** Label for the active market (matches the status line / command bar). */
-export function marketLabelOf(market: MarketType): string {
-  return market === 'kiwoom' ? 'KRX' : 'UPBIT';
 }

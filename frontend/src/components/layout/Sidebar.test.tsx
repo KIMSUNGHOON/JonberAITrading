@@ -25,7 +25,6 @@ function renderSidebar() {
 describe('Sidebar renders from NAV_ITEMS (single source)', () => {
   beforeEach(() => {
     useStore.setState({
-      upbitApiConfigured: false,
       kiwoomApiConfigured: false,
       activeMarket: 'kiwoom',
     });

@@ -25,7 +25,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useStore } from '@/store';
+import { useStore, type MarketType } from '@/store';
 import {
   getOperations, cancelKRStockSession, convertWatchToQueue,
   removeFromWatchList, cancelKRStockOrder, cancelQueuedTrade, processTradeQueue,
@@ -62,7 +62,7 @@ export function useOperations() {
   const refetch = useCallback(async (showLoading = false) => {
     if (showLoading) setState('loading');
     try {
-      const res = await getOperations('kiwoom');
+      const res = await getOperations(activeMarket);
       if (!aliveRef.current) return;
       setData(res);
       setState('ready');
@@ -72,7 +72,7 @@ export function useOperations() {
       setErr(e instanceof Error ? e.message : '로드 실패');
       setState('error');
     }
-  }, []);
+  }, [activeMarket]);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -225,7 +225,7 @@ export function AwaitingColumn({
 }: {
   items: OperationsResponse['awaiting'];
   errors: Record<string, string>;
-  activeMarket: 'kiwoom';
+  activeMarket: MarketType;
   onFocus: (row: OperationsAwaiting) => void;
 }) {
   if (!columnVisible(items, 'sessions', errors)) return null;
@@ -365,7 +365,7 @@ export function PendingBuyColumn({
 }: {
   pendingBuy: OperationsResponse['pending_buy'];
   errors: Record<string, string>;
-  activeMarket: 'kiwoom';
+  activeMarket: MarketType;
   /**
    * Task 8b: backported from the /trading TradeQueueWidget — cancels a
    * PENDING queued trade (DELETE /trading/queue/{id}). Distinct from
@@ -460,7 +460,7 @@ export function HoldingColumn({
 }: {
   items: OperationsResponse['holding'];
   errors: Record<string, string>;
-  activeMarket: 'kiwoom';
+  activeMarket: MarketType;
   navigate: (path: string) => void;
 }) {
   if (!columnVisible(items, 'holding', errors)) return null;
@@ -503,7 +503,7 @@ export function TodayFillsColumn({
 }: {
   items: OperationsResponse['today_fills'];
   errors: Record<string, string>;
-  activeMarket: 'kiwoom';
+  activeMarket: MarketType;
   navigate: (path: string) => void;
 }) {
   if (!columnVisible(items, 'today_fills', errors)) return null;

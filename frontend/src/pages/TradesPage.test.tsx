@@ -9,6 +9,13 @@
  * KR 섹션 게이트도 PositionsPage와 같은 이유로 `kiwoomApiConfigured` 단독으로
  * 단순화했다 — activeMarket은 동결 이후 사실상 항상 'kiwoom'이라 원래 OR 조건이
  * 상시 참이 되어 미설정 상태에서도 계좌 패널이 뜨는 모순이 있었다.
+ *
+ * Task 6 fix round 1 (코디네이터 리뷰): `upbitApiConfigured` 자체가 스토어에서
+ * 제거됐다(코인 스택 제거 이후 프로덕션 리더 0 — 실제 Upbit UI는 SettingsModal이
+ * getUpbitApiStatus()를 로컬 상태로 직접 소비했다). "Upbit이 설정되어
+ * 있어도(레거시 상태)" 테스트는 이제 존재하지 않는 필드를 흉내 내는 것이므로
+ * 제거한다 — Crypto Trades 미노출은 activeMarket/kiwoomApiConfigured 두
+ * 테스트만으로 이미 고정돼 있다.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
@@ -27,7 +34,6 @@ describe('TradesPage — 코인 동결', () => {
     useStore.setState({
       activeMarket: 'kiwoom',
       kiwoomApiConfigured: true,
-      upbitApiConfigured: false,
     } as never);
   });
 
@@ -36,18 +42,7 @@ describe('TradesPage — 코인 동결', () => {
     await waitFor(() => expect(screen.getByTestId('kiwoom-trades')).toBeInTheDocument());
   });
 
-  it('Crypto Trades 섹션은 렌더되지 않는다 (Upbit 미설정)', async () => {
-    render(<TradesPage />);
-    await waitFor(() => expect(screen.getByTestId('kiwoom-trades')).toBeInTheDocument());
-    expect(screen.queryByText('Crypto Trades')).not.toBeInTheDocument();
-  });
-
-  it('Upbit이 설정되어 있어도(레거시 상태) Crypto Trades 섹션은 뜨지 않는다', async () => {
-    useStore.setState({
-      activeMarket: 'kiwoom',
-      kiwoomApiConfigured: true,
-      upbitApiConfigured: true,
-    } as never);
+  it('Crypto Trades 섹션은 렌더되지 않는다', async () => {
     render(<TradesPage />);
     await waitFor(() => expect(screen.getByTestId('kiwoom-trades')).toBeInTheDocument());
     expect(screen.queryByText('Crypto Trades')).not.toBeInTheDocument();
@@ -57,7 +52,6 @@ describe('TradesPage — 코인 동결', () => {
     useStore.setState({
       activeMarket: 'kiwoom',
       kiwoomApiConfigured: false,
-      upbitApiConfigured: false,
     } as never);
     render(<TradesPage />);
     await waitFor(() => expect(screen.queryByTestId('kiwoom-trades')).not.toBeInTheDocument());

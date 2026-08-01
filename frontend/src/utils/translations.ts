@@ -182,7 +182,6 @@ type AnalysisKeys =
 type MarketTabKeys =
   | 'market_kr_stock'
   | 'market_us_stock'
-  | 'market_coin'
   | 'market_all';
 
 // Basket
@@ -399,7 +398,6 @@ const translations: Record<Language, Record<TranslationKey, string>> = {
     // Market Tabs
     market_kr_stock: '국내주식',
     market_us_stock: '해외주식',
-    market_coin: '암호화폐',
     market_all: '전체',
 
     // Basket (label: Scratchpad, P2-T3 — '관심종목' now belongs to the server watch-list)
@@ -593,7 +591,6 @@ const translations: Record<Language, Record<TranslationKey, string>> = {
     // Market Tabs
     market_kr_stock: 'KR Stock',
     market_us_stock: 'US Stock',
-    market_coin: 'Crypto',
     market_all: 'All',
 
     // Basket (label: Scratchpad, P2-T3 — "Watchlist" now belongs to the server watch-list)

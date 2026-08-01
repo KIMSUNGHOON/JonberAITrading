@@ -27,7 +27,7 @@ describe('detectBackendOrigin', () => {
   it('skips a foreign app on :8000 and picks our backend on :8001', async () => {
     const fetchFn = fetchStub({
       8000: { name: 'AgentHub', status: 'ok' }, // 타 앱 — 식별 필드 없음
-      8001: { kiwoom: 'hitl', coin: 'hitl', master_enabled: false },
+      8001: { kiwoom: 'hitl', master_enabled: false },
     });
     const origin = await detectBackendOrigin({ ports: [8000, 8001], fetchFn });
     expect(origin).toBe('http://127.0.0.1:8001');
@@ -35,7 +35,7 @@ describe('detectBackendOrigin', () => {
 
   it('returns the first matching port when ours is on :8000', async () => {
     const fetchFn = fetchStub({
-      8000: { kiwoom: 'autonomous', coin: 'hitl', master_enabled: true },
+      8000: { kiwoom: 'autonomous', master_enabled: true },
     });
     const origin = await detectBackendOrigin({ ports: [8000, 8001], fetchFn });
     expect(origin).toBe('http://127.0.0.1:8000');
@@ -52,7 +52,7 @@ describe('detectBackendOrigin', () => {
 
   it('probes the identification endpoint, not just any 200', async () => {
     const fetchFn = fetchStub({
-      8001: { kiwoom: 'hitl', coin: 'hitl', master_enabled: false },
+      8001: { kiwoom: 'hitl', master_enabled: false },
     });
     await detectBackendOrigin({ ports: [8001], fetchFn });
     expect(fetchFn).toHaveBeenCalledWith(

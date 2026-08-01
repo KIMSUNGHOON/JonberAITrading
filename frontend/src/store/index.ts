@@ -200,9 +200,6 @@ interface UIState {
   // is marked read immediately (the user is looking at it).
   notificationPanelOpen: boolean;
 
-  // Upbit API status
-  upbitApiConfigured: boolean;
-
   // Kiwoom API status
   kiwoomApiConfigured: boolean;
 
@@ -226,7 +223,7 @@ interface UIState {
   // R3 trading modes (Autonomous | HITL) per market. null until fetched from
   // GET /settings/trading-mode (components fetch; the store only holds state).
   // NOT persisted.
-  tradingModes: { kiwoom: TradingMode; coin: TradingMode } | null;
+  tradingModes: { kiwoom: TradingMode } | null;
   autonomyMasterEnabled: boolean;
 
   // P4 T3: brief, app-wide informational toast (e.g. "이미 보유 중 · 포지션
@@ -369,7 +366,6 @@ interface UIActions {
   setChatPopupPosition: (position: { x: number; y: number }) => void;
   // Notification panel (P1-3)
   setNotificationPanelOpen: (open: boolean) => void;
-  setUpbitApiConfigured: (configured: boolean) => void;
   setKiwoomApiConfigured: (configured: boolean) => void;
   setChartTimeframe: (timeframe: TimeFrame) => void;
   toggleChartIndicator: (indicator: 'showSMA50' | 'showSMA200' | 'showVolume') => void;
@@ -457,7 +453,6 @@ const initialUIState: UIState = {
   chatPopupSize: 'medium',
   chatPopupPosition: { x: -1, y: -1 }, // -1 = use default position (bottom-right)
   notificationPanelOpen: false,
-  upbitApiConfigured: false,
   kiwoomApiConfigured: false,
   chartConfig: {
     timeframe: '1d',
@@ -1320,8 +1315,6 @@ export const useStore = create<Store>()(
 
       setNotificationPanelOpen: (open) => set({ notificationPanelOpen: open }),
 
-      setUpbitApiConfigured: (configured) => set({ upbitApiConfigured: configured }),
-
       setKiwoomApiConfigured: (configured) => set({ kiwoomApiConfigured: configured }),
 
       setHasVisited: (visited) => set({ hasVisited: visited }),
@@ -1334,7 +1327,7 @@ export const useStore = create<Store>()(
 
       setTradingModes: (resp) =>
         set({
-          tradingModes: { kiwoom: resp.kiwoom, coin: resp.coin },
+          tradingModes: { kiwoom: resp.kiwoom },
           autonomyMasterEnabled: resp.master_enabled,
         }),
 

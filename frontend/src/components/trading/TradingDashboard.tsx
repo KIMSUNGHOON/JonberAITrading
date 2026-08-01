@@ -175,7 +175,7 @@ export default function TradingDashboard() {
   };
 
   const autonomousMarkets = tradingModes
-    ? (['kiwoom', 'coin'] as const).filter((m) => tradingModes[m] === 'autonomous')
+    ? (['kiwoom'] as const).filter((m) => tradingModes[m] === 'autonomous')
     : [];
   const fullyArmed =
     masterEnabled && autonomousMarkets.length > 0 && brainStatus?.is_running && execStatus?.is_active;

@@ -31,7 +31,6 @@ describe('PositionsPage — 손익 요약 스트립', () => {
     useStore.setState({
       activeMarket: 'kiwoom',
       kiwoomApiConfigured: true,
-      upbitApiConfigured: false,
     } as never);
   });
 
@@ -57,7 +56,6 @@ describe('PositionsPage — 손익 요약 스트립', () => {
     useStore.setState({
       activeMarket: 'kiwoom',
       kiwoomApiConfigured: false,
-      upbitApiConfigured: false,
     } as never);
     render(<PositionsPage />);
 

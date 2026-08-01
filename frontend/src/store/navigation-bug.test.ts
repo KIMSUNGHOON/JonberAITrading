@@ -154,17 +154,24 @@ describe('Navigation Bug Investigation', () => {
   });
 
   describe('Market switching should not affect sessions', () => {
-    it('should preserve sessions across setActiveMarket calls', () => {
+    it('setActiveMarket clears chartSymbol but leaves kiwoom.sessions untouched', () => {
+      // MarketType is 'kiwoom'-only since the coin stack's removal
+      // (2026-08-01), so calling setActiveMarket('kiwoom') while already on
+      // 'kiwoom' is a same-value no-op for `activeMarket` itself — the only
+      // thing left to actually exercise is setActiveMarket's OTHER effect
+      // (store/index.ts: it unconditionally clears chartSymbol so the chart
+      // falls back to the newly-active session's ticker). Assert both: the
+      // clear happens, and it doesn't collaterally touch sessions.
       const session = createMockSession({ sessionId: 'test-session' });
       useStore.getState().addKiwoomSession(session);
+      useStore.getState().setChartSymbol('005930');
+      expect(useStore.getState().chartSymbol).toBe('005930');
 
-      // MarketType is 'kiwoom'-only since the coin stack's removal
-      // (2026-08-01) — this still exercises that setActiveMarket itself
-      // never touches kiwoom.sessions.
       useStore.getState().setActiveMarket('kiwoom');
 
-      // Session should still exist
+      expect(useStore.getState().chartSymbol).toBeNull();
       expect(useStore.getState().kiwoom.sessions).toHaveLength(1);
+      expect(useStore.getState().kiwoom.sessions[0].sessionId).toBe('test-session');
     });
   });
 

@@ -6,6 +6,7 @@ import type {
   KRStockTradeProposal,
   ApprovalRequest, ApprovalDecision,
 } from '@/types';
+import type { MarketType } from '@/store';
 
 export type AnyTradeProposal = KRStockTradeProposal;
 
@@ -14,13 +15,13 @@ export function getProposalSymbol(proposal: AnyTradeProposal): string {
   return 'UNKNOWN';
 }
 
-export function getProposalMarketType(_proposal: AnyTradeProposal): 'kiwoom' {
+export function getProposalMarketType(_proposal: AnyTradeProposal): MarketType {
   return 'kiwoom';
 }
 
 export function formatCurrency(
   value: number | null | undefined,
-  _marketType: 'kiwoom',
+  _marketType: MarketType,
 ): string {
   if (value === null || value === undefined) return 'N/A';
   return `₩${value.toLocaleString('ko-KR')}`;

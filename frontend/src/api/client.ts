@@ -11,10 +11,7 @@ import type {
   SettingsStatus,
   TradingMode,
   TradingModeResponse,
-  UpbitApiKeyRequest,
-  UpbitApiKeyResponse,
-  UpbitApiKeyStatus,
-  UpbitValidateResponse,
+  MarketType,
   // Korean Stock (Kiwoom) Types
   KRStockListResponse,
   KRStockTickerResponse,
@@ -269,50 +266,13 @@ class ApiClient {
    * Set the trading mode for one market. Returns the full updated state.
    */
   async setTradingMode(
-    market: 'kiwoom' | 'coin',
+    market: MarketType,
     mode: TradingMode
   ): Promise<TradingModeResponse> {
     const response = await this.client.put<TradingModeResponse>(
       '/settings/trading-mode',
       { market, mode }
     );
-    return response.data;
-  }
-
-  /**
-   * Get Upbit API key status.
-   */
-  async getUpbitApiStatus(): Promise<UpbitApiKeyStatus> {
-    const response = await this.client.get<UpbitApiKeyStatus>('/settings/upbit');
-    return response.data;
-  }
-
-  /**
-   * Update Upbit API keys.
-   */
-  async updateUpbitApiKeys(request: UpbitApiKeyRequest): Promise<UpbitApiKeyResponse> {
-    const response = await this.client.post<UpbitApiKeyResponse>(
-      '/settings/upbit',
-      request
-    );
-    return response.data;
-  }
-
-  /**
-   * Validate Upbit API keys.
-   */
-  async validateUpbitApiKeys(): Promise<UpbitValidateResponse> {
-    const response = await this.client.post<UpbitValidateResponse>(
-      '/settings/upbit/validate'
-    );
-    return response.data;
-  }
-
-  /**
-   * Clear Upbit API keys.
-   */
-  async clearUpbitApiKeys(): Promise<{ message: string }> {
-    const response = await this.client.delete('/settings/upbit');
     return response.data;
   }
 
@@ -1211,7 +1171,7 @@ class ApiClient {
   /**
    * Get operations pipeline snapshot for a market.
    */
-  async getOperations(market: 'kiwoom' | 'coin' = 'kiwoom'): Promise<OperationsResponse> {
+  async getOperations(market: MarketType = 'kiwoom'): Promise<OperationsResponse> {
     const response = await this.client.get<OperationsResponse>('/trading/operations', {
       params: { market },
     });
@@ -1700,17 +1660,8 @@ export const getSettings = () => apiClient.getSettings();
 
 export const getTradingMode = () => apiClient.getTradingMode();
 
-export const setTradingMode = (market: 'kiwoom' | 'coin', mode: TradingMode) =>
+export const setTradingMode = (market: MarketType, mode: TradingMode) =>
   apiClient.setTradingMode(market, mode);
-
-export const getUpbitApiStatus = () => apiClient.getUpbitApiStatus();
-
-export const updateUpbitApiKeys = (request: UpbitApiKeyRequest) =>
-  apiClient.updateUpbitApiKeys(request);
-
-export const validateUpbitApiKeys = () => apiClient.validateUpbitApiKeys();
-
-export const clearUpbitApiKeys = () => apiClient.clearUpbitApiKeys();
 
 // Korean Stock (Kiwoom) API
 export const getKRStocks = (limit?: number) => apiClient.getKRStocks(limit);
@@ -1889,7 +1840,7 @@ export const convertWatchToQueue = (request: ConvertWatchToQueueRequest) =>
   apiClient.convertWatchToQueue(request);
 
 // Operations API
-export const getOperations = (market: 'kiwoom' | 'coin' = 'kiwoom') =>
+export const getOperations = (market: MarketType = 'kiwoom') =>
   apiClient.getOperations(market);
 
 // Performance API

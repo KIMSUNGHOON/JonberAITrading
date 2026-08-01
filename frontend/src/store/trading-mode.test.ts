@@ -65,13 +65,11 @@ describe('setTradingModes', () => {
   it('stores per-market modes and the master gate from the API response', () => {
     useStore.getState().setTradingModes({
       kiwoom: 'autonomous',
-      coin: 'hitl',
       master_enabled: true,
     });
 
     expect(useStore.getState().tradingModes).toEqual({
       kiwoom: 'autonomous',
-      coin: 'hitl',
     });
     expect(useStore.getState().autonomyMasterEnabled).toBe(true);
   });
@@ -79,16 +77,14 @@ describe('setTradingModes', () => {
   it('overwrites a previous response wholesale', () => {
     useStore.getState().setTradingModes({
       kiwoom: 'autonomous',
-      coin: 'autonomous',
       master_enabled: true,
     });
     useStore.getState().setTradingModes({
       kiwoom: 'hitl',
-      coin: 'hitl',
       master_enabled: false,
     });
 
-    expect(useStore.getState().tradingModes).toEqual({ kiwoom: 'hitl', coin: 'hitl' });
+    expect(useStore.getState().tradingModes).toEqual({ kiwoom: 'hitl' });
     expect(useStore.getState().autonomyMasterEnabled).toBe(false);
   });
 });

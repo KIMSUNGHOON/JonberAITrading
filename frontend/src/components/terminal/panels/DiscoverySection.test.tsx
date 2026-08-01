@@ -96,7 +96,6 @@ beforeEach(() => {
   searchKRStocks.mockResolvedValue({ stocks: [], total: 0 });
   useStore.setState({
     basket: { items: [], maxItems: 10, isUpdating: false },
-    upbitApiConfigured: false,
     kiwoomApiConfigured: false,
     chartSymbol: null,
   });
@@ -618,7 +617,6 @@ describe('DiscoverySection — Scratchpad power features folded in from BasketWi
   describe('API-not-configured warning banner', () => {
     it('KR 항목이 있고 Kiwoom API 미등록이면 경고 배너를 보여주고, 클릭 시 설정 모달을 연다', () => {
       useStore.setState({
-        upbitApiConfigured: true,
         kiwoomApiConfigured: false,
         basket: { items: [krItem()], maxItems: 10, isUpdating: false },
       });
@@ -631,7 +629,6 @@ describe('DiscoverySection — Scratchpad power features folded in from BasketWi
 
     it('필요한 API가 모두 등록되어 있으면 경고 배너를 보여주지 않는다', () => {
       useStore.setState({
-        upbitApiConfigured: true,
         kiwoomApiConfigured: true,
         basket: { items: [krItem()], maxItems: 10, isUpdating: false },
       });

@@ -2,8 +2,8 @@
  * Settings Modal Component
  *
  * Provides UI for configuring application settings including:
- * - Upbit API keys for cryptocurrency trading
- * - Other settings (LLM, etc.)
+ * - Kiwoom API keys for Korean stock trading
+ * - Trading mode (Autonomous | HITL) and other settings (LLM, etc.)
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
@@ -20,10 +20,6 @@ import {
   Zap,
 } from 'lucide-react';
 import {
-  getUpbitApiStatus,
-  updateUpbitApiKeys,
-  validateUpbitApiKeys,
-  clearUpbitApiKeys,
   getKiwoomApiStatus,
   updateKiwoomApiKeys,
   validateKiwoomApiKeys,
@@ -31,7 +27,7 @@ import {
   getSettings,
 } from '@/api/client';
 import { useStore } from '@/store';
-import type { UpbitApiKeyStatus, KiwoomApiKeyStatus, SettingsStatus } from '@/types';
+import type { KiwoomApiKeyStatus, SettingsStatus } from '@/types';
 import { TradingModeSection } from './TradingModeSection';
 
 interface SettingsModalProps {
@@ -40,20 +36,12 @@ interface SettingsModalProps {
 }
 
 export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<'upbit' | 'kiwoom' | 'general'>('upbit');
-  const [upbitStatus, setUpbitStatus] = useState<UpbitApiKeyStatus | null>(null);
+  const [activeTab, setActiveTab] = useState<'kiwoom' | 'general'>('kiwoom');
   const [kiwoomStatus, setKiwoomStatus] = useState<KiwoomApiKeyStatus | null>(null);
   const [settings, setSettings] = useState<SettingsStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-
-  // Upbit API form state
-  const [accessKey, setAccessKey] = useState('');
-  const [secretKey, setSecretKey] = useState('');
-  const [showAccessKey, setShowAccessKey] = useState(false);
-  const [showSecretKey, setShowSecretKey] = useState(false);
-  const [validating, setValidating] = useState(false);
 
   // Kiwoom API form state
   const [kiwoomAppKey, setKiwoomAppKey] = useState('');
@@ -68,11 +56,9 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [inputErrors, setInputErrors] = useState<Record<string, string>>({});
 
   // Refs for auto-focus
-  const upbitAccessKeyRef = useRef<HTMLInputElement>(null);
   const kiwoomAppKeyRef = useRef<HTMLInputElement>(null);
 
   // Store actions for updating global API status
-  const setUpbitApiConfigured = useStore((state) => state.setUpbitApiConfigured);
   const setKiwoomApiConfigured = useStore((state) => state.setKiwoomApiConfigured);
 
   // Load settings on open
@@ -88,9 +74,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
     // Delay focus to ensure DOM is ready
     const timer = setTimeout(() => {
-      if (activeTab === 'upbit' && upbitAccessKeyRef.current) {
-        upbitAccessKeyRef.current.focus();
-      } else if (activeTab === 'kiwoom' && kiwoomAppKeyRef.current) {
+      if (activeTab === 'kiwoom' && kiwoomAppKeyRef.current) {
         kiwoomAppKeyRef.current.focus();
       }
     }, 100);
@@ -109,12 +93,10 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     try {
       setLoading(true);
       setError(null);
-      const [upbit, kiwoom, fullSettings] = await Promise.all([
-        getUpbitApiStatus(),
+      const [kiwoom, fullSettings] = await Promise.all([
         getKiwoomApiStatus().catch(() => null), // Kiwoom might not be configured
         getSettings(),
       ]);
-      setUpbitStatus(upbit);
       setKiwoomStatus(kiwoom);
       setSettings(fullSettings);
     } catch (err) {
@@ -124,26 +106,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       setLoading(false);
     }
   };
-
-  // Validate input fields
-  const validateUpbitInputs = useCallback((): boolean => {
-    const errors: Record<string, string> = {};
-
-    if (!accessKey.trim()) {
-      errors.upbitAccessKey = 'Access Key is required';
-    } else if (accessKey.trim().length < 10) {
-      errors.upbitAccessKey = 'Access Key seems too short';
-    }
-
-    if (!secretKey.trim()) {
-      errors.upbitSecretKey = 'Secret Key is required';
-    } else if (secretKey.trim().length < 10) {
-      errors.upbitSecretKey = 'Secret Key seems too short';
-    }
-
-    setInputErrors(errors);
-    return Object.keys(errors).length === 0;
-  }, [accessKey, secretKey]);
 
   const validateKiwoomInputs = useCallback((): boolean => {
     const errors: Record<string, string> = {};
@@ -165,54 +127,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     setInputErrors(errors);
     return Object.keys(errors).length === 0;
   }, [kiwoomAppKey, kiwoomAppSecret, kiwoomAccount]);
-
-  // Combined Save & Validate for Upbit
-  const handleSaveAndValidateUpbit = async () => {
-    if (!validateUpbitInputs()) {
-      return;
-    }
-
-    try {
-      setLoading(true);
-      setError(null);
-      setSuccess(null);
-
-      // Step 1: Save keys
-      const saveResponse = await updateUpbitApiKeys({
-        access_key: accessKey.trim(),
-        secret_key: secretKey.trim(),
-      });
-
-      if (!saveResponse.success) {
-        setError(saveResponse.message);
-        return;
-      }
-
-      setUpbitStatus(saveResponse.status);
-      setUpbitApiConfigured(saveResponse.status.is_configured);
-
-      // Step 2: Validate keys
-      setValidating(true);
-      const validateResponse = await validateUpbitApiKeys();
-
-      if (validateResponse.is_valid) {
-        setSuccess(`Setup complete! Found ${validateResponse.account_count} account(s).`);
-        setAccessKey('');
-        setSecretKey('');
-        // Refresh status
-        const status = await getUpbitApiStatus();
-        setUpbitStatus(status);
-      } else {
-        setError(`Keys saved but validation failed: ${validateResponse.message}`);
-      }
-    } catch (err) {
-      setError('Failed to setup API keys');
-      console.error(err);
-    } finally {
-      setLoading(false);
-      setValidating(false);
-    }
-  };
 
   // Combined Save & Validate for Kiwoom
   const handleSaveAndValidateKiwoom = async () => {
@@ -266,97 +180,10 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   };
 
   // Keyboard handler for Enter key
-  const handleUpbitKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSaveAndValidateUpbit();
-    }
-  };
-
   const handleKiwoomKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSaveAndValidateKiwoom();
-    }
-  };
-
-  const handleSaveUpbitKeys = async () => {
-    if (!accessKey.trim() || !secretKey.trim()) {
-      setError('Both Access Key and Secret Key are required');
-      return;
-    }
-
-    try {
-      setLoading(true);
-      setError(null);
-      setSuccess(null);
-
-      const response = await updateUpbitApiKeys({
-        access_key: accessKey.trim(),
-        secret_key: secretKey.trim(),
-      });
-
-      if (response.success) {
-        setUpbitStatus(response.status);
-        setUpbitApiConfigured(response.status.is_configured);
-        setAccessKey('');
-        setSecretKey('');
-        setSuccess('API keys updated. Click "Validate" to test them.');
-      } else {
-        setError(response.message);
-      }
-    } catch (err) {
-      setError('Failed to update API keys');
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleValidateKeys = async () => {
-    try {
-      setValidating(true);
-      setError(null);
-      setSuccess(null);
-
-      const response = await validateUpbitApiKeys();
-
-      if (response.is_valid) {
-        setSuccess(`Validation successful! Found ${response.account_count} account(s).`);
-        // Reload status to get updated validation info
-        const status = await getUpbitApiStatus();
-        setUpbitStatus(status);
-      } else {
-        setError(`Validation failed: ${response.message}`);
-      }
-    } catch (err) {
-      setError('Failed to validate API keys');
-      console.error(err);
-    } finally {
-      setValidating(false);
-    }
-  };
-
-  const handleClearKeys = async () => {
-    if (!confirm('Are you sure you want to clear the API keys?')) {
-      return;
-    }
-
-    try {
-      setLoading(true);
-      setError(null);
-      setSuccess(null);
-
-      await clearUpbitApiKeys();
-      const status = await getUpbitApiStatus();
-      setUpbitStatus(status);
-      setUpbitApiConfigured(status.is_configured);
-      setSuccess('API keys cleared');
-    } catch (err) {
-      setError('Failed to clear API keys');
-      console.error(err);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -474,16 +301,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
         {/* Tabs */}
         <div className="flex border-b border-border">
           <button
-            onClick={() => setActiveTab('upbit')}
-            className={`px-4 py-3 text-sm font-medium transition-colors ${
-              activeTab === 'upbit'
-                ? 'text-blue-400 border-b-2 border-blue-400'
-                : 'text-gray-400 hover:text-white'
-            }`}
-          >
-            Upbit API
-          </button>
-          <button
             onClick={() => setActiveTab('kiwoom')}
             className={`px-4 py-3 text-sm font-medium transition-colors ${
               activeTab === 'kiwoom'
@@ -524,230 +341,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
           {loading ? (
             <div className="flex items-center justify-center py-8">
               <Loader2 className="w-6 h-6 text-blue-400 animate-spin" />
-            </div>
-          ) : activeTab === 'upbit' ? (
-            <div className="space-y-6">
-              {/* Current Status */}
-              <div className="bg-surface rounded-lg p-4">
-                <h3 className="text-sm font-medium text-gray-300 mb-3">
-                  Current Status
-                </h3>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-400">Configured</span>
-                    <span className="flex items-center gap-1.5">
-                      {upbitStatus?.is_configured ? (
-                        <>
-                          <CheckCircle2 className="w-4 h-4 text-green-400" />
-                          <span className="text-sm text-green-400">Yes</span>
-                        </>
-                      ) : (
-                        <>
-                          <XCircle className="w-4 h-4 text-gray-500" />
-                          <span className="text-sm text-gray-500">No</span>
-                        </>
-                      )}
-                    </span>
-                  </div>
-                  {upbitStatus?.access_key_masked && (
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-gray-400">Access Key</span>
-                      <span className="text-sm font-mono text-gray-300">
-                        {upbitStatus.access_key_masked}
-                      </span>
-                    </div>
-                  )}
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-400">Validated</span>
-                    <span className="flex items-center gap-1.5">
-                      {upbitStatus?.is_valid === true ? (
-                        <>
-                          <CheckCircle2 className="w-4 h-4 text-green-400" />
-                          <span className="text-sm text-green-400">Valid</span>
-                        </>
-                      ) : upbitStatus?.is_valid === false ? (
-                        <>
-                          <XCircle className="w-4 h-4 text-red-400" />
-                          <span className="text-sm text-red-400">Invalid</span>
-                        </>
-                      ) : (
-                        <span className="text-sm text-gray-500">Not tested</span>
-                      )}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-400">Trading Mode</span>
-                    <span className={`text-sm font-medium ${
-                      upbitStatus?.trading_mode === 'live'
-                        ? 'text-orange-400'
-                        : 'text-blue-400'
-                    }`}>
-                      {upbitStatus?.trading_mode?.toUpperCase() || 'PAPER'}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Action Buttons */}
-                {upbitStatus?.is_configured && (
-                  <div className="flex gap-2 mt-4 pt-4 border-t border-border">
-                    <button
-                      onClick={handleValidateKeys}
-                      disabled={validating}
-                      className="flex items-center gap-2 px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg disabled:opacity-50 transition-colors"
-                    >
-                      {validating ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                      )}
-                      Validate
-                    </button>
-                    <button
-                      onClick={handleClearKeys}
-                      className="px-3 py-1.5 text-sm text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors"
-                    >
-                      Clear Keys
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* API Key Form */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-medium text-gray-300">
-                  {upbitStatus?.is_configured ? 'Update API Keys' : 'Enter API Keys'}
-                </h3>
-                <p className="text-xs text-gray-500">
-                  Get your API keys from{' '}
-                  <a
-                    href="https://upbit.com/mypage/open_api_management"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-blue-400 hover:underline"
-                  >
-                    Upbit Open API Management
-                  </a>
-                </p>
-
-                {/* Access Key */}
-                <div className="space-y-1.5">
-                  <label className="text-sm text-gray-400">Access Key</label>
-                  <div className="relative">
-                    <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
-                    <input
-                      ref={upbitAccessKeyRef}
-                      type={showAccessKey ? 'text' : 'password'}
-                      value={accessKey}
-                      onChange={(e) => {
-                        setAccessKey(e.target.value);
-                        if (inputErrors.upbitAccessKey) {
-                          setInputErrors((prev) => ({ ...prev, upbitAccessKey: '' }));
-                        }
-                      }}
-                      onKeyDown={handleUpbitKeyDown}
-                      placeholder="Enter your Upbit Access Key"
-                      className={`w-full pl-10 pr-10 py-2.5 bg-surface border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 ${
-                        inputErrors.upbitAccessKey ? 'border-red-500' : 'border-border'
-                      }`}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowAccessKey(!showAccessKey)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
-                    >
-                      {showAccessKey ? (
-                        <EyeOff className="w-4 h-4" />
-                      ) : (
-                        <Eye className="w-4 h-4" />
-                      )}
-                    </button>
-                  </div>
-                  {inputErrors.upbitAccessKey && (
-                    <p className="text-xs text-red-400 flex items-center gap-1">
-                      <AlertCircle className="w-3 h-3" />
-                      {inputErrors.upbitAccessKey}
-                    </p>
-                  )}
-                </div>
-
-                {/* Secret Key */}
-                <div className="space-y-1.5">
-                  <label className="text-sm text-gray-400">Secret Key</label>
-                  <div className="relative">
-                    <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
-                    <input
-                      type={showSecretKey ? 'text' : 'password'}
-                      value={secretKey}
-                      onChange={(e) => {
-                        setSecretKey(e.target.value);
-                        if (inputErrors.upbitSecretKey) {
-                          setInputErrors((prev) => ({ ...prev, upbitSecretKey: '' }));
-                        }
-                      }}
-                      onKeyDown={handleUpbitKeyDown}
-                      placeholder="Enter your Upbit Secret Key"
-                      className={`w-full pl-10 pr-10 py-2.5 bg-surface border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 ${
-                        inputErrors.upbitSecretKey ? 'border-red-500' : 'border-border'
-                      }`}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowSecretKey(!showSecretKey)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
-                    >
-                      {showSecretKey ? (
-                        <EyeOff className="w-4 h-4" />
-                      ) : (
-                        <Eye className="w-4 h-4" />
-                      )}
-                    </button>
-                  </div>
-                  {inputErrors.upbitSecretKey && (
-                    <p className="text-xs text-red-400 flex items-center gap-1">
-                      <AlertCircle className="w-3 h-3" />
-                      {inputErrors.upbitSecretKey}
-                    </p>
-                  )}
-                </div>
-
-                {/* Action Buttons */}
-                <div className="flex gap-2">
-                  <button
-                    onClick={handleSaveAndValidateUpbit}
-                    disabled={loading || validating || !accessKey.trim() || !secretKey.trim()}
-                    className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
-                  >
-                    {loading || validating ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <Zap className="w-4 h-4" />
-                    )}
-                    {validating ? 'Validating...' : 'Save & Validate'}
-                  </button>
-                  <button
-                    onClick={handleSaveUpbitKeys}
-                    disabled={loading || !accessKey.trim() || !secretKey.trim()}
-                    className="px-4 py-2.5 text-gray-400 hover:text-white hover:bg-surface rounded-lg transition-colors text-sm"
-                    title="Save without validation"
-                  >
-                    Save Only
-                  </button>
-                </div>
-                <p className="text-xs text-gray-500 text-center">
-                  Press Enter to Save & Validate
-                </p>
-              </div>
-
-              {/* Note */}
-              <div className="text-xs text-gray-500 bg-surface/50 rounded-lg p-3">
-                <p className="font-medium text-gray-400 mb-1">Note:</p>
-                <ul className="list-disc list-inside space-y-0.5">
-                  <li>API keys are stored in runtime memory only</li>
-                  <li>Keys will be cleared when the server restarts</li>
-                  <li>For persistence, set UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY in .env</li>
-                  <li>Trading mode is controlled by UPBIT_TRADING_MODE in .env</li>
-                </ul>
-              </div>
             </div>
           ) : activeTab === 'kiwoom' ? (
             /* Kiwoom Settings Tab */

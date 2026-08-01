@@ -15,7 +15,7 @@ import { ChatToggleButton } from '@/components/chat/ChatToggleButton';
 import { ChatPopup } from '@/components/chat/ChatPopup';
 import { Toast } from '@/components/ui/Toast';
 import { TradeNotificationToast } from '@/components/ui/TradeNotificationToast';
-import { getUpbitApiStatus, getKiwoomApiStatus, getTradingMode } from '@/api/client';
+import { getKiwoomApiStatus, getTradingMode } from '@/api/client';
 import { rehydrateKiwoomSessions } from '@/api/kiwoomSessionHandlers';
 import { SessionBridge } from '@/routes/SessionBridge';
 import { PositionsPage } from '@/pages/PositionsPage';
@@ -31,7 +31,6 @@ import { AgentChatDashboard } from '@/components/agent-chat';
 function App() {
   const showSettingsModal = useStore((state) => state.showSettingsModal);
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
-  const setUpbitApiConfigured = useStore((state) => state.setUpbitApiConfigured);
   const setKiwoomApiConfigured = useStore((state) => state.setKiwoomApiConfigured);
   const setTradingModes = useStore((state) => state.setTradingModes);
   const error = useStore(selectError);
@@ -59,14 +58,6 @@ function App() {
   // Check API status on mount
   useEffect(() => {
     async function checkApiStatus() {
-      // Check Upbit API
-      try {
-        const upbitStatus = await getUpbitApiStatus();
-        setUpbitApiConfigured(upbitStatus.is_configured);
-      } catch (err) {
-        console.error('Failed to check Upbit API status:', err);
-      }
-
       // Check Kiwoom API
       try {
         const kiwoomStatus = await getKiwoomApiStatus();
@@ -92,7 +83,7 @@ function App() {
       }
     }
     checkApiStatus();
-  }, [setUpbitApiConfigured, setKiwoomApiConfigured, setTradingModes]);
+  }, [setKiwoomApiConfigured, setTradingModes]);
 
   return (
     <div className="h-screen overflow-hidden">
