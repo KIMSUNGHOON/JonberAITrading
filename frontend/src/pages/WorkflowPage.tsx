@@ -25,7 +25,6 @@ import { AnalysisQueueWidget } from '@/components/analysis/AnalysisQueueWidget';
 import { WorkflowProgress } from '@/components/analysis/WorkflowProgress';
 import { ReasoningWire } from '@/components/common/ReasoningWire';
 import { PositionCard } from '@/components/position/PositionCard';
-import { CoinInfo } from '@/components/coin/CoinInfo';
 import {
   KiwoomPositionPanel,
   KiwoomOpenOrders,
@@ -144,13 +143,6 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
             {showChartPanel && ticker && (
               <section>
                 <ChartPanel ticker={ticker} />
-              </section>
-            )}
-
-            {/* Coin Info - Show for coin markets */}
-            {ticker && ticker.includes('-') && (
-              <section>
-                <CoinInfo market={ticker} />
               </section>
             )}
 
