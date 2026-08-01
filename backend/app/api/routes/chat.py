@@ -35,7 +35,7 @@ class ActiveAnalysis(BaseModel):
     """Currently active or most recent analysis."""
     ticker: str
     displayName: str
-    marketType: str  # "stock", "coin", "kiwoom"
+    marketType: str  # "kiwoom" (2026-08-01 Upbit 제거: "stock"/"coin"는 더 이상 오지 않는다)
     status: str  # "running", "completed", "cancelled", "error"
     recommendation: Optional[str] = None  # "BUY", "SELL", "HOLD"
     confidence: Optional[float] = None  # 0-100
@@ -90,17 +90,16 @@ You help users understand market analysis, trading strategies, and their portfol
 Your capabilities:
 - Answer questions about technical analysis, fundamental analysis, and market sentiment
 - Explain trading concepts and strategies
-- Provide insights about specific stocks or cryptocurrencies
+- Provide insights about specific Korean stocks
 - Help users understand risk management
 - Clarify trade proposals and rationale
 
 Guidelines:
 - Be concise but informative
-- Use Korean for Korean stocks/market discussions, English for US stocks
 - Match the user's language
 - Don't provide specific financial advice or guarantees
 - If you don't know something, say so honestly
-- When discussing prices, use appropriate currency (KRW for Korean stocks/crypto, USD for US stocks)
+- When discussing prices, use KRW (₩)
 - Reference the trading context provided to give relevant, personalized responses
 - When the user asks about "this stock" or "the analysis", refer to the active analysis context"""
 
@@ -115,9 +114,13 @@ def _format_trading_context(ctx: TradingContext) -> str:
     sections = []
 
     # Active Analysis
+    # (2026-08-01 Upbit 제거: marketType은 이제 프론트에서 'kiwoom'만 보낸다
+    # — "stock"(US, R2 제거)·"coin"(Upbit, 이번 아크 제거) 분기는 죽은 코드라
+    # market_label·currency 둘 다 단일 시장으로 단순화했다. 방어적으로
+    # .get() fallback은 남겨 예상 밖 값이 와도 그대로 표시되게 한다.)
     if ctx.activeAnalysis:
         a = ctx.activeAnalysis
-        market_label = {"stock": "US Stock", "coin": "Crypto", "kiwoom": "KR Stock"}.get(a.marketType, a.marketType)
+        market_label = {"kiwoom": "KR Stock"}.get(a.marketType, a.marketType)
         lines = [
             "## 현재 분석 중인 종목",
             f"- 종목: {a.displayName} ({a.ticker})",
@@ -126,8 +129,7 @@ def _format_trading_context(ctx: TradingContext) -> str:
         ]
         if a.recommendation:
             lines.append(f"- 추천: {a.recommendation}" + (f" (신뢰도: {a.confidence:.0f}%)" if a.confidence else ""))
-        # Define currency symbol based on market type
-        currency = "₩" if a.marketType in ("kiwoom", "coin") else "$"
+        currency = "₩"
         if a.currentPrice:
             lines.append(f"- 현재가: {currency}{a.currentPrice:,.0f}")
         if a.entryPrice:
@@ -145,7 +147,10 @@ def _format_trading_context(ctx: TradingContext) -> str:
         lines = ["## 최근 거래 결정"]
         for d in ctx.recentDecisions[:5]:
             action_kr = "승인" if d.action == "approved" else "거절"
-            currency = "₩" if d.price and d.price > 1000 else "$"
+            # (2026-08-01 Upbit 제거 전에는 가격대로 KRW/USD를 추정하는
+            # 휴리스틱이었다 — 저가 KR 종목을 오분류할 수 있는 버그였고,
+            # 이제 시장이 KR 하나뿐이라 애초에 불필요.)
+            currency = "₩"
             line = f"- {d.displayName} ({d.ticker}): {d.tradeAction} {action_kr}"
             if d.quantity and d.price:
                 line += f" - {d.quantity}주 @ {currency}{d.price:,.0f}"

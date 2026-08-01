@@ -2,8 +2,10 @@
 
 Phase 1 backfills `outcome_realized_pnl` onto the ENTRY decision once its
 position is matched-closed (see `storage_service.update_decision_outcome`,
-wired from `kr_realized_pnl`/coin close paths) but leaves `outcome_label`
-nullable and never scores which agent's vote was actually right. Without
+wired from the `kr_realized_pnl` close path — the coin close path this used
+to also feed from was removed with the rest of the Upbit stack, 2026-08-01)
+but leaves `outcome_label` nullable and never scores which agent's vote was
+actually right. Without
 that, Phase 3's adaptive strategy re-weighting has no data to re-weight
 against.
 

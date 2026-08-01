@@ -296,18 +296,17 @@ class PaperFillSettings(BaseSettings):
       (`services/trading/fill_costs.py`), which shows a realistic
       "what would I actually keep if I exited now" number without touching
       the ledger.
-    - coin paper trading has NO broker ledger — the app's own SQLite
-      storage IS the ledger (see
-      `agents/graph/coin_nodes.py::_execute_paper_order`) — so
-      `coin_fee_bps` IS simulated directly into the coin cost
-      basis/realized P&L there (and into the displayed unrealized P&L in
-      `app/api/routes/coin/helpers.py::calculate_position_pnl`).
 
     Rates deliberately err high rather than trying to be exact (real rates
     vary by year/broker/rebate tier and are not this app's concern) — the
     whole point of this settings group is that paper P&L should never be
     MORE optimistic than reality. Env-overridable with the `PAPER_FILL_`
-    prefix, e.g. `PAPER_FILL_COIN_FEE_BPS=10`.
+    prefix, e.g. `PAPER_FILL_KR_COMMISSION_BPS=3`.
+
+    (2026-08-01 Upbit 제거: `coin_fee_bps`는 유일한 소비처
+    `agents/graph/coin_nodes.py::_execute_paper_order`·
+    `app/api/routes/coin/helpers.py::calculate_position_pnl`가 모두
+    삭제되며 죽은 필드가 되어 함께 제거했다.)
     """
 
     model_config = SettingsConfigDict(
@@ -328,10 +327,6 @@ class PaperFillSettings(BaseSettings):
     # special tax portion) — use the higher end so this never understates
     # the real exit cost.
     kr_sell_tax_bps: float = Field(default=23.0, ge=0)
-
-    # Upbit KRW-market fee is ~0.05% per side. coin paper trading has no
-    # broker ledger, so this is simulated directly (see class docstring).
-    coin_fee_bps: float = Field(default=5.0, ge=0)
 
     # Reserved for P2-4 Task P2 (adverse execution-price slippage
     # simulation) — the field exists now so config stays stable across

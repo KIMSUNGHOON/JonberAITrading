@@ -2,7 +2,8 @@
 Korean Stock (Kiwoom) Analysis API Schemas
 
 Pydantic models for Kiwoom REST API request/response validation.
-Follows the same patterns as coin.py for consistency.
+Followed the same patterns as coin.py (removed 2026-08-01 Upbit 제거) for
+consistency.
 """
 
 from datetime import datetime

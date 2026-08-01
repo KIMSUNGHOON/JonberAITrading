@@ -671,7 +671,10 @@ class _SessionFrameCursor:
             if hasattr(action, "value"):
                 action = action.value
 
-            # Support stock (ticker), coin (market), and Korean stock (stk_cd) proposals
+            # Korean stock proposals key off stk_cd (or ticker). The "market"
+            # fallback is legacy read-compat for rows persisted before the
+            # US-stack (R2, 2026-07-11) and Upbit (2026-08-01) removals —
+            # not a live coin/US code path, just don't break old sessions.
             ticker_or_market = proposal.get("ticker") or proposal.get("market") or proposal.get("stk_cd", "")
             display_name = proposal.get("stk_nm") or proposal.get("korean_name") or ""
 
@@ -711,7 +714,8 @@ class _SessionFrameCursor:
             pnl = (current_price - entry_price) * quantity
             pnl_percent = ((current_price / entry_price) - 1) * 100 if entry_price else 0
 
-            # Support both stock (ticker) and coin (market) positions
+            # Same legacy read-compat as the proposal branch above — "market"
+            # is not a live coin/US field, just old persisted rows.
             position_ticker = position.get("ticker") or position.get("market", "")
 
             position_data = {

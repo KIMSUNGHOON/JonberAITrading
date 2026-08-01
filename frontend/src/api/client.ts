@@ -879,6 +879,11 @@ class ApiClient {
 
   /**
    * Get market hours status.
+   *
+   * (2026-08-01 Upbit 제거: 응답의 `crypto` 키를 제거했다 — 백엔드
+   * GET /trading/market-hours는 이미 `krx`만 반환하고 있었고[services/
+   * trading/market_hours.py의 `_get_crypto_session` 제거는 그보다 앞선
+   * 백엔드 제거 단계에서 끝났다], 이 타입만 실물과 어긋난 채 남아 있었다.)
    */
   async getMarketHours(): Promise<{
     krx: {
@@ -888,13 +893,6 @@ class ApiClient {
       current_time: string;
       next_open: string | null;
       next_close: string | null;
-      message: string;
-    };
-    crypto: {
-      market: string;
-      name: string;
-      is_open: boolean;
-      current_time: string;
       message: string;
     };
   }> {

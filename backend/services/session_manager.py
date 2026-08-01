@@ -129,7 +129,8 @@ class AnalysisSession:
     """
     Unified session data structure for all analysis types.
 
-    This replaces the separate dicts in analysis.py, coin.py, kr_stocks.py.
+    This replaces the separate dicts in analysis.py, kr_stocks.py (and,
+    before its 2026-08-01 removal, coin.py).
     """
     session_id: str
     market_type: MarketType
@@ -182,7 +183,8 @@ class AnalysisSession:
         """
         Convert to legacy format for backward compatibility.
 
-        Matches the format used by existing routes (analysis.py, coin.py, kr_stocks.py).
+        Matches the format used by existing routes (analysis.py, kr_stocks.py,
+        and — before its 2026-08-01 removal — coin.py).
         """
         base = {
             "session_id": self.session_id,
@@ -1812,9 +1814,10 @@ async def run_session_cleanup_task() -> None:
 # cancellation paths that want a swallowed-failure write rather than the
 # raise-on-failure write-through below: approval.py's cancel-zombie-
 # tolerance branch and its generic decision-processing error handler, and
-# kr_stocks/analysis.py + coin/analysis.py's awaiting-writethrough
-# fail-closed branch (best-effort ERROR landing after the write-through
-# itself already failed). `mirror_session_state` and `mirror_session_removal`
+# kr_stocks/analysis.py's awaiting-writethrough fail-closed branch
+# (best-effort ERROR landing after the write-through itself already
+# failed; coin/analysis.py had the same call site before its 2026-08-01
+# removal). `mirror_session_state` and `mirror_session_removal`
 # currently have no callers -- kept as the swallowed-failure counterpart to
 # `commit_session_state`/`commit_session_status` below for any future
 # best-effort site; most producer code (e.g. the discussion coordinator's

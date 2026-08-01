@@ -126,9 +126,11 @@ async def maybe_schedule_auto_approve(session_id: str, market: str) -> None:
 
     TG-3 (spec F1): this is also the de-facto dispatch point for the
     Telegram approve/reject inline-keyboard message — every caller of this
-    function is a producer's awaiting-commit success path (kr_stocks/coin
-    `_finalize_awaiting_transition`) or approval.py's reject->re-analysis
-    rearm, i.e. exactly the point where session_id + the SM-persisted
+    function is a producer's awaiting-commit success path
+    (kr_stocks/analysis.py's `_finalize_awaiting_transition` — coin's
+    equivalent existed too before the 2026-08-01 Upbit removal) or
+    approval.py's reject->re-analysis rearm, i.e. exactly the point where
+    session_id + the SM-persisted
     trade_proposal.id are both confirmed and BOTH HITL and autonomous
     sessions are covered. The notify call below fires unconditionally
     (regardless of `decision.allowed`) — this replaces the old auto-only
@@ -432,8 +434,8 @@ async def rearm_awaiting_approvals() -> None:
       a live grace task is presumably already counting it down, so scheduling
       another would stack a duplicate timer.
     - maybe_schedule_auto_approve() itself pre-checks the gate; a deny (e.g.
-      master gate still off, or a coin session under HITL-only mode) writes
-      nothing and the session stays plain HITL.
+      master gate still off, or the session's trading mode set to
+      HITL-only) writes nothing and the session stays plain HITL.
     - any error scanning or scheduling a single session is logged and that
       session is skipped — never raised — so one bad session can't block
       startup or the rest of the pass.

@@ -13,8 +13,12 @@ from enum import Enum
 # The 7 TradeActions split by position (KR position-aware semantics).
 FEASIBLE_WITH_POSITION = frozenset({"HOLD", "ADD", "REDUCE", "SELL"})
 FEASIBLE_WITHOUT_POSITION = frozenset({"BUY", "WATCH", "AVOID", "HOLD"})
-# Position-unaware markets (US/coin): their node + execution pipeline handle only
-# these three (their _signal_to_action range and TradeAction enum).
+# Position-unaware markets (US, removed R2 2026-07-11; coin, removed
+# 2026-08-01 Upbit 제거) used only these three (their _signal_to_action range
+# and TradeAction enum). No production node consumes this anymore — the
+# surviving KR stock stack is position-aware and uses FEASIBLE_WITH_POSITION/
+# FEASIBLE_WITHOUT_POSITION above — but it's kept as a generically-testable
+# feasible-set shape for `action_is_feasible`/`resolve_action`.
 POSITION_AGNOSTIC_ACTIONS = frozenset({"BUY", "SELL", "HOLD"})
 
 

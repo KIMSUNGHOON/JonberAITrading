@@ -58,9 +58,11 @@ export function OrderTicketRail() {
   const [feedback, setFeedback] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const approveRef = useRef<HTMLButtonElement>(null);
+  // getProposalMarketType() always returns 'kiwoom' (2026-08-01 Upbit 제거로
+  // MarketType이 'kiwoom' 단일 유니온이 됐다) — 'crypto' 분기는 죽은 코드였다.
   const marketType = active ? getProposalMarketType(proposal!) : 'kiwoom';
   const { status: marketStatus, countdownFormatted, nextEventFormatted } = useMarketHours({
-    market: marketType === 'kiwoom' ? 'krx' : 'crypto',
+    market: 'krx',
     enableCountdown: true,
   });
   const isMarketClosed = marketType === 'kiwoom' && marketStatus && !marketStatus.is_open;

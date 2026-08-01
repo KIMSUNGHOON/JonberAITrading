@@ -1,10 +1,14 @@
-"""Shared builder for the 3 market trading graphs (P4 consolidation).
+"""Shared builder for market trading graphs (P4 consolidation).
 
-The KR / US / coin stacks assemble the SAME topology — entry -> 4 sequential
-analyses -> decision -> approval (HITL interrupt) -> {execute | re_analyze | end}.
-Only the state type, node functions, entry-node name and the 2nd-analysis label
-differ. This is a leaf module: it imports ONLY langgraph (no stack-specific
-modules) so it never introduces an import cycle.
+Originally shared by 3 stacks (KR / US / coin) that all assembled the SAME
+topology — entry -> 4 sequential analyses -> decision -> approval (HITL
+interrupt) -> {execute | re_analyze | end}; only the state type, node
+functions, entry-node name and the 2nd-analysis label differed. The US stack
+(R2, 2026-07-11) and coin stack (2026-08-01 Upbit 제거) were both removed,
+so `kr_stock_graph.py` is the sole caller now — kept generic rather than
+inlined, since nothing about the remaining call site requires collapsing it.
+This is a leaf module: it imports ONLY langgraph (no stack-specific modules)
+so it never introduces an import cycle.
 """
 
 from typing import Optional
@@ -16,7 +20,9 @@ from langgraph.graph import END, StateGraph
 def build_analysis_graph(
     state_type,
     *,
-    entry_node,       # (name, fn) — "decompose" (US) / "data_collection" (KR, coin)
+    entry_node,       # (name, fn) — "data_collection" for the surviving KR stack
+                      # (was "decompose" for the now-removed US stack; coin used
+                      # "data_collection" too before its 2026-08-01 removal)
     analysis_nodes,   # [(name, fn), ...] in order: technical, 2nd, sentiment, risk
     decision_node,
     approval_node,

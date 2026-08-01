@@ -1,10 +1,14 @@
-"""Market-agnostic state primitives shared by the 3 trading stacks (P4 consolidation).
+"""Market-agnostic state primitives, originally shared by 3 trading stacks
+(P4 consolidation) — US (removed R2, 2026-07-11) and coin (removed 2026-08-01
+Upbit 제거) are both gone now, leaving only KR stock, but the module is kept
+as-is since nothing requires collapsing it into kr_stock_state.py.
 
-Only genuinely-identical pieces live here: SignalType (byte-identical across KR/US/coin)
-and the append_list LangGraph reducer. Deliberately NOT here (they differ per market):
-the 3 TradeAction enums (KR has 7 position-aware actions; US/coin have 3), the
-market-specific models, the signal parsers, and the consensus math (KR uses different
-thresholds and excludes the risk agent). Leaf module — imports only enum/typing.
+Only genuinely-identical pieces live here: SignalType and the append_list
+LangGraph reducer. Deliberately NOT here (they differed per market and KR's
+7 position-aware TradeAction values are the only enum left): the
+market-specific models, the signal parsers, and the consensus math (KR uses
+different thresholds and excludes the risk agent). Leaf module — imports
+only enum/typing.
 """
 
 from enum import Enum
