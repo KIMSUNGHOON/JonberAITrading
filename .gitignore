@@ -133,7 +133,6 @@ list-candles-seconds
 websocket-ticker
 websocket-trade
 rate-limits
-upbit-api-overview.html
 
 # SQLite database
 *.db

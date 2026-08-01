@@ -84,7 +84,7 @@ describe('buildWsUrl', () => {
 
   it('falls back to the current host with ws: for http pages', () => {
     vi.stubEnv('VITE_WS_URL', '');
-    expect(buildWsUrl('/ws/ticker')).toBe(`ws://${window.location.host}/ws/ticker`);
+    expect(buildWsUrl('/ws/session/x')).toBe(`ws://${window.location.host}/ws/session/x`);
   });
 });
 

@@ -8,11 +8,11 @@
 
 ## 1. 사전 조건
 
-- `.env`: 모의투자 `KIWOOM_APP_KEY`/`KIWOOM_SECRET_KEY`, `KIWOOM_IS_MOCK=true`(기본), `UPBIT_TRADING_MODE=paper`
+- `.env`: 모의투자 `KIWOOM_APP_KEY`/`KIWOOM_SECRET_KEY`, `KIWOOM_IS_MOCK=true`(기본)
 - 백엔드 기동 (env 마스터 게이트는 **재시작 필요** — 유일하게 런타임 전환 불가한 스위치):
   ```bash
   cd backend
-  UPBIT_TRADING_MODE=paper KIWOOM_IS_MOCK=true AUTONOMY_ENABLED=true \
+  KIWOOM_IS_MOCK=true AUTONOMY_ENABLED=true \
     <conda python> -m uvicorn app.main:app --port 8000
   ```
   Telegram 알림을 받으려면 `TELEGRAM_ENABLED=true` + 토큰/챗ID 추가.

@@ -1,8 +1,11 @@
-"""Broker-agnostic ExecutionService (P5 single execution path).
+"""Broker-agnostic ExecutionService — currently unused by any production call site.
 
-Every order-placement call site routes an order through place_order(); the service
-dispatches to the adapter registered for that market. Per-broker order models live
-only in the adapters, so this is the ONE execution path.
+No production order path routes through place_order() today. All four live order
+paths construct KiwoomExecutionAdapter directly instead: kr_stocks/positions.py,
+kr_stocks/orders.py, agents/graph/kr_stock_nodes/execution.py, and
+services/trading/order_agent.py. This class exists as a broker-agnostic seam for a
+future multi-market dispatcher; treat it as unwired scaffolding, not the execution
+path an incident responder should trace live orders through.
 """
 
 from __future__ import annotations

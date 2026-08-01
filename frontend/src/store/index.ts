@@ -250,8 +250,8 @@ interface UIState {
 export interface BasketItem {
   id: string;
   marketType: MarketType;
-  ticker: string;           // 005930, KRW-BTC, AAPL
-  displayName: string;      // 삼성전자, 비트코인, Apple Inc.
+  ticker: string;           // 005930, 000660
+  displayName: string;      // 삼성전자, SK하이닉스
   price: number;
   prevPrice: number;        // For calculating change
   changeRate: number;       // Percentage change

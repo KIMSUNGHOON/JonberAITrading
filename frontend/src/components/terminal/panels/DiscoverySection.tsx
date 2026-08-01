@@ -389,6 +389,14 @@ export function DiscoverySection() {
     // hits the LIVE server watch list, so a one-line runtime guard stays as
     // the last line of defense against ever promoting a non-kiwoom ticker
     // there (coordinator review, upbit-removal Task 6 fix round 1).
+    //
+    // handleAnalyzeItem/handleBulkAnalyze below deliberately do NOT carry the
+    // same guard (whole-branch review, upbit-removal final fix wave): their
+    // only sink is useStartAnalysis, which calls startKRStockAnalysis
+    // unconditionally regardless of the marketType argument — a leaked
+    // non-kiwoom item still can't reach a removed route. Promote is the one
+    // path that mutates live server state, so it's the one path that keeps
+    // a belt-and-suspenders check.
     if (item.marketType !== 'kiwoom') return;
     runPromote(() => addToWatchList({
       ticker: item.ticker,
