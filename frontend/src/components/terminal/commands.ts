@@ -78,9 +78,10 @@ export function buildCommands(_ctx: CommandCtx): Command[] {
     run: (c) => c.goTo(view),
   }));
 
+  // 코인 동결(freeze) 이후 마켓은 KR 하나뿐 — market:coin 항목은 fix round 1에서
+  // 제거됐다(⌘K를 통해 setActiveMarket('coin')을 호출하던 배선, 리뷰 발견).
   const market: Command[] = [
     { id: 'market:kr', title: 'KR', group: '마켓', run: (c) => c.setActiveMarket('kiwoom') },
-    { id: 'market:coin', title: 'COIN', group: '마켓', run: (c) => c.setActiveMarket('coin') },
   ];
 
   const actions: Command[] = [

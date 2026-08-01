@@ -2,7 +2,6 @@
  * TradesPage Component
  *
  * Full-page view of executed trade history across all markets.
- * - Coin trade history
  * - Kiwoom trade history
  * - Filtering by market type
  */
@@ -10,7 +9,6 @@
 import { ArrowLeft } from 'lucide-react';
 import { useStore } from '@/store';
 import { useGoTo } from '@/hooks/useNav';
-import { CoinTradeHistory } from '@/components/coin/CoinTradeHistory';
 import { KRStockTradeHistory } from '@/components/kiwoom';
 
 interface TradesPageProps {
@@ -19,9 +17,7 @@ interface TradesPageProps {
 
 export function TradesPage({ onBack }: TradesPageProps) {
   const goTo = useGoTo();
-  const activeMarket = useStore((state) => state.activeMarket);
   const kiwoomApiConfigured = useStore((state) => state.kiwoomApiConfigured);
-  const upbitApiConfigured = useStore((state) => state.upbitApiConfigured);
 
   const handleBack = () => {
     if (onBack) {
@@ -51,16 +47,8 @@ export function TradesPage({ onBack }: TradesPageProps) {
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-6">
         <div className="max-w-6xl mx-auto space-y-6">
-          {/* Coin Trades */}
-          {(activeMarket === 'coin' || upbitApiConfigured) && (
-            <section>
-              <h2 className="text-lg font-semibold mb-3">Crypto Trades</h2>
-              <CoinTradeHistory pageSize={15} />
-            </section>
-          )}
-
           {/* Kiwoom Trades */}
-          {(activeMarket === 'kiwoom' || kiwoomApiConfigured) && (
+          {kiwoomApiConfigured && (
             <section>
               <h2 className="text-lg font-semibold mb-3">Korean Stock Trades</h2>
               <KRStockTradeHistory pageSize={15} />
@@ -68,7 +56,7 @@ export function TradesPage({ onBack }: TradesPageProps) {
           )}
 
           {/* Empty state */}
-          {!upbitApiConfigured && !kiwoomApiConfigured && (
+          {!kiwoomApiConfigured && (
             <div className="card p-8 text-center">
               <p className="text-dim">
                 Configure your API keys in Settings to view trade history

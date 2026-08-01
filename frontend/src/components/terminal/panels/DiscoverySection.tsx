@@ -632,13 +632,15 @@ export function DiscoverySection() {
           )}
         </div>
         <div className="flex items-center gap-1.5 px-2.5 py-1.5 flex-none relative">
+          {/* 코인 동결(freeze) 이후 마켓은 KR 하나뿐 — COIN 옵션은 fix round 1에서
+              제거됐다(scratchpad에서 market:'coin'으로 startCoinAnalysis까지 도달하던
+              배선, 리뷰 발견). select 자체는 남겨 최소 변경으로 유지한다. */}
           <select
             value={scratchpad.market}
             onChange={(e) => scratchpad.setMarket(e.target.value as MarketType)}
             className="px-1.5 py-1 bg-card border border-hairline rounded text-[10px]"
           >
             <option value="kiwoom">KR</option>
-            <option value="coin">COIN</option>
           </select>
           <input
             type="text"

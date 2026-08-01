@@ -2,7 +2,6 @@
  * PositionsPage Component
  *
  * Full-page view of positions across all markets.
- * - Coin positions
  * - Kiwoom positions
  * - Stock positions
  */

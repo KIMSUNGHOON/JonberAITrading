@@ -553,7 +553,14 @@ describe('DiscoverySection — Scratchpad power features folded in from BasketWi
       expect(screen.getByText(/잘못된 종목코드.*BAD/)).toBeInTheDocument();
     });
 
-    it('coin 마켓에서 콤마로 구분된 여러 티커를 KRW- 접두로 추가한다', async () => {
+    // 코인 동결(freeze) fix round 1: <select>에서 COIN <option>은 제거됐다(리뷰
+    // 발견 — market:'coin'으로 startCoinAnalysis까지 도달하던 배선). 이 테스트는
+    // fireEvent.change로 DOM value를 직접 주입하므로 실제 사용자가 드롭다운을 열어
+    // 고를 수 있는 옵션과 무관하게 통과한다 — market:'coin' 이후의 토큰 파싱 로직
+    // 자체(레거시 상태 방어용으로 코드는 남겨둠)를 검증하는 것이지, COIN이 여전히
+    // 선택 가능하다는 뜻이 아니다. 진짜 도달 불가능성은 아래
+    // 'select에 COIN 옵션이 없다' 테스트가 고정한다.
+    it('(레거시) market:coin 상태에서는 콤마로 구분된 여러 티커를 KRW- 접두로 추가한다', async () => {
       render(<DiscoverySection />);
       fireEvent.change(screen.getByRole('combobox'), { target: { value: 'coin' } });
       fireEvent.change(screen.getByPlaceholderText(/종목코드/), { target: { value: 'BTC,ETH' } });
@@ -562,6 +569,13 @@ describe('DiscoverySection — Scratchpad power features folded in from BasketWi
         const tickers = useStore.getState().basket.items.map((i) => i.ticker);
         expect(tickers).toEqual(expect.arrayContaining(['KRW-BTC', 'KRW-ETH']));
       });
+    });
+
+    it('select에 COIN 옵션이 없다 — 동결 이후 사용자가 실제로 고를 수 있는 값은 KR뿐', () => {
+      render(<DiscoverySection />);
+      const select = screen.getByRole('combobox') as HTMLSelectElement;
+      const optionValues = Array.from(select.options).map((o) => o.value);
+      expect(optionValues).toEqual(['kiwoom']);
     });
   });
 

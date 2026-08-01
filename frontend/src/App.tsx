@@ -16,7 +16,7 @@ import { ChatPopup } from '@/components/chat/ChatPopup';
 import { Toast } from '@/components/ui/Toast';
 import { TradeNotificationToast } from '@/components/ui/TradeNotificationToast';
 import { getUpbitApiStatus, getKiwoomApiStatus, getTradingMode } from '@/api/client';
-import { rehydrateKiwoomSessions, rehydrateCoinSessions } from '@/api/kiwoomSessionHandlers';
+import { rehydrateKiwoomSessions } from '@/api/kiwoomSessionHandlers';
 import { SessionBridge } from '@/routes/SessionBridge';
 import { PositionsPage } from '@/pages/PositionsPage';
 import { TradesPage } from '@/pages/TradesPage';
@@ -95,11 +95,12 @@ function App() {
       } catch {
         // silent
       }
-      try {
-        await rehydrateCoinSessions();
-      } catch {
-        // silent
-      }
+      // 코인 동결(freeze) fix round 1: rehydrateCoinSessions() 호출 제거.
+      // 이 호출이 백엔드에 남아있는 coin 세션을 store.coin에 채우면 activeMarket
+      // 없이도 AnalysisQueueWidget의 코인 세션 카드·WorkflowPage의 CoinInfo(티커
+      // 형식 기반, activeMarket 무관)가 열려 언마운트된 /coin/* 라우트를 칠 수
+      // 있었다(리뷰 발견, 브리프 미기재). 함수 자체는 kiwoomSessionHandlers.ts에
+      // 그대로 남아 있다 — 부팅 시 호출만 끊는다.
     }
     checkApiStatus();
   }, [setUpbitApiConfigured, setKiwoomApiConfigured, setTradingModes]);

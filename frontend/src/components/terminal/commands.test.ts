@@ -32,6 +32,15 @@ describe('commands', () => {
     expect(hit).toBeDefined();
     expect(hit?.arg).toBeUndefined();
   });
+
+  // 코인 동결(freeze) fix round 1: ⌘K를 통해 setActiveMarket('coin')을 호출하는
+  // 배선이 살아 있었다(리뷰 발견). market:coin 항목 제거를 회귀 방지로 고정한다.
+  it('마켓 그룹에 coin 항목이 없다 — 동결 이후 KR만 남는다', () => {
+    const cmds = buildCommands(ctx as any);
+    const marketCmds = cmds.filter((c) => c.group === '마켓');
+    expect(marketCmds.map((c) => c.id)).toEqual(['market:kr']);
+    expect(marketCmds.some((c) => c.id.includes('coin'))).toBe(false);
+  });
 });
 
 describe('parseOrderArgs', () => {

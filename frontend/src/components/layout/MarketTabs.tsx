@@ -1,24 +1,26 @@
 /**
  * MarketTabs Component
  *
- * Two markets: Stock (KR · Kiwoom) and Crypto (Upbit).
+ * 코인 동결(freeze) 이후 유일한 마켓: Stock (KR · Kiwoom).
  * The US stock stack is FROZEN (no broker, sim-only) — the Stock tab routes
  * straight to the Korean market.
+ *
+ * Crypto 탭은 코인 동결 fix round 1에서 제거됐다 — 사이드바/모바일 내비를 통해
+ * `setActiveMarket('coin')`을 호출할 수 있는 배선이었다(리뷰 발견, 브리프 Step 미기재).
+ * 코인 구현 자체는 그대로 둔다.
  */
 
-import { TrendingUp, Bitcoin, Lock } from 'lucide-react';
+import { TrendingUp, Lock } from 'lucide-react';
 import { useStore } from '@/store';
 
 export function MarketTabs() {
   const activeMarket = useStore((state) => state.activeMarket);
   const setActiveMarket = useStore((state) => state.setActiveMarket);
-  const upbitApiConfigured = useStore((state) => state.upbitApiConfigured);
   const kiwoomApiConfigured = useStore((state) => state.kiwoomApiConfigured);
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
 
   // Determine effective market for display
   const isStock = activeMarket === 'kiwoom';
-  const isCoin = activeMarket === 'coin';
 
   const handleStockClick = () => {
     if (!kiwoomApiConfigured) {
@@ -26,14 +28,6 @@ export function MarketTabs() {
       return;
     }
     setActiveMarket('kiwoom');
-  };
-
-  const handleCoinClick = () => {
-    if (!upbitApiConfigured) {
-      setShowSettingsModal(true);
-      return;
-    }
-    setActiveMarket('coin');
   };
 
   return (
@@ -55,25 +49,6 @@ export function MarketTabs() {
           <TrendingUp size={16} className="flex-shrink-0" />
           <span className="truncate">Stock</span>
           {!kiwoomApiConfigured && (
-            <Lock size={12} className="text-amber-300 opacity-70 flex-shrink-0" />
-          )}
-        </button>
-
-        {/* Crypto Tab */}
-        <button
-          onClick={handleCoinClick}
-          className={`
-            flex-1 flex items-center justify-center gap-1.5 px-2 py-2 rounded-md
-            text-sm font-medium transition-all duration-200 min-w-0
-            ${isCoin
-              ? 'bg-amber-600 text-white shadow-md'
-              : 'text-gray-400 hover:text-white hover:bg-surface-light'
-            }
-          `}
-        >
-          <Bitcoin size={16} className="flex-shrink-0" />
-          <span className="truncate">Crypto</span>
-          {!upbitApiConfigured && (
             <Lock size={12} className="text-amber-300 opacity-70 flex-shrink-0" />
           )}
         </button>

@@ -26,8 +26,6 @@ import { WorkflowProgress } from '@/components/analysis/WorkflowProgress';
 import { ReasoningWire } from '@/components/common/ReasoningWire';
 import { PositionCard } from '@/components/position/PositionCard';
 import { CoinInfo } from '@/components/coin/CoinInfo';
-import { CoinPositionPanel } from '@/components/coin/CoinPositionPanel';
-import { CoinOpenOrders } from '@/components/coin/CoinOpenOrders';
 import {
   KiwoomPositionPanel,
   KiwoomOpenOrders,
@@ -165,18 +163,6 @@ export function WorkflowPage({ onBack }: WorkflowPageProps) {
 
             {/* Trading Panels */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-              {/* Coin Trading Panels */}
-              {activeMarket === 'coin' && (
-                <>
-                  <section>
-                    <CoinPositionPanel />
-                  </section>
-                  <section>
-                    <CoinOpenOrders />
-                  </section>
-                </>
-              )}
-
               {/* Kiwoom Trading Panels */}
               {activeMarket === 'kiwoom' && (
                 <>
