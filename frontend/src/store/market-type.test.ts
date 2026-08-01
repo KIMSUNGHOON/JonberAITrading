@@ -4,11 +4,20 @@ import { useStore } from '@/store';
 /**
  * Recursively collects every own-enumerable key matching `pattern` anywhere
  * in `value` — not just at the top level. A shallow `Object.keys()` scan
- * would pass even with a nested coin slice intact (e.g. a future
- * `tradingModes: { kiwoom, coin }` regression), since nothing under a
+ * would pass even with a nested coin key intact (e.g. a future coin field
+ * inside `chartConfig` or a `kiwoom.*` sub-object), since nothing under a
  * top-level key would ever be inspected. Arrays are walked by element
  * (their own numeric-index keys are not pattern-tested); a `seen` set
  * guards against cycles.
+ *
+ * Caveat: the test below asserts against the store's default state
+ * (`useStore.getState()` right after module load, before any session or
+ * fetch populates it). `value === null` short-circuits the walk, so a
+ * regression hidden behind a field that defaults to `null` and is only
+ * populated later — e.g. `tradingModes` (`{ kiwoom: TradingMode } | null`,
+ * `null` until `/api/trading/mode` resolves) — is invisible to this test
+ * no matter how deep the scan goes. It only covers keys reachable from the
+ * default snapshot.
  */
 function collectMatchingKeys(
   value: unknown,

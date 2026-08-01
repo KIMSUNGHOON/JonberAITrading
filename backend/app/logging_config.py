@@ -317,7 +317,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     - Response body (for errors)
     """
 
-    # 비밀을 평문 바디로 받는 라우트(POST /api/settings/upbit, /api/settings/kiwoom 등)는
+    # 비밀을 평문 바디로 받는 라우트(POST /api/settings/kiwoom 등. 2026-08-01
+    # Upbit 제거로 /api/settings/upbit는 사라졌으나, 이 규칙은 "/settings" 전체를
+    # 접두사로 잡으므로 코드 변경은 불필요 — 예시 경로만 정정한다)는
     # body_preview 500바이트가 바디 전체를 덮으므로 아예 읽지 않는다.
     _SENSITIVE_BODY_PATHS = ("/settings",)
 

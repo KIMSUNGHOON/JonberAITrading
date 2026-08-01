@@ -254,9 +254,15 @@ def test_configure_logging_suppresses_leaky_loggers():
 
 
 def test_sensitive_path_skips_body_logging():
-    """설정(비밀) 경로는 바디 로깅 대상에서 제외되고, 일반 경로는 유지된다."""
+    """설정(비밀) 경로는 바디 로깅 대상에서 제외되고, 일반 경로는 유지된다.
+
+    (2026-08-01 Upbit 제거: 이 룰은 "/settings" 하나를 접두사로 잡는 범용
+    매칭이라 특정 하위 경로에 의존하지 않는다 — /api/settings/upbit는
+    Task 6에서 사라졌으므로 예시를 현재 살아있는 /settings/kiwoom 계열
+    경로로 정정했다. `_SENSITIVE_BODY_PATHS` 자체는 손대지 않는다.)
+    """
     middleware = RequestLoggingMiddleware(app=None)
 
     assert middleware._is_sensitive_path("/api/settings/kiwoom") is True
-    assert middleware._is_sensitive_path("/api/v1/settings/upbit/keys") is True
+    assert middleware._is_sensitive_path("/api/v1/settings/kiwoom/validate") is True
     assert middleware._is_sensitive_path("/api/trading/watch-list") is False

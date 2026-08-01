@@ -132,14 +132,16 @@ export function TerminalShell() {
 
       {/* ── status line ── */}
       <div className="flex items-center gap-4 h-6 px-3 bg-card border-t border-hairline text-[11px] text-muted whitespace-nowrap overflow-x-auto flex-none font-mono tabular-nums">
-        <span className="uppercase">{activeMarket === 'kiwoom' ? 'KRX' : 'UPBIT'}</span>
+        {/* activeMarket is 'kiwoom'-only since the 2026-08-01 Upbit removal
+            (MarketType narrowed to a single union member) — no ternary needed. */}
+        <span className="uppercase">KRX</span>
         <span className="text-up">● live</span>
         <span className="text-ink">{clock} KST</span>
         {/* Trading mode indicator. The app is PAPER/mock-only (live trading is
             frozen). Do NOT derive this from kiwoomApiConfigured — that flag is
             whether API keys exist, not the trade mode, and reading it here would
             mis-label real vs paper trading. Wire to the backend's real trading
-            mode (KIWOOM_IS_MOCK / UPBIT_TRADING_MODE) before ever showing LIVE. */}
+            mode (KIWOOM_IS_MOCK) before ever showing LIVE. */}
         <span className="text-warn">PAPER</span>
         {activeTradingMode !== null && (
           <span className={activeTradingMode === 'autonomous' ? 'text-accent' : 'text-dim'}>
