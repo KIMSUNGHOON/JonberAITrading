@@ -26,6 +26,76 @@ from services.agent_chat.agents import (
 
 
 # -------------------------------------------
+# 실 LLM 차단 (autouse) — 2026-08-03 라이브 장애 회귀 방지
+# -------------------------------------------
+#
+# 이 파일은 각 테스트 본문에서 직접 `TechnicalDiscussionAgent()` 등을 생성한다
+# (픽스처를 경유하지 않음). `BaseDiscussionAgent.__init__`는 `get_llm_provider()`를
+# 불러 `self.llm`을 실 라우터로 채우고, `.analyze()`/`.vote()`/`.respond()`가 그
+# 라우터를 호출하면 `claude`/`codex` CLI가 실제로 뜬다(라이브 프로세스로 확인됨).
+#
+# conftest.py의 `mock_llm`/`mock_llm_buy_signal`/`mock_llm_sell_signal`은 재사용하지
+# 않는다 — 두 가지 이유:
+#   1) 일반 픽스처라 테스트가 인자로 요청해야만 적용된다. 이 파일의 16개 테스트
+#      전부가 요청하지 않았고(그래서 이 사고가 났다), 앞으로 추가될 테스트도
+#      기억에 의존하게 된다. autouse가 "기본적으로 안전"을 보장한다.
+#   2) 반환 모양이 실제 계약과 어긋난다: `LLMProvider.generate()`는 `str`을 반환하고
+#      (`agents/llm_provider.py`), 에이전트들은 그 결과를 `.format()`/`in`/`.split()`로
+#      문자열처럼 직접 다룬다. `mock_llm`은 `AsyncMock(return_value=MagicMock(content=...))`
+#      를 반환해 `response`가 문자열이 아닌 MagicMock이 되고, 이는 조용히 깨진다
+#      (예: `"동의" in response`는 MagicMock.__contains__ 기본값 때문에 예외 없이
+#      False가 되어 분기가 뒤바뀐다) — 실제 계약을 검증하지 못하는 목이다.
+#
+# 대신 `services.agent_chat.agents.base_agent.get_llm_provider`를 패치한다 —
+# `test_structured_vote.py`가 이미 같은 지점을 패치하는 검증된 방식이다. 패치 지점이
+# 정확히 하나뿐임은 `grep -rn get_llm_provider services/agent_chat/`로 확인했다
+# (coordinator.py는 별도 지연 임포트라 이 파일의 테스트 경로에 닿지 않는다).
+#
+# `generate_structured`는 의도적으로 실패시켜 정규식 폴백 경로(`_call_llm` →
+# `_parse_vote`/`_parse_confidence`/`_extract_key_factors`)를 타게 한다 — 구조화
+# 경로의 성공/폴백 분기 자체는 `test_structured_vote.py`가 이미 전담 커버하므로,
+# 이 파일은 "프롬프트 조립 → 텍스트 응답 → 파싱"이라는 본래 취지(에이전트 행동)를
+# 계속 검증한다.
+_MOCK_LLM_RESPONSE = (
+    "기술적/펀더멘털/심리/리스크 지표를 종합했을 때 매수 우위 신호입니다.\n\n"
+    "투표: BUY\n"
+    "신뢰도: 78%\n"
+    "포지션: 3%\n"
+    "손절가: -5%\n"
+    "익절가: +10%\n"
+    "근거:\n"
+    "- RSI 과매도권 이탈 시도\n"
+    "- MACD 상승 모멘텀 확인\n"
+    "- 거래량 동반 상승"
+)
+
+
+@pytest.fixture(autouse=True)
+def _mock_llm_provider(monkeypatch):
+    """이 파일의 모든 BaseDiscussionAgent 생성을 가짜 LLM provider로 라우팅.
+
+    autouse이므로 이 파일에 새로 추가되는 테스트도 별도 인자 요청 없이 자동으로
+    보호된다. `.generate`는 정규식 파서가 실제로 소비할 수 있는 형태의 한국어
+    텍스트를 결정적으로 반환하고, `.generate_structured`는 실패시켜 각 에이전트의
+    `vote()`가 정규식 폴백 경로를 타도록 한다(구조화 경로는 test_structured_vote.py
+    소관).
+    """
+    fake_llm = MagicMock(name="fake_llm_provider_for_test_agents")
+    fake_llm.generate = AsyncMock(return_value=_MOCK_LLM_RESPONSE)
+    fake_llm.generate_structured = AsyncMock(
+        side_effect=ValueError(
+            "mock: test_agents.py는 정규식 폴백 경로를 검증한다 — "
+            "구조화 투표 경로는 test_structured_vote.py 소관"
+        )
+    )
+    monkeypatch.setattr(
+        "services.agent_chat.agents.base_agent.get_llm_provider",
+        lambda: fake_llm,
+    )
+    return fake_llm
+
+
+# -------------------------------------------
 # Fixtures
 # -------------------------------------------
 

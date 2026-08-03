@@ -7,12 +7,14 @@ Handles watch list monitoring, opportunity detection, and trade execution.
 
 import asyncio
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable
 
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from agents.llm.backends.base import LLMAllBackendsFailed
 from services.agent_chat.models import (
     ChatSession,
     DecisionAction,
@@ -346,6 +348,128 @@ from services.agent_chat.position_manager import (
 )
 
 logger = structlog.get_logger()
+
+
+# LLM 장애 통지 래치 — 감시 주기가 1분이라 래치가 없으면 장애 지속 동안 매분 발송된다.
+# 원인 문자열을 키로 1회만 보내고, 복구되면 `clear_llm_failure_latch()`가 지워
+# 재발 시 다시 알린다 — reconciler의 원가 드리프트 래치와 같은 잠금/해제
+# *패턴*을 따르되, 키는 ticker가 아니라 원인 문자열이다: 완료된 토론 하나가
+# LLM 계층 전체의 복구 증거이므로 해제도 전역(clear)이어야 한다(reconciler는
+# ticker별 discard가 맞다 — 거긴 종목마다 원가가 독립적으로 어긋나므로).
+_LLM_FAILURE_NOTIFIED: set = set()
+
+# 래치 크기 상한. 키를 안정화해도(아래 `_llm_failure_cause_key`) 예상 못 한 변동
+# 요소가 남아 있을 수 있으므로 메모리 증가에는 **무조건적인** 상한을 둔다 — 이
+# 집합은 best-effort 중복 억제 장치이지 영구 원장이 아니다.
+_LLM_FAILURE_NOTIFIED_MAX = 64
+
+_LLM_FAILURE_DIGITS_RE = re.compile(r"\d+")
+
+
+def _llm_failure_cause_key(exc: Exception) -> str:
+    """래치 키를 만든다. **알림 본문이 아니라** 중복 억제 전용이다.
+
+    예전 키는 `str(exc)[:160]`이었다. 그 160자 안에 호출마다 달라지는 값이 하나만
+    들어와도 dedup이 통째로 무력화돼 "장애가 지속되는 동안 실패한 토론마다,
+    감시 주기(1분)마다 Telegram 1건"이 된다 — 메모리 증가보다 나쁜 실패 모드다.
+    그런데 실제로 그 안에 들어오는 변동 요소가 셋이나 된다:
+
+      - **대기 상한 숫자**: 토론 단위 예산(Task 8 Fix 1)이 붙으면서 300 고정이
+        아니라 "그 시점에 남은 예산"(60/40/0...)이 된다.
+      - **task 이름**: 토론 1건이 LLM을 약 15회 부르고 단계마다 task가 다르므로,
+        어느 호출에서 터졌느냐에 따라 문자열이 바뀐다.
+      - **CLI 원문 blob**: 한도 리셋 시각 등이 그대로 들어온다(Fix 3이 사유를
+        더 잘 보존하게 만들었으므로 변동성은 오히려 커졌다).
+
+    그래서 ①숫자를 전부 `#`로 정규화하고 ②앞 40자만 쓰고 ③예외 타입을 붙인다.
+    40자면 라우터가 내는 세 가지 실패 **모양**은 그대로 갈린다
+    ("usage limit outlasted ...", "no available backend ...",
+    "all backends failed ...") — 성격이 다른 장애는 각자 자기 알림을 받는다.
+    반대로 같은 전멸 장애 안에서 백엔드별 세부 사유가 다른 것들은 한 건으로
+    합쳐진다. 이건 의도한 트레이드오프다: 운영자가 취할 조치가 동일하고, 알림
+    **본문**에는 첫 사유의 전문(160자)이 그대로 실려 세부는 잃지 않는다.
+    """
+    normalized = _LLM_FAILURE_DIGITS_RE.sub("#", str(exc))
+    return f"{type(exc).__name__}:{normalized[:40]}"
+
+
+def clear_llm_failure_latch() -> None:
+    """LLM 호출이 성공하면 호출해 래치를 푼다."""
+    _LLM_FAILURE_NOTIFIED.clear()
+
+
+async def _alert_llm_failure(ticker: str, exc: Exception) -> None:
+    """LLM 장애로 토론이 실패했음을 운영자에게 알린다. Best-effort —
+    통지 실패가 토론 경로를 더 망가뜨려선 안 된다.
+
+    **claim-then-back-out**으로 래치를 관리한다: dedup 체크와 `add(cause)`를
+    맞닿여 동기적으로 실행해(둘 사이에 `await`가 없다) 다른 코루틴이 끼어들
+    틈을 없앤다 — 이게 TOCTOU를 막는 장치다. `LLMAllBackendsFailed`는 task와
+    최종 에러로 키가 잡혀(agents/llm/router.py) 동시에 실패하는 여러 티커의
+    토론이 **같은 cause 문자열**을 공유하므로, add를 발송 확인 뒤로 미루면
+    두 코루틴이 나란히 dedup을 통과해 중복 발송된다(재현: 동일 cause로
+    `_alert_llm_failure`를 `asyncio.gather`하면 확인 전에는 send_count=2).
+    발송이 실제로 실패/미확인으로 끝나는 모든 경로(`is_ready` False,
+    `sent` False, 예외)에서는 `discard(cause)`로 되돌려 Finding 1(발송
+    미확인 시 영구 래치 금지)을 그대로 지킨다.
+
+    **락을 쓰지 않는 이유**: `asyncio.Lock`으로 체크~발송~커밋 전체를
+    감싸면 경쟁은 막지만, 이 함수는 토론 실패 예외 처리기 안에서
+    await되므로 느리거나 멈춘 Telegram 요청 하나가 락을 쥔 채 다른 모든
+    알림 시도를 그 뒤에 줄 세운다 — 장애 상황에서 알림 자체가 지연·정체될
+    위험을 굳이 만드는 셈이다. claim-then-back-out은 블로킹 프리미티브
+    없이 경쟁만 닫는다: 대가는 발송이 실제로 실패했을 때 동시 호출자가
+    선점된 claim을 보고 그냥 반환한다는 것뿐 — 다음 감시 주기(1분 뒤)에
+    재시도되므로 감내할 수 있다.
+
+    **back-out은 `finally`에 둔다(취소 안전)**: `except Exception`은
+    `asyncio.CancelledError`를 잡지 않는다(3.8부터 `BaseException`). 토론
+    태스크가 `get_telegram_notifier()`나 `send_system_status()` 안에서
+    await 중일 때 취소되면, 예전 구조에서는 claim만 남고 메시지는 안 나간
+    채 그 사유가 영구히 래치돼(다음 성공 토론까지) 같은 장애가 통째로
+    침묵했다. `finally`로 옮기면 취소·예외·조용한 실패 어느 경로든 claim이
+    풀리고, 취소는 그대로 전파된다(삼키지 않는다).
+    """
+    reason = str(exc)[:160]                 # 본문·로그에 실리는 사유(전문에 가깝게)
+    cause = _llm_failure_cause_key(exc)     # 래치 키(안정화된 축약)
+
+    # 메모리 하드 상한. 키를 안정화했는데도 상한에 닿았다면 예상 못 한 변동
+    # 요소가 남아 있다는 뜻이므로, 무한 증가 대신 래치를 비운다(그 대가는
+    # 알림 1건 재발송뿐이다).
+    if len(_LLM_FAILURE_NOTIFIED) >= _LLM_FAILURE_NOTIFIED_MAX:
+        logger.warning("llm_failure_latch_overflow", size=len(_LLM_FAILURE_NOTIFIED))
+        _LLM_FAILURE_NOTIFIED.clear()
+    if cause in _LLM_FAILURE_NOTIFIED:
+        return
+    _LLM_FAILURE_NOTIFIED.add(cause)  # claim (동기, 위 dedup 체크와 맞닿아 있음)
+
+    committed = False
+    try:
+        from services.telegram import get_telegram_notifier
+
+        notifier = await get_telegram_notifier()
+        if not notifier.is_ready:
+            logger.warning("llm_failure_alert_notifier_not_ready", ticker=ticker, cause=reason)
+            return
+        sent = await notifier.send_system_status(
+            "error",
+            f"LLM 장애로 토론을 완료하지 못했습니다 ({ticker})\n"
+            f"사유: {reason}\n"
+            f"→ 매매 결정은 내려지지 않았습니다. 복구되면 다음 감시 주기에 재시도합니다.",
+        )
+        if sent:
+            committed = True   # 발송이 **확인된** 유일한 경로 — 여기서만 래치를 유지한다
+        else:
+            # 예외 없이 실패한 경우(네트워크 순단 등) — 아래 finally가 claim을
+            # 되돌려 다음 시도에서 재발송되지만, 이번 실패 자체는 로그로 남긴다.
+            logger.warning("llm_failure_alert_not_sent", ticker=ticker, cause=reason)
+    except Exception as e:  # noqa: BLE001 — 통지는 절대 경로를 깨뜨리지 않는다
+        logger.warning("llm_failure_alert_failed", ticker=ticker, error=str(e))
+    finally:
+        # 취소(CancelledError)를 포함한 모든 미확인 종료 경로에서 claim을 되돌린다.
+        # CancelledError는 여기서 잡히지 않으므로 그대로 전파된다.
+        if not committed:
+            _LLM_FAILURE_NOTIFIED.discard(cause)
 
 
 class ChatCoordinator:
@@ -853,6 +977,7 @@ class ChatCoordinator:
         """Run a discussion and handle the result."""
         try:
             session = await room.start()
+            clear_llm_failure_latch()
 
             # Record last discussion time
             self._last_discussion[ticker] = datetime.now()
@@ -881,6 +1006,12 @@ class ChatCoordinator:
                 ticker=ticker,
                 error=str(e),
             )
+            # 이 경로는 자동 감시 루프의 백그라운드 태스크다 — 여기서 re-raise하면
+            # 미처리 태스크 예외가 되어 무인 운용을 죽인다(2026-08-03과 같은
+            # 모양). 계약대로 로그로 삼키되, LLM 전체 백엔드 소진은 운영자가
+            # 몰라선 안 되므로 별도로 통지한다.
+            if isinstance(e, LLMAllBackendsFailed):
+                await _alert_llm_failure(ticker, e)
         finally:
             # Remove from active rooms
             self._active_rooms.pop(ticker, None)
@@ -1593,9 +1724,24 @@ class ChatCoordinator:
             # failures).
             try:
                 session = await room.start()
+                clear_llm_failure_latch()
                 await persist_session(session)
                 self._last_discussion[ticker] = datetime.now()
                 return session
+            except LLMAllBackendsFailed as e:
+                # 사이트 B. 이 경로에는 원래 except가 없었다 — "예외가 HTTP
+                # 호출자에게 그대로 간다"는 전제였는데, 실제 호출자 목록을 세어
+                # 보면 틀렸다: `app/api/routes/agent_chat.py:320`은 `wait`를 넘기지
+                # 않아 백그라운드 경로(사이트 C)로 가고, 프로덕션에서 wait=True로
+                # 부르는 곳은 `position_manager.py:1232` 하나뿐인데 그 핸들러는
+                # 로그 한 줄만 남긴다. 그래서 익절·손절임박·큰손실·전략재평가
+                # 토론이 LLM 장애로 죽으면 **실 포지션에 가장 가까운 경로**에서
+                # 운영자에게 아무것도 가지 않았다.
+                #
+                # 사이트 A/C와 달리 여기서는 삼키지 않는다 — 이 경로의 계약은
+                # 전파다(호출자가 session.decision을 읽는다). 알리고 다시 던진다.
+                await _alert_llm_failure(ticker, e)
+                raise
             finally:
                 self._active_rooms.pop(ticker, None)
 
@@ -1613,6 +1759,7 @@ class ChatCoordinator:
         """
         try:
             session = await room.start()
+            clear_llm_failure_latch()
 
             await persist_session(session)
             self._last_discussion[ticker] = datetime.now()
@@ -1628,6 +1775,11 @@ class ChatCoordinator:
             # is what makes it queryable) keeps the (CANCELLED) session from
             # dangling as a permanent 404.
             await persist_session(room.session)
+            # LLM 전체 백엔드 소진은 여기서도 삼켜야 한다(위 persist_session이
+            # 세션 dangling 404를 막는 복구 로직이라 re-raise로 우회할 수 없다) —
+            # 대신 운영자에게 별도로 알린다.
+            if isinstance(e, LLMAllBackendsFailed):
+                await _alert_llm_failure(ticker, e)
         finally:
             self._active_rooms.pop(ticker, None)
 

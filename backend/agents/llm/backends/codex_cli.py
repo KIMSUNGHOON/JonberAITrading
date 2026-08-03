@@ -15,7 +15,7 @@ import structlog
 from langchain_core.messages import BaseMessage
 
 from agents.llm.backends.base import (
-    BackendAuthError, BackendError, BackendTransientError, LLMBackend,
+    BackendAuthError, BackendError, BackendTransientError, BackendUsageLimitError, LLMBackend,
 )
 from agents.llm.messages import flatten_messages
 from agents.llm.subprocess_runner import run_cli
@@ -23,6 +23,7 @@ from agents.llm.tasks import BackendName
 
 logger = structlog.get_logger()
 
+_LIMIT_MARKERS = ("usage limit",)
 _RATE_MARKERS = ("rate limit", "429", "overloaded", "usage limit")
 _AUTH_MARKERS = ("not logged in", "unauthorized", "please run codex login", "authentication")
 
@@ -39,8 +40,11 @@ class CodexCLIBackend(LLMBackend):
         self.model = model
         self.timeout = timeout
 
-    def _classify(self, msg: str, stderr: str = "") -> BackendError:
-        low = f"{msg} {stderr}".lower()
+    def _classify(self, msg: str, extra: str = "") -> BackendError:
+        low = f"{msg} {extra}".lower()
+        # 한도를 rate보다 먼저 본다 — 한도는 대기로 풀리지만 일반 rate는 아니다.
+        if any(m in low for m in _LIMIT_MARKERS):
+            return BackendUsageLimitError(msg)
         if any(m in low for m in _RATE_MARKERS):
             return BackendTransientError(msg)
         if any(m in low for m in _AUTH_MARKERS):
@@ -80,7 +84,12 @@ class CodexCLIBackend(LLMBackend):
                 # missing/unrunnable binary -> permanent; router marks unavailable + falls through
                 raise BackendAuthError(f"codex CLI unavailable at '{self.cli_path}': {e}")
             if rc != 0:
-                raise self._classify(f"codex exited {rc}: {err[:200]}", err)
+                # claude_cli.py와 같은 이유로 **각 스트림에** strip을 건다:
+                # 공백뿐인 stderr("\n")가 truthy라 `(err or out)`이 그걸 골라
+                # 잡으면 사유가 빈 채로 나간다. 분류는 두 스트림을 따로 받으므로
+                # 영향 없다.
+                detail = (err.strip() or out.strip())
+                raise self._classify(f"codex exited {rc}: {detail[:200]}", f"{err} {out}")
             try:
                 with open(out_path) as f:
                     text = f.read().strip()

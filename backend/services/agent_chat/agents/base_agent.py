@@ -112,12 +112,16 @@ class BaseDiscussionAgent(ABC):
             response = await self.llm.generate(messages)
             return response
         except Exception as e:
+            # 실패를 문자열로 반환하지 않는다. 그렇게 하면 에러가 토론에 정상 의견처럼
+            # 흘러들어 합의 불성립이 가짜 NO_ACTION이 되고, 원장에 실제 판단이 아닌
+            # 결정이 쌓인다(2026-08-03 라이브에서 중재자 결정이 0.2ms 만에 나왔다).
+            # chat_room.start()가 이 예외를 잡아 세션을 CANCELLED로 표시한다.
             logger.error(
                 "llm_call_failed",
                 agent=self.agent_name,
                 error=str(e),
             )
-            return f"분석 중 오류 발생: {str(e)}"
+            raise
 
     async def _structured_vote(self, messages, *, schema: dict, task=TaskType.GROUP_CHAT):
         """Return the validated structured-vote dict, or None on any failure

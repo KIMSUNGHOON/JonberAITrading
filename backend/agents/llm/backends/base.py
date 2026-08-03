@@ -21,6 +21,14 @@ class BackendTransientError(BackendError):
     """Transient failure (rate limit / 429 / overloaded / 5xx) — longer CB cooldown."""
 
 
+class BackendUsageLimitError(BackendTransientError):
+    """사용량 한도 소진. 기다리면 풀리는 종류라 라우터가 신선도 상한까지 대기한다.
+
+    `BackendTransientError`의 하위 타입인 이유: 라우터의 기존 transient 처리
+    (서킷 2배 쿨다운)를 그대로 물려받아야 하기 때문이다.
+    """
+
+
 class BackendTimeoutError(BackendError):
     """The backend exceeded its timeout."""
 
