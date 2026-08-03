@@ -75,7 +75,9 @@ async def test_latch_not_set_when_send_returns_false():
     with patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
         await coord_mod._alert_llm_failure("005930", LLMAllBackendsFailed("usage limit reached"))
 
-    assert "usage limit reached" not in coord_mod._LLM_FAILURE_NOTIFIED
+    # 키 형식이 바뀌어도(안정화 축약) 의미가 유지되도록 집합 자체가 비었는지를 본다 —
+    # 원문 부분문자열 `not in`은 키가 무엇이든 항상 참이라 회귀를 못 잡는다.
+    assert coord_mod._LLM_FAILURE_NOTIFIED == set()
 
 
 @pytest.mark.asyncio
@@ -300,3 +302,143 @@ async def test_site_b_success_path_clears_latch_and_returns_session():
     mock_clear.assert_called_once()
     mock_persist.assert_awaited_once_with(session)
     assert "005930" not in coordinator._active_rooms
+
+
+# -------------------------------------------------------------------------
+# 래치의 두 결함 — (a) 취소로 wedge, (b) 키 불안정
+# -------------------------------------------------------------------------
+
+
+class TestLatchSurvivesCancellation:
+    """(a) back-out이 `except Exception` 안에 있으면 `asyncio.CancelledError`
+    (3.8부터 BaseException)를 못 잡는다. 토론 태스크가 통지 중에 취소되면 claim만
+    남고 메시지는 안 나간 채 그 사유가 **영구히** 래치돼, 같은 원인의 이후 장애가
+    다음 성공 토론까지 통째로 침묵한다."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_sending_backs_out_and_still_propagates(self):
+        notifier = _notifier()
+        started = asyncio.Event()
+
+        async def _hanging_send(*args, **kwargs):
+            started.set()
+            await asyncio.sleep(3600)
+            return True
+
+        notifier.send_system_status = AsyncMock(side_effect=_hanging_send)
+        coord_mod._LLM_FAILURE_NOTIFIED.clear()
+
+        with patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
+            task = asyncio.create_task(
+                coord_mod._alert_llm_failure("005930", LLMAllBackendsFailed("usage limit reached"))
+            )
+            await started.wait()
+            # 발송 도중이므로 claim은 이미 잡혀 있다 — 바로 이 상태에서 취소한다.
+            assert coord_mod._LLM_FAILURE_NOTIFIED
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task   # 취소는 삼키지 않고 전파돼야 한다
+
+        assert coord_mod._LLM_FAILURE_NOTIFIED == set(), (
+            "취소로 발송이 무산됐는데 claim이 남았다 — 같은 사유의 장애가 영구히 침묵한다"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_resolving_notifier_backs_out_too(self):
+        """`get_telegram_notifier()` 안에서 취소되는 경우도 같다."""
+        started = asyncio.Event()
+
+        async def _hanging_notifier():
+            started.set()
+            await asyncio.sleep(3600)
+
+        coord_mod._LLM_FAILURE_NOTIFIED.clear()
+        with patch("services.telegram.get_telegram_notifier", _hanging_notifier):
+            task = asyncio.create_task(
+                coord_mod._alert_llm_failure("005930", LLMAllBackendsFailed("usage limit reached"))
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert coord_mod._LLM_FAILURE_NOTIFIED == set()
+
+    @pytest.mark.asyncio
+    async def test_notifier_not_ready_backs_out(self):
+        """조용한 실패 경로(`is_ready` False)도 `finally`로 옮긴 뒤 그대로인지."""
+        notifier = _notifier()
+        notifier.is_ready = False
+        coord_mod._LLM_FAILURE_NOTIFIED.clear()
+        with patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
+            await coord_mod._alert_llm_failure("005930", LLMAllBackendsFailed("usage limit"))
+
+        assert coord_mod._LLM_FAILURE_NOTIFIED == set()
+
+
+class TestLatchKeyIsStable:
+    """(b) 키가 `str(exc)[:160]`이면 호출마다 달라지는 값 하나로 dedup이 통째로
+    무너져 "실패한 토론마다 매분 Telegram"이 된다 — 메모리 증가보다 나쁘다.
+
+    실제로 그 160자 안에 들어오는 변동 요소가 셋이다: 대기 상한 숫자(토론 예산이
+    붙으면서 300 고정이 아니게 됐다), task 이름(토론 1건이 단계마다 다른 task로
+    LLM을 약 15회 부른다), CLI 원문 blob(한도 리셋 시각 등).
+    """
+
+    @staticmethod
+    def _give_up(cap: int, task: str, reset_epoch: int) -> LLMAllBackendsFailed:
+        """라우터가 실제로 만드는 give-up 메시지 모양 그대로."""
+        return LLMAllBackendsFailed(
+            f"usage limit outlasted the {cap}s freshness cap for task '{task}': "
+            f"claude exited 1: Claude AI usage limit reached|{reset_epoch}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_same_outage_with_varying_numbers_and_task_alerts_once(self):
+        notifier = _notifier()
+        coord_mod._LLM_FAILURE_NOTIFIED.clear()
+        with patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
+            await coord_mod._alert_llm_failure("005930", self._give_up(300, "group_chat", 1754236800))
+            await coord_mod._alert_llm_failure("000660", self._give_up(60, "technical_analysis", 1754240400))
+            await coord_mod._alert_llm_failure("089860", self._give_up(0, "risk_assessment", 1754244000))
+
+        assert notifier.send_system_status.await_count == 1
+        assert len(coord_mod._LLM_FAILURE_NOTIFIED) == 1
+
+    @pytest.mark.asyncio
+    async def test_genuinely_different_causes_still_get_their_own_alert(self):
+        """합쳐도 되는 것만 합쳐야 한다 — 성격이 다른 장애는 각자 알림을 받는다."""
+        notifier = _notifier()
+        coord_mod._LLM_FAILURE_NOTIFIED.clear()
+        with patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
+            await coord_mod._alert_llm_failure("005930", self._give_up(300, "group_chat", 1754236800))
+            await coord_mod._alert_llm_failure("005930", LLMAllBackendsFailed("no available backend for task 'group_chat'"))
+            await coord_mod._alert_llm_failure("005930", LLMAllBackendsFailed("all backends failed for task 'group_chat': logged out"))
+
+        assert notifier.send_system_status.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_message_body_keeps_the_full_reason_not_the_shortened_key(self):
+        """키는 축약하되 **본문**은 사유 전문(160자)을 유지해야 한다 — 축약이
+        운영자에게 보이는 정보까지 깎으면 안 된다."""
+        notifier = _notifier()
+        coord_mod._LLM_FAILURE_NOTIFIED.clear()
+        with patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
+            await coord_mod._alert_llm_failure("005930", self._give_up(300, "group_chat", 1754236800))
+
+        body = " ".join(str(a) for a in notifier.send_system_status.await_args.args)
+        assert "Claude AI usage limit reached|1754236800" in body
+        assert "group_chat" in body
+
+    @pytest.mark.asyncio
+    async def test_latch_size_is_hard_bounded(self):
+        """키를 안정화해도 메모리 상한은 무조건적으로 건다."""
+        notifier = _notifier()
+        coord_mod._LLM_FAILURE_NOTIFIED.clear()
+        with patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
+            for i in range(coord_mod._LLM_FAILURE_NOTIFIED_MAX * 2):
+                await coord_mod._alert_llm_failure(
+                    "005930", LLMAllBackendsFailed(f"distinct-shape-{chr(97 + i % 26)}{'x' * (i % 30)} failure")
+                )
+
+        assert len(coord_mod._LLM_FAILURE_NOTIFIED) <= coord_mod._LLM_FAILURE_NOTIFIED_MAX

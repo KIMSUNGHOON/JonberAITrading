@@ -7,6 +7,7 @@ Handles watch list monitoring, opportunity detection, and trade execution.
 
 import asyncio
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable
 
@@ -357,6 +358,40 @@ logger = structlog.get_logger()
 # ticker별 discard가 맞다 — 거긴 종목마다 원가가 독립적으로 어긋나므로).
 _LLM_FAILURE_NOTIFIED: set = set()
 
+# 래치 크기 상한. 키를 안정화해도(아래 `_llm_failure_cause_key`) 예상 못 한 변동
+# 요소가 남아 있을 수 있으므로 메모리 증가에는 **무조건적인** 상한을 둔다 — 이
+# 집합은 best-effort 중복 억제 장치이지 영구 원장이 아니다.
+_LLM_FAILURE_NOTIFIED_MAX = 64
+
+_LLM_FAILURE_DIGITS_RE = re.compile(r"\d+")
+
+
+def _llm_failure_cause_key(exc: Exception) -> str:
+    """래치 키를 만든다. **알림 본문이 아니라** 중복 억제 전용이다.
+
+    예전 키는 `str(exc)[:160]`이었다. 그 160자 안에 호출마다 달라지는 값이 하나만
+    들어와도 dedup이 통째로 무력화돼 "장애가 지속되는 동안 실패한 토론마다,
+    감시 주기(1분)마다 Telegram 1건"이 된다 — 메모리 증가보다 나쁜 실패 모드다.
+    그런데 실제로 그 안에 들어오는 변동 요소가 셋이나 된다:
+
+      - **대기 상한 숫자**: 토론 단위 예산(Task 8 Fix 1)이 붙으면서 300 고정이
+        아니라 "그 시점에 남은 예산"(60/40/0...)이 된다.
+      - **task 이름**: 토론 1건이 LLM을 약 15회 부르고 단계마다 task가 다르므로,
+        어느 호출에서 터졌느냐에 따라 문자열이 바뀐다.
+      - **CLI 원문 blob**: 한도 리셋 시각 등이 그대로 들어온다(Fix 3이 사유를
+        더 잘 보존하게 만들었으므로 변동성은 오히려 커졌다).
+
+    그래서 ①숫자를 전부 `#`로 정규화하고 ②앞 40자만 쓰고 ③예외 타입을 붙인다.
+    40자면 라우터가 내는 세 가지 실패 **모양**은 그대로 갈린다
+    ("usage limit outlasted ...", "no available backend ...",
+    "all backends failed ...") — 성격이 다른 장애는 각자 자기 알림을 받는다.
+    반대로 같은 전멸 장애 안에서 백엔드별 세부 사유가 다른 것들은 한 건으로
+    합쳐진다. 이건 의도한 트레이드오프다: 운영자가 취할 조치가 동일하고, 알림
+    **본문**에는 첫 사유의 전문(160자)이 그대로 실려 세부는 잃지 않는다.
+    """
+    normalized = _LLM_FAILURE_DIGITS_RE.sub("#", str(exc))
+    return f"{type(exc).__name__}:{normalized[:40]}"
+
 
 def clear_llm_failure_latch() -> None:
     """LLM 호출이 성공하면 호출해 래치를 푼다."""
@@ -386,33 +421,55 @@ async def _alert_llm_failure(ticker: str, exc: Exception) -> None:
     없이 경쟁만 닫는다: 대가는 발송이 실제로 실패했을 때 동시 호출자가
     선점된 claim을 보고 그냥 반환한다는 것뿐 — 다음 감시 주기(1분 뒤)에
     재시도되므로 감내할 수 있다.
+
+    **back-out은 `finally`에 둔다(취소 안전)**: `except Exception`은
+    `asyncio.CancelledError`를 잡지 않는다(3.8부터 `BaseException`). 토론
+    태스크가 `get_telegram_notifier()`나 `send_system_status()` 안에서
+    await 중일 때 취소되면, 예전 구조에서는 claim만 남고 메시지는 안 나간
+    채 그 사유가 영구히 래치돼(다음 성공 토론까지) 같은 장애가 통째로
+    침묵했다. `finally`로 옮기면 취소·예외·조용한 실패 어느 경로든 claim이
+    풀리고, 취소는 그대로 전파된다(삼키지 않는다).
     """
-    cause = str(exc)[:160]
+    reason = str(exc)[:160]                 # 본문·로그에 실리는 사유(전문에 가깝게)
+    cause = _llm_failure_cause_key(exc)     # 래치 키(안정화된 축약)
+
+    # 메모리 하드 상한. 키를 안정화했는데도 상한에 닿았다면 예상 못 한 변동
+    # 요소가 남아 있다는 뜻이므로, 무한 증가 대신 래치를 비운다(그 대가는
+    # 알림 1건 재발송뿐이다).
+    if len(_LLM_FAILURE_NOTIFIED) >= _LLM_FAILURE_NOTIFIED_MAX:
+        logger.warning("llm_failure_latch_overflow", size=len(_LLM_FAILURE_NOTIFIED))
+        _LLM_FAILURE_NOTIFIED.clear()
     if cause in _LLM_FAILURE_NOTIFIED:
         return
     _LLM_FAILURE_NOTIFIED.add(cause)  # claim (동기, 위 dedup 체크와 맞닿아 있음)
+
+    committed = False
     try:
         from services.telegram import get_telegram_notifier
 
         notifier = await get_telegram_notifier()
         if not notifier.is_ready:
-            _LLM_FAILURE_NOTIFIED.discard(cause)
-            logger.warning("llm_failure_alert_notifier_not_ready", ticker=ticker, cause=cause)
+            logger.warning("llm_failure_alert_notifier_not_ready", ticker=ticker, cause=reason)
             return
         sent = await notifier.send_system_status(
             "error",
             f"LLM 장애로 토론을 완료하지 못했습니다 ({ticker})\n"
-            f"사유: {cause}\n"
+            f"사유: {reason}\n"
             f"→ 매매 결정은 내려지지 않았습니다. 복구되면 다음 감시 주기에 재시도합니다.",
         )
-        if not sent:
-            # 예외 없이 실패한 경우(네트워크 순단 등) — claim을 되돌려
-            # 다음 시도에서 재발송되지만, 이번 실패 자체는 로그로 남긴다.
-            _LLM_FAILURE_NOTIFIED.discard(cause)
-            logger.warning("llm_failure_alert_not_sent", ticker=ticker, cause=cause)
+        if sent:
+            committed = True   # 발송이 **확인된** 유일한 경로 — 여기서만 래치를 유지한다
+        else:
+            # 예외 없이 실패한 경우(네트워크 순단 등) — 아래 finally가 claim을
+            # 되돌려 다음 시도에서 재발송되지만, 이번 실패 자체는 로그로 남긴다.
+            logger.warning("llm_failure_alert_not_sent", ticker=ticker, cause=reason)
     except Exception as e:  # noqa: BLE001 — 통지는 절대 경로를 깨뜨리지 않는다
-        _LLM_FAILURE_NOTIFIED.discard(cause)
         logger.warning("llm_failure_alert_failed", ticker=ticker, error=str(e))
+    finally:
+        # 취소(CancelledError)를 포함한 모든 미확인 종료 경로에서 claim을 되돌린다.
+        # CancelledError는 여기서 잡히지 않으므로 그대로 전파된다.
+        if not committed:
+            _LLM_FAILURE_NOTIFIED.discard(cause)
 
 
 class ChatCoordinator:
