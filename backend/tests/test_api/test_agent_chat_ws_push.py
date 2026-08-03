@@ -53,13 +53,21 @@ class FakeRoom:
 
     instances: list = []
 
-    def __init__(self, ticker: str, stock_name: str, context=None, agent_weights=None):
+    def __init__(self, ticker: str, stock_name: str, context=None, agent_weights=None,
+                 consensus_threshold=0.75):
         # Pre-existing bug fix (unrelated to P4-4, verified via `git stash`
         # against HEAD 5551cf8 -- ChatRoom.__init__ gained `agent_weights` in
         # an earlier, unrelated Phase4 calibration feature; this double was
         # never updated to accept it, so any real call site TypeErrors here).
+        #
+        # 같은 일이 `consensus_threshold`(E-3)에서 또 났다: 코디네이터의 두 생성
+        # 지점이 이 인자를 넘기기 시작했는데 더블이 못 받아 이 파일의 테스트 6건이
+        # 전부 TypeError로 죽어 있었다 — 하필 `wait=True` 경로 커버리지다. 시그니처만
+        # 실물에 맞춘다(값은 여기서 쓰이지 않는다. 전달 검증은
+        # test_coordinator.py::test_start_manual_discussion_passes_context_consensus_threshold).
         self.ticker = ticker
         self.stock_name = stock_name
+        self.consensus_threshold = consensus_threshold
         self.session = ChatSession(ticker=ticker, stock_name=stock_name)
         self._message_callbacks = []
         self._status_callbacks = []
@@ -149,8 +157,9 @@ async def test_manual_discussion_returns_before_completion(coordinator):
     room_gate = asyncio.Event()
 
     class SlowFakeRoom(FakeRoom):
-        def __init__(self, ticker, stock_name, context=None, agent_weights=None):
-            super().__init__(ticker, stock_name, context, agent_weights)
+        def __init__(self, ticker, stock_name, context=None, agent_weights=None,
+                     consensus_threshold=0.75):
+            super().__init__(ticker, stock_name, context, agent_weights, consensus_threshold)
             self.release = room_gate  # don't finish until the test says so
 
     import services.agent_chat.coordinator as cm

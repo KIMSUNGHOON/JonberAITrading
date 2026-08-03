@@ -144,9 +144,15 @@ class _ScriptedRoom:
     ChatCoordinator._handle_decision's BUY/SELL/ADD/REDUCE execution branch,
     so no autonomy-gate/trading-coordinator mocking is needed here)."""
 
-    def __init__(self, ticker, stock_name, context, agent_weights=None):
+    def __init__(self, ticker, stock_name, context, agent_weights=None,
+                 consensus_threshold=0.75):
+        # `consensus_threshold`는 E-3에서 코디네이터의 두 생성 지점이 넘기기
+        # 시작한 인자인데 이 더블이 못 받아 아래 3건이 TypeError로 죽어 있었다
+        # (그중 둘이 `start_manual_discussion` 호출부 커버리지다). 시그니처만
+        # 실물에 맞춘다 — 값 전달 자체의 검증은 test_coordinator.py가 맡는다.
         self.ticker = ticker
         self.stock_name = stock_name
+        self.consensus_threshold = consensus_threshold
         self.session = ChatSession(ticker=ticker, stock_name=stock_name, context=context)
         self._message_cbs = []
         self._status_cbs = []
