@@ -97,9 +97,12 @@ class ClaudeCLIBackend(LLMBackend):
     async def health(self) -> bool:
         cwd = tempfile.mkdtemp(prefix="claudecli-h-")
         try:
+            # 프로브는 반드시 실제 사용 모델로 한다. haiku로 확인하고 sonnet으로 호출하면
+            # 모델·플랜 단위 한도가 프로브를 통과해, /api/llm/stats가 healthy: true를
+            # 보고하는 동안 전 호출이 실패한다(2026-08-03 라이브에서 실제로 발생).
             rc, out, _ = await run_cli(
                 [self.cli_path, "-p", "--output-format", "json", "--tools", "",
-                 "--strict-mcp-config", "--model", "haiku", "ok"],
+                 "--strict-mcp-config", "--model", self.model, "ok"],
                 stdin=None, timeout=30, cwd=cwd,
             )
             return rc == 0 and json.loads(out).get("subtype") == "success"
