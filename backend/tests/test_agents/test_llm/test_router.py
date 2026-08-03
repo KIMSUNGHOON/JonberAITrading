@@ -137,12 +137,18 @@ def test_snapshot_shape():
     assert "backends" in snap
 
 
-# ---------- health cache gating + missing-CLI fall-through ----------
+# ---------- health cache (observation only, Task 3B) + missing-CLI fall-through ----------
 
-def test_unhealthy_backend_dropped_from_resolve():
+def test_unhealthy_health_cache_does_not_drop_backend_from_resolve():
+    """Task 3B 이전에는 이 테스트가 반대를 assert했다(health=False -> resolve에서 제외).
+    그 게이트가 데드락의 원인이었다: 실제 호출 실패 -> health=False -> resolve가 후보에서
+    제외 -> 다시 호출될 일이 없어 성공 기록이 영원히 불가능 -> 영구 배제. 이제 헬스 캐시는
+    `snapshot()`이 읽는 관측용 표시일 뿐이고, 후보 제외는 서킷 브레이커(쿨다운으로 회복)
+    하나만 담당한다. 데드락 회귀 시나리오는 test_router_health_from_traffic.py를 본다."""
     r = _router({BackendName.OPENROUTER: FakeBackend(BackendName.OPENROUTER)})
-    r._health_cache[BackendName.OPENROUTER] = False  # probed down at startup
-    assert r.resolve(TaskType.SCANNER, streaming=False) == []
+    r._health_cache[BackendName.OPENROUTER] = False  # 관측용 표시 — 후보에서 빼지 않는다
+    chain = r.resolve(TaskType.SCANNER, streaming=False)
+    assert [b.name for b in chain] == [BackendName.OPENROUTER]
 
 
 @pytest.mark.asyncio

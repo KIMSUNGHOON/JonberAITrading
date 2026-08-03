@@ -179,8 +179,11 @@ class Router:
                 continue
             if bn in self._unavailable:
                 continue
-            if self._health_cache.get(bn) is False:  # probed down at startup
-                continue
+            # 헬스 게이트를 두지 않는다. 헬스 캐시는 이제 실제 호출 결과를 반영하는
+            # **관측용 표시**이지 후보 필터가 아니다(값은 `snapshot()`에서만 읽는다).
+            # 필터로 쓰면 실패로 죽음 표시가 된 백엔드가 후보에서 빠지고, 빠졌으니
+            # 다시 호출될 일이 없어 영원히 죽음으로 남는 데드락이 된다. 회복 판정은
+            # 서킷 브레이커의 쿨다운이 전담한다(바로 아래 `allow()`).
             if not self._breakers[bn].allow():
                 continue
             if streaming and not backend.supports_stream:
@@ -273,6 +276,7 @@ class Router:
                             timeout=timeout,
                         )
                     self._breakers[bn].record_success()
+                    self._health_cache[bn] = True
                     if bn == BackendName.OPENROUTER:
                         self.add_openrouter_spend(_OPENROUTER_COST_ESTIMATE)
                     return result
@@ -281,6 +285,7 @@ class Router:
                     if bn not in charged_this_call:
                         self._breakers[bn].record_failure(transient=transient)  # 페널티: 호출당 1회
                         charged_this_call.add(bn)
+                    self._health_cache[bn] = False  # 관측: 매 실패마다(페널티와 달리 1회 제한 없음)
                     if isinstance(e, BackendAuthError):
                         self._unavailable.add(bn)
                     logger.warning("llm_fallback", from_backend=bn.value, task=task.value, reason=str(e)[:120])
@@ -348,8 +353,9 @@ class Router:
 
     async def startup(self) -> None:
         """Best-effort health probes (cached for /api/llm/stats). Never raises."""
-        probes = dict(self._backends)
-        probes[BackendName.CLAUDE_CLI] = self._claude_sonnet
+        # claude는 인스턴스가 둘이다(전략용 opus / 나머지 sonnet). 하나만 프로브하면
+        # 다른 쪽 한도가 관측 대상 밖으로 빠진다. 둘 다 보고 AND로 기록한다.
+        probes = {bn: b for bn, b in self._backends.items() if bn != BackendName.CLAUDE_CLI}
         for bn, backend in probes.items():
             if backend is None:
                 continue
@@ -357,6 +363,13 @@ class Router:
                 self._health_cache[bn] = await backend.health()
             except Exception:
                 self._health_cache[bn] = False
+        claude_ok = True
+        for inst in (self._claude_sonnet, self._claude_opus):
+            try:
+                claude_ok = claude_ok and await inst.health()
+            except Exception:
+                claude_ok = False
+        self._health_cache[BackendName.CLAUDE_CLI] = claude_ok
         logger.info("llm_router_startup", health={k.value: v for k, v in self._health_cache.items()})
 
     async def aclose(self) -> None:
