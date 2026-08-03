@@ -286,6 +286,66 @@ async def test_real_resolve_waits_to_cap_and_charges_breaker_once(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_usage_limit_failure_opens_circuit_with_doubled_cooldown(monkeypatch):
+    """A 서킷: "한도 분류 시 쿨다운이 2배로 적용된다"를 수치로 확인한다.
+
+    지금까지 있던 커버리지는 두 가지뿐이었다: ①`BackendUsageLimitError`가
+    `BackendTransientError`의 하위 타입이라는 타입 관계
+    (test_backend_error_capture.py::test_usage_limit_is_a_transient_error)
+    ②서킷이 threshold 미만에서는 닫혀 있다는 것(바로 위
+    test_real_resolve_waits_to_cap_and_charges_breaker_once, `_fails == 1`).
+    실제로 서킷이 **열렸을 때** 적용되는 쿨다운 값이 정말 2배인지는 아무 테스트도
+    관측하지 않았다 — router.py:69의 `self.cooldown * (2 if transient else 1)`가
+    깨져 있어도(예: 2를 1로 바꿔도) 지금까지의 스위트는 green이었을 것이다.
+
+    `record_failure`는 `generate()` 호출 1건당 딱 1회만 charge된다(위 테스트의
+    Finding 1 수정 결과). threshold(기본 3)에 닿으려면 독립된 `generate()` 호출이
+    3번 필요하다 — 매 호출은 usage limit이라 신선도 상한(300초)까지 라우터가
+    내부 재시도를 반복한 뒤 포기하므로, 실시간 5분씩 세 번 기다리지 않도록 위
+    테스트들과 같은 가짜 시계+sleep 기법을 그대로 쓴다.
+    """
+    monkeypatch.setattr(settings, "LLM_CIRCUIT_FAIL_THRESHOLD", 3, raising=False)
+    monkeypatch.setattr(settings, "LLM_CIRCUIT_COOLDOWN", 60, raising=False)
+
+    backend = _Backend(
+        BackendName.CLAUDE_CLI,
+        error=BackendUsageLimitError("claude exited 1: usage limit reached"),
+    )
+    elapsed = {"t": 0.0}
+
+    async def _fake_sleep(sec):
+        elapsed["t"] += sec
+
+    r = router_mod.Router(backends={BackendName.CLAUDE_CLI: backend}, now=lambda: elapsed["t"])
+    breaker = r._breakers[BackendName.CLAUDE_CLI]
+
+    with patch.object(router_mod.asyncio, "sleep", _fake_sleep):
+        for _ in range(3):
+            with pytest.raises(LLMAllBackendsFailed):
+                await r.generate(_msgs(), task=TaskType.GROUP_CHAT)
+
+    # 3번째 실패에서 정확히 threshold(3)에 도달해 서킷이 열렸다.
+    assert breaker._fails == 3
+    assert breaker.state() == "open"
+
+    # 핵심 수치 검증 — "열렸다"가 아니라 "얼마로 열렸다"를 고정한다.
+    assert breaker._cooldown_used == settings.LLM_CIRCUIT_COOLDOWN * 2
+
+    # 사설(private) 속성 하나에만 기대지 않도록, 공개 동작(allow())으로도 같은
+    # 사실을 이중 확인한다: 단일 쿨다운이 지난 시점엔 아직 닫히면(허용되면) 안
+    # 되고, 2배가 지난 시점엔 열려야(허용돼야) 한다. 2배 적용이 깨져 1배로
+    # 되돌아가면 아래 첫 assert가 실패로 잡아낸다.
+    opened_at = breaker._opened_at
+    assert opened_at is not None
+
+    elapsed["t"] = opened_at + settings.LLM_CIRCUIT_COOLDOWN + 1
+    assert breaker.allow() is False, "단일 쿨다운만 지났는데 허용됐다 — 2배가 적용되지 않았다"
+
+    elapsed["t"] = opened_at + settings.LLM_CIRCUIT_COOLDOWN * 2 + 1
+    assert breaker.allow() is True
+
+
+@pytest.mark.asyncio
 async def test_gives_up_with_usage_limit_reason_when_clamp_cuts_pass_short(monkeypatch):
     """2026-08-03 리뷰 라운드 2 Finding 재현: 체인의 앞쪽 백엔드가 행(hang)하다가
     클램프된 타임아웃에 걸리면, 남은 예산이 0이 돼 뒤쪽(진짜 usage-limited) 백엔드는
