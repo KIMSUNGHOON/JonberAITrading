@@ -86,3 +86,68 @@ class TestCodexStdoutCapture:
         ):
             with pytest.raises(BackendUsageLimitError):
                 await backend.generate(_messages())
+
+
+class TestWhitespaceOnlyStderrDoesNotEatTheReason:
+    """공백뿐인 stderr가 사유를 통째로 먹던 회귀 — 이번 아크의 출발 증상이다.
+
+    `run_cli`은 디코딩만 한 원본을 돌려주므로 stderr가 개행 하나("\\n")여도
+    truthy다. 예전 `(err or out or "").strip()`은 그 개행을 골라 잡고 뒤늦게
+    strip해 `detail=""`을 만들었고, 결과가 `"claude exited 1: "`(빈 콜론)였다.
+    그 문자열은 라우터의 give-up 메시지를 거쳐 그대로 Telegram 본문에 실린다 —
+    운영자가 받는 유일한 단서가 사라지는 것이다.
+    """
+
+    @pytest.mark.asyncio
+    async def test_claude_uses_stdout_when_stderr_is_only_whitespace(self):
+        backend = ClaudeCLIBackend()
+        with patch(
+            "agents.llm.backends.claude_cli.run_cli",
+            AsyncMock(return_value=(1, _LIMIT_JSON, "\n")),
+        ):
+            with pytest.raises(BackendUsageLimitError) as ei:
+                await backend.generate(_messages())
+
+        msg = str(ei.value)
+        assert "usage limit" in msg.lower()
+        assert not msg.endswith(": "), f"사유가 빈 채로 나갔다: {msg!r}"
+
+    @pytest.mark.asyncio
+    async def test_claude_prefers_stderr_when_it_has_real_content(self):
+        """공백 처리를 넣으면서 우선순위(stderr 우선)가 뒤집히지 않았는지."""
+        backend = ClaudeCLIBackend()
+        with patch(
+            "agents.llm.backends.claude_cli.run_cli",
+            AsyncMock(return_value=(1, "stdout noise", "  real stderr reason  ")),
+        ):
+            with pytest.raises(BackendError) as ei:
+                await backend.generate(_messages())
+
+        assert "real stderr reason" in str(ei.value)
+        assert "stdout noise" not in str(ei.value)
+
+    @pytest.mark.asyncio
+    async def test_codex_uses_stdout_when_stderr_is_only_whitespace(self):
+        backend = CodexCLIBackend()
+        with patch(
+            "agents.llm.backends.codex_cli.run_cli",
+            AsyncMock(return_value=(1, "usage limit reached", "   \n  ")),
+        ):
+            with pytest.raises(BackendUsageLimitError) as ei:
+                await backend.generate(_messages())
+
+        msg = str(ei.value)
+        assert "usage limit reached" in msg
+        assert not msg.endswith(": "), f"사유가 빈 채로 나갔다: {msg!r}"
+
+    @pytest.mark.asyncio
+    async def test_classification_unaffected_by_whitespace_only_stderr(self):
+        """분류는 `_classify`의 두 번째 인자로 두 스트림을 그대로 받으므로
+        `detail` 계산 방식과 무관하다 — 한도가 여전히 한도로 분류되는지."""
+        backend = ClaudeCLIBackend()
+        with patch(
+            "agents.llm.backends.claude_cli.run_cli",
+            AsyncMock(return_value=(1, _LIMIT_JSON, "\t\n")),
+        ):
+            with pytest.raises(BackendUsageLimitError):
+                await backend.generate(_messages())

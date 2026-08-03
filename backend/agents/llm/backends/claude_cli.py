@@ -79,7 +79,13 @@ class ClaudeCLIBackend(LLMBackend):
             shutil.rmtree(cwd, ignore_errors=True)
 
         if rc != 0:
-            detail = (err or out or "").strip()
+            # `.strip()`을 **각 스트림에** 건다. `run_cli`은 디코딩만 한 원본을
+            # 돌려주므로 stderr가 개행 하나("\n")여도 truthy다 — `(err or out)`은
+            # 그 개행을 골라 잡고 뒤늦게 strip해 `detail=""`이 된다. 그러면
+            # "claude exited 1: "처럼 사유가 빈 채로 나가고, 그 문자열이 그대로
+            # Telegram 본문에 실린다(2026-08-03 조사의 출발점인 바로 그 빈 콜론).
+            # 분류(`_classify`)는 두 스트림을 따로 받으므로 영향 없다.
+            detail = (err.strip() or out.strip())
             raise self._classify(f"claude exited {rc}: {detail[:200]}", f"{err} {out}")
         try:
             obj = json.loads(out)

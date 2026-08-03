@@ -84,7 +84,11 @@ class CodexCLIBackend(LLMBackend):
                 # missing/unrunnable binary -> permanent; router marks unavailable + falls through
                 raise BackendAuthError(f"codex CLI unavailable at '{self.cli_path}': {e}")
             if rc != 0:
-                detail = (err or out or "").strip()
+                # claude_cli.py와 같은 이유로 **각 스트림에** strip을 건다:
+                # 공백뿐인 stderr("\n")가 truthy라 `(err or out)`이 그걸 골라
+                # 잡으면 사유가 빈 채로 나간다. 분류는 두 스트림을 따로 받으므로
+                # 영향 없다.
+                detail = (err.strip() or out.strip())
                 raise self._classify(f"codex exited {rc}: {detail[:200]}", f"{err} {out}")
             try:
                 with open(out_path) as f:
