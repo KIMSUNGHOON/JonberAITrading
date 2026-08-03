@@ -8,10 +8,9 @@ Updated to use dynamic KRX holiday data from KRXHolidayService.
 Also provides KRX tick size (호가 단위) calculation functions.
 """
 
-from datetime import datetime, time, date, timedelta
+from datetime import datetime, time, date, timedelta, timezone
 from enum import Enum
 from typing import NamedTuple, Optional, Set
-import pytz
 
 import structlog
 
@@ -32,8 +31,20 @@ class MarketSession(NamedTuple):
     message: str
 
 
-# Korea timezone
-KST = pytz.timezone("Asia/Seoul")
+# Korea timezone — stdlib 고정 오프셋을 쓴다.
+#
+# pytz 객체(`pytz.timezone("Asia/Seoul")`)를 쓰면 안 된다. pytz는 `tzinfo=`나
+# `.replace(tzinfo=...)`로 직접 붙이는 용법을 지원하지 않고, 그렇게 붙이면 그 존의
+# **최초 역사적 오프셋**인 LMT `+08:28`이 적용된다. 이 파일은 경계 시각을
+# `datetime.combine(..., tzinfo=KST)`로 만들기 때문에 정확히 그 함정에 빠져,
+# 2026-08-03 라이브에서 `next_close`가 `15:30+08:28`로 나가고 카운트다운이 32분
+# 초과됐다(`datetime.now(KST)`만 멀쩡했던 이유는 pytz가 `fromutc()`는 제대로
+# 구현하기 때문이다).
+#
+# 고정 오프셋이 안전한 이유: 한국은 1988년 이후 서머타임이 없다. 그리고 이 관용구는
+# `services/kiwoom/auth.py`·`services/kiwoom/models.py`가 이미 쓰고 있어 레포 전체가
+# 하나로 통일된다.
+KST = timezone(timedelta(hours=9))
 
 
 class MarketHoursService:
