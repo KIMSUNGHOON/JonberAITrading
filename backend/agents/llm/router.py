@@ -13,7 +13,8 @@ import structlog
 from langchain_core.messages import BaseMessage
 
 from agents.llm.backends.base import (
-    BackendAuthError, BackendError, BackendTransientError, LLMAllBackendsFailed, LLMBackend,
+    BackendAuthError, BackendError, BackendTransientError, BackendUsageLimitError,
+    LLMAllBackendsFailed, LLMBackend,
 )
 from agents.llm.tasks import (
     ROUTING_POLICY, STRATEGIC_TASKS, BackendName, TaskType, coerce_task,
@@ -25,6 +26,13 @@ logger = structlog.get_logger()
 # Flat per-successful-call OpenRouter cost estimate (USD). Coarse — the real cost
 # isn't surfaced by the HTTP backend; this exists so the budget guard has signal.
 _OPENROUTER_COST_ESTIMATE = 0.01
+
+# 사용량 한도 대기 — 상한은 **신선도**에서 유도된 값이다. 멈췄던 토론은 멈춘 시점의
+# 가격·차트를 들고 있어서, 이보다 오래 기다렸다 재개하면 낡은 값으로 매매를 결정한다.
+# 감시 주기가 1분이므로 버려도 곧 새 데이터로 다시 시작한다 — 재개해서 아끼는 것은
+# "이미 한 분석"뿐이고, 잃는 것은 판단의 근거다.
+_USAGE_LIMIT_WAIT_SECONDS = 300   # 감시 주기(1분)의 5배
+_USAGE_LIMIT_RETRY_INTERVAL = 20
 
 
 class CircuitBreaker:
@@ -188,34 +196,63 @@ class Router:
         response_schema: Optional[dict] = None,
     ) -> str:
         task = coerce_task(task)
-        chain = self.resolve(task, streaming=False)
-        if not chain:
-            raise LLMAllBackendsFailed(f"no available backend for task '{task.value}'")
-        last: Optional[Exception] = None
-        for backend in chain:
-            bn = backend.name
-            try:
-                async with self._sems[bn]:
-                    result = await asyncio.wait_for(
-                        backend.generate(
-                            messages, temperature=temperature, max_tokens=max_tokens,
-                            response_schema=response_schema,
-                        ),
-                        timeout=self._timeouts[bn],
-                    )
-                self._breakers[bn].record_success()
-                if bn == BackendName.OPENROUTER:
-                    self.add_openrouter_spend(_OPENROUTER_COST_ESTIMATE)
-                return result
-            except (BackendError, asyncio.TimeoutError, TimeoutError) as e:
-                transient = isinstance(e, (BackendTransientError, asyncio.TimeoutError, TimeoutError))
-                self._breakers[bn].record_failure(transient=transient)
-                if isinstance(e, BackendAuthError):
-                    self._unavailable.add(bn)
-                logger.warning("llm_fallback", from_backend=bn.value, task=task.value, reason=str(e)[:120])
-                last = e
-                continue
-        raise LLMAllBackendsFailed(f"all backends failed for task '{task.value}': {last}")
+        deadline: Optional[float] = None
+        while True:
+            chain = self.resolve(task, streaming=False)
+            if not chain:
+                # 체인이 비었다 = 서킷이 열렸거나 전부 unavailable. 기다려도 이 패스에서
+                # 달라질 것이 없고, 긴 장애에 신선도 예산을 낭비할 이유가 없다.
+                raise LLMAllBackendsFailed(f"no available backend for task '{task.value}'")
+            last: Optional[Exception] = None
+            for backend in chain:
+                bn = backend.name
+                try:
+                    async with self._sems[bn]:
+                        result = await asyncio.wait_for(
+                            backend.generate(
+                                messages, temperature=temperature, max_tokens=max_tokens,
+                                response_schema=response_schema,
+                            ),
+                            timeout=self._timeouts[bn],
+                        )
+                    self._breakers[bn].record_success()
+                    if bn == BackendName.OPENROUTER:
+                        self.add_openrouter_spend(_OPENROUTER_COST_ESTIMATE)
+                    return result
+                except (BackendError, asyncio.TimeoutError, TimeoutError) as e:
+                    transient = isinstance(e, (BackendTransientError, asyncio.TimeoutError, TimeoutError))
+                    self._breakers[bn].record_failure(transient=transient)
+                    if isinstance(e, BackendAuthError):
+                        self._unavailable.add(bn)
+                    logger.warning("llm_fallback", from_backend=bn.value, task=task.value, reason=str(e)[:120])
+                    last = e
+                    continue
+
+            # 이 패스의 모든 백엔드가 실패했다. 기다리면 풀리는 종류만 기다린다 —
+            # 인증 오류·모델 부재·네트워크 실패는 대기로 해결되지 않는다.
+            if not isinstance(last, BackendUsageLimitError):
+                raise LLMAllBackendsFailed(f"all backends failed for task '{task.value}': {last}")
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now + _USAGE_LIMIT_WAIT_SECONDS
+                logger.warning(
+                    "llm_usage_limit_waiting",
+                    task=task.value,
+                    cap_seconds=_USAGE_LIMIT_WAIT_SECONDS,
+                    reason=str(last)[:160],
+                )
+            if now >= deadline:
+                logger.error(
+                    "llm_usage_limit_gave_up",
+                    task=task.value,
+                    waited_seconds=_USAGE_LIMIT_WAIT_SECONDS,
+                    reason=str(last)[:160],
+                )
+                raise LLMAllBackendsFailed(
+                    f"usage limit outlasted the {_USAGE_LIMIT_WAIT_SECONDS}s freshness cap "
+                    f"for task '{task.value}': {last}"
+                )
+            await asyncio.sleep(_USAGE_LIMIT_RETRY_INTERVAL)
 
     async def stream(
         self,
