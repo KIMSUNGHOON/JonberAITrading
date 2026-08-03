@@ -351,7 +351,10 @@ logger = structlog.get_logger()
 
 # LLM 장애 통지 래치 — 감시 주기가 1분이라 래치가 없으면 장애 지속 동안 매분 발송된다.
 # 원인 문자열을 키로 1회만 보내고, 복구되면 `clear_llm_failure_latch()`가 지워
-# 재발 시 다시 알린다(reconciler의 원가 드리프트 래치와 같은 형태).
+# 재발 시 다시 알린다 — reconciler의 원가 드리프트 래치와 같은 잠금/해제
+# *패턴*을 따르되, 키는 ticker가 아니라 원인 문자열이다: 완료된 토론 하나가
+# LLM 계층 전체의 복구 증거이므로 해제도 전역(clear)이어야 한다(reconciler는
+# ticker별 discard가 맞다 — 거긴 종목마다 원가가 독립적으로 어긋나므로).
 _LLM_FAILURE_NOTIFIED: set = set()
 
 
@@ -362,23 +365,37 @@ def clear_llm_failure_latch() -> None:
 
 async def _alert_llm_failure(ticker: str, exc: Exception) -> None:
     """LLM 장애로 토론이 실패했음을 운영자에게 알린다. Best-effort —
-    통지 실패가 토론 경로를 더 망가뜨려선 안 된다."""
+    통지 실패가 토론 경로를 더 망가뜨려선 안 된다.
+
+    래치는 **발송이 실제로 확인된 뒤에만** 잠근다. `send_system_status`는
+    예외를 던지지 않고 False를 반환하는 경로가 여럿이다(설정 꺼짐, 봇
+    미초기화, Telegram TimedOut/NetworkError/Forbidden — `_send_message`
+    참고, BadRequest만 별도 처리됨). 발송 전에 래치부터 걸면 LLM 장애와
+    겹친 일시적 네트워크 순단이 그 장애의 유일한 통지 기회를 조용히
+    삼켜버린다 — 이 태스크가 없애려는 바로 그 결함이 한 겹 위에서
+    재현되는 셈이다.
+    """
     cause = str(exc)[:160]
     if cause in _LLM_FAILURE_NOTIFIED:
         return
-    _LLM_FAILURE_NOTIFIED.add(cause)
     try:
         from services.telegram import get_telegram_notifier
 
         notifier = await get_telegram_notifier()
         if not notifier.is_ready:
             return
-        await notifier.send_system_status(
+        sent = await notifier.send_system_status(
             "error",
             f"LLM 장애로 토론을 완료하지 못했습니다 ({ticker})\n"
             f"사유: {cause}\n"
             f"→ 매매 결정은 내려지지 않았습니다. 복구되면 다음 감시 주기에 재시도합니다.",
         )
+        if sent:
+            _LLM_FAILURE_NOTIFIED.add(cause)
+        else:
+            # 예외 없이 실패한 경우(네트워크 순단 등) — 래치를 걸지 않아
+            # 다음 시도에서 재발송되지만, 이번 실패 자체는 로그로 남긴다.
+            logger.warning("llm_failure_alert_not_sent", ticker=ticker, cause=cause)
     except Exception as e:  # noqa: BLE001 — 통지는 절대 경로를 깨뜨리지 않는다
         logger.warning("llm_failure_alert_failed", ticker=ticker, error=str(e))
 
