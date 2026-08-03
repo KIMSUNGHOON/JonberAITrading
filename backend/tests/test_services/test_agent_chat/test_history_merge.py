@@ -313,7 +313,7 @@ class TestSubStatusPrecedence:
 
 class TestLegacyLedgerRowNullSafety:
     @pytest.mark.asyncio
-    async def test_preexisting_row_without_count_columns_zero_falls_back(self, storage, coordinator):
+    async def test_preexisting_row_without_count_columns_zero_falls_back(self, storage, coordinator, sm):
         """A row written before P4-3's total_messages/total_rounds columns
         existed (NULL) must 0-fallback, and the ledger's own status
         vocabulary passes through unchanged (FE vocab unaffected)."""
