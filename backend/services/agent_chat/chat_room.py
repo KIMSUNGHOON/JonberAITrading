@@ -11,6 +11,8 @@ from typing import Dict, List, Optional
 
 import structlog
 
+from agents.llm import usage_budget
+from agents.llm.router import get_router
 from services.agent_chat.models import (
     AgentMessage,
     AgentType,
@@ -158,10 +160,29 @@ class ChatRoom:
             session_id=self.session.id,
         )
 
-        self.session.started_at = datetime.now()
-        self.session.status = SessionStatus.ANALYZING
-        await self._emit_status(SessionStatus.ANALYZING)
+        # 사용량 한도 대기 예산을 **토론 1건**에 건다(agents/llm/usage_budget.py).
+        # 상한 300초의 근거인 신선도는 *토론이 시작된* 시점부터 낡는다 — 호출마다
+        # 300초를 새로 기다리면 토론 한 번(LLM 호출 약 15회)이 한 시간을 넘기면서도
+        # "5분 신선도"를 주장하게 되고, wait=True 경로에서는 그 대기가 그대로
+        # PositionManager 감시 루프를 멈춰 세운다.
+        #
+        # 데드라인은 반드시 라우터와 **같은 시계**에서 읽는다(`Router.now()`).
+        # 토큰은 finally에서 돌려줘 이 토론 밖(스캐너·발굴 등)으로 예산이 새지
+        # 않게 한다 — 예산 미설정이 곧 "종전대로 호출당 상한"이기 때문이다.
+        budget_token = usage_budget.set_deadline(
+            get_router().now() + usage_budget.USAGE_LIMIT_WAIT_SECONDS
+        )
+        try:
+            self.session.started_at = datetime.now()
+            self.session.status = SessionStatus.ANALYZING
+            await self._emit_status(SessionStatus.ANALYZING)
 
+            return await self._run_phases()
+        finally:
+            usage_budget.reset_deadline(budget_token)
+
+    async def _run_phases(self) -> ChatSession:
+        """토론 본체(분석→토론→투표→결정). `start()`가 예산을 건 상태에서만 불린다."""
         try:
             # Phase 1: Initial Analysis
             await self._run_analysis_round()

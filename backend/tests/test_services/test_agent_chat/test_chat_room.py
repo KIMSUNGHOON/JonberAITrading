@@ -374,3 +374,107 @@ class TestChatRoomIntegration:
         assert session.decision.action == DecisionAction.BUY
         assert len(session.rounds) >= 1
         assert len(session.votes) == 4
+
+
+# -------------------------------------------
+# 토론 단위 사용량 예산 배선 (2026-08-03 최종 리뷰 Finding 3)
+# -------------------------------------------
+
+
+class TestUsageBudgetWiring:
+    """`start()`가 토론 1건에 사용량 한도 대기 예산을 걸고 끝나면 반드시 푸는지.
+
+    예산이 걸리지 않으면 라우터는 종전대로 **호출당** 300초를 기다린다 — 토론
+    한 번이 LLM을 약 15회 부르므로 한도 지속 시 토론 하나가 한 시간을 넘기고,
+    wait=True 경로에서는 그 대기가 PositionManager 감시 루프를 그대로 멈춘다.
+    예산을 풀지 못하면 반대로 그 토론이 끝난 뒤의 스캐너·발굴 호출까지 남은
+    예산에 묶인다.
+    """
+
+    @staticmethod
+    def _fake_router(now_value: float):
+        router = MagicMock()
+        router.now = MagicMock(return_value=now_value)
+        return router
+
+    @pytest.mark.asyncio
+    async def test_budget_is_set_during_discussion_and_reset_after(self, chat_room):
+        from agents.llm import usage_budget
+
+        seen = {}
+
+        moderator = chat_room.agents[AgentType.MODERATOR]
+
+        async def _observing_analyze(_context):
+            # 토론 **안쪽**에서 본 예산 — 라우터가 실제로 읽는 그 값이다.
+            seen["inside"] = usage_budget.get_deadline()
+            raise RuntimeError("여기서 끊는다 — 예산 관측이 목적이다")
+
+        moderator.analyze = AsyncMock(side_effect=_observing_analyze)
+
+        assert usage_budget.get_deadline() is None
+        with patch(
+            "services.agent_chat.chat_room.get_router",
+            return_value=self._fake_router(1000.0),
+        ):
+            with pytest.raises(RuntimeError):
+                await chat_room.start()
+
+        # 라우터와 같은 시계 위의 절대 시각으로 잡혔다(1000 + 300).
+        assert seen["inside"] == 1000.0 + usage_budget.USAGE_LIMIT_WAIT_SECONDS
+        # 실패로 끝나도 예산은 반드시 풀린다 — 안 그러면 다음 스캐너 호출이
+        # 남의 토론 예산에 묶인다.
+        assert usage_budget.get_deadline() is None
+
+    @pytest.mark.asyncio
+    async def test_budget_reset_on_success_path_too(self, chat_room):
+        from agents.llm import usage_budget
+
+        for agent_type, agent in chat_room.agents.items():
+            agent.analyze = AsyncMock(return_value=AgentMessage(
+                agent_type=agent_type,
+                agent_name=agent.agent_name,
+                message_type=MessageType.ANALYSIS,
+                content=f"{agent_type.value} 분석 결과",
+                confidence=0.8,
+            ))
+        for agent_type in chat_room.discussion_order:
+            agent = chat_room.agents[agent_type]
+            agent.respond = AsyncMock(return_value=None)
+            agent.vote = AsyncMock(return_value=AgentVote(
+                agent_type=agent_type,
+                vote=VoteType.BUY,
+                confidence=0.8,
+                reasoning="매수 추천",
+            ))
+        moderator = chat_room.agents[AgentType.MODERATOR]
+        moderator.announce_voting = AsyncMock(return_value=AgentMessage(
+            agent_type=AgentType.MODERATOR,
+            agent_name="토론 진행자",
+            message_type=MessageType.ANALYSIS,
+            content="투표 시작",
+        ))
+        moderator.make_decision = AsyncMock(return_value=TradeDecision(
+            action=DecisionAction.BUY,
+            confidence=0.85,
+            consensus_level=0.9,
+            entry_price=72500,
+            stop_loss=68875,
+            take_profit=79750,
+            rationale="합의에 의한 매수 결정",
+        ))
+        moderator.announce_decision = AsyncMock(return_value=AgentMessage(
+            agent_type=AgentType.MODERATOR,
+            agent_name="토론 진행자",
+            message_type=MessageType.DECISION,
+            content="최종 결정: 매수",
+        ))
+
+        with patch(
+            "services.agent_chat.chat_room.get_router",
+            return_value=self._fake_router(1000.0),
+        ):
+            session = await chat_room.start()
+
+        assert session.status == SessionStatus.DECIDED
+        assert usage_budget.get_deadline() is None

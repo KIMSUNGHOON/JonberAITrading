@@ -12,12 +12,14 @@
 라우터·서킷·대기가 같은 가짜 시계를 공유하는 상태로 실제 라우팅 경로를 태운다.
 """
 import asyncio
+import contextvars
 from unittest.mock import patch
 
 import pytest
 from langchain_core.messages import HumanMessage
 
 from agents.llm import router as router_mod
+from agents.llm import usage_budget
 from agents.llm.backends.base import (
     BackendAuthError,
     BackendError,
@@ -412,3 +414,158 @@ async def test_gives_up_with_usage_limit_reason_when_clamp_cuts_pass_short(monke
     # 아니다 — 정확한 값으로 못박아 둔다: 1패스(무클램프 행) + CAP(300).
     expected_total = settings.LLM_TIMEOUT + router_mod._USAGE_LIMIT_WAIT_SECONDS
     assert elapsed["t"] == pytest.approx(expected_total)
+
+
+# =========================================================================
+# 토론 단위 예산(2026-08-03 최종 리뷰 Finding 3) — 상한이 "호출당"이 아니라
+# "토론당"이 되는지. 토론 한 번은 LLM을 순차로 약 15회 부르므로, 호출마다
+# 300초를 새로 기다리면 토론 하나가 한 시간을 넘기면서 5분 신선도를 주장한다.
+# =========================================================================
+
+
+def _budget_backend():
+    return _Backend(
+        BackendName.CLAUDE_CLI,
+        error=BackendUsageLimitError("claude exited 1: usage limit reached"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_budget_keeps_per_call_cap_for_non_discussion_callers():
+    """예산 미설정 = 종전 동작 그대로. 스캐너·발굴·기타 토론 밖 호출은 이번
+    변경으로 **아무것도** 달라지면 안 된다 — 읽어서 확인하지 말고 관측한다."""
+    assert usage_budget.get_deadline() is None  # 이 테스트가 실제로 미설정 상태다
+
+    backend = _budget_backend()
+    elapsed = {"t": 0.0}
+
+    async def _fake_sleep(sec):
+        elapsed["t"] += sec
+
+    r = router_mod.Router(backends={BackendName.CLAUDE_CLI: backend}, now=lambda: elapsed["t"])
+    with patch.object(router_mod.asyncio, "sleep", _fake_sleep):
+        with pytest.raises(LLMAllBackendsFailed) as ei:
+            await r.generate(_msgs(), task=TaskType.GROUP_CHAT)
+
+    assert elapsed["t"] >= router_mod._USAGE_LIMIT_WAIT_SECONDS
+    assert elapsed["t"] < router_mod._USAGE_LIMIT_WAIT_SECONDS + 2 * router_mod._USAGE_LIMIT_RETRY_INTERVAL
+    assert "300s freshness cap" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_budget_clamps_wait_to_what_remains_of_the_discussion():
+    """토론이 이미 240초를 썼다면(예산 300 중 60초 남음) 이 호출은 60초까지만
+    기다린다 — 300초를 새로 시작하지 않는다."""
+    backend = _budget_backend()
+    elapsed = {"t": 240.0}
+
+    async def _fake_sleep(sec):
+        elapsed["t"] += sec
+
+    r = router_mod.Router(backends={BackendName.CLAUDE_CLI: backend}, now=lambda: elapsed["t"])
+    token = usage_budget.set_deadline(300.0)   # 토론 시작이 t=0, 예산 데드라인 t=300
+    try:
+        with patch.object(router_mod.asyncio, "sleep", _fake_sleep):
+            with pytest.raises(LLMAllBackendsFailed) as ei:
+                await r.generate(_msgs(), task=TaskType.GROUP_CHAT)
+    finally:
+        usage_budget.reset_deadline(token)
+
+    # 남은 예산(60초)만큼만 기다렸다 — 상한 300이 그대로 걸렸다면 t는 540 근처가 된다.
+    assert 300.0 <= elapsed["t"] < 300.0 + router_mod._USAGE_LIMIT_RETRY_INTERVAL
+    assert "usage limit outlasted" in str(ei.value)
+    assert "60s freshness cap" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_budget_fails_fast_without_starting_a_fresh_wait():
+    """예산이 이미 소진됐으면 이후 호출은 **한 번도 자지 않고** 즉시 실패한다.
+    이게 없으면 토론의 15개 호출이 각자 300초씩 이어 붙어 한 시간이 된다."""
+    backend = _budget_backend()
+    slept = []
+    elapsed = {"t": 400.0}   # 예산 데드라인(300)을 이미 지났다
+
+    async def _fake_sleep(sec):
+        slept.append(sec)
+        elapsed["t"] += sec
+
+    r = router_mod.Router(backends={BackendName.CLAUDE_CLI: backend}, now=lambda: elapsed["t"])
+    token = usage_budget.set_deadline(300.0)
+    try:
+        with patch.object(router_mod.asyncio, "sleep", _fake_sleep):
+            with pytest.raises(LLMAllBackendsFailed) as ei:
+                await r.generate(_msgs(), task=TaskType.GROUP_CHAT)
+    finally:
+        usage_budget.reset_deadline(token)
+
+    assert slept == []              # 대기 0회
+    assert backend.calls == 1       # 패스도 1회만
+    # 사유는 여전히 usage limit이어야 한다 — 운영자가 "왜 실패했나"를 잃지 않는다.
+    assert "usage limit outlasted" in str(ei.value)
+    assert "usage limit reached" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_gather_children_share_the_parent_discussion_budget():
+    """`asyncio.gather`가 만드는 자식 태스크는 생성 시점 컨텍스트를 복사하므로
+    분석 라운드의 4개 병렬 에이전트가 **같은** 예산을 나눠 쓴다 — 추정하지 말고
+    실제 gather로 관측한다(자식마다 새 300초를 시작하면 이 테스트가 깨진다)."""
+    backends = [_budget_backend() for _ in range(4)]
+    elapsed = {"t": 0.0}
+
+    async def _fake_sleep(sec):
+        elapsed["t"] += sec
+
+    routers = [
+        router_mod.Router(backends={BackendName.CLAUDE_CLI: b}, now=lambda: elapsed["t"])
+        for b in backends
+    ]
+
+    token = usage_budget.set_deadline(60.0)   # 남은 예산 60초
+    try:
+        with patch.object(router_mod.asyncio, "sleep", _fake_sleep):
+            results = await asyncio.gather(
+                *[r.generate(_msgs(), task=TaskType.GROUP_CHAT) for r in routers],
+                return_exceptions=True,
+            )
+    finally:
+        usage_budget.reset_deadline(token)
+
+    assert all(isinstance(x, LLMAllBackendsFailed) for x in results)
+    # 자식이 각자 300초를 새로 잡았다면 공유 시계는 최소 300을 넘는다.
+    assert elapsed["t"] <= 60.0 + router_mod._USAGE_LIMIT_RETRY_INTERVAL
+    assert all("usage limit outlasted" in str(x) for x in results)
+    # 상한 문구는 자식마다 다르다(각자 자기 시점의 **남은** 예산이다: 60/40/20/0) —
+    # 중요한 건 아무도 300초를 새로 잡지 않았다는 것이다.
+    assert not any("300s freshness cap" in str(x) for x in results)
+
+
+@pytest.mark.asyncio
+async def test_child_context_set_does_not_leak_back_to_the_parent():
+    """자식 태스크에서 예산을 세워도 부모(및 그 뒤에 도는 스캐너 호출)로는 새지
+    않는다 — ContextVar 복사 방향이 한쪽뿐임을 못박아 둔다."""
+    seen = {}
+
+    async def _child():
+        seen["inherited"] = usage_budget.get_deadline()
+        usage_budget.set_deadline(999.0)      # 일부러 반환 토큰을 버린다
+        seen["after_child_set"] = usage_budget.get_deadline()
+
+    token = usage_budget.set_deadline(123.0)
+    try:
+        await asyncio.gather(_child())
+        assert usage_budget.get_deadline() == 123.0   # 부모는 그대로
+    finally:
+        usage_budget.reset_deadline(token)
+
+    assert seen["inherited"] == 123.0
+    assert seen["after_child_set"] == 999.0
+    assert usage_budget.get_deadline() is None
+
+
+def test_reset_survives_a_foreign_token():
+    """`finally`에서 불리는 함수라 절대 raise하면 안 된다 — 여기서 예외가 나면
+    토론 실패의 진짜 사유를 덮어쓴다."""
+    foreign = contextvars.copy_context().run(lambda: usage_budget.set_deadline(1.0))
+    usage_budget.reset_deadline(foreign)   # raise하지 않는다
+    assert usage_budget.get_deadline() is None

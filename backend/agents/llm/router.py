@@ -16,6 +16,7 @@ from agents.llm.backends.base import (
     BackendAuthError, BackendError, BackendTransientError, BackendUsageLimitError,
     LLMAllBackendsFailed, LLMBackend,
 )
+from agents.llm import usage_budget
 from agents.llm.tasks import (
     ROUTING_POLICY, STRATEGIC_TASKS, BackendName, TaskType, coerce_task,
 )
@@ -32,12 +33,13 @@ _OPENROUTER_COST_ESTIMATE = 0.01
 # 감시 주기가 1분이므로 버려도 곧 새 데이터로 다시 시작한다 — 재개해서 아끼는 것은
 # "이미 한 분석"뿐이고, 잃는 것은 판단의 근거다.
 #
-# 알려진 한계(고치지 않음, 2026-08-03 리뷰 Finding 3): 이 상한은 `generate()` 호출
-# 1건에 붙는다. 근거(신선도)는 토론 1건 전체에 붙어야 맞는데, 토론 한 번에 LLM 호출이
-# 여러 단계(예: 4에이전트 각각 + 모더레이터)면 각 단계가 독립적으로 최대 300초씩
-# 기다릴 수 있어 토론 전체로는 300초를 크게 넘길 수 있다. 상한을 토론 단위로 옮기려면
-# `chat_room` 상태 기계를 건드려야 하는데, 이번 아크 범위 밖이다(ld-global-constraints).
-_USAGE_LIMIT_WAIT_SECONDS = 300   # 감시 주기(1분)의 5배
+# 이 상한은 **두 가지 방식**으로 걸린다(2026-08-03 최종 리뷰 Finding 3 봉합):
+#   - 토론 안(`chat_room.start()` 아래): 토론 1건 전체에 걸리는 예산. 근거인 신선도가
+#     토론 시작 시점부터 낡으므로 이쪽이 원래 의도한 의미다. 호출 15회가 각자 300초를
+#     새로 기다려 토론 하나가 한 시간을 넘기던 결함을 닫는다
+#     (`agents/llm/usage_budget.py` 참고).
+#   - 토론 밖(스캐너·발굴 등): 예산이 설정돼 있지 않으므로 종전 그대로 **호출당** 상한.
+_USAGE_LIMIT_WAIT_SECONDS = usage_budget.USAGE_LIMIT_WAIT_SECONDS   # 감시 주기(1분)의 5배
 _USAGE_LIMIT_RETRY_INTERVAL = 20
 
 
@@ -107,6 +109,16 @@ class Router:
         self._openrouter_spend = 0.0
         self._spend_day = date.today()
         self._health_cache: dict = {}
+
+    def now(self) -> float:
+        """라우터가 쓰는 시계의 현재 시각.
+
+        토론 단위 사용량 예산(`agents/llm/usage_budget.py`)의 데드라인은 이 시계
+        **위의 절대 시각**이어야 한다. 예산을 세우는 `chat_room`이 `time.monotonic()`을
+        따로 부르면, 테스트가 `Router(now=...)`로 주입한 가짜 시계와 어긋나 예산이
+        즉시 만료되거나 영원히 만료되지 않는다 — 그래서 시계를 공개한다.
+        """
+        return self._now()
 
     # ---- construction ----
 
@@ -215,16 +227,23 @@ class Router:
         # 않는다(2026-08-03 리뷰 라운드 2 Finding). 대기 중임을 판단하고 알리는 데는
         # 항상 이 변수를 쓴다.
         usage_limit_error: Optional[BackendUsageLimitError] = None
+        # 토론 단위 예산(있으면). `None`이면 토론 밖 호출이므로 종전과 동일하게
+        # 호출당 상한을 그대로 쓴다 — 스캐너·발굴은 이 코드로 아무것도 달라지지 않는다.
+        budget_deadline: Optional[float] = usage_budget.get_deadline()
+        # 이번 호출에 실제로 적용된 대기 상한(예산에 잘리면 300보다 작다). 로그·give-up
+        # 메시지가 "실제로 기다린 만큼"을 말하게 한다.
+        cap_used: float = float(_USAGE_LIMIT_WAIT_SECONDS)
 
         def _give_up() -> None:
             logger.error(
                 "llm_usage_limit_gave_up",
                 task=task.value,
-                waited_seconds=_USAGE_LIMIT_WAIT_SECONDS,
+                waited_seconds=round(cap_used, 1),
+                discussion_budget=budget_deadline is not None,
                 reason=str(usage_limit_error)[:160],
             )
             raise LLMAllBackendsFailed(
-                f"usage limit outlasted the {_USAGE_LIMIT_WAIT_SECONDS}s freshness cap "
+                f"usage limit outlasted the {cap_used:.0f}s freshness cap "
                 f"for task '{task.value}': {usage_limit_error}"
             )
 
@@ -311,10 +330,18 @@ class Router:
             now = self._now()
             if deadline is None:
                 deadline = now + _USAGE_LIMIT_WAIT_SECONDS
+                if budget_deadline is not None and budget_deadline < deadline:
+                    # 토론 예산이 남은 만큼으로 자른다. 예산이 이미 소진됐으면
+                    # `deadline <= now`가 되어 바로 아래에서 sleep 없이 포기한다 —
+                    # 같은 토론의 뒤쪽 호출들이 각자 새 300초를 시작하지 못하게
+                    # 막는 것이 이 clamp의 목적이다.
+                    deadline = budget_deadline
+                cap_used = max(0.0, deadline - now)
                 logger.warning(
                     "llm_usage_limit_waiting",
                     task=task.value,
-                    cap_seconds=_USAGE_LIMIT_WAIT_SECONDS,
+                    cap_seconds=round(cap_used, 1),
+                    discussion_budget=budget_deadline is not None,
                     reason=str(usage_limit_error)[:160],
                 )
             if now >= deadline:
