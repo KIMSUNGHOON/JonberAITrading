@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Callable
 import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from agents.llm.backends.base import LLMAllBackendsFailed
 from services.agent_chat.models import (
     ChatSession,
     DecisionAction,
@@ -346,6 +347,40 @@ from services.agent_chat.position_manager import (
 )
 
 logger = structlog.get_logger()
+
+
+# LLM 장애 통지 래치 — 감시 주기가 1분이라 래치가 없으면 장애 지속 동안 매분 발송된다.
+# 원인 문자열을 키로 1회만 보내고, 복구되면 `clear_llm_failure_latch()`가 지워
+# 재발 시 다시 알린다(reconciler의 원가 드리프트 래치와 같은 형태).
+_LLM_FAILURE_NOTIFIED: set = set()
+
+
+def clear_llm_failure_latch() -> None:
+    """LLM 호출이 성공하면 호출해 래치를 푼다."""
+    _LLM_FAILURE_NOTIFIED.clear()
+
+
+async def _alert_llm_failure(ticker: str, exc: Exception) -> None:
+    """LLM 장애로 토론이 실패했음을 운영자에게 알린다. Best-effort —
+    통지 실패가 토론 경로를 더 망가뜨려선 안 된다."""
+    cause = str(exc)[:160]
+    if cause in _LLM_FAILURE_NOTIFIED:
+        return
+    _LLM_FAILURE_NOTIFIED.add(cause)
+    try:
+        from services.telegram import get_telegram_notifier
+
+        notifier = await get_telegram_notifier()
+        if not notifier.is_ready:
+            return
+        await notifier.send_system_status(
+            "error",
+            f"LLM 장애로 토론을 완료하지 못했습니다 ({ticker})\n"
+            f"사유: {cause}\n"
+            f"→ 매매 결정은 내려지지 않았습니다. 복구되면 다음 감시 주기에 재시도합니다.",
+        )
+    except Exception as e:  # noqa: BLE001 — 통지는 절대 경로를 깨뜨리지 않는다
+        logger.warning("llm_failure_alert_failed", ticker=ticker, error=str(e))
 
 
 class ChatCoordinator:
@@ -853,6 +888,7 @@ class ChatCoordinator:
         """Run a discussion and handle the result."""
         try:
             session = await room.start()
+            clear_llm_failure_latch()
 
             # Record last discussion time
             self._last_discussion[ticker] = datetime.now()
@@ -881,6 +917,12 @@ class ChatCoordinator:
                 ticker=ticker,
                 error=str(e),
             )
+            # 이 경로는 자동 감시 루프의 백그라운드 태스크다 — 여기서 re-raise하면
+            # 미처리 태스크 예외가 되어 무인 운용을 죽인다(2026-08-03과 같은
+            # 모양). 계약대로 로그로 삼키되, LLM 전체 백엔드 소진은 운영자가
+            # 몰라선 안 되므로 별도로 통지한다.
+            if isinstance(e, LLMAllBackendsFailed):
+                await _alert_llm_failure(ticker, e)
         finally:
             # Remove from active rooms
             self._active_rooms.pop(ticker, None)
@@ -1593,6 +1635,7 @@ class ChatCoordinator:
             # failures).
             try:
                 session = await room.start()
+                clear_llm_failure_latch()
                 await persist_session(session)
                 self._last_discussion[ticker] = datetime.now()
                 return session
@@ -1613,6 +1656,7 @@ class ChatCoordinator:
         """
         try:
             session = await room.start()
+            clear_llm_failure_latch()
 
             await persist_session(session)
             self._last_discussion[ticker] = datetime.now()
@@ -1628,6 +1672,11 @@ class ChatCoordinator:
             # is what makes it queryable) keeps the (CANCELLED) session from
             # dangling as a permanent 404.
             await persist_session(room.session)
+            # LLM 전체 백엔드 소진은 여기서도 삼켜야 한다(위 persist_session이
+            # 세션 dangling 404를 막는 복구 로직이라 re-raise로 우회할 수 없다) —
+            # 대신 운영자에게 별도로 알린다.
+            if isinstance(e, LLMAllBackendsFailed):
+                await _alert_llm_failure(ticker, e)
         finally:
             self._active_rooms.pop(ticker, None)
 
