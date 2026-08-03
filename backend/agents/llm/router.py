@@ -204,17 +204,25 @@ class Router:
         task = coerce_task(task)
         deadline: Optional[float] = None
         last: Optional[Exception] = None
+        # 대기를 시작하게 만든 "원래" 사유. `last`와 분리해 둔다 — 클램프(Finding 2)가
+        # 패스를 중간에 자르면(아래 `pass_cut_short`) `last`는 행(hang) 백엔드의
+        # asyncio.TimeoutError로 덮이고, 정작 대기 이유였던 usage limit 백엔드는
+        # 시도조차 못 해 본다. give-up 메시지·로그가 `last`를 쓰면 그 순간
+        # "all backends failed: "(빈 사유)로 퇴화하고 llm_usage_limit_gave_up도 찍히지
+        # 않는다(2026-08-03 리뷰 라운드 2 Finding). 대기 중임을 판단하고 알리는 데는
+        # 항상 이 변수를 쓴다.
+        usage_limit_error: Optional[BackendUsageLimitError] = None
 
         def _give_up() -> None:
             logger.error(
                 "llm_usage_limit_gave_up",
                 task=task.value,
                 waited_seconds=_USAGE_LIMIT_WAIT_SECONDS,
-                reason=str(last)[:160],
+                reason=str(usage_limit_error)[:160],
             )
             raise LLMAllBackendsFailed(
                 f"usage limit outlasted the {_USAGE_LIMIT_WAIT_SECONDS}s freshness cap "
-                f"for task '{task.value}': {last}"
+                f"for task '{task.value}': {usage_limit_error}"
             )
 
         # 서킷 차단기 charge(페널티)는 이 generate() 호출 안에서 백엔드별로 딱 한 번만
@@ -238,6 +246,10 @@ class Router:
                 # 체인이 비었다 = 서킷이 열렸거나 전부 unavailable. 기다려도 이 패스에서
                 # 달라질 것이 없고, 긴 장애에 신선도 예산을 낭비할 이유가 없다.
                 raise LLMAllBackendsFailed(f"no available backend for task '{task.value}'")
+            # 예산 부족으로 이 패스가 중간에 잘렸는지(뒤 백엔드를 아예 시도 못 했는지)
+            # 표시한다 — 잘렸다면 `last`는 그 백엔드가 아니라 앞선(보통 행/타임아웃)
+            # 백엔드의 예외이므로, 대기 지속 여부 판단에 `last`를 쓰면 안 된다.
+            pass_cut_short = False
             for backend in chain:
                 bn = backend.name
                 timeout = self._timeouts[bn]
@@ -246,6 +258,7 @@ class Router:
                     if remaining <= 0:
                         # 이 백엔드를 시도할 예산이 이미 없다 — 시도하지 않고 패스를
                         # 접어 아래 give-up 경로로 넘긴다.
+                        pass_cut_short = True
                         break
                     # 시도별 타임아웃을 남은 예산으로 clamp한다 — 안 그러면 행 백엔드
                     # 하나가 신선도 상한을 통째로 넘길 수 있다(Finding 2).
@@ -277,10 +290,19 @@ class Router:
             # 이 패스의 모든 백엔드가 실패했다(또는 예산 부족으로 건너뛰었다). 기다리면
             # 풀리는 종류만 기다린다 — 인증 오류·모델 부재·네트워크 실패는 대기로 해결
             # 되지 않는다.
-            # NOTE: `last`는 체인의 **마지막** 백엔드가 남긴 예외다 — 즉 대기 여부가
-            # 체인 순서에 좌우된다(설계 그대로 유지; 알려진 한계로만 남긴다).
-            if not isinstance(last, BackendUsageLimitError):
+            # NOTE: `last`는 체인의 **마지막으로 시도된** 백엔드가 남긴 예외다 — 즉 대기
+            # 개시 여부가 체인 순서에 좌우된다(설계 그대로 유지; 알려진 한계로만 남긴다).
+            if isinstance(last, BackendUsageLimitError):
+                usage_limit_error = last
+            elif not pass_cut_short:
+                # 패스가 (예산 부족 없이) 온전히 끝났는데 이번엔 usage limit이 아니다 —
+                # 설령 이미 대기 중이었더라도 확정적인 다른 실패이므로 대기를 접고 즉시
+                # 던진다(예전 대기 사유를 그대로 물려받지 않는다).
                 raise LLMAllBackendsFailed(f"all backends failed for task '{task.value}': {last}")
+            # else: pass_cut_short — 예산이 모자라 usage limit 백엔드를 아예 시도하지
+            # 못했을 뿐, `deadline is not None`이면 `usage_limit_error`는 반드시 이전
+            # 패스에서 채워져 있다(대기가 시작될 때 항상 둘이 함께 설정되므로). 원래
+            # 대기 사유가 여전히 유효하니 대기를 계속한다.
             now = self._now()
             if deadline is None:
                 deadline = now + _USAGE_LIMIT_WAIT_SECONDS
@@ -288,7 +310,7 @@ class Router:
                     "llm_usage_limit_waiting",
                     task=task.value,
                     cap_seconds=_USAGE_LIMIT_WAIT_SECONDS,
-                    reason=str(last)[:160],
+                    reason=str(usage_limit_error)[:160],
                 )
             if now >= deadline:
                 _give_up()

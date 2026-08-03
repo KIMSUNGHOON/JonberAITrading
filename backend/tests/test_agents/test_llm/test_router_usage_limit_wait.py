@@ -11,6 +11,7 @@
 가려진다 — 그래서 `test_real_resolve_...`는 일부러 `resolve()`를 패치하지 않고,
 라우터·서킷·대기가 같은 가짜 시계를 공유하는 상태로 실제 라우팅 경로를 태운다.
 """
+import asyncio
 from unittest.mock import patch
 
 import pytest
@@ -45,6 +46,32 @@ class _Backend(LLMBackend):
         if self.calls <= self._fail_times:
             raise self._error
         return self._result
+
+    async def health(self):
+        return True
+
+
+class _SimulatedHangSignal(Exception):
+    """`_HangingBackend`가 즉시 내는 표시용 예외 — 실제로 기다리지 않는다.
+    `_fake_wait_for`가 이 신호를 가로채 `timeout` 인자만큼 공유 가짜 시계를
+    전진시킨 뒤 `asyncio.TimeoutError`로 바꿔치기한다. 이렇게 하면 "백엔드가
+    타임아웃까지 행(hang)했다"를 실제 wall-clock 대기 없이, 라우터가 clamp한
+    `timeout` 값까지 정확히 반영해 재현할 수 있다."""
+
+
+class _HangingBackend(LLMBackend):
+    """항상 `_SimulatedHangSignal`을 즉시 던진다 — `_fake_wait_for`와 짝을 이뤄
+    "행(hang)하다가 라우터의 clamp된 타임아웃에 걸려 잘린 백엔드"를 흉내낸다."""
+
+    def __init__(self, name):
+        self.name = name
+        self.supports_stream = False
+        self.supports_schema = True
+        self.calls = 0
+
+    async def generate(self, messages, *, temperature=None, max_tokens=None, response_schema=None):
+        self.calls += 1
+        raise _SimulatedHangSignal()
 
     async def health(self):
         return True
@@ -256,3 +283,72 @@ async def test_real_resolve_waits_to_cap_and_charges_breaker_once(monkeypatch):
     # 실제로 여러 패스가 돌았다(재시도가 일어났다는 증거) — charge는 1회여도 시도
     # 자체는 반복됐다.
     assert backend.calls > 1
+
+
+@pytest.mark.asyncio
+async def test_gives_up_with_usage_limit_reason_when_clamp_cuts_pass_short(monkeypatch):
+    """2026-08-03 리뷰 라운드 2 Finding 재현: 체인의 앞쪽 백엔드가 행(hang)하다가
+    클램프된 타임아웃에 걸리면, 남은 예산이 0이 돼 뒤쪽(진짜 usage-limited) 백엔드는
+    시도조차 못 하고 패스가 잘린다. 이때도 give-up이 "빈 사유"가 아니라 애초에
+    대기를 시작하게 만든 usage-limit 사유로, `llm_usage_limit_gave_up`이 찍히는
+    경로로 나가야 한다(라운드 1 수정 직후엔 `all backends failed ...: `처럼 빈
+    사유로 퇴화하는 회귀가 있었다 — 리뷰어가 read-only 프로브로 실측).
+
+    실제 wall-clock 대기 없이 재현하려고 `asyncio.wait_for` 자체를 가짜로 바꾼다:
+    `_HangingBackend`가 `_SimulatedHangSignal`을 즉시 내면, 가짜 wait_for가 그걸
+    보고 라우터가 넘긴 `timeout`(=클램프된 값)만큼 공유 시계를 전진시킨 뒤
+    `asyncio.TimeoutError`를 낸다 — 실제 타임아웃이 "그만큼 걸렸다"는 관측 가능한
+    효과만 재현하고, 실제로는 기다리지 않는다.
+    """
+    # 타임아웃을 이 테스트 안에서 고정한다(코드 기본값과 동일한 값) — `.env`가
+    # LLM_TIMEOUT을 건드려도 재현 시나리오(2패스째에 정확히 클램프가 걸리는 것)가
+    # 깨지지 않게 한다. 클램프가 실제로 걸리려면 OPENROUTER의 무클램프 타임아웃이
+    # `CAP - RETRY_INTERVAL`(=280) 이상이어야 한다 — 300은 이를 만족한다.
+    monkeypatch.setattr(settings, "LLM_TIMEOUT", 300, raising=False)
+    monkeypatch.setattr(settings, "LLM_CLI_TIMEOUT", 180, raising=False)
+
+    elapsed = {"t": 0.0}
+
+    async def _fake_sleep(sec):
+        elapsed["t"] += sec
+
+    async def _fake_wait_for(coro, timeout):
+        try:
+            return await coro
+        except _SimulatedHangSignal:
+            elapsed["t"] += timeout
+            raise asyncio.TimeoutError("simulated hang")
+
+    hang = _HangingBackend(BackendName.OPENROUTER)
+    limited = _Backend(
+        BackendName.CLAUDE_CLI,
+        error=BackendUsageLimitError("claude exited 1: usage limit reached"),
+    )
+
+    # SENTIMENT_ANALYSIS 체인은 [OPENROUTER, CLAUDE_CLI] — 리뷰어의 원 프로브와
+    # 동일한 순서/구성. `resolve()`를 고정 패치해 매 패스 같은 체인을 낸다.
+    r = router_mod.Router(now=lambda: elapsed["t"])
+    with patch.object(r, "resolve", return_value=[hang, limited]), \
+         patch.object(router_mod.asyncio, "sleep", _fake_sleep), \
+         patch.object(router_mod.asyncio, "wait_for", _fake_wait_for):
+        with pytest.raises(LLMAllBackendsFailed) as exc_info:
+            await r.generate(_msgs(), task=TaskType.SENTIMENT_ANALYSIS)
+
+    # 회귀 지점: 메시지가 "all backends failed ...: "(last가 TimeoutError라 빈
+    # 사유)로 퇴화하지 않고, usage-limit 사유를 담은 give-up 메시지여야 한다.
+    msg = str(exc_info.value)
+    assert "usage limit outlasted" in msg
+    assert "usage limit reached" in msg
+
+    # 패스가 클램프로 잘려 CLAUDE_CLI가 마지막 패스에서는 시도되지 못했다는 증거:
+    # OPENROUTER(행)는 매 패스 시도되지만 CLAUDE_CLI는 그보다 적게 호출된다.
+    assert hang.calls > limited.calls
+    assert limited.calls >= 1   # 첫 패스에서는 usage limit이 실제로 확인됐다
+
+    # 대기 "지속시간" 자체(300초)는 라운드 2에서도 정상이지만, 이 시나리오의 총
+    # 경과는 300초가 아니다 — 데드라인이 "1패스가 끝난 뒤"에야 잡히는데, 그 1패스
+    # 자체가 행 때문에 무클램프 LLM_TIMEOUT(=300)만큼 걸렸다. 이건 이번 라운드에서
+    # 손대지 않기로 한 잔여 사항(코디네이터 residual 1)의 산술적 귀결이지 새 결함이
+    # 아니다 — 정확한 값으로 못박아 둔다: 1패스(무클램프 행) + CAP(300).
+    expected_total = settings.LLM_TIMEOUT + router_mod._USAGE_LIMIT_WAIT_SECONDS
+    assert elapsed["t"] == pytest.approx(expected_total)
