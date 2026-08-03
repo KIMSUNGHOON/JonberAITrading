@@ -31,6 +31,12 @@ _OPENROUTER_COST_ESTIMATE = 0.01
 # 가격·차트를 들고 있어서, 이보다 오래 기다렸다 재개하면 낡은 값으로 매매를 결정한다.
 # 감시 주기가 1분이므로 버려도 곧 새 데이터로 다시 시작한다 — 재개해서 아끼는 것은
 # "이미 한 분석"뿐이고, 잃는 것은 판단의 근거다.
+#
+# 알려진 한계(고치지 않음, 2026-08-03 리뷰 Finding 3): 이 상한은 `generate()` 호출
+# 1건에 붙는다. 근거(신선도)는 토론 1건 전체에 붙어야 맞는데, 토론 한 번에 LLM 호출이
+# 여러 단계(예: 4에이전트 각각 + 모더레이터)면 각 단계가 독립적으로 최대 300초씩
+# 기다릴 수 있어 토론 전체로는 300초를 크게 넘길 수 있다. 상한을 토론 단위로 옮기려면
+# `chat_room` 상태 기계를 건드려야 하는데, 이번 아크 범위 밖이다(ld-global-constraints).
 _USAGE_LIMIT_WAIT_SECONDS = 300   # 감시 주기(1분)의 5배
 _USAGE_LIMIT_RETRY_INTERVAL = 20
 
@@ -197,15 +203,53 @@ class Router:
     ) -> str:
         task = coerce_task(task)
         deadline: Optional[float] = None
+        last: Optional[Exception] = None
+
+        def _give_up() -> None:
+            logger.error(
+                "llm_usage_limit_gave_up",
+                task=task.value,
+                waited_seconds=_USAGE_LIMIT_WAIT_SECONDS,
+                reason=str(last)[:160],
+            )
+            raise LLMAllBackendsFailed(
+                f"usage limit outlasted the {_USAGE_LIMIT_WAIT_SECONDS}s freshness cap "
+                f"for task '{task.value}': {last}"
+            )
+
+        # 서킷 차단기 charge(페널티)는 이 generate() 호출 안에서 백엔드별로 딱 한 번만
+        # 한다 — 재시도 패스마다 charge하면 몇 패스 만에(threshold=3이면 40초 만에)
+        # 서킷이 열려 resolve()가 빈 체인을 반환하고, "체인이 비면 즉시 던진다" 규칙과
+        # 충돌해 300초 대기가 사실상 도달 불가능해진다(2026-08-03 리뷰 Finding 1).
+        # 헬스 캐시 갱신은 반대로 **매 실패마다** 해야 하는 관측이다(Task 3B가 여기
+        # 붙는다) — 페널티(서킷)와 관측(헬스)을 한 자리에 섞지 않는다.
+        charged_this_call: set = set()
+
         while True:
+            now = self._now()
+            if deadline is not None and now >= deadline:
+                # 새 패스를 시작하기 전에도 상한을 확인한다. 패스 하나가 최대
+                # LLM_TIMEOUT/LLM_CLI_TIMEOUT만큼 걸릴 수 있어, 패스가 끝난 뒤에만
+                # 확인하면(아래) 행(hang) 백엔드 하나가 상한을 통째로 넘길 수 있다
+                # (Finding 2).
+                _give_up()
             chain = self.resolve(task, streaming=False)
             if not chain:
                 # 체인이 비었다 = 서킷이 열렸거나 전부 unavailable. 기다려도 이 패스에서
                 # 달라질 것이 없고, 긴 장애에 신선도 예산을 낭비할 이유가 없다.
                 raise LLMAllBackendsFailed(f"no available backend for task '{task.value}'")
-            last: Optional[Exception] = None
             for backend in chain:
                 bn = backend.name
+                timeout = self._timeouts[bn]
+                if deadline is not None:
+                    remaining = deadline - self._now()
+                    if remaining <= 0:
+                        # 이 백엔드를 시도할 예산이 이미 없다 — 시도하지 않고 패스를
+                        # 접어 아래 give-up 경로로 넘긴다.
+                        break
+                    # 시도별 타임아웃을 남은 예산으로 clamp한다 — 안 그러면 행 백엔드
+                    # 하나가 신선도 상한을 통째로 넘길 수 있다(Finding 2).
+                    timeout = min(timeout, remaining)
                 try:
                     async with self._sems[bn]:
                         result = await asyncio.wait_for(
@@ -213,7 +257,7 @@ class Router:
                                 messages, temperature=temperature, max_tokens=max_tokens,
                                 response_schema=response_schema,
                             ),
-                            timeout=self._timeouts[bn],
+                            timeout=timeout,
                         )
                     self._breakers[bn].record_success()
                     if bn == BackendName.OPENROUTER:
@@ -221,18 +265,23 @@ class Router:
                     return result
                 except (BackendError, asyncio.TimeoutError, TimeoutError) as e:
                     transient = isinstance(e, (BackendTransientError, asyncio.TimeoutError, TimeoutError))
-                    self._breakers[bn].record_failure(transient=transient)
+                    if bn not in charged_this_call:
+                        self._breakers[bn].record_failure(transient=transient)  # 페널티: 호출당 1회
+                        charged_this_call.add(bn)
                     if isinstance(e, BackendAuthError):
                         self._unavailable.add(bn)
                     logger.warning("llm_fallback", from_backend=bn.value, task=task.value, reason=str(e)[:120])
                     last = e
                     continue
 
-            # 이 패스의 모든 백엔드가 실패했다. 기다리면 풀리는 종류만 기다린다 —
-            # 인증 오류·모델 부재·네트워크 실패는 대기로 해결되지 않는다.
+            # 이 패스의 모든 백엔드가 실패했다(또는 예산 부족으로 건너뛰었다). 기다리면
+            # 풀리는 종류만 기다린다 — 인증 오류·모델 부재·네트워크 실패는 대기로 해결
+            # 되지 않는다.
+            # NOTE: `last`는 체인의 **마지막** 백엔드가 남긴 예외다 — 즉 대기 여부가
+            # 체인 순서에 좌우된다(설계 그대로 유지; 알려진 한계로만 남긴다).
             if not isinstance(last, BackendUsageLimitError):
                 raise LLMAllBackendsFailed(f"all backends failed for task '{task.value}': {last}")
-            now = time.monotonic()
+            now = self._now()
             if deadline is None:
                 deadline = now + _USAGE_LIMIT_WAIT_SECONDS
                 logger.warning(
@@ -242,16 +291,7 @@ class Router:
                     reason=str(last)[:160],
                 )
             if now >= deadline:
-                logger.error(
-                    "llm_usage_limit_gave_up",
-                    task=task.value,
-                    waited_seconds=_USAGE_LIMIT_WAIT_SECONDS,
-                    reason=str(last)[:160],
-                )
-                raise LLMAllBackendsFailed(
-                    f"usage limit outlasted the {_USAGE_LIMIT_WAIT_SECONDS}s freshness cap "
-                    f"for task '{task.value}': {last}"
-                )
+                _give_up()
             await asyncio.sleep(_USAGE_LIMIT_RETRY_INTERVAL)
 
     async def stream(
