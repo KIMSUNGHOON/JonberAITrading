@@ -367,22 +367,37 @@ async def _alert_llm_failure(ticker: str, exc: Exception) -> None:
     """LLM 장애로 토론이 실패했음을 운영자에게 알린다. Best-effort —
     통지 실패가 토론 경로를 더 망가뜨려선 안 된다.
 
-    래치는 **발송이 실제로 확인된 뒤에만** 잠근다. `send_system_status`는
-    예외를 던지지 않고 False를 반환하는 경로가 여럿이다(설정 꺼짐, 봇
-    미초기화, Telegram TimedOut/NetworkError/Forbidden — `_send_message`
-    참고, BadRequest만 별도 처리됨). 발송 전에 래치부터 걸면 LLM 장애와
-    겹친 일시적 네트워크 순단이 그 장애의 유일한 통지 기회를 조용히
-    삼켜버린다 — 이 태스크가 없애려는 바로 그 결함이 한 겹 위에서
-    재현되는 셈이다.
+    **claim-then-back-out**으로 래치를 관리한다: dedup 체크와 `add(cause)`를
+    맞닿여 동기적으로 실행해(둘 사이에 `await`가 없다) 다른 코루틴이 끼어들
+    틈을 없앤다 — 이게 TOCTOU를 막는 장치다. `LLMAllBackendsFailed`는 task와
+    최종 에러로 키가 잡혀(agents/llm/router.py) 동시에 실패하는 여러 티커의
+    토론이 **같은 cause 문자열**을 공유하므로, add를 발송 확인 뒤로 미루면
+    두 코루틴이 나란히 dedup을 통과해 중복 발송된다(재현: 동일 cause로
+    `_alert_llm_failure`를 `asyncio.gather`하면 확인 전에는 send_count=2).
+    발송이 실제로 실패/미확인으로 끝나는 모든 경로(`is_ready` False,
+    `sent` False, 예외)에서는 `discard(cause)`로 되돌려 Finding 1(발송
+    미확인 시 영구 래치 금지)을 그대로 지킨다.
+
+    **락을 쓰지 않는 이유**: `asyncio.Lock`으로 체크~발송~커밋 전체를
+    감싸면 경쟁은 막지만, 이 함수는 토론 실패 예외 처리기 안에서
+    await되므로 느리거나 멈춘 Telegram 요청 하나가 락을 쥔 채 다른 모든
+    알림 시도를 그 뒤에 줄 세운다 — 장애 상황에서 알림 자체가 지연·정체될
+    위험을 굳이 만드는 셈이다. claim-then-back-out은 블로킹 프리미티브
+    없이 경쟁만 닫는다: 대가는 발송이 실제로 실패했을 때 동시 호출자가
+    선점된 claim을 보고 그냥 반환한다는 것뿐 — 다음 감시 주기(1분 뒤)에
+    재시도되므로 감내할 수 있다.
     """
     cause = str(exc)[:160]
     if cause in _LLM_FAILURE_NOTIFIED:
         return
+    _LLM_FAILURE_NOTIFIED.add(cause)  # claim (동기, 위 dedup 체크와 맞닿아 있음)
     try:
         from services.telegram import get_telegram_notifier
 
         notifier = await get_telegram_notifier()
         if not notifier.is_ready:
+            _LLM_FAILURE_NOTIFIED.discard(cause)
+            logger.warning("llm_failure_alert_notifier_not_ready", ticker=ticker, cause=cause)
             return
         sent = await notifier.send_system_status(
             "error",
@@ -390,13 +405,13 @@ async def _alert_llm_failure(ticker: str, exc: Exception) -> None:
             f"사유: {cause}\n"
             f"→ 매매 결정은 내려지지 않았습니다. 복구되면 다음 감시 주기에 재시도합니다.",
         )
-        if sent:
-            _LLM_FAILURE_NOTIFIED.add(cause)
-        else:
-            # 예외 없이 실패한 경우(네트워크 순단 등) — 래치를 걸지 않아
+        if not sent:
+            # 예외 없이 실패한 경우(네트워크 순단 등) — claim을 되돌려
             # 다음 시도에서 재발송되지만, 이번 실패 자체는 로그로 남긴다.
+            _LLM_FAILURE_NOTIFIED.discard(cause)
             logger.warning("llm_failure_alert_not_sent", ticker=ticker, cause=cause)
     except Exception as e:  # noqa: BLE001 — 통지는 절대 경로를 깨뜨리지 않는다
+        _LLM_FAILURE_NOTIFIED.discard(cause)
         logger.warning("llm_failure_alert_failed", ticker=ticker, error=str(e))
 
 

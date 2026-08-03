@@ -3,6 +3,7 @@
 감시 주기가 1분이라 래치가 없으면 장애 지속 동안 매분 발송된다. 원인별 1회만
 보내고, 해소되면 래치를 풀어 재발 시 다시 알린다.
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -75,6 +76,37 @@ async def test_latch_not_set_when_send_returns_false():
         await coord_mod._alert_llm_failure("005930", LLMAllBackendsFailed("usage limit reached"))
 
     assert "usage limit reached" not in coord_mod._LLM_FAILURE_NOTIFIED
+
+
+@pytest.mark.asyncio
+async def test_concurrent_calls_with_same_cause_send_once():
+    """TOCTOU regression: LLMAllBackendsFailed is keyed on task + last error
+    (agents/llm/router.py), so multiple tickers failing because every LLM
+    backend died share an identical cause string, and the coordinator runs
+    discussions concurrently per ticker (asyncio.create_task). Two coroutines
+    racing on the same cause must not both pass the dedup check before
+    either confirms delivery — that would fan one outage out into one
+    Telegram message per concurrently-failing ticker.
+
+    The send mock does a real `await asyncio.sleep(0)` to force a yield
+    between the dedup-check/claim and the confirmed send, deterministically
+    reproducing the interleaving without relying on wall-clock timing.
+    """
+    notifier = _notifier()
+
+    async def _yielding_send(*args, **kwargs):
+        await asyncio.sleep(0)
+        return True
+
+    notifier.send_system_status = AsyncMock(side_effect=_yielding_send)
+    coord_mod._LLM_FAILURE_NOTIFIED.clear()
+    with patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
+        await asyncio.gather(
+            coord_mod._alert_llm_failure("005930", LLMAllBackendsFailed("usage limit reached")),
+            coord_mod._alert_llm_failure("000660", LLMAllBackendsFailed("usage limit reached")),
+        )
+
+    assert notifier.send_system_status.await_count == 1
 
 
 # -------------------------------------------------------------------------
