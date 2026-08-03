@@ -225,6 +225,87 @@ class TestChatRoomCancel:
 
 
 # -------------------------------------------
+# Analysis Round Failure Handling
+#
+# 2026-08-03 회귀 방지: analyze()가 실패해도 에러 텍스트가 AgentMessage로
+# 세션에 쌓이면 안 된다(정상 의견처럼 토론에 흘러들어 가짜 NO_ACTION이 된다).
+# 부분 실패는 생존자만으로 계속 진행하고(voting round와 같은 계약), 전원
+# 실패면 투표로 넘어가지 않고 예외를 전파한다.
+# -------------------------------------------
+
+
+class TestAnalysisRoundFailureHandling:
+    """_run_analysis_round이 agent.analyze() 실패를 다루는 방식."""
+
+    @staticmethod
+    def _mock_moderator_opening(chat_room):
+        moderator = chat_room.agents[AgentType.MODERATOR]
+        moderator.analyze = AsyncMock(return_value=AgentMessage(
+            agent_type=AgentType.MODERATOR,
+            agent_name="토론 진행자",
+            message_type=MessageType.ANALYSIS,
+            content="토론을 시작합니다",
+        ))
+        return moderator
+
+    @pytest.mark.asyncio
+    async def test_failed_agent_contributes_no_message(self, chat_room):
+        """일부 에이전트만 실패하면: 실패한 에이전트는 메시지를 남기지 않고,
+        생존한 에이전트의 분석만으로 라운드가 정상 종료된다(부분 실패는 진행)."""
+        self._mock_moderator_opening(chat_room)
+
+        failing = chat_room.agents[AgentType.TECHNICAL]
+        failing.analyze = AsyncMock(side_effect=RuntimeError("llm down"))
+
+        for agent_type in (AgentType.FUNDAMENTAL, AgentType.SENTIMENT, AgentType.RISK):
+            agent = chat_room.agents[agent_type]
+            agent.analyze = AsyncMock(return_value=AgentMessage(
+                agent_type=agent_type,
+                agent_name=agent.agent_name,
+                message_type=MessageType.ANALYSIS,
+                content=f"{agent_type.value} 분석 결과",
+                confidence=0.8,
+            ))
+
+        await chat_room._run_analysis_round()
+
+        contents = [m.content for m in chat_room.session.all_messages]
+        # 에러 텍스트가 "정상 의견"으로 세션에 들어가면 안 된다.
+        assert not any("분석 중 오류" in c for c in contents)
+        # 실패한 에이전트 이름으로 만들어진 메시지가 없어야 한다.
+        assert not any(m.agent_type == AgentType.TECHNICAL for m in chat_room.session.all_messages)
+        # 모더레이터 오프닝 1개 + 생존한 3개 에이전트 분석만 남는다.
+        assert len(chat_room.session.all_messages) == 4
+
+    @pytest.mark.asyncio
+    async def test_all_agents_failed_raises_and_skips_voting(self, chat_room):
+        """전원 분석 실패면: 투표 라운드로 넘어가지 않고 예외가 전파돼야 한다.
+        chat_room.start()가 이를 잡아 세션을 CANCELLED로 표시한다(새 상태값 없음)."""
+        self._mock_moderator_opening(chat_room)
+
+        for agent_type in chat_room.discussion_order:
+            agent = chat_room.agents[agent_type]
+            agent.analyze = AsyncMock(
+                side_effect=RuntimeError(f"{agent_type.value} llm down")
+            )
+            # 투표까지 도달하면 안 된다 — 호출 여부로 검증한다.
+            agent.vote = AsyncMock(return_value=AgentVote(
+                agent_type=agent_type,
+                vote=VoteType.HOLD,
+                confidence=0.5,
+                reasoning="도달하면 안 됨",
+            ))
+
+        with pytest.raises(RuntimeError):
+            await chat_room.start()
+
+        assert chat_room.session.status == SessionStatus.CANCELLED
+        assert len(chat_room.session.votes) == 0
+        for agent_type in chat_room.discussion_order:
+            chat_room.agents[agent_type].vote.assert_not_called()
+
+
+# -------------------------------------------
 # Integration Tests
 # -------------------------------------------
 

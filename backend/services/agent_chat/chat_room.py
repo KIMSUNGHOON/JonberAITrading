@@ -231,6 +231,11 @@ class ChatRoom:
 
         analyses = await asyncio.gather(*analysis_tasks, return_exceptions=True)
 
+        # voting round(아래 _run_voting_round)와 같은 계약: 실패는 로그로만 남기고
+        # 그 에이전트의 기여는 없는 것으로 취급한다. 에러 텍스트를 AgentMessage로
+        # 만들어 세션에 넣지 않는다 — 그러면 정상 의견처럼 토론에 흘러들어 합의
+        # 불성립이 가짜 NO_ACTION이 된다(2026-08-03 라이브 장애와 같은 모양).
+        failures: List[Exception] = []
         for i, result in enumerate(analyses):
             if isinstance(result, Exception):
                 logger.error(
@@ -238,21 +243,18 @@ class ChatRoom:
                     agent=self.discussion_order[i].value,
                     error=str(result),
                 )
-                # Create error message
-                error_msg = AgentMessage(
-                    agent_type=self.discussion_order[i],
-                    agent_name=f"{self.discussion_order[i].value} 분석가",
-                    message_type=MessageType.ANALYSIS,
-                    content=f"분석 중 오류 발생: {str(result)}",
-                    confidence=0.0,
-                )
-                self.session.add_message(error_msg)
-                await self._emit_message(error_msg)
+                failures.append(result)
             else:
                 self.session.add_message(result)
                 await self._emit_message(result)
 
         self.session.end_round()
+
+        if failures and len(failures) == len(analyses):
+            # 전원 분석 실패 — 실제 분석이 하나도 없는 토론을 투표·중재자 결정까지
+            # 진행시키면 그 자체가 가짜 결정이 된다. chat_room.start()가 이 예외를
+            # 잡아 세션을 CANCELLED로 표시하므로 새 상태값 없이 raise만으로 충분하다.
+            raise failures[0]
 
         logger.info(
             "analysis_round_completed",
