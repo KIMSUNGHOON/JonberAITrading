@@ -170,3 +170,133 @@ async def test_site_a_success_path_clears_latch():
         await coordinator._run_discussion("005930", room)
 
     mock_clear.assert_called_once()
+
+
+# -------------------------------------------------------------------------
+# 사이트 B — `start_manual_discussion(wait=True)`. 실 포지션에 가장 가까운
+# 경로인데 여기만 알림 배선이 없었다.
+#
+# 원래 판단은 "예외가 HTTP 호출자에게 그대로 가니 알림이 필요 없다"였는데,
+# 실제 호출자를 세어 보면 전제가 틀렸다:
+#   - `app/api/routes/agent_chat.py:320` — `wait`를 넘기지 않는다 → 사이트 C
+#     (백그라운드) 경로로 간다.
+#   - `services/agent_chat/position_manager.py:1232` — 프로덕션의 유일한
+#     wait=True 호출자. 그 except는 `position_discussion_failed` 로그 한 줄뿐이다.
+# 즉 익절·손절임박·큰손실·전략재평가 토론이 LLM 장애로 죽으면 운영자에게 아무
+# 통지도 가지 않았다.
+# -------------------------------------------------------------------------
+
+
+class _FailingRoom:
+    """`room.start()`가 정해진 예외를 내는 가짜 룸 — 사이트 A/C 배선 테스트와
+    같은 방식으로 **실제 호출부**를 태운다."""
+
+    def __init__(self, exc, **kwargs):
+        self._exc = exc
+        self.ticker = kwargs.get("ticker", "005930")
+        self.stock_name = kwargs.get("stock_name", "삼성전자")
+        self.session = MagicMock(name="cancelled_session")
+
+    def on_status_change(self, callback):  # 코디네이터가 부를 수 있다
+        pass
+
+    async def start(self):
+        raise self._exc
+
+
+def _wait_true_harness(exc):
+    """`start_manual_discussion(wait=True)`를 실제로 태우기 위한 최소 배선."""
+    context = MagicMock()
+    context.is_stale = False
+    context.consensus_threshold = 0.75
+
+    coordinator = ChatCoordinator()
+    patches = [
+        patch("services.agent_chat.coordinator.ChatRoom", lambda **kw: _FailingRoom(exc, **kw)),
+        patch("services.agent_chat.coordinator._fire_room_created", MagicMock()),
+        patch("services.agent_chat.coordinator._register_sm_discussion", AsyncMock()),
+        patch("services.agent_chat.coordinator.persist_session", AsyncMock()),
+        patch.object(coordinator, "_fetch_market_context", AsyncMock(return_value=context)),
+        patch.object(coordinator, "_compute_agent_weights", AsyncMock(return_value=None)),
+    ]
+    return coordinator, patches
+
+
+@pytest.mark.asyncio
+async def test_site_b_wait_true_alerts_and_reraises():
+    """사이트 A/C와 달리 이 경로의 계약은 **전파**다(호출자가 session.decision을
+    읽는다). 알리고 다시 던져야 한다 — 삼키면 PositionManager가 "결정 없음"을
+    정상 결과로 오해할 수 있다."""
+    exc = LLMAllBackendsFailed("usage limit reached")
+    coordinator, patches = _wait_true_harness(exc)
+
+    with patch("services.agent_chat.coordinator._alert_llm_failure", AsyncMock()) as mock_alert:
+        for p in patches:
+            p.start()
+        try:
+            with pytest.raises(LLMAllBackendsFailed):
+                await coordinator.start_manual_discussion(
+                    ticker="005930", stock_name="삼성전자", wait=True
+                )
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    mock_alert.assert_awaited_once_with("005930", exc)
+    # finally가 raise 경로에서도 계속 동작해야 한다 — 남아 있으면 그 종목은
+    # "이미 토론 중"으로 영구히 막힌다.
+    assert "005930" not in coordinator._active_rooms
+
+
+@pytest.mark.asyncio
+async def test_site_b_pops_active_room_on_cancellation_without_alerting():
+    """취소는 LLM 장애가 아니다 — 알리지 않고 전파하되, `_active_rooms`는
+    반드시 비워져야 한다(락업 방지)."""
+    coordinator, patches = _wait_true_harness(asyncio.CancelledError())
+
+    with patch("services.agent_chat.coordinator._alert_llm_failure", AsyncMock()) as mock_alert:
+        for p in patches:
+            p.start()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await coordinator.start_manual_discussion(
+                    ticker="005930", stock_name="삼성전자", wait=True
+                )
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    mock_alert.assert_not_awaited()
+    assert "005930" not in coordinator._active_rooms
+
+
+@pytest.mark.asyncio
+async def test_site_b_success_path_clears_latch_and_returns_session():
+    """성공 경로가 회귀하지 않는지 — 예외 처리를 끼워 넣으면서 정상 반환·래치
+    해제가 깨지지 않았음을 같이 못박는다."""
+    session = MagicMock(name="decided_session")
+
+    class _OkRoom(_FailingRoom):
+        async def start(self):
+            return session
+
+    context = MagicMock()
+    context.is_stale = False
+    context.consensus_threshold = 0.75
+    coordinator = ChatCoordinator()
+
+    with patch("services.agent_chat.coordinator.ChatRoom", lambda **kw: _OkRoom(None, **kw)), \
+            patch("services.agent_chat.coordinator._fire_room_created", MagicMock()), \
+            patch("services.agent_chat.coordinator._register_sm_discussion", AsyncMock()), \
+            patch("services.agent_chat.coordinator.persist_session", AsyncMock()) as mock_persist, \
+            patch("services.agent_chat.coordinator.clear_llm_failure_latch") as mock_clear, \
+            patch.object(coordinator, "_fetch_market_context", AsyncMock(return_value=context)), \
+            patch.object(coordinator, "_compute_agent_weights", AsyncMock(return_value=None)):
+        returned = await coordinator.start_manual_discussion(
+            ticker="005930", stock_name="삼성전자", wait=True
+        )
+
+    assert returned is session
+    mock_clear.assert_called_once()
+    mock_persist.assert_awaited_once_with(session)
+    assert "005930" not in coordinator._active_rooms

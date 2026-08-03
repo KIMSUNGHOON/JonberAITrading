@@ -1671,6 +1671,20 @@ class ChatCoordinator:
                 await persist_session(session)
                 self._last_discussion[ticker] = datetime.now()
                 return session
+            except LLMAllBackendsFailed as e:
+                # 사이트 B. 이 경로에는 원래 except가 없었다 — "예외가 HTTP
+                # 호출자에게 그대로 간다"는 전제였는데, 실제 호출자 목록을 세어
+                # 보면 틀렸다: `app/api/routes/agent_chat.py:320`은 `wait`를 넘기지
+                # 않아 백그라운드 경로(사이트 C)로 가고, 프로덕션에서 wait=True로
+                # 부르는 곳은 `position_manager.py:1232` 하나뿐인데 그 핸들러는
+                # 로그 한 줄만 남긴다. 그래서 익절·손절임박·큰손실·전략재평가
+                # 토론이 LLM 장애로 죽으면 **실 포지션에 가장 가까운 경로**에서
+                # 운영자에게 아무것도 가지 않았다.
+                #
+                # 사이트 A/C와 달리 여기서는 삼키지 않는다 — 이 경로의 계약은
+                # 전파다(호출자가 session.decision을 읽는다). 알리고 다시 던진다.
+                await _alert_llm_failure(ticker, e)
+                raise
             finally:
                 self._active_rooms.pop(ticker, None)
 
