@@ -324,6 +324,29 @@ class PositionManagerConfig(BaseModel):
     min_discussion_interval_minutes: int = 15
     max_discussions_per_position: int = 8
 
+    # Discussion timeout bound (2026-08-04). `_trigger_discussion` awaits
+    # `start_manual_discussion(..., wait=True)` inline with no timeout, and
+    # that chain is the ONLY thing standing between `_monitor_loop` and the
+    # next check cycle -- one slow discussion stalls monitoring for every
+    # position, not just the one being discussed. Measured live: discussions
+    # averaged 262s (median 217s, max 651s), and the loop was blocked ~40%
+    # of a session.
+    #
+    # 600, not 900: 900 equals min_discussion_interval_minutes (15min) in
+    # seconds, so it would collide with that cooldown boundary, AND today's
+    # observed maximum was 651s -- 900 would never have fired against real
+    # data. 600 would have cut exactly one of today's 39 position
+    # discussions, bounding the worst-case monitoring stall at ~10 minutes
+    # instead of unbounded.
+    discussion_timeout_seconds: float = Field(
+        default=600,
+        gt=0,
+        description="Max seconds to wait for a triggered agent discussion "
+                     "(_trigger_discussion -> start_manual_discussion("
+                     "wait=True)) before giving up via asyncio.wait_for and "
+                     "resuming position monitoring.",
+    )
+
     # Holding period
     long_holding_days: int = 30
 
@@ -449,6 +472,15 @@ class PositionManager:
 
         # Chat coordinator reference (set by coordinator)
         self._chat_coordinator = None
+
+        # Discussion-timeout notification latch (2026-08-04) -- dedups
+        # repeated Telegram alerts for the same ticker while it keeps timing
+        # out. Instance-scoped (unlike coordinator._alert_llm_failure's
+        # module-global set): a discussion timeout is intrinsically
+        # per-position, not a shared cause many tickers hit at once, and
+        # instance scope means a fresh PositionManager() in tests starts
+        # clean with no manual latch-clear needed between tests.
+        self._discussion_timeout_notified: set = set()
 
         # E2-1: market-gate last-known state, for the transition-only log
         # helper below (None = not yet observed this process).
@@ -1229,14 +1261,24 @@ class PositionManager:
             # debate completes — session.decision is read right below, so the
             # async default (returns a still-running session, decision=None)
             # would make _apply_decision dead code.
-            session = await self._chat_coordinator.start_manual_discussion(
-                ticker=position.ticker,
-                stock_name=position.stock_name,
-                wait=True,
+            #
+            # Bounded (2026-08-04) with asyncio.wait_for: this await was the
+            # ONLY thing between `_monitor_loop` and the next check cycle for
+            # EVERY monitored position, not just this one, and it had no
+            # timeout at all -- see discussion_timeout_seconds on
+            # PositionManagerConfig for the measured numbers behind 600s.
+            session = await asyncio.wait_for(
+                self._chat_coordinator.start_manual_discussion(
+                    ticker=position.ticker,
+                    stock_name=position.stock_name,
+                    wait=True,
+                ),
+                timeout=self.config.discussion_timeout_seconds,
             )
 
             position.discussion_count += 1
             position.last_discussion = datetime.now()
+            self._discussion_timeout_notified.discard(position.ticker)
 
             # Handle decision. session.id is the REAL, persisted
             # agent_chat_decisions.id (decision_log.persist_session writes
@@ -1249,12 +1291,87 @@ class PositionManager:
                     position, session.decision, decision_id=session.id
                 )
 
+        except asyncio.TimeoutError:
+            # Caught BEFORE the generic `except Exception` below on purpose:
+            # asyncio.TimeoutError IS an Exception subclass, so that handler
+            # alone already keeps a timeout from propagating into
+            # `_monitor_loop` -- but it would do so SILENTLY (no
+            # _alert_llm_failure-style notice exists for a plain timeout,
+            # only for LLMAllBackendsFailed inside coordinator.py). Note
+            # `position.discussion_count`/`last_discussion` are deliberately
+            # left untouched here -- both assignments above sit right after
+            # the awaited call with no await between them, so a timeout
+            # short-circuits into this branch before either runs (both-or-
+            # neither, never half-updated), matching the documented "the
+            # caller's discussion budget must not be consumed by failures"
+            # contract for this call (coordinator.start_manual_discussion).
+            logger.error(
+                "position_discussion_timeout",
+                ticker=position.ticker,
+                timeout_seconds=self.config.discussion_timeout_seconds,
+            )
+            await self._alert_discussion_timeout(
+                position, self.config.discussion_timeout_seconds
+            )
+
         except Exception as e:
             logger.error(
                 "position_discussion_failed",
                 ticker=position.ticker,
                 error=str(e),
             )
+
+    async def _alert_discussion_timeout(
+        self, position: MonitoredPosition, timeout_seconds: float
+    ) -> None:
+        """토론이 제한시간을 넘겨 강제 종료됐음을 폰으로 알린다. Best-effort —
+        통지 실패가 감시 루프를 죽여선 안 된다.
+
+        `coordinator._alert_llm_failure`의 claim-then-back-out 래치
+        (services/agent_chat/coordinator.py, TOCTOU 봉합 2026-08-03)와 같은
+        장치를 쓴다: dedup 체크와 `add(ticker)`가 맞닿아 있어(둘 사이에
+        `await`가 없다) 다른 코루틴이 끼어들 틈이 없다. 발송이 실제로
+        실패/미확인으로 끝나는 모든 경로에서는 `finally`가 claim을
+        되돌려(취소 포함 — `except Exception`은 `asyncio.CancelledError`를
+        잡지 않으므로 그대로 전파된다) 다음 타임아웃에서 재시도된다.
+
+        키는 원인 문자열이 아니라 **ticker** — LLM 전멸처럼 여러 종목이
+        동시에 같은 사유를 공유하는 장애가 아니라(감시 루프는 포지션을
+        순차 처리한다), 토론 타임아웃은 종목별로 독립적이다. 그래서 모듈
+        전역 집합 대신 인스턴스 스코프(`self._discussion_timeout_notified`)
+        — 테스트마다 새 PositionManager()가 자동으로 깨끗한 래치를 갖는다
+        (coordinator 테스트처럼 수동 `.clear()`가 필요 없다).
+        """
+        ticker = position.ticker
+        if ticker in self._discussion_timeout_notified:
+            return
+        self._discussion_timeout_notified.add(ticker)  # claim (동기, 위 dedup과 맞닿아 있음)
+
+        committed = False
+        try:
+            from services.telegram import get_telegram_notifier
+            from services.telegram.formatting import stock_label
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                logger.warning("discussion_timeout_alert_notifier_not_ready", ticker=ticker)
+                return
+            label = stock_label(getattr(position, "stock_name", None), ticker)
+            sent = await notifier.send_message(
+                f"⏱️ 포지션 토론 제한시간 초과 ({timeout_seconds:.0f}s)\n"
+                f"{label}\n"
+                f"→ 이번 주기 결정은 내려지지 않았습니다. 감시는 계속됩니다.",
+                parse_mode=None,
+            )
+            if sent:
+                committed = True  # 발송이 확인된 유일한 경로 — 여기서만 래치를 유지한다
+            else:
+                logger.warning("discussion_timeout_alert_not_sent", ticker=ticker)
+        except Exception as e:  # noqa: BLE001 — 통지는 절대 감시 루프를 깨뜨리지 않는다
+            logger.warning("discussion_timeout_alert_failed", ticker=ticker, error=str(e))
+        finally:
+            if not committed:
+                self._discussion_timeout_notified.discard(ticker)
 
     async def _auto_execute_event(
         self,
