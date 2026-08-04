@@ -1514,10 +1514,18 @@ class ChatCoordinator:
                                 )
                             news_sentiment = sentiment_result.sentiment
                         except Exception as sentiment_error:
+                            # error_type이 없으면 사유를 알 수 없다 — 이 경로에서
+                            # 가장 흔한 실패인 asyncio.TimeoutError는 str()이 빈
+                            # 문자열이라 `error=`만 남기면 로그가 `error=`로 끝난다
+                            # (08-04 라이브: 18건 전부 공백). 어제 claude_cli가
+                            # stderr만 읽어 사유를 잃었던 것과 같은 계열의 결함이라,
+                            # 같은 처방을 쓴다 — 타입을 남겨 20초 타임아웃인지
+                            # 다른 예외인지 구분 가능하게 한다.
                             logger.warning(
                                 "news_sentiment_fallback",
                                 ticker=ticker,
                                 error=str(sentiment_error),
+                                error_type=type(sentiment_error).__name__,
                             )
             except Exception as e:
                 logger.warning("news_fetch_failed", error=str(e))

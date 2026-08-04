@@ -257,6 +257,15 @@ class ExecutionCoordinator:
         # explicit _persist_state/_restore_state helpers ignore this flag.
         self._persistence_active = False
 
+        # Daily trade count — 이 카운트가 속한 달력일(in-memory). 자정을 넘겨
+        # 계속 도는 프로세스는 `_state.daily_trades_count` 하나만으로는 그게
+        # 어제 몫인지 알 길이 없어 상한이 나날이 좁아지다 결국 매매가 전부
+        # 막힌다(2026-08-04 라이브 사고). `_maybe_reset_daily_trades()`가 읽기/
+        # 증가/영속 앞에서 이 값과 오늘을 매번 비교해 lazily 되돌린다 —
+        # `agents/llm/router.py`의 `_maybe_reset_day()`(OpenRouter 일일 예산)와
+        # 동일 패턴.
+        self._daily_count_day: date = date.today()
+
         # 체결 통지 태스크 강참조. create_task 결과를 붙들지 않으면 GC가
         # 태스크를 수거해 통지가 조용히 사라진다.
         self._notify_tasks: set = set()
@@ -759,6 +768,7 @@ class ExecutionCoordinator:
             )
 
         # Check daily trade limit
+        self._maybe_reset_daily_trades()
         if self._state.daily_trades_count >= self.risk_params.max_daily_trades:
             rationale = f"Daily trade limit reached ({self._state.daily_trades_count}/{self.risk_params.max_daily_trades})"
             self._log_activity(
@@ -1548,6 +1558,7 @@ class ExecutionCoordinator:
 
         # Update trade count
         if result.filled_quantity > 0:
+            self._maybe_reset_daily_trades()
             self._state.daily_trades_count += 1
             self._schedule_persist()
 
@@ -1970,11 +1981,35 @@ class ExecutionCoordinator:
             else str(self._state.mode)
         )
 
+    def _maybe_reset_daily_trades(self) -> None:
+        """`daily_trades_count`를 새 달력일로 lazy 롤오버한다.
+
+        `daily_trades_count`를 읽거나 쓰는 모든 지점(게이트 판정·증가·영속·
+        외부 상태 조회) **앞**에서 호출해야 한다. 특히 영속 호출이 빠지면:
+        카운트가 어제 몫인 채로 `_persist_state`가 오늘 날짜를 찍어버리고,
+        다음 재시작에서 `_restore_state`가 "날짜가 맞다"며 그 낡은 카운트를
+        그대로 복원한다 — 재시작으로도 못 고치는 자기영속 결함이 된다
+        (2026-08-04 실 라이브 사고: daily_trades_count=4 / daily_count_date=
+        오늘로 영속돼 있었는데 그중 3건은 전날 거래였다).
+
+        `agents/llm/router.py`의 `_maybe_reset_day()`(OpenRouter 일일 예산)와
+        동일 패턴 — 스케줄된 잡 없이, 쓰는 시점마다 스스로 확인한다.
+        """
+        today = date.today()
+        if today != self._daily_count_day:
+            self._daily_count_day = today
+            self._state.daily_trades_count = 0
+
     async def _persist_state(self) -> None:
         """Best-effort persist of restart-critical state. Never raises — a storage
         failure must not break trading."""
         try:
             from services.storage_service import get_storage_service
+
+            # 아래 blob이 "오늘" 날짜를 daily_trades_count에 찍는다 — 롤오버가
+            # 안 돌았으면 어제 몫 카운트에 오늘 도장을 찍는 셈이라, 다음 restore가
+            # "날짜 일치"로 보고 그대로 복원해버린다(자기영속 결함, 위 docstring).
+            self._maybe_reset_daily_trades()
 
             blob = json.dumps(
                 {
@@ -2088,11 +2123,15 @@ class ExecutionCoordinator:
                 WatchedStock.model_validate(w) for w in data.get("watch_list", [])
             ]
 
-            # Daily count — reset on a new calendar day.
+            # Daily count — reset on a new calendar day. `_daily_count_day`도
+            # 여기서 오늘로 맞춰야, 복원 직후 첫 읽기/쓰기에서
+            # `_maybe_reset_daily_trades()`가 방금 복원한 값을 다시 지워버리지
+            # 않는다 — 재시작이 이 in-memory day의 유일한 초기화 지점이다.
             if data.get("daily_count_date") == date.today().isoformat():
                 self._state.daily_trades_count = int(data.get("daily_trades_count", 0))
             else:
                 self._state.daily_trades_count = 0
+            self._daily_count_day = date.today()
 
             # Tracked orders (F3): TRACKING orders resume so the scheduler poll
             # can pick up their post-fill. A TRACKING order whose trade_date
@@ -3048,6 +3087,10 @@ class ExecutionCoordinator:
     @property
     def state(self) -> TradingState:
         """Get current trading state."""
+        # 외부 조회(상태 API, 포트폴리오 요약 등)가 게이트/증가/영속 호출 없이
+        # 하루의 첫 접근이 될 수도 있다 — 여기서도 롤오버를 확인해야 새 날의
+        # 첫 조회가 어제 카운트를 보여주지 않는다.
+        self._maybe_reset_daily_trades()
         return self._state
 
     @property
@@ -3057,6 +3100,10 @@ class ExecutionCoordinator:
 
     def get_portfolio_summary(self) -> dict:
         """Get portfolio summary."""
+        # `self._state`를 직접 넘겨 `state` 프로퍼티(위)를 건너뛰므로 여기서도
+        # 롤오버를 확인해야 한다 — 그렇지 않으면 이 경로로만 조회할 때
+        # daily_trades가 새 날에도 어제 값으로 보인다.
+        self._maybe_reset_daily_trades()
         return self.portfolio_agent.get_portfolio_summary(self._state)
 
     def get_pending_alerts(self) -> List[TradingAlert]:

@@ -1246,11 +1246,24 @@ class TestNewsSentimentWiring:
                 AsyncMock(return_value=mock_news_service),
             ),
             patch("services.news.sentiment.NewsSentimentAnalyzer") as MockAnalyzer,
+            patch("services.agent_chat.coordinator.logger") as mock_logger,
         ):
             MockAnalyzer.return_value.analyze = AsyncMock(side_effect=asyncio.TimeoutError())
             context = await coordinator._fetch_market_context("005930", "삼성전자")
 
         assert context.news_sentiment == "negative"  # 등락률 -3.0% 폴백 라벨
+
+        # 타임아웃이 사유를 남기는지 — TimeoutError는 str()이 빈 문자열이라
+        # `error=`만 로그하면 무엇이 실패했는지 알 수 없다(08-04 라이브에서
+        # 18건 전부 공백으로 남아 원인 판별이 불가능했다). 타입이 그 공백을
+        # 메우는 유일한 단서이므로 회귀하면 여기서 잡힌다.
+        fallback_calls = [
+            c for c in mock_logger.warning.call_args_list
+            if c.args and c.args[0] == "news_sentiment_fallback"
+        ]
+        assert len(fallback_calls) == 1
+        assert fallback_calls[0].kwargs["error"] == ""  # 이래서 타입이 필요하다
+        assert fallback_calls[0].kwargs["error_type"] == "TimeoutError"
 
     @pytest.mark.asyncio
     async def test_no_articles_skips_analyzer_and_leaves_sentiment_none(self, coordinator):
