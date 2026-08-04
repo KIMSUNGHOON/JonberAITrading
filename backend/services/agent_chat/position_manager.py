@@ -7,7 +7,7 @@ Triggers agent discussions for position management decisions.
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional, Callable, Any
 
@@ -217,6 +217,27 @@ class MonitoredPosition(BaseModel):
     events_triggered: List[str] = Field(default_factory=list)
     discussion_count: int = 0
 
+    # Daily discussion-cap rollover (2026-08-04, third instance of the
+    # pattern in `agents/llm/router.py`'s `_maybe_reset_day()` /
+    # `services/trading/coordinator.py`'s `_maybe_reset_daily_trades()`).
+    # Which calendar day `discussion_count` currently belongs to. Nothing
+    # schedules a reset -- a long-running process that crosses midnight
+    # without restarting must still start counting fresh the next day, or
+    # `max_discussions_per_position` silently becomes permanent (2026-08-04
+    # live incident: 4/5 positions hit the cap ~12:53 and got zero strategic
+    # re-evaluation for the rest of the session). Every read/write site
+    # calls `PositionManager._maybe_reset_discussion_count(position)` first
+    # -- see that method's docstring for the full touch-point list and why,
+    # unlike the coordinator fix, there is no persist/restore leg to guard
+    # here (`discussion_count` is not persisted at all).
+    # `lambda: date.today()`, not the bare `date.today` bound method: the
+    # bound method resolves `datetime.date.today` once at class-definition
+    # time and is immune to `monkeypatch.setattr(position_manager, "date",
+    # ...)` in tests, whereas the lambda re-looks-up the module-level `date`
+    # name (LOAD_GLOBAL) on every call, matching how `_maybe_reset_
+    # discussion_count`'s own `date.today()` call already behaves.
+    discussion_count_date: date = Field(default_factory=lambda: date.today())
+
     # Set once when an autonomous defensive close is blocked by the gate, so the
     # human is notified once per denied episode instead of every monitor cycle
     # (the *_HIT events are not de-duped). Reset when the gate next allows.
@@ -323,6 +344,29 @@ class PositionManagerConfig(BaseModel):
     # Discussion limits
     min_discussion_interval_minutes: int = 15
     max_discussions_per_position: int = 8
+
+    # Discussion timeout bound (2026-08-04). `_trigger_discussion` awaits
+    # `start_manual_discussion(..., wait=True)` inline with no timeout, and
+    # that chain is the ONLY thing standing between `_monitor_loop` and the
+    # next check cycle -- one slow discussion stalls monitoring for every
+    # position, not just the one being discussed. Measured live: discussions
+    # averaged 262s (median 217s, max 651s), and the loop was blocked ~40%
+    # of a session.
+    #
+    # 600, not 900: 900 equals min_discussion_interval_minutes (15min) in
+    # seconds, so it would collide with that cooldown boundary, AND today's
+    # observed maximum was 651s -- 900 would never have fired against real
+    # data. 600 would have cut exactly one of today's 39 position
+    # discussions, bounding the worst-case monitoring stall at ~10 minutes
+    # instead of unbounded.
+    discussion_timeout_seconds: float = Field(
+        default=600,
+        gt=0,
+        description="Max seconds to wait for a triggered agent discussion "
+                     "(_trigger_discussion -> start_manual_discussion("
+                     "wait=True)) before giving up via asyncio.wait_for and "
+                     "resuming position monitoring.",
+    )
 
     # Holding period
     long_holding_days: int = 30
@@ -449,6 +493,15 @@ class PositionManager:
 
         # Chat coordinator reference (set by coordinator)
         self._chat_coordinator = None
+
+        # Discussion-timeout notification latch (2026-08-04) -- dedups
+        # repeated Telegram alerts for the same ticker while it keeps timing
+        # out. Instance-scoped (unlike coordinator._alert_llm_failure's
+        # module-global set): a discussion timeout is intrinsically
+        # per-position, not a shared cause many tickers hit at once, and
+        # instance scope means a fresh PositionManager() in tests starts
+        # clean with no manual latch-clear needed between tests.
+        self._discussion_timeout_notified: set = set()
 
         # E2-1: market-gate last-known state, for the transition-only log
         # helper below (None = not yet observed this process).
@@ -645,17 +698,36 @@ class PositionManager:
         if ticker in self._positions:
             del self._positions[ticker]
             self._schedule_persist_stops()
+            # Review fix (2026-08-04): `_discussion_timeout_notified` is
+            # ticker-keyed and was only ever cleared by that SAME ticker's
+            # next successful discussion. Without this, sell -> re-buy the
+            # same ticker inherits the old position's latch state -- the new
+            # position's first timeout would be silently deduped against an
+            # alert that was actually about a completely different holding.
+            self._discussion_timeout_notified.discard(ticker)
             logger.info("position_removed", ticker=ticker)
             return True
         return False
 
     def get_position(self, ticker: str) -> Optional[MonitoredPosition]:
         """Get a specific position."""
-        return self._positions.get(ticker)
+        position = self._positions.get(ticker)
+        # Backs GET /positions/{ticker} -- an external read of
+        # `discussion_count` can be the day's first touch for this
+        # position, so the rollover must run here too (see
+        # `_maybe_reset_discussion_count`'s docstring).
+        if position is not None:
+            self._maybe_reset_discussion_count(position)
+        return position
 
     def get_all_positions(self) -> List[MonitoredPosition]:
         """Get all monitored positions."""
-        return list(self._positions.values())
+        positions = list(self._positions.values())
+        # Backs GET /positions (and get_summary()) -- same reasoning as
+        # get_position above, for every position in the list.
+        for position in positions:
+            self._maybe_reset_discussion_count(position)
+        return positions
 
     # -------------------------------------------
     # Monitoring Loop
@@ -1194,8 +1266,46 @@ class PositionManager:
         # Send Telegram notification
         await self._notify_event(event)
 
+    def _maybe_reset_discussion_count(self, position: MonitoredPosition) -> None:
+        """Lazy-rolls `position.discussion_count` onto a new calendar day.
+
+        Mirrors `services.trading.coordinator.ExecutionCoordinator.
+        _maybe_reset_daily_trades()` / `agents.llm.router.LLMRouter.
+        _maybe_reset_day()` -- same lazy-reset shape (checked at every touch
+        point, no scheduled job), applied per-position since each
+        `MonitoredPosition` carries its own cap.
+
+        Must be called before EVERY read or write of `discussion_count`:
+        the gate (`_should_trigger_discussion`), the increment
+        (`_trigger_discussion`), and both external accessors
+        (`get_position`/`get_all_positions`, which back the
+        `GET /positions` and `GET /positions/{ticker}` API routes). Skipping
+        any one of these lets a stale cap silently become permanent for that
+        position -- the exact 2026-08-04 incident this closes (4 of 5 live
+        positions hit `max_discussions_per_position` around 12:53 and got
+        zero strategic re-evaluation for the rest of the session, with no
+        notification to anyone).
+
+        Unlike the coordinator's `daily_trades_count`, `discussion_count` is
+        NOT persisted anywhere -- `_persist_stops`/`restore_stop_overlay`
+        only ever serialize stop levels (stop_loss/take_profit/
+        trailing_stop_pct/take_profit_reached_at), never this field. So
+        there is no restore-path date-stamping trap to guard here (the trap
+        that made yesterday's `daily_trades_count` bug survive a restart): a
+        process restart already re-creates every position via
+        `sync_from_account` -> `add_position`, whose default
+        `discussion_count=0` is fresh regardless of date. The only gap this
+        closes is a long-running process crossing midnight without ever
+        restarting.
+        """
+        today = date.today()
+        if position.discussion_count_date != today:
+            position.discussion_count_date = today
+            position.discussion_count = 0
+
     def _should_trigger_discussion(self, position: MonitoredPosition) -> bool:
         """Check if a discussion should be triggered."""
+        self._maybe_reset_discussion_count(position)
         # Check max discussions
         if position.discussion_count >= self.config.max_discussions_per_position:
             return False
@@ -1229,14 +1339,31 @@ class PositionManager:
             # debate completes — session.decision is read right below, so the
             # async default (returns a still-running session, decision=None)
             # would make _apply_decision dead code.
-            session = await self._chat_coordinator.start_manual_discussion(
-                ticker=position.ticker,
-                stock_name=position.stock_name,
-                wait=True,
+            #
+            # Bounded (2026-08-04) with asyncio.wait_for: this await was the
+            # ONLY thing between `_monitor_loop` and the next check cycle for
+            # EVERY monitored position, not just this one, and it had no
+            # timeout at all -- see discussion_timeout_seconds on
+            # PositionManagerConfig for the measured numbers behind 600s.
+            session = await asyncio.wait_for(
+                self._chat_coordinator.start_manual_discussion(
+                    ticker=position.ticker,
+                    stock_name=position.stock_name,
+                    wait=True,
+                ),
+                timeout=self.config.discussion_timeout_seconds,
             )
 
+            # Reset-then-increment (not just reset-then-check in the gate
+            # above): the awaited discussion can span the timeout window
+            # (up to discussion_timeout_seconds, default 600s) and cross
+            # midnight itself, so re-checking the day right here is what
+            # keeps a discussion that started late on day N from stacking
+            # onto day N's stale count once it resolves on day N+1.
+            self._maybe_reset_discussion_count(position)
             position.discussion_count += 1
             position.last_discussion = datetime.now()
+            self._discussion_timeout_notified.discard(position.ticker)
 
             # Handle decision. session.id is the REAL, persisted
             # agent_chat_decisions.id (decision_log.persist_session writes
@@ -1249,12 +1376,103 @@ class PositionManager:
                     position, session.decision, decision_id=session.id
                 )
 
+        except asyncio.TimeoutError:
+            # Caught BEFORE the generic `except Exception` below on purpose:
+            # asyncio.TimeoutError IS an Exception subclass, so that handler
+            # alone already keeps a timeout from propagating into
+            # `_monitor_loop` -- but it would do so SILENTLY (no
+            # _alert_llm_failure-style notice exists for a plain timeout,
+            # only for LLMAllBackendsFailed inside coordinator.py).
+            #
+            # Review fix (2026-08-04, final branch review): a timeout used
+            # to leave BOTH `discussion_count` and `last_discussion`
+            # untouched, on the theory that a failed discussion shouldn't
+            # consume the day's budget. Confirmed against the real
+            # coordinator that this has a second effect that matters more --
+            # `_should_trigger_discussion` reads `last_discussion` for its
+            # cooldown, so leaving it untouched meant a chronically slow
+            # position retried every 30s (the next monitor tick) with NO
+            # backoff: stall 600s, cancel, stall 600s again, forever. That's
+            # not a cosmetic loop -- this IS the monitor loop carrying the
+            # TIGHTER of the two stop-loss engines, so a permanently-retrying
+            # timeout is a permanently-stalled defensive stop, and each
+            # cancelled discussion also burns ~15 paid LLM calls.
+            #
+            # So the two fields now split: `last_discussion` IS set here
+            # (throttles the next attempt via `min_discussion_interval_minutes`,
+            # same as a normal discussion) but `discussion_count` is
+            # deliberately still left alone -- a failed discussion must not
+            # consume `max_discussions_per_position`'s daily budget, only the
+            # existing count would've silently prevented any FUTURE
+            # discussion this ticker.
+            position.last_discussion = datetime.now()
+            logger.error(
+                "position_discussion_timeout",
+                ticker=position.ticker,
+                timeout_seconds=self.config.discussion_timeout_seconds,
+            )
+            await self._alert_discussion_timeout(
+                position, self.config.discussion_timeout_seconds
+            )
+
         except Exception as e:
             logger.error(
                 "position_discussion_failed",
                 ticker=position.ticker,
                 error=str(e),
             )
+
+    async def _alert_discussion_timeout(
+        self, position: MonitoredPosition, timeout_seconds: float
+    ) -> None:
+        """토론이 제한시간을 넘겨 강제 종료됐음을 폰으로 알린다. Best-effort —
+        통지 실패가 감시 루프를 죽여선 안 된다.
+
+        `coordinator._alert_llm_failure`의 claim-then-back-out 래치
+        (services/agent_chat/coordinator.py, TOCTOU 봉합 2026-08-03)와 같은
+        장치를 쓴다: dedup 체크와 `add(ticker)`가 맞닿아 있어(둘 사이에
+        `await`가 없다) 다른 코루틴이 끼어들 틈이 없다. 발송이 실제로
+        실패/미확인으로 끝나는 모든 경로에서는 `finally`가 claim을
+        되돌려(취소 포함 — `except Exception`은 `asyncio.CancelledError`를
+        잡지 않으므로 그대로 전파된다) 다음 타임아웃에서 재시도된다.
+
+        키는 원인 문자열이 아니라 **ticker** — LLM 전멸처럼 여러 종목이
+        동시에 같은 사유를 공유하는 장애가 아니라(감시 루프는 포지션을
+        순차 처리한다), 토론 타임아웃은 종목별로 독립적이다. 그래서 모듈
+        전역 집합 대신 인스턴스 스코프(`self._discussion_timeout_notified`)
+        — 테스트마다 새 PositionManager()가 자동으로 깨끗한 래치를 갖는다
+        (coordinator 테스트처럼 수동 `.clear()`가 필요 없다).
+        """
+        ticker = position.ticker
+        if ticker in self._discussion_timeout_notified:
+            return
+        self._discussion_timeout_notified.add(ticker)  # claim (동기, 위 dedup과 맞닿아 있음)
+
+        committed = False
+        try:
+            from services.telegram import get_telegram_notifier
+            from services.telegram.formatting import stock_label
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                logger.warning("discussion_timeout_alert_notifier_not_ready", ticker=ticker)
+                return
+            label = stock_label(getattr(position, "stock_name", None), ticker)
+            sent = await notifier.send_message(
+                f"⏱️ 포지션 토론 제한시간 초과 ({timeout_seconds:.0f}s)\n"
+                f"{label}\n"
+                f"→ 이번 주기 결정은 내려지지 않았습니다. 감시는 계속됩니다.",
+                parse_mode=None,
+            )
+            if sent:
+                committed = True  # 발송이 확인된 유일한 경로 — 여기서만 래치를 유지한다
+            else:
+                logger.warning("discussion_timeout_alert_not_sent", ticker=ticker)
+        except Exception as e:  # noqa: BLE001 — 통지는 절대 감시 루프를 깨뜨리지 않는다
+            logger.warning("discussion_timeout_alert_failed", ticker=ticker, error=str(e))
+        finally:
+            if not committed:
+                self._discussion_timeout_notified.discard(ticker)
 
     async def _auto_execute_event(
         self,

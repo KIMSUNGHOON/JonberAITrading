@@ -4,6 +4,9 @@
 - opt-in: agent_weights=None == legacy behavior exactly
 - tilt formula + clamps + min-sample gate
 - single-vote guard: <2 scoring votes -> consensus 0.0 (audit defect C seal)
+- panel-coverage factor: raw ratio * (participating_weight / panel_weight) so
+  a partially-answering panel (LLM dropout) can't report full agreement
+  (audit 2026-07-22 Finding 1/4, second pass — 2026-08-04)
 """
 
 from unittest.mock import AsyncMock, patch
@@ -39,6 +42,10 @@ def test_default_weights_constant_shape():
 
 
 def test_consensus_without_weights_matches_legacy():
+    """No-op proof: full 4-of-4 panel votes -> participating_weight ==
+    panel_weight -> coverage == 1.0 -> unchanged from pre-coverage-fix math.
+    This is what proves the panel-coverage factor does not disturb normal
+    (everyone-answered) operation."""
     votes = [_vote(AgentType.TECHNICAL), _vote(AgentType.FUNDAMENTAL),
              _vote(AgentType.SENTIMENT, VoteType.SELL), _vote(AgentType.RISK, VoteType.HOLD)]
     session = _session(votes)
@@ -47,10 +54,16 @@ def test_consensus_without_weights_matches_legacy():
 
 
 def test_consensus_uses_injected_weights():
+    """Only technical+risk vote (2 of 4 panel seats) -> coverage < 1 scales
+    the raw ratio down, on top of the injected-weight tilt."""
     votes = [_vote(AgentType.TECHNICAL), _vote(AgentType.RISK, VoteType.SELL)]
     session = _session(votes, weights={"technical": 0.375, "risk": 0.15})
-    # bull=0.375*0.8=0.3, bear=0.15*0.8=0.12 → 0.3/0.42
-    assert session.calculate_consensus() == pytest.approx(0.3 / 0.42)
+    # raw: bull=0.375*0.8=0.3, bear=0.15*0.8=0.12 -> 0.3/0.42 = 5/7
+    # panel_weight (tech 0.375 + fundamental fallback 0.25 + sentiment
+    # fallback 0.20 + risk 0.15) = 0.975; participating_weight = 0.375+0.15
+    # = 0.525 -> coverage = 0.525/0.975 = 7/13
+    # consensus = (5/7) * (7/13) = 5/13
+    assert session.calculate_consensus() == pytest.approx(5 / 13)
 
 
 def test_single_vote_guard_consensus_zero():
@@ -61,8 +74,13 @@ def test_single_vote_guard_consensus_zero():
 
 
 def test_two_votes_still_score():
+    """2 of 4 panel seats vote (>= 2-scoring-vote guard passes) and fully
+    agree -> raw ratio is 1.0, but panel-coverage (0.5/1.0=0.5) must scale
+    that down. Pre-fix this asserted 1.0 -- a half-dead panel manufacturing
+    full-confidence consensus was exactly the audit 2026-07-22 Finding 1/4
+    inflation this fix seals."""
     session = _session([_vote(AgentType.TECHNICAL), _vote(AgentType.FUNDAMENTAL)])
-    assert session.calculate_consensus() == pytest.approx(1.0)
+    assert session.calculate_consensus() == pytest.approx(0.5)
 
 
 def test_weighted_confidence_accepts_weights_param():
@@ -76,6 +94,49 @@ def test_weighted_confidence_accepts_weights_param():
 
 def _vote_conf(agent_type, vote, confidence):
     return AgentVote(agent_type=agent_type, vote=vote, confidence=confidence, reasoning="r")
+
+
+# ---------- panel-coverage factor (audit 2026-07-22 Finding 1/4, 2nd pass) ----------
+
+
+def test_moderator_vote_excluded_from_participating_weight():
+    """모더레이터 투표가 self.votes에 섞여 있어도(정상 흐름에선 안 생기지만
+    방어적으로) participating_weight에는 절대 얹히면 안 된다 — 얹히면
+    resolve_agent_weight의 0.25 폴백이 커버리지를 부풀린다(제약 #2).
+    tech+fund 2석만 실제 패널 참여, moderator는 continue로 제외 ->
+    coverage = 0.5/1.0 = 0.5 (0.75가 아니라)."""
+    votes = [_vote(AgentType.TECHNICAL), _vote(AgentType.FUNDAMENTAL),
+             _vote_conf(AgentType.MODERATOR, VoteType.BUY, 1.0)]
+    session = _session(votes)
+    assert session.calculate_consensus() == pytest.approx(0.5)
+
+
+def test_full_panel_plus_moderator_consensus_does_not_exceed_one():
+    """패널 4석 전원 만장일치 + 모더레이터 투표까지 섞여도 커버리지는
+    1.0을 넘을 수 없다 (모더레이터 폴백 가중이 새면 participating_weight >
+    panel_weight가 되어 합의가 100%를 초과해 소비자 쪽 게이트 비교를
+    무의미하게 만들 수 있었다)."""
+    votes = [
+        _vote_conf(AgentType.TECHNICAL, VoteType.STRONG_BUY, 0.9),
+        _vote_conf(AgentType.FUNDAMENTAL, VoteType.STRONG_BUY, 0.9),
+        _vote_conf(AgentType.SENTIMENT, VoteType.STRONG_BUY, 0.9),
+        _vote_conf(AgentType.RISK, VoteType.STRONG_BUY, 0.9),
+        _vote_conf(AgentType.MODERATOR, VoteType.BUY, 1.0),
+    ]
+    session = _session(votes)
+    assert session.calculate_consensus() == pytest.approx(1.0)
+
+
+def test_calculate_consensus_and_consensus_from_votes_agree():
+    """두 진입점(calculate_consensus/_consensus_from_votes)이 같은 votes에
+    대해 항상 같은 값을 내야 한다 — 갈라지면 tilt_changed_gate_verdict의
+    두 경로 비교가 허위 경고를 낸다(models.py :433-434)."""
+    votes = [_vote(AgentType.TECHNICAL), _vote(AgentType.RISK, VoteType.SELL)]
+    session = _session(votes, weights={"technical": 0.375, "risk": 0.15})
+    live = session.calculate_consensus()
+    pure = session._consensus_from_votes(session.agent_weights)
+    assert live == pytest.approx(pure)
+    assert session.consensus_level == pytest.approx(live)
 
 
 def test_tilt_changed_gate_verdict_none_without_weights():

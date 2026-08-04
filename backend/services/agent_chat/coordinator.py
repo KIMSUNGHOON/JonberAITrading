@@ -797,8 +797,14 @@ class ChatCoordinator:
                 if should_discuss:
                     opportunities.append(stock)
 
-            # Start discussions for opportunities (up to max concurrent)
-            available_slots = self.max_concurrent - len(self._active_rooms)
+            # Start discussions for opportunities (up to max concurrent).
+            # Clamp to 0: if _active_rooms somehow exceeds max_concurrent,
+            # a raw negative here would slice from the *end* of the list
+            # (`opportunities[:-1]` drops only the last element, it does not
+            # yield an empty list) and start discussions anyway -- the exact
+            # opposite of "no free slots". max(0, x) is a no-op for the
+            # normal x > 0 case.
+            available_slots = max(0, self.max_concurrent - len(self._active_rooms))
             for stock in opportunities[:available_slots]:
                 await self._start_discussion(stock)
                 ticker = stock.get("ticker")

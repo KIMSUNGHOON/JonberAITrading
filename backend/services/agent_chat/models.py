@@ -337,44 +337,11 @@ class ChatSession(BaseModel):
         if not self.votes:
             return 0.0
 
-        # Count weighted votes by direction
-        bullish_weight = 0.0
-        bearish_weight = 0.0
-        neutral_weight = 0.0
-        scoring_votes = 0
-
-        for vote in self.votes:
-            if vote.agent_type == AgentType.MODERATOR:
-                continue  # Moderator doesn't vote
-
-            weight = resolve_agent_weight(vote.agent_type, self.agent_weights)
-            weighted_confidence = weight * vote.confidence
-
-            if vote.vote in (VoteType.STRONG_BUY, VoteType.BUY):
-                bullish_weight += weighted_confidence
-                scoring_votes += 1
-            elif vote.vote in (VoteType.STRONG_SELL, VoteType.SELL):
-                bearish_weight += weighted_confidence
-                scoring_votes += 1
-            elif vote.vote == VoteType.HOLD:
-                neutral_weight += weighted_confidence
-                scoring_votes += 1
-
-        # Phase4: 단독투표 가드 — 유효(방향) 투표가 2 미만이면 합의는 성립하지
-        # 않는다 (기존엔 3표가 예외로 드롭돼도 남은 1표가 max/total=1.0으로
-        # 75% 게이트를 통과하던 감사 C 결함의 봉합).
-        if scoring_votes < 2:
-            self.consensus_level = 0.0
-            return 0.0
-
-        total_weight = bullish_weight + bearish_weight + neutral_weight
-        if total_weight == 0:
-            return 0.0
-
-        # Consensus is the proportion of the dominant direction
-        max_direction = max(bullish_weight, bearish_weight, neutral_weight)
-        self.consensus_level = max_direction / total_weight
-
+        # 감사 2026-07-22 Finding 1/4 (2차): 실제 계산은 전부
+        # _consensus_from_votes에 있다 — 이 함수와 그 함수가 서로 다른
+        # 커버리지 처리를 하면 tilt_changed_gate_verdict의 가중/기본 비교가
+        # 갈라져 허위 경고를 낸다.
+        self.consensus_level = self._consensus_from_votes(self.agent_weights)
         return self.consensus_level
 
     def _consensus_from_votes(self, weights: Optional[Dict[str, float]]) -> float:
@@ -385,17 +352,42 @@ class ChatSession(BaseModel):
         tilt_changed_gate_verdict can compute the base-weight counterfactual
         without disturbing the live (already-computed, possibly tilted)
         consensus_level field or calling calculate_consensus with a
-        temporary weight swap."""
+        temporary weight swap.
+
+        감사 2026-07-22 Finding 1/4 (2차, 2026-08-04): 원래 식은
+        max_direction / total_weight였는데, total_weight는 "실제로 투표한
+        에이전트"의 가중합일 뿐 패널 전체가 아니다. LLM 장애로 에이전트가
+        누락되면(어제 아크가 이 누락을 ABSTAIN 조작 대신 진짜 결측으로
+        바꿨다 — 인플레이션 메커니즘 자체는 그대로) 살아남은 둘이 합의하는
+        것만으로 반쪽짜리 패널이 100% 확신을 만들어낼 수 있었다.
+        panel-coverage factor(참여가중/패널가중)를 곱해 이를 봉합한다:
+        패널이 4석 다 응답하면 coverage==1(무변화, 아래
+        test_consensus_without_weights_matches_legacy가 그 증거), 절반만
+        응답하면 raw 비율이 그만큼 깎인다.
+
+        moderator는 반드시 `continue` **이후**에만 participating_weight에
+        누적한다 — resolve_agent_weight가 패널 밖 타입(moderator)엔 0.25
+        폴백을 주므로, continue보다 먼저 누적하면 참여가중이 패널가중을
+        넘어 coverage가 1.0을 초과하고 합의가 오히려 **상승**할 수 있다
+        (이 봉합의 목적을 정확히 뒤집는다). add_vote가 agent_type당 표를
+        하나로 중복 제거하고 AgentType엔 패널 4종+MODERATOR 외 값이 없으므로,
+        moderator를 제외하는 한 participating_weight는 항상 panel_weight의
+        부분합이다 — 즉 coverage <= 1이 구조적으로 보장되어 이 인수는
+        합의를 낮추기만 하고 절대 올리지 않는다."""
         bullish_weight = 0.0
         bearish_weight = 0.0
         neutral_weight = 0.0
         scoring_votes = 0
+        participating_weight = 0.0
 
         for vote in self.votes:
             if vote.agent_type == AgentType.MODERATOR:
-                continue
+                continue  # Moderator doesn't vote — must stay before any
+                # weight accumulation below (see docstring: counting it here
+                # would let coverage exceed 1.0).
 
             weight = resolve_agent_weight(vote.agent_type, weights)
+            participating_weight += weight
             weighted_confidence = weight * vote.confidence
 
             if vote.vote in (VoteType.STRONG_BUY, VoteType.BUY):
@@ -415,7 +407,16 @@ class ChatSession(BaseModel):
         if total_weight == 0:
             return 0.0
 
-        return max(bullish_weight, bearish_weight, neutral_weight) / total_weight
+        raw_consensus = max(bullish_weight, bearish_weight, neutral_weight) / total_weight
+
+        panel_weight = sum(
+            resolve_agent_weight(agent_type, weights) for agent_type in DEFAULT_AGENT_WEIGHTS
+        )
+        if panel_weight <= 0:
+            return raw_consensus
+
+        coverage = participating_weight / panel_weight
+        return raw_consensus * coverage
 
     def tilt_changed_gate_verdict(self) -> Optional[bool]:
         """동적 가중(캘리브레이션 틸트)이 합의 게이트(consensus_threshold) 통과

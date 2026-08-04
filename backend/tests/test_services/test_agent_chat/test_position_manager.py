@@ -3899,3 +3899,337 @@ class TestFallbackEventReasonLabelMapping:
             f"reason={reason!r} must label the reconstructed event as "
             f"{expected_event_type}, not default to STOP_LOSS_HIT"
         )
+
+
+# -------------------------------------------
+# Discussion timeout bound (2026-08-04)
+# -------------------------------------------
+#
+# `_trigger_discussion`'s `await self._chat_coordinator
+# .start_manual_discussion(..., wait=True)` was unbounded -- measured live,
+# discussions averaged 262s (median 217s, max 651s), and the 30s monitor
+# loop was blocked ~40% of a session because this await is the ONLY thing
+# between `_monitor_loop` and the next check cycle for EVERY position, not
+# just the one being discussed. Both engines hold stop-losses for the same
+# live positions and PositionManager's are the TIGHTER ones, so the
+# effective stop for every position lived in the loop that kept stalling.
+#
+# Fixed with `asyncio.wait_for` at a configurable
+# `discussion_timeout_seconds` (default 600). Not 900: 900 ==
+# min_discussion_interval_minutes (15min) in seconds, so it would collide
+# with that cooldown boundary, AND today's observed maximum was 651s -- 900
+# would never have fired against real data.
+#
+# asyncio.TimeoutError is a plain Exception subclass, so the pre-existing
+# bare `except Exception` at the bottom of `_trigger_discussion` already
+# kept a timeout from propagating into the monitor loop -- the NEW risk
+# this introduces is SILENCE (no `_alert_llm_failure`-style notice existed
+# for a plain timeout, only for `LLMAllBackendsFailed` inside
+# coordinator.py). `_alert_discussion_timeout` closes that gap, mirroring
+# `coordinator._alert_llm_failure`'s claim-then-back-out latch (TOCTOU fix,
+# 2026-08-03) but instance-scoped and ticker-keyed rather than
+# module-global and cause-keyed (see the method's docstring for why).
+
+
+class _SlowCoordinator:
+    """`start_manual_discussion(wait=True)` sleeps past the configured
+    timeout. Deterministic and fast: the SLEEP is real asyncio time but the
+    configured TIMEOUT is tiny (0.05s in these tests), so `asyncio.wait_for`
+    cancels the sleep almost immediately -- these tests never wait anywhere
+    near production's 600s."""
+
+    def __init__(self, sleep_seconds: float, session=None):
+        self._sleep_seconds = sleep_seconds
+        self._session = session
+        self.call_count = 0
+
+    async def start_manual_discussion(self, ticker, stock_name, wait=False):
+        self.call_count += 1
+        await asyncio.sleep(self._sleep_seconds)
+        return self._session
+
+
+class TestDiscussionTimeoutBound:
+    @staticmethod
+    def _position_manager(discussion_timeout_seconds=0.05, **overrides):
+        cfg = PositionManagerConfig(
+            discussion_timeout_seconds=discussion_timeout_seconds,
+            min_discussion_interval_minutes=0,
+            **overrides,
+        )
+        return PositionManager(config=cfg)
+
+    @staticmethod
+    def _position(pm):
+        return pm.add_position(
+            ticker="005930",
+            stock_name="삼성전자",
+            quantity=100,
+            avg_price=72500,
+            current_price=70000,
+            stop_loss=71000,
+        )
+
+    @staticmethod
+    def _event():
+        return PositionEvent(
+            ticker="005930",
+            event_type=PositionEventType.STRATEGIC_REEVAL,
+            current_price=70000,
+            trigger_value=0,
+            message="test",
+        )
+
+    # ---- config field ----
+
+    def test_config_default_is_600_not_900(self):
+        """900 == min_discussion_interval_minutes (15min) in seconds -- it
+        would collide with the cooldown boundary AND never have fired
+        against today's observed 651s max discussion."""
+        cfg = PositionManagerConfig()
+        assert cfg.discussion_timeout_seconds == 600
+
+    def test_config_field_is_tunable(self):
+        cfg = PositionManagerConfig(discussion_timeout_seconds=120)
+        assert cfg.discussion_timeout_seconds == 120
+
+    # ---- bounding ----
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_cut_and_does_not_propagate(self):
+        pm = self._position_manager(discussion_timeout_seconds=0.05)
+        position = self._position(pm)
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+
+        # Must return promptly (well under the 5s sleep), not hang, and not
+        # raise out of the monitoring path.
+        await asyncio.wait_for(
+            pm._trigger_discussion(self._event(), position), timeout=2.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_bump_discussion_count(self):
+        """A timeout must NOT consume the daily discussion budget
+        (max_discussions_per_position) -- only a discussion that actually
+        completed should count against it."""
+        pm = self._position_manager(discussion_timeout_seconds=0.05)
+        position = self._position(pm)
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+        assert position.discussion_count == 0
+
+        await pm._trigger_discussion(self._event(), position)
+
+        assert position.discussion_count == 0
+
+    @pytest.mark.asyncio
+    async def test_timeout_sets_last_discussion_for_backoff(self):
+        """Review fix (2026-08-04, final branch review): a timeout used to
+        leave `last_discussion` untouched too, which meant
+        `_should_trigger_discussion` kept returning True every 30s monitor
+        tick -- a chronically slow position retried with NO backoff (stall
+        600s, cancel, stall 600s again, forever), and this loop carries the
+        TIGHTER of the two stop-loss engines. `last_discussion` must now be
+        set on timeout so the existing min_discussion_interval_minutes
+        cooldown actually throttles the retry."""
+        pm = self._position_manager(discussion_timeout_seconds=0.05)
+        position = self._position(pm)
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+        assert position.last_discussion is None
+
+        await pm._trigger_discussion(self._event(), position)
+
+        assert position.last_discussion is not None
+
+    @pytest.mark.asyncio
+    async def test_timeout_throttles_immediate_retrigger_via_should_trigger_discussion(self):
+        """Pins the actual behaviour the backoff exists for: after a
+        timeout, `_should_trigger_discussion` must return False until
+        min_discussion_interval_minutes elapses -- NOT true again on the
+        very next 30s monitor tick."""
+        cfg = PositionManagerConfig(
+            discussion_timeout_seconds=0.05, min_discussion_interval_minutes=15
+        )
+        pm = PositionManager(config=cfg)
+        position = self._position(pm)
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+
+        await pm._trigger_discussion(self._event(), position)
+
+        assert not pm._should_trigger_discussion(position), (
+            "a timed-out discussion must be throttled by the interval "
+            "cooldown, exactly like a completed one -- otherwise the next "
+            "30s monitor tick immediately retries, burning ~15 paid LLM "
+            "calls per attempt with no backoff"
+        )
+
+    @pytest.mark.asyncio
+    async def test_under_timeout_discussion_untouched(self):
+        """A discussion that finishes inside the budget must behave exactly
+        as before the wrap: count bumped, last_discussion set, decision
+        applied."""
+        pm = self._position_manager(discussion_timeout_seconds=5.0)
+        position = self._position(pm)
+        decision = SimpleNamespace(
+            action=DecisionAction.HOLD, quantity=None, stop_loss=None, take_profit=None,
+        )
+        session = SimpleNamespace(id="fast-1", decision=decision)
+        fast_coord = _SlowCoordinator(sleep_seconds=0.01, session=session)
+        pm.set_chat_coordinator(fast_coord)
+        pm._apply_decision = AsyncMock()
+
+        await pm._trigger_discussion(self._event(), position)
+
+        assert fast_coord.call_count == 1
+        assert position.discussion_count == 1
+        assert position.last_discussion is not None
+        pm._apply_decision.assert_awaited_once()
+
+    # ---- notification ----
+
+    @pytest.mark.asyncio
+    async def test_timeout_fires_notification(self, monkeypatch):
+        pm = self._position_manager(discussion_timeout_seconds=0.05)
+        position = self._position(pm)
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+
+        notifier = AsyncMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            "services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)
+        )
+
+        await pm._trigger_discussion(self._event(), position)
+
+        notifier.send_message.assert_awaited_once()
+        text = str(notifier.send_message.await_args.args[0])
+        assert "005930" in text or "삼성전자" in text
+
+    @pytest.mark.asyncio
+    async def test_notification_dedup_no_spam_same_ticker(self, monkeypatch):
+        """Two timeouts in a row for the SAME ticker (interval throttle
+        disabled in the fixture) must only alert once until the latch
+        clears."""
+        pm = self._position_manager(discussion_timeout_seconds=0.05)
+        position = self._position(pm)
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+
+        notifier = AsyncMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            "services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)
+        )
+
+        await pm._trigger_discussion(self._event(), position)
+        await pm._trigger_discussion(self._event(), position)
+
+        assert notifier.send_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_notification_reclears_after_a_successful_discussion(self, monkeypatch):
+        """Timeout, then a discussion that completes in-budget, then another
+        timeout: must alert twice -- the latch clears on recovery, exactly
+        like coordinator._alert_llm_failure's clear-on-success."""
+        pm = self._position_manager(discussion_timeout_seconds=0.05)
+        position = self._position(pm)
+
+        notifier = AsyncMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            "services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)
+        )
+
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+        await pm._trigger_discussion(self._event(), position)  # times out, alerts
+
+        decision = SimpleNamespace(
+            action=DecisionAction.HOLD, quantity=None, stop_loss=None, take_profit=None,
+        )
+        session = SimpleNamespace(id="fast-1", decision=decision)
+        pm._apply_decision = AsyncMock()
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=0.01, session=session))
+        await pm._trigger_discussion(self._event(), position)  # succeeds, clears latch
+
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+        await pm._trigger_discussion(self._event(), position)  # times out again -> re-alert
+
+        assert notifier.send_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_notification_latch_cleared_on_position_removal(self, monkeypatch):
+        """Review fix (2026-08-04, final branch review): the latch was only
+        ever cleared by that SAME ticker's next successful discussion.
+        Without clearing it on remove_position, a sell -> re-buy of the same
+        ticker would inherit stale latch state, and the NEW position's first
+        timeout would be silently deduped against an alert that was really
+        about the old, already-closed position -- a silent-notification
+        failure, the exact family this whole fix exists to close."""
+        pm = self._position_manager(discussion_timeout_seconds=0.05)
+        position = self._position(pm)
+
+        notifier = AsyncMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            "services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)
+        )
+
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+        await pm._trigger_discussion(self._event(), position)  # times out, alerts, latches
+        assert notifier.send_message.await_count == 1
+
+        # Sell, then re-buy the SAME ticker -- a fresh position.
+        pm.remove_position("005930")
+        new_position = self._position(pm)
+
+        await pm._trigger_discussion(self._event(), new_position)  # times out again
+
+        assert notifier.send_message.await_count == 2, (
+            "the new position's timeout must alert -- it must not be "
+            "silently deduped against the old (now-closed) position's latch"
+        )
+
+    @pytest.mark.asyncio
+    async def test_notification_failure_does_not_break_the_loop(self, monkeypatch):
+        pm = self._position_manager(discussion_timeout_seconds=0.05)
+        position = self._position(pm)
+        pm.set_chat_coordinator(_SlowCoordinator(sleep_seconds=5.0))
+
+        monkeypatch.setattr(
+            "services.telegram.get_telegram_notifier",
+            AsyncMock(side_effect=RuntimeError("telegram down")),
+        )
+
+        # Must not raise out of the monitoring path.
+        await asyncio.wait_for(
+            pm._trigger_discussion(self._event(), position), timeout=2.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_race_between_dedup_check_and_claim(self, monkeypatch):
+        """TOCTOU regression, mirrored from coordinator's
+        test_concurrent_calls_with_same_cause_send_once: two coroutines
+        racing the SAME ticker's timeout latch must not both pass the dedup
+        check before either commits the claim."""
+        pm = self._position_manager(discussion_timeout_seconds=0.05)
+        position = self._position(pm)
+
+        async def _yielding_send(*args, **kwargs):
+            await asyncio.sleep(0)
+            return True
+
+        notifier = AsyncMock()
+        notifier.is_ready = True
+        notifier.send_message = AsyncMock(side_effect=_yielding_send)
+        monkeypatch.setattr(
+            "services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)
+        )
+
+        await asyncio.gather(
+            pm._alert_discussion_timeout(position, 0.05),
+            pm._alert_discussion_timeout(position, 0.05),
+        )
+
+        assert notifier.send_message.await_count == 1

@@ -756,6 +756,71 @@ class TestMaxConcurrent:
 
         assert at_limit is True
 
+    @pytest.mark.asyncio
+    async def test_over_capacity_starts_zero_discussions(self, coordinator):
+        """Regression for the negative-slice bug: when _active_rooms already
+        exceeds max_concurrent (e.g. a room count that raced past the limit),
+        `available_slots` goes negative. Slicing a list with a negative
+        index does NOT yield an empty list -- it drops elements off the
+        *end* (`opportunities[:-1]` keeps everything but the last one) -- so
+        the naive `opportunities[:available_slots]` would start discussions
+        at the exact moment the coordinator should be refusing all of them.
+        Those discussions can reach the live order path via _handle_decision,
+        so this must start none."""
+        coordinator.max_concurrent = 3
+        for i in range(4):  # over capacity: 4 active rooms > max_concurrent 3
+            coordinator._active_rooms[f"active_{i}"] = MagicMock()
+
+        watch_stocks = [
+            {"ticker": "111111", "stock_name": "A", "signal": "hold",
+             "confidence": 0.9, "current_price": 100, "target_entry_price": 100},
+            {"ticker": "222222", "stock_name": "B", "signal": "hold",
+             "confidence": 0.9, "current_price": 100, "target_entry_price": 100},
+            {"ticker": "333333", "stock_name": "C", "signal": "hold",
+             "confidence": 0.9, "current_price": 100, "target_entry_price": 100},
+        ]
+        coordinator._running = True
+
+        with (
+            patch("services.agent_chat.coordinator.is_krx_open_cached", return_value=True),
+            patch.object(coordinator, "_get_watch_list", AsyncMock(return_value=watch_stocks)),
+            patch.object(coordinator, "_detect_opportunity", AsyncMock(return_value=True)),
+            patch.object(coordinator, "_start_discussion", AsyncMock()) as mock_start,
+        ):
+            await coordinator._check_watch_list()
+
+        mock_start.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_free_slots_still_starts_expected_number(self, coordinator):
+        """Sanity check that the fix does not change the normal (positive
+        available_slots) path: with 1 active room and max_concurrent=3,
+        exactly 2 of 3 opportunities should be started."""
+        coordinator.max_concurrent = 3
+        coordinator._active_rooms["already_running"] = MagicMock()
+
+        watch_stocks = [
+            {"ticker": "111111", "stock_name": "A", "signal": "hold",
+             "confidence": 0.9, "current_price": 100, "target_entry_price": 100},
+            {"ticker": "222222", "stock_name": "B", "signal": "hold",
+             "confidence": 0.9, "current_price": 100, "target_entry_price": 100},
+            {"ticker": "333333", "stock_name": "C", "signal": "hold",
+             "confidence": 0.9, "current_price": 100, "target_entry_price": 100},
+        ]
+        coordinator._running = True
+
+        with (
+            patch("services.agent_chat.coordinator.is_krx_open_cached", return_value=True),
+            patch.object(coordinator, "_get_watch_list", AsyncMock(return_value=watch_stocks)),
+            patch.object(coordinator, "_detect_opportunity", AsyncMock(return_value=True)),
+            patch.object(coordinator, "_start_discussion", AsyncMock()) as mock_start,
+        ):
+            await coordinator._check_watch_list()
+
+        assert mock_start.call_count == 2
+        started_tickers = {call.args[0]["ticker"] for call in mock_start.call_args_list}
+        assert started_tickers == {"111111", "222222"}
+
 
 # -------------------------------------------
 # Singleton Tests
