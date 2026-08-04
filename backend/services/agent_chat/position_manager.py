@@ -7,7 +7,7 @@ Triggers agent discussions for position management decisions.
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional, Callable, Any
 
@@ -216,6 +216,27 @@ class MonitoredPosition(BaseModel):
     # Event tracking
     events_triggered: List[str] = Field(default_factory=list)
     discussion_count: int = 0
+
+    # Daily discussion-cap rollover (2026-08-04, third instance of the
+    # pattern in `agents/llm/router.py`'s `_maybe_reset_day()` /
+    # `services/trading/coordinator.py`'s `_maybe_reset_daily_trades()`).
+    # Which calendar day `discussion_count` currently belongs to. Nothing
+    # schedules a reset -- a long-running process that crosses midnight
+    # without restarting must still start counting fresh the next day, or
+    # `max_discussions_per_position` silently becomes permanent (2026-08-04
+    # live incident: 4/5 positions hit the cap ~12:53 and got zero strategic
+    # re-evaluation for the rest of the session). Every read/write site
+    # calls `PositionManager._maybe_reset_discussion_count(position)` first
+    # -- see that method's docstring for the full touch-point list and why,
+    # unlike the coordinator fix, there is no persist/restore leg to guard
+    # here (`discussion_count` is not persisted at all).
+    # `lambda: date.today()`, not the bare `date.today` bound method: the
+    # bound method resolves `datetime.date.today` once at class-definition
+    # time and is immune to `monkeypatch.setattr(position_manager, "date",
+    # ...)` in tests, whereas the lambda re-looks-up the module-level `date`
+    # name (LOAD_GLOBAL) on every call, matching how `_maybe_reset_
+    # discussion_count`'s own `date.today()` call already behaves.
+    discussion_count_date: date = Field(default_factory=lambda: date.today())
 
     # Set once when an autonomous defensive close is blocked by the gate, so the
     # human is notified once per denied episode instead of every monitor cycle
@@ -683,11 +704,23 @@ class PositionManager:
 
     def get_position(self, ticker: str) -> Optional[MonitoredPosition]:
         """Get a specific position."""
-        return self._positions.get(ticker)
+        position = self._positions.get(ticker)
+        # Backs GET /positions/{ticker} -- an external read of
+        # `discussion_count` can be the day's first touch for this
+        # position, so the rollover must run here too (see
+        # `_maybe_reset_discussion_count`'s docstring).
+        if position is not None:
+            self._maybe_reset_discussion_count(position)
+        return position
 
     def get_all_positions(self) -> List[MonitoredPosition]:
         """Get all monitored positions."""
-        return list(self._positions.values())
+        positions = list(self._positions.values())
+        # Backs GET /positions (and get_summary()) -- same reasoning as
+        # get_position above, for every position in the list.
+        for position in positions:
+            self._maybe_reset_discussion_count(position)
+        return positions
 
     # -------------------------------------------
     # Monitoring Loop
@@ -1226,8 +1259,46 @@ class PositionManager:
         # Send Telegram notification
         await self._notify_event(event)
 
+    def _maybe_reset_discussion_count(self, position: MonitoredPosition) -> None:
+        """Lazy-rolls `position.discussion_count` onto a new calendar day.
+
+        Mirrors `services.trading.coordinator.ExecutionCoordinator.
+        _maybe_reset_daily_trades()` / `agents.llm.router.LLMRouter.
+        _maybe_reset_day()` -- same lazy-reset shape (checked at every touch
+        point, no scheduled job), applied per-position since each
+        `MonitoredPosition` carries its own cap.
+
+        Must be called before EVERY read or write of `discussion_count`:
+        the gate (`_should_trigger_discussion`), the increment
+        (`_trigger_discussion`), and both external accessors
+        (`get_position`/`get_all_positions`, which back the
+        `GET /positions` and `GET /positions/{ticker}` API routes). Skipping
+        any one of these lets a stale cap silently become permanent for that
+        position -- the exact 2026-08-04 incident this closes (4 of 5 live
+        positions hit `max_discussions_per_position` around 12:53 and got
+        zero strategic re-evaluation for the rest of the session, with no
+        notification to anyone).
+
+        Unlike the coordinator's `daily_trades_count`, `discussion_count` is
+        NOT persisted anywhere -- `_persist_stops`/`restore_stop_overlay`
+        only ever serialize stop levels (stop_loss/take_profit/
+        trailing_stop_pct/take_profit_reached_at), never this field. So
+        there is no restore-path date-stamping trap to guard here (the trap
+        that made yesterday's `daily_trades_count` bug survive a restart): a
+        process restart already re-creates every position via
+        `sync_from_account` -> `add_position`, whose default
+        `discussion_count=0` is fresh regardless of date. The only gap this
+        closes is a long-running process crossing midnight without ever
+        restarting.
+        """
+        today = date.today()
+        if position.discussion_count_date != today:
+            position.discussion_count_date = today
+            position.discussion_count = 0
+
     def _should_trigger_discussion(self, position: MonitoredPosition) -> bool:
         """Check if a discussion should be triggered."""
+        self._maybe_reset_discussion_count(position)
         # Check max discussions
         if position.discussion_count >= self.config.max_discussions_per_position:
             return False
@@ -1276,6 +1347,13 @@ class PositionManager:
                 timeout=self.config.discussion_timeout_seconds,
             )
 
+            # Reset-then-increment (not just reset-then-check in the gate
+            # above): the awaited discussion can span the timeout window
+            # (up to discussion_timeout_seconds, default 600s) and cross
+            # midnight itself, so re-checking the day right here is what
+            # keeps a discussion that started late on day N from stacking
+            # onto day N's stale count once it resolves on day N+1.
+            self._maybe_reset_discussion_count(position)
             position.discussion_count += 1
             position.last_discussion = datetime.now()
             self._discussion_timeout_notified.discard(position.ticker)
