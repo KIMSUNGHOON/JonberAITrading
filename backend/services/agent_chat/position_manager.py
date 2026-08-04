@@ -698,6 +698,13 @@ class PositionManager:
         if ticker in self._positions:
             del self._positions[ticker]
             self._schedule_persist_stops()
+            # Review fix (2026-08-04): `_discussion_timeout_notified` is
+            # ticker-keyed and was only ever cleared by that SAME ticker's
+            # next successful discussion. Without this, sell -> re-buy the
+            # same ticker inherits the old position's latch state -- the new
+            # position's first timeout would be silently deduped against an
+            # alert that was actually about a completely different holding.
+            self._discussion_timeout_notified.discard(ticker)
             logger.info("position_removed", ticker=ticker)
             return True
         return False
@@ -1375,14 +1382,30 @@ class PositionManager:
             # alone already keeps a timeout from propagating into
             # `_monitor_loop` -- but it would do so SILENTLY (no
             # _alert_llm_failure-style notice exists for a plain timeout,
-            # only for LLMAllBackendsFailed inside coordinator.py). Note
-            # `position.discussion_count`/`last_discussion` are deliberately
-            # left untouched here -- both assignments above sit right after
-            # the awaited call with no await between them, so a timeout
-            # short-circuits into this branch before either runs (both-or-
-            # neither, never half-updated), matching the documented "the
-            # caller's discussion budget must not be consumed by failures"
-            # contract for this call (coordinator.start_manual_discussion).
+            # only for LLMAllBackendsFailed inside coordinator.py).
+            #
+            # Review fix (2026-08-04, final branch review): a timeout used
+            # to leave BOTH `discussion_count` and `last_discussion`
+            # untouched, on the theory that a failed discussion shouldn't
+            # consume the day's budget. Confirmed against the real
+            # coordinator that this has a second effect that matters more --
+            # `_should_trigger_discussion` reads `last_discussion` for its
+            # cooldown, so leaving it untouched meant a chronically slow
+            # position retried every 30s (the next monitor tick) with NO
+            # backoff: stall 600s, cancel, stall 600s again, forever. That's
+            # not a cosmetic loop -- this IS the monitor loop carrying the
+            # TIGHTER of the two stop-loss engines, so a permanently-retrying
+            # timeout is a permanently-stalled defensive stop, and each
+            # cancelled discussion also burns ~15 paid LLM calls.
+            #
+            # So the two fields now split: `last_discussion` IS set here
+            # (throttles the next attempt via `min_discussion_interval_minutes`,
+            # same as a normal discussion) but `discussion_count` is
+            # deliberately still left alone -- a failed discussion must not
+            # consume `max_discussions_per_position`'s daily budget, only the
+            # existing count would've silently prevented any FUTURE
+            # discussion this ticker.
+            position.last_discussion = datetime.now()
             logger.error(
                 "position_discussion_timeout",
                 ticker=position.ticker,
