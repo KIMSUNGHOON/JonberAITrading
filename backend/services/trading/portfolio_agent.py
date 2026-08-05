@@ -191,6 +191,29 @@ class PortfolioAgent:
         # 4. Apply constraints
         position_value = min(available_for_trade, max_position_value)
 
+        # U3 review fix (final review, Important-3, 2026-08-05): sizing_
+        # lineage as built inside _calculate_max_position_value only knows
+        # about the caps computed THERE (risk_bucket_cap/r_cap/
+        # liquidity_cap) -- it has no visibility into this min(), so a
+        # persisted `binding` can name a cap that never actually determined
+        # the size whenever available_for_trade (min_cash_ratio /
+        # max_total_stock_pct headroom, computed above) is the smaller of
+        # the two. That's exactly the case at a full 5/5 portfolio with a
+        # near-ceiling stock allocation -- the scenario this whole unit
+        # exists to study. Recording both operands of this min() lets a
+        # reader compare `position_value` against
+        # `lineage[lineage["binding"]]` after the fact: equal means the
+        # named cap held, smaller means available_for_trade (or a later
+        # clamp such as coordinator.py's quantity_override, out of this
+        # function's visibility and NOT captured here) actually bound.
+        # `binding` itself deliberately stays scoped to the three caps --
+        # widening its vocabulary to non-cap constraints would require
+        # rewriting the invariant this module's docstring already states
+        # precisely; these two fields answer the same question without
+        # touching that contract.
+        sizing_lineage["available_for_trade"] = available_for_trade
+        sizing_lineage["position_value"] = position_value
+
         # 5. Calculate quantity
         quantity = int(position_value / entry_price)
 

@@ -216,6 +216,97 @@ def test_calculate_allocation_threads_lineage_into_allocation_plan():
         "liquidity_cap",
         "liquidity_too_thin",
     )
+    # 최종 리뷰 Important-3: available_for_trade/position_value가 public
+    # calculate_allocation 경유로도 실린다 (ample cash라 여기서는 cap이
+    # 그대로 이긴다 -- position_value == lineage[binding]).
+    assert plan.sizing_lineage["available_for_trade"] > 0
+    assert plan.sizing_lineage["position_value"] == pytest.approx(
+        plan.sizing_lineage[plan.sizing_lineage["binding"]]
+    )
+
+
+# -------------------------------------------
+# 최종 리뷰 Important-3 (2026-08-05): binding이 실제로 구속하지 않은 캡을
+# 지목할 수 있는 시나리오 -- 사이징 계보의 존재 이유를 정면으로 겨눈다.
+#
+# _calculate_max_position_value 내부에서 계산되는 캡(risk_bucket_cap/r_cap/
+# liquidity_cap)만으로는 min(available_for_trade, max_position_value)의
+# available_for_trade 쪽이 이겼는지 알 수 없다. 포트폴리오가 이미 커서
+# min_cash_ratio/max_total_stock_pct 여유(available_for_trade)가 캡보다
+# 작아지는 시나리오를 구성해, position_value(실제 최종값)가
+# lineage[binding](캡 값)보다 작다는 사실이 available_for_trade와
+# position_value 두 필드만으로 드러나는지 확인한다.
+# -------------------------------------------
+
+
+def test_available_for_trade_reveals_when_cash_binds_tighter_than_named_cap():
+    """포트폴리오가 거의 만석(현금 여유 협소)이라 available_for_trade가
+    risk_bucket_cap보다 작은 시나리오. binding은 여전히 "risk_bucket_cap"
+    이라고 말하지만(이 함수는 available_for_trade를 모른다), 실제로 주문을
+    구속한 것은 available_for_trade다. 이 사실은 오직
+    position_value < lineage[lineage["binding"]] 비교로만 드러난다 --
+    이게 바로 이 review fix가 만드는 free 진단이다."""
+    from services.trading.models import AccountInfo, OrderSide
+
+    equity = 100_000_000.0
+    agent = PortfolioAgent(risk_params=RiskParameters())  # min_cash_ratio=0.20, max_total_stock_pct=0.80, max_single_position_pct=0.15
+    # available = available_cash(25M) - min_cash(equity*0.20=20M) = 5M
+    # stock_headroom = max_stock_value(equity*0.80=80M) - current_stock_value(70M) = 10M
+    # available_for_trade = min(5M, 10M) = 5M
+    account = AccountInfo(
+        total_equity=equity, available_cash=25_000_000.0, total_stock_value=70_000_000.0
+    )
+
+    plan = agent.calculate_allocation(
+        account=account,
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.BUY,
+        entry_price=100_000.0,
+        risk_score=1,
+        current_positions=[],  # existing_position 분기를 우회 -- 순수 min() 시나리오
+        adtv=None,
+    )
+
+    lineage = plan.sizing_lineage
+    assert lineage, "sizing_lineage가 비어있다"
+    # risk_bucket_cap = equity * 0.15 = 15,000,000 -- available_for_trade(5M)보다 크다.
+    assert lineage["binding"] == "risk_bucket_cap"
+    assert lineage["risk_bucket_cap"] == pytest.approx(equity * 0.15)
+    assert lineage["available_for_trade"] == pytest.approx(5_000_000.0)
+    assert lineage["position_value"] == pytest.approx(5_000_000.0)
+    # 바로 이 불일치가 리뷰가 지적한 결함의 증거다: binding이 이름댄 캡의
+    # 값과 실제 최종 position_value가 다르다 -- risk_bucket_cap은 이
+    # 사이즈를 결정하지 않았다, available_for_trade가 결정했다.
+    assert lineage["position_value"] < lineage[lineage["binding"]]
+    assert plan.quantity == int(5_000_000.0 / 100_000.0)
+
+
+def test_position_value_equals_binding_cap_when_cash_is_not_the_constraint():
+    """대조군: 현금이 풍부하면 position_value == lineage[binding]이어야
+    한다 -- 위 테스트가 진짜로 available_for_trade 시나리오를 격리했는지
+    확인하는 결의 테스트."""
+    from services.trading.models import AccountInfo, OrderSide
+
+    equity = 100_000_000.0
+    agent = PortfolioAgent(risk_params=RiskParameters())
+    account = AccountInfo(
+        total_equity=equity, available_cash=equity, total_stock_value=0.0
+    )
+
+    plan = agent.calculate_allocation(
+        account=account,
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.BUY,
+        entry_price=100_000.0,
+        risk_score=1,
+        current_positions=[],
+        adtv=None,
+    )
+
+    lineage = plan.sizing_lineage
+    assert lineage["position_value"] == pytest.approx(lineage[lineage["binding"]])
 
 
 # -------------------------------------------
