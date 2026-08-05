@@ -420,15 +420,36 @@ class PositionManagerConfig(BaseModel):
     # then flows through the SAME min_discussion_interval_minutes /
     # max_discussions_per_position throttle as defensive events, so this
     # bounds LLM-discussion volume/cost exactly like the existing events do
-    # — it does not bypass or duplicate that throttle. Tuned (2026-07-15,
-    # monitoring-cadence-tuning arc) for faster-market responsiveness so a
-    # held position is never silent for a full day: at most a
-    # half-hourly re-judgment (sooner on a real move).
+    # — it does not bypass or duplicate that throttle.
+    #
+    # 30 -> 49 (2026-08-05, live incident on both 2026-08-04 and
+    # 2026-08-05): at 30 minutes, max_discussions_per_position's 8-per-day
+    # budget is exhausted 240 minutes after open -- ALL five held positions
+    # hit 8/8 by 12:55:50 today and then got ZERO strategic re-evaluation
+    # for the remaining 2h35m to the 15:30 close, while the watch-list
+    # control group (not subject to this per-position cap) kept being
+    # discussed all afternoon. Not an LLM failure, not throughput -- purely
+    # the interval front-loading the fixed daily budget into the morning.
+    # 49 is chosen so 8 * 49 = 392 minutes spans (with margin) the full
+    # 390-minute KRX session, spreading the same eight re-evaluations
+    # across the whole day instead of burning them by lunch. Total
+    # discussion volume, and therefore LLM cost, is unchanged ($0.088/
+    # discussion measured 2026-08-05) -- only the spacing changes. Does not
+    # collide with min_discussion_interval_minutes (15) or
+    # discussion_timeout_seconds (600s = 10min), both well below it. See
+    # TestStrategicReevalConfig::test_daily_cap_cannot_exhaust_before_
+    # session_close, which pins this cap-vs-session-length invariant
+    # instead of the raw number.
     reeval_interval_minutes: int = Field(
-        default=30,
+        default=49,
         ge=1,
         description="Minutes since a position's last strategic re-eval "
-                     "before it becomes due again (periodic trigger).",
+                     "before it becomes due again (periodic trigger). Must "
+                     "satisfy max_discussions_per_position * "
+                     "reeval_interval_minutes >= the KRX session length "
+                     "(390 minutes) or the daily discussion cap exhausts "
+                     "before close -- see the comment above and "
+                     "TestStrategicReevalConfig in test_position_manager.py.",
     )
     reeval_price_change_pct: float = Field(
         default=2.0,
