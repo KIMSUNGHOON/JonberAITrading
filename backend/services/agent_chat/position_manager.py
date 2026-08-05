@@ -2209,9 +2209,15 @@ class PositionManager:
         CURRENTLY held quantity, NOT the discussion's own free-text quantity
         — through the SAME autonomy gate (`check_autonomy`) the full-close /
         partial-reduce SELL paths already enforce: master gate, market mode,
-        paper-only, daily-loss breaker, max-open-positions, and — because
-        this is a BUY/ADD — the per-trade notional cap. Identical safety
-        level to the entry BUY path (`on_trade_approved`).
+        paper-only, daily-loss breaker, and — because this is a BUY/ADD —
+        the per-trade notional cap.
+
+        ONE check differs from the entry BUY path (2026-08-05):
+        max-open-positions is exempted when the ticker is already held,
+        because buying more of a position you already have cannot raise the
+        number of open positions. The gate decides that from its own
+        holdings lookup — see check 6 in `services/autonomy/gate.py`.
+        Everything else is the same safety level as `on_trade_approved`.
 
         On any real fill, the monitored quantity is incremented by the
         ACTUAL filled amount (never the requested one) and avg_entry_price
@@ -2374,9 +2380,11 @@ class PositionManager:
         configurable percentage of the CURRENTLY held quantity
         (``round(position.quantity * config.add_position_pct)``), then
         placed through the SAME autonomy gate (`check_autonomy(BUY)`) the
-        SELL paths already enforce, with the same identical safety level as
-        the entry BUY path. A sizing result of zero or less keeps P0's
-        not-executed notice (no buy execution attempted, no gate call).
+        SELL paths already enforce — same safety level as the entry BUY path
+        EXCEPT max-open-positions, which an already-held ticker is exempt
+        from as of 2026-08-05 (see `_execute_add_position`). A sizing result
+        of zero or less keeps P0's not-executed notice (no buy execution
+        attempted, no gate call).
         """
         from services.agent_chat.models import DecisionAction
 

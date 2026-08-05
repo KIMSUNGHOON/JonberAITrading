@@ -1075,6 +1075,15 @@ class ChatCoordinator:
                 action=decision.action.value,
                 quantity=decision.quantity,
                 entry_price=decision.entry_price,
+                # 슬롯 상한 면제 판정용 (2026-08-05). 이 경로도 자율 ADD를
+                # 낼 수 있고, 한 종목이 보유 중이면서 동시에 ACTIVE 워치
+                # 항목일 수 있다(`trading/coordinator.py`의
+                # `_check_watch_list` 주석). 넘기지 않으면 보유 종목에 대한
+                # 추가매수가 여전히 max_positions로 거절되고, 그 거절이
+                # 아래 slot_contest에 **자기 자신이 incumbent인 challenger**
+                # 행으로 남아 원장이 오염된다. 게이트는 실제 보유일 때만
+                # 면제하므로 미보유 BUY의 슬롯 상한은 그대로다.
+                ticker=ticker,
             )
             if gate.allowed:
                 await self._execute_trade(ticker, decision, session)

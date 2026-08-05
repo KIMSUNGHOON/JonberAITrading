@@ -2997,9 +2997,11 @@ class ExecutionCoordinator:
         `PositionManager._execute_add_position` is the (only) autonomous
         caller today: it already passes the request through
         `check_autonomy(BUY)` — the SAME gate (master gate, market mode,
-        paper-only, daily-loss breaker, max-open-positions, per-trade
-        notional cap) the entry BUY path (`on_trade_approved`) enforces —
-        before reaching here.
+        paper-only, daily-loss breaker, per-trade notional cap) the entry
+        BUY path (`on_trade_approved`) enforces — before reaching here.
+        max-open-positions is the one exception: an already-held ticker is
+        exempt from it (2026-08-05), since adding to a position cannot raise
+        the number of open positions.
 
         Requires a matching position on THIS coordinator's OWN ledger
         (`_state.positions`). The caller (PositionManager) works off a

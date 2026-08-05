@@ -2681,6 +2681,11 @@ class TestApplyDecisionAddP2:
         assert gate_calls[0].get("ticker") == "005930", (
             "추가매수 대상 티커를 게이트에 넘겨야 슬롯 상한을 면제할 수 있다"
         )
+        assert gate_calls[0]["action"] == "BUY", (
+            "action은 계속 BUY여야 한다 — 진입 BUY와 동일한 안전(브레이커·"
+            "명목캡·코디네이터 활성)을 그대로 받겠다는 의도가 여기 걸려 있다. "
+            "ADD로 바꾸면 이 테스트가 아니라 게이트 쪽 분기가 조용히 달라진다"
+        )
 
     @pytest.mark.asyncio
     async def test_add_position_pct_is_configurable(self, monkeypatch):

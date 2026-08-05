@@ -233,24 +233,37 @@ class TestAddToHeldTickerExemptFromSlotCap:
         assert not decision.allowed
         assert decision.check == "max_positions"
 
-    async def test_slot_count_comes_from_the_same_held_snapshot(self, master_on):
-        """ticker가 주어지면 소속과 개수를 같은 스냅샷에서 읽는다.
+    async def test_empty_ticker_is_treated_as_no_ticker(self, master_on):
+        # 빈 문자열은 "판정 대상 없음"이다. `if ticker is not None`으로 바뀌면
+        # 빈 문자열이 보유 목록과 대조되어 결과가 뒤집힐 수 있다.
+        decision = await _check(
+            action="BUY",
+            ticker="",
+            held_tickers_provider=_held("004370"),
+            **_providers(positions=5),
+        )
+        assert not decision.allowed
+        assert decision.check == "max_positions"
 
-        따로 조회하면 그 사이에 체결이 끼어 "목록엔 없는데 카운트는 0"
-        같은 어긋난 쌍으로 판정할 수 있다. 보유 목록이 5종이면 카운트
-        프로바이더가 뭐라 하든 5로 판정해야 한다.
+    async def test_unheld_ticker_is_judged_by_the_count_provider(self, master_on):
+        """미보유일 때의 개수 판정은 **카운트 프로바이더**가 한다.
+
+        소속과 개수는 서로 다른 집합에서 나온다(카운트는 수량 0 행·미체결
+        BUY까지 포함하는 과대포함, 소속은 실제 보유만). 그러므로 주입된
+        카운트 프로바이더가 ticker 유무와 무관하게 존중되어야 한다 —
+        무시되면 테스트가 조용히 실제 브로커 기본값으로 새어나간다.
         """
         decision = await _check(
             action="BUY",
             ticker="005930",
-            held_tickers_provider=_held(
-                "004370", "068270", "089860", "090430", "316140"
-            ),
-            **_providers(positions=0),  # 어긋난 값 — 무시되어야 한다
+            held_tickers_provider=_held("004370", "068270"),
+            **_providers(positions=5),
         )
         assert not decision.allowed
         assert decision.check == "max_positions"
-        assert "5 >= limit 5" in decision.reason
+        assert "5 >= limit 5" in decision.reason, (
+            "보유 목록 크기(2)가 아니라 카운트 프로바이더 값(5)으로 판정해야 한다"
+        )
 
     async def test_held_lookup_failure_denies_fail_closed(self, master_on):
         async def boom(market):
@@ -277,6 +290,121 @@ class TestAddToHeldTickerExemptFromSlotCap:
         )
         assert not decision.allowed
         assert decision.check == "daily_loss_breaker"
+
+
+class TestHeldSetIsRealHoldingsOnly:
+    """슬롯 면제의 근거가 되는 보유 집합은 **실제 보유**만 담아야 한다.
+
+    카운트용 집합은 일부러 과대포함이다(수량 0 행, 아직 체결되지 않은 BUY까지
+    센다). 상한을 **세는** 데에는 과대포함이 보수적이라 안전하다 — 더 많이
+    거절할 뿐이다. 그러나 같은 집합으로 **소속**을 판정하면 방향이 뒤집힌다:
+    실제로는 보유하지 않은 종목이 "이미 보유 중"으로 통과해 6번째 슬롯이
+    열린다. 그래서 두 집합은 갈라져 있어야 한다.
+
+    리포의 다른 두 곳(`position_manager.py`, `reconciler.py`)은 이미
+    `hldg_qty > 0`으로 보유를 정의한다. 게이트만 그러지 않았다.
+    """
+
+    def _mock_holdings(self, monkeypatch, qty_by_ticker):
+        from unittest.mock import AsyncMock
+
+        from services.kiwoom.models import AccountBalance, Holding
+
+        client = AsyncMock()
+        client.get_account_balance.return_value = AccountBalance(
+            holdings=[
+                Holding(
+                    stk_cd=t, stk_nm=t, hldg_qty=q, avg_buy_prc=50_000,
+                    cur_prc=50_000, evlu_amt=50_000 * q, evlu_pfls_amt=0,
+                    evlu_pfls_rt=0.0,
+                )
+                for t, q in qty_by_ticker.items()
+            ]
+        )
+
+        async def fake_get_client():
+            return client
+
+        import app.core.kiwoom_singleton as singleton
+
+        monkeypatch.setattr(singleton, "get_shared_kiwoom_client_async", fake_get_client)
+        return client
+
+    async def test_zero_quantity_holding_is_not_a_held_ticker(self, monkeypatch):
+        self._mock_holdings(monkeypatch, {"004370": 10, "316140": 0})
+
+        held = await gate_module._default_held_tickers_provider("kiwoom")
+
+        assert held == {"004370"}, (
+            "수량 0 행은 이미 청산된 종목이다 — 보유로 세면 그 종목의 추가매수가 "
+            "슬롯 상한을 면제받아 실제 보유 종목 수가 상한을 넘는다"
+        )
+
+    async def test_count_still_includes_zero_quantity_rows(self, monkeypatch):
+        # 카운트는 종전대로 과대포함을 유지한다 — 상한을 세는 데에는 보수적이다.
+        self._mock_holdings(monkeypatch, {"004370": 10, "316140": 0})
+
+        count = await gate_module._default_positions_count_provider("kiwoom")
+
+        assert count == 2, "카운트 쪽 동작은 이 변경으로 달라지면 안 된다"
+
+    async def test_zero_quantity_ticker_is_denied_not_exempted(self, master_on, monkeypatch):
+        """종단 확인: 청산된 종목에 대한 추가매수는 면제되지 않는다.
+
+        `_check` 헬퍼는 항상 카운트 프로바이더를 주입하므로 여기서는
+        `check_autonomy`를 직접 부른다 — 이 테스트의 요점이 **실제 기본
+        프로바이더 두 개**가 같은 계좌 스냅샷을 서로 다르게 해석하는지이기
+        때문이다(카운트는 6, 소속은 316140 제외).
+        """
+        self._mock_holdings(
+            monkeypatch,
+            {"004370": 10, "068270": 10, "089860": 10, "090430": 10,
+             "005930": 10, "316140": 0},
+        )
+        providers = _providers()
+
+        decision = await check_autonomy(
+            "kiwoom",
+            action="BUY",
+            quantity=10,
+            entry_price=50_000,
+            ticker="316140",
+            mode_provider=providers["mode_provider"],
+            paper_provider=providers["paper_provider"],
+            daily_loss_provider=providers["daily_loss_provider"],
+            coordinator_active_provider=providers["coordinator_active_provider"],
+            account_equity_provider=_default_account_equity,
+        )
+
+        assert not decision.allowed, (
+            "수량 0 종목은 실제 보유가 아니므로 면제 대상이 아니고, "
+            "과대포함 카운트(6)가 상한 5를 넘어 거절되어야 한다"
+        )
+        assert decision.check == "max_positions"
+
+
+class TestGateFailsClosedOnMalformedHeldSet(object):
+    """보유 목록 조회가 예외가 아니라 **이상한 값**을 돌려줄 때도 거절해야 한다.
+
+    모듈 계약은 "any provider error converts to a deny"다. 예외만 막고 반환
+    타입을 안 막으면, 문자열을 돌려주는 프로바이더에서 `ticker in held`가
+    부분문자열 일치로 참이 되어(예: "0043" in "004370,068270") 면제가 새어
+    나간다.
+    """
+
+    @pytest.mark.parametrize("bad", [None, 5, "004370,068270,316140"])
+    async def test_non_collection_held_denies(self, master_on, bad):
+        async def bad_provider(market):
+            return bad
+
+        decision = await _check(
+            action="BUY",
+            ticker="0043",
+            held_tickers_provider=bad_provider,
+            **_providers(positions=5),
+        )
+        assert not decision.allowed, f"{bad!r}를 보유 목록으로 받아들이면 안 된다"
+        assert decision.check == "max_positions"
 
 
 class TestCoordinatorActiveGate:
