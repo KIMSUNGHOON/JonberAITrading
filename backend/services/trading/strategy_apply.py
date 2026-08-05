@@ -38,8 +38,12 @@ from __future__ import annotations
 
 from typing import Optional
 
+import structlog
+
 from .models import RiskParameters
 from .strategy import TradingStrategy
+
+logger = structlog.get_logger(__name__)
 
 # risk_params 필드명 -> (lo, hi) 매핑 바운드. 값 출처는 아래 _source_values.
 # 단위: max_single_position_pct/min_cash_ratio는 소수분율,
@@ -67,6 +71,35 @@ GATE_PROTECTED_FIELDS: frozenset[str] = frozenset({
     "sudden_move_stabilization_pct",
     "max_daily_trades",
 })
+
+# U4: 전략 노브명 -> RiskParameters 필드명. GATE_PROTECTED_FIELDS 봉인 때문에
+# 전략이 정한 값이 실효값에 절대 도달하지 못하는 노브만 여기 넣는다. EOD 패널이
+# 매일 밤 max_positions를 논의해 결정하지만(2026-08-04 리비전: 6) max_open_
+# positions는 봉인돼 있어 그 결정이 도달할 경로가 없다 — 봉인은 유지하고
+# 폐기 사실만 로그로 보이게 한다(관측 전용, 실효값은 절대 바꾸지 않는다).
+_DISCARDED_KNOB_MAP: dict[str, str] = {
+    "max_positions": "max_open_positions",
+}
+
+
+def log_discarded_knobs(*, strategy_values, effective_values) -> None:
+    """전략이 정한 값이 봉인 때문에 버려질 때 남긴다. never-raise — 이 함수의
+    실패가 전략 적용 경로를 막아서는 안 된다(이 아크의 원칙)."""
+    try:
+        if not strategy_values or not effective_values:
+            return
+        for knob, field in _DISCARDED_KNOB_MAP.items():
+            voted = strategy_values.get(knob)
+            effective = effective_values.get(field)
+            if voted is None or effective is None or voted == effective:
+                continue
+            logger.info(
+                "strategy_knob_discarded",
+                knob=knob, field=field, voted=voted, effective=effective,
+                note="GATE_PROTECTED_FIELDS 봉인으로 실효값에 반영되지 않음",
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("discarded_knob_log_failed", error=str(e), error_type=type(e).__name__)
 
 
 def _source_values(strategy: TradingStrategy) -> dict[str, float]:
@@ -107,6 +140,13 @@ def apply_strategy_to_risk_params(
             setattr(risk_params, field, target)
             changes[field] = (before, target)
         return changes
+
+    # U4: 봉인 때문에 실효값에 못 도달하는 전략 노브를 관측한다(로그 전용,
+    # 아래의 실제 매핑/클램프 로직에는 관여하지 않는다).
+    log_discarded_knobs(
+        strategy_values={"max_positions": strategy.position_sizing.max_positions},
+        effective_values={"max_open_positions": risk_params.max_open_positions},
+    )
 
     sources = _source_values(strategy)
     targets = {
