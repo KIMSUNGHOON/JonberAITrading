@@ -292,10 +292,23 @@ class PaperFillSettings(BaseSettings):
       KR ledger calculation (`ManagedPosition.unrealized_pnl`,
       `fill_confirm`, coordinator avg_price, `paper_performance`) — that
       would double-count and desync the app from the broker's own numbers.
-      They exist ONLY for the KR display-layer cost helper
-      (`services/trading/fill_costs.py`), which shows a realistic
-      "what would I actually keep if I exited now" number without touching
-      the ledger.
+
+      There are exactly two consumers, and both are safe for the same
+      reason — neither one's output is read by any P&L arithmetic:
+      - `services/trading/fill_costs.py`: KR display-layer cost helper,
+        shows a realistic "what would I actually keep if I exited now"
+        number without touching the ledger.
+      - `services/trading/cost_model.py` (U1, 2026-08-05): computes
+        per-fill commission/tax that `record_trade_fill_async` writes onto
+        `kr_stock_trades.fee`/`.tax` as a LEDGER ANNOTATION, not a ledger
+        input — it is stored alongside the fill for observability, not fed
+        back into any position/P&L calculation. This is safe only as long
+        as `kr_stock_trades.fee`/`.tax` stay read-only display fields; as
+        of 2026-08-05 their only readers are
+        `app/api/routes/kr_stocks/trades.py:63,113`, both pure pass-throughs
+        into the API response model. If a future change makes any P&L
+        calculation read `kr_stock_trades.fee`/`.tax`, this principle is
+        violated again — check here first.
 
     Rates deliberately err high rather than trying to be exact (real rates
     vary by year/broker/rebate tier and are not this app's concern) — the

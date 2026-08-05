@@ -357,6 +357,60 @@ class StorageService:
                     )
                 """)
 
+                # Slot contest ledger (portfolio instrumentation U2): when the
+                # portfolio is already at max_positions, the autonomy gate
+                # refuses a new BUY/ADD opportunity flat -- no comparison
+                # against what's already held is ever recorded anywhere. This
+                # table is recording-only (see services/agent_chat/
+                # slot_contest.py) -- it does not decide whether a swap would
+                # have been better, it just keeps the challenger's terms and
+                # a snapshot of the incumbents so that question is answerable
+                # later. Accrete-style (id uuid PK, NOT trade_date) like
+                # regime_snapshot/discovery_candidates: every refusal appends
+                # its own row.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS slot_contest (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        challenger_ticker TEXT NOT NULL,
+                        challenger_action TEXT,
+                        challenger_consensus REAL,
+                        challenger_confidence REAL,
+                        challenger_entry_price REAL,
+                        challenger_stop_loss REAL,
+                        challenger_take_profit REAL,
+                        incumbents_json TEXT NOT NULL
+                    )
+                """)
+
+                # slot_contest.gate_reason/open_positions_count (final review,
+                # Important-1, 2026-08-05): gate.py's max_positions check
+                # returns the SAME check name ("max_positions") whether
+                # positions_count_provider genuinely found the portfolio
+                # full OR merely raised while trying to count (a
+                # count-lookup error, not a full portfolio) -- with no
+                # reason column those two cases were permanently
+                # indistinguishable once written. `len(incumbents_json)`
+                # can't stand in either: the gate counts from the broker
+                # balance + pending BUYs (gate.py's
+                # _default_positions_count_provider) while incumbents_json
+                # comes from the in-memory PositionManager -- two sources
+                # with a history of divergence in this system, so a lagging
+                # PM can leave incumbents_json="[]" on a genuine refusal.
+                # gate_reason carries gate.reason verbatim -- self-diagnosing
+                # (an exception message vs. "open positions N >= limit M").
+                # open_positions_count carries the SAME broker-derived count
+                # gate.py itself would have computed (re-queried
+                # independently at the call site, never from `incumbents`),
+                # so comparing it against len(incumbents) becomes a free
+                # consistency check between the two sources.
+                await self._ensure_columns(
+                    conn,
+                    "slot_contest",
+                    {"gate_reason": "TEXT", "open_positions_count": "INTEGER"},
+                )
+
                 # agent_chat_decisions.agent_weights (Phase4 T4): persists the
                 # consensus weights (default or calibration-tilted) actually
                 # used to reach this decision, as a JSON TEXT blob — without
@@ -395,6 +449,19 @@ class StorageService:
                         "strategy_id": "TEXT",
                         "entry_or_exit": "TEXT",
                     },
+                )
+
+                # kr_stock_trades.tax/cost_source (U1, 체결 비용 기록):
+                # `record_trade_fill_async`의 `fee` 인자가 이전까지 어떤
+                # 호출자도 넘기지 않아 기존 103건 전부 fee=0이었다 — 수수료만
+                # 있고 매도 증권거래세는 어디에도 기록되지 않았다. tax는
+                # 수수료와 별개 금액(매도에만 붙는다), cost_source는 이 값이
+                # `compute_fill_cost` 모델 산정('model')인지 브로커가 준
+                # 체결 단위 수수료('broker')인지 구분한다.
+                await self._ensure_columns(
+                    conn,
+                    "kr_stock_trades",
+                    {"tax": "INTEGER DEFAULT 0", "cost_source": "TEXT"},
                 )
 
                 # Regime snapshot index/flow/sentiment 심화 (Phase5): breadth-only
@@ -443,6 +510,21 @@ class StorageService:
                     conn,
                     "agent_chat_decisions",
                     {"decision_source": "TEXT", "session_ref": "TEXT"},
+                )
+
+                # agent_chat_decisions.sizing_lineage (U3, 사이징 계보,
+                # 2026-08-05): 완료된 8회 왕복 거래에서 패자 평균 명목이
+                # 승자의 1.27배였다(등가중 +0.92% vs 자본가중 -0.39%) —
+                # risk_score 배수(1.0/0.7/0.5)와 유동성 참여율 캡 중
+                # 어느 쪽이 사이징을 눌렀는지 기록이 없어 원인을 분리할
+                # 수 없었다. PortfolioAgent._calculate_max_position_value의
+                # 선택적 lineage out-param(JSON: base_max/risk_factor/
+                # risk_bucket_cap/r_cap/liquidity_cap/binding)을 담는
+                # 자리 -- 계산 자체는 바꾸지 않는다, 기록만 한다.
+                await self._ensure_columns(
+                    conn,
+                    "agent_chat_decisions",
+                    {"sizing_lineage": "TEXT"},
                 )
 
                 # Create indexes for better query performance
@@ -1139,8 +1221,8 @@ class StorageService:
                     INSERT INTO kr_stock_trades
                     (id, session_id, stk_cd, stk_nm, side, order_type, price,
                      quantity, executed_quantity, fee, total_krw, status, order_id, created_at,
-                     decision_id, strategy_id, entry_or_exit)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     decision_id, strategy_id, entry_or_exit, tax, cost_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["id"],
@@ -1160,6 +1242,8 @@ class StorageService:
                         record.get("decision_id"),
                         record.get("strategy_id"),
                         record.get("entry_or_exit"),
+                        record.get("tax", 0),
+                        record.get("cost_source"),
                     ),
                 )
                 await conn.commit()
@@ -1319,6 +1403,16 @@ class StorageService:
                 persist_analysis_decision; omitted/None for the normal
                 agent-chat debate path, which leaves both columns NULL —
                 read consumers treat NULL decision_source as 'agent_chat').
+                sizing_lineage (dict/None — U3, 사이징 계보: which cap
+                (risk_bucket_cap/r_cap/liquidity_cap) actually bound this
+                decision's position sizing, from
+                PortfolioAgent._calculate_max_position_value's optional
+                `lineage` out-param, JSON-serialized the same way
+                agent_weights/behavioral_signals are. No current caller
+                populates this yet — the column and this write-path exist
+                so a future call site that has both the lineage dict and
+                this decision's id can populate it without a further
+                storage_service.py change).
             votes: list of dicts with keys decision_id, agent_type, vote,
                 confidence, reasoning, key_factors (list),
                 suggested_position_pct, suggested_stop_loss_pct,
@@ -1339,8 +1433,9 @@ class StorageService:
                      entry_price, stop_loss, take_profit, position_pct,
                      news_sentiment, news_count, behavioral_signals,
                      market_sentiment, flow, agent_weights,
-                     total_messages, total_rounds, decision_source, session_ref)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_messages, total_rounds, decision_source, session_ref,
+                     sizing_lineage)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         decision["id"],
@@ -1381,6 +1476,12 @@ class StorageService:
                         # persist_analysis_decision passes them explicitly.
                         decision.get("decision_source"),
                         decision.get("session_ref"),
+                        # U3: no existing caller sets this yet (see docstring
+                        # above) -- lands NULL, identical to every row
+                        # written before this column existed.
+                        json.dumps(decision["sizing_lineage"])
+                        if decision.get("sizing_lineage") is not None
+                        else None,
                     ),
                 )
 
@@ -1718,6 +1819,64 @@ class StorageService:
         except Exception as e:
             logger.error(
                 "decision_label_update_failed",
+                decision_id=decision_id,
+                error=str(e),
+            )
+            return False
+
+    async def update_decision_sizing_lineage(
+        self, decision_id: Optional[str], sizing_lineage: dict
+    ) -> bool:
+        """
+        Backfill agent_chat_decisions.sizing_lineage for an already-recorded
+        decision (U3, 사이징 계보, 2026-08-05).
+
+        `PortfolioAgent._calculate_max_position_value`'s lineage dict is
+        computed synchronously inside `calculate_allocation`, well before
+        any decision row necessarily exists — it travels out on
+        `AllocationPlan.sizing_lineage` and is only attributable to a
+        specific `agent_chat_decisions` row once the caller
+        (`ExecutionCoordinator.on_trade_approved`) reaches the point where
+        the order is placed and its `session_id` (== `agent_chat_decisions.
+        id` for the agent-chat path, per `decision_log.serialize_session`)
+        is in scope. This mirrors `update_decision_label`'s shape exactly —
+        a `decision_id` with no matching row (e.g. a manually-approved
+        trade with no originating agent-chat decision, or a queued trade
+        whose session_id predates this column) is not treated as an error,
+        same convention as `update_decision_outcome`.
+
+        Args:
+            decision_id: agent_chat_decisions.id to update. A falsy value
+                is short-circuited outright (same rationale as
+                update_decision_outcome's guard) rather than issued as a
+                `WHERE id = NULL` query.
+            sizing_lineage: the lineage dict (base_max/risk_factor/
+                risk_bucket_cap/r_cap/liquidity_cap/binding) to JSON-encode
+                and store.
+
+        Returns:
+            True if the UPDATE executed successfully (including a no-op
+            match), False on a falsy decision_id or any exception.
+        """
+        if not decision_id:
+            return False
+
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE agent_chat_decisions SET sizing_lineage = ? WHERE id = ?",
+                    (json.dumps(sizing_lineage), decision_id),
+                )
+                await conn.commit()
+                logger.debug(
+                    "decision_sizing_lineage_updated", decision_id=decision_id
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "decision_sizing_lineage_update_failed",
                 decision_id=decision_id,
                 error=str(e),
             )
@@ -2365,6 +2524,109 @@ class StorageService:
         except Exception as e:
             logger.error("backfill_market_context_failed",
                          trade_date=trade_date, error=str(e))
+
+    # -------------------------------------------
+    # Slot Contest Ledger (portfolio instrumentation U2)
+    # -------------------------------------------
+
+    async def insert_slot_contest(
+        self,
+        *,
+        id: str,
+        trade_date: str,
+        challenger_ticker: str,
+        challenger_action: Optional[str] = None,
+        challenger_consensus: Optional[float] = None,
+        challenger_confidence: Optional[float] = None,
+        challenger_entry_price: Optional[float] = None,
+        challenger_stop_loss: Optional[float] = None,
+        challenger_take_profit: Optional[float] = None,
+        incumbents_json: str = "[]",
+        gate_reason: Optional[str] = None,
+        open_positions_count: Optional[int] = None,
+    ) -> bool:
+        """Record one slot-full refusal (a challenger denied because
+        max_positions was already reached) plus a snapshot of the
+        incumbents it was refused in favor of. Recording only -- this
+        never judges whether a swap would have been better.
+
+        gate_reason/open_positions_count (final review, Important-1,
+        2026-08-05): gate_reason is gate.reason verbatim -- the only way to
+        tell a genuine "portfolio full" refusal apart from a
+        positions_count_provider lookup error, both of which land here
+        under check="max_positions". open_positions_count is the
+        broker-derived count from the SAME provider gate.py itself used,
+        re-queried independently at the call site (never derived from
+        `incumbents_json`) -- comparing it to len(incumbents) is a free
+        consistency check between the gate's count source and the
+        PositionManager's.
+
+        Best-effort like add_kr_stock_trade above: on any storage error
+        this logs and returns False rather than raising. The caller,
+        services.agent_chat.slot_contest.record_slot_contest, wraps this
+        call in its own try/except regardless -- this method's own
+        except is a second, independent line of defense, not the only
+        one guarding the autonomy-gate refusal path this observes.
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO slot_contest
+                    (id, trade_date, challenger_ticker, challenger_action,
+                     challenger_consensus, challenger_confidence,
+                     challenger_entry_price, challenger_stop_loss,
+                     challenger_take_profit, incumbents_json,
+                     gate_reason, open_positions_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        id,
+                        trade_date,
+                        challenger_ticker,
+                        challenger_action,
+                        challenger_consensus,
+                        challenger_confidence,
+                        challenger_entry_price,
+                        challenger_stop_loss,
+                        challenger_take_profit,
+                        incumbents_json,
+                        gate_reason,
+                        open_positions_count,
+                    ),
+                )
+                await conn.commit()
+                logger.debug("slot_contest_saved", ticker=challenger_ticker)
+                return True
+        except Exception as e:
+            logger.error(
+                "slot_contest_save_failed", ticker=challenger_ticker, error=str(e)
+            )
+            return False
+
+    async def get_slot_contests(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Read back slot_contest rows, newest first. Empty list on any
+        storage error (read-side mirror of get_kr_stock_trades above)."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM slot_contest
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("slot_contests_get_failed", error=str(e))
+            return []
 
     # -------------------------------------------
     # Health Check

@@ -53,7 +53,7 @@ async def record_trade_fill_async(
     status: str,
     stk_nm: Optional[str] = None,
     session_id: Optional[str] = None,
-    fee: int = 0,
+    fee: Optional[int] = None,
     total_krw: Optional[float] = None,
     order_id: Optional[str] = None,
     trade_id: Optional[str] = None,
@@ -65,9 +65,25 @@ async def record_trade_fill_async(
     raises; storage failures are logged only so a recording failure can
     never break the caller's trading flow."""
     from services.storage_service import get_storage_service
+    from services.trading.cost_model import compute_fill_cost
 
     try:
         storage = await get_storage_service()
+
+        # 비용 산정 — 호출자가 명시적으로 넘기지 않으면 모델로 산정한다.
+        # 세 호출자(ledger_reconcile / kr_stock_nodes.execution / coordinator)가
+        # 각자 넘기게 하면 하나만 빠뜨려도 원장이 다시 섞인다. 단일 지점에서
+        # 산정해 미래 호출자도 빠뜨릴 수 없게 한다.
+        if fee is None:
+            commission, tax = compute_fill_cost(side, price, executed_quantity)
+            cost_source = "model"
+        else:
+            # 호출자가 fee를 직접 넘기면 그 값을 전체 비용으로 취급하고
+            # tax는 별도 산정하지 않는다(0) — 이 분기는 현재 어떤 호출자도
+            # fee를 넘기지 않아 도달하지 않는다.
+            commission, tax = int(fee), 0
+            cost_source = "broker"
+
         record: dict[str, Any] = {
             "id": trade_id or str(uuid.uuid4()),
             "session_id": session_id,
@@ -78,7 +94,9 @@ async def record_trade_fill_async(
             "price": round(price),
             "quantity": quantity,
             "executed_quantity": executed_quantity,
-            "fee": fee,
+            "fee": commission,
+            "tax": tax,
+            "cost_source": cost_source,
             "total_krw": (
                 round(total_krw)
                 if total_krw is not None

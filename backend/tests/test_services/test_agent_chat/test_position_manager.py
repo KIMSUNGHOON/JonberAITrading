@@ -29,6 +29,20 @@ from services.agent_chat.position_manager import (
 
 
 # -------------------------------------------
+# Constants
+# -------------------------------------------
+
+# KRX regular session length in minutes: 09:00-15:30 KST (see
+# services/trading/market_hours.py MarketHoursService, market_open=time(9,0)
+# / market_close=time(15,30) -> 6.5h = 390min). Used to pin the invariant
+# that PositionManagerConfig's daily strategic-re-eval budget
+# (max_discussions_per_position) must not exhaust before the session ends
+# -- see TestStrategicReevalConfig.test_daily_cap_cannot_exhaust_before_
+# session_close.
+KRX_SESSION_MINUTES = 390
+
+
+# -------------------------------------------
 # Fixtures
 # -------------------------------------------
 
@@ -2954,7 +2968,11 @@ class TestStrategicReevalConfig:
 
     def test_defaults(self):
         cfg = PositionManagerConfig()
-        assert cfg.reeval_interval_minutes == 30
+        # 49: 8 (max_discussions_per_position) x 49 = 392min covers the
+        # 390min KRX session -- see the field's docstring for the full
+        # incident and test_daily_cap_cannot_exhaust_before_session_close
+        # below for the invariant this pins.
+        assert cfg.reeval_interval_minutes == 49
         assert cfg.reeval_price_change_pct == 2.0
         assert cfg.min_discussion_interval_minutes == 15
         assert cfg.max_discussions_per_position == 8
@@ -3000,6 +3018,41 @@ class TestStrategicReevalConfig:
             "reeval_price_change_pct=2.0"
         )
         assert event.event_type == PositionEventType.STRATEGIC_REEVAL
+
+    def test_daily_cap_cannot_exhaust_before_session_close(self):
+        """Invariant, not a number pin: max_discussions_per_position *
+        reeval_interval_minutes must cover the full KRX_SESSION_MINUTES
+        session. If it doesn't, a held position burns its entire daily
+        strategic-re-eval budget before the market closes and then goes
+        completely dark for the rest of the day -- exactly what happened
+        live on 2026-08-04 (4/5 positions, cap hit ~12:53) and again on
+        2026-08-05 (all 5 positions, cap hit by 12:55:50, zero re-eval for
+        the remaining 2h35m to close). The watch-list control group (not
+        subject to this per-position cap) kept being discussed all
+        afternoon on 2026-08-05, which is what isolates this as a
+        cap/interval interaction rather than an LLM or market-conditions
+        problem.
+
+        Deliberately derives both operands from the config object instead
+        of hard-coding 8 or 49, so this also fires if a future change
+        raises the cap or shortens the interval without checking the
+        interaction -- unlike a bare `reeval_interval_minutes == 49`
+        assertion, which would only restate the current value."""
+        cfg = PositionManagerConfig()
+        total_reeval_minutes = (
+            cfg.max_discussions_per_position * cfg.reeval_interval_minutes
+        )
+        assert total_reeval_minutes >= KRX_SESSION_MINUTES, (
+            f"max_discussions_per_position ({cfg.max_discussions_per_position}) "
+            f"* reeval_interval_minutes ({cfg.reeval_interval_minutes}) = "
+            f"{total_reeval_minutes} minutes, which is LESS than the "
+            f"{KRX_SESSION_MINUTES}-minute KRX session (09:00-15:30 KST). "
+            "The daily strategic-re-eval cap will exhaust before the "
+            "session closes, leaving held positions with zero strategic "
+            "re-evaluation for the remainder of the day (see the "
+            "2026-08-04 and 2026-08-05 live incidents referenced on "
+            "PositionManagerConfig.reeval_interval_minutes)."
+        )
 
 
 class TestStrategicReevalTriggerP3:
