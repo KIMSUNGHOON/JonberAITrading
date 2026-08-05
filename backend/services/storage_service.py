@@ -485,6 +485,21 @@ class StorageService:
                     {"decision_source": "TEXT", "session_ref": "TEXT"},
                 )
 
+                # agent_chat_decisions.sizing_lineage (U3, 사이징 계보,
+                # 2026-08-05): 완료된 8회 왕복 거래에서 패자 평균 명목이
+                # 승자의 1.27배였다(등가중 +0.92% vs 자본가중 -0.39%) —
+                # risk_score 배수(1.0/0.7/0.5)와 유동성 참여율 캡 중
+                # 어느 쪽이 사이징을 눌렀는지 기록이 없어 원인을 분리할
+                # 수 없었다. PortfolioAgent._calculate_max_position_value의
+                # 선택적 lineage out-param(JSON: base_max/risk_factor/
+                # risk_bucket_cap/r_cap/liquidity_cap/binding)을 담는
+                # 자리 -- 계산 자체는 바꾸지 않는다, 기록만 한다.
+                await self._ensure_columns(
+                    conn,
+                    "agent_chat_decisions",
+                    {"sizing_lineage": "TEXT"},
+                )
+
                 # Create indexes for better query performance
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints(session_id)"
@@ -1361,6 +1376,16 @@ class StorageService:
                 persist_analysis_decision; omitted/None for the normal
                 agent-chat debate path, which leaves both columns NULL —
                 read consumers treat NULL decision_source as 'agent_chat').
+                sizing_lineage (dict/None — U3, 사이징 계보: which cap
+                (risk_bucket_cap/r_cap/liquidity_cap) actually bound this
+                decision's position sizing, from
+                PortfolioAgent._calculate_max_position_value's optional
+                `lineage` out-param, JSON-serialized the same way
+                agent_weights/behavioral_signals are. No current caller
+                populates this yet — the column and this write-path exist
+                so a future call site that has both the lineage dict and
+                this decision's id can populate it without a further
+                storage_service.py change).
             votes: list of dicts with keys decision_id, agent_type, vote,
                 confidence, reasoning, key_factors (list),
                 suggested_position_pct, suggested_stop_loss_pct,
@@ -1381,8 +1406,9 @@ class StorageService:
                      entry_price, stop_loss, take_profit, position_pct,
                      news_sentiment, news_count, behavioral_signals,
                      market_sentiment, flow, agent_weights,
-                     total_messages, total_rounds, decision_source, session_ref)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_messages, total_rounds, decision_source, session_ref,
+                     sizing_lineage)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         decision["id"],
@@ -1423,6 +1449,12 @@ class StorageService:
                         # persist_analysis_decision passes them explicitly.
                         decision.get("decision_source"),
                         decision.get("session_ref"),
+                        # U3: no existing caller sets this yet (see docstring
+                        # above) -- lands NULL, identical to every row
+                        # written before this column existed.
+                        json.dumps(decision["sizing_lineage"])
+                        if decision.get("sizing_lineage") is not None
+                        else None,
                     ),
                 )
 

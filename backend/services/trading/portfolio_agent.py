@@ -146,11 +146,24 @@ class PortfolioAgent:
             )
 
         # 2. Calculate position size based on risk
+        # U3 (사이징 계보, 2026-08-05): 어느 캡이 실제로 물었는지 관찰만
+        # 한다 — sizing_lineage는 계산에 아무 영향을 주지 않는 out-param
+        # 이고, 여기서는 관측성을 위해 로그로만 남긴다. agent_chat_decisions
+        # 행 하나로 이 계보를 귀속시키려면 이 지점에 없는 decision_id가
+        # 필요한데(calculate_allocation은 동기 함수이고 유일한 호출부인
+        # coordinator.on_trade_approved도 그 id를 여기로 넘기지 않는다),
+        # 그 배선은 이 태스크의 선언된 파일 범위(portfolio_agent.py/
+        # storage_service.py) 밖이라 여기서는 하지 않는다 — 스키마
+        # (storage_service.py의 sizing_lineage 컬럼)와 저장 접점
+        # (save_agent_chat_decision의 sizing_lineage 키)만 준비해 둔다.
+        sizing_lineage: dict = {}
         max_position_value = self._calculate_max_position_value(
             account.total_equity, risk_score,
             entry_price=entry_price, stop_loss=stop_loss,
-            adtv=adtv,
+            adtv=adtv, lineage=sizing_lineage,
         )
+        if sizing_lineage:
+            logger.debug(f"[PortfolioAgent] sizing lineage: {sizing_lineage}")
 
         # 3. Consider existing position
         if existing_position:
@@ -291,6 +304,7 @@ class PortfolioAgent:
         entry_price: Optional[float] = None,
         stop_loss: Optional[float] = None,
         adtv: Optional[float] = None,
+        lineage: Optional[dict] = None,
     ) -> float:
         """
         Calculate maximum position value based on risk.
@@ -306,6 +320,16 @@ class PortfolioAgent:
         C1 (유동성 인지, 2026-07-27): R-cap 결합 다음으로 유동성 참여율 캡을
         추가로 결합한다. `adtv`도 기본값 None이라 기존 호출부는 캡 미적용
         (fail-open)으로 동작이 완전히 그대로다.
+
+        U3 (사이징 계보, 2026-08-05): `lineage`는 선택적 out-param dict다 —
+        entry_price/stop_loss/adtv와 같은 패턴으로, 넘기지 않으면(기본
+        None) 관찰 코드가 전부 스킵되어 기존 호출부는 바이트 단위로 동일하게
+        동작한다. 넘기면 이미 계산되는 중간값(base_max/risk_factor/
+        risk_bucket_cap/r_cap/liquidity_cap)과 실제로 반환값을 만든 캡의
+        이름(binding)을 기록한다 — 계산식/순서/반올림/클램프는 한 글자도
+        바꾸지 않는다. 패자 평균 명목이 승자의 1.27배(등가중 +0.92% vs
+        자본가중 -0.39%)인 원인이 risk_score 배수인지 유동성 캡인지
+        기록이 없어 분리할 수 없었던 것을 이 out-param이 메운다.
         """
         base_max = total_equity * self.risk_params.max_single_position_pct
 
@@ -321,6 +345,7 @@ class PortfolioAgent:
             risk_factor = 0.5
 
         max_value = base_max * risk_factor
+        risk_bucket_cap = max_value
 
         r_cap = r_cap_value(
             equity=total_equity,
@@ -328,6 +353,7 @@ class PortfolioAgent:
             entry_price=entry_price if entry_price is not None else 0,
             stop_price=stop_loss,
         )
+        r_cap_applied = False
         if r_cap is not None and r_cap < max_value:
             logger.debug(
                 f"[PortfolioAgent] R cap {r_cap:,.0f} tighter than risk-bucket "
@@ -335,6 +361,7 @@ class PortfolioAgent:
                 f"(risk_budget_pct={self.risk_params.risk_budget_pct}%)"
             )
             max_value = r_cap
+            r_cap_applied = True
 
         # C1(유동성 인지): 유동성 참여율 캡을 마지막에 결합한다. adtv=None이면
         # 캡 미적용(fail-open) — A1 게이트를 이미 통과한 종목이다.
@@ -361,6 +388,41 @@ class PortfolioAgent:
                 f"[PortfolioAgent] skip-floor 미평가(total_equity={total_equity}) "
                 f"— 유동성 캡만 결합됨 max_value={max_value:,.0f}"
             )
+
+        if lineage is not None:
+            # 순수함수 liquidity_cap_value를 여기서 한 번 더 부르는 것은
+            # apply_liquidity_cap 내부가 하는 계산과 완전히 동일한
+            # 계산(같은 adtv 입력)이라 max_value에는 아무 영향이 없다 —
+            # 관찰 전용 재계산이다. r_cap과 대칭으로 "이겼든 졌든 계산되면
+            # 기록"한다: adtv_unknown(ADTV 자체가 없어 계산이 성립하지
+            # 않는 경우)만 None이고, 그 밖의 사유(liquidity_cap/
+            # liquidity_too_thin/skip_floor_disabled/None)는 실 ADTV로
+            # 캡이 계산됐다는 뜻이므로 값을 남긴다.
+            from services.discovery.liquidity import liquidity_cap_value
+
+            lineage["base_max"] = base_max
+            lineage["risk_factor"] = risk_factor
+            lineage["risk_bucket_cap"] = risk_bucket_cap
+            lineage["r_cap"] = r_cap
+            lineage["liquidity_cap"] = liquidity_cap_value(adtv)
+
+            # 승자 판정: 결합 순서(risk_bucket_cap -> r_cap -> liquidity_cap)
+            # 그대로 앞선 캡부터 확인한다. 유동성이 실제로 이 값을 만들었으면
+            # (liquidity_cap 또는 liquidity_too_thin — 후자는 반환값이 0.0이라
+            # liq 캡 원값과 더 이상 같지 않으므로 값 비교가 아니라 reason으로
+            # 판정) 유동성이 승자다. 그렇지 않고 r_cap이 위에서 실제로 채택
+            # 됐으면(r_cap_applied) r_cap이 승자다. 둘 다 아니면 risk_bucket_cap
+            # 이 처음부터 끝까지 안 바뀐 것이다. 동률(r_cap == risk_bucket_cap)
+            # 은 위의 엄격한 '<' 비교 때문에 애초에 r_cap_applied가 False로
+            # 남아 risk_bucket_cap 쪽으로 귀속된다 — "동률이면 더 앞선(더
+            # 보수적으로 적용된) 캡" 규칙과 실제 결합 코드의 strict-less-than
+            # 의미가 정확히 일치한다.
+            if liq_reason in ("liquidity_cap", "liquidity_too_thin"):
+                lineage["binding"] = "liquidity_cap"
+            elif r_cap_applied:
+                lineage["binding"] = "r_cap"
+            else:
+                lineage["binding"] = "risk_bucket_cap"
 
         return max_value
 
