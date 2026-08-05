@@ -148,14 +148,11 @@ class PortfolioAgent:
         # 2. Calculate position size based on risk
         # U3 (사이징 계보, 2026-08-05): 어느 캡이 실제로 물었는지 관찰만
         # 한다 — sizing_lineage는 계산에 아무 영향을 주지 않는 out-param
-        # 이고, 여기서는 관측성을 위해 로그로만 남긴다. agent_chat_decisions
-        # 행 하나로 이 계보를 귀속시키려면 이 지점에 없는 decision_id가
-        # 필요한데(calculate_allocation은 동기 함수이고 유일한 호출부인
-        # coordinator.on_trade_approved도 그 id를 여기로 넘기지 않는다),
-        # 그 배선은 이 태스크의 선언된 파일 범위(portfolio_agent.py/
-        # storage_service.py) 밖이라 여기서는 하지 않는다 — 스키마
-        # (storage_service.py의 sizing_lineage 컬럼)와 저장 접점
-        # (save_agent_chat_decision의 sizing_lineage 키)만 준비해 둔다.
+        # 이다. 여기서 만든 dict를 AllocationPlan.sizing_lineage에 실어
+        # 반환하면, 유일한 호출부인 coordinator.on_trade_approved가 이미
+        # session_id(=agent_chat_decisions.id)를 갖고 있으므로 거기서
+        # agent_chat_decisions 행에 귀속시킬 수 있다 — 이 함수 자체는
+        # 여전히 동기·무-I/O로 남는다.
         sizing_lineage: dict = {}
         max_position_value = self._calculate_max_position_value(
             account.total_equity, risk_score,
@@ -185,6 +182,7 @@ class PortfolioAgent:
                     estimated_amount=0,
                     position_pct=0,
                     rationale=f"이미 보유 중: {existing_position.quantity}주 ({current_position_pct:.1f}%) - 추가 매수 불가 (최대 포지션 도달)",
+                    sizing_lineage=sizing_lineage,
                 )
 
             # Calculate remaining allowed position
@@ -210,6 +208,7 @@ class PortfolioAgent:
                 estimated_amount=0,
                 position_pct=0,
                 rationale=rationale,
+                sizing_lineage=sizing_lineage,
             )
 
         # 6. Final calculations
@@ -243,6 +242,7 @@ class PortfolioAgent:
             risk_score=risk_score,
             rebalance_orders=rebalance_orders,
             rationale=rationale,
+            sizing_lineage=sizing_lineage,
         )
 
     def _calculate_sell_allocation(

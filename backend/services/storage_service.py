@@ -1797,6 +1797,64 @@ class StorageService:
             )
             return False
 
+    async def update_decision_sizing_lineage(
+        self, decision_id: Optional[str], sizing_lineage: dict
+    ) -> bool:
+        """
+        Backfill agent_chat_decisions.sizing_lineage for an already-recorded
+        decision (U3, 사이징 계보, 2026-08-05).
+
+        `PortfolioAgent._calculate_max_position_value`'s lineage dict is
+        computed synchronously inside `calculate_allocation`, well before
+        any decision row necessarily exists — it travels out on
+        `AllocationPlan.sizing_lineage` and is only attributable to a
+        specific `agent_chat_decisions` row once the caller
+        (`ExecutionCoordinator.on_trade_approved`) reaches the point where
+        the order is placed and its `session_id` (== `agent_chat_decisions.
+        id` for the agent-chat path, per `decision_log.serialize_session`)
+        is in scope. This mirrors `update_decision_label`'s shape exactly —
+        a `decision_id` with no matching row (e.g. a manually-approved
+        trade with no originating agent-chat decision, or a queued trade
+        whose session_id predates this column) is not treated as an error,
+        same convention as `update_decision_outcome`.
+
+        Args:
+            decision_id: agent_chat_decisions.id to update. A falsy value
+                is short-circuited outright (same rationale as
+                update_decision_outcome's guard) rather than issued as a
+                `WHERE id = NULL` query.
+            sizing_lineage: the lineage dict (base_max/risk_factor/
+                risk_bucket_cap/r_cap/liquidity_cap/binding) to JSON-encode
+                and store.
+
+        Returns:
+            True if the UPDATE executed successfully (including a no-op
+            match), False on a falsy decision_id or any exception.
+        """
+        if not decision_id:
+            return False
+
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE agent_chat_decisions SET sizing_lineage = ? WHERE id = ?",
+                    (json.dumps(sizing_lineage), decision_id),
+                )
+                await conn.commit()
+                logger.debug(
+                    "decision_sizing_lineage_updated", decision_id=decision_id
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "decision_sizing_lineage_update_failed",
+                decision_id=decision_id,
+                error=str(e),
+            )
+            return False
+
     # -------------------------------------------
     # Agent Calibration Ledger (Phase2 Task 1)
     # -------------------------------------------

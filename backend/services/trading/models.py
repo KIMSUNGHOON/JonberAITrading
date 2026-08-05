@@ -422,6 +422,13 @@ class AllocationPlan(BaseModel):
     # Reason/rationale
     rationale: Optional[str] = None
 
+    # U3 (사이징 계보, 2026-08-05): PortfolioAgent._calculate_max_position_
+    # value's optional `lineage` out-param, threaded through unchanged --
+    # None for every early-return plan computed before sizing runs (e.g.
+    # insufficient cash), populated for every plan computed after it. Purely
+    # additive/optional so no existing AllocationPlan(...) call site breaks.
+    sizing_lineage: Optional[dict] = None
+
     model_config = ConfigDict(use_enum_values=True)
 
 

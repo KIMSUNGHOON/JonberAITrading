@@ -16,6 +16,8 @@ risk_budget_pct=0.75)에서 계산한다 — 하드코딩한 3.0%/0.75% 상수�
 설정에서 읽는다(EOD 전략이 이 파라미터를 야간 개정하므로 하드코딩은 조용히
 의미를 잃는다).
 """
+import json
+
 import pytest
 
 from services.trading.models import RiskParameters
@@ -141,3 +143,197 @@ def test_lineage_liquidity_cap_is_none_when_adtv_unknown():
     lineage = {}
     a._calculate_max_position_value(EQUITY, risk_score=1, adtv=None, lineage=lineage)
     assert lineage["liquidity_cap"] is None
+
+
+# -------------------------------------------
+# Wiring: does the lineage actually land on a real agent_chat_decisions row?
+#
+# `PortfolioAgent.calculate_allocation` builds the lineage dict and returns
+# it on `AllocationPlan.sizing_lineage` (a pure, synchronous, no-I/O
+# computation — proven above). `ExecutionCoordinator.on_trade_approved` is
+# the only caller, and it already has a `session_id` in scope that equals
+# `agent_chat_decisions.id` for the agent-chat autonomous path (per
+# `services/agent_chat/decision_log.py::serialize_session`, and confirmed
+# `persist_session` always runs before `on_trade_approved` is ever reached
+# in that path — `services/agent_chat/coordinator.py:994` then `:998`/
+# `:1080`/`:1192`). This drives that real coordinator method end-to-end
+# (mocking only the broker call and `PortfolioAgent.calculate_allocation`'s
+# internals — the sizing math itself is covered exhaustively above) and
+# reads the row back through `isolated_storage_service` to prove the write
+# actually lands, not just that the accessor method is syntactically wired.
+# -------------------------------------------
+
+
+async def test_sizing_lineage_lands_on_the_decision_row(isolated_storage_service):
+    from datetime import datetime
+    from unittest.mock import AsyncMock, MagicMock
+
+    from services.trading.coordinator import ExecutionCoordinator
+    from services.trading.market_hours import MarketSession
+    from services.trading.models import (
+        AllocationPlan,
+        OrderResult,
+        OrderSide,
+        TradingMode,
+    )
+
+    decision_id = "u3-wiring-test-decision"
+    await isolated_storage_service.save_agent_chat_decision(
+        {
+            "id": decision_id,
+            "ticker": "005930",
+            "trade_date": "2026-08-05",
+            "status": "decided",
+            "action": "BUY",
+            "confidence": 0.7,
+            "consensus_level": 0.8,
+            "rationale": "test",
+        },
+        [],
+    )
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    coord._state.mode = TradingMode.ACTIVE
+    coord._market_hours.get_market_session = MagicMock(
+        return_value=MarketSession(
+            is_open=True,
+            current_time=datetime.now(),
+            next_open=None,
+            next_close=None,
+            message="open",
+        )
+    )
+    coord._refresh_account_info = AsyncMock()
+    # Never touch the real Kiwoom singleton for ADTV — BUY always resolves
+    # it before calculate_allocation; short-circuit to None (fail-open,
+    # matches _resolve_adtv's own documented degrade path).
+    coord.portfolio_agent._resolve_adtv = AsyncMock(return_value=None)
+
+    async def _fake_execute_order(order):
+        return OrderResult(
+            order_id="o1",
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=order.price or 50_000,
+            status="filled",
+        )
+
+    coord._execute_order = _fake_execute_order
+
+    stub_lineage = {
+        "base_max": 74_550_000.0,
+        "risk_factor": 1.0,
+        "risk_bucket_cap": 74_550_000.0,
+        "r_cap": None,
+        "liquidity_cap": None,
+        "binding": "risk_bucket_cap",
+    }
+    stub_plan = AllocationPlan(
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.BUY,
+        quantity=1,
+        entry_price=50_000,
+        estimated_amount=50_000,
+        position_pct=1.0,
+        rationale="stub allocation",
+        rebalance_orders=[],
+        sizing_lineage=stub_lineage,
+    )
+    coord.portfolio_agent.calculate_allocation = MagicMock(return_value=stub_plan)
+
+    await coord.on_trade_approved(
+        session_id=decision_id,
+        ticker="005930",
+        stock_name="삼성전자",
+        action="BUY",
+        entry_price=50_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=1,
+        quantity_override=1,
+    )
+
+    rows = await isolated_storage_service.get_agent_chat_decisions(ticker="005930")
+    matches = [r for r in rows if r["id"] == decision_id]
+    assert matches, "decision row not found"
+    raw = matches[0]["sizing_lineage"]
+    assert raw is not None, "sizing_lineage column is NULL -- the write never landed"
+    assert json.loads(raw) == stub_lineage
+
+
+async def test_sizing_lineage_write_is_a_noop_when_no_matching_decision_row(
+    isolated_storage_service,
+):
+    """A session_id with no backing agent_chat_decisions row (e.g. a
+    manually-approved trade, or a queued trade predating this column) must
+    not raise -- same convention as update_decision_outcome/
+    update_decision_label."""
+    from datetime import datetime
+    from unittest.mock import AsyncMock, MagicMock
+
+    from services.trading.coordinator import ExecutionCoordinator
+    from services.trading.market_hours import MarketSession
+    from services.trading.models import (
+        AllocationPlan,
+        OrderResult,
+        OrderSide,
+        TradingMode,
+    )
+
+    coord = ExecutionCoordinator(kiwoom_client=None)
+    coord._state.mode = TradingMode.ACTIVE
+    coord._market_hours.get_market_session = MagicMock(
+        return_value=MarketSession(
+            is_open=True,
+            current_time=datetime.now(),
+            next_open=None,
+            next_close=None,
+            message="open",
+        )
+    )
+    coord._refresh_account_info = AsyncMock()
+    coord.portfolio_agent._resolve_adtv = AsyncMock(return_value=None)
+
+    async def _fake_execute_order(order):
+        return OrderResult(
+            order_id="o1",
+            ticker=order.ticker,
+            side=order.side,
+            requested_quantity=order.quantity,
+            filled_quantity=order.quantity,
+            avg_price=order.price or 50_000,
+            status="filled",
+        )
+
+    coord._execute_order = _fake_execute_order
+
+    stub_plan = AllocationPlan(
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.BUY,
+        quantity=1,
+        entry_price=50_000,
+        estimated_amount=50_000,
+        position_pct=1.0,
+        rationale="stub allocation",
+        rebalance_orders=[],
+        sizing_lineage={"binding": "risk_bucket_cap"},
+    )
+    coord.portfolio_agent.calculate_allocation = MagicMock(return_value=stub_plan)
+
+    # Must not raise even though "no-such-decision" matches no row.
+    allocation = await coord.on_trade_approved(
+        session_id="no-such-decision",
+        ticker="005930",
+        stock_name="삼성전자",
+        action="BUY",
+        entry_price=50_000,
+        stop_loss=None,
+        take_profit=None,
+        risk_score=1,
+        quantity_override=1,
+    )
+    assert allocation.quantity == 1

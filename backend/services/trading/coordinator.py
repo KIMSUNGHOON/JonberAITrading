@@ -1009,6 +1009,27 @@ class ExecutionCoordinator:
             reason=f"Trade approval (risk: {risk_score})",
         )
 
+        # U3 (사이징 계보, 2026-08-05): 이 지점이 계보(allocation.sizing_
+        # lineage)와 그 계보가 귀속될 decision_id(order.session_id ==
+        # agent-chat 경로에서 agent_chat_decisions.id)가 함께 갖춰지는
+        # 유일한 자리다. 주문이 실제로 체결되는지와 무관하게(사이징 계산
+        # 자체는 체결 전에 이미 끝났다) 여기서 즉시 기록한다. 매칭되는
+        # 행이 없으면(수동 승인 등 agent-chat 기원이 아닌 경로) 조용히
+        # no-op — update_decision_label과 같은 관례. 저장 실패가 주문
+        # 경로를 절대 끊지 않도록 이 호출 자체도 try/except로 감싼다
+        # (StorageService 메서드 내부 가드와 별개의 방어선).
+        if allocation.sizing_lineage:
+            try:
+                storage = await get_storage_service()
+                await storage.update_decision_sizing_lineage(
+                    order.session_id, allocation.sizing_lineage
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Coordinator] sizing lineage 저장 실패 "
+                    f"(주문 경로에는 영향 없음): {e}"
+                )
+
         self._log_activity(
             ActivityType.ORDER_PLACED,
             f"Order placed: {action} {allocation.quantity} {stock_name or ticker} @ ₩{entry_price:,.0f}",
