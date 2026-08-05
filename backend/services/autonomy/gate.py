@@ -148,7 +148,14 @@ async def _default_daily_loss_provider(market: str) -> float:
     return 0.0
 
 
-async def _default_positions_count_provider(market: str) -> int:
+async def _default_held_tickers_provider(market: str) -> set:
+    """The set of tickers occupying a position slot right now.
+
+    Split out of `_default_positions_count_provider` (2026-08-05) so the slot
+    count and the slot MEMBERSHIP come from one place: check 6 needs both —
+    the count to enforce the cap, the membership to know whether a request
+    would occupy a NEW slot at all.
+    """
     if market == "kiwoom":
         # Storage has no KR position store — count from the broker (the mock
         # server in paper mode). Errors bubble to the gate's fail-closed wrap.
@@ -175,8 +182,12 @@ async def _default_positions_count_provider(market: str) -> int:
                 if t.side == "buy"
             }
 
-        return len(tickers)
+        return tickers
     raise ValueError(f"unknown market: {market}")
+
+
+async def _default_positions_count_provider(market: str) -> int:
+    return len(await _default_held_tickers_provider(market))
 
 
 def _default_risk_params() -> RiskParameters:
@@ -230,15 +241,24 @@ async def check_autonomy(
     action: str,
     quantity: Optional[float],
     entry_price: Optional[float],
+    ticker: Optional[str] = None,
     mode_provider: Optional[Provider] = None,
     paper_provider: Optional[Provider] = None,
     daily_loss_provider: Optional[Provider] = None,
     positions_count_provider: Optional[Provider] = None,
+    held_tickers_provider: Optional[Provider] = None,
     risk_params_provider: Optional[Callable[[], RiskParameters]] = None,
     coordinator_active_provider: Optional[Provider] = None,
     account_equity_provider: Optional[Provider] = None,
 ) -> GateDecision:
     """Decide whether an autonomous execution is allowed. Fail-closed.
+
+    `ticker` (optional, 2026-08-05) is used by check 6 ONLY: when the request
+    targets a ticker that already occupies a position slot, the
+    max_open_positions cap does not apply, because buying more of something
+    you already hold cannot raise the number of open positions. Omitting it
+    keeps the pre-existing behaviour exactly (the cap applies unconditionally),
+    so no existing call site changes meaning.
 
     NOTE (I6 scoping): this function is the shared policy point for
     AUTONOMOUS execution only — the injector's pre-check/re-check and every
@@ -255,6 +275,7 @@ async def check_autonomy(
     paper_provider = paper_provider or _default_paper_provider
     daily_loss_provider = daily_loss_provider or _default_daily_loss_provider
     positions_count_provider = positions_count_provider or _default_positions_count_provider
+    held_tickers_provider = held_tickers_provider or _default_held_tickers_provider
     risk_params_provider = risk_params_provider or _default_risk_params
     coordinator_active_provider = coordinator_active_provider or _default_coordinator_active_provider
     account_equity_provider = account_equity_provider or _default_account_equity_provider
@@ -328,12 +349,44 @@ async def check_autonomy(
                     "사후 체결 추적 불가 — trading 시스템 미기동",
                 )
 
-        # 6. Max concurrent positions
-        try:
-            count = int(await positions_count_provider(market))
-        except Exception as e:
-            return _deny("max_positions", str(e))
-        if count >= params.max_open_positions:
+        # 6. Max concurrent positions.
+        #
+        # 이미 슬롯을 차지하고 있는 종목을 더 사는 요청은 이 상한의 대상이
+        # 아니다 — 보유 종목 수는 **서로 다른 티커의 집합** 크기이고, 추가
+        # 매수는 그 집합에 원소를 더하지 않는다.
+        #
+        # 라이브 사고(2026-08-05): 316140이 하루 동안 ADD를 7회 의결했는데
+        # 전부 여기서 `open positions 5 >= limit 5`로 거절돼 체결 0건이었다.
+        # 만석(5/5)이 이 시스템의 정상 상태이므로 자율 추가매수가 상시
+        # 불가능했다. `PositionManager._execute_add_position`은 "진입 BUY와
+        # 동일한 안전"을 의도해 이 게이트를 action="BUY"로 부르는데, 진입
+        # BUY 의미에 포함된 슬롯 점검이 추가매수에는 무의미했던 것이다.
+        #
+        # 면제는 호출자의 주장이 아니라 **게이트가 직접 조회한 보유 목록**을
+        # 근거로 한다(`held_tickers_provider`). 조회 실패는 다른 검사와 똑같이
+        # fail-closed — 보유 여부를 모르면 상한을 그대로 적용하는 것이 아니라
+        # 거절한다(모른 채로 상한을 적용하면 정상 추가매수가 막히고, 모른 채로
+        # 면제하면 슬롯이 새기 때문에 어느 쪽도 안전하지 않다).
+        #
+        # ticker가 주어지면 소속과 개수를 **같은 스냅샷**에서 얻는다. 보유
+        # 목록과 카운트를 따로 조회하면 그 사이에 체결이 끼어 "목록엔 없는데
+        # 카운트는 4" 같은 어긋난 쌍으로 판정할 수 있고, 브로커 왕복도 두
+        # 번이 된다. ticker가 없는 기존 호출부는 종전대로 카운트만 조회한다.
+        exempt_from_slot_cap = False
+        if ticker:
+            try:
+                held = await held_tickers_provider(market)
+            except Exception as e:
+                return _deny("max_positions", str(e))
+            exempt_from_slot_cap = ticker in held
+            count = len(held)
+        else:
+            try:
+                count = int(await positions_count_provider(market))
+            except Exception as e:
+                return _deny("max_positions", str(e))
+
+        if not exempt_from_slot_cap and count >= params.max_open_positions:
             return _deny(
                 "max_positions",
                 f"open positions {count} >= limit {params.max_open_positions}",

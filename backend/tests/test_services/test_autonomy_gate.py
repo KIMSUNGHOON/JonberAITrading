@@ -183,6 +183,102 @@ async def test_max_positions_denies_buy(master_on):
     assert decision.check == "max_positions"
 
 
+def _held(*tickers):
+    async def held_tickers_provider(market):
+        return set(tickers)
+
+    return held_tickers_provider
+
+
+class TestAddToHeldTickerExemptFromSlotCap:
+    """이미 보유한 종목을 더 사는 것은 max_open_positions를 소비하지 않는다.
+
+    2026-08-05 라이브: 316140이 ADD를 7회 의결했는데 전부
+    `check=max_positions`("open positions 5 >= limit 5")로 거절돼 체결 0건이
+    었다. 보유 종목 수는 계좌의 **서로 다른 티커 집합** 크기이므로, 이미
+    보유한 종목을 추가매수해도 그 수는 변하지 않는다. 만석(5/5)이 이
+    시스템의 정상 상태라, 이 검사는 자율 추가매수를 상시 불가능하게 만들고
+    있었다(이전 아크의 "매수 81건 중 ADD 라벨 0건"의 정체).
+
+    면제는 **티커가 실제로 보유 목록에 있을 때만** 적용된다 — 호출자의
+    주장이 아니라 게이트가 직접 확인한다.
+    """
+
+    async def test_add_to_held_ticker_allowed_when_slots_full(self, master_on):
+        decision = await _check(
+            action="BUY",
+            ticker="316140",
+            held_tickers_provider=_held(
+                "004370", "068270", "089860", "090430", "316140"
+            ),
+            **_providers(positions=5),
+        )
+        assert decision.allowed is True
+
+    async def test_unheld_ticker_still_denied_when_slots_full(self, master_on):
+        decision = await _check(
+            action="BUY",
+            ticker="005930",
+            held_tickers_provider=_held(
+                "004370", "068270", "089860", "090430", "316140"
+            ),
+            **_providers(positions=5),
+        )
+        assert not decision.allowed
+        assert decision.check == "max_positions"
+
+    async def test_omitting_ticker_preserves_existing_behavior(self, master_on):
+        # 기존 호출부(티커를 넘기지 않는 곳)는 동작이 한 톨도 바뀌면 안 된다.
+        decision = await _check(action="BUY", **_providers(positions=5))
+        assert not decision.allowed
+        assert decision.check == "max_positions"
+
+    async def test_slot_count_comes_from_the_same_held_snapshot(self, master_on):
+        """ticker가 주어지면 소속과 개수를 같은 스냅샷에서 읽는다.
+
+        따로 조회하면 그 사이에 체결이 끼어 "목록엔 없는데 카운트는 0"
+        같은 어긋난 쌍으로 판정할 수 있다. 보유 목록이 5종이면 카운트
+        프로바이더가 뭐라 하든 5로 판정해야 한다.
+        """
+        decision = await _check(
+            action="BUY",
+            ticker="005930",
+            held_tickers_provider=_held(
+                "004370", "068270", "089860", "090430", "316140"
+            ),
+            **_providers(positions=0),  # 어긋난 값 — 무시되어야 한다
+        )
+        assert not decision.allowed
+        assert decision.check == "max_positions"
+        assert "5 >= limit 5" in decision.reason
+
+    async def test_held_lookup_failure_denies_fail_closed(self, master_on):
+        async def boom(market):
+            raise RuntimeError("broker unreachable")
+
+        decision = await _check(
+            action="BUY",
+            ticker="316140",
+            held_tickers_provider=boom,
+            **_providers(positions=5),
+        )
+        assert not decision.allowed
+        assert decision.check == "max_positions"
+        assert "broker unreachable" in decision.reason
+
+    async def test_held_ticker_still_subject_to_other_caps(self, master_on):
+        # 슬롯 면제가 다른 검사까지 열어주면 안 된다 — 일일 손실 브레이커는
+        # 여전히 물어야 한다.
+        decision = await _check(
+            action="BUY",
+            ticker="316140",
+            held_tickers_provider=_held("316140"),
+            **_providers(positions=5, daily_loss_pct=99.0),
+        )
+        assert not decision.allowed
+        assert decision.check == "daily_loss_breaker"
+
+
 class TestCoordinatorActiveGate:
     """F4b I6: an autonomous BUY/ADD must deny when the trading coordinator
     isn't active — otherwise the F3 post-fill tail (fill-tracker poll /

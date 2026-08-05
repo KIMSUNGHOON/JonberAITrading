@@ -2237,6 +2237,15 @@ class PositionManager:
                 action="BUY",
                 quantity=add_quantity,
                 entry_price=position.current_price,
+                # 슬롯 상한(max_open_positions) 면제용 (2026-08-05). action은
+                # 계속 "BUY"다 — 진입 BUY와 **동일한** 안전(브레이커·명목캡·
+                # 코디네이터 활성)을 그대로 받겠다는 기존 의도를 바꾸지
+                # 않는다. 다만 그 중 슬롯 점검만은 추가매수에 무의미하다:
+                # 이미 보유한 티커를 더 사도 보유 종목 수는 늘지 않는다.
+                # 게이트가 보유 목록을 직접 조회해 판정하므로 여기서 티커를
+                # 넘기는 것은 "면제해 달라"는 주장이 아니라 판정 대상을
+                # 알려주는 것이다.
+                ticker=position.ticker,
             )
             if not gate.allowed:
                 logger.warning(
