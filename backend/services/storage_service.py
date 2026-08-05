@@ -397,6 +397,19 @@ class StorageService:
                     },
                 )
 
+                # kr_stock_trades.tax/cost_source (U1, 체결 비용 기록):
+                # `record_trade_fill_async`의 `fee` 인자가 이전까지 어떤
+                # 호출자도 넘기지 않아 기존 103건 전부 fee=0이었다 — 수수료만
+                # 있고 매도 증권거래세는 어디에도 기록되지 않았다. tax는
+                # 수수료와 별개 금액(매도에만 붙는다), cost_source는 이 값이
+                # `compute_fill_cost` 모델 산정('model')인지 브로커가 준
+                # 체결 단위 수수료('broker')인지 구분한다.
+                await self._ensure_columns(
+                    conn,
+                    "kr_stock_trades",
+                    {"tax": "INTEGER DEFAULT 0", "cost_source": "TEXT"},
+                )
+
                 # Regime snapshot index/flow/sentiment 심화 (Phase5): breadth-only
                 # 로 만들어진 기존 db에 지수/수급/파생심리 컬럼을 ALTER로 추가.
                 await self._ensure_columns(
@@ -1139,8 +1152,8 @@ class StorageService:
                     INSERT INTO kr_stock_trades
                     (id, session_id, stk_cd, stk_nm, side, order_type, price,
                      quantity, executed_quantity, fee, total_krw, status, order_id, created_at,
-                     decision_id, strategy_id, entry_or_exit)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     decision_id, strategy_id, entry_or_exit, tax, cost_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["id"],
@@ -1160,6 +1173,8 @@ class StorageService:
                         record.get("decision_id"),
                         record.get("strategy_id"),
                         record.get("entry_or_exit"),
+                        record.get("tax", 0),
+                        record.get("cost_source"),
                     ),
                 )
                 await conn.commit()
