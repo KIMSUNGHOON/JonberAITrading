@@ -357,6 +357,33 @@ class StorageService:
                     )
                 """)
 
+                # Slot contest ledger (portfolio instrumentation U2): when the
+                # portfolio is already at max_positions, the autonomy gate
+                # refuses a new BUY/ADD opportunity flat -- no comparison
+                # against what's already held is ever recorded anywhere. This
+                # table is recording-only (see services/agent_chat/
+                # slot_contest.py) -- it does not decide whether a swap would
+                # have been better, it just keeps the challenger's terms and
+                # a snapshot of the incumbents so that question is answerable
+                # later. Accrete-style (id uuid PK, NOT trade_date) like
+                # regime_snapshot/discovery_candidates: every refusal appends
+                # its own row.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS slot_contest (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        challenger_ticker TEXT NOT NULL,
+                        challenger_action TEXT,
+                        challenger_consensus REAL,
+                        challenger_confidence REAL,
+                        challenger_entry_price REAL,
+                        challenger_stop_loss REAL,
+                        challenger_take_profit REAL,
+                        incumbents_json TEXT NOT NULL
+                    )
+                """)
+
                 # agent_chat_decisions.agent_weights (Phase4 T4): persists the
                 # consensus weights (default or calibration-tilted) actually
                 # used to reach this decision, as a JSON TEXT blob — without
@@ -2380,6 +2407,93 @@ class StorageService:
         except Exception as e:
             logger.error("backfill_market_context_failed",
                          trade_date=trade_date, error=str(e))
+
+    # -------------------------------------------
+    # Slot Contest Ledger (portfolio instrumentation U2)
+    # -------------------------------------------
+
+    async def insert_slot_contest(
+        self,
+        *,
+        id: str,
+        trade_date: str,
+        challenger_ticker: str,
+        challenger_action: Optional[str] = None,
+        challenger_consensus: Optional[float] = None,
+        challenger_confidence: Optional[float] = None,
+        challenger_entry_price: Optional[float] = None,
+        challenger_stop_loss: Optional[float] = None,
+        challenger_take_profit: Optional[float] = None,
+        incumbents_json: str = "[]",
+    ) -> bool:
+        """Record one slot-full refusal (a challenger denied because
+        max_positions was already reached) plus a snapshot of the
+        incumbents it was refused in favor of. Recording only -- this
+        never judges whether a swap would have been better.
+
+        Best-effort like add_kr_stock_trade above: on any storage error
+        this logs and returns False rather than raising. The caller,
+        services.agent_chat.slot_contest.record_slot_contest, wraps this
+        call in its own try/except regardless -- this method's own
+        except is a second, independent line of defense, not the only
+        one guarding the autonomy-gate refusal path this observes.
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO slot_contest
+                    (id, trade_date, challenger_ticker, challenger_action,
+                     challenger_consensus, challenger_confidence,
+                     challenger_entry_price, challenger_stop_loss,
+                     challenger_take_profit, incumbents_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        id,
+                        trade_date,
+                        challenger_ticker,
+                        challenger_action,
+                        challenger_consensus,
+                        challenger_confidence,
+                        challenger_entry_price,
+                        challenger_stop_loss,
+                        challenger_take_profit,
+                        incumbents_json,
+                    ),
+                )
+                await conn.commit()
+                logger.debug("slot_contest_saved", ticker=challenger_ticker)
+                return True
+        except Exception as e:
+            logger.error(
+                "slot_contest_save_failed", ticker=challenger_ticker, error=str(e)
+            )
+            return False
+
+    async def get_slot_contests(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Read back slot_contest rows, newest first. Empty list on any
+        storage error (read-side mirror of get_kr_stock_trades above)."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM slot_contest
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("slot_contests_get_failed", error=str(e))
+            return []
 
     # -------------------------------------------
     # Health Check

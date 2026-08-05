@@ -24,6 +24,7 @@ from services.agent_chat.models import (
 )
 from services.agent_chat.chat_room import ChatRoom
 from services.agent_chat.decision_log import persist_session
+from services.agent_chat.slot_contest import record_slot_contest
 from services.autonomy import check_autonomy
 from services.session_manager import (
     MarketType as SmMarketType,
@@ -1085,6 +1086,25 @@ class ChatCoordinator:
                     check=gate.check,
                     reason=gate.reason,
                 )
+                # Slot contest ledger (portfolio instrumentation U2):
+                # max_positions is the only refusal reason that is actually
+                # a slot contest -- the portfolio was full and this
+                # challenger lost out to whatever is already held. Other
+                # denials (notional cap, daily-loss breaker, coordinator
+                # inactive, ...) aren't about competing for a slot, so they
+                # are deliberately not recorded here. Recording-only: does
+                # not change gate.allowed, this log, or _notify_gate_denied
+                # below. record_slot_contest never raises on its own (see
+                # its docstring); _collect_incumbent_snapshot is likewise
+                # never-raise, so nothing here needs an additional
+                # try/except to keep this refusal path from being disrupted
+                # by an observation failure.
+                if gate.check == "max_positions":
+                    await record_slot_contest(
+                        ticker=ticker,
+                        decision=decision,
+                        incumbents=self._collect_incumbent_snapshot(),
+                    )
                 await self._notify_gate_denied(ticker, decision, gate.reason)
 
         # Send Telegram notification
@@ -1104,6 +1124,41 @@ class ChatCoordinator:
                 )
         except Exception as e:
             logger.warning("gate_denied_notify_failed", ticker=ticker, error=str(e))
+
+    def _collect_incumbent_snapshot(self) -> List[dict]:
+        """Snapshot of currently-held positions for the slot_contest ledger
+        (portfolio instrumentation U2) -- ticker, unrealized P&L%, and
+        distance to each stop as of the moment a challenger was refused for
+        max_positions. Never raises: any failure (no position manager yet,
+        a bad position field, ...) yields an empty list rather than
+        breaking the gate-denied path that calls this."""
+        try:
+            if self._position_manager is None:
+                return []
+
+            snapshot: List[dict] = []
+            for position in self._position_manager.get_all_positions():
+                entry: dict = {
+                    "ticker": position.ticker,
+                    "unrealized_pnl_pct": position.unrealized_pnl_pct,
+                }
+                if position.stop_loss and position.current_price:
+                    entry["stop_loss_distance_pct"] = (
+                        (position.current_price - position.stop_loss)
+                        / position.current_price
+                        * 100
+                    )
+                if position.take_profit and position.current_price:
+                    entry["take_profit_distance_pct"] = (
+                        (position.take_profit - position.current_price)
+                        / position.current_price
+                        * 100
+                    )
+                snapshot.append(entry)
+            return snapshot
+        except Exception as e:
+            logger.warning("slot_contest_incumbent_snapshot_failed", error=str(e))
+            return []
 
     async def _execute_trade(
         self,
