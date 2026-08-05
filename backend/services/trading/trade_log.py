@@ -78,6 +78,9 @@ async def record_trade_fill_async(
             commission, tax = compute_fill_cost(side, price, executed_quantity)
             cost_source = "model"
         else:
+            # 호출자가 fee를 직접 넘기면 그 값을 전체 비용으로 취급하고
+            # tax는 별도 산정하지 않는다(0) — 이 분기는 현재 어떤 호출자도
+            # fee를 넘기지 않아 도달하지 않는다.
             commission, tax = int(fee), 0
             cost_source = "broker"
 
