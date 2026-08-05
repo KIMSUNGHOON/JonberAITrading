@@ -145,6 +145,79 @@ def test_lineage_liquidity_cap_is_none_when_adtv_unknown():
     assert lineage["liquidity_cap"] is None
 
 
+def test_lineage_binding_is_liquidity_too_thin_when_position_rejected():
+    """리뷰 Important(2026-08-05): 유동성 캡이 계좌의 1% 미만이면
+    apply_liquidity_cap이 진입 자체를 포기(value=0.0)한다 — 그런데
+    lineage["liquidity_cap"]엔 거부를 유발한 원시(raw, 양수) 캡 값이
+    그대로 남는다(0으로 지우지 않는다 — 문턱에서 얼마나 멀었는지가
+    나중에 유동성 정책을 물을 때 필요하다). binding="liquidity_cap"으로
+    쓰면 value(0.0) == lineage["liquidity_cap"](양수) 불변식이 깨지므로
+    별도 라벨 "liquidity_too_thin"을 쓴다.
+
+    EQUITY=497,000,000, adtv=100,000,000 -> raw cap = adtv * 0.005 =
+    500,000. floor = EQUITY * 0.01 = 4,970,000. 500,000 < 4,970,000 이므로
+    liquidity_too_thin이 발동한다 — 리뷰가 제시한 정확한 수치."""
+    a = _agent()
+    lineage = {}
+    value = a._calculate_max_position_value(
+        EQUITY, risk_score=1, adtv=100_000_000.0, lineage=lineage,
+    )
+    assert value == 0.0
+    assert lineage["binding"] == "liquidity_too_thin"
+    # 원시 캡은 보존된다 — 0으로 지워지지 않는다.
+    assert lineage["liquidity_cap"] == pytest.approx(500_000.0)
+    # 불변식의 예외를 명시적으로 확인한다: 이 binding에서는
+    # value != lineage[lineage["binding"]] 형태의 단순 룩업이 없다
+    # ("liquidity_too_thin"은 lineage의 키가 아니다).
+    assert "liquidity_too_thin" not in lineage
+    assert value != lineage["liquidity_cap"]
+
+
+# -------------------------------------------
+# Minor (review, 2026-08-05): the coordinator-level wiring tests below stub
+# `PortfolioAgent.calculate_allocation` entirely, so the actual threading of
+# `sizing_lineage` through the three `AllocationPlan(...)` return sites
+# inside `calculate_allocation` itself (the "already at max position"
+# early-out, the "position too small" early-out, and the final success
+# return) had no test behind it -- only confirmed by reading. This drives
+# the real, unmocked method end-to-end.
+# -------------------------------------------
+
+
+def test_calculate_allocation_threads_lineage_into_allocation_plan():
+    from services.trading.models import AccountInfo, OrderSide
+
+    agent = PortfolioAgent(risk_params=RiskParameters())
+    account = AccountInfo(
+        total_equity=EQUITY, available_cash=EQUITY, total_stock_value=0.0
+    )
+
+    plan = agent.calculate_allocation(
+        account=account,
+        ticker="005930",
+        stock_name="삼성전자",
+        side=OrderSide.BUY,
+        entry_price=100_000.0,
+        risk_score=1,
+        stop_loss=93_000.0,
+        current_positions=[],
+        adtv=None,
+    )
+
+    assert plan.quantity > 0, "allocation was rejected -- nothing to assert lineage on"
+    assert plan.sizing_lineage, "AllocationPlan.sizing_lineage is empty/None"
+    assert plan.sizing_lineage["risk_factor"] == 1.0
+    assert plan.sizing_lineage["base_max"] == pytest.approx(
+        EQUITY * agent.risk_params.max_single_position_pct
+    )
+    assert plan.sizing_lineage["binding"] in (
+        "risk_bucket_cap",
+        "r_cap",
+        "liquidity_cap",
+        "liquidity_too_thin",
+    )
+
+
 # -------------------------------------------
 # Wiring: does the lineage actually land on a real agent_chat_decisions row?
 #

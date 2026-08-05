@@ -330,6 +330,15 @@ class PortfolioAgent:
         바꾸지 않는다. 패자 평균 명목이 승자의 1.27배(등가중 +0.92% vs
         자본가중 -0.39%)인 원인이 risk_score 배수인지 유동성 캡인지
         기록이 없어 분리할 수 없었던 것을 이 out-param이 메운다.
+
+        불변식 `value == lineage[lineage["binding"]]`은 `binding`이
+        `"liquidity_too_thin"`일 때 예외다(리뷰 Important, 2026-08-05) —
+        이 경우 진입 자체가 거부돼 `value`는 항상 0.0이고,
+        `lineage["liquidity_cap"]`은 거부를 유발한 원시(raw) 캡 값을
+        그대로 보존한다(0으로 지우지 않는다 — 문턱에서 얼마나 멀었는지가
+        나중에 유동성 정책을 물을 때 필요하다). `binding`의 다른 모든
+        값(`risk_bucket_cap`/`r_cap`/`liquidity_cap`)에서는 불변식이
+        그대로 성립한다.
         """
         base_max = total_equity * self.risk_params.max_single_position_pct
 
@@ -407,17 +416,29 @@ class PortfolioAgent:
             lineage["liquidity_cap"] = liquidity_cap_value(adtv)
 
             # 승자 판정: 결합 순서(risk_bucket_cap -> r_cap -> liquidity_cap)
-            # 그대로 앞선 캡부터 확인한다. 유동성이 실제로 이 값을 만들었으면
-            # (liquidity_cap 또는 liquidity_too_thin — 후자는 반환값이 0.0이라
-            # liq 캡 원값과 더 이상 같지 않으므로 값 비교가 아니라 reason으로
-            # 판정) 유동성이 승자다. 그렇지 않고 r_cap이 위에서 실제로 채택
-            # 됐으면(r_cap_applied) r_cap이 승자다. 둘 다 아니면 risk_bucket_cap
+            # 그대로 앞선 캡부터 확인한다. r_cap이 위에서 실제로 채택됐으면
+            # (r_cap_applied) r_cap이 승자다. 둘 다 아니면 risk_bucket_cap
             # 이 처음부터 끝까지 안 바뀐 것이다. 동률(r_cap == risk_bucket_cap)
             # 은 위의 엄격한 '<' 비교 때문에 애초에 r_cap_applied가 False로
             # 남아 risk_bucket_cap 쪽으로 귀속된다 — "동률이면 더 앞선(더
             # 보수적으로 적용된) 캡" 규칙과 실제 결합 코드의 strict-less-than
             # 의미가 정확히 일치한다.
-            if liq_reason in ("liquidity_cap", "liquidity_too_thin"):
+            #
+            # 리뷰 Important(2026-08-05): liquidity_too_thin은 "유동성 캡이
+            # 이겼다"가 아니다 — "캡이 계좌의 1% 미만이라 진입 자체를
+            # 포기했다"이고, 그때 apply_liquidity_cap은 max_value=0.0을
+            # 반환한다. 반면 lineage["liquidity_cap"]엔 위에서 이미 원시
+            # (rejection 이전) 캡 값을 그대로 남겨뒀다(0으로 지우지
+            # 않는다 — 문턱에서 얼마나 멀었는지가 유동성 정책 질문에
+            # 필요하다). 그래서 여기서 binding="liquidity_cap"으로 쓰면
+            # value(0.0) == lineage["liquidity_cap"](양수) 불변식이
+            # 깨진다. liquidity_cap이 "이겨서 캡이 됨"과 liquidity_too_thin
+            # 이 "너무 얕아 거부됨"은 서로 다른 사건이므로 별도 라벨을
+            # 쓴다 — 이 라벨일 때만 위 불변식이 예외임을 함수 docstring에
+            # 명시했다.
+            if liq_reason == "liquidity_too_thin":
+                lineage["binding"] = "liquidity_too_thin"
+            elif liq_reason == "liquidity_cap":
                 lineage["binding"] = "liquidity_cap"
             elif r_cap_applied:
                 lineage["binding"] = "r_cap"
