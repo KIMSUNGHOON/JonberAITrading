@@ -48,13 +48,49 @@ async def test_records_challenger_and_incumbents(isolated_storage_service):
         {"ticker": "089860", "consensus": 0.74, "unrealized_pnl_pct": 2.31},
     ]
 
-    await record_slot_contest(ticker="251970", decision=decision, incumbents=incumbents)
+    await record_slot_contest(
+        ticker="251970", decision=decision, incumbents=incumbents,
+        gate_reason="open positions 5 >= limit 5", open_positions_count=5,
+    )
 
     rows = await isolated_storage_service.get_slot_contests()
     assert len(rows) == 1
     assert rows[0]["challenger_ticker"] == "251970"
     assert rows[0]["challenger_consensus"] == pytest.approx(0.743)
     assert len(json.loads(rows[0]["incumbents_json"])) == 2
+    # 최종 리뷰 Important-1: gate_reason/open_positions_count가 그대로 저장된다.
+    assert rows[0]["gate_reason"] == "open positions 5 >= limit 5"
+    assert rows[0]["open_positions_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_gate_reason_disambiguates_lookup_error_from_genuine_refusal(
+    isolated_storage_service,
+):
+    """최종 리뷰 Important-1의 핵심 시나리오: gate.py:333-334는
+    positions_count_provider가 raise했을 때도, 진짜로 포트폴리오가 만석일
+    때도 동일하게 check="max_positions"를 반환한다. gate_reason 컬럼이
+    없으면 이 두 행은 저장된 뒤 영구히 구별 불가능하다 -- 이 테스트는
+    count-lookup 에러 문구가 그대로 저장되어 자가진단 가능함을 확인한다."""
+    from services.agent_chat.slot_contest import record_slot_contest
+    from services.agent_chat.models import TradeDecision, DecisionAction
+
+    decision = TradeDecision(
+        action=DecisionAction.BUY, confidence=0.6, consensus_level=0.7,
+        rationale="test",
+    )
+
+    # count-lookup 자체가 실패한 경우: gate.reason은 예외 메시지다(gate.py
+    # `except Exception as e: return _deny("max_positions", str(e))`).
+    await record_slot_contest(
+        ticker="005930", decision=decision, incumbents=[],
+        gate_reason="unknown market: kiwoom-timeout", open_positions_count=None,
+    )
+
+    rows = await isolated_storage_service.get_slot_contests()
+    assert len(rows) == 1
+    assert rows[0]["gate_reason"] == "unknown market: kiwoom-timeout"
+    assert rows[0]["open_positions_count"] is None
 
 
 @pytest.mark.asyncio
@@ -70,7 +106,10 @@ async def test_never_raises_when_storage_explodes():
     with patch("services.agent_chat.slot_contest.get_storage_service",
                AsyncMock(side_effect=RuntimeError("boom"))):
         # 예외가 새어나오면 게이트 경로가 죽는다 — 이 스펙의 유일한 실 위험이다
-        await record_slot_contest(ticker="005930", decision=decision, incumbents=[])
+        await record_slot_contest(
+            ticker="005930", decision=decision, incumbents=[],
+            gate_reason="open positions 5 >= limit 5",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +155,7 @@ def _coordinator_with_one_incumbent():
             ticker="004370", stock_name="incumbent",
             quantity=10, avg_price=1000, current_price=1046,
             stop_loss=940, take_profit=1100,
+            entry_decision_id="decision-004370-entry",
         ),
     ]
     coord._position_manager = pm
@@ -132,6 +172,8 @@ async def test_max_positions_denial_records_slot_contest(isolated_storage_servic
     notifier = MagicMock(is_ready=False)
 
     with patch("services.agent_chat.coordinator.check_autonomy", AsyncMock(return_value=gate)), \
+         patch("services.autonomy.gate._default_positions_count_provider",
+               AsyncMock(return_value=5)), \
          patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
         await coord._handle_decision("251970", _decision(0.7435), _session("251970"))
 
@@ -143,6 +185,14 @@ async def test_max_positions_denial_records_slot_contest(isolated_storage_servic
     assert len(incumbents) == 1
     assert incumbents[0]["ticker"] == "004370"
     assert incumbents[0]["unrealized_pnl_pct"] == pytest.approx(4.6)
+    # 최종 리뷰 Important-2: entry_decision_id가 스냅샷에 실린다 --
+    # trade_date+ticker의 모호한 조인을 정확한 조인으로 바꾼다.
+    assert incumbents[0]["entry_decision_id"] == "decision-004370-entry"
+    # 최종 리뷰 Important-1: gate.reason과 (재조회한) 브로커 카운트가 행에
+    # 함께 실린다 -- len(incumbents)==1과 open_positions_count==5의 불일치
+    # 자체가 이 두 소스(브로커 vs PositionManager)가 갈라졌다는 신호다.
+    assert rows[0]["gate_reason"] == "portfolio full (5/5)"
+    assert rows[0]["open_positions_count"] == 5
 
 
 @pytest.mark.asyncio
@@ -181,6 +231,8 @@ async def test_recording_failure_does_not_break_gate_denied_path():
     with patch("services.agent_chat.coordinator.check_autonomy", AsyncMock(return_value=gate)), \
          patch("services.agent_chat.slot_contest.get_storage_service",
                AsyncMock(side_effect=RuntimeError("storage exploded"))), \
+         patch("services.autonomy.gate._default_positions_count_provider",
+               AsyncMock(return_value=5)), \
          patch.object(coord, "_notify_gate_denied", AsyncMock()) as mock_notify, \
          patch("services.telegram.get_telegram_notifier", AsyncMock(return_value=notifier)):
         # 예외가 새어나오면 이 await 자체가 실패해 테스트가 죽는다.
@@ -209,3 +261,82 @@ def test_collect_incumbent_snapshot_empty_before_position_manager_started():
     coord = ChatCoordinator()
     assert coord._position_manager is None
     assert coord._collect_incumbent_snapshot() == []
+
+
+# ---------------------------------------------------------------------------
+# 최종 리뷰 Important-2: entry_decision_id가 스냅샷에 실린다.
+# ---------------------------------------------------------------------------
+
+
+def test_collect_incumbent_snapshot_includes_entry_decision_id():
+    """MonitoredPosition.entry_decision_id가 각 스냅샷 항목에 그대로
+    실린다 -- trade_date+ticker로 agent_chat_decisions를 조인하는 모호한
+    방법 대신, 워치 재토론(같은 티커가 여러 번 재논의됨)에서도 정확히
+    이 포지션의 진입을 결정한 행 하나를 가리킬 수 있게 한다."""
+    from services.agent_chat.coordinator import ChatCoordinator
+    from services.agent_chat.position_manager import MonitoredPosition
+
+    coord = ChatCoordinator()
+    pm = MagicMock()
+    pm.get_all_positions.return_value = [
+        MonitoredPosition(
+            ticker="251970", stock_name="펌텍코리아",
+            quantity=5, avg_price=47_000, current_price=47_500,
+            entry_decision_id="decision-251970-third-review",
+        ),
+    ]
+    coord._position_manager = pm
+
+    snapshot = coord._collect_incumbent_snapshot()
+    assert len(snapshot) == 1
+    assert snapshot[0]["entry_decision_id"] == "decision-251970-third-review"
+
+
+def test_collect_incumbent_snapshot_entry_decision_id_none_for_broker_synced_position():
+    """브로커 동기화로 발견된 포지션(sync_from_account)은 토론이 없었으므로
+    entry_decision_id가 None인 것이 정상 케이스다 -- 키 자체는 여전히
+    실려야 한다(누락이 아니라 명시적 None)."""
+    from services.agent_chat.coordinator import ChatCoordinator
+    from services.agent_chat.position_manager import MonitoredPosition
+
+    coord = ChatCoordinator()
+    pm = MagicMock()
+    pm.get_all_positions.return_value = [
+        MonitoredPosition(
+            ticker="005930", stock_name="삼성전자",
+            quantity=10, avg_price=70_000, current_price=71_000,
+        ),
+    ]
+    coord._position_manager = pm
+
+    snapshot = coord._collect_incumbent_snapshot()
+    assert "entry_decision_id" in snapshot[0]
+    assert snapshot[0]["entry_decision_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# 최종 리뷰 Important-1: _fetch_open_positions_count 자체.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_positions_count_returns_provider_value():
+    from services.agent_chat.coordinator import ChatCoordinator
+
+    coord = ChatCoordinator()
+    with patch("services.autonomy.gate._default_positions_count_provider",
+               AsyncMock(return_value=5)):
+        assert await coord._fetch_open_positions_count() == 5
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_positions_count_never_raises_when_provider_explodes():
+    """gate.py의 count-lookup이 raise하는 바로 그 상황(gate.py:333-334가
+    fail-closed로 deny하는 원인)에서도 이 헬퍼 자체는 삼키고 None을
+    반환해야 한다 -- 게이트 거절 경로를 이 관측이 다시 깨면 안 된다."""
+    from services.agent_chat.coordinator import ChatCoordinator
+
+    coord = ChatCoordinator()
+    with patch("services.autonomy.gate._default_positions_count_provider",
+               AsyncMock(side_effect=RuntimeError("kiwoom unavailable"))):
+        assert await coord._fetch_open_positions_count() is None

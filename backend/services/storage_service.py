@@ -384,6 +384,33 @@ class StorageService:
                     )
                 """)
 
+                # slot_contest.gate_reason/open_positions_count (final review,
+                # Important-1, 2026-08-05): gate.py's max_positions check
+                # returns the SAME check name ("max_positions") whether
+                # positions_count_provider genuinely found the portfolio
+                # full OR merely raised while trying to count (a
+                # count-lookup error, not a full portfolio) -- with no
+                # reason column those two cases were permanently
+                # indistinguishable once written. `len(incumbents_json)`
+                # can't stand in either: the gate counts from the broker
+                # balance + pending BUYs (gate.py's
+                # _default_positions_count_provider) while incumbents_json
+                # comes from the in-memory PositionManager -- two sources
+                # with a history of divergence in this system, so a lagging
+                # PM can leave incumbents_json="[]" on a genuine refusal.
+                # gate_reason carries gate.reason verbatim -- self-diagnosing
+                # (an exception message vs. "open positions N >= limit M").
+                # open_positions_count carries the SAME broker-derived count
+                # gate.py itself would have computed (re-queried
+                # independently at the call site, never from `incumbents`),
+                # so comparing it against len(incumbents) becomes a free
+                # consistency check between the two sources.
+                await self._ensure_columns(
+                    conn,
+                    "slot_contest",
+                    {"gate_reason": "TEXT", "open_positions_count": "INTEGER"},
+                )
+
                 # agent_chat_decisions.agent_weights (Phase4 T4): persists the
                 # consensus weights (default or calibration-tilted) actually
                 # used to reach this decision, as a JSON TEXT blob — without
@@ -2515,11 +2542,24 @@ class StorageService:
         challenger_stop_loss: Optional[float] = None,
         challenger_take_profit: Optional[float] = None,
         incumbents_json: str = "[]",
+        gate_reason: Optional[str] = None,
+        open_positions_count: Optional[int] = None,
     ) -> bool:
         """Record one slot-full refusal (a challenger denied because
         max_positions was already reached) plus a snapshot of the
         incumbents it was refused in favor of. Recording only -- this
         never judges whether a swap would have been better.
+
+        gate_reason/open_positions_count (final review, Important-1,
+        2026-08-05): gate_reason is gate.reason verbatim -- the only way to
+        tell a genuine "portfolio full" refusal apart from a
+        positions_count_provider lookup error, both of which land here
+        under check="max_positions". open_positions_count is the
+        broker-derived count from the SAME provider gate.py itself used,
+        re-queried independently at the call site (never derived from
+        `incumbents_json`) -- comparing it to len(incumbents) is a free
+        consistency check between the gate's count source and the
+        PositionManager's.
 
         Best-effort like add_kr_stock_trade above: on any storage error
         this logs and returns False rather than raising. The caller,
@@ -2538,8 +2578,9 @@ class StorageService:
                     (id, trade_date, challenger_ticker, challenger_action,
                      challenger_consensus, challenger_confidence,
                      challenger_entry_price, challenger_stop_loss,
-                     challenger_take_profit, incumbents_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     challenger_take_profit, incumbents_json,
+                     gate_reason, open_positions_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         id,
@@ -2552,6 +2593,8 @@ class StorageService:
                         challenger_stop_loss,
                         challenger_take_profit,
                         incumbents_json,
+                        gate_reason,
+                        open_positions_count,
                     ),
                 )
                 await conn.commit()

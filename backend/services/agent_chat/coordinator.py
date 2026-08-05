@@ -1104,6 +1104,8 @@ class ChatCoordinator:
                         ticker=ticker,
                         decision=decision,
                         incumbents=self._collect_incumbent_snapshot(),
+                        gate_reason=gate.reason,
+                        open_positions_count=await self._fetch_open_positions_count(),
                     )
                 await self._notify_gate_denied(ticker, decision, gate.reason)
 
@@ -1125,13 +1127,44 @@ class ChatCoordinator:
         except Exception as e:
             logger.warning("gate_denied_notify_failed", ticker=ticker, error=str(e))
 
+    async def _fetch_open_positions_count(self) -> Optional[int]:
+        """Broker-derived open-positions count for the slot_contest ledger
+        (final review, Important-1, 2026-08-05) -- the SAME source gate.py's
+        max_positions check itself uses (broker balance + pending BUYs via
+        `_default_positions_count_provider`), queried independently here
+        rather than derived from `_collect_incumbent_snapshot`'s in-memory
+        PositionManager list. Recording both from their own sources is what
+        turns `open_positions_count` into a free consistency check against
+        `len(incumbents)` instead of a tautology that always agrees with
+        itself. Never raises: any failure (provider error, kiwoom
+        unavailable, ...) yields None rather than breaking the gate-denied
+        path that calls this -- mirrors `_collect_incumbent_snapshot`'s
+        contract."""
+        try:
+            from services.autonomy.gate import _default_positions_count_provider
+
+            return await _default_positions_count_provider("kiwoom")
+        except Exception as e:
+            logger.warning("slot_contest_open_positions_count_failed", error=str(e))
+            return None
+
     def _collect_incumbent_snapshot(self) -> List[dict]:
         """Snapshot of currently-held positions for the slot_contest ledger
-        (portfolio instrumentation U2) -- ticker, unrealized P&L%, and
-        distance to each stop as of the moment a challenger was refused for
-        max_positions. Never raises: any failure (no position manager yet,
-        a bad position field, ...) yields an empty list rather than
-        breaking the gate-denied path that calls this."""
+        (portfolio instrumentation U2) -- ticker, unrealized P&L%, entry
+        decision id, and distance to each stop as of the moment a
+        challenger was refused for max_positions. Never raises: any failure
+        (no position manager yet, a bad position field, ...) yields an
+        empty list rather than breaking the gate-denied path that calls
+        this.
+
+        entry_decision_id (final review, Important-2, 2026-08-05):
+        MonitoredPosition.entry_decision_id is the durable
+        agent_chat_decisions.id of the discussion that established this
+        position's ENTRY. Recording it turns a fuzzy trade_date+ticker join
+        against agent_chat_decisions into an exact one -- watch-monitored
+        tickers get re-discussed repeatedly (the 3x/2x refusals this unit
+        was built to capture are exactly that pattern), so trade_date+ticker
+        alone is ambiguous precisely where it matters most."""
         try:
             if self._position_manager is None:
                 return []
@@ -1141,6 +1174,7 @@ class ChatCoordinator:
                 entry: dict = {
                     "ticker": position.ticker,
                     "unrealized_pnl_pct": position.unrealized_pnl_pct,
+                    "entry_decision_id": position.entry_decision_id,
                 }
                 if position.stop_loss and position.current_price:
                     entry["stop_loss_distance_pct"] = (
