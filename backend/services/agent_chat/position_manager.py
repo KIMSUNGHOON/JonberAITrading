@@ -2269,6 +2269,7 @@ class PositionManager:
             from app.dependencies import get_trading_coordinator
             from services.trading.coordinator import (
                 ORDER_STATUS_REJECTED_LIQUIDITY_CAP,
+                ORDER_STATUS_REJECTED_POSITION_CAP,
             )
 
             trading_coord = await get_trading_coordinator()
@@ -2311,6 +2312,31 @@ class PositionManager:
                         "주문 수량이 0으로 클램프됐습니다. "
                         "→ 조치 불필요: 정책이 의도대로 추가매수를 억제했습니다"
                         "(시스템 이상 아님). 기존 포지션은 정상 보유 중입니다.",
+                    )
+                return
+
+            if result.status == ORDER_STATUS_REJECTED_POSITION_CAP:
+                # 단일 종목 천장에 막혀 0주 (2026-08-05). 위 유동성 분기와
+                # 완전히 같은 성격이다 — 원장은 멀쩡하고 정책이 의도대로
+                # 억제한 것이므로 desync도 "미체결"도 아니다. 천장에 도달한
+                # 종목은 이 분기가 재평가마다 재진입하므로 같은 래치를
+                # 공유한다(래치를 나누면 두 천장이 번갈아 걸릴 때 각각
+                # 한 번씩, 결국 두 배로 통지된다).
+                logger.info(
+                    "add_blocked_by_position_cap",
+                    ticker=position.ticker,
+                    requested=add_quantity,
+                    held_quantity=position.quantity,
+                )
+                if not position.liquidity_cap_blocked_notified:
+                    position.liquidity_cap_blocked_notified = True
+                    await self._alert_execution_blocked(
+                        position,
+                        "단일 종목 상한",
+                        "주문 수량이 0으로 클램프됐습니다. "
+                        "→ 조치 불필요: 이 종목이 계좌 비중 천장에 도달해 "
+                        "정책이 추가매수를 억제했습니다(시스템 이상 아님). "
+                        "기존 포지션은 정상 보유 중입니다.",
                     )
                 return
 

@@ -195,3 +195,76 @@ async def test_liquidity_cap_block_alert_never_raises():
          patch("services.telegram.get_telegram_notifier",
                new=AsyncMock(side_effect=RuntimeError("telegram down"))):
         await pm._execute_add_position(position, 100, "test_add")  # raise하지 않아야 한다
+
+
+# ---------------------------------------------------------------------------
+# 단일 종목 상한 차단 통지 (2026-08-05)
+# ---------------------------------------------------------------------------
+
+
+async def test_position_cap_block_is_not_reported_as_unfilled():
+    """단일 종목 상한 차단은 "미체결"이 아니라 정상 억제다.
+
+    `_add_to_position`이 새 거절 상태를 돌려주는데 `_execute_add_position`이
+    그걸 모르면 `filled <= 0` 분기로 떨어져 "추가매수 미체결"로 오분류되고,
+    래치가 없는 그 경로가 재평가마다 통지를 반복한다. 천장에 도달한 종목은
+    ADD가 매번 0이므로 도배가 된다 — 유동성 캡에서 이미 겪은 실패 모드다.
+    """
+    from services.agent_chat.position_manager import PositionManager
+    from services.autonomy.gate import GateDecision
+    from services.trading.coordinator import ORDER_STATUS_REJECTED_POSITION_CAP
+
+    pm = PositionManager()
+    position = _position()
+
+    gate = GateDecision(allowed=True, reason="ok", check="all")
+    result = MagicMock()
+    result.status = ORDER_STATUS_REJECTED_POSITION_CAP
+    trading_coord = MagicMock()
+    trading_coord._add_to_position = AsyncMock(return_value=result)
+
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    before = position.quantity
+    with patch("services.autonomy.check_autonomy", new=AsyncMock(return_value=gate)), \
+         patch("app.dependencies.get_trading_coordinator", new=AsyncMock(return_value=trading_coord)), \
+         patch("services.telegram.get_telegram_notifier", new=AsyncMock(return_value=notifier)):
+        await pm._execute_add_position(position, 100, "test_add")
+
+    assert position.quantity == before, "차단됐으므로 보유 수량은 그대로여야 한다"
+    notifier.send_message.assert_awaited_once()
+    body = notifier.send_message.await_args.args[0]
+    assert "상한" in body
+    assert "미체결" not in body, "정상 억제를 실패로 알리면 안 된다"
+    assert "조치" in body
+
+
+async def test_position_cap_block_shares_the_liquidity_latch():
+    """두 천장이 같은 래치를 쓴다 — 나누면 번갈아 걸릴 때 두 배로 통지된다."""
+    from services.agent_chat.position_manager import PositionManager
+    from services.autonomy.gate import GateDecision
+    from services.trading.coordinator import ORDER_STATUS_REJECTED_POSITION_CAP
+
+    pm = PositionManager()
+    position = _position()
+
+    gate = GateDecision(allowed=True, reason="ok", check="all")
+    result = MagicMock()
+    result.status = ORDER_STATUS_REJECTED_POSITION_CAP
+    trading_coord = MagicMock()
+    trading_coord._add_to_position = AsyncMock(return_value=result)
+
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    with patch("services.autonomy.check_autonomy", new=AsyncMock(return_value=gate)), \
+         patch("app.dependencies.get_trading_coordinator", new=AsyncMock(return_value=trading_coord)), \
+         patch("services.telegram.get_telegram_notifier", new=AsyncMock(return_value=notifier)):
+        await pm._execute_add_position(position, 100, "test_add")
+        await pm._execute_add_position(position, 100, "test_add")
+        await pm._execute_add_position(position, 100, "test_add")
+
+    assert notifier.send_message.await_count == 1, "래치가 없으면 재평가마다 도배된다"

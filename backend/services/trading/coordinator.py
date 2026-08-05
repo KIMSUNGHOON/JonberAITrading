@@ -79,6 +79,11 @@ logger = logging.getLogger(__name__)
 # (PositionManager._execute_add_position)가 None을 원장 불일치로 해석해
 # 🚨 desync 통지를 보내기 때문이다. 유동성 차단은 원장 문제가 아니다.
 ORDER_STATUS_REJECTED_LIQUIDITY_CAP = "rejected_liquidity_cap"
+# 단일 종목 상한(max_single_position_pct 등)에 이미 도달해 추가매수 여유가
+# 0인 경우. 유동성 차단과 **구별**한다 — 둘 다 정상 억제이지 원장 문제가
+# 아니지만(호출자가 None을 desync로 오진하면 안 된다), 어느 천장에 막혔는지가
+# 운영 판단에서 다르다.
+ORDER_STATUS_REJECTED_POSITION_CAP = "rejected_position_cap"
 
 _DISCOVERY_SCAN_TIMEOUT_SECONDS = 5400.0
 _DISCOVERY_SCAN_POLL_INTERVAL_SECONDS = 5.0
@@ -2987,6 +2992,73 @@ class ExecutionCoordinator:
             )
         return min(quantity, allowed)
 
+    def _clamp_add_for_position_cap(
+        self, ticker: str, quantity: int, position: ManagedPosition
+    ) -> int:
+        """자율 ADD 수량을 단일 종목 천장 안으로 깎는다(총 포지션 기준).
+
+            allowed_notional = max(0, 천장 - 보유평가액)
+
+        천장은 진입 BUY가 쓰는 것과 **같은 함수**
+        (`PortfolioAgent._calculate_max_position_value`)에서 나온다 —
+        `max_single_position_pct` × risk_score 버킷, R-사이징 캡과 min 결합.
+        새 상한을 만드는 게 아니라, 이 경로만 지나가지 않던 기존 상한을
+        지나가게 하는 것이다.
+
+        유동성 캡은 여기 넣지 않는다 — 바로 위에서 이미 적용됐고, `adtv`를
+        넘기지 않으면 그 항은 fail-open으로 빠져 중복 계산되지 않는다.
+
+        **기준이 추가분이 아니라 총 포지션인 이유**는 유동성 캡과 같다:
+        추가분에만 걸면 매번 캡만큼 더 살 수 있어 천장을 영원히 넘는다.
+
+        never-raise — 사이징 계산 실패가 포지션 관리를 멈추면 안 된다.
+        계좌 평가액을 모르면 캡 미적용(fail-open, `_clamp_add_for_liquidity`의
+        adtv 미상 규약과 동일)이되 경고를 남겨 조용히 꺼진 것을 관측한다.
+        """
+        try:
+            account = getattr(self._state, "account", None)
+            total_equity = float(getattr(account, "total_equity", 0) or 0)
+            if total_equity <= 0 or not math.isfinite(total_equity):
+                logger.warning(
+                    f"[Coordinator] ADD 단일종목 상한 미적용 {ticker}: 계좌 평가액 없음"
+                )
+                return quantity
+
+            price = position.current_price or position.avg_price
+            if not price or not math.isfinite(price) or price <= 0:
+                logger.warning(
+                    f"[Coordinator] ADD 단일종목 상한 미적용 {ticker}: 가격 없음/비유한"
+                )
+                return quantity
+
+            cap = self.portfolio_agent._calculate_max_position_value(
+                total_equity=total_equity,
+                risk_score=position.risk_score or 5,
+                entry_price=price,
+                stop_loss=position.stop_loss,
+            )
+            if cap is None or not math.isfinite(cap):
+                logger.warning(
+                    f"[Coordinator] ADD 단일종목 상한 미적용 {ticker}: 천장 계산 불가"
+                )
+                return quantity
+
+            held_notional = position.quantity * price
+            allowed = int(max(0.0, cap - held_notional) / price)
+
+            if allowed < quantity:
+                logger.info(
+                    f"[Coordinator] ADD 단일종목 상한 적용 {ticker}: "
+                    f"{quantity}주 -> {allowed}주 "
+                    f"(천장 {cap / 1e4:,.0f}만원, 보유 {held_notional / 1e4:,.0f}만원)"
+                )
+            return min(quantity, allowed)
+        except Exception as e:
+            logger.warning(
+                f"[Coordinator] ADD 단일종목 상한 계산 실패 {ticker}: {e} — 캡 미적용"
+            )
+            return quantity
+
     async def _add_to_position(
         self, ticker: str, quantity: int, decision_id: Optional[str] = None
     ) -> Optional[OrderResult]:
@@ -3069,6 +3141,35 @@ class ExecutionCoordinator:
                     message="유동성 캡 — 총 포지션이 ADTV 참여율 상한을 초과",
                 )
             quantity = clamped
+
+        # 단일 종목 상한 (2026-08-05). 진입 BUY는 `on_trade_approved` ->
+        # `calculate_allocation` -> `_calculate_max_position_value`로
+        # max_single_position_pct / risk_score 버킷 / R-사이징 캡을 전부
+        # 받는데, 이 ADD 경로만 `OrderRequest`를 직접 만들어 그 앞을 지나가지
+        # 않았다. 슬롯 상한이 ADD를 구조적으로 막고 있던 동안에는 무해했지만
+        # (2026-08-05에 그 브레이크를 풀었다), 그 뒤로는 노출을 키우는 유일한
+        # 경로가 총량 상한 없이 복리로 늘어난다 —
+        # `add_position_pct=0.25`라 재평가마다 ×1.25이고, 라이브 실측으로
+        # 하루 7회면 계좌의 약 13%가 한 종목에 실린다.
+        #
+        # 유동성 캡과 같은 규약: 기준은 추가분이 아니라 **총 포지션**이다.
+        clamped = self._clamp_add_for_position_cap(ticker, quantity, position)
+        if clamped <= 0:
+            logger.warning(
+                f"[Coordinator] ADD 단일종목 상한 차단 {ticker}: "
+                f"{quantity}주 요청 -> 0주 (총 포지션이 이미 상한 도달)"
+            )
+            return OrderResult(
+                order_id="",
+                ticker=ticker,
+                side=OrderSide.BUY,
+                requested_quantity=quantity,
+                filled_quantity=0,
+                avg_price=0,
+                status=ORDER_STATUS_REJECTED_POSITION_CAP,
+                message="단일 종목 상한 — 총 포지션이 계좌 비중 천장에 도달",
+            )
+        quantity = clamped
 
         order = OrderRequest(
             ticker=ticker,
