@@ -84,6 +84,12 @@ async def write_daily_snapshot(coordinator: Any, storage: Any, trade_date: str) 
         balance = await client.get_account_balance()
 
         equity = balance.total_value
+        # stock_value: 현금을 뺀 "주식만" 평가액 합계 -- 슬리브 변동성 계산
+        # (모듈 docstring 참고)의 재료로 지금부터 쌓는다. balance.evlu_amt
+        # (브로커의 tot_est_amt)도 개념상 같은 값이지만, holdings에서 직접
+        # 합산해 그 필드의 브로커 매핑이 바뀌어도 이 계산이 조용히 틀어지지
+        # 않게 한다.
+        stock_value = sum(h.evlu_amt for h in balance.holdings)
         # ka10074's realized_pnl (rlzt_pl) is already NET of commission/tax —
         # see paper_performance.build_performance_report's docstring for the
         # documented proof. commission/tax are reference cost breakdowns
@@ -108,6 +114,7 @@ async def write_daily_snapshot(coordinator: Any, storage: Any, trade_date: str) 
             "loss_trades": loss_trades,
             "cumulative_return_pct": cumulative_return_pct,
             "regime_snapshot_id": None,  # Phase 5
+            "stock_value": stock_value,
         }
         return await storage.save_daily_perf_snapshot(record)
     except Exception as e:

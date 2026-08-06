@@ -411,6 +411,71 @@ class StorageService:
                     {"gate_reason": "TEXT", "open_positions_count": "INTEGER"},
                 )
 
+                # exposure_shadow (포트폴리오 목표 노출도, 관측 단계,
+                # 2026-08-06): 5분마다 "공식이 말한 목표"와 "실제 비중"을 나란히
+                # 적는다. 이 단계에서는 기록만 하고 사이징에 연결하지 않는다 --
+                # 2~3주 뒤 slot_contest와 대조해 "슬롯이 거절된 순간 공식이
+                # 말한 여유가 얼마였는가"에 답하기 위한 재료다.
+                # accrete-style: 시각마다 자기 행을 덧붙인다.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS exposure_shadow (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        target_pct REAL NOT NULL,
+                        actual_pct REAL,
+                        equity REAL,
+                        stock_value REAL,
+                        m_regime REAL,
+                        m_vol REAL,
+                        m_evidence REAL,
+                        m_drawdown REAL,
+                        binding TEXT,
+                        degraded TEXT,
+                        index_vol_annualized REAL,
+                        index_vol_n INTEGER,
+                        n_round_trips INTEGER,
+                        e_base REAL,
+                        e_max REAL,
+                        equity_peak REAL
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_exposure_shadow_trade_date "
+                    "ON exposure_shadow(trade_date)"
+                )
+
+                # exposure_shadow.e_base/e_max/equity_peak (리뷰 반영,
+                # 2026-08-06): e_base/e_max는 이전까지 호출자가 넘기지 않아
+                # 늘 함수 기본값이었고 행에도 없었다 -- 관측 기간 중 이
+                # 노브를 튜닝하면(그것이 이 관측 창의 목적이다) 그 시점
+                # 이전 행들이 전부 조용히 다른 의미가 되는데, 행에 값이
+                # 없으면 그 경계를 나중에 가려낼 수 없다. equity_peak은
+                # m_drawdown으로 역산 가능하지만 바닥 클램프(0.3)이거나
+                # m_drawdown==1.0인 두 경우(가장 캐봐야 할 경우들)에는
+                # 역산이 안 된다. CREATE TABLE에 이미 넣었지만, 이 세
+                # 컬럼이 추가되기 전에 이미 만들어진 DB 파일에는
+                # CREATE TABLE IF NOT EXISTS가 no-op이므로 ALTER로 채운다
+                # -- 이 프로젝트에 마이그레이션 메커니즘이 없다.
+                await self._ensure_columns(
+                    conn,
+                    "exposure_shadow",
+                    {"e_base": "REAL", "e_max": "REAL", "equity_peak": "REAL"},
+                )
+
+                # daily_perf_snapshot.stock_value: 현금 희석을 제거한 "주식
+                # 슬리브" 변동성으로 갈아타려면 일별 주식 평가액이 필요한데
+                # 지금 어디에도 없었다. write_daily_snapshot
+                # (services/trading/eod_snapshot.py)이 보유종목 평가금액
+                # 합계를 채운다(리뷰 반영, 2026-08-06 -- 이전까지는 컬럼만
+                # 있고 쓰는 곳이 없어 한 달 뒤 전량 NULL이 될 판이었다).
+                # 지금부터 쌓아 한 달 뒤 슬리브 변동성 계산에 쓴다.
+                await self._ensure_columns(
+                    conn,
+                    "daily_perf_snapshot",
+                    {"stock_value": "REAL"},
+                )
+
                 # agent_chat_decisions.agent_weights (Phase4 T4): persists the
                 # consensus weights (default or calibration-tilted) actually
                 # used to reach this decision, as a JSON TEXT blob — without
@@ -1130,7 +1195,8 @@ class StorageService:
         Args:
             record: dict with keys trade_date, equity, realized_pnl,
                 commission, tax, net_pnl, win_trades, loss_trades,
-                cumulative_return_pct, and optionally regime_snapshot_id.
+                cumulative_return_pct, and optionally regime_snapshot_id,
+                stock_value.
 
         Returns:
             True if the statement executed successfully (including when the
@@ -1145,8 +1211,8 @@ class StorageService:
                     INSERT OR IGNORE INTO daily_perf_snapshot
                     (trade_date, equity, realized_pnl, commission, tax,
                      net_pnl, win_trades, loss_trades, cumulative_return_pct,
-                     regime_snapshot_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     regime_snapshot_id, stock_value)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["trade_date"],
@@ -1159,6 +1225,7 @@ class StorageService:
                         record.get("loss_trades"),
                         record.get("cumulative_return_pct"),
                         record.get("regime_snapshot_id"),
+                        record.get("stock_value"),
                     ),
                 )
                 await conn.commit()
@@ -2605,6 +2672,182 @@ class StorageService:
                 "slot_contest_save_failed", ticker=challenger_ticker, error=str(e)
             )
             return False
+
+    # -------------------------------------------
+    # Exposure Shadow (portfolio target exposure, observation-only)
+    # -------------------------------------------
+
+    async def insert_exposure_shadow(
+        self,
+        *,
+        trade_date: str,
+        target,            # TargetExposure — 순환 import를 피해 타입 힌트 생략
+        equity: float,
+        stock_value: float,
+        actual_pct: float,
+        n_round_trips: Optional[int],
+        e_base: Optional[float] = None,
+        e_max: Optional[float] = None,
+        equity_peak: Optional[float] = None,
+    ) -> bool:
+        """목표 노출도 1행을 적는다. 실패-무해 — False만 돌려주고 raise 안 한다.
+
+        `degraded`는 콤마로 join해 저장한다. 리스트가 비면 빈 문자열이다
+        (NULL과 구별된다 -- NULL은 "기록 안 됨", 빈 문자열은 "저하 없음").
+
+        `e_base`/`e_max`/`equity_peak`은 이 행을 만든 계산에 실제로 쓰인
+        값을 그대로 넘겨야 한다 -- 함수 기본값에 의존하면 나중에 어떤
+        값이 실제로 쓰였는지 알 길이 없다(리뷰 반영, 2026-08-06). 선택
+        인자로 둔 것은 순수하게 하위호환 때문이다: 넘기지 않으면 NULL로
+        남는다("몰랐다"는 NULL로 남지, 임의로 추정하지 않는다).
+
+        `n_round_trips`는 nullable이다 -- 조회 실패로 계산에는 대체값
+        (EVIDENCE_TARGET_TRIPS)을 넣었더라도 이 컬럼에는 None을 넘겨야
+        한다. 대체값을 그대로 저장하면 `AVG(n_round_trips)` 같은 사후
+        집계가 측정값과 대체값을 구분 못 하고 섞인다(리뷰 반영,
+        2026-08-06).
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO exposure_shadow
+                    (id, trade_date, target_pct, actual_pct, equity, stock_value,
+                     m_regime, m_vol, m_evidence, m_drawdown, binding, degraded,
+                     index_vol_annualized, index_vol_n, n_round_trips,
+                     e_base, e_max, equity_peak)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        trade_date,
+                        target.target_pct,
+                        actual_pct,
+                        equity,
+                        stock_value,
+                        target.m_regime,
+                        target.m_vol,
+                        target.m_evidence,
+                        target.m_drawdown,
+                        target.binding,
+                        ",".join(target.degraded),
+                        target.index_vol_annualized,
+                        target.index_vol_n,
+                        n_round_trips,
+                        e_base,
+                        e_max,
+                        equity_peak,
+                    ),
+                )
+                await conn.commit()
+            return True
+        except Exception as e:
+            logger.warning("exposure_shadow_insert_failed", error=str(e))
+            return False
+
+    async def get_exposure_shadow(self, trade_date: str) -> list[dict]:
+        """해당 거래일의 목표 노출도 행을 시각순으로 돌려준다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM exposure_shadow WHERE trade_date = ? "
+                    "ORDER BY created_at",
+                    (trade_date,),
+                )
+                return [dict(row) for row in await cursor.fetchall()]
+        except Exception as e:
+            logger.warning("exposure_shadow_read_failed", error=str(e))
+            return []
+
+    async def get_recent_index_returns(
+        self, limit: int = 20
+    ) -> Optional[list[float]]:
+        """최근 `limit` 거래일의 KOSPI 일별 등락률(%). 오래된 것부터.
+
+        기록이 아직 없어 결과가 진짜로 비어 있으면 `[]`(유효한 데이터 --
+        "지수 이력이 짧다"). 조회 자체가 실패하면 `None`을 돌려준다 --
+        `[]`로 뭉개면 호출자(`_record_exposure_shadow`)가 "이력이 짧다"와
+        "조회가 실패했다"를 구분할 수 없다. 이 파일의 다른 세 노출도 조회
+        헬퍼(get_latest_regime_label/count_round_trips/get_equity_peak)와
+        같은 규약이다(리뷰 반영, 2026-08-06)."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT index_kospi_chg_pct FROM regime_snapshot "
+                    "WHERE index_kospi_chg_pct IS NOT NULL "
+                    "ORDER BY trade_date DESC LIMIT ?",
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+            return [float(r[0]) for r in reversed(rows)]
+        except Exception as e:
+            logger.warning("index_returns_read_failed", error=str(e))
+            return None
+
+    async def get_latest_regime_label(self) -> Optional[str]:
+        """가장 최근 레짐 라벨. 아직 기록이 없거나 조회 자체가 실패하면
+        None -- "레짐 미기록"과 "neutral 레짐"은 서로 다른 사실이고,
+        여기서 뭉개면 나중에 구분할 수 없다(리뷰 반영, 2026-08-06).
+        호출자(`_record_exposure_shadow`)가 None을 감지해 'neutral'로
+        치환하고 `degraded`에 `regime_read_failed`를 남긴다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT regime_label FROM regime_snapshot "
+                    "ORDER BY trade_date DESC LIMIT 1"
+                )
+                row = await cursor.fetchone()
+            return row[0] if row and row[0] else None
+        except Exception as e:
+            logger.warning("regime_label_read_failed", error=str(e))
+            return None
+
+    async def count_round_trips(self) -> Optional[int]:
+        """완료된 왕복 거래 수.
+
+        `kr_realized_pnl`의 행은 거래가 아니라 **부분체결 슬라이스**이고
+        `stk_cd='ALL'`인 계좌 백필 행이 섞여 있다. (stk_cd, entry_at)로 접고
+        백필을 제외해야 실제 왕복 수가 나온다 -- 접지 않으면 22, 접으면 8이다.
+
+        조회 자체가 실패하면 None을 돌려준다 -- 0은 "아직 왕복이 없다"는
+        유효한 결과이고 None은 "셀 수 없었다"는 뜻이라 서로 다르다(리뷰
+        반영, 2026-08-06). 0으로 뭉개면 호출자가 증거 부족(m_evidence 바닥
+        클램프)과 조회 실패를 구분할 수 없다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT stk_cd, entry_at FROM kr_realized_pnl "
+                    "  WHERE stk_cd != 'ALL' GROUP BY stk_cd, entry_at"
+                    ")"
+                )
+                row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+        except Exception as e:
+            logger.warning("round_trip_count_failed", error=str(e))
+            return None
+
+    async def get_equity_peak(self) -> Optional[float]:
+        """일별 스냅샷 중 최고 자산. 스냅샷이 아직 없으면 0.0(유효한 결과 --
+        첫 관측이라 낙폭 배수가 중립인 게 맞다), 조회 자체가 실패하면
+        None을 돌려준다(리뷰 반영, 2026-08-06)."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT MAX(equity) FROM daily_perf_snapshot"
+                )
+                row = await cursor.fetchone()
+            return float(row[0]) if row and row[0] else 0.0
+        except Exception as e:
+            logger.warning("equity_peak_read_failed", error=str(e))
+            return None
 
     async def get_slot_contests(self, limit: int = 200) -> list[dict[str, Any]]:
         """Read back slot_contest rows, newest first. Empty list on any

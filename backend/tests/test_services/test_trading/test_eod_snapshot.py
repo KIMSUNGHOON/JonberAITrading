@@ -18,7 +18,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.kiwoom.models import AccountBalance, DailyRealizedPnlRow, RealizedPnl
+from services.kiwoom.models import (
+    AccountBalance,
+    DailyRealizedPnlRow,
+    Holding,
+    RealizedPnl,
+)
 from services.storage_service import StorageService
 from services.trading.eod_snapshot import _BACKFILL_STK_CD_SENTINEL, write_daily_snapshot
 
@@ -62,14 +67,14 @@ def _pnl(realized=50000, commission=500, tax=284, dt="20260715") -> RealizedPnl:
     )
 
 
-def _balance(evlu_amt=500_500_000, d2=10_000_000) -> AccountBalance:
+def _balance(evlu_amt=500_500_000, d2=10_000_000, holdings=None) -> AccountBalance:
     return AccountBalance(
         pchs_amt=490_000_000,
         evlu_amt=evlu_amt,
         evlu_pfls_amt=evlu_amt - 490_000_000,
         evlu_pfls_rt=1.0,
         d2_ord_psbl_amt=d2,
-        holdings=[],
+        holdings=holdings if holdings is not None else [],
     )
 
 
@@ -134,6 +139,38 @@ async def test_write_daily_snapshot_writes_one_row(tmp_path):
     assert row["loss_trades"] == 1
     assert row["cumulative_return_pct"] is not None
     assert row["regime_snapshot_id"] is None
+
+
+async def test_write_daily_snapshot_persists_nonnull_stock_value(tmp_path):
+    """stock_value는 Task 3에서 컬럼만 추가되고 아무도 쓰지 않아 한 달 뒤
+    전량 NULL이 될 판이었다(리뷰 반영, 2026-08-06) -- 이 테스트는 실제로
+    보유종목 평가금액 합계가 저장되는지 잠근다."""
+    trade_date = "2026-07-15"
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+
+    holdings = [
+        Holding(
+            stk_cd="005930", stk_nm="삼성전자", hldg_qty=10,
+            avg_buy_prc=70000, cur_prc=72000, evlu_amt=720_000,
+            evlu_pfls_amt=20000, evlu_pfls_rt=2.86,
+        ),
+        Holding(
+            stk_cd="000660", stk_nm="SK하이닉스", hldg_qty=5,
+            avg_buy_prc=100000, cur_prc=95000, evlu_amt=475_000,
+            evlu_pfls_amt=-25000, evlu_pfls_rt=-5.0,
+        ),
+    ]
+    coordinator = _StubCoordinator(
+        _StubClient(_pnl(), _balance(holdings=holdings))
+    )
+
+    ok = await write_daily_snapshot(coordinator, storage, trade_date)
+    assert ok is True
+
+    rows = await storage.get_daily_perf_snapshots()
+    assert len(rows) == 1
+    assert rows[0]["stock_value"] is not None
+    assert rows[0]["stock_value"] == pytest.approx(1_195_000)
 
 
 async def test_write_daily_snapshot_second_call_same_date_is_noop(tmp_path):

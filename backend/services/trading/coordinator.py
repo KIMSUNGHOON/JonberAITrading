@@ -85,6 +85,10 @@ ORDER_STATUS_REJECTED_LIQUIDITY_CAP = "rejected_liquidity_cap"
 # 운영 판단에서 다르다.
 ORDER_STATUS_REJECTED_POSITION_CAP = "rejected_position_cap"
 
+# 목표 노출도 섀도 기록 주기(초). 장중 390분 ÷ 5분 = 하루 약 78행 —
+# 슬롯 거절 시점과 최대 5분 차이라 대조에 충분하고, 연 2만 행이라 무시할 양이다.
+EXPOSURE_SHADOW_INTERVAL_SECONDS: int = 300
+
 _DISCOVERY_SCAN_TIMEOUT_SECONDS = 5400.0
 _DISCOVERY_SCAN_POLL_INTERVAL_SECONDS = 5.0
 
@@ -244,6 +248,10 @@ class ExecutionCoordinator:
         # entry-candidate prices went stale for the whole session. Same
         # lifecycle shape as _queue_scheduler_task above.
         self._watch_refresh_task: Optional[asyncio.Task] = None
+
+        # Portfolio-exposure shadow recording loop (관측 전용, 2026-08-06):
+        # same idempotent-guard lifecycle shape as the two tasks above.
+        self._exposure_shadow_task: Optional[asyncio.Task] = None
 
         # E2-2: market-gate last-known state for _refresh_watch_prices, for
         # the transition-only log helper below (None = not yet observed
@@ -477,6 +485,12 @@ class ExecutionCoordinator:
                 self._watch_refresh_loop()
             )
 
+        # 목표 노출도 섀도 기록 (관측 전용, 같은 idempotent 가드 형태).
+        if self._exposure_shadow_task is None or self._exposure_shadow_task.done():
+            self._exposure_shadow_task = asyncio.create_task(
+                self._exposure_shadow_loop()
+            )
+
     async def resume_if_persisted(self) -> bool:
         """부팅 시 호출 — 마지막으로 저장된 mode가 active/paused면 방어를
         되살린다. 실제로 재개했으면 True, no-op이면 False.
@@ -564,6 +578,11 @@ class ExecutionCoordinator:
         if self._watch_refresh_task is not None:
             self._watch_refresh_task.cancel()
             self._watch_refresh_task = None
+
+        # Stop the exposure-shadow recording loop.
+        if self._exposure_shadow_task is not None:
+            self._exposure_shadow_task.cancel()
+            self._exposure_shadow_task = None
 
         # Persist mode on shutdown -- unconditional (IMPORTANT 3, 2026-07-29).
         # A stop() on a coordinator that never start()ed in THIS process
@@ -2436,6 +2455,126 @@ class ExecutionCoordinator:
                     if w.status == WatchStatus.ACTIVE
                 )
                 await asyncio.sleep(compute_watch_ttl(active_count))
+        except asyncio.CancelledError:
+            pass
+
+    async def _record_exposure_shadow(self) -> None:
+        """목표 노출도를 계산해 1행 적는다. never-raise.
+
+        관측 전용 (2026-08-06). 이 메서드는 주문 수량·게이트·사이징을 일절
+        건드리지 않는다 -- 계산해서 기록만 한다.
+        """
+        try:
+            if not is_krx_open_cached():
+                return
+
+            account = getattr(self._state, "account", None)
+            equity = float(getattr(account, "total_equity", 0) or 0)
+            if equity <= 0 or not math.isfinite(equity):
+                # 0으로 채운 행은 나중에 진짜 0과 구분되지 않는다.
+                return
+
+            stock_value = sum(
+                p.quantity * p.current_price for p in self._state.positions
+            )
+
+            # get_storage_service가 모듈 상단(:55)에도 import돼 있지만,
+            # 여기서 다시 지역 import하는 이유는 테스트가
+            # patch("services.storage_service.get_storage_service")로
+            # 원본 모듈의 속성을 갈아끼우기 때문이다 -- 함수 호출 시점에
+            # 다시 조회해야 그 패치가 반영된다. "죽은 코드"로 보고 지우면
+            # 이 메서드를 겨냥한 4개 테스트가 전부 깨진다.
+            from services.storage_service import get_storage_service
+            from services.trading.exposure_target import (
+                E_BASE_DEFAULT,
+                E_MAX_DEFAULT,
+                EVIDENCE_TARGET_TRIPS,
+                compute_target_exposure,
+            )
+
+            storage = await get_storage_service()
+            trade_date = datetime.now().strftime("%Y-%m-%d")
+
+            # 아래 네 조회는 각각 실패 시 None을 돌려준다(그럴싸한 기본값
+            # 대신) -- "[]"/"neutral"/0/0.0으로 조용히 뭉개면 진짜 값과
+            # 조회 실패가 나중에 구분되지 않는다(리뷰 반영, 2026-08-06).
+            # None을 만나면 계산에는 중립을 만드는 값을 넣되
+            # (annualized_vol이 표본 부족일 때 m_vol=1.0을 쓰는 것과 같은
+            # 관례), degraded에 원인을 남겨 이 행이 "진짜 중립"이 아니라
+            # "조회 실패로 중립 취급"임을 나중에 걸러낼 수 있게 한다. 행
+            # 자체는 계속 쓴다 -- 버리면 시간당 ~78행 관측이 구멍나
+            # 건강성 점검을 왜곡한다.
+            index_returns_raw = await storage.get_recent_index_returns(limit=20)
+            index_returns_read_failed = index_returns_raw is None
+            index_returns = index_returns_raw if index_returns_raw is not None else []
+
+            regime_label = await storage.get_latest_regime_label()
+            regime_read_failed = regime_label is None
+            if regime_read_failed:
+                regime_label = "neutral"
+
+            n_round_trips = await storage.count_round_trips()
+            round_trips_read_failed = n_round_trips is None
+            if round_trips_read_failed:
+                # EVIDENCE_TARGET_TRIPS를 넣으면 m_evidence=1.0(중립) --
+                # 0을 넣으면 EXPOSURE_FLOOR로 클램프돼 "증거가 얇다"는
+                # 진짜 신호와 똑같아 보인다. 이 대체값은 계산에만 쓴다 --
+                # 저장용 n_round_trips_for_row는 따로 둬서 이 40이
+                # "측정된 왕복 수"로 오인되지 않게 한다(리뷰 반영,
+                # 2026-08-06).
+                n_round_trips = EVIDENCE_TARGET_TRIPS
+            n_round_trips_for_row = None if round_trips_read_failed else n_round_trips
+
+            equity_peak_raw = await storage.get_equity_peak()
+            equity_peak_read_failed = equity_peak_raw is None
+            equity_peak = max(equity, float(equity_peak_raw or 0.0))
+
+            target = compute_target_exposure(
+                equity=equity,
+                stock_value=stock_value,
+                index_returns=index_returns,
+                regime_label=regime_label,
+                n_round_trips=n_round_trips,
+                equity_peak=equity_peak,
+                e_base=E_BASE_DEFAULT,
+                e_max=E_MAX_DEFAULT,
+            )
+
+            # TargetExposure.degraded는 평범한 mutable 리스트라 계산 후에
+            # 덧붙여도 안전하다.
+            if index_returns_read_failed:
+                target.degraded.append("index_returns_read_failed")
+            if regime_read_failed:
+                target.degraded.append("regime_read_failed")
+            if round_trips_read_failed:
+                target.degraded.append("round_trips_read_failed")
+            if equity_peak_read_failed:
+                target.degraded.append("equity_peak_read_failed")
+
+            await storage.insert_exposure_shadow(
+                trade_date=trade_date,
+                target=target,
+                equity=equity,
+                stock_value=stock_value,
+                actual_pct=stock_value / equity,
+                n_round_trips=n_round_trips_for_row,
+                e_base=E_BASE_DEFAULT,
+                e_max=E_MAX_DEFAULT,
+                equity_peak=equity_peak,
+            )
+        except Exception as e:
+            logger.warning(f"[Coordinator] exposure shadow record failed: {e}")
+
+    async def _exposure_shadow_loop(self) -> None:
+        """5분마다 `_record_exposure_shadow`를 돌린다.
+
+        `_watch_refresh_loop`/`_queue_scheduler_loop`와 같은 생명주기 --
+        start()에서 생성, stop()에서 취소.
+        """
+        try:
+            while True:
+                await self._record_exposure_shadow()
+                await asyncio.sleep(EXPOSURE_SHADOW_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             pass
 
