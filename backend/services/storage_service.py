@@ -411,6 +411,46 @@ class StorageService:
                     {"gate_reason": "TEXT", "open_positions_count": "INTEGER"},
                 )
 
+                # exposure_shadow (포트폴리오 목표 노출도, 관측 단계,
+                # 2026-08-06): 5분마다 "공식이 말한 목표"와 "실제 비중"을 나란히
+                # 적는다. 이 단계에서는 기록만 하고 사이징에 연결하지 않는다 --
+                # 2~3주 뒤 slot_contest와 대조해 "슬롯이 거절된 순간 공식이
+                # 말한 여유가 얼마였는가"에 답하기 위한 재료다.
+                # accrete-style: 시각마다 자기 행을 덧붙인다.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS exposure_shadow (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        target_pct REAL NOT NULL,
+                        actual_pct REAL,
+                        equity REAL,
+                        stock_value REAL,
+                        m_regime REAL,
+                        m_vol REAL,
+                        m_evidence REAL,
+                        m_drawdown REAL,
+                        binding TEXT,
+                        degraded TEXT,
+                        index_vol_annualized REAL,
+                        index_vol_n INTEGER,
+                        n_round_trips INTEGER
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_exposure_shadow_trade_date "
+                    "ON exposure_shadow(trade_date)"
+                )
+
+                # daily_perf_snapshot.stock_value: 현금 희석을 제거한 "주식
+                # 슬리브" 변동성으로 갈아타려면 일별 주식 평가액이 필요한데
+                # 지금 어디에도 없다. 지금부터 쌓아 한 달 뒤 쓴다.
+                await self._ensure_columns(
+                    conn,
+                    "daily_perf_snapshot",
+                    {"stock_value": "REAL"},
+                )
+
                 # agent_chat_decisions.agent_weights (Phase4 T4): persists the
                 # consensus weights (default or calibration-tilted) actually
                 # used to reach this decision, as a JSON TEXT blob — without
@@ -2605,6 +2645,76 @@ class StorageService:
                 "slot_contest_save_failed", ticker=challenger_ticker, error=str(e)
             )
             return False
+
+    # -------------------------------------------
+    # Exposure Shadow (portfolio target exposure, observation-only)
+    # -------------------------------------------
+
+    async def insert_exposure_shadow(
+        self,
+        *,
+        trade_date: str,
+        target,            # TargetExposure — 순환 import를 피해 타입 힌트 생략
+        equity: float,
+        stock_value: float,
+        actual_pct: float,
+        n_round_trips: int,
+    ) -> bool:
+        """목표 노출도 1행을 적는다. 실패-무해 — False만 돌려주고 raise 안 한다.
+
+        `degraded`는 콤마로 join해 저장한다. 리스트가 비면 빈 문자열이다
+        (NULL과 구별된다 -- NULL은 "기록 안 됨", 빈 문자열은 "저하 없음").
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO exposure_shadow
+                    (id, trade_date, target_pct, actual_pct, equity, stock_value,
+                     m_regime, m_vol, m_evidence, m_drawdown, binding, degraded,
+                     index_vol_annualized, index_vol_n, n_round_trips)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        trade_date,
+                        target.target_pct,
+                        actual_pct,
+                        equity,
+                        stock_value,
+                        target.m_regime,
+                        target.m_vol,
+                        target.m_evidence,
+                        target.m_drawdown,
+                        target.binding,
+                        ",".join(target.degraded),
+                        target.index_vol_annualized,
+                        target.index_vol_n,
+                        n_round_trips,
+                    ),
+                )
+                await conn.commit()
+            return True
+        except Exception as e:
+            logger.warning("exposure_shadow_insert_failed", error=str(e))
+            return False
+
+    async def get_exposure_shadow(self, trade_date: str) -> list[dict]:
+        """해당 거래일의 목표 노출도 행을 시각순으로 돌려준다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM exposure_shadow WHERE trade_date = ? "
+                    "ORDER BY created_at",
+                    (trade_date,),
+                )
+                return [dict(row) for row in await cursor.fetchall()]
+        except Exception as e:
+            logger.warning("exposure_shadow_read_failed", error=str(e))
+            return []
 
     async def get_slot_contests(self, limit: int = 200) -> list[dict[str, Any]]:
         """Read back slot_contest rows, newest first. Empty list on any
