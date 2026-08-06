@@ -110,3 +110,43 @@ class TestUnknownRegimeIsRecorded:
         r = compute_target_exposure(**_args(regime_label="누가봐도이상한값"))
         assert r.m_regime == pytest.approx(1.0)
         assert "regime_unknown" in r.degraded
+
+
+class TestDegradedRecordsOnlyWhenSignalExistedButFailed:
+    """degraded는 판정에 쓸 신호가 있었는데 못 쓴 경우만 기록한다.
+
+    반대로 신호가 애초에 존재하지 않아 항등원을 쓰는 경우(no history, equity_peak=0)와
+    계산 결과가 정당하게 1.0인 경우(낙폭 없음, equity == equity_peak)는
+    사실이지 저하가 아니므로 기록하지 않는다. degraded는 "무언가 잘못됐다"는
+    신호이어야 하므로, 둘을 섞으면 그 값을 잃는다.
+    """
+
+    def test_no_history_is_not_a_degradation(self):
+        """신규 계좌(equity_peak=0) → drawdown 계산이 항등원 1.0을 쓴다.
+
+        이는 신호 부족이 아니라 사실이므로, equity_peak_invalid 같은 항목을
+        degraded에 추가하지 않는다. 유일한 degraded 항목은 staged placeholder
+        'index_vol_not_implemented'이어야 한다.
+        """
+        r = compute_target_exposure(**_args(equity_peak=0.0))
+        assert r.m_drawdown == pytest.approx(1.0)
+        assert r.degraded == ["index_vol_not_implemented"]
+
+    def test_no_drawdown_is_not_a_degradation(self):
+        """정상 상태(equity == equity_peak) → drawdown 없음.
+
+        계산 결과가 정당하게 1.0이므로, 이를 degraded에 기록하지 않는다.
+        """
+        r = compute_target_exposure(**_args(equity=497_403_042.0, equity_peak=497_403_042.0))
+        assert r.m_drawdown == pytest.approx(1.0)
+        assert r.degraded == ["index_vol_not_implemented"]
+
+    def test_signal_existed_but_failed_is_recorded(self):
+        """Unknown regime는 신호(regime_label)가 있었는데 못 썼으므로 기록된다.
+
+        이는 위의 두 경우(신호 자체가 없거나 계산이 정당함)와 다르다.
+        Test reference: TestUnknownRegimeIsRecorded.test_unknown_regime_is_neutral_but_flagged
+        """
+        r = compute_target_exposure(**_args(regime_label="unknown_regime_value"))
+        assert r.m_regime == pytest.approx(1.0)
+        assert "regime_unknown" in r.degraded
