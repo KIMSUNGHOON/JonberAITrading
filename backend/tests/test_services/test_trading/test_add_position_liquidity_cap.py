@@ -12,6 +12,8 @@ exposure-increasing 경로였다.
 (라이브 094840 실측: ADTV 5.3억 -> 캡 265만원인데 이미 1,729만원 보유 = 6.5배).
 """
 
+from datetime import date as _dt_date
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -56,11 +58,21 @@ def coord():
     """_add_to_position만 실행 가능한 최소 coordinator."""
     from services.trading.coordinator import ExecutionCoordinator
 
+    from datetime import date
+
+    from services.trading.models import RiskParameters
+
     c = ExecutionCoordinator.__new__(ExecutionCoordinator)
     c._state = MagicMock()
     c._state.positions = [_position()]
+    # `_add_to_position`이 일일 거래 상한을 보게 되면서(2026-08-06) 생긴 의존성.
+    # MagicMock은 비교 연산에서 TypeError를 내므로 실제 값을 넣어야 한다.
+    c._state.daily_trades_count = 0
+    c._daily_count_day = date.today()
+    c.risk_params = RiskParameters(max_daily_trades=10)
     c._execute_order = AsyncMock(return_value=_fill(0))
     c._add_position = MagicMock()
+    c._schedule_persist = MagicMock()
     c.portfolio_agent = MagicMock()
     return c
 
@@ -286,8 +298,15 @@ class TestAddRespectsSinglePositionCap:
         c._state.account = AccountInfo(
             total_equity=497_403_042.0, available_cash=449_360_601.0
         )
-        params = RiskParameters(max_single_position_pct=0.03, risk_budget_pct=0.75)
+        params = RiskParameters(
+            max_single_position_pct=0.03, risk_budget_pct=0.75, max_daily_trades=10
+        )
         c.risk_params = params
+        # 일일 상한 의존성(2026-08-06) — 이 클래스는 단일 종목 상한만 보므로
+        # 예산은 넉넉히 열어 둔다.
+        c._state.daily_trades_count = 0
+        c._daily_count_day = _dt_date.today()
+        c._schedule_persist = MagicMock()
         c.portfolio_agent = PortfolioAgent(risk_params=params)
         # 유동성은 이 시나리오에서 binding이 아니다(대형주) — 격리해서 본다.
         c.portfolio_agent._resolve_adtv = AsyncMock(return_value=1_000 * 억)
@@ -330,3 +349,96 @@ class TestAddRespectsSinglePositionCap:
         assert result.status == ORDER_STATUS_REJECTED_POSITION_CAP
         assert result.filled_quantity == 0
         coord._execute_order.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# 일일 거래 상한 (2026-08-06) — ADD도 예산을 받는다
+# ---------------------------------------------------------------------------
+
+
+class TestAddRespectsDailyTradeCap:
+    """자율 ADD도 `max_daily_trades`를 받아야 한다.
+
+    검사(`on_trade_approved`)와 증가(`_execute_order`)가 서로 다른 함수에 있고,
+    `_add_to_position`은 `_execute_order`로 직행해 검사를 우회한다. ADD가 한 번도
+    체결되지 않던 동안에는 무해했으나, 슬롯 상한 수정으로 ADD가 실제로 나가기
+    시작하면 예산을 **소비하면서 그 상한은 받지 않는** 상태가 된다.
+
+    실측 추정(2026-08-06 종가 기준): 보유 5종이 각자 3% 천장에 닿을 때까지
+    25%씩 늘면 하루 약 12회 — 상한 10을 넘는다. 그러면 카운터가 상한을 지나
+    올라가고 그 뒤 신규 진입 BUY가 막힌다.
+
+    ⚠️ 검사는 `_add_to_position`에만 넣는다. 공유 `_execute_order`에 넣으면
+    손절 SELL까지 예산에 걸려, 예산 소진이 곧 방어 정지가 된다 — 일일 손실
+    브레이커를 노출 증가 액션에만 걸도록 좁힌 것(S-1/D3)과 같은 이유다.
+    """
+
+    @pytest.fixture
+    def coord(self):
+        """모듈 픽스처에 risk_params와 daily_count_date를 얹는다.
+
+        모듈 픽스처는 유동성 캡만 보므로 이 둘이 없다. MagicMock인 _state가
+        daily_count_date를 자동 생성하면 date 비교에서 터지므로 실제 date를 넣는다.
+        """
+        from datetime import date
+
+        from services.trading.coordinator import ExecutionCoordinator
+        from services.trading.models import RiskParameters
+
+        c = ExecutionCoordinator.__new__(ExecutionCoordinator)
+        c._state = MagicMock()
+        c._state.positions = [_position()]
+        c._state.daily_trades_count = 0
+        c._daily_count_day = date.today()
+        c.risk_params = RiskParameters(max_daily_trades=10)
+        c._execute_order = AsyncMock(return_value=_fill(0))
+        c._add_position = MagicMock()
+        c._schedule_persist = MagicMock()
+        c.portfolio_agent = MagicMock()
+        return c
+
+    @pytest.mark.asyncio
+    async def test_add_refused_when_daily_budget_exhausted(self, coord):
+        from services.trading.coordinator import ORDER_STATUS_REJECTED_DAILY_LIMIT
+
+        coord.portfolio_agent._resolve_adtv = AsyncMock(return_value=200 * 억)
+        coord._state.daily_trades_count = 10
+        coord.risk_params.max_daily_trades = 10
+
+        result = await coord._add_to_position("094840", quantity=100)
+
+        assert result is not None, "None이면 호출자가 원장 불일치로 오진한다"
+        assert result.status == ORDER_STATUS_REJECTED_DAILY_LIMIT
+        assert result.filled_quantity == 0
+        coord._execute_order.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_allowed_below_the_budget(self, coord):
+        coord.portfolio_agent._resolve_adtv = AsyncMock(return_value=200 * 억)
+        coord._state.daily_trades_count = 9
+        coord.risk_params.max_daily_trades = 10
+        coord._execute_order = AsyncMock(return_value=_fill(100))
+
+        await coord._add_to_position("094840", quantity=100)
+
+        coord._execute_order.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_daily_count_is_rolled_over_before_reading(self, coord):
+        """어제 소진한 카운트가 오늘을 막으면 안 된다.
+
+        `daily_trades_count`는 lazy 롤오버라, 읽기 전에
+        `_maybe_reset_daily_trades()`를 태우지 않으면 어제 값으로 판정한다 —
+        2026-08-04에 실제로 겪은 사고와 같은 계열이다.
+        """
+        from datetime import date, timedelta
+
+        coord.portfolio_agent._resolve_adtv = AsyncMock(return_value=200 * 억)
+        coord._state.daily_trades_count = 10
+        coord._daily_count_day = date.today() - timedelta(days=1)
+        coord.risk_params.max_daily_trades = 10
+        coord._execute_order = AsyncMock(return_value=_fill(100))
+
+        await coord._add_to_position("094840", quantity=100)
+
+        coord._execute_order.assert_awaited_once(), "어제 카운트가 오늘을 막았다"

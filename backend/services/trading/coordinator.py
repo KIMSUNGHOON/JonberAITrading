@@ -84,6 +84,10 @@ ORDER_STATUS_REJECTED_LIQUIDITY_CAP = "rejected_liquidity_cap"
 # 아니지만(호출자가 None을 desync로 오진하면 안 된다), 어느 천장에 막혔는지가
 # 운영 판단에서 다르다.
 ORDER_STATUS_REJECTED_POSITION_CAP = "rejected_position_cap"
+# 일일 거래 상한을 이미 소진한 경우. 이 역시 원장 문제가 아닌 정상 억제라
+# `None`과 구별해야 한다. 다른 두 거절과 달리 이것은 **포트폴리오 전역** 조건이라
+# 종목마다 통지하면 같은 사실이 N번 간다 — 호출자는 로그만 남기고 통지하지 않는다.
+ORDER_STATUS_REJECTED_DAILY_LIMIT = "rejected_daily_limit"
 
 # 목표 노출도 섀도 기록 주기(초). 장중 390분 ÷ 5분 = 하루 약 78행 —
 # 슬롯 거절 시점과 최대 5분 차이라 대조에 충분하고, 연 2만 행이라 무시할 양이다.
@@ -3250,6 +3254,38 @@ class ExecutionCoordinator:
                 f"quantity ({quantity})"
             )
             return None
+
+        # 일일 거래 상한 (2026-08-06). 검사는 `on_trade_approved`에, 증가는
+        # `_execute_order`에 있어 이 경로가 검사만 우회하고 있었다 — ADD가 한 번도
+        # 체결되지 않던 동안에는 무해했으나, 슬롯 상한 수정(같은 날 배포)으로 ADD가
+        # 실제로 나가기 시작하면 예산을 **소비하면서 상한은 안 받는** 상태가 된다.
+        # 실측 추정으로 보유 5종이 각자 3% 천장까지 25%씩 늘면 하루 약 12회로
+        # 상한 10을 넘고, 그 뒤 신규 진입 BUY가 막힌다.
+        #
+        # ⚠️ 검사는 여기(ADD 경로)에만 둔다. 공유 `_execute_order`에 넣으면 손절
+        # SELL까지 예산에 걸려 **예산 소진이 곧 방어 정지**가 된다 — 일일 손실
+        # 브레이커를 노출 증가 액션에만 걸도록 좁힌 것(S-1/D3)과 같은 이유다.
+        #
+        # 읽기 전에 lazy 롤오버를 태운다 — 안 태우면 어제 소진한 카운트가 오늘을
+        # 막는다(`on_trade_approved`의 검사도 같은 순서다).
+        self._maybe_reset_daily_trades()
+        if self._state.daily_trades_count >= self.risk_params.max_daily_trades:
+            logger.info(
+                f"[Coordinator] ADD 일일 상한 차단 {ticker}: "
+                f"{quantity}주 요청 -> 0주 "
+                f"({self._state.daily_trades_count}/"
+                f"{self.risk_params.max_daily_trades} 소진)"
+            )
+            return OrderResult(
+                order_id="",
+                ticker=ticker,
+                side=OrderSide.BUY,
+                requested_quantity=quantity,
+                filled_quantity=0,
+                avg_price=0,
+                status=ORDER_STATUS_REJECTED_DAILY_LIMIT,
+                message="일일 거래 상한 소진 — 내일 리셋된다",
+            )
 
         # 유동성 캡 (2026-07-27 유동성 인지 아크 후속). 진입 BUY는 C1 사이징
         # 캡(ADTV의 0.5%)을 받는데 이 ADD 경로만 우회하고 있었다 — 진입이
