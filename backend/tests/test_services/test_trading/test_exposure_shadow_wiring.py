@@ -346,8 +346,17 @@ class TestObservationOnlyContract:
     """이 유닛은 사이징을 건드리지 않는다 -- 계약을 코드로 고정한다."""
 
     @pytest.mark.asyncio
-    async def test_recording_does_not_change_allocation(self):
-        """섀도 기록 전후로 사이징 결과가 동일해야 한다."""
+    async def test_recording_has_no_global_side_effect_on_sizing(self):
+        """섀도 기록이 PortfolioAgent.calculate_allocation과 공유하는
+        전역/모듈 상태가 없어야 한다 -- 기록 전후로 완전히 독립된
+        agent/account 쌍(coord와 무관하게 새로 만든 것)에 대해 같은
+        입력을 넣으면 같은 사이징이 나와야 한다는 뜻이다.
+
+        ⚠️ 이 테스트는 coord._state 자체가 훼손되지 않았는지는 보지
+        않는다 -- before/after 모두 coord와 별개로 만든 agent/account를
+        쓰기 때문이다(원래 있던 형태를 그대로 유지). coord._state의
+        불변은 아래 test_recording_does_not_mutate_coordinator_state가
+        따로 담당한다 -- 두 테스트는 서로 다른 갭을 막는다."""
         from services.trading.models import AccountInfo, RiskParameters
         from services.trading.portfolio_agent import PortfolioAgent
 
@@ -381,10 +390,64 @@ class TestObservationOnlyContract:
         assert before.quantity == after.quantity
         assert before.estimated_amount == pytest.approx(after.estimated_amount)
 
+    @pytest.mark.asyncio
+    async def test_recording_does_not_mutate_coordinator_state(self):
+        """_record_exposure_shadow는 관측 전용이다 -- coord._state.account/
+        positions를 갱신해서는 안 된다.
+
+        Task 4 리뷰가 지적한 구멍: `_coord_for_shadow()`의 `coord._state`는
+        MagicMock이라 임의의 속성 쓰기를 조용히 받아준다. 그 안의
+        `coord._state.account`는 진짜 Pydantic v2 모델(AccountInfo,
+        frozen 아님)이라 `self._state.account.total_equity = ...`처럼
+        인플레이스로 고쳐도 예외 없이 성공한다 -- 즉 MagicMock 자체는
+        이런 변형을 절대 못 잡는다.
+
+        여기서 "호출 전 값을 참조로 저장해뒀다가 호출 후 그 참조와
+        비교"하면 안 된다 -- account가 인플레이스로 바뀌면 그 참조도
+        같이 바뀌어 자기 자신과 비교하는 꼴이 되어 항상 통과한다
+        (리뷰 지적). 그래서 `_coord_for_shadow()`가 실제로 넣는 값을
+        리터럴 상수로 못박아 두고 호출 후 그 상수와 비교한다."""
+        coord = _coord_for_shadow()
+        storage = MagicMock()
+        storage.insert_exposure_shadow = AsyncMock(return_value=True)
+        storage.get_recent_index_returns = AsyncMock(return_value=[])
+        storage.get_latest_regime_label = AsyncMock(return_value="neutral")
+        storage.count_round_trips = AsyncMock(return_value=8)
+        storage.get_equity_peak = AsyncMock(return_value=497_403_042.0)
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        # _coord_for_shadow()가 세팅한 값 그대로(리터럴). coord._state.account
+        # 자체와 비교하지 않는다 -- 인플레이스 변형이면 참조도 같이 바뀐다.
+        assert coord._state.account.total_equity == pytest.approx(497_403_042.0)
+        assert coord._state.account.available_cash == pytest.approx(449_360_601.0)
+        assert coord._state.positions == []
+
     def test_exposure_target_module_does_not_import_execution_paths(self):
         """순수 계산 모듈이 실행 경로를 import하면 '관측 전용'이 깨진다.
 
         cwd에 의존하지 않도록 모듈의 __file__로 경로를 잡는다.
+
+        `ast.ImportFrom`은 `node.module`만 보면 안 된다 -- `from services.trading
+        import coordinator`처럼 금지어가 `node.names`의 별칭에만 있고
+        `node.module`("services.trading")에는 없는 형태, 그리고
+        `from . import coordinator`처럼 `node.module`이 아예 None인 상대
+        import 형태를 둘 다 놓친다(리뷰에서 실제로 셋 다 안 잡히는 것을
+        AST 프로브로 확인). 그래서 각 별칭을 `node.module`과 합성한
+        `"{module}.{alias.name}"`(module이 없으면 `alias.name` 그대로)도
+        함께 검사 대상에 넣는다. `ast.walk`는 함수 본문 내부까지
+        재귀하므로 지연 import(함수 안 import)도 잡힌다.
+
+        ⚠️ 알려진 한계: `importlib.import_module("services.trading.coordinator")`나
+        `__import__(...)`처럼 문자열로 모듈 경로를 조립하는 완전 동적
+        import는 `ast.Import`/`ast.ImportFrom` 노드로 나타나지 않아 이
+        정적 분석으로는 잡을 수 없다(함수 호출의 문자열 인자까지
+        해석하지 않는다). exposure_target.py에는 현재 그런 동적 import
+        메커니즘이 없다 -- 하지만 이 게이트가 "모든 우회를 막는다"는
+        보장은 아니라는 뜻이므로 여기 명시해둔다.
         """
         import ast
         from pathlib import Path
@@ -397,7 +460,10 @@ class TestObservationOnlyContract:
             if isinstance(node, ast.Import):
                 imported += [a.name for a in node.names]
             elif isinstance(node, ast.ImportFrom):
-                imported.append(node.module or "")
+                module = node.module or ""
+                imported.append(module)
+                prefix = f"{module}." if module else ""
+                imported += [f"{prefix}{alias.name}" for alias in node.names]
 
         forbidden = ("coordinator", "portfolio_agent", "autonomy",
                      "storage_service", "kiwoom")
