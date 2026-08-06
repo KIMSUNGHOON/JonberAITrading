@@ -2716,6 +2716,74 @@ class StorageService:
             logger.warning("exposure_shadow_read_failed", error=str(e))
             return []
 
+    async def get_recent_index_returns(self, limit: int = 20) -> list[float]:
+        """최근 `limit` 거래일의 KOSPI 일별 등락률(%). 오래된 것부터."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT index_kospi_chg_pct FROM regime_snapshot "
+                    "WHERE index_kospi_chg_pct IS NOT NULL "
+                    "ORDER BY trade_date DESC LIMIT ?",
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+            return [float(r[0]) for r in reversed(rows)]
+        except Exception as e:
+            logger.warning("index_returns_read_failed", error=str(e))
+            return []
+
+    async def get_latest_regime_label(self) -> str:
+        """가장 최근 레짐 라벨. 없으면 'neutral'."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT regime_label FROM regime_snapshot "
+                    "ORDER BY trade_date DESC LIMIT 1"
+                )
+                row = await cursor.fetchone()
+            return row[0] if row and row[0] else "neutral"
+        except Exception as e:
+            logger.warning("regime_label_read_failed", error=str(e))
+            return "neutral"
+
+    async def count_round_trips(self) -> int:
+        """완료된 왕복 거래 수.
+
+        `kr_realized_pnl`의 행은 거래가 아니라 **부분체결 슬라이스**이고
+        `stk_cd='ALL'`인 계좌 백필 행이 섞여 있다. (stk_cd, entry_at)로 접고
+        백필을 제외해야 실제 왕복 수가 나온다 -- 접지 않으면 22, 접으면 8이다.
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT stk_cd, entry_at FROM kr_realized_pnl "
+                    "  WHERE stk_cd != 'ALL' GROUP BY stk_cd, entry_at"
+                    ")"
+                )
+                row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+        except Exception as e:
+            logger.warning("round_trip_count_failed", error=str(e))
+            return 0
+
+    async def get_equity_peak(self) -> float:
+        """일별 스냅샷 중 최고 자산. 없으면 0.0."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT MAX(equity) FROM daily_perf_snapshot"
+                )
+                row = await cursor.fetchone()
+            return float(row[0]) if row and row[0] else 0.0
+        except Exception as e:
+            logger.warning("equity_peak_read_failed", error=str(e))
+            return 0.0
+
     async def get_slot_contests(self, limit: int = 200) -> list[dict[str, Any]]:
         """Read back slot_contest rows, newest first. Empty list on any
         storage error (read-side mirror of get_kr_stock_trades above)."""

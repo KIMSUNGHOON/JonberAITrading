@@ -106,3 +106,83 @@ async def test_daily_perf_snapshot_has_stock_value_column(isolated_storage_servi
         cursor = await conn.execute("PRAGMA table_info(daily_perf_snapshot)")
         cols = {row[1] for row in await cursor.fetchall()}
     assert "stock_value" in cols
+
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+def _coord_for_shadow():
+    """_record_exposure_shadow만 실행 가능한 최소 coordinator."""
+    from services.trading.coordinator import ExecutionCoordinator
+    from services.trading.models import AccountInfo
+
+    c = ExecutionCoordinator.__new__(ExecutionCoordinator)
+    c._state = MagicMock()
+    c._state.account = AccountInfo(
+        total_equity=497_403_042.0, available_cash=449_360_601.0
+    )
+    c._state.positions = []
+    return c
+
+
+class TestExposureShadowRecording:
+    @pytest.mark.asyncio
+    async def test_skips_when_market_closed(self):
+        """장외에는 행을 쓰지 않는다 — 기존 감시 루프의 idle 규약과 동일."""
+        coord = _coord_for_shadow()
+        storage = MagicMock()
+        storage.insert_exposure_shadow = AsyncMock(return_value=True)
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=False), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        storage.insert_exposure_shadow.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_equity_is_zero(self):
+        """0으로 채운 행은 나중에 진짜 0과 구분되지 않는다."""
+        from services.trading.models import AccountInfo
+
+        coord = _coord_for_shadow()
+        coord._state.account = AccountInfo(total_equity=0.0, available_cash=0.0)
+        storage = MagicMock()
+        storage.insert_exposure_shadow = AsyncMock(return_value=True)
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        storage.insert_exposure_shadow.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_records_a_row_during_market_hours(self):
+        coord = _coord_for_shadow()
+        storage = MagicMock()
+        storage.insert_exposure_shadow = AsyncMock(return_value=True)
+        storage.get_recent_index_returns = AsyncMock(return_value=[])
+        storage.get_latest_regime_label = AsyncMock(return_value="neutral")
+        storage.count_round_trips = AsyncMock(return_value=8)
+        storage.get_equity_peak = AsyncMock(return_value=497_403_042.0)
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        storage.insert_exposure_shadow.assert_awaited_once()
+        kwargs = storage.insert_exposure_shadow.await_args.kwargs
+        assert kwargs["target"].target_pct == pytest.approx(0.10)
+        assert kwargs["n_round_trips"] == 8
+
+    @pytest.mark.asyncio
+    async def test_storage_failure_never_propagates(self):
+        """관측 실패가 코디네이터 루프를 죽이면 본말전도다."""
+        coord = _coord_for_shadow()
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(side_effect=RuntimeError("db down"))):
+            await coord._record_exposure_shadow()   # raise 하면 실패
