@@ -163,6 +163,40 @@ def _coordinator_with_one_incumbent():
 
 
 @pytest.mark.asyncio
+async def test_handle_decision_passes_ticker_to_the_gate(isolated_storage_service):
+    """워치 경로도 게이트에 ticker를 넘겨야 한다.
+
+    자율 ADD 경로는 둘이다: PositionManager의 전략 재평가와, 여기(워치리스트
+    자동 경로). 한쪽만 배선하면 "자율 추가매수가 풀렸다"가 절반만 참이다.
+
+    이 경로는 특히 중요하다 — 한 종목이 **보유 중이면서 동시에 ACTIVE 워치
+    항목**일 수 있다(`trading/coordinator.py`에 그 조건이 문서화돼 있다).
+    그때 슬롯 상한에 걸려 거절되면, 이 경로가 유일하게 쓰는 `slot_contest`
+    원장에 **자기 자신이 incumbent 목록에 들어있는 challenger** 행이 남아
+    "교체했다면 나았을까"에 답하려고 만든 원장이 오염된다.
+    """
+    from services.autonomy import GateDecision
+
+    coord = _coordinator_with_one_incumbent()
+    captured = {}
+
+    async def capturing_gate(market, **kwargs):
+        captured.update(kwargs)
+        # max_positions가 아닌 사유로 거절 — 실행도 slot_contest 기록도 타지 않는다.
+        return GateDecision(
+            allowed=False, reason="breaker", check="daily_loss_breaker"
+        )
+
+    with patch("services.agent_chat.coordinator.check_autonomy", capturing_gate):
+        await coord._handle_decision("251970", _decision(0.7435), _session("251970"))
+
+    assert captured.get("ticker") == "251970", (
+        "이 경로가 ticker를 넘기지 않으면 보유 종목에 대한 추가매수가 "
+        "여전히 max_positions로 거절된다"
+    )
+
+
+@pytest.mark.asyncio
 async def test_max_positions_denial_records_slot_contest(isolated_storage_service):
     """배선 (a): gate.check == "max_positions" 거절이면 행이 남는다."""
     from services.autonomy import GateDecision

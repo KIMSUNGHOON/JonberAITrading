@@ -11,8 +11,10 @@ BUY/ADD 기회를 지금 보유 중인 것과 비교조차 하지 않고 그대�
 데이터 없이 정하는 것이다.
 
 호출 지점은 services/agent_chat/coordinator.py의 게이트 거절 분기다
-(services/autonomy/gate.py가 아니다 -- check_autonomy는 ticker도 decision도
-받지 않아 그 시그니처로는 이 기록을 만들 수 없다).
+(services/autonomy/gate.py가 아니다 -- check_autonomy는 decision을 받지 않아
+그 시그니처로는 이 기록을 만들 수 없다. 2026-08-05에 슬롯 상한 면제를 위해
+ticker 인자가 추가됐지만, 합의도·incumbent 스냅샷 등 나머지는 여전히 게이트
+바깥에만 있다).
 """
 from __future__ import annotations
 

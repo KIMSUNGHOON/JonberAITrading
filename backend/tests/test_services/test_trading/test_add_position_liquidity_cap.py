@@ -243,3 +243,90 @@ async def test_non_positive_quantity_still_returns_none(coord):
 
     assert result is None
     coord.portfolio_agent._resolve_adtv.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# 단일 종목 상한 (2026-08-05) — 진입 경로와 같은 캡을 ADD도 통과한다
+# ---------------------------------------------------------------------------
+
+
+class TestAddRespectsSinglePositionCap:
+    """자율 ADD도 `max_single_position_pct`를 받아야 한다.
+
+    이 캡은 `PortfolioAgent._calculate_max_position_value`에서만 계산되고,
+    그 함수는 진입 사이징 경로(`calculate_allocation`)에서만 호출됐다.
+    `_add_to_position`은 `OrderRequest`를 직접 만들어 `_execute_order`로
+    가므로 이 캡을 통째로 우회했다.
+
+    ADD가 슬롯 상한에 막혀 구조적으로 불가능했던 동안에는 이 공백이 무해
+    했지만, 그 브레이크가 풀리면 노출을 키우는 유일한 경로가 총량 상한 없이
+    복리로 늘어난다(`add_position_pct=0.25` → 재평가마다 ×1.25).
+
+    라이브 수치(2026-08-05): 316140이 402주 @₩33,550 = ₩13.5M,
+    계좌 ₩497.4M, `max_single_position_pct=0.03` → 천장 ₩14.92M = 444주.
+    여유는 42주뿐이므로 100주 요청은 42주로 깎여야 한다.
+    """
+
+    @pytest.fixture
+    def coord(self):
+        from services.trading.coordinator import ExecutionCoordinator
+        from services.trading.models import AccountInfo, RiskParameters
+        from services.trading.portfolio_agent import PortfolioAgent
+
+        c = ExecutionCoordinator.__new__(ExecutionCoordinator)
+        c._state = MagicMock()
+        c._state.positions = [
+            ManagedPosition(
+                ticker="316140", stock_name="316140",
+                quantity=402, avg_price=33_146.0, current_price=33_550.0,
+                stop_loss=31_154.0, take_profit=36_448.0,
+                status=PositionStatus.FILLED, risk_score=3,
+            )
+        ]
+        c._state.account = AccountInfo(
+            total_equity=497_403_042.0, available_cash=449_360_601.0
+        )
+        params = RiskParameters(max_single_position_pct=0.03, risk_budget_pct=0.75)
+        c.risk_params = params
+        c.portfolio_agent = PortfolioAgent(risk_params=params)
+        # 유동성은 이 시나리오에서 binding이 아니다(대형주) — 격리해서 본다.
+        c.portfolio_agent._resolve_adtv = AsyncMock(return_value=1_000 * 억)
+        c._execute_order = AsyncMock(return_value=_fill(42, price=33_550.0))
+        c._add_position = MagicMock()
+        return c
+
+    @pytest.mark.asyncio
+    async def test_add_clamped_to_single_position_cap(self, coord):
+        await coord._add_to_position("316140", quantity=100)
+
+        coord._execute_order.assert_awaited_once()
+        placed = coord._execute_order.await_args.args[0].quantity
+        assert placed == 42, (
+            f"천장 ₩14,922,091 - 보유 ₩13,487,100 = 여유 ₩1,434,991 → "
+            f"42주여야 하는데 {placed}주가 나갔다"
+        )
+
+    @pytest.mark.asyncio
+    async def test_total_position_stays_under_cap_after_clamp(self, coord):
+        await coord._add_to_position("316140", quantity=100)
+
+        placed = coord._execute_order.await_args.args[0].quantity
+        total_notional = (402 + placed) * 33_550.0
+        cap = 497_403_042.0 * 0.03
+        assert total_notional <= cap, (
+            "클램프 후 총 포지션이 상한을 넘으면 캡이 추가분 기준으로 "
+            "잘못 걸린 것이다"
+        )
+
+    @pytest.mark.asyncio
+    async def test_position_already_at_cap_is_rejected_not_ordered(self, coord):
+        from services.trading.coordinator import ORDER_STATUS_REJECTED_POSITION_CAP
+
+        coord._state.positions[0].quantity = 450  # 천장 444주를 이미 초과
+
+        result = await coord._add_to_position("316140", quantity=100)
+
+        assert result is not None, "None이면 호출자가 원장 불일치로 오진한다"
+        assert result.status == ORDER_STATUS_REJECTED_POSITION_CAP
+        assert result.filled_quantity == 0
+        coord._execute_order.assert_not_awaited()

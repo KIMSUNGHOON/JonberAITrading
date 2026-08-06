@@ -2209,9 +2209,15 @@ class PositionManager:
         CURRENTLY held quantity, NOT the discussion's own free-text quantity
         — through the SAME autonomy gate (`check_autonomy`) the full-close /
         partial-reduce SELL paths already enforce: master gate, market mode,
-        paper-only, daily-loss breaker, max-open-positions, and — because
-        this is a BUY/ADD — the per-trade notional cap. Identical safety
-        level to the entry BUY path (`on_trade_approved`).
+        paper-only, daily-loss breaker, and — because this is a BUY/ADD —
+        the per-trade notional cap.
+
+        ONE check differs from the entry BUY path (2026-08-05):
+        max-open-positions is exempted when the ticker is already held,
+        because buying more of a position you already have cannot raise the
+        number of open positions. The gate decides that from its own
+        holdings lookup — see check 6 in `services/autonomy/gate.py`.
+        Everything else is the same safety level as `on_trade_approved`.
 
         On any real fill, the monitored quantity is incremented by the
         ACTUAL filled amount (never the requested one) and avg_entry_price
@@ -2237,6 +2243,15 @@ class PositionManager:
                 action="BUY",
                 quantity=add_quantity,
                 entry_price=position.current_price,
+                # 슬롯 상한(max_open_positions) 면제용 (2026-08-05). action은
+                # 계속 "BUY"다 — 진입 BUY와 **동일한** 안전(브레이커·명목캡·
+                # 코디네이터 활성)을 그대로 받겠다는 기존 의도를 바꾸지
+                # 않는다. 다만 그 중 슬롯 점검만은 추가매수에 무의미하다:
+                # 이미 보유한 티커를 더 사도 보유 종목 수는 늘지 않는다.
+                # 게이트가 보유 목록을 직접 조회해 판정하므로 여기서 티커를
+                # 넘기는 것은 "면제해 달라"는 주장이 아니라 판정 대상을
+                # 알려주는 것이다.
+                ticker=position.ticker,
             )
             if not gate.allowed:
                 logger.warning(
@@ -2254,6 +2269,7 @@ class PositionManager:
             from app.dependencies import get_trading_coordinator
             from services.trading.coordinator import (
                 ORDER_STATUS_REJECTED_LIQUIDITY_CAP,
+                ORDER_STATUS_REJECTED_POSITION_CAP,
             )
 
             trading_coord = await get_trading_coordinator()
@@ -2296,6 +2312,31 @@ class PositionManager:
                         "주문 수량이 0으로 클램프됐습니다. "
                         "→ 조치 불필요: 정책이 의도대로 추가매수를 억제했습니다"
                         "(시스템 이상 아님). 기존 포지션은 정상 보유 중입니다.",
+                    )
+                return
+
+            if result.status == ORDER_STATUS_REJECTED_POSITION_CAP:
+                # 단일 종목 천장에 막혀 0주 (2026-08-05). 위 유동성 분기와
+                # 완전히 같은 성격이다 — 원장은 멀쩡하고 정책이 의도대로
+                # 억제한 것이므로 desync도 "미체결"도 아니다. 천장에 도달한
+                # 종목은 이 분기가 재평가마다 재진입하므로 같은 래치를
+                # 공유한다(래치를 나누면 두 천장이 번갈아 걸릴 때 각각
+                # 한 번씩, 결국 두 배로 통지된다).
+                logger.info(
+                    "add_blocked_by_position_cap",
+                    ticker=position.ticker,
+                    requested=add_quantity,
+                    held_quantity=position.quantity,
+                )
+                if not position.liquidity_cap_blocked_notified:
+                    position.liquidity_cap_blocked_notified = True
+                    await self._alert_execution_blocked(
+                        position,
+                        "단일 종목 상한",
+                        "주문 수량이 0으로 클램프됐습니다. "
+                        "→ 조치 불필요: 이 종목이 계좌 비중 천장에 도달해 "
+                        "정책이 추가매수를 억제했습니다(시스템 이상 아님). "
+                        "기존 포지션은 정상 보유 중입니다.",
                     )
                 return
 
@@ -2365,9 +2406,11 @@ class PositionManager:
         configurable percentage of the CURRENTLY held quantity
         (``round(position.quantity * config.add_position_pct)``), then
         placed through the SAME autonomy gate (`check_autonomy(BUY)`) the
-        SELL paths already enforce, with the same identical safety level as
-        the entry BUY path. A sizing result of zero or less keeps P0's
-        not-executed notice (no buy execution attempted, no gate call).
+        SELL paths already enforce — same safety level as the entry BUY path
+        EXCEPT max-open-positions, which an already-held ticker is exempt
+        from as of 2026-08-05 (see `_execute_add_position`). A sizing result
+        of zero or less keeps P0's not-executed notice (no buy execution
+        attempted, no gate call).
         """
         from services.agent_chat.models import DecisionAction
 

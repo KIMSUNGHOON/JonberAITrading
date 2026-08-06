@@ -2640,6 +2640,54 @@ class TestApplyDecisionAddP2:
         assert merged.avg_price == expected_avg, "avg_entry_price must be the cost-weighted average"
 
     @pytest.mark.asyncio
+    async def test_add_passes_ticker_so_gate_can_exempt_the_slot_cap(
+        self, config, monkeypatch
+    ):
+        """게이트에 ticker를 넘겨야 max_open_positions 면제가 성립한다.
+
+        추가매수는 보유 티커 집합에 원소를 더하지 않으므로 슬롯 상한의
+        대상이 아니다. 게이트(check 6)는 그 면제를 **자신이 조회한 보유
+        목록**으로 판정하는데, 판정 대상 티커를 모르면 면제할 수가 없다.
+
+        라이브 사고(2026-08-05): 316140의 ADD 7건이 전부
+        `check=max_positions`("open positions 5 >= limit 5")로 거절돼 체결
+        0건이었다. 게이트 쪽 면제만 고치고 이 배선을 빠뜨리면 라이브는
+        한 톨도 달라지지 않는다.
+        """
+        pm, pos = self._position(config, quantity=100, current_price=72500)
+
+        fake_coord = MagicMock()
+
+        async def _add(ticker, quantity, decision_id=None):
+            return _buy_order_result(filled_quantity=quantity, avg_price=74_000)
+
+        fake_coord._add_to_position = _add
+        monkeypatch.setattr(
+            "app.dependencies.get_trading_coordinator",
+            AsyncMock(return_value=fake_coord),
+        )
+
+        gate_calls = []
+
+        async def allow_gate(market, **kwargs):
+            gate_calls.append(kwargs)
+            return GateDecision(allowed=True, reason="ok", check="all")
+
+        monkeypatch.setattr(autonomy_pkg, "check_autonomy", allow_gate)
+
+        await pm._apply_decision(pos, _honesty_decision(DecisionAction.ADD))
+
+        assert gate_calls, "게이트가 호출되지 않았다"
+        assert gate_calls[0].get("ticker") == "005930", (
+            "추가매수 대상 티커를 게이트에 넘겨야 슬롯 상한을 면제할 수 있다"
+        )
+        assert gate_calls[0]["action"] == "BUY", (
+            "action은 계속 BUY여야 한다 — 진입 BUY와 동일한 안전(브레이커·"
+            "명목캡·코디네이터 활성)을 그대로 받겠다는 의도가 여기 걸려 있다. "
+            "ADD로 바꾸면 이 테스트가 아니라 게이트 쪽 분기가 조용히 달라진다"
+        )
+
+    @pytest.mark.asyncio
     async def test_add_position_pct_is_configurable(self, monkeypatch):
         """A custom add_position_pct changes the sized quantity — proves the
         sizing policy is a config field, not a hardcoded constant."""
