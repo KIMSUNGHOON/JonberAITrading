@@ -2473,18 +2473,47 @@ class ExecutionCoordinator:
                 p.quantity * p.current_price for p in self._state.positions
             )
 
+            # get_storage_service가 모듈 상단(:55)에도 import돼 있지만,
+            # 여기서 다시 지역 import하는 이유는 테스트가
+            # patch("services.storage_service.get_storage_service")로
+            # 원본 모듈의 속성을 갈아끼우기 때문이다 -- 함수 호출 시점에
+            # 다시 조회해야 그 패치가 반영된다. "죽은 코드"로 보고 지우면
+            # 이 메서드를 겨냥한 4개 테스트가 전부 깨진다.
             from services.storage_service import get_storage_service
-            from services.trading.exposure_target import compute_target_exposure
+            from services.trading.exposure_target import (
+                EVIDENCE_TARGET_TRIPS,
+                compute_target_exposure,
+            )
 
             storage = await get_storage_service()
             trade_date = datetime.now().strftime("%Y-%m-%d")
 
+            # 아래 세 조회는 각각 실패 시 None을 돌려준다(그럴싸한 기본값
+            # 대신) -- "neutral"/0/0.0으로 조용히 뭉개면 진짜 값과 조회
+            # 실패가 나중에 구분되지 않는다(리뷰 반영, 2026-08-06). None을
+            # 만나면 계산에는 중립을 만드는 값을 넣되(annualized_vol이
+            # 표본 부족일 때 m_vol=1.0을 쓰는 것과 같은 관례), degraded에
+            # 원인을 남겨 이 행이 "진짜 중립"이 아니라 "조회 실패로 중립
+            # 취급"임을 나중에 걸러낼 수 있게 한다. 행 자체는 계속 쓴다 --
+            # 버리면 시간당 ~78행 관측이 구멍나 건강성 점검을 왜곡한다.
             index_returns = await storage.get_recent_index_returns(limit=20)
+
             regime_label = await storage.get_latest_regime_label()
+            regime_read_failed = regime_label is None
+            if regime_read_failed:
+                regime_label = "neutral"
+
             n_round_trips = await storage.count_round_trips()
-            equity_peak = max(
-                equity, float(await storage.get_equity_peak() or 0.0)
-            )
+            round_trips_read_failed = n_round_trips is None
+            if round_trips_read_failed:
+                # EVIDENCE_TARGET_TRIPS를 넣으면 m_evidence=1.0(중립) --
+                # 0을 넣으면 EXPOSURE_FLOOR로 클램프돼 "증거가 얇다"는
+                # 진짜 신호와 똑같아 보인다.
+                n_round_trips = EVIDENCE_TARGET_TRIPS
+
+            equity_peak_raw = await storage.get_equity_peak()
+            equity_peak_read_failed = equity_peak_raw is None
+            equity_peak = max(equity, float(equity_peak_raw or 0.0))
 
             target = compute_target_exposure(
                 equity=equity,
@@ -2494,6 +2523,15 @@ class ExecutionCoordinator:
                 n_round_trips=n_round_trips,
                 equity_peak=equity_peak,
             )
+
+            # TargetExposure.degraded는 평범한 mutable 리스트라 계산 후에
+            # 덧붙여도 안전하다.
+            if regime_read_failed:
+                target.degraded.append("regime_read_failed")
+            if round_trips_read_failed:
+                target.degraded.append("round_trips_read_failed")
+            if equity_peak_read_failed:
+                target.degraded.append("equity_peak_read_failed")
 
             await storage.insert_exposure_shadow(
                 trade_date=trade_date,

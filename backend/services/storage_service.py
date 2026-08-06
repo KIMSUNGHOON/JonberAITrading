@@ -2733,8 +2733,12 @@ class StorageService:
             logger.warning("index_returns_read_failed", error=str(e))
             return []
 
-    async def get_latest_regime_label(self) -> str:
-        """가장 최근 레짐 라벨. 없으면 'neutral'."""
+    async def get_latest_regime_label(self) -> Optional[str]:
+        """가장 최근 레짐 라벨. 아직 기록이 없거나 조회 자체가 실패하면
+        None -- "레짐 미기록"과 "neutral 레짐"은 서로 다른 사실이고,
+        여기서 뭉개면 나중에 구분할 수 없다(리뷰 반영, 2026-08-06).
+        호출자(`_record_exposure_shadow`)가 None을 감지해 'neutral'로
+        치환하고 `degraded`에 `regime_read_failed`를 남긴다."""
         await self.initialize()
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
@@ -2743,18 +2747,22 @@ class StorageService:
                     "ORDER BY trade_date DESC LIMIT 1"
                 )
                 row = await cursor.fetchone()
-            return row[0] if row and row[0] else "neutral"
+            return row[0] if row and row[0] else None
         except Exception as e:
             logger.warning("regime_label_read_failed", error=str(e))
-            return "neutral"
+            return None
 
-    async def count_round_trips(self) -> int:
+    async def count_round_trips(self) -> Optional[int]:
         """완료된 왕복 거래 수.
 
         `kr_realized_pnl`의 행은 거래가 아니라 **부분체결 슬라이스**이고
         `stk_cd='ALL'`인 계좌 백필 행이 섞여 있다. (stk_cd, entry_at)로 접고
         백필을 제외해야 실제 왕복 수가 나온다 -- 접지 않으면 22, 접으면 8이다.
-        """
+
+        조회 자체가 실패하면 None을 돌려준다 -- 0은 "아직 왕복이 없다"는
+        유효한 결과이고 None은 "셀 수 없었다"는 뜻이라 서로 다르다(리뷰
+        반영, 2026-08-06). 0으로 뭉개면 호출자가 증거 부족(m_evidence 바닥
+        클램프)과 조회 실패를 구분할 수 없다."""
         await self.initialize()
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
@@ -2768,10 +2776,12 @@ class StorageService:
             return int(row[0]) if row else 0
         except Exception as e:
             logger.warning("round_trip_count_failed", error=str(e))
-            return 0
+            return None
 
-    async def get_equity_peak(self) -> float:
-        """일별 스냅샷 중 최고 자산. 없으면 0.0."""
+    async def get_equity_peak(self) -> Optional[float]:
+        """일별 스냅샷 중 최고 자산. 스냅샷이 아직 없으면 0.0(유효한 결과 --
+        첫 관측이라 낙폭 배수가 중립인 게 맞다), 조회 자체가 실패하면
+        None을 돌려준다(리뷰 반영, 2026-08-06)."""
         await self.initialize()
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
@@ -2782,7 +2792,7 @@ class StorageService:
             return float(row[0]) if row and row[0] else 0.0
         except Exception as e:
             logger.warning("equity_peak_read_failed", error=str(e))
-            return 0.0
+            return None
 
     async def get_slot_contests(self, limit: int = 200) -> list[dict[str, Any]]:
         """Read back slot_contest rows, newest first. Empty list on any

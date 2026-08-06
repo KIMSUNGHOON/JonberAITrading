@@ -108,6 +108,57 @@ async def test_daily_perf_snapshot_has_stock_value_column(isolated_storage_servi
     assert "stock_value" in cols
 
 
+class TestExposureReadHelpersFailClosed:
+    """세 조회 헬퍼(get_latest_regime_label/count_round_trips/
+    get_equity_peak)는 조회 자체가 실패하면 그럴싸한 기본값("neutral"/0/
+    0.0)이 아니라 None을 돌려줘야 한다 -- 실패와 진짜 값을 코디네이터가
+    구분할 수 있어야 하기 때문이다(_record_exposure_shadow의
+    degraded 태깅이 이 None에 의존한다)."""
+
+    @pytest.mark.asyncio
+    async def test_get_latest_regime_label_returns_none_when_table_empty(
+        self, isolated_storage_service
+    ):
+        """레짐 기록이 아직 없는 것과 진짜 'neutral' 레짐은 다른 사실이다."""
+        assert await isolated_storage_service.get_latest_regime_label() is None
+
+    @pytest.mark.asyncio
+    async def test_get_latest_regime_label_returns_none_on_read_failure(
+        self, isolated_storage_service, monkeypatch
+    ):
+        import services.storage_service as ss
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(ss.aiosqlite, "connect", _boom)
+        assert await isolated_storage_service.get_latest_regime_label() is None
+
+    @pytest.mark.asyncio
+    async def test_count_round_trips_returns_none_on_read_failure(
+        self, isolated_storage_service, monkeypatch
+    ):
+        import services.storage_service as ss
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(ss.aiosqlite, "connect", _boom)
+        assert await isolated_storage_service.count_round_trips() is None
+
+    @pytest.mark.asyncio
+    async def test_get_equity_peak_returns_none_on_read_failure(
+        self, isolated_storage_service, monkeypatch
+    ):
+        import services.storage_service as ss
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(ss.aiosqlite, "connect", _boom)
+        assert await isolated_storage_service.get_equity_peak() is None
+
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -128,33 +179,59 @@ def _coord_for_shadow():
 class TestExposureShadowRecording:
     @pytest.mark.asyncio
     async def test_skips_when_market_closed(self):
-        """장외에는 행을 쓰지 않는다 — 기존 감시 루프의 idle 규약과 동일."""
+        """장외에는 행을 쓰지 않는다 — 기존 감시 루프의 idle 규약과 동일.
+
+        storage는 test_records_a_row_during_market_hours와 동일하게 4개
+        조회 헬퍼를 전부 채운 완전한 더블을 쓴다 -- 그래야 이 게이트가
+        지워졌을 때 실제로 이 테스트가 실패한다. (리뷰 발견: 이전 버전은
+        빈 MagicMock을 썼는데, 게이트가 지워지면
+        `await storage.get_recent_index_returns(...)`가 awaitable이 아닌
+        MagicMock을 await하려다 TypeError를 내고 그게 바깥 except에
+        먹혀서 insert_exposure_shadow가 여전히 호출 안 된 것처럼 보였다 --
+        즉 게이트 없이도 이 assert가 통과했다.)
+        """
         coord = _coord_for_shadow()
         storage = MagicMock()
         storage.insert_exposure_shadow = AsyncMock(return_value=True)
+        storage.get_recent_index_returns = AsyncMock(return_value=[])
+        storage.get_latest_regime_label = AsyncMock(return_value="neutral")
+        storage.count_round_trips = AsyncMock(return_value=8)
+        storage.get_equity_peak = AsyncMock(return_value=497_403_042.0)
 
         with patch("services.trading.coordinator.is_krx_open_cached", return_value=False), \
              patch("services.storage_service.get_storage_service",
                    new=AsyncMock(return_value=storage)):
             await coord._record_exposure_shadow()
 
+        storage.get_recent_index_returns.assert_not_awaited()
         storage.insert_exposure_shadow.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skips_when_equity_is_zero(self):
-        """0으로 채운 행은 나중에 진짜 0과 구분되지 않는다."""
+        """0으로 채운 행은 나중에 진짜 0과 구분되지 않는다.
+
+        storage는 완전한 더블을 쓴다 -- 그래야 이 게이트가 지워졌을 때
+        `stock_value / equity`의 ZeroDivisionError가 바깥 except에 먹혀
+        거짓 통과하는 일이 없다(위 test_skips_when_market_closed과 같은
+        리뷰 발견의 두 번째 사례).
+        """
         from services.trading.models import AccountInfo
 
         coord = _coord_for_shadow()
         coord._state.account = AccountInfo(total_equity=0.0, available_cash=0.0)
         storage = MagicMock()
         storage.insert_exposure_shadow = AsyncMock(return_value=True)
+        storage.get_recent_index_returns = AsyncMock(return_value=[])
+        storage.get_latest_regime_label = AsyncMock(return_value="neutral")
+        storage.count_round_trips = AsyncMock(return_value=8)
+        storage.get_equity_peak = AsyncMock(return_value=497_403_042.0)
 
         with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
              patch("services.storage_service.get_storage_service",
                    new=AsyncMock(return_value=storage)):
             await coord._record_exposure_shadow()
 
+        storage.get_recent_index_returns.assert_not_awaited()
         storage.insert_exposure_shadow.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -186,3 +263,80 @@ class TestExposureShadowRecording:
              patch("services.storage_service.get_storage_service",
                    new=AsyncMock(side_effect=RuntimeError("db down"))):
             await coord._record_exposure_shadow()   # raise 하면 실패
+
+    @pytest.mark.asyncio
+    async def test_regime_read_failure_is_recorded_as_degraded(self):
+        """get_latest_regime_label이 실패해서 None을 돌려줘도 행은 쓴다 --
+        'neutral'로 조용히 뭉개면 진짜 neutral 레짐과 조회 실패를 나중에
+        구분할 수 없다. m_regime 자체는 중립값(1.0)으로 계산하되
+        degraded에 원인을 남긴다."""
+        coord = _coord_for_shadow()
+        storage = MagicMock()
+        storage.insert_exposure_shadow = AsyncMock(return_value=True)
+        storage.get_recent_index_returns = AsyncMock(return_value=[])
+        storage.get_latest_regime_label = AsyncMock(return_value=None)
+        storage.count_round_trips = AsyncMock(return_value=8)
+        storage.get_equity_peak = AsyncMock(return_value=497_403_042.0)
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        storage.insert_exposure_shadow.assert_awaited_once()
+        kwargs = storage.insert_exposure_shadow.await_args.kwargs
+        assert "regime_read_failed" in kwargs["target"].degraded
+        assert kwargs["target"].m_regime == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_round_trips_read_failure_is_recorded_as_degraded(self):
+        """count_round_trips이 실패해서 None을 돌려줘도 행은 쓴다 -- 0으로
+        뭉개면 m_evidence가 바닥(EXPOSURE_FLOOR 클램프)으로 떨어져 '증거가
+        얇다'는 진짜 신호와 '조회가 실패했다'가 똑같이 보인다. 대신
+        EVIDENCE_TARGET_TRIPS(annualized_vol이 표본 부족일 때 m_vol=1.0을
+        쓰는 것과 같은 중립 관례)를 넣어 m_evidence=1.0으로 계산하고
+        degraded에 원인을 남긴다."""
+        from services.trading.exposure_target import EVIDENCE_TARGET_TRIPS
+
+        coord = _coord_for_shadow()
+        storage = MagicMock()
+        storage.insert_exposure_shadow = AsyncMock(return_value=True)
+        storage.get_recent_index_returns = AsyncMock(return_value=[])
+        storage.get_latest_regime_label = AsyncMock(return_value="neutral")
+        storage.count_round_trips = AsyncMock(return_value=None)
+        storage.get_equity_peak = AsyncMock(return_value=497_403_042.0)
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        storage.insert_exposure_shadow.assert_awaited_once()
+        kwargs = storage.insert_exposure_shadow.await_args.kwargs
+        assert "round_trips_read_failed" in kwargs["target"].degraded
+        assert kwargs["target"].m_evidence == pytest.approx(1.0)
+        assert kwargs["n_round_trips"] == EVIDENCE_TARGET_TRIPS
+
+    @pytest.mark.asyncio
+    async def test_equity_peak_read_failure_is_recorded_as_degraded(self):
+        """get_equity_peak이 실패해서 None을 돌려줘도 행은 쓴다 -- 0.0으로
+        뭉개도 결과적으로 max(equity, 0.0)=equity라 계산 자체는 중립과
+        같지만, degraded 없이는 '진짜 낙폭이 없다'와 '고점을 못 읽었다'가
+        똑같이 보인다."""
+        coord = _coord_for_shadow()
+        storage = MagicMock()
+        storage.insert_exposure_shadow = AsyncMock(return_value=True)
+        storage.get_recent_index_returns = AsyncMock(return_value=[])
+        storage.get_latest_regime_label = AsyncMock(return_value="neutral")
+        storage.count_round_trips = AsyncMock(return_value=8)
+        storage.get_equity_peak = AsyncMock(return_value=None)
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        storage.insert_exposure_shadow.assert_awaited_once()
+        kwargs = storage.insert_exposure_shadow.await_args.kwargs
+        assert "equity_peak_read_failed" in kwargs["target"].degraded
+        assert kwargs["target"].m_drawdown == pytest.approx(1.0)
