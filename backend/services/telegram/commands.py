@@ -690,12 +690,12 @@ def _prev_business_day(today: str) -> str:
     from datetime import date, timedelta
 
     try:
-        from services.krx_holiday import get_holiday_service
+        from services.krx_holiday import get_holiday_service_sync
 
-        svc = get_holiday_service()
+        svc = get_holiday_service_sync()
         d = date.fromisoformat(today) - timedelta(days=1)
         for _ in range(10):
-            if svc.is_business_day(d):
+            if svc.is_trading_day(d):
                 return d.isoformat()
             d -= timedelta(days=1)
     except Exception:

@@ -270,8 +270,10 @@ def format_slots(d: SlotData) -> str:
 # -------------------------------------------
 
 
-def format_exposure(d: Optional[ExposureData]) -> str:
+def format_exposure(d) -> str:
     """목표 노출도와 그것을 만든 성분. degraded 사유가 보여야 값이 있다."""
+    if isinstance(d, ExposureUnavailable):
+        return f"[목표 노출도]\n\n  {_NO_DATA}"
     if d is None:
         return f"[목표 노출도]\n\n  {_NOT_STARTED}"
 
@@ -336,6 +338,7 @@ async def collect_brief(trade_date: str, prev_date: Optional[str] = None) -> Bri
 
     coord = await _safe("brief_coordinator", _coordinator())
     if coord is not None:
+      try:
         account = getattr(coord._state, "account", None)
         d.equity = float(getattr(account, "total_equity", 0) or 0) or None
         positions = list(getattr(coord._state, "positions", []) or [])
@@ -365,6 +368,10 @@ async def collect_brief(trade_date: str, prev_date: Optional[str] = None) -> Bri
             daily_trades=getattr(coord._state, "daily_trades_count", 0),
             max_daily_trades=getattr(rp, "max_daily_trades", 0),
         )
+      except Exception:
+        # 코디네이터 파생부가 통째로 죽어도 브리핑 전체를 잃지 않는다 --
+        # 이 블록만 비고 어제/노출도 섹션은 그대로 나간다.
+        pass
 
     storage = await _safe("brief_storage", _storage())
     if storage is not None:
@@ -404,14 +411,28 @@ async def collect_slots(trade_date: str) -> SlotData:
     return d
 
 
-async def collect_exposure() -> Optional[ExposureData]:
-    """최근 목표 노출도 1행. 관측이 아직 안 돌았으면 None."""
+class ExposureUnavailable:
+    """조회 자체가 실패했다 -- "아직 행이 없다"(None)와 구별한다.
+
+    둘을 None 하나로 뭉개면 스토리지 장애가 영구히 "관측 시작 전"으로 보고된다.
+    """
+
+
+async def collect_exposure():
+    """최근 목표 노출도 1행.
+
+    - `ExposureData` : 행이 있다
+    - `None`         : 관측이 아직 안 돌았다(정상)
+    - `ExposureUnavailable` : 조회 실패(비정상)
+    """
     from services.telegram.commands import _safe
 
     storage = await _safe("exposure_storage", _storage())
     if storage is None:
-        return None
+        return ExposureUnavailable()
     row = await _safe("exposure_row", storage.get_latest_exposure_shadow())
+    if row is None:
+        return ExposureUnavailable()
     if not row:
         return None
     return ExposureData(
@@ -517,8 +538,13 @@ async def _scan_block_reason(ticker: str) -> Optional[str]:
     try:
         log_dir = _log_dir()
         candidates = list(log_dir.glob("*.log")) + list(log_dir.glob("*.log.[0-9]"))
-        logs = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
-        logs = logs[:_LOG_SCAN_FILES]
+        newest_first = sorted(
+            candidates, key=lambda p: p.stat().st_mtime, reverse=True
+        )[:_LOG_SCAN_FILES]
+        # 최신 N개를 고르되 grep에는 **오래된 것부터** 넘긴다. grep은 인자
+        # 순서대로 출력하므로, 최신 파일을 먼저 주면 아래 "마지막 줄이 이긴다"
+        # 규칙이 오래된 사유를 집어 든다(리뷰가 실측으로 잡았다).
+        logs = list(reversed(newest_first))
         if not logs:
             return None
 
@@ -576,7 +602,7 @@ async def send_morning_brief() -> bool:
             from services.krx_holiday import get_holiday_service
 
             svc = await get_holiday_service()
-            if not svc.is_business_day(date.today()):
+            if not svc.is_trading_day(date.today()):
                 log.info("morning_brief_skipped_non_business_day")
                 return False
         except Exception:
@@ -586,7 +612,12 @@ async def send_morning_brief() -> bool:
 
         today = date.today().isoformat()
         prev = (date.today() - timedelta(days=1)).isoformat()
-        data = await collect_brief(today, prev)
+        try:
+            data = await collect_brief(today, prev)
+        except Exception:
+            # 수집이 통째로 실패해도 "브리핑을 못 만들었다"는 사실은 보낸다 --
+            # 침묵하면 스케줄러가 죽은 것과 구별되지 않는다.
+            data = BriefData(trade_date=today)
         text = format_brief(data)
 
         from services.telegram import get_telegram_notifier

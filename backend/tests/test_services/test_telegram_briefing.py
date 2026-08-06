@@ -173,12 +173,20 @@ class TestSlots:
         assert "없음" in text
 
     def test_caps_the_list_and_says_how_many_were_cut(self):
-        """많은 날 _truncate가 조용히 자르는 것보다 명시적으로 잘라야 한다."""
+        """많은 날 _truncate가 조용히 자르는 것보다 명시적으로 잘라야 한다.
+
+        리뷰 지적(2026-08-06): 이전 판본은 슬라이싱과 "…외 N종" 줄을 통째로
+        지워도 통과했다 — 25행이 3,900자 안에 들어가고 헤더에 이미 "25"가
+        있었기 때문이다. 렌더된 종목 줄 수를 직접 세어 캡을 고정한다.
+        """
         many = [dict(ticker=f"{i:06d}", count=1, max_consensus=0.8,
                      first="09:00:00", last="09:00:00") for i in range(25)]
         text = format_slots(self._slots(refusals=many))
+
+        rendered = [ln for ln in text.splitlines() if "최고 합의" in ln]
+        assert len(rendered) == 10, f"10종만 그려야 하는데 {len(rendered)}종"
+        assert "…외 15종" in text, "잘린 수를 명시해야 한다"
         assert len(text) < 3900
-        assert "25" in text, "전체 건수는 남아야 한다"
 
 
 class TestExposure:
@@ -268,3 +276,86 @@ class TestBlockReasonScanner:
         '막힌 게 없다'로 오독된다."""
         text = format_why(WhyData(ticker="316140", executed=False, block_reason=None))
         assert "막은 것" not in text
+
+
+class TestHolidayServiceContract:
+    """휴장일 판단이 조용히 실패하면 주말 아침에도 브리핑이 날아간다.
+
+    리뷰가 실측으로 잡았다(2026-08-06): `is_business_day`는 존재하지 않는
+    메서드였고(실제는 `is_trading_day`), 호출부가 broad except 안이라
+    AttributeError가 매번 삼켜져 휴장일 스킵이 **한 번도 동작하지 않았다.**
+    """
+
+    def test_holiday_service_exposes_the_method_we_call(self):
+        from services.krx_holiday.service import KRXHolidayService
+
+        assert hasattr(KRXHolidayService, "is_trading_day"), (
+            "이 이름이 바뀌면 브리핑의 휴장일 스킵이 조용히 죽는다"
+        )
+
+    def test_sync_accessor_exists_for_non_async_callers(self):
+        """`_prev_business_day`는 동기 함수라 async 접근자를 쓸 수 없다."""
+        from services.krx_holiday.service import get_holiday_service_sync
+
+        assert callable(get_holiday_service_sync)
+
+    @pytest.mark.asyncio
+    async def test_morning_brief_skips_non_trading_day(self, monkeypatch):
+        import services.telegram.briefing as b
+
+        sent = []
+
+        class FakeSvc:
+            def is_trading_day(self, d):
+                return False
+
+        async def fake_get_svc():
+            return FakeSvc()
+
+        monkeypatch.setattr("services.krx_holiday.get_holiday_service", fake_get_svc,
+                            raising=False)
+        monkeypatch.setattr(b, "collect_brief",
+                            lambda *a, **k: sent.append("collected"))
+
+        result = await b.send_morning_brief()
+        assert result is False
+        assert not sent, "휴장일엔 수집조차 하지 않아야 한다"
+
+
+class TestScanPicksTheNewestEvent:
+    """리뷰가 실측으로 잡았다 — grep 인자 순서 때문에 오래된 사유를 집었다."""
+
+    @pytest.mark.asyncio
+    async def test_newest_file_wins(self, tmp_path, monkeypatch):
+        import os
+        import time
+
+        import services.telegram.briefing as b
+
+        old = tmp_path / "old.log"
+        old.write_text("add_gate_denied ticker=316140\n")
+        new = tmp_path / "new.log"
+        new.write_text("add_blocked_by_position_cap ticker=316140\n")
+
+        # mtime을 명시적으로 벌린다 -- 같은 초에 쓰이면 정렬이 흔들린다.
+        past = time.time() - 3600
+        os.utime(old, (past, past))
+
+        monkeypatch.setattr(b, "_log_dir", lambda: tmp_path)
+        r = await b._scan_block_reason("316140")
+        assert "단일 종목 상한" in r, f"최신 파일의 사유를 집어야 하는데: {r}"
+
+
+class TestExposureFailureIsNotAbsence:
+    """조회 실패와 '아직 행 없음'을 뭉개면 장애가 영구히 정상으로 보고된다."""
+
+    def test_unavailable_renders_as_failure_not_not_started(self):
+        from services.telegram.briefing import ExposureUnavailable
+
+        text = format_exposure(ExposureUnavailable())
+        assert _NO_DATA in text
+        assert "관측 시작 전" not in text
+
+    def test_none_still_renders_as_not_started(self):
+        text = format_exposure(None)
+        assert "관측 시작 전" in text
