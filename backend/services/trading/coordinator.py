@@ -2481,6 +2481,8 @@ class ExecutionCoordinator:
             # 이 메서드를 겨냥한 4개 테스트가 전부 깨진다.
             from services.storage_service import get_storage_service
             from services.trading.exposure_target import (
+                E_BASE_DEFAULT,
+                E_MAX_DEFAULT,
                 EVIDENCE_TARGET_TRIPS,
                 compute_target_exposure,
             )
@@ -2488,15 +2490,18 @@ class ExecutionCoordinator:
             storage = await get_storage_service()
             trade_date = datetime.now().strftime("%Y-%m-%d")
 
-            # 아래 세 조회는 각각 실패 시 None을 돌려준다(그럴싸한 기본값
-            # 대신) -- "neutral"/0/0.0으로 조용히 뭉개면 진짜 값과 조회
-            # 실패가 나중에 구분되지 않는다(리뷰 반영, 2026-08-06). None을
-            # 만나면 계산에는 중립을 만드는 값을 넣되(annualized_vol이
-            # 표본 부족일 때 m_vol=1.0을 쓰는 것과 같은 관례), degraded에
-            # 원인을 남겨 이 행이 "진짜 중립"이 아니라 "조회 실패로 중립
-            # 취급"임을 나중에 걸러낼 수 있게 한다. 행 자체는 계속 쓴다 --
-            # 버리면 시간당 ~78행 관측이 구멍나 건강성 점검을 왜곡한다.
-            index_returns = await storage.get_recent_index_returns(limit=20)
+            # 아래 네 조회는 각각 실패 시 None을 돌려준다(그럴싸한 기본값
+            # 대신) -- "[]"/"neutral"/0/0.0으로 조용히 뭉개면 진짜 값과
+            # 조회 실패가 나중에 구분되지 않는다(리뷰 반영, 2026-08-06).
+            # None을 만나면 계산에는 중립을 만드는 값을 넣되
+            # (annualized_vol이 표본 부족일 때 m_vol=1.0을 쓰는 것과 같은
+            # 관례), degraded에 원인을 남겨 이 행이 "진짜 중립"이 아니라
+            # "조회 실패로 중립 취급"임을 나중에 걸러낼 수 있게 한다. 행
+            # 자체는 계속 쓴다 -- 버리면 시간당 ~78행 관측이 구멍나
+            # 건강성 점검을 왜곡한다.
+            index_returns_raw = await storage.get_recent_index_returns(limit=20)
+            index_returns_read_failed = index_returns_raw is None
+            index_returns = index_returns_raw if index_returns_raw is not None else []
 
             regime_label = await storage.get_latest_regime_label()
             regime_read_failed = regime_label is None
@@ -2508,8 +2513,12 @@ class ExecutionCoordinator:
             if round_trips_read_failed:
                 # EVIDENCE_TARGET_TRIPS를 넣으면 m_evidence=1.0(중립) --
                 # 0을 넣으면 EXPOSURE_FLOOR로 클램프돼 "증거가 얇다"는
-                # 진짜 신호와 똑같아 보인다.
+                # 진짜 신호와 똑같아 보인다. 이 대체값은 계산에만 쓴다 --
+                # 저장용 n_round_trips_for_row는 따로 둬서 이 40이
+                # "측정된 왕복 수"로 오인되지 않게 한다(리뷰 반영,
+                # 2026-08-06).
                 n_round_trips = EVIDENCE_TARGET_TRIPS
+            n_round_trips_for_row = None if round_trips_read_failed else n_round_trips
 
             equity_peak_raw = await storage.get_equity_peak()
             equity_peak_read_failed = equity_peak_raw is None
@@ -2522,10 +2531,14 @@ class ExecutionCoordinator:
                 regime_label=regime_label,
                 n_round_trips=n_round_trips,
                 equity_peak=equity_peak,
+                e_base=E_BASE_DEFAULT,
+                e_max=E_MAX_DEFAULT,
             )
 
             # TargetExposure.degraded는 평범한 mutable 리스트라 계산 후에
             # 덧붙여도 안전하다.
+            if index_returns_read_failed:
+                target.degraded.append("index_returns_read_failed")
             if regime_read_failed:
                 target.degraded.append("regime_read_failed")
             if round_trips_read_failed:
@@ -2539,7 +2552,10 @@ class ExecutionCoordinator:
                 equity=equity,
                 stock_value=stock_value,
                 actual_pct=stock_value / equity,
-                n_round_trips=n_round_trips,
+                n_round_trips=n_round_trips_for_row,
+                e_base=E_BASE_DEFAULT,
+                e_max=E_MAX_DEFAULT,
+                equity_peak=equity_peak,
             )
         except Exception as e:
             logger.warning(f"[Coordinator] exposure shadow record failed: {e}")

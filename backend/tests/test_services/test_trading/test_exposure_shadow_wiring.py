@@ -27,6 +27,9 @@ async def test_insert_and_read_round_trip(isolated_storage_service):
         stock_value=49_426_800.0,
         actual_pct=49_426_800.0 / 497_403_042.0,
         n_round_trips=8,
+        e_base=0.50,
+        e_max=0.30,
+        equity_peak=497_403_042.0,
     )
     assert ok is True
 
@@ -37,6 +40,9 @@ async def test_insert_and_read_round_trip(isolated_storage_service):
     assert row["actual_pct"] == pytest.approx(0.0994, abs=1e-3)
     assert row["binding"] == "m_evidence"
     assert row["m_evidence"] == pytest.approx(0.20)
+    assert row["e_base"] == pytest.approx(0.50)
+    assert row["e_max"] == pytest.approx(0.30)
+    assert row["equity_peak"] == pytest.approx(497_403_042.0)
 
 
 @pytest.mark.asyncio
@@ -158,6 +164,29 @@ class TestExposureReadHelpersFailClosed:
         monkeypatch.setattr(ss.aiosqlite, "connect", _boom)
         assert await isolated_storage_service.get_equity_peak() is None
 
+    @pytest.mark.asyncio
+    async def test_get_recent_index_returns_returns_none_on_read_failure(
+        self, isolated_storage_service, monkeypatch
+    ):
+        """네 번째 조회 헬퍼도 같은 규약이어야 한다 -- 조회 실패를 `[]`로
+        뭉개면 '지수 이력이 짧다'(진짜 데이터)와 구분이 안 된다(리뷰
+        반영, 2026-08-06)."""
+        import services.storage_service as ss
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(ss.aiosqlite, "connect", _boom)
+        assert await isolated_storage_service.get_recent_index_returns() is None
+
+    @pytest.mark.asyncio
+    async def test_get_recent_index_returns_returns_empty_list_when_table_empty(
+        self, isolated_storage_service
+    ):
+        """지수 이력이 아직 없는 것과 조회 실패는 다른 사실이다 -- 빈
+        테이블은 `[]`(진짜 데이터)여야지 `None`(조회 실패)이 아니다."""
+        assert await isolated_storage_service.get_recent_index_returns() == []
+
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -265,6 +294,30 @@ class TestExposureShadowRecording:
             await coord._record_exposure_shadow()   # raise 하면 실패
 
     @pytest.mark.asyncio
+    async def test_index_returns_read_failure_is_recorded_as_degraded(self):
+        """get_recent_index_returns이 실패해서 None을 돌려줘도 행은 쓴다 --
+        `[]`로 조용히 뭉개면 '지수 이력이 짧다'는 진짜 신호(빈 리스트도
+        똑같이 만든다)와 '조회가 실패했다'가 나중에 구분되지 않는다.
+        m_vol 자체는 중립값(1.0)으로 계산하되 degraded에 원인을 남긴다."""
+        coord = _coord_for_shadow()
+        storage = MagicMock()
+        storage.insert_exposure_shadow = AsyncMock(return_value=True)
+        storage.get_recent_index_returns = AsyncMock(return_value=None)
+        storage.get_latest_regime_label = AsyncMock(return_value="neutral")
+        storage.count_round_trips = AsyncMock(return_value=8)
+        storage.get_equity_peak = AsyncMock(return_value=497_403_042.0)
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        storage.insert_exposure_shadow.assert_awaited_once()
+        kwargs = storage.insert_exposure_shadow.await_args.kwargs
+        assert "index_returns_read_failed" in kwargs["target"].degraded
+        assert kwargs["target"].m_vol == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
     async def test_regime_read_failure_is_recorded_as_degraded(self):
         """get_latest_regime_label이 실패해서 None을 돌려줘도 행은 쓴다 --
         'neutral'로 조용히 뭉개면 진짜 neutral 레짐과 조회 실패를 나중에
@@ -295,9 +348,8 @@ class TestExposureShadowRecording:
         얇다'는 진짜 신호와 '조회가 실패했다'가 똑같이 보인다. 대신
         EVIDENCE_TARGET_TRIPS(annualized_vol이 표본 부족일 때 m_vol=1.0을
         쓰는 것과 같은 중립 관례)를 넣어 m_evidence=1.0으로 계산하고
-        degraded에 원인을 남긴다."""
-        from services.trading.exposure_target import EVIDENCE_TARGET_TRIPS
-
+        degraded에 원인을 남긴다. 다만 그 대체값 자체는 행에 저장하지
+        않는다(아래 n_round_trips 어서션)."""
         coord = _coord_for_shadow()
         storage = MagicMock()
         storage.insert_exposure_shadow = AsyncMock(return_value=True)
@@ -315,7 +367,12 @@ class TestExposureShadowRecording:
         kwargs = storage.insert_exposure_shadow.await_args.kwargs
         assert "round_trips_read_failed" in kwargs["target"].degraded
         assert kwargs["target"].m_evidence == pytest.approx(1.0)
-        assert kwargs["n_round_trips"] == EVIDENCE_TARGET_TRIPS
+        # 계산에는 대체값(EVIDENCE_TARGET_TRIPS)을 쓰지만, 저장하는 행의
+        # n_round_trips 컬럼에는 None을 넘겨야 한다 -- 40을 그대로 저장하면
+        # 나중에 AVG(n_round_trips) 같은 집계가 측정값과 대체값을 구분하지
+        # 못하고 섞인다(리뷰 반영, 2026-08-06). 대체값은 target.m_evidence
+        # 계산에만 살아있어야 한다.
+        assert kwargs["n_round_trips"] is None
 
     @pytest.mark.asyncio
     async def test_equity_peak_read_failure_is_recorded_as_degraded(self):

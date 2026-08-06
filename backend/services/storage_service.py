@@ -434,7 +434,10 @@ class StorageService:
                         degraded TEXT,
                         index_vol_annualized REAL,
                         index_vol_n INTEGER,
-                        n_round_trips INTEGER
+                        n_round_trips INTEGER,
+                        e_base REAL,
+                        e_max REAL,
+                        equity_peak REAL
                     )
                 """)
                 await conn.execute(
@@ -442,9 +445,31 @@ class StorageService:
                     "ON exposure_shadow(trade_date)"
                 )
 
+                # exposure_shadow.e_base/e_max/equity_peak (리뷰 반영,
+                # 2026-08-06): e_base/e_max는 이전까지 호출자가 넘기지 않아
+                # 늘 함수 기본값이었고 행에도 없었다 -- 관측 기간 중 이
+                # 노브를 튜닝하면(그것이 이 관측 창의 목적이다) 그 시점
+                # 이전 행들이 전부 조용히 다른 의미가 되는데, 행에 값이
+                # 없으면 그 경계를 나중에 가려낼 수 없다. equity_peak은
+                # m_drawdown으로 역산 가능하지만 바닥 클램프(0.3)이거나
+                # m_drawdown==1.0인 두 경우(가장 캐봐야 할 경우들)에는
+                # 역산이 안 된다. CREATE TABLE에 이미 넣었지만, 이 세
+                # 컬럼이 추가되기 전에 이미 만들어진 DB 파일에는
+                # CREATE TABLE IF NOT EXISTS가 no-op이므로 ALTER로 채운다
+                # -- 이 프로젝트에 마이그레이션 메커니즘이 없다.
+                await self._ensure_columns(
+                    conn,
+                    "exposure_shadow",
+                    {"e_base": "REAL", "e_max": "REAL", "equity_peak": "REAL"},
+                )
+
                 # daily_perf_snapshot.stock_value: 현금 희석을 제거한 "주식
                 # 슬리브" 변동성으로 갈아타려면 일별 주식 평가액이 필요한데
-                # 지금 어디에도 없다. 지금부터 쌓아 한 달 뒤 쓴다.
+                # 지금 어디에도 없었다. write_daily_snapshot
+                # (services/trading/eod_snapshot.py)이 보유종목 평가금액
+                # 합계를 채운다(리뷰 반영, 2026-08-06 -- 이전까지는 컬럼만
+                # 있고 쓰는 곳이 없어 한 달 뒤 전량 NULL이 될 판이었다).
+                # 지금부터 쌓아 한 달 뒤 슬리브 변동성 계산에 쓴다.
                 await self._ensure_columns(
                     conn,
                     "daily_perf_snapshot",
@@ -1170,7 +1195,8 @@ class StorageService:
         Args:
             record: dict with keys trade_date, equity, realized_pnl,
                 commission, tax, net_pnl, win_trades, loss_trades,
-                cumulative_return_pct, and optionally regime_snapshot_id.
+                cumulative_return_pct, and optionally regime_snapshot_id,
+                stock_value.
 
         Returns:
             True if the statement executed successfully (including when the
@@ -1185,8 +1211,8 @@ class StorageService:
                     INSERT OR IGNORE INTO daily_perf_snapshot
                     (trade_date, equity, realized_pnl, commission, tax,
                      net_pnl, win_trades, loss_trades, cumulative_return_pct,
-                     regime_snapshot_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     regime_snapshot_id, stock_value)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["trade_date"],
@@ -1199,6 +1225,7 @@ class StorageService:
                         record.get("loss_trades"),
                         record.get("cumulative_return_pct"),
                         record.get("regime_snapshot_id"),
+                        record.get("stock_value"),
                     ),
                 )
                 await conn.commit()
@@ -2658,12 +2685,27 @@ class StorageService:
         equity: float,
         stock_value: float,
         actual_pct: float,
-        n_round_trips: int,
+        n_round_trips: Optional[int],
+        e_base: Optional[float] = None,
+        e_max: Optional[float] = None,
+        equity_peak: Optional[float] = None,
     ) -> bool:
         """목표 노출도 1행을 적는다. 실패-무해 — False만 돌려주고 raise 안 한다.
 
         `degraded`는 콤마로 join해 저장한다. 리스트가 비면 빈 문자열이다
         (NULL과 구별된다 -- NULL은 "기록 안 됨", 빈 문자열은 "저하 없음").
+
+        `e_base`/`e_max`/`equity_peak`은 이 행을 만든 계산에 실제로 쓰인
+        값을 그대로 넘겨야 한다 -- 함수 기본값에 의존하면 나중에 어떤
+        값이 실제로 쓰였는지 알 길이 없다(리뷰 반영, 2026-08-06). 선택
+        인자로 둔 것은 순수하게 하위호환 때문이다: 넘기지 않으면 NULL로
+        남는다("몰랐다"는 NULL로 남지, 임의로 추정하지 않는다).
+
+        `n_round_trips`는 nullable이다 -- 조회 실패로 계산에는 대체값
+        (EVIDENCE_TARGET_TRIPS)을 넣었더라도 이 컬럼에는 None을 넘겨야
+        한다. 대체값을 그대로 저장하면 `AVG(n_round_trips)` 같은 사후
+        집계가 측정값과 대체값을 구분 못 하고 섞인다(리뷰 반영,
+        2026-08-06).
         """
         await self.initialize()
         try:
@@ -2673,8 +2715,9 @@ class StorageService:
                     INSERT INTO exposure_shadow
                     (id, trade_date, target_pct, actual_pct, equity, stock_value,
                      m_regime, m_vol, m_evidence, m_drawdown, binding, degraded,
-                     index_vol_annualized, index_vol_n, n_round_trips)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     index_vol_annualized, index_vol_n, n_round_trips,
+                     e_base, e_max, equity_peak)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(uuid.uuid4()),
@@ -2692,6 +2735,9 @@ class StorageService:
                         target.index_vol_annualized,
                         target.index_vol_n,
                         n_round_trips,
+                        e_base,
+                        e_max,
+                        equity_peak,
                     ),
                 )
                 await conn.commit()
@@ -2716,8 +2762,17 @@ class StorageService:
             logger.warning("exposure_shadow_read_failed", error=str(e))
             return []
 
-    async def get_recent_index_returns(self, limit: int = 20) -> list[float]:
-        """최근 `limit` 거래일의 KOSPI 일별 등락률(%). 오래된 것부터."""
+    async def get_recent_index_returns(
+        self, limit: int = 20
+    ) -> Optional[list[float]]:
+        """최근 `limit` 거래일의 KOSPI 일별 등락률(%). 오래된 것부터.
+
+        기록이 아직 없어 결과가 진짜로 비어 있으면 `[]`(유효한 데이터 --
+        "지수 이력이 짧다"). 조회 자체가 실패하면 `None`을 돌려준다 --
+        `[]`로 뭉개면 호출자(`_record_exposure_shadow`)가 "이력이 짧다"와
+        "조회가 실패했다"를 구분할 수 없다. 이 파일의 다른 세 노출도 조회
+        헬퍼(get_latest_regime_label/count_round_trips/get_equity_peak)와
+        같은 규약이다(리뷰 반영, 2026-08-06)."""
         await self.initialize()
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
@@ -2731,7 +2786,7 @@ class StorageService:
             return [float(r[0]) for r in reversed(rows)]
         except Exception as e:
             logger.warning("index_returns_read_failed", error=str(e))
-            return []
+            return None
 
     async def get_latest_regime_label(self) -> Optional[str]:
         """가장 최근 레짐 라벨. 아직 기록이 없거나 조회 자체가 실패하면

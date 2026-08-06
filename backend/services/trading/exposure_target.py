@@ -31,6 +31,15 @@ EVIDENCE_TARGET_TRIPS: int = 40
 # 노출도 하한. 증거가 0이어도 완전히 0이 되지는 않게 한다.
 EXPOSURE_FLOOR: float = 0.02
 
+# E_base/E_max 기본값. 함수 시그니처의 기본 인자 값과 동일한 값을 상수로도
+# 노출한다 -- 호출자(coordinator._record_exposure_shadow)가 기본값에
+# 암묵적으로 기대는 대신 이 상수를 명시적으로 넘기고 기록에도 남길 수
+# 있게 한다(리뷰 반영, 2026-08-06). 둘 다 관측 기간 동안 조정될 수 있는
+# 노브다 -- 바뀌면 그 이전 행들의 의미도 같이 바뀌므로, 행에 남아야
+# 시대(era)를 구분할 수 있다.
+E_BASE_DEFAULT: float = 0.50
+E_MAX_DEFAULT: float = 0.30
+
 # 낙폭 배수의 기울기와 바닥. 고점 대비 10% 빠지면 0.7배.
 DRAWDOWN_SLOPE: float = 3.0
 DRAWDOWN_FLOOR: float = 0.3
@@ -104,8 +113,8 @@ def compute_target_exposure(
     regime_label: str,
     n_round_trips: int,
     equity_peak: float,
-    e_base: float = 0.50,
-    e_max: float = 0.30,
+    e_base: float = E_BASE_DEFAULT,
+    e_max: float = E_MAX_DEFAULT,
 ) -> TargetExposure:
     """목표 주식 비중(0~1)을 계산한다.
 
