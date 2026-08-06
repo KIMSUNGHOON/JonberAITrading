@@ -67,6 +67,37 @@ async def test_degraded_reasons_are_persisted(isolated_storage_service):
 
 
 @pytest.mark.asyncio
+async def test_empty_degraded_list_round_trips_as_empty_string_not_null(
+    isolated_storage_service,
+):
+    """빈 리스트는 빈 문자열로 남아야 한다 -- NULL("기록 안 됨")과 구별되는
+    "저하 없음"이라는 판정이다. 모든 성분이 정상 신호를 가져야 degraded가
+    비므로, 위생 게이트를 통과하는 변동성 표본(연율 약 18%, 5~60% 게이트
+    안)과 알려진 regime_label을 함께 준다."""
+    result = compute_target_exposure(
+        equity=497_403_042.0,
+        stock_value=49_426_800.0,
+        index_returns=[1.14, -1.14] * 10,
+        regime_label="neutral",
+        n_round_trips=8,
+        equity_peak=497_403_042.0,
+    )
+    assert result.degraded == []
+
+    await isolated_storage_service.insert_exposure_shadow(
+        trade_date="2026-08-06",
+        target=result,
+        equity=497_403_042.0,
+        stock_value=49_426_800.0,
+        actual_pct=0.0994,
+        n_round_trips=8,
+    )
+    row = (await isolated_storage_service.get_exposure_shadow("2026-08-06"))[0]
+    assert row["degraded"] == ""
+    assert row["degraded"] is not None
+
+
+@pytest.mark.asyncio
 async def test_daily_perf_snapshot_has_stock_value_column(isolated_storage_service):
     """슬리브 변동성으로 갈아타기 위한 재료를 지금부터 쌓는다."""
     import aiosqlite
