@@ -340,3 +340,68 @@ class TestExposureShadowRecording:
         kwargs = storage.insert_exposure_shadow.await_args.kwargs
         assert "equity_peak_read_failed" in kwargs["target"].degraded
         assert kwargs["target"].m_drawdown == pytest.approx(1.0)
+
+
+class TestObservationOnlyContract:
+    """이 유닛은 사이징을 건드리지 않는다 -- 계약을 코드로 고정한다."""
+
+    @pytest.mark.asyncio
+    async def test_recording_does_not_change_allocation(self):
+        """섀도 기록 전후로 사이징 결과가 동일해야 한다."""
+        from services.trading.models import AccountInfo, RiskParameters
+        from services.trading.portfolio_agent import PortfolioAgent
+
+        agent = PortfolioAgent(risk_params=RiskParameters(max_single_position_pct=0.03))
+        account = AccountInfo(total_equity=497_403_042.0, available_cash=449_360_601.0)
+
+        before = agent.calculate_allocation(
+            account=account, ticker="005930", stock_name="삼성전자",
+            side="buy", entry_price=70_000.0, risk_score=3,
+            stop_loss=65_000.0, take_profit=80_000.0, current_positions=[],
+        )
+
+        coord = _coord_for_shadow()
+        storage = MagicMock()
+        storage.insert_exposure_shadow = AsyncMock(return_value=True)
+        storage.get_recent_index_returns = AsyncMock(return_value=[])
+        storage.get_latest_regime_label = AsyncMock(return_value="neutral")
+        storage.count_round_trips = AsyncMock(return_value=8)
+        storage.get_equity_peak = AsyncMock(return_value=497_403_042.0)
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        after = agent.calculate_allocation(
+            account=account, ticker="005930", stock_name="삼성전자",
+            side="buy", entry_price=70_000.0, risk_score=3,
+            stop_loss=65_000.0, take_profit=80_000.0, current_positions=[],
+        )
+
+        assert before.quantity == after.quantity
+        assert before.estimated_amount == pytest.approx(after.estimated_amount)
+
+    def test_exposure_target_module_does_not_import_execution_paths(self):
+        """순수 계산 모듈이 실행 경로를 import하면 '관측 전용'이 깨진다.
+
+        cwd에 의존하지 않도록 모듈의 __file__로 경로를 잡는다.
+        """
+        import ast
+        from pathlib import Path
+
+        import services.trading.exposure_target as mod
+
+        tree = ast.parse(Path(mod.__file__).read_text())
+        imported: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported += [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                imported.append(node.module or "")
+
+        forbidden = ("coordinator", "portfolio_agent", "autonomy",
+                     "storage_service", "kiwoom")
+        for name in imported:
+            assert not any(f in name for f in forbidden), (
+                f"{name}을 import하면 순수성이 깨진다 — 이 모듈은 DB도 API도 몰라야 한다"
+            )
