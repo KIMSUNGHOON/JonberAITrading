@@ -2762,6 +2762,125 @@ class StorageService:
             logger.warning("exposure_shadow_read_failed", error=str(e))
             return []
 
+    async def get_latest_exposure_shadow(self) -> Optional[dict]:
+        """가장 최근 목표 노출도 행(날짜 무관). 없으면 None.
+
+        08:30 브리핑 시점에는 오늘 행이 없다 -- 장중에만 쌓이기 때문이다.
+        그래서 날짜로 거르지 않고 최근 1행을 돌려주되, 호출자가 `created_at`을
+        함께 표시해 "언제 값인지"를 드러내야 한다. 어제 값을 오늘 값인 척
+        보여주는 것이 이 메서드의 실패 모드다.
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM exposure_shadow ORDER BY created_at DESC LIMIT 1"
+                )
+                row = await cursor.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.warning("latest_exposure_shadow_read_failed", error=str(e))
+            return None
+
+    async def get_day_rollup(self, trade_date: str) -> Optional[dict]:
+        """하루 요약 — 결정 수·체결 수·실현손익·슬롯 거절 수.
+
+        `kr_realized_pnl`은 거래 단위가 아니라 부분체결 슬라이스이고
+        `stk_cd='ALL'` 백필 행이 섞여 있다. 합계를 낼 때 백필을 빼지 않으면
+        계좌 조정액이 당일 손익으로 잡힌다.
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                async def scalar(sql: str, default=0):
+                    cur = await conn.execute(sql, (trade_date,))
+                    row = await cur.fetchone()
+                    return (row[0] if row and row[0] is not None else default)
+
+                decisions = await scalar(
+                    "SELECT COUNT(*) FROM agent_chat_decisions "
+                    "WHERE date(created_at,'+9 hours') = ?"
+                )
+                fills = await scalar(
+                    "SELECT COUNT(*) FROM kr_stock_trades "
+                    "WHERE date(created_at,'+9 hours') = ?"
+                )
+                realized = await scalar(
+                    "SELECT COALESCE(SUM(realized_amount), 0) FROM kr_realized_pnl "
+                    "WHERE date(created_at,'+9 hours') = ? AND stk_cd != 'ALL'",
+                    0.0,
+                )
+                refusals = await scalar(
+                    "SELECT COUNT(*) FROM slot_contest "
+                    "WHERE date(created_at,'+9 hours') = ?"
+                )
+            return dict(
+                trade_date=trade_date,
+                decisions=decisions,
+                fills=fills,
+                realized_pnl=float(realized),
+                slot_refusals=refusals,
+            )
+        except Exception as e:
+            logger.warning("day_rollup_read_failed", error=str(e), trade_date=trade_date)
+            return None
+
+    async def get_slot_contest_rollup(self, trade_date: str) -> list[dict]:
+        """슬롯 거절을 종목별로 접는다 — 건수·최고 합의·처음/마지막 시각."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT challenger_ticker AS ticker, COUNT(*) AS count, "
+                    "  MAX(challenger_consensus) AS max_consensus, "
+                    "  MIN(time(created_at,'+9 hours')) AS first, "
+                    "  MAX(time(created_at,'+9 hours')) AS last "
+                    "FROM slot_contest WHERE date(created_at,'+9 hours') = ? "
+                    "GROUP BY challenger_ticker ORDER BY count DESC",
+                    (trade_date,),
+                )
+                return [dict(r) for r in await cursor.fetchall()]
+        except Exception as e:
+            logger.warning("slot_contest_rollup_failed", error=str(e))
+            return []
+
+    async def get_ticker_day_decisions(self, ticker: str, trade_date: str) -> list[dict]:
+        """해당 종목의 그날 결정을 시각순으로."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT datetime(created_at,'+9 hours') AS created_at, action, "
+                    "  consensus_level, sizing_lineage "
+                    "FROM agent_chat_decisions "
+                    "WHERE ticker = ? AND date(created_at,'+9 hours') = ? "
+                    "ORDER BY created_at",
+                    (ticker, trade_date),
+                )
+                return [dict(r) for r in await cursor.fetchall()]
+        except Exception as e:
+            logger.warning("ticker_day_decisions_failed", error=str(e), ticker=ticker)
+            return []
+
+    async def get_ticker_day_fills(self, ticker: str, trade_date: str) -> int:
+        """해당 종목의 그날 체결 건수."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM kr_stock_trades "
+                    "WHERE stk_cd = ? AND date(created_at,'+9 hours') = ?",
+                    (ticker, trade_date),
+                )
+                row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+        except Exception as e:
+            logger.warning("ticker_day_fills_failed", error=str(e), ticker=ticker)
+            return 0
+
     async def get_recent_index_returns(
         self, limit: int = 20
     ) -> Optional[list[float]]:
