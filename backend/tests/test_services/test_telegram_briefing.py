@@ -359,3 +359,60 @@ class TestExposureFailureIsNotAbsence:
     def test_none_still_renders_as_not_started(self):
         text = format_exposure(None)
         assert "관측 시작 전" in text
+
+
+class TestExposureAbsentIsNotFailure:
+    """라이브에서 실제로 걸린 버그(2026-08-07 07:3x).
+
+    `/exposure`가 "조회 실패"를 냈는데 로그에 예외가 하나도 없었다. 원인은
+    `get_latest_exposure_shadow`가 "행 없음"과 "조회 실패"를 **둘 다 None**으로
+    돌려준 것 — 포맷터 계층에서 갈라 놓고 스토리지 계층에서 다시 합쳐 버렸다.
+
+    계약: None = 행 없음(정상) / 예외 = 조회 실패(비정상).
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_table_is_not_started_not_failure(self, isolated_storage_service):
+        import services.telegram.briefing as b
+
+        async def fake_storage():
+            return isolated_storage_service
+
+        b._storage = fake_storage
+        try:
+            result = await b.collect_exposure()
+        finally:
+            import importlib
+            importlib.reload(b)
+
+        assert result is None, "행이 없으면 None -- ExposureUnavailable이 아니다"
+        assert "관측 시작 전" in format_exposure(result)
+
+    @pytest.mark.asyncio
+    async def test_storage_raising_is_a_failure(self, monkeypatch):
+        import services.telegram.briefing as b
+
+        class Boom:
+            async def get_latest_exposure_shadow(self):
+                raise RuntimeError("db down")
+
+        async def fake_storage():
+            return Boom()
+
+        monkeypatch.setattr(b, "_storage", fake_storage)
+        result = await b.collect_exposure()
+
+        assert isinstance(result, b.ExposureUnavailable)
+        assert _NO_DATA in format_exposure(result)
+
+    @pytest.mark.asyncio
+    async def test_storage_method_raises_instead_of_swallowing(self, isolated_storage_service):
+        """스토리지가 예외를 삼키면 위 구별이 원천적으로 불가능하다."""
+        import aiosqlite
+
+        async with aiosqlite.connect(str(isolated_storage_service.db_path)) as conn:
+            await conn.execute("DROP TABLE IF EXISTS exposure_shadow")
+            await conn.commit()
+
+        with pytest.raises(Exception):
+            await isolated_storage_service.get_latest_exposure_shadow()

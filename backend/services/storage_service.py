@@ -2780,8 +2780,11 @@ class StorageService:
                 row = await cursor.fetchone()
             return dict(row) if row else None
         except Exception as e:
+            # 삼키지 않는다 -- 삼키면 "행이 아직 없다"(정상)와 "조회가 실패했다"
+            # (비정상)가 둘 다 None이 되어 호출자가 구별할 수 없다. 이 메서드의
+            # 계약: None = 행 없음, 예외 = 조회 실패.
             logger.warning("latest_exposure_shadow_read_failed", error=str(e))
-            return None
+            raise
 
     async def get_day_rollup(self, trade_date: str) -> Optional[dict]:
         """하루 요약 — 결정 수·체결 수·실현손익·슬롯 거절 수.

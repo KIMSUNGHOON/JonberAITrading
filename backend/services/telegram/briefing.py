@@ -375,7 +375,13 @@ async def collect_brief(trade_date: str, prev_date: Optional[str] = None) -> Bri
 
     storage = await _safe("brief_storage", _storage())
     if storage is not None:
-        rows = await _safe("brief_exposure", storage.get_latest_exposure_shadow())
+        try:
+            rows = await storage.get_latest_exposure_shadow()
+        except Exception:
+            # 브리핑에서는 조회 실패도 "관측 시작 전"으로 접는다 -- 한 줄짜리
+            # 요약이라 상태를 셋으로 나눌 지면이 없다. 상세는 /exposure가
+            # 구별해 보여준다.
+            rows = None
         if rows:
             d.exposure = dict(
                 target_pct=rows.get("target_pct"),
@@ -430,8 +436,12 @@ async def collect_exposure():
     storage = await _safe("exposure_storage", _storage())
     if storage is None:
         return ExposureUnavailable()
-    row = await _safe("exposure_row", storage.get_latest_exposure_shadow())
-    if row is None:
+    try:
+        # `_safe`를 쓰지 않는 이유: `_safe`는 실패를 None으로 접는데, 이
+        # 호출에서는 None이 "행이 아직 없다"는 정상 신호다. 둘을 구별하려면
+        # 예외를 직접 받아야 한다.
+        row = await storage.get_latest_exposure_shadow()
+    except Exception:
         return ExposureUnavailable()
     if not row:
         return None
