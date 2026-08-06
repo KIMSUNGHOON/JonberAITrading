@@ -2268,6 +2268,7 @@ class PositionManager:
 
             from app.dependencies import get_trading_coordinator
             from services.trading.coordinator import (
+                ORDER_STATUS_REJECTED_DAILY_LIMIT,
                 ORDER_STATUS_REJECTED_LIQUIDITY_CAP,
                 ORDER_STATUS_REJECTED_POSITION_CAP,
             )
@@ -2338,6 +2339,22 @@ class PositionManager:
                         "정책이 추가매수를 억제했습니다(시스템 이상 아님). "
                         "기존 포지션은 정상 보유 중입니다.",
                     )
+                return
+
+            if result.status == ORDER_STATUS_REJECTED_DAILY_LIMIT:
+                # 일일 거래 상한 소진 (2026-08-06). 앞의 두 거절과 달리 이것은
+                # **포트폴리오 전역** 조건이라 종목마다 통지하면 같은 사실이
+                # 보유 종목 수만큼 간다. 게다가 소진 상태는 daily_trades로
+                # 이미 조회 가능하고 내일 자동 리셋되므로 운영자가 할 일이
+                # 없다 — 로그만 남기고 통지하지 않는다.
+                #
+                # 이 분기가 없으면 아래 `filled <= 0`으로 떨어져 "미체결"로
+                # 오분류되고, 그 경로는 래치가 없어 재평가마다 통지가 반복된다.
+                logger.info(
+                    "add_blocked_by_daily_limit",
+                    ticker=position.ticker,
+                    requested=add_quantity,
+                )
                 return
 
             # 이번엔 캡에 걸리지 않고 여기까지 왔다 — 다음 차단 시 다시
