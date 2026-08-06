@@ -35,6 +35,19 @@ EXPOSURE_FLOOR: float = 0.02
 DRAWDOWN_SLOPE: float = 3.0
 DRAWDOWN_FLOOR: float = 0.3
 
+# 변동성 배수. 목표·실측·게이트 경계는 **전부 퍼센트 단위**다 — 목표만 소수로
+# 두면 배수가 100배 틀어진다.
+TARGET_VOL_PCT: float = 18.0
+VOL_WINDOW: int = 20
+VOL_MIN_SAMPLES: int = 5
+VOL_MULTIPLIER_MIN: float = 0.5
+VOL_MULTIPLIER_MAX: float = 1.5
+
+# 위생 게이트. 이 밖의 실현 변동성은 시장이 아니라 데이터 소스를 의심한다.
+VOL_GATE_MIN_PCT: float = 5.0
+VOL_GATE_MAX_PCT: float = 60.0
+TRADING_DAYS_PER_YEAR: int = 250
+
 
 @dataclass
 class TargetExposure:
@@ -61,6 +74,26 @@ def _drawdown_multiplier(equity: float, equity_peak: float) -> float:
         return 1.0
     drawdown = max(0.0, (equity_peak - equity) / equity_peak)
     return max(DRAWDOWN_FLOOR, 1.0 - DRAWDOWN_SLOPE * drawdown)
+
+
+def annualized_vol(
+    index_returns: list[float], window: int = VOL_WINDOW
+) -> tuple[Optional[float], int]:
+    """최근 `window`개 등락률(%)의 표본표준편차 × √250, 그리고 사용한 표본 수.
+
+    표본이 `VOL_MIN_SAMPLES` 미만이면 (None, 실제 표본 수)를 돌려준다 —
+    표본 수는 부족해도 기록에는 남아야 한다.
+    """
+    usable = [r for r in (index_returns or []) if r is not None and math.isfinite(r)]
+    sample = usable[-window:]
+    n = len(sample)
+    if n < VOL_MIN_SAMPLES:
+        return None, n
+    sd = statistics.stdev(sample)
+    vol = sd * math.sqrt(TRADING_DAYS_PER_YEAR)
+    if not math.isfinite(vol):
+        return None, n
+    return vol, n
 
 
 def compute_target_exposure(
@@ -90,12 +123,20 @@ def compute_target_exposure(
         m_regime = 1.0
         degraded.append("regime_unknown")
 
-    # Task 2에서 실제 변동성 배수로 교체된다. 그때까지도 "조용한 중립"은
-    # 금지이므로 사유를 남긴다 — 이 값이 왜 1.0인지가 기록에 있어야 한다.
-    m_vol = 1.0
-    degraded.append("index_vol_not_implemented")
-    vol_ann: Optional[float] = None
-    vol_n = 0
+    vol_ann, vol_n = annualized_vol(index_returns)
+    if vol_ann is None:
+        m_vol = 1.0
+        degraded.append("index_vol_insufficient")
+    elif not (VOL_GATE_MIN_PCT <= vol_ann <= VOL_GATE_MAX_PCT):
+        # 시장이 아니라 데이터 소스를 의심한다. 중립으로 두되 원값은
+        # TargetExposure에 그대로 실어 보낸다.
+        m_vol = 1.0
+        degraded.append("index_vol_implausible")
+    else:
+        m_vol = min(
+            VOL_MULTIPLIER_MAX,
+            max(VOL_MULTIPLIER_MIN, TARGET_VOL_PCT / vol_ann),
+        )
 
     m_evidence = min(1.0, max(0, n_round_trips) / EVIDENCE_TARGET_TRIPS)
     m_drawdown = _drawdown_multiplier(equity, equity_peak)

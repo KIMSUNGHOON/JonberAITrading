@@ -125,21 +125,22 @@ class TestDegradedRecordsOnlyWhenSignalExistedButFailed:
         """신규 계좌(equity_peak=0) → drawdown 계산이 항등원 1.0을 쓴다.
 
         이는 신호 부족이 아니라 사실이므로, equity_peak_invalid 같은 항목을
-        degraded에 추가하지 않는다. 유일한 degraded 항목은 staged placeholder
-        'index_vol_not_implemented'이어야 한다.
+        degraded에 추가하지 않는다. 다만 empty index_returns는 충분한 표본이
+        아니므로 index_vol_insufficient가 기록된다.
         """
         r = compute_target_exposure(**_args(equity_peak=0.0))
         assert r.m_drawdown == pytest.approx(1.0)
-        assert r.degraded == ["index_vol_not_implemented"]
+        assert r.degraded == ["index_vol_insufficient"]
 
     def test_no_drawdown_is_not_a_degradation(self):
         """정상 상태(equity == equity_peak) → drawdown 없음.
 
-        계산 결과가 정당하게 1.0이므로, 이를 degraded에 기록하지 않는다.
+        계산 결과가 정당하게 1.0이므로, drawdown은 degraded에 기록하지 않는다.
+        다만 empty index_returns는 충분한 표본이 아니므로 index_vol_insufficient가 기록된다.
         """
         r = compute_target_exposure(**_args(equity=497_403_042.0, equity_peak=497_403_042.0))
         assert r.m_drawdown == pytest.approx(1.0)
-        assert r.degraded == ["index_vol_not_implemented"]
+        assert r.degraded == ["index_vol_insufficient"]
 
     def test_signal_existed_but_failed_is_recorded(self):
         """Unknown regime는 신호(regime_label)가 있었는데 못 썼으므로 기록된다.
@@ -150,3 +151,87 @@ class TestDegradedRecordsOnlyWhenSignalExistedButFailed:
         r = compute_target_exposure(**_args(regime_label="unknown_regime_value"))
         assert r.m_regime == pytest.approx(1.0)
         assert "regime_unknown" in r.degraded
+
+
+from services.trading.exposure_target import annualized_vol
+
+
+class TestAnnualizedVol:
+    def test_annualizes_with_sqrt_250(self):
+        """일별 1% 표준편차 → 연 15.8%."""
+        returns = [1.0, -1.0] * 10
+        vol, n = annualized_vol(returns)
+        assert n == 20
+        assert vol == pytest.approx(1.0 * (250 ** 0.5), rel=0.05)
+
+    def test_uses_only_the_last_window(self):
+        returns = [50.0] * 30 + [1.0, -1.0] * 10
+        vol, n = annualized_vol(returns, window=20)
+        assert n == 20
+        assert vol == pytest.approx(1.0 * (250 ** 0.5), rel=0.05)
+
+    def test_short_series_reports_actual_sample_size(self):
+        vol, n = annualized_vol([1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
+        assert n == 6
+        assert vol is not None
+
+    def test_too_few_samples_returns_none(self):
+        vol, n = annualized_vol([1.0, -1.0])
+        assert vol is None
+        assert n == 2
+
+
+class TestVolHygieneGate:
+    """모의 시장 데이터가 공식에 새어들지 않게 막는다.
+
+    라이브 실측(2026-08-06): regime_snapshot의 지수 등락률 14일치가 연변동성
+    112.1%다. 지수 레벨 변화와 등락률이 서로 일치하므로 파싱 오류가 아니라
+    데이터 자체가 ±10~18%로 움직인다(계좌는 paper 모드). 브로드 지수로는
+    불가능한 값이므로 신뢰하지 않는다.
+    """
+
+    # 2026-08-06 라이브 실측값 그대로
+    LIVE_MOCK_RETURNS = [
+        -6.36, -6.37, -4.46, 0.74, 4.4, -5.72, 0.97,
+        -10.84, -5.98, -1.23, 17.91, -5.12, 1.62, 3.76,
+    ]
+
+    def test_implausible_vol_is_neutralized_and_flagged(self):
+        r = compute_target_exposure(**_args(index_returns=self.LIVE_MOCK_RETURNS))
+        assert r.m_vol == pytest.approx(1.0)
+        assert "index_vol_implausible" in r.degraded
+
+    def test_implausible_vol_preserves_the_raw_value(self):
+        """중립으로 처리하되 원값은 남긴다 — 나중에 판정하려면 필요하다."""
+        r = compute_target_exposure(**_args(index_returns=self.LIVE_MOCK_RETURNS))
+        assert r.index_vol_annualized is not None
+        assert r.index_vol_annualized > 60.0
+        assert r.index_vol_n == 14
+
+    def test_plausible_vol_is_actually_applied(self):
+        """일별 1.14% → 연 18% → 배수 1.0 근처."""
+        returns = [1.14, -1.14] * 10
+        r = compute_target_exposure(**_args(index_returns=returns))
+        assert r.m_vol == pytest.approx(1.0, abs=0.15)
+        assert r.degraded == []
+
+    def test_calm_market_raises_the_multiplier(self):
+        returns = [0.5, -0.5] * 10   # 연 ≈ 7.9%
+        r = compute_target_exposure(**_args(index_returns=returns))
+        assert r.m_vol > 1.0
+
+    def test_multiplier_is_clipped_both_ways(self):
+        calm = compute_target_exposure(**_args(index_returns=[0.35, -0.35] * 10))
+        rough = compute_target_exposure(**_args(index_returns=[3.5, -3.5] * 10))
+        assert calm.m_vol == pytest.approx(1.5)
+        assert rough.m_vol == pytest.approx(0.5)
+
+    def test_insufficient_samples_is_neutral_and_flagged(self):
+        r = compute_target_exposure(**_args(index_returns=[1.0, -1.0]))
+        assert r.m_vol == pytest.approx(1.0)
+        assert "index_vol_insufficient" in r.degraded
+
+    def test_empty_series_is_neutral_and_flagged(self):
+        r = compute_target_exposure(**_args(index_returns=[]))
+        assert r.m_vol == pytest.approx(1.0)
+        assert "index_vol_insufficient" in r.degraded
