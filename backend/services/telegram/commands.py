@@ -666,3 +666,110 @@ register_command(
     detail="목적: /halt로 멈춘 자율 실행을 되살린다",
     caution="확인 버튼은 1회용이며 5분 뒤 만료된다",
 )
+
+# -------------------------------------------
+# 브리핑·조회 명령 (2026-08-06)
+# -------------------------------------------
+#
+# 포맷터와 수집기는 `services/telegram/briefing.py`에 있다 -- 이 파일이 이미
+# 600행을 넘었고, 브리핑은 자체 데이터 계약과 순수 포맷터를 갖는 별개 단위다.
+
+
+def _kst_today() -> str:
+    from datetime import datetime
+
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _prev_business_day(today: str) -> str:
+    """직전 거래일. 휴장일 서비스가 없으면 단순히 하루 전으로 떨어진다.
+
+    브리핑의 '어제' 섹션은 값이 비어도 브리핑 전체를 죽이지 않으므로,
+    여기서 정확도보다 never-raise를 택한다.
+    """
+    from datetime import date, timedelta
+
+    try:
+        from services.krx_holiday import get_holiday_service
+
+        svc = get_holiday_service()
+        d = date.fromisoformat(today) - timedelta(days=1)
+        for _ in range(10):
+            if svc.is_business_day(d):
+                return d.isoformat()
+            d -= timedelta(days=1)
+    except Exception:
+        pass
+    return (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+
+
+async def handle_brief(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+    from services.telegram.briefing import collect_brief, format_brief
+
+    today = _kst_today()
+    data = await _safe("brief", collect_brief(today, _prev_business_day(today)))
+    if data is None:
+        await _reply(update, f"[장전 브리핑] {today}\n\n{_NO_DATA}")
+        return
+    await _reply(update, format_brief(data))
+
+
+async def handle_why(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+    from services.telegram.briefing import collect_why, format_why
+
+    args = getattr(context, "args", None) or []
+    if not args:
+        await _reply(update, "사용법: /why 316140")
+        return
+    ticker = str(args[0]).strip()
+    data = await _safe("why", collect_why(ticker, _kst_today()))
+    if data is None:
+        await _reply(update, f"[왜?] {ticker}\n\n{_NO_DATA}")
+        return
+    await _reply(update, format_why(data))
+
+
+async def handle_slots(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+    from services.telegram.briefing import collect_slots, format_slots
+
+    args = getattr(context, "args", None) or []
+    trade_date = str(args[0]).strip() if args else _kst_today()
+    data = await _safe("slots", collect_slots(trade_date))
+    if data is None:
+        await _reply(update, f"[슬롯 경합] {trade_date}\n\n{_NO_DATA}")
+        return
+    await _reply(update, format_slots(data))
+
+
+async def handle_exposure(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
+    from services.telegram.briefing import collect_exposure, format_exposure
+
+    data = await _safe("exposure", collect_exposure())
+    await _reply(update, format_exposure(data))
+
+
+register_command(
+    "brief", handle_brief,
+    summary="장전 브리핑 (자산 배분·보유·어제·오늘 준비)", group="지금 상태",
+    detail="목적: 오늘 무엇을 알고 시작해야 하나",
+    caution="목표 노출도는 장중에만 갱신된다 — 표시된 기준 시각을 함께 볼 것",
+)
+register_command(
+    "why", handle_why,
+    summary="왜 샀나 / 왜 안 샀나", group="지금 상태",
+    usage="/why 316140",
+    detail="목적: 결정이 실행으로 이어졌는지, 아니면 무엇이 막았는지",
+    caution="거절 사유는 활성 로그 꼬리에서 찾는다 — 로그가 회전하면 안 보일 수 있다",
+)
+register_command(
+    "slots", handle_slots,
+    summary="자리가 없어 거절된 종목", group="지금 상태",
+    usage="/slots 또는 /slots 2026-08-06",
+    detail="목적: 슬롯 상한이 기회를 얼마나 버리고 있나",
+)
+register_command(
+    "exposure", handle_exposure,
+    summary="목표 노출도와 성분", group="지금 상태",
+    detail="목적: 지금 얼마나 실려야 하는가, 무엇이 그것을 묶고 있나",
+    caution="degraded가 비어 있지 않으면 그 성분은 신뢰할 수 없어 중립 처리된 것",
+)

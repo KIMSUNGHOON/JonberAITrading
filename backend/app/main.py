@@ -360,6 +360,13 @@ async def lifespan(app: FastAPI):
         # Start automatic update scheduler (monthly on 1st at 6:00 AM)
         holiday_service.start_scheduler(update_day=1, update_hour=6)
         logger.info("holiday_update_scheduler_started")
+
+        # 장전 브리핑 08:30 자동 발송 (2026-08-06). 실패해도 앱을 죽이지
+        # 않는다 -- 브리핑은 관측용이고 매매와 무관하다.
+        from services.telegram.briefing import start_morning_brief_scheduler
+
+        start_morning_brief_scheduler()
+        logger.info("morning_brief_scheduler_wired")
     except Exception as e:
         logger.warning("holiday_service_init_failed", error=str(e))
 
