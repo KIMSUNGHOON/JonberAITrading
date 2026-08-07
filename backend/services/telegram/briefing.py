@@ -43,6 +43,7 @@ class BriefData:
     # 2026-08-07: 오늘의 레짐 판정 행(services.storage_service.
     # get_latest_regime_judgment 반환 그대로). 행이 없어도(아직 안 돌았거나
     # 수집 실패) 정상 상태다 -- format_regime(None)이 그렇게 명시적으로 쓴다.
+    # 조회 자체가 실패하면 `RegimeUnavailable`이 들어온다(3-상태, I-3).
     regime: Optional[dict] = None
 
 
@@ -98,9 +99,29 @@ def _pct(v: Optional[float], digits: int = 1) -> str:
 # -------------------------------------------
 
 
-def format_regime(row: Optional[dict]) -> str:
-    """오늘의 레짐 판정 블록. 행이 없으면 그렇게 쓴다 -- 조용히 중립을
-    보여주면 '판정 못 함'과 '중립으로 판정함'이 구별되지 않는다."""
+class RegimeUnavailable:
+    """레짐 판정 **조회 자체가 실패**했다 -- "아직 행이 없다"(None)와 구별한다.
+
+    둘을 None 하나로 합치면 DB 장애가 영구히 "아직 안 돌았음"으로 읽힌다.
+    이 설계의 명시 원칙("오류와 부재를 절대 합치지 않는다")을 어기는 것이고,
+    2026-08-06에 사용자가 폰에서 실제로 신고한 사고와 같은 계열이다. 같은
+    파일의 `ExposureUnavailable`과 동일한 3-상태 패턴을 따른다.
+
+    배포 다음날 아침 검증이 전적으로 이 화면을 통해 이뤄지므로, 여기서
+    오판이 나면 정상/비정상 판별 자체가 불가능해진다.
+    """
+
+
+def format_regime(row) -> str:
+    """오늘의 레짐 판정 블록. 세 상태를 구별한다 -- 조용히 중립을
+    보여주면 '판정 못 함'과 '중립으로 판정함'이 구별되지 않는다.
+
+    - `dict`               : 판정이 있다
+    - `None`               : 아직 안 돌았거나 매크로 수집 실패(정상 상태)
+    - `RegimeUnavailable`  : 조회 실패(비정상)
+    """
+    if isinstance(row, RegimeUnavailable) or row is RegimeUnavailable:
+        return f"📊 레짐: {_NO_DATA}"
     if not row:
         return "📊 레짐: 판정 없음 (아직 돌지 않았거나 매크로 수집 실패)"
     lines = [
@@ -429,7 +450,9 @@ async def collect_brief(trade_date: str, prev_date: Optional[str] = None) -> Bri
             # 동일한 섹션-독립 실패 패턴.
             d.regime = await storage.get_latest_regime_judgment()
         except Exception:
-            d.regime = None
+            # `None`(행 없음)으로 접지 않는다 -- 조회 실패가 "아직 안 돌았음"으로
+            # 읽히면 배포 다음날 아침 검증이 정상/비정상을 구별하지 못한다(I-3).
+            d.regime = RegimeUnavailable()
         if prev_date:
             d.yesterday = await _safe(
                 "brief_yesterday", storage.get_day_rollup(prev_date)
@@ -458,15 +481,23 @@ async def collect_slots(trade_date: str) -> SlotData:
     return d
 
 
-async def collect_regime_row() -> Optional[dict]:
+async def collect_regime_row():
     """오늘의 레짐 판정 1행. `/exposure`가 `format_regime`으로 앞에 붙일 때
     쓴다(`/brief`는 `collect_brief`가 `BriefData.regime`으로 직접 채운다).
+
+    - `dict`              : 행이 있다
+    - `None`              : 아직 안 돌았다(정상)
+    - `RegimeUnavailable` : 조회 실패(비정상)
 
     `get_latest_regime_judgment()`는 행이 없으면 `None`, DB 오류는 raise한다.
     여기서 직접 try/except로 감싸는 이유: `_safe`로 감싸면 "행 없음"과
     "조회 실패"가 다시 하나의 `None`으로 합쳐져 로그에서도 구별이 안 된다
     (commands.py의 바깥 `_safe("exposure_regime", ...)`는 이 함수 자체가
     호출부에서 죽지 않게 하는 별도의 방어층이지, 이 구별을 대신하지 않는다).
+
+    I-3 (2026-08-07): 로그에서만 구별하고 **화면에는 같은 문구**를 내보내던
+    것을 봉합했다. 조회 실패는 `RegimeUnavailable`로 올려 보낸다 --
+    `collect_exposure`/`ExposureUnavailable`과 같은 패턴.
     """
     try:
         storage = await _storage()
@@ -477,7 +508,7 @@ async def collect_regime_row() -> Optional[dict]:
         logging.getLogger(__name__).warning(
             "regime_row_fetch_failed: %s", e
         )
-        return None
+        return RegimeUnavailable()
 
 
 class ExposureUnavailable:

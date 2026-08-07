@@ -449,6 +449,20 @@ class ExecutionCoordinator:
         # 수 없다.
         await self._persist_state()
 
+        # C-2 (2026-08-07): 레짐 슬롯 상향은 게이트 검사 8과 생사를 같이해야
+        # 한다. 킬스위치가 off면 08:05 스케줄러가 **아예 안 뜨므로**
+        # (`start_regime_scheduler`가 플래그를 보고 None을 반환한다) 되돌리기
+        # 로직이 그 안에만 있으면 영원히 실행되지 않는다. 코디네이터 기동은
+        # 킬스위치와 무관하게 돌기 때문에 여기가 유일하게 확실한 지점이다.
+        #
+        # 위치가 중요하다: `_restore_state()`가 블롭의 (상향된) risk_params를
+        # 메모리로 되살린 **뒤**, 그리고 시작 큐 드레인(아래 process_trade_queue)
+        # **앞**이어야 한다 -- 안 그러면 개장 직후 큐가 낡은 상향 천장으로
+        # 매수한다. `_persist_state()` 뒤에 두는 것도 의도다(그 persist는
+        # risk_monitor가 실제로 켜진 뒤 mode=active를 남기는 2026-07-29의
+        # 순서 계약이고, 그 앞에 다른 persist를 끼우면 계약이 깨진다).
+        await self.apply_regime_slots()
+
         self._log_activity(
             ActivityType.SYSTEM_START,
             (
@@ -2469,20 +2483,139 @@ class ExecutionCoordinator:
         except asyncio.CancelledError:
             pass
 
-    async def apply_regime_slots(self) -> Optional[dict]:
-        """목표 노출도에 맞춰 슬롯 수와 종목당 상한을 맞춘다. never-raise.
+    # 레짐 슬롯 상향 이전의 원래 값. **코디네이터 상태 블롭이 아니라 별도
+    # 키**다 -- `_persist_state()`는 블롭을 매번 처음부터 다시 만들기 때문에
+    # 거기 넣으면 다음 뮤테이션 한 번에 조용히 사라진다(그리고 baseline이
+    # 사라지면 되돌릴 방법이 영원히 없어진다).
+    _REGIME_BASELINE_KEY = "regime:slot_baseline"
 
-        슬롯은 **올리기만 한다** -- 목표가 내려갔다고 줄이면 같은 금액을 더
-        적은 종목에 담게 되어 집중도가 오른다. 총량 축소는 전적으로 게이트
-        검사 8이 담당한다.
+    async def _save_regime_slot_baseline(self) -> None:
+        """상향 **전** 값을 한 번만 적어 둔다. 이미 있으면 절대 덮어쓰지 않는다.
+
+        덮어쓰면 두 번째 상향이 첫 번째 상향값을 baseline으로 굳혀버려
+        "브랜치 이전 값으로 돌아간다"는 약속이 래칫으로 바뀐다.
+        """
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
+        if await storage.get_app_setting(self._REGIME_BASELINE_KEY):
+            return
+        await storage.set_app_setting(
+            self._REGIME_BASELINE_KEY,
+            json.dumps(
+                {
+                    "max_open_positions": int(self.risk_params.max_open_positions),
+                    "max_single_position_pct": float(
+                        self.risk_params.max_single_position_pct
+                    ),
+                }
+            ),
+        )
+        logger.info(
+            f"[Coordinator] regime_slot_baseline_saved: "
+            f"max_open_positions={self.risk_params.max_open_positions} "
+            f"max_single_position_pct={self.risk_params.max_single_position_pct}"
+        )
+
+    async def _restore_regime_slot_baseline(self, reason: str) -> Optional[dict]:
+        """상향을 되돌린다 -- 실효 천장을 브랜치 이전 값으로 돌려놓는다.
+
+        **C-2 (2026-08-07 최종 리뷰)**: 슬롯·종목당 상한의 상향은 게이트
+        검사 8과 생사를 같이해야 한다. 검사 8이 구속력을 잃는 경우
+        (킬스위치 off / 판정 부재·만료)에 상향만 남으면 실효 천장이
+        `16 × 5% = 80%`인데 그것을 상쇄할 기계가 하나도 없다 -- **장애나
+        비활성화가 노출도를 위로 여는** 형태가 된다. 운영자의 자연스러운
+        대응("이상하다 → 끄자")이 정확히 반대 결과를 낸다.
+
+        `min()`으로 내리기만 한다. 되돌리기가 어떤 경우에도 노출도를 **위로**
+        열어서는 안 되기 때문이다(운영자가 baseline보다 더 낮춰 둔 값을
+        복원이 도로 올리는 일도 없다).
+        """
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
+        raw = await storage.get_app_setting(self._REGIME_BASELINE_KEY)
+        if not raw:
+            # 한 번도 상향한 적이 없다 -- 되돌릴 것도 없다.
+            return None
+        baseline = json.loads(raw)
+        if not isinstance(baseline, dict):
+            raise TypeError(
+                f"regime slot baseline is not a JSON object "
+                f"(got {type(baseline).__name__})"
+            )
+
+        new_slots = min(
+            int(self.risk_params.max_open_positions),
+            int(baseline["max_open_positions"]),
+        )
+        new_pct = min(
+            float(self.risk_params.max_single_position_pct),
+            float(baseline["max_single_position_pct"]),
+        )
+        changed = (
+            new_slots != int(self.risk_params.max_open_positions)
+            or new_pct != float(self.risk_params.max_single_position_pct)
+        )
+        self.risk_params.max_open_positions = new_slots
+        self.risk_params.max_single_position_pct = new_pct
+
+        if changed:
+            await self._persist_state()
+            logger.info(
+                f"[Coordinator] regime_slots_restored ({reason}): "
+                f"max_open_positions={new_slots} "
+                f"max_single_position_pct={new_pct}"
+            )
+        return {
+            "max_open_positions": new_slots,
+            "max_single_position_pct": new_pct,
+            "restored": True,
+            "reason": reason,
+        }
+
+    async def apply_regime_slots(self) -> Optional[dict]:
+        """슬롯 수와 종목당 상한을 게이트 검사 8의 구속력에 맞춘다. never-raise.
+
+        두 방향이 있다.
+
+        - **검사 8이 구속력을 가질 때**(킬스위치 on + 유효한 판정) 목표를
+          담을 수 있게 슬롯을 **올리기만 한다** -- 목표가 내려갔다고 줄이면
+          같은 금액을 더 적은 종목에 담게 되어 집중도가 오른다. 총량 축소는
+          전적으로 검사 8이 담당한다.
+        - **검사 8이 구속력을 잃을 때**(킬스위치 off / 판정 부재·만료) 상향을
+          되돌린다(C-2). 이 방향이 없으면 킬스위치가 롤백이 아니라 **완화
+          동작**이 된다 -- 상세는 `_restore_regime_slot_baseline` 참조.
+
+        조회 **예외**는 되돌리지 않는다. DB 오류에서는 게이트 검사 8이
+        fail-closed로 `deny`하므로 검사 8은 오히려 **더** 구속력이 세진다.
+        되돌려야 하는 것은 검사가 조용히 **스킵**되는 경우(`target is None`)뿐이다.
 
         `GATE_PROTECTED_FIELDS`는 그대로 둔다. 그 봉인은 전략 패널의 자유
         서술값을 막기 위한 것이고, 이 경로는 값이 3개뿐인 룩업이라 드리프트가
         구조적으로 불가능하다.
         """
         try:
-            if not get_settings().REGIME_EXPOSURE_ENABLED:
+            # I-1 (2026-08-07 최종 리뷰): `_persistence_active=False`는 이
+            # 프로세스에서 `_restore_state()`가 한 번도 안 돌았다는 뜻이고,
+            # 그때 `self.risk_params`는 **`RiskParameters()` 기본값**이지 라이브
+            # 값이 아니다(도달 경로 실재: `resume_if_persisted()`가 저장된
+            # mode≠active/paused면 `_restore_state()` 없이 no-op한다). 그
+            # 상태에서 계산하면 `slots_for_target(..., current_max=기본값 5)`가
+            # 라이브 7을 못 보고, 쓰면 `_persist_fields(risk_params=...)`의
+            # 최상위-키 교체가 라이브 `max_trade_notional_pct` 10.0을 기본값
+            # 15.0으로(자율 게이트 검사 7의 안전 레일이 50% 완화) 리셋한다.
+            # **입력이 틀렸으므로 쓰기만 고칠 문제가 아니다** -- 통째로 건너뛰고
+            # 다음 `start()`(= `_restore_state()` 직후)의 화해에 맡긴다.
+            if not self._persistence_active:
+                logger.info(
+                    "[Coordinator] regime_slots_skipped: persistence inactive "
+                    "(risk_params are defaults, not live values)"
+                )
                 return None
+
+            if not get_settings().REGIME_EXPOSURE_ENABLED:
+                return await self._restore_regime_slot_baseline("kill_switch_off")
 
             from services.trading.exposure_target import (
                 REGIME_PER_POSITION_PCT,
@@ -2492,7 +2625,13 @@ class ExecutionCoordinator:
 
             target = await get_effective_target()
             if target is None:
-                return None
+                return await self._restore_regime_slot_baseline(
+                    "judgment_absent_or_stale"
+                )
+
+            # 상향 전에 원래 값을 남긴다 -- 이 순서가 뒤집히면 되돌릴 값이
+            # 이미 상향된 값이 되어 baseline이 무의미해진다.
+            await self._save_regime_slot_baseline()
 
             new_slots = slots_for_target(
                 target, current_max=int(self.risk_params.max_open_positions)
@@ -2500,25 +2639,11 @@ class ExecutionCoordinator:
             self.risk_params.max_open_positions = new_slots
             self.risk_params.max_single_position_pct = REGIME_PER_POSITION_PCT
 
-            # 영속: RMW 경로만 쓴다. `_persist_state()`는 in-memory `_state`
-            # 전체를 블롭에 덮어쓰므로, `_restore_state()`가 이 프로세스에서
-            # 한 번도 안 돈 코디네이터(`_persistence_active=False`)에 부르면
-            # positions/trade_queue/watch_list가 빈 기본값인 채로 실제
-            # 블롭을 지워버린다(2026-07-29 사고: 빈 스냅샷이 실 포지션
-            # 손절가를 덮어씀). 그래서 `_persistence_active`가 True일 때만
-            # (즉 `_state`가 진짜 데이터를 담고 있을 때만) 전체 스냅샷을
-            # 쓰고, 아니면 `_persist_fields()`로 `risk_params` 키만
-            # 부분 갱신한다 -- `PUT /api/trading/risk-params`
-            # (app/api/routes/trading.py)와 동일한 판단, 동일한 키 모양
-            # (`risk_params=self.risk_params.model_dump()`, 블롭 안에서
-            # `"risk_params"`는 중첩 dict라 `max_open_positions`를 최상위
-            # 키로 넘기면 `_restore_state()`가 절대 못 읽는다).
-            if self._persistence_active:
-                await self._persist_state()
-            else:
-                await self._persist_fields(
-                    risk_params=self.risk_params.model_dump()
-                )
+            # `_persistence_active`가 True인 것은 위에서 확인했다(= `_state`가
+            # `_restore_state()`를 거친 진짜 데이터). 그래서 전체 스냅샷이
+            # 안전하다 -- 2026-07-29의 "빈 스냅샷이 실 포지션 손절가를 덮어씀"
+            # 사고는 `_persistence_active=False`에서만 성립한다.
+            await self._persist_state()
 
             logger.info(
                 f"[Coordinator] regime_slots_applied: target_pct={target} "

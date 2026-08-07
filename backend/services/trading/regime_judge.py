@@ -144,6 +144,12 @@ async def judge_regime() -> Optional[dict]:
         )
         degraded.extend(target.degraded)
 
+        effective = _clamp_when_defense_unreliable(
+            target.target_pct, degraded, prev_row
+        )
+        if effective is None:
+            return None
+
         trade_date = date.today().isoformat()
         persisted = await storage.insert_regime_judgment(
             trade_date=trade_date,
@@ -152,7 +158,7 @@ async def judge_regime() -> Optional[dict]:
             rationale=rationale,
             key_drivers=key_drivers,
             anchor_target_pct=target.anchor_pct,
-            effective_target_pct=target.target_pct,
+            effective_target_pct=effective,
             prev_effective_pct=target.prev_effective_pct,
             degraded=degraded,
             macro_snapshot_id=None,
@@ -167,7 +173,7 @@ async def judge_regime() -> Optional[dict]:
         logger.info(
             "regime_judged",
             regime=regime, anchor=target.anchor_pct,
-            effective=target.target_pct, degraded=degraded,
+            effective=effective, degraded=degraded,
         )
         return {
             "trade_date": trade_date,
@@ -176,12 +182,61 @@ async def judge_regime() -> Optional[dict]:
             "rationale": rationale,
             "key_drivers": key_drivers,
             "anchor_target_pct": target.anchor_pct,
-            "effective_target_pct": target.target_pct,
+            "effective_target_pct": effective,
             "degraded": degraded,
         }
     except Exception as e:
         logger.warning("regime_judge_failed", error=str(e))
         return None
+
+
+# 낙폭 배수(`M_drawdown`)를 믿을 수 없게 만드는 저하 사유들. 둘 다 결과가
+# 같다 -- `_drawdown_multiplier`가 무감쇠(1.0)로 조용히 넘어간다.
+DEFENSE_UNRELIABLE_TAGS: tuple[str, ...] = (
+    "portfolio_state_unavailable",
+    "equity_peak_unavailable",
+)
+
+
+def _clamp_when_defense_unreliable(
+    effective: float, degraded: list[str], prev_row: Optional[dict]
+) -> Optional[float]:
+    """계좌 조회 실패가 **노출도를 위로 열지 않도록** 목표를 눌러 둔다.
+
+    **I-2 (2026-08-07 최종 리뷰)**: `_portfolio_state()`가 실패하면
+    `(0.0, 0.0, 0.0)`이 나오고 `_drawdown_multiplier(0, 0)`가 `1.0`을
+    돌려준다 -- `degraded`에 태그는 남지만 숫자는 그대로다. `M_vol`을
+    축소 전용으로 바꾼 뒤(C-1) 평상시 `m_vol`은 1.0에 가까우므로
+    **`m_drawdown`이 사실상 유일하게 남는 안전 배수**다. 계좌가 실제로
+    낙폭 중인 날 하필 08:05 키움 조회가 실패하면 그날 하루가 방어 없이
+    집행된다.
+
+    - 이어받을 직전 목표가 있으면 그 값 **이하**로 클램프한다. 조회 실패가
+      목표를 올리는 일은 없고, 판정 행은 그대로 남아 관측이 끊기지 않는다.
+    - 계좌 자체를 못 읽었는데 직전 목표도 없으면 `None`을 돌려준다 -- 행을
+      적지 않으면 `get_effective_target()`이 `None`이 되어 검사 8이 스킵되고,
+      C-2의 되돌리기가 실효 천장을 브랜치 이전 값으로 되돌린다. 이 파일이
+      이미 "직전도 없으면 임의의 숫자를 만들지 않는다"로 처리하는 것과
+      같은 규칙이다.
+    """
+    if not any(tag in degraded for tag in DEFENSE_UNRELIABLE_TAGS):
+        return effective
+
+    prev = (prev_row or {}).get("effective_target_pct")
+    if prev is None:
+        if "portfolio_state_unavailable" in degraded:
+            logger.warning("regime_judge_skipped_portfolio_unavailable")
+            return None
+        return effective
+
+    if effective > float(prev):
+        logger.warning(
+            "regime_judge_target_clamped_defense_unreliable",
+            raw=effective, clamped=float(prev), degraded=degraded,
+        )
+        degraded.append("target_clamped_defense_unreliable")
+        return float(prev)
+    return effective
 
 
 async def _portfolio_state() -> tuple[float, float, float, list[str]]:
@@ -196,8 +251,11 @@ async def _portfolio_state() -> tuple[float, float, float, list[str]]:
     취급하게 되고, `_drawdown_multiplier`가 무감쇠(1.0)로 조용히 넘어간다 —
     계좌가 실제로 낙폭 중인 날 하필 이 조회가 실패하면 낙폭 방어가 흔적
     없이 꺼진다. 그래서 `None`인 경우를 따로 감지해 `degraded`에 남긴다
-    (숫자 자체는 바꾸지 않는다 — `peak_raw or 0.0`와 결과값은 동일하다.
-    그 값을 어떻게 쓸지는 이 태스크의 범위 밖이고, 지금 필요한 건 기록이다).
+    (여기서는 숫자를 바꾸지 않는다 — `peak_raw or 0.0`와 결과값은 동일하다).
+
+    **그 태그를 실제로 소비하는 곳은 `_clamp_when_defense_unreliable`이다**
+    (I-2, 2026-08-07): 기록만 남기고 숫자를 그대로 두면 조회 실패가 방어
+    없는 목표를 그날 하루 집행하게 만든다.
     """
     degraded: list[str] = []
     try:

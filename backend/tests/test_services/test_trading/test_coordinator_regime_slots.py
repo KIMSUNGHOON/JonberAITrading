@@ -1,23 +1,71 @@
+"""레짐 슬롯 배선 — 상향과 **되돌리기**.
+
+2026-08-07 최종 리뷰 이후 이 경로는 두 방향을 갖는다:
+
+- 검사 8이 구속력을 가질 때(킬스위치 on + 유효한 판정) → 슬롯 상향
+- 검사 8이 구속력을 잃을 때(킬스위치 off / 판정 부재·만료) → **baseline 복원**
+
+두 번째가 없으면 킬스위치가 롤백이 아니라 완화 동작이 된다(C-2).
+
+⚠️ 이 테스트들은 실제 `StorageService`를 탄다(baseline은 별도 app_setting
+키에 산다). 반드시 `temp_storage`로 격리한다 -- 이 리포는 테스트가 라이브
+`storage.db`에 쓴 전력이 있다.
+"""
+
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from services.trading.models import RiskParameters
+import services.storage_service as ss
+from services.storage_service import StorageService
+from services.trading.coordinator import ExecutionCoordinator
+
+pytestmark = pytest.mark.asyncio
+
+_BASELINE = {"max_open_positions": 7, "max_single_position_pct": 0.03}
 
 
-def _coord():
-    from services.trading.coordinator import ExecutionCoordinator
+@pytest.fixture
+async def temp_storage(tmp_path, monkeypatch):
+    storage = StorageService(db_path=tmp_path / "test_storage.db")
+    await storage.initialize()
+    monkeypatch.setattr(ss, "_storage_service", storage)
+    yield storage
+    monkeypatch.setattr(ss, "_storage_service", None)
 
-    c = ExecutionCoordinator.__new__(ExecutionCoordinator)
-    c.risk_params = RiskParameters()
-    c.risk_params.max_open_positions = 7
-    c.risk_params.max_single_position_pct = 0.03
-    c._persistence_active = False
+
+def _coord(slots: int = 7, pct: float = 0.03, persistence: bool = True):
+    """라이브 값(슬롯 7 × 종목당 3%)을 든 코디네이터.
+
+    `_persistence_active=True`가 기본인 것은 의도다 -- 08:05 사이클이 실제로
+    도는 상태(`start()`를 거쳐 `_restore_state()`가 라이브 risk_params를
+    되살린 상태)가 그것이다. False는 I-1 테스트에서만 명시적으로 쓴다.
+    """
+    c = ExecutionCoordinator(kiwoom_client=None)
+    c.risk_params.max_open_positions = slots
+    c.risk_params.max_single_position_pct = pct
+    c._persistence_active = persistence
     return c
 
 
-@pytest.mark.asyncio
-async def test_target_raises_slots_and_sets_per_position():
+def _settings(enabled: bool):
+    gs = patch("services.trading.coordinator.get_settings")
+    return gs, enabled
+
+
+async def _seed_baseline(storage, coord, baseline=None):
+    await storage.set_app_setting(
+        coord._REGIME_BASELINE_KEY, json.dumps(baseline or _BASELINE)
+    )
+
+
+# -------------------------------------------
+# 상향 (기존 계약 — 불변)
+# -------------------------------------------
+
+
+async def test_target_raises_slots_and_sets_per_position(temp_storage):
     c = _coord()
     with patch("services.trading.coordinator.get_settings") as gs, \
          patch("services.trading.regime_judge.get_effective_target",
@@ -29,11 +77,9 @@ async def test_target_raises_slots_and_sets_per_position():
     assert c.risk_params.max_single_position_pct == 0.05
 
 
-@pytest.mark.asyncio
-async def test_slots_never_decrease():
+async def test_slots_never_decrease(temp_storage):
     """목표가 내려가도 슬롯은 그대로 — 줄이면 집중도가 오른다."""
-    c = _coord()
-    c.risk_params.max_open_positions = 16
+    c = _coord(slots=16, pct=0.05)
     with patch("services.trading.coordinator.get_settings") as gs, \
          patch("services.trading.regime_judge.get_effective_target",
                AsyncMock(return_value=0.20)):
@@ -43,8 +89,92 @@ async def test_slots_never_decrease():
     assert c.risk_params.max_open_positions == 16
 
 
-@pytest.mark.asyncio
-async def test_kill_switch_off_changes_nothing():
+# -------------------------------------------
+# C-2 — 상향은 검사 8과 생사를 같이한다
+# -------------------------------------------
+
+
+async def test_first_raise_saves_the_pre_branch_baseline(temp_storage):
+    c = _coord()
+    with patch("services.trading.coordinator.get_settings") as gs, \
+         patch("services.trading.regime_judge.get_effective_target",
+               AsyncMock(return_value=0.55)):
+        gs.return_value.REGIME_EXPOSURE_ENABLED = True
+        await c.apply_regime_slots()
+
+    saved = json.loads(await temp_storage.get_app_setting(c._REGIME_BASELINE_KEY))
+    assert saved == _BASELINE
+
+
+async def test_baseline_is_never_overwritten_by_a_later_raise(temp_storage):
+    """두 번째 상향이 baseline을 첫 상향값으로 굳히면 "브랜치 이전 값으로
+    돌아간다"는 약속이 래칫으로 바뀐다."""
+    c = _coord()
+    with patch("services.trading.coordinator.get_settings") as gs, \
+         patch("services.trading.regime_judge.get_effective_target",
+               AsyncMock(side_effect=[0.55, 0.80])):
+        gs.return_value.REGIME_EXPOSURE_ENABLED = True
+        await c.apply_regime_slots()   # 7 → 11
+        await c.apply_regime_slots()   # 11 → 16
+
+    assert c.risk_params.max_open_positions == 16
+    saved = json.loads(await temp_storage.get_app_setting(c._REGIME_BASELINE_KEY))
+    assert saved == _BASELINE
+
+
+async def test_kill_switch_off_restores_the_pre_branch_ceiling(temp_storage):
+    """**이 수정의 핵심 속성.** 킬스위치를 끄면 검사 8이 통째로 사라진다.
+    상향만 남으면 실효 천장이 16 × 5% = 80%인데 그것을 상쇄할 기계가 없다 --
+    끄는 행위가 완화 동작이 된다."""
+    c = _coord(slots=16, pct=0.05)
+    await _seed_baseline(temp_storage, c)
+
+    with patch("services.trading.coordinator.get_settings") as gs:
+        gs.return_value.REGIME_EXPOSURE_ENABLED = False
+        out = await c.apply_regime_slots()
+
+    assert c.risk_params.max_open_positions == 7
+    assert c.risk_params.max_single_position_pct == 0.03
+    assert out["restored"] is True and out["reason"] == "kill_switch_off"
+
+
+async def test_expired_or_absent_judgment_restores_the_pre_branch_ceiling(temp_storage):
+    """판정 5역일 만료·매크로 수집 연속 실패도 검사 8을 스킵시킨다 --
+    `get_effective_target()`이 `None`을 돌려주는 그 경우 전부."""
+    c = _coord(slots=16, pct=0.05)
+    await _seed_baseline(temp_storage, c)
+
+    with patch("services.trading.coordinator.get_settings") as gs, \
+         patch("services.trading.regime_judge.get_effective_target",
+               AsyncMock(return_value=None)):
+        gs.return_value.REGIME_EXPOSURE_ENABLED = True
+        out = await c.apply_regime_slots()
+
+    assert c.risk_params.max_open_positions == 7
+    assert c.risk_params.max_single_position_pct == 0.03
+    assert out["reason"] == "judgment_absent_or_stale"
+
+
+async def test_read_failure_does_not_restore_because_the_gate_fails_closed(temp_storage):
+    """DB 오류는 검사 8을 **더** 구속력 있게 만든다(fail-closed deny). 되돌려야
+    하는 것은 검사가 조용히 스킵되는 경우뿐이다 -- 여기서 되돌리면 오류가
+    오히려 노출도를 흔든다."""
+    c = _coord(slots=16, pct=0.05)
+    await _seed_baseline(temp_storage, c)
+
+    with patch("services.trading.coordinator.get_settings") as gs, \
+         patch("services.trading.regime_judge.get_effective_target",
+               AsyncMock(side_effect=RuntimeError("db down"))):
+        gs.return_value.REGIME_EXPOSURE_ENABLED = True
+        assert await c.apply_regime_slots() is None
+
+    assert c.risk_params.max_open_positions == 16
+    assert c.risk_params.max_single_position_pct == 0.05
+
+
+async def test_restore_without_a_baseline_changes_nothing(temp_storage):
+    """한 번도 상향한 적이 없으면 되돌릴 것도 없다 -- 킬스위치 off가
+    기본 배포에서 아무 값도 건드리지 않아야 한다(현행 동작과 동일)."""
     c = _coord()
     with patch("services.trading.coordinator.get_settings") as gs:
         gs.return_value.REGIME_EXPOSURE_ENABLED = False
@@ -53,42 +183,117 @@ async def test_kill_switch_off_changes_nothing():
     assert c.risk_params.max_single_position_pct == 0.03
 
 
-@pytest.mark.asyncio
-async def test_no_judgment_changes_nothing():
-    c = _coord()
-    with patch("services.trading.coordinator.get_settings") as gs, \
-         patch("services.trading.regime_judge.get_effective_target",
-               AsyncMock(return_value=None)):
-        gs.return_value.REGIME_EXPOSURE_ENABLED = True
-        assert await c.apply_regime_slots() is None
-    assert c.risk_params.max_open_positions == 7
+async def test_restore_never_raises_the_ceiling(temp_storage):
+    """되돌리기는 **내리기만** 한다. 운영자가 baseline보다 더 낮춰 둔 값을
+    복원이 도로 올리면 그것도 "장애가 노출도를 위로 여는" 형태다."""
+    c = _coord(slots=4, pct=0.02)
+    await _seed_baseline(temp_storage, c)
+
+    with patch("services.trading.coordinator.get_settings") as gs:
+        gs.return_value.REGIME_EXPOSURE_ENABLED = False
+        await c.apply_regime_slots()
+
+    assert c.risk_params.max_open_positions == 4
+    assert c.risk_params.max_single_position_pct == 0.02
 
 
-@pytest.mark.asyncio
-async def test_read_failure_does_not_raise_and_changes_nothing():
-    c = _coord()
-    with patch("services.trading.coordinator.get_settings") as gs, \
-         patch("services.trading.regime_judge.get_effective_target",
-               AsyncMock(side_effect=RuntimeError("db down"))):
-        gs.return_value.REGIME_EXPOSURE_ENABLED = True
-        assert await c.apply_regime_slots() is None
-    assert c.risk_params.max_open_positions == 7
+async def test_restore_is_persisted_so_a_restart_keeps_it(temp_storage):
+    c = _coord(slots=16, pct=0.05)
+    await _seed_baseline(temp_storage, c)
+
+    with patch("services.trading.coordinator.get_settings") as gs:
+        gs.return_value.REGIME_EXPOSURE_ENABLED = False
+        await c.apply_regime_slots()
+
+    blob = json.loads(await temp_storage.get_app_setting(c._STATE_KEY))
+    assert blob["risk_params"]["max_open_positions"] == 7
+    assert blob["risk_params"]["max_single_position_pct"] == 0.03
 
 
-@pytest.mark.asyncio
-async def test_persistence_active_uses_full_snapshot_not_partial_fields():
-    """`_persistence_active=True`(즉 `_restore_state()`가 이미 돌아 `_state`가
-    진짜 데이터를 담고 있음) 일 때는 전체 스냅샷 `_persist_state()`를 쓰고,
-    부분 RMW `_persist_fields()`는 쓰지 않는다.
+async def test_start_reconciles_slots_with_the_gate(temp_storage):
+    """배선 카나리 -- 킬스위치가 off면 08:05 스케줄러가 **아예 안 뜨므로**
+    되돌리기가 스케줄러 안에만 있으면 영원히 실행되지 않는다. 코디네이터
+    기동은 킬스위치와 무관하게 돌기 때문에 여기가 유일하게 확실한 지점이다.
 
-    리뷰 지적: 기존 5개 테스트는 픽스처가 `_persistence_active = False`로
-    고정돼 있어 이 분기(`coordinator.py`의 `if self._persistence_active:`
-    True 쪽)가 한 번도 실행되지 않았다 -- 방향이 맞다는 것을 소스 대조로만
-    확인했지 테스트로 지키지는 못했다. 2026-07-29에 실제로 사고가 난 것이
-    정확히 이 분기라 지금 계좌의 실 포지션 6종을 지킨다.
+    `start()`가 `_restore_state()`로 블롭의 (상향된) risk_params를 되살린
+    **뒤**에 화해가 일어나는지까지 함께 잠근다.
     """
+    c = ExecutionCoordinator(kiwoom_client=None)
+    await _seed_baseline(temp_storage, c)
+    await temp_storage.set_app_setting(
+        c._STATE_KEY,
+        json.dumps(
+            {
+                "positions": [],
+                "trade_queue": [],
+                "watch_list": [],
+                "daily_trades_count": 0,
+                "daily_count_date": "2026-08-07",
+                "risk_params": {
+                    "max_open_positions": 16,
+                    "max_single_position_pct": 0.05,
+                },
+                "mode": "active",
+            }
+        ),
+    )
+
+    with patch("services.trading.coordinator.get_settings") as gs:
+        gs.return_value.REGIME_EXPOSURE_ENABLED = False
+        await c.start(drain_queue=False)
+        try:
+            assert c.risk_params.max_open_positions == 7
+            assert c.risk_params.max_single_position_pct == 0.03
+        finally:
+            await c.stop()
+
+
+# -------------------------------------------
+# I-1 — 라이브 리스크 파라미터를 기본값으로 덮어쓰지 않는다
+# -------------------------------------------
+
+
+async def test_persistence_inactive_skips_entirely_and_preserves_live_params(
+    temp_storage,
+):
+    """`_persistence_active=False`면 `self.risk_params`는 `RiskParameters()`
+    **기본값**이지 라이브 값이 아니다(`resume_if_persisted()`가 저장된
+    mode≠active면 `_restore_state()` 없이 no-op하는 실재 경로).
+
+    그 상태에서 계산도 쓰기도 하면 안 된다. 예전 구현은
+    `_persist_fields(risk_params=...)`로 블롭의 `risk_params` 최상위 키를
+    **통째로 교체**해서, 운영자가 트레이딩을 정지시켜 둔 채 재시작한 다음날
+    아침 08:05에 `max_trade_notional_pct` 10.0 → 15.0(자율 게이트 검사 7의
+    안전 레일이 50% 완화)이 조용히 일어났다.
+    """
+    live = {
+        "max_open_positions": 7,
+        "max_single_position_pct": 0.03,
+        "max_trade_notional_pct": 10.0,
+        "min_cash_ratio": 0.30,
+    }
+    c = _coord(persistence=False)
+    await temp_storage.set_app_setting(
+        c._STATE_KEY, json.dumps({"risk_params": dict(live), "mode": "stopped"})
+    )
+
+    with patch("services.trading.coordinator.get_settings") as gs, \
+         patch("services.trading.regime_judge.get_effective_target",
+               AsyncMock(return_value=0.55)) as get_target:
+        gs.return_value.REGIME_EXPOSURE_ENABLED = True
+        assert await c.apply_regime_slots() is None
+
+    # 목표를 조회조차 하지 않는다 -- 입력이 틀렸으므로 쓰기만 고칠 문제가 아니다.
+    get_target.assert_not_awaited()
+    blob = json.loads(await temp_storage.get_app_setting(c._STATE_KEY))
+    assert blob["risk_params"] == live
+
+
+async def test_persistence_active_uses_the_full_snapshot(temp_storage):
+    """`_persistence_active=True`(= `_restore_state()`가 이미 돌아 `_state`가
+    진짜 데이터) 일 때만 전체 스냅샷을 쓴다 -- 2026-07-29의 "빈 스냅샷이 실
+    포지션 손절가를 덮어씀" 사고는 False에서만 성립한다."""
     c = _coord()
-    c._persistence_active = True
     c._persist_state = AsyncMock()
     c._persist_fields = AsyncMock()
     with patch("services.trading.coordinator.get_settings") as gs, \
@@ -96,31 +301,7 @@ async def test_persistence_active_uses_full_snapshot_not_partial_fields():
                AsyncMock(return_value=0.55)):
         gs.return_value.REGIME_EXPOSURE_ENABLED = True
         out = await c.apply_regime_slots()
+
     assert out == {"max_open_positions": 11, "max_single_position_pct": 0.05}
     c._persist_state.assert_awaited_once()
     c._persist_fields.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_persistence_inactive_uses_partial_fields_not_full_snapshot():
-    """`_persistence_active=False`(이 프로세스에서 `start()`를 거친 적 없어
-    `_state`가 빈 기본값) 일 때는 부분 RMW `_persist_fields()`만 쓰고,
-    전체 스냅샷 `_persist_state()`는 쓰지 않는다.
-
-    반대 방향으로 뒤집으면 빈 `_state`가 블롭의 실 데이터(포지션·손절가
-    포함)를 덮어쓴다 -- 2026-07-29 사고 그 자체.
-    """
-    c = _coord()
-    assert c._persistence_active is False
-    c._persist_state = AsyncMock()
-    c._persist_fields = AsyncMock()
-    with patch("services.trading.coordinator.get_settings") as gs, \
-         patch("services.trading.regime_judge.get_effective_target",
-               AsyncMock(return_value=0.55)):
-        gs.return_value.REGIME_EXPOSURE_ENABLED = True
-        out = await c.apply_regime_slots()
-    assert out == {"max_open_positions": 11, "max_single_position_pct": 0.05}
-    c._persist_fields.assert_awaited_once_with(
-        risk_params=c.risk_params.model_dump()
-    )
-    c._persist_state.assert_not_called()

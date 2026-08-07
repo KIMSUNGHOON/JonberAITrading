@@ -559,7 +559,9 @@ class TestCollectBriefRegimeIsIndependentSection:
         monkeypatch.setattr(b, "_storage", fake_storage)
         data = await b.collect_brief("2026-08-07", prev_date="2026-08-06")
 
-        assert data.regime is None
+        assert isinstance(data.regime, b.RegimeUnavailable), (
+            "조회 실패는 '행 없음'(None)이 아니라 조회 실패로 남아야 한다 (I-3)"
+        )
         assert data.yesterday is not None, (
             "레짐 조회 실패가 다른 섹션(어제)까지 삼켰다 -- 직접 try/except가 "
             "빠졌다는 신호"
@@ -623,7 +625,79 @@ class TestCollectRegimeRow:
         monkeypatch.setattr(b, "_storage", fake_storage)
         row = await b.collect_regime_row()  # 예외가 나가면 이 테스트가 실패한다
 
-        assert row is None
+        assert isinstance(row, b.RegimeUnavailable)
+
+
+class TestRegimeThreeStates:
+    """I-3 (2026-08-07 최종 리뷰) — "행 없음"과 "조회 실패"를 절대 합치지 않는다.
+
+    배포 다음날 아침 검증이 전적으로 이 화면을 통해 이뤄진다. DB 오류가
+    "아직 안 돌았음"으로 읽히면 정상/비정상 판별 자체가 불가능해진다 --
+    2026-08-06에 사용자가 폰에서 실제로 신고한 사고와 같은 계열이다.
+    """
+
+    def test_format_regime_distinguishes_absent_from_unavailable(self):
+        from services.telegram.briefing import RegimeUnavailable, format_regime
+
+        absent = format_regime(None)
+        unavailable = format_regime(RegimeUnavailable())
+
+        assert "판정 없음" in absent
+        assert _NO_DATA not in absent
+        assert _NO_DATA in unavailable
+        assert "판정 없음" not in unavailable
+
+    @pytest.mark.asyncio
+    async def test_collect_regime_row_failure_renders_as_a_failure(self, monkeypatch):
+        """수집기와 포맷터를 이어서 확인한다 -- 둘 중 하나만 3-상태여도
+        화면에는 여전히 "아직 안 돌았음"이 나간다."""
+        import services.telegram.briefing as b
+
+        class Boom:
+            async def get_latest_regime_judgment(self):
+                raise RuntimeError("db down")
+
+        async def fake_storage():
+            return Boom()
+
+        monkeypatch.setattr(b, "_storage", fake_storage)
+        text = b.format_regime(await b.collect_regime_row())
+
+        assert _NO_DATA in text
+        assert "판정 없음" not in text
+
+    @pytest.mark.asyncio
+    async def test_brief_regime_failure_is_not_reported_as_no_judgment(
+        self, monkeypatch
+    ):
+        """`/brief`도 같은 구별을 해야 한다 -- 08:30 자동 발송이 검증의
+        1차 창구다."""
+        import services.telegram.briefing as b
+
+        class Boom:
+            async def get_latest_regime_judgment(self):
+                raise RuntimeError("db down")
+
+            async def get_latest_exposure_shadow(self):
+                return None
+
+            async def get_day_rollup(self, d):
+                return None
+
+        async def fake_storage():
+            return Boom()
+
+        async def no_coordinator():
+            return None
+
+        monkeypatch.setattr(b, "_storage", fake_storage)
+        monkeypatch.setattr(b, "_coordinator", no_coordinator)
+        d = await b.collect_brief("2026-08-07")
+
+        assert isinstance(d.regime, b.RegimeUnavailable)
+        text = b.format_brief(d)
+        assert _NO_DATA in b.format_regime(d.regime)
+        assert "판정 없음" not in text
 
 
 class TestHandleExposurePrependsRegime:
