@@ -10,6 +10,7 @@ Check chain (first failure denies):
     → daily_loss_breaker (BUY/ADD only, S-1/D3)
     → coordinator_active (BUY/ADD, kiwoom only)
     → max_positions (BUY/ADD only) → notional_cap (BUY/ADD only, kiwoom only)
+    → exposure_target (BUY/ADD only, kiwoom only, REGIME_EXPOSURE_ENABLED gated)
 
 Design rules:
 - FAIL-CLOSED: any provider error — or a provider return the check cannot
@@ -45,7 +46,7 @@ from typing import Awaitable, Callable, Optional
 
 import structlog
 
-from app.config import settings
+from app.config import get_settings
 from services.trading.models import RiskParameters
 
 logger = structlog.get_logger()
@@ -262,6 +263,32 @@ async def _default_account_equity_provider(market: str) -> Optional[float]:
     return float(balance.evlu_amt + balance.d2_ord_psbl_amt)
 
 
+async def _default_exposure_target_provider(market: str) -> Optional[float]:
+    """유효한 목표 노출도(분율). 판정 부재/만료는 None, **DB 오류는 raise**.
+
+    이 둘을 합치면 안 된다 -- 부재는 검사 스킵(기존 천장 유지)이고 오류는
+    fail-closed 거절이다. 2026-08-06에 /exposure가 storage 계층에서 이
+    둘을 합쳐 "행 없음"을 "조회 실패"로 보고한 사고가 있었다.
+    """
+    if market != "kiwoom":
+        return None
+    from services.trading.regime_judge import get_effective_target
+
+    return await get_effective_target()
+
+
+async def _default_stock_value_provider(market: str) -> Optional[float]:
+    """현재 주식 평가액. `evlu_amt`가 곧 평가금액이다
+    (`total_value = evlu_amt + d2_ord_psbl_amt`, kiwoom/models.py:227)."""
+    if market != "kiwoom":
+        return None
+    from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+
+    client = await get_shared_kiwoom_client_async()
+    balance = await client.get_account_balance()
+    return float(balance.evlu_amt)
+
+
 # -------------------------------------------
 # The gate
 # -------------------------------------------
@@ -282,6 +309,8 @@ async def check_autonomy(
     risk_params_provider: Optional[Callable[[], RiskParameters]] = None,
     coordinator_active_provider: Optional[Provider] = None,
     account_equity_provider: Optional[Provider] = None,
+    exposure_target_provider: Optional[Provider] = None,
+    stock_value_provider: Optional[Provider] = None,
 ) -> GateDecision:
     """Decide whether an autonomous execution is allowed. Fail-closed.
 
@@ -313,7 +342,7 @@ async def check_autonomy(
     account_equity_provider = account_equity_provider or _default_account_equity_provider
 
     # 1. Master gate (env)
-    if not settings.AUTONOMY_ENABLED:
+    if not get_settings().AUTONOMY_ENABLED:
         return _deny("master_gate", "AUTONOMY_ENABLED is off")
 
     # 2. Per-market mode
@@ -457,5 +486,38 @@ async def check_autonomy(
                     f"notional ₩{notional:,.0f} > cap ₩{cap:,.0f} "
                     f"({params.max_trade_notional_pct}% of ₩{equity:,.0f})",
                 )
+
+            # 8. 목표 노출도 상한 (레짐 인지, 2026-08-07)
+            #    이 분기는 `action in POSITION_INCREASING_ACTIONS` 안이므로
+            #    SELL/REDUCE는 구조적으로 면제된다 -- 손절 경로에 새 조건이
+            #    하나도 추가되지 않는다.
+            #    ⚠️ target은 **분율**(0.55)이다. 바로 위 notional_cap의
+            #    `/100.0`을 복사해 오면 목표가 100배 작아져 모든 매수가 막힌다.
+            if get_settings().REGIME_EXPOSURE_ENABLED:
+                try:
+                    target = await (
+                        exposure_target_provider or _default_exposure_target_provider
+                    )(market)
+                except Exception as e:
+                    return _deny("exposure_target", f"target unavailable: {e}")
+
+                if target is not None:
+                    try:
+                        stock_value = await (
+                            stock_value_provider or _default_stock_value_provider
+                        )(market)
+                    except Exception as e:
+                        return _deny("exposure_target", f"stock value unavailable: {e}")
+                    if stock_value is None:
+                        return _deny("exposure_target", "stock value unknown")
+                    exposure_cap = float(target) * float(equity)
+                    projected = float(stock_value) + notional
+                    if projected > exposure_cap:
+                        return _deny(
+                            "exposure_target",
+                            f"projected ₩{projected:,.0f} > target cap "
+                            f"₩{exposure_cap:,.0f} ({float(target) * 100:.1f}% of "
+                            f"₩{equity:,.0f})",
+                        )
 
     return GateDecision(allowed=True, reason="ok", check="all")

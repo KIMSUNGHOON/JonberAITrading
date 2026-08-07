@@ -137,6 +137,10 @@ class Settings(BaseSettings):
     US_SIGNAL_ENABLED: bool = False
     FINNHUB_API_KEY: SecretStr | None = None
 
+    # 레짐 인지 노출도 제어 (2026-08-07). False면 게이트 검사 8과 리스크
+    # 파라미터 쓰기를 둘 다 건너뛴다 -- 현행 동작과 바이트 단위로 동일.
+    REGIME_EXPOSURE_ENABLED: bool = False
+
     # -------------------------------------------
     # Phase3: EOD strategy consensus (strategy_orchestrator.py). ENABLED
     # gates the market-close LLM panel (3 structured calls via the
