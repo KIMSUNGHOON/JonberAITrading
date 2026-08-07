@@ -445,6 +445,46 @@ class StorageService:
                     "ON exposure_shadow(trade_date)"
                 )
 
+                # macro_snapshot (레짐 판정 입력, 2026-08-07)
+                # quotes_json = {ticker: {"chg_pct": float, "prev_close": float}}
+                # missing_json = 수신 실패 티커 리스트. 조용히 0을 채우지
+                # 않는다 -- 못 받은 것은 못 받았다고 남긴다.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS macro_snapshot (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL UNIQUE,
+                        quotes_json TEXT NOT NULL,
+                        missing_json TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_macro_snapshot_trade_date "
+                    "ON macro_snapshot(trade_date)"
+                )
+
+                # regime_judgment (LLM 레짐 판정 + 그 판정이 만든 목표, 2026-08-07)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS regime_judgment (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL UNIQUE,
+                        regime TEXT NOT NULL,
+                        confidence REAL,
+                        rationale TEXT,
+                        key_drivers_json TEXT,
+                        anchor_target_pct REAL NOT NULL,
+                        effective_target_pct REAL NOT NULL,
+                        prev_effective_pct REAL,
+                        degraded_json TEXT,
+                        macro_snapshot_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_regime_judgment_trade_date "
+                    "ON regime_judgment(trade_date)"
+                )
+
                 # exposure_shadow.e_base/e_max/equity_peak (리뷰 반영,
                 # 2026-08-06): e_base/e_max는 이전까지 호출자가 넘기지 않아
                 # 늘 함수 기본값이었고 행에도 없었다 -- 관측 기간 중 이
@@ -2706,6 +2746,16 @@ class StorageService:
         한다. 대체값을 그대로 저장하면 `AVG(n_round_trips)` 같은 사후
         집계가 측정값과 대체값을 구분 못 하고 섞인다(리뷰 반영,
         2026-08-06).
+
+        `m_regime`/`m_evidence` 컬럼은 2026-08-07(레짐 인지 노출도 개편)부터
+        항상 NULL이다 -- `TargetExposure`에서 두 필드가 사라졌다(레짐
+        배수는 폐기, 증거 배수는 왕복 표본이 모의 시장에서 쌓인 것이라
+        안전장치로 기능하지 못해 제거). 그 정보는 사라진 게 아니라
+        `regime_judgment` 테이블(`regime`/`anchor_target_pct`/
+        `effective_target_pct`/`degraded`)로 더 온전하게 옮겨갔다 --
+        그쪽이 권위 있는 출처다. 컬럼 자체는 SQLite에서 지우는 비용을
+        치를 이유가 없어 남겨뒀지만, 값은 반드시 `None`이어야 한다 --
+        `0`을 넣으면 "배수가 0이었다"로 오독돼 사후 분석이 오염된다.
         """
         await self.initialize()
         try:
@@ -2726,9 +2776,9 @@ class StorageService:
                         actual_pct,
                         equity,
                         stock_value,
-                        target.m_regime,
+                        None,   # m_regime — regime_judgment로 이전, 2026-08-07
                         target.m_vol,
-                        target.m_evidence,
+                        None,   # m_evidence — 안전장치로 기능 못해 폐기, 2026-08-07
                         target.m_drawdown,
                         target.binding,
                         ",".join(target.degraded),
@@ -2785,6 +2835,162 @@ class StorageService:
             # 계약: None = 행 없음, 예외 = 조회 실패.
             logger.warning("latest_exposure_shadow_read_failed", error=str(e))
             raise
+
+    # -------------------------------------------
+    # Macro Snapshot (regime judgment input, 2026-08-07)
+    # -------------------------------------------
+
+    async def insert_macro_snapshot(
+        self, *, trade_date: str, quotes: dict, missing: list[str]
+    ) -> bool:
+        """매크로 스냅샷 1행. 같은 날짜 재수집은 덮어쓴다(UNIQUE + REPLACE).
+        실패-무해 — False만 돌려주고 raise 안 한다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO macro_snapshot
+                    (id, trade_date, quotes_json, missing_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        trade_date,
+                        json.dumps(quotes, ensure_ascii=False),
+                        json.dumps(missing or [], ensure_ascii=False),
+                    ),
+                )
+                await conn.commit()
+            return True
+        except Exception as e:
+            logger.warning("macro_snapshot_insert_failed", error=str(e))
+            return False
+
+    async def get_macro_snapshot(self, trade_date: str) -> Optional[dict]:
+        """행 없으면 None. **DB 오류는 raise한다** — 호출자가 '없음'과
+        '못 읽음'을 구별할 수 있어야 한다(2026-08-06 /exposure 사고)."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT quotes_json, missing_json, created_at FROM macro_snapshot "
+                "WHERE trade_date = ?",
+                (trade_date,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "quotes": json.loads(row["quotes_json"]),
+            "missing": json.loads(row["missing_json"] or "[]"),
+            "created_at": row["created_at"],
+        }
+
+    async def get_recent_macro_returns(
+        self, ticker: str, limit: int = 20
+    ) -> Optional[list[float]]:
+        """최근 `limit`일의 해당 티커 chg_pct를 **시간 오름차순**으로.
+        `annualized_vol`이 `sample[-window:]`를 취하므로 순서가 뒤집히면
+        '최근 20일'이 '가장 오래된 20일'이 된다. 행이 없으면 []이고,
+        **DB 오류는 raise한다**."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT quotes_json FROM macro_snapshot "
+                "ORDER BY trade_date DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        out: list[float] = []
+        for row in reversed(rows):  # DESC로 뽑아 뒤집어 오름차순으로 만든다
+            q = json.loads(row["quotes_json"]).get(ticker)
+            if q is None:
+                continue
+            v = q.get("chg_pct")
+            if v is not None:
+                out.append(float(v))
+        return out
+
+    # -------------------------------------------
+    # Regime Judgment (LLM 레짐 판정 + 목표 노출도, 2026-08-07)
+    # -------------------------------------------
+
+    async def insert_regime_judgment(
+        self,
+        *,
+        trade_date: str,
+        regime: str,
+        confidence: Optional[float],
+        rationale: Optional[str],
+        key_drivers: Optional[list],
+        anchor_target_pct: float,
+        effective_target_pct: float,
+        prev_effective_pct: Optional[float],
+        degraded: Optional[list],
+        macro_snapshot_id: Optional[str] = None,
+    ) -> bool:
+        """레짐 판정 1행. 같은 날 재판정은 덮어쓴다. 실패-무해."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO regime_judgment
+                    (id, trade_date, regime, confidence, rationale,
+                     key_drivers_json, anchor_target_pct, effective_target_pct,
+                     prev_effective_pct, degraded_json, macro_snapshot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        trade_date,
+                        regime,
+                        confidence,
+                        rationale,
+                        json.dumps(key_drivers or [], ensure_ascii=False),
+                        anchor_target_pct,
+                        effective_target_pct,
+                        prev_effective_pct,
+                        json.dumps(degraded or [], ensure_ascii=False),
+                        macro_snapshot_id,
+                    ),
+                )
+                await conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"insert_regime_judgment failed: {e}")
+            return False
+
+    async def get_latest_regime_judgment(self) -> Optional[dict]:
+        """가장 최근 trade_date의 판정. 행 없으면 None, **DB 오류는 raise**."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                """
+                SELECT trade_date, regime, confidence, rationale,
+                       key_drivers_json, anchor_target_pct, effective_target_pct,
+                       prev_effective_pct, degraded_json, created_at
+                FROM regime_judgment ORDER BY trade_date DESC LIMIT 1
+                """
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "trade_date": row["trade_date"],
+            "regime": row["regime"],
+            "confidence": row["confidence"],
+            "rationale": row["rationale"],
+            "key_drivers": json.loads(row["key_drivers_json"] or "[]"),
+            "anchor_target_pct": row["anchor_target_pct"],
+            "effective_target_pct": row["effective_target_pct"],
+            "prev_effective_pct": row["prev_effective_pct"],
+            "degraded": json.loads(row["degraded_json"] or "[]"),
+            "created_at": row["created_at"],
+        }
 
     async def get_day_rollup(self, trade_date: str) -> Optional[dict]:
         """하루 요약 — 결정 수·체결 수·실현손익·슬롯 거절 수.

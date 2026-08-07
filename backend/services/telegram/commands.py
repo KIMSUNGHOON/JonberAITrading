@@ -742,10 +742,21 @@ async def handle_slots(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> 
 
 
 async def handle_exposure(update: Update, context: "ContextTypes.DEFAULT_TYPE") -> None:
-    from services.telegram.briefing import collect_exposure, format_exposure
+    from services.telegram.briefing import (
+        collect_exposure,
+        collect_regime_row,
+        format_exposure,
+        format_regime,
+    )
 
+    # 레짐 판정(regime_judgment)과 목표 노출도 관측(exposure_shadow)은 서로
+    # 다른 테이블·다른 기능이라 각자 독립적으로 없거나 있을 수 있다 --
+    # 하나가 죽어도 다른 하나는 그대로 나가도록 별도 `_safe`로 감싼다.
+    # `format_exposure`/`collect_exposure`의 기존 계약(ExposureData/None/
+    # ExposureUnavailable 삼중 상태, 기존 테스트 다수)은 건드리지 않는다.
+    regime_row = await _safe("exposure_regime", collect_regime_row())
     data = await _safe("exposure", collect_exposure())
-    await _reply(update, format_exposure(data))
+    await _reply(update, f"{format_regime(regime_row)}\n\n{format_exposure(data)}")
 
 
 register_command(

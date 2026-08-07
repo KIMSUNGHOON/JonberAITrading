@@ -387,6 +387,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("us_ai_signal_scheduler_init_failed", error=str(e))
 
+    # 레짐 인지 노출도 08:05 일일 사이클(REGIME_EXPOSURE_ENABLED off면 no-op).
+    try:
+        from services.trading.regime_judge import start_regime_scheduler
+
+        start_regime_scheduler()
+        logger.info("regime_scheduler_wired")
+    except Exception as e:
+        logger.warning("regime_scheduler_init_failed", error=str(e))
+
     # Initialize the LLM router (best-effort CLI/HTTP health probes for /api/llm/stats)
     try:
         from agents.llm.router import get_router
