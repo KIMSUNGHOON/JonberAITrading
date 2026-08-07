@@ -166,6 +166,8 @@ def semantic_fingerprint(strategy: TradingStrategy) -> tuple:
         strategy.exit_conditions.take_profit_pct,
         strategy.position_sizing.max_trade_notional_pct,
         strategy.entry_conditions.consensus_threshold,
+        strategy.position_sizing.target_vol_pct,
+        strategy.position_sizing.vol_multiplier_min,
     )
 
 

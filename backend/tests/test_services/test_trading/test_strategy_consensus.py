@@ -405,3 +405,26 @@ def test_vote_schema_includes_vol_knobs():
     props = STRATEGY_VOTE_SCHEMA["properties"]["adjustments"]["properties"]
     assert props["target_vol_pct"] == {"type": ["number", "null"]}
     assert props["vol_multiplier_min"] == {"type": ["number", "null"]}
+
+
+def test_semantic_fingerprint_detects_vol_knob_only_changes():
+    """재리뷰 지적(2026-08-08): knob_targets에 두 노브를 배선한 이상
+    semantic_fingerprint도 그 변화를 감지해야 한다 — 안 그러면 이 두 노브
+    '만' 바뀐 EOD 실행이 strategy_revisions.changed=0으로 거짓 기록된다.
+    다른 7개 노브·stance는 완전히 동일하게 맞추고 target_vol_pct/
+    vol_multiplier_min만 다르게 해 지문이 달라지는지 확인한다."""
+    baseline = TradingStrategy()
+    moved = baseline.model_copy(deep=True)
+    moved.position_sizing.target_vol_pct = 25.0
+    moved.position_sizing.vol_multiplier_min = 0.65
+
+    assert semantic_fingerprint(moved) != semantic_fingerprint(baseline)
+
+    # 노브 값 하나만 바뀌어도 감지되어야 한다(둘 다 바뀌어야만 잡히는 결함 방지).
+    only_target = baseline.model_copy(deep=True)
+    only_target.position_sizing.target_vol_pct = 30.0
+    assert semantic_fingerprint(only_target) != semantic_fingerprint(baseline)
+
+    only_multiplier = baseline.model_copy(deep=True)
+    only_multiplier.position_sizing.vol_multiplier_min = 0.7
+    assert semantic_fingerprint(only_multiplier) != semantic_fingerprint(baseline)
