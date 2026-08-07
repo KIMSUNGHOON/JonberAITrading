@@ -2746,6 +2746,16 @@ class StorageService:
         한다. 대체값을 그대로 저장하면 `AVG(n_round_trips)` 같은 사후
         집계가 측정값과 대체값을 구분 못 하고 섞인다(리뷰 반영,
         2026-08-06).
+
+        `m_regime`/`m_evidence` 컬럼은 2026-08-07(레짐 인지 노출도 개편)부터
+        항상 NULL이다 -- `TargetExposure`에서 두 필드가 사라졌다(레짐
+        배수는 폐기, 증거 배수는 왕복 표본이 모의 시장에서 쌓인 것이라
+        안전장치로 기능하지 못해 제거). 그 정보는 사라진 게 아니라
+        `regime_judgment` 테이블(`regime`/`anchor_target_pct`/
+        `effective_target_pct`/`degraded`)로 더 온전하게 옮겨갔다 --
+        그쪽이 권위 있는 출처다. 컬럼 자체는 SQLite에서 지우는 비용을
+        치를 이유가 없어 남겨뒀지만, 값은 반드시 `None`이어야 한다 --
+        `0`을 넣으면 "배수가 0이었다"로 오독돼 사후 분석이 오염된다.
         """
         await self.initialize()
         try:
@@ -2766,9 +2776,9 @@ class StorageService:
                         actual_pct,
                         equity,
                         stock_value,
-                        target.m_regime,
+                        None,   # m_regime — regime_judgment로 이전, 2026-08-07
                         target.m_vol,
-                        target.m_evidence,
+                        None,   # m_evidence — 안전장치로 기능 못해 폐기, 2026-08-07
                         target.m_drawdown,
                         target.binding,
                         ",".join(target.degraded),
