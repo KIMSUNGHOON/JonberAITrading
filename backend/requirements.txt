@@ -25,6 +25,7 @@ langgraph>=0.2.0
 # -------------------------------------------
 pandas>=2.2.0
 numpy>=1.26.0
+yfinance>=1.0.0  # KOSPI(^KS11) index_series.py -- regime volatility input
 
 # -------------------------------------------
 # Async & HTTP Client

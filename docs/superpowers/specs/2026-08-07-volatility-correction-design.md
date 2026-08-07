@@ -243,28 +243,56 @@ def is_series_stale(latest_trade_date: str, today: date) -> bool:
 ⚠️ 테스트마다 물을 것: **"이 속성이 위반되면 이 테스트가 실제로 실패하는가."**
 이 리포는 공허한 테스트가 3라운드 연속 나온 전력이 있다.
 
-## 7. 배포 후 판정 (월요일 08:05)
+## 7. 배포 후 판정 (월요일)
+
+`m_vol`·`index_vol_annualized`·`binding`은 `regime_judgment`가 아니라
+`exposure_shadow`에만 저장된다(`insert_regime_judgment`는 `effective_target_pct`·
+`degraded`만 싣는다). 그 행은 코디네이터의 `_record_exposure_shadow`가
+`is_krx_open_cached()` 가드 뒤에서 5분 주기로 쓰므로 **09:00 개장 이후에만
+존재한다.** 08:05 시점에는 아래를 두 시각으로 나눠서 본다.
+
+### 08:05 확인 가능
 
 | 확인 | 정상 | 실패 신호 |
 |---|---|---|
 | `index_daily` | **약 40행**, 최신이 **2거래일 이내** | 0행 = 수집 배선 실패 |
-| `index_daily` 연속성 | 거래일 누락 없음 | 구멍 = upsert 창이 부족 |
-| `index_vol_annualized` | **90~110** 근처 | 9~15면 아직 SPY |
-| `m_vol` | **0.5** (하한) | 1.0이면 게이트가 남아 있거나 표본 부족 |
-| `degraded` | `index_vol_implausible`이 **없어야** 정상 | 있으면 게이트 제거 실패 |
-| `effective_target_pct` | **0.15 근처** | 0.30이면 `m_vol`이 안 물렸다 |
+| `index_daily` 연속성 | **최근 1~2 거래일의 구멍은 정상**(아래 참고) | **오래된 구간**(3거래일 이상 전)에 구멍 = 문제 |
+| `regime_judgment.effective_target_pct` | **0.15 근처**(≈0.1538 기대) | 0.30이면 `m_vol`이 안 물렸다 |
+| `regime_judgment.degraded` | `index_vol_implausible`이 **없어야** 정상 | 있으면 게이트 제거 실패 |
 | `risk_params` | `target_vol_pct=18.0`, `vol_multiplier_min=0.5` | 없으면 필드 추가 실패 |
 | `regime:slot_baseline` | 행 존재 | 없으면 되돌리기 기계 무력 |
 
-⚠️ **2026-08-07 재정정**: 위 `index_daily` 판정 기준을 원래 "최신 = 직전
-거래일"로 적었으나 **항상 참은 아니다.** yfinance는 당일 봉을 정산 전에
-`Close=NaN`으로 돌려줄 때가 있고(2026-08-07 실측), 필터가 이를 걸러내면
-그날 실행에서는 최신 행이 전날로 남는다. 다음 실행이 자동으로 메운다(§4
-`refresh_index_daily`의 매 실행 전체 창 재기록). "최신이 2거래일 이내"가
-맞는 기준이다 — 그대로 두면 정상 동작을 배선 실패로 오판한다.
+⚠️ **`index_daily` 연속성 재정정**: 원래 "거래일 누락 없음"이 정상 기준이었으나
+**항상 참은 아니다.** yfinance는 당일 봉을 정산 전에 `Close=NaN`으로 돌려줄
+때가 있고(2026-08-07 실측 — 금요일 봉이 다음날 아침에도 여전히 `NaN`),
+`isfinite` 필터가 이를 걸러내면 그 구멍은 **원인이 upsert 창 부족이 아니라
+Yahoo 정산 지연이다.** 다음 실행이 자동으로 메운다(§4 `refresh_index_daily`의
+매 실행 전체 창 재기록). 최근 1~2 거래일의 구멍은 이 지연으로 정상 발생한다 —
+**오래된 구간**(정산이 끝났을 시점)에 구멍이 남아 있을 때만 배선 실패로 본다.
+
+### 09:05 이후 확인 가능
+
+```sql
+SELECT m_vol, index_vol_annualized, binding, degraded
+FROM exposure_shadow ORDER BY created_at DESC LIMIT 1;
+```
+
+| 확인 | 정상 | 실패 신호 |
+|---|---|---|
+| `index_vol_annualized` | **90~110** 근처 | 9~15면 아직 SPY |
+| `m_vol` | **0.5** (하한) | 1.0이면 세 원인 중 하나 — `degraded` 열로 구별한다: 게이트가 남아 있음(`index_vol_implausible`), 표본 부족(`index_vol_insufficient`), **시계열 노후**(`index_series_stale` — `index_daily` 최신 행이 `INDEX_SERIES_MAX_AGE_DAYS`(7일)보다 오래됨) |
+| `degraded` | 위 세 값 중 아무것도 없어야 정상 | 있으면 위 표에서 원인 특정 |
 
 **예상**: `ramped 0.3078 × m_vol 0.50 = 목표 15.39%` (현재 보유 15.78%).
 사실상 동결 — 신규 매수는 막히고 기존 포지션은 유지된다. **2년 최고 변동성 국면에서 의도한 동작이다.**
+
+### 슬롯 노브 — 월요일에 움직이는 것은 하나뿐
+
+`max_open_positions`는 **7 유지가 정상이다.** `slots_for_target`은 상향만
+하고 하향은 하지 않는데(§6 참고), 목표 0.1538 → `ceil(0.1538/0.05)=4`
+→ `max(current_max, 4)`이고 `current_max`는 이미 7이므로 결과도 7이다.
+월요일에 실제로 움직이는 노브는 **`max_single_position_pct` 0.03→0.05
+하나뿐이다.**
 
 ## 8. 남는 위험
 
