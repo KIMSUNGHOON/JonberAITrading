@@ -445,6 +445,24 @@ class StorageService:
                     "ON exposure_shadow(trade_date)"
                 )
 
+                # macro_snapshot (레짐 판정 입력, 2026-08-07)
+                # quotes_json = {ticker: {"chg_pct": float, "prev_close": float}}
+                # missing_json = 수신 실패 티커 리스트. 조용히 0을 채우지
+                # 않는다 -- 못 받은 것은 못 받았다고 남긴다.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS macro_snapshot (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL UNIQUE,
+                        quotes_json TEXT NOT NULL,
+                        missing_json TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_macro_snapshot_trade_date "
+                    "ON macro_snapshot(trade_date)"
+                )
+
                 # exposure_shadow.e_base/e_max/equity_peak (리뷰 반영,
                 # 2026-08-06): e_base/e_max는 이전까지 호출자가 넘기지 않아
                 # 늘 함수 기본값이었고 행에도 없었다 -- 관측 기간 중 이
@@ -2785,6 +2803,83 @@ class StorageService:
             # 계약: None = 행 없음, 예외 = 조회 실패.
             logger.warning("latest_exposure_shadow_read_failed", error=str(e))
             raise
+
+    # -------------------------------------------
+    # Macro Snapshot (regime judgment input, 2026-08-07)
+    # -------------------------------------------
+
+    async def insert_macro_snapshot(
+        self, *, trade_date: str, quotes: dict, missing: list[str]
+    ) -> bool:
+        """매크로 스냅샷 1행. 같은 날짜 재수집은 덮어쓴다(UNIQUE + REPLACE).
+        실패-무해 — False만 돌려주고 raise 안 한다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO macro_snapshot
+                    (id, trade_date, quotes_json, missing_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        trade_date,
+                        json.dumps(quotes, ensure_ascii=False),
+                        json.dumps(missing or [], ensure_ascii=False),
+                    ),
+                )
+                await conn.commit()
+            return True
+        except Exception as e:
+            logger.warning("macro_snapshot_insert_failed", error=str(e))
+            return False
+
+    async def get_macro_snapshot(self, trade_date: str) -> Optional[dict]:
+        """행 없으면 None. **DB 오류는 raise한다** — 호출자가 '없음'과
+        '못 읽음'을 구별할 수 있어야 한다(2026-08-06 /exposure 사고)."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT quotes_json, missing_json, created_at FROM macro_snapshot "
+                "WHERE trade_date = ?",
+                (trade_date,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "quotes": json.loads(row["quotes_json"]),
+            "missing": json.loads(row["missing_json"] or "[]"),
+            "created_at": row["created_at"],
+        }
+
+    async def get_recent_macro_returns(
+        self, ticker: str, limit: int = 20
+    ) -> Optional[list[float]]:
+        """최근 `limit`일의 해당 티커 chg_pct를 **시간 오름차순**으로.
+        `annualized_vol`이 `sample[-window:]`를 취하므로 순서가 뒤집히면
+        '최근 20일'이 '가장 오래된 20일'이 된다. 행이 없으면 []이고,
+        **DB 오류는 raise한다**."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT quotes_json FROM macro_snapshot "
+                "ORDER BY trade_date DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        out: list[float] = []
+        for row in reversed(rows):  # DESC로 뽑아 뒤집어 오름차순으로 만든다
+            q = json.loads(row["quotes_json"]).get(ticker)
+            if q is None:
+                continue
+            v = q.get("chg_pct")
+            if v is not None:
+                out.append(float(v))
+        return out
 
     async def get_day_rollup(self, trade_date: str) -> Optional[dict]:
         """하루 요약 — 결정 수·체결 수·실현손익·슬롯 거절 수.
