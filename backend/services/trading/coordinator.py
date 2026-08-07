@@ -2462,6 +2462,70 @@ class ExecutionCoordinator:
         except asyncio.CancelledError:
             pass
 
+    async def apply_regime_slots(self) -> Optional[dict]:
+        """목표 노출도에 맞춰 슬롯 수와 종목당 상한을 맞춘다. never-raise.
+
+        슬롯은 **올리기만 한다** -- 목표가 내려갔다고 줄이면 같은 금액을 더
+        적은 종목에 담게 되어 집중도가 오른다. 총량 축소는 전적으로 게이트
+        검사 8이 담당한다.
+
+        `GATE_PROTECTED_FIELDS`는 그대로 둔다. 그 봉인은 전략 패널의 자유
+        서술값을 막기 위한 것이고, 이 경로는 값이 3개뿐인 룩업이라 드리프트가
+        구조적으로 불가능하다.
+        """
+        try:
+            if not get_settings().REGIME_EXPOSURE_ENABLED:
+                return None
+
+            from services.trading.exposure_target import (
+                REGIME_PER_POSITION_PCT,
+                slots_for_target,
+            )
+            from services.trading.regime_judge import get_effective_target
+
+            target = await get_effective_target()
+            if target is None:
+                return None
+
+            new_slots = slots_for_target(
+                target, current_max=int(self.risk_params.max_open_positions)
+            )
+            self.risk_params.max_open_positions = new_slots
+            self.risk_params.max_single_position_pct = REGIME_PER_POSITION_PCT
+
+            # 영속: RMW 경로만 쓴다. `_persist_state()`는 in-memory `_state`
+            # 전체를 블롭에 덮어쓰므로, `_restore_state()`가 이 프로세스에서
+            # 한 번도 안 돈 코디네이터(`_persistence_active=False`)에 부르면
+            # positions/trade_queue/watch_list가 빈 기본값인 채로 실제
+            # 블롭을 지워버린다(2026-07-29 사고: 빈 스냅샷이 실 포지션
+            # 손절가를 덮어씀). 그래서 `_persistence_active`가 True일 때만
+            # (즉 `_state`가 진짜 데이터를 담고 있을 때만) 전체 스냅샷을
+            # 쓰고, 아니면 `_persist_fields()`로 `risk_params` 키만
+            # 부분 갱신한다 -- `PUT /api/trading/risk-params`
+            # (app/api/routes/trading.py)와 동일한 판단, 동일한 키 모양
+            # (`risk_params=self.risk_params.model_dump()`, 블롭 안에서
+            # `"risk_params"`는 중첩 dict라 `max_open_positions`를 최상위
+            # 키로 넘기면 `_restore_state()`가 절대 못 읽는다).
+            if self._persistence_active:
+                await self._persist_state()
+            else:
+                await self._persist_fields(
+                    risk_params=self.risk_params.model_dump()
+                )
+
+            logger.info(
+                f"[Coordinator] regime_slots_applied: target_pct={target} "
+                f"max_open_positions={new_slots} "
+                f"max_single_position_pct={REGIME_PER_POSITION_PCT}"
+            )
+            return {
+                "max_open_positions": new_slots,
+                "max_single_position_pct": REGIME_PER_POSITION_PCT,
+            }
+        except Exception as e:
+            logger.warning(f"[Coordinator] apply_regime_slots failed: {e}")
+            return None
+
     async def _record_exposure_shadow(self) -> None:
         """목표 노출도를 계산해 1행 적는다. never-raise.
 
