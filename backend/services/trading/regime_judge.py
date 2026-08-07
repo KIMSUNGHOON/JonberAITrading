@@ -131,7 +131,8 @@ async def judge_regime() -> Optional[dict]:
             key_drivers = prev_row.get("key_drivers") or []
             confidence = prev_row.get("confidence")
 
-        equity, equity_peak, actual_pct = await _portfolio_state()
+        equity, equity_peak, actual_pct, portfolio_degraded = await _portfolio_state()
+        degraded.extend(portfolio_degraded)
 
         target = compute_regime_target(
             regime_label=regime,
@@ -183,9 +184,22 @@ async def judge_regime() -> Optional[dict]:
         return None
 
 
-async def _portfolio_state() -> tuple[float, float, float]:
-    """(equity, equity_peak, actual_stock_pct). 조회 실패는 (0,0,0) —
-    호출자가 seed로만 쓰므로 0이면 램프가 바닥에서 시작할 뿐이다."""
+async def _portfolio_state() -> tuple[float, float, float, list[str]]:
+    """(equity, equity_peak, actual_stock_pct, degraded).
+
+    계좌 조회 자체가 실패하면 (0.0, 0.0, 0.0, ["portfolio_state_unavailable"])을
+    돌려준다 — 호출자가 seed로만 쓰므로 0이면 램프가 바닥에서 시작할 뿐이다.
+
+    `StorageService.get_equity_peak()`은 "스냅샷 없음"(정상, `0.0`)과 "조회
+    자체 실패"(`None`)를 명시적으로 구분해서 돌려준다. `peak_raw or 0.0`로
+    두 경우를 뭉개면 실제 고점을 잃어버린 채로 오늘 equity를 고점처럼
+    취급하게 되고, `_drawdown_multiplier`가 무감쇠(1.0)로 조용히 넘어간다 —
+    계좌가 실제로 낙폭 중인 날 하필 이 조회가 실패하면 낙폭 방어가 흔적
+    없이 꺼진다. 그래서 `None`인 경우를 따로 감지해 `degraded`에 남긴다
+    (숫자 자체는 바꾸지 않는다 — `peak_raw or 0.0`와 결과값은 동일하다.
+    그 값을 어떻게 쓸지는 이 태스크의 범위 밖이고, 지금 필요한 건 기록이다).
+    """
+    degraded: list[str] = []
     try:
         from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 
@@ -193,14 +207,26 @@ async def _portfolio_state() -> tuple[float, float, float]:
         balance = await client.get_account_balance()
         equity = float(balance.evlu_amt + balance.d2_ord_psbl_amt)
         stock_value = float(balance.evlu_amt)
+
         storage = await get_storage_service()
         peak_raw = await storage.get_equity_peak()
-        equity_peak = max(equity, float(peak_raw or 0.0))
+        if peak_raw is None:
+            # 조회 자체 실패 -- "스냅샷 없음"(0.0, 정상)과 다르다. 낙폭
+            # 배수를 신뢰할 수 없다는 사실을 판정 행에 남긴다.
+            degraded.append("equity_peak_unavailable")
+            logger.warning("regime_judge_equity_peak_unavailable")
+            peak_value = 0.0
+        else:
+            peak_value = float(peak_raw)
+        equity_peak = max(equity, peak_value)
+
         actual = stock_value / equity if equity > 0 else 0.0
-        return equity, equity_peak, actual
+        return equity, equity_peak, actual, degraded
     except Exception as e:
         logger.warning("regime_judge_portfolio_state_failed", error=str(e))
-        return 0.0, 0.0, 0.0
+        if "portfolio_state_unavailable" not in degraded:
+            degraded.append("portfolio_state_unavailable")
+        return 0.0, 0.0, 0.0, degraded
 
 
 async def get_effective_target() -> Optional[float]:

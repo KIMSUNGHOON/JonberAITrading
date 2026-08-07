@@ -160,3 +160,41 @@ async def test_persist_failure_returns_none_and_does_not_claim_success():
 
     assert out is None, "저장이 실패했는데 성공 dict를 돌려주면 거짓 보고다"
     assert await storage.get_latest_regime_judgment() is None
+
+
+@pytest.mark.asyncio
+async def test_portfolio_query_failure_is_recorded_in_degraded():
+    """계좌 조회 자체가 실패하면(equity/stock_value를 모름) 판정 행의
+    degraded에 그 사실이 남아야 한다 -- 조용히 (0,0,0)으로 넘어가면
+    낙폭 방어가 꺼진 채로 아무 사후 감사 흔적도 안 남는다."""
+    with patch("app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+               AsyncMock(side_effect=RuntimeError("kiwoom down"))), \
+         patch("services.trading.regime_judge.refresh_macro_snapshot",
+               AsyncMock(return_value=_SNAPSHOT)), \
+         patch("services.trading.regime_judge.get_llm_provider", return_value=_llm()):
+        out = await judge_regime()
+
+    assert out is not None
+    assert "portfolio_state_unavailable" in out["degraded"]
+
+
+@pytest.mark.asyncio
+async def test_equity_peak_unavailable_is_recorded_in_degraded():
+    """get_equity_peak()이 None(조회 실패)을 돌려주면(고점을 모름 -> 낙폭
+    배수를 신뢰할 수 없음), 그 사실이 판정 행의 degraded에 남아야 한다.
+    '스냅샷 없음'(0.0, 정상)과 달리 이건 진짜 조회 실패다."""
+    storage = await get_storage_service()
+    balance = MagicMock(evlu_amt=1_000_000.0, d2_ord_psbl_amt=500_000.0)
+    client = MagicMock()
+    client.get_account_balance = AsyncMock(return_value=balance)
+
+    with patch("app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+               AsyncMock(return_value=client)), \
+         patch.object(storage, "get_equity_peak", AsyncMock(return_value=None)), \
+         patch("services.trading.regime_judge.refresh_macro_snapshot",
+               AsyncMock(return_value=_SNAPSHOT)), \
+         patch("services.trading.regime_judge.get_llm_provider", return_value=_llm()):
+        out = await judge_regime()
+
+    assert out is not None
+    assert "equity_peak_unavailable" in out["degraded"]
