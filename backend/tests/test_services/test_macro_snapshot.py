@@ -57,3 +57,21 @@ async def test_fetch_exception_does_not_propagate():
         AsyncMock(side_effect=RuntimeError("finnhub down")),
     ):
         assert await refresh_macro_snapshot() is None
+
+
+@pytest.mark.asyncio
+async def test_failed_persist_is_reported_as_none_not_success():
+    """insert_macro_snapshot는 실패-무해(raise 없이 False만 반환)라, 반환값을
+    직접 확인하지 않으면 DB 쓰기가 실패해도 '기록됨'으로 오보된다."""
+    quotes = {"SPY": {"chg_pct": -0.16, "prev_close": 769.8}}
+    with (
+        patch(
+            "services.trading.macro_snapshot.fetch_us_ai_overnight",
+            AsyncMock(return_value=quotes),
+        ),
+        patch(
+            "services.storage_service.StorageService.insert_macro_snapshot",
+            AsyncMock(return_value=False),
+        ),
+    ):
+        assert await refresh_macro_snapshot() is None

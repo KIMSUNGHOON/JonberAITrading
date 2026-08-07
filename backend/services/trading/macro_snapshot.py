@@ -44,11 +44,18 @@ async def refresh_macro_snapshot() -> Optional[dict]:
 
     try:
         storage = await get_storage_service()
-        await storage.insert_macro_snapshot(
+        ok = await storage.insert_macro_snapshot(
             trade_date=trade_date, quotes=quotes, missing=missing
         )
     except Exception as e:
         logger.warning("macro_snapshot_persist_failed", error=str(e))
+        return None
+
+    if not ok:
+        # insert_macro_snapshot는 실패-무해(자체 예외를 삼키고 False만 반환)라
+        # 위 try/except로는 이 실패를 절대 못 잡는다 — 반환값을 직접 확인해야
+        # "기록됨" 로그가 거짓 성공을 보고하지 않는다.
+        logger.warning("macro_snapshot_persist_failed", trade_date=trade_date)
         return None
 
     logger.info(
