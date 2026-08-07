@@ -96,8 +96,9 @@ async def test_degraded_reasons_are_persisted(isolated_storage_service):
         index_returns=[-10.84, 17.91, -5.12, 1.62, 3.76, -6.36, -4.46],
         equity=497_403_042.0,
         equity_peak=497_403_042.0,
+        series_stale=True,
     )
-    assert "index_vol_implausible" in result.degraded
+    assert "index_series_stale" in result.degraded
 
     await isolated_storage_service.insert_exposure_shadow(
         trade_date="2026-08-07",
@@ -108,7 +109,7 @@ async def test_degraded_reasons_are_persisted(isolated_storage_service):
         n_round_trips=None,
     )
     row = (await isolated_storage_service.get_exposure_shadow("2026-08-07"))[0]
-    assert "index_vol_implausible" in row["degraded"]
+    assert "index_series_stale" in row["degraded"]
     assert row["index_vol_annualized"] > 60.0
     assert row["index_vol_n"] == 7
 
@@ -118,10 +119,10 @@ async def test_empty_degraded_list_round_trips_as_empty_string_not_null(
     isolated_storage_service,
 ):
     """빈 리스트는 빈 문자열로 남아야 한다 -- NULL("기록 안 됨")과 구별되는
-    "저하 없음"이라는 판정이다. 알려진 regime_label, 위생 게이트를 통과하는
-    변동성 표본(연율 약 18%, 5~60% 게이트 안), 그리고 prev_effective_pct를
-    앵커와 같게 줘서(ramped==anchor, daily_limit 안 걸림) degraded가 실제로
-    빌 조건을 만든다."""
+    "저하 없음"이라는 판정이다. 알려진 regime_label, 신선한(series_stale=False)
+    변동성 표본(연율 약 18%), 그리고 prev_effective_pct를 앵커와 같게 줘서
+    (ramped==anchor, daily_limit 안 걸림) degraded가 실제로 빌 조건을
+    만든다."""
     result = compute_regime_target(
         regime_label="neutral",
         prev_effective_pct=0.65,

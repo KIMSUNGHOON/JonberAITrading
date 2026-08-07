@@ -36,7 +36,7 @@ def _brief(**over) -> BriefData:
         ],
         max_positions=5,
         max_single_position_pct=0.03,
-        exposure=dict(target_pct=0.12, binding="m_evidence", degraded="index_vol_implausible",
+        exposure=dict(target_pct=0.12, binding="m_evidence", degraded="index_series_stale",
                       ts="2026-08-06 15:25:00"),
         yesterday=dict(trade_date="2026-08-06", decisions=101, fills=0,
                        realized_pnl=0.0, slot_refusals=16),
@@ -199,7 +199,7 @@ class TestExposure:
             target_pct=0.12,
             actual_pct=0.098,
             binding="daily_limit",
-            degraded="index_vol_implausible",
+            degraded="index_series_stale",
             m_vol=1.0, m_drawdown=1.0,
             index_vol_annualized=112.1, index_vol_n=14,
             n_round_trips=8,
@@ -215,9 +215,9 @@ class TestExposure:
     def test_degraded_reason_is_visible(self):
         """중립값이 왜 중립인지가 안 보이면 degraded를 만든 의미가 없다."""
         text = format_exposure(self._exp())
-        assert "index_vol_implausible" in text
+        assert "index_series_stale" in text
 
-    def test_raw_vol_is_shown_even_when_gated(self):
+    def test_raw_vol_is_shown_even_when_stale(self):
         text = format_exposure(self._exp())
         assert "112.1" in text
 

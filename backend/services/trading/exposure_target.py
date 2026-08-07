@@ -69,9 +69,6 @@ VOL_MULTIPLIER_MIN: float = 0.5
 # 의미 있게 동작한다(연 30% → 0.6배).
 VOL_MULTIPLIER_MAX: float = 1.0
 
-# 위생 게이트. 이 밖의 실현 변동성은 시장이 아니라 데이터 소스를 의심한다.
-VOL_GATE_MIN_PCT: float = 5.0
-VOL_GATE_MAX_PCT: float = 60.0
 TRADING_DAYS_PER_YEAR: int = 250
 
 
@@ -130,6 +127,7 @@ def compute_regime_target(
     index_returns: list[float],
     equity: float,
     equity_peak: float,
+    series_stale: bool = False,
 ) -> TargetExposure:
     """레짐 라벨에서 목표 주식 비중(분율)을 만든다.
 
@@ -160,10 +158,16 @@ def compute_regime_target(
     if vol_ann is None:
         m_vol = 1.0
         degraded.append("index_vol_insufficient")
-    elif not (VOL_GATE_MIN_PCT <= vol_ann <= VOL_GATE_MAX_PCT):
+    elif series_stale:
+        # 시계열이 오래됐으면 값 자체를 못 믿는다. 중립으로 두되 원값은
+        # 그대로 실어 보낸다.
         m_vol = 1.0
-        degraded.append("index_vol_implausible")
+        degraded.append("index_series_stale")
     else:
+        # ⚠️ 위생 게이트를 두지 않는다. 2026-08-06에 넣은 [5, 60]이
+        # 실제 KOSPI 변동성(101.7%, 2년 중 상위 1.1%)을 거부해
+        # **방어가 가장 필요한 날에 정확히 꺼졌다**. "변동성이 크다"는
+        # 저하 사유가 아니라 배수가 반영해야 할 사실이다.
         m_vol = min(VOL_MULTIPLIER_MAX,
                     max(VOL_MULTIPLIER_MIN, TARGET_VOL_PCT / vol_ann))
 
