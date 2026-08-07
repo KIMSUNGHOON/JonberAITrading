@@ -121,6 +121,12 @@ class PositionSizingRules(BaseModel):
     # 미조정=거동 불변.
     risk_budget_pct: float = Field(default=0.75, ge=0.1, le=3.0)
 
+    # 변동성 타게팅 노브 (2026-08-07). 상수에서 전략 소유로 옮겼다 --
+    # 매크로 국면이 바뀌면 위험 취향도 바뀌어야 하는데, 사람이 손으로
+    # 고른 상수는 두 달 만에 낡았다.
+    target_vol_pct: float = Field(default=18.0, ge=10.0, le=40.0)
+    vol_multiplier_min: float = Field(default=0.5, ge=0.2, le=0.8)
+
 
 class TradingStrategy(BaseModel):
     """Complete trading strategy configuration"""

@@ -128,6 +128,8 @@ def compute_regime_target(
     equity: float,
     equity_peak: float,
     series_stale: bool = False,
+    target_vol_pct: float = TARGET_VOL_PCT,
+    vol_multiplier_min: float = VOL_MULTIPLIER_MIN,
 ) -> TargetExposure:
     """레짐 라벨에서 목표 주식 비중(분율)을 만든다.
 
@@ -169,7 +171,7 @@ def compute_regime_target(
         # **방어가 가장 필요한 날에 정확히 꺼졌다**. "변동성이 크다"는
         # 저하 사유가 아니라 배수가 반영해야 할 사실이다.
         m_vol = min(VOL_MULTIPLIER_MAX,
-                    max(VOL_MULTIPLIER_MIN, TARGET_VOL_PCT / vol_ann))
+                    max(vol_multiplier_min, target_vol_pct / vol_ann))
 
     m_drawdown = _drawdown_multiplier(equity, equity_peak)
 

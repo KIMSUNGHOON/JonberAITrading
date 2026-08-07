@@ -58,6 +58,10 @@ STRATEGY_MAPPED_FIELDS: dict[str, tuple[float, float]] = {
     # GATE_PROTECTED가 아닌 allowlist. 퍼센트 단위, ×100 변환 없음(RiskParameters
     # .risk_budget_pct/PositionSizingRules.risk_budget_pct 둘 다 퍼센트).
     "risk_budget_pct": (0.25, 1.5),
+    # 변동성 타게팅 (2026-08-07). vol_multiplier_min 상한이 0.8인 이유는
+    # 1.0이면 전략이 변동성 방어를 통째로 끄기 때문이다.
+    "target_vol_pct": (10.0, 40.0),
+    "vol_multiplier_min": (0.2, 0.8),
 }
 
 # 자율 게이트·브레이커·모드 필드 — 전략이 절대 못 움직인다(테스트로 봉인).
@@ -111,6 +115,8 @@ def _source_values(strategy: TradingStrategy) -> dict[str, float]:
         "default_take_profit_pct": strategy.exit_conditions.take_profit_pct * 100.0,
         "max_trade_notional_pct": strategy.position_sizing.max_trade_notional_pct,
         "risk_budget_pct": strategy.position_sizing.risk_budget_pct,
+        "target_vol_pct": strategy.position_sizing.target_vol_pct,
+        "vol_multiplier_min": strategy.position_sizing.vol_multiplier_min,
     }
 
 

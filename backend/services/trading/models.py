@@ -287,6 +287,20 @@ class RiskParameters(BaseModel):
                      "/stop_distance_pct, min()-combined with existing caps"
     )
 
+    # 변동성 타게팅 노브 (2026-08-07). exposure_target.compute_regime_target의
+    # 모듈 상수(TARGET_VOL_PCT/VOL_MULTIPLIER_MIN)를 전략 소유로 옮겼다 —
+    # strategy_apply가 [10, 40] / [0.2, 0.8] 하드 바운드로 클램프한다.
+    target_vol_pct: float = Field(
+        default=18.0, ge=10.0, le=40.0,
+        description="변동성 타게팅 기준(퍼센트). KOSPI 20일 실현 연변동성 "
+                    "중앙값 20.6%와 맞물리는 값",
+    )
+    vol_multiplier_min: float = Field(
+        default=0.5, ge=0.2, le=0.8,
+        description="변동성 배수 하한(분율). 1.0을 허용하지 않는 이유는 "
+                    "전략이 변동성 방어를 통째로 끄지 못하게 하려는 것",
+    )
+
 
 # -------------------------------------------
 # Order Models
