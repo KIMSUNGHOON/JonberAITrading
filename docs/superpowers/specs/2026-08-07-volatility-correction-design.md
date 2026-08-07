@@ -247,7 +247,7 @@ def is_series_stale(latest_trade_date: str, today: date) -> bool:
 
 | 확인 | 정상 | 실패 신호 |
 |---|---|---|
-| `index_daily` | **약 40행**, 최신 = 직전 거래일 | 0행 = 수집 배선 실패 |
+| `index_daily` | **약 40행**, 최신이 **2거래일 이내** | 0행 = 수집 배선 실패 |
 | `index_daily` 연속성 | 거래일 누락 없음 | 구멍 = upsert 창이 부족 |
 | `index_vol_annualized` | **90~110** 근처 | 9~15면 아직 SPY |
 | `m_vol` | **0.5** (하한) | 1.0이면 게이트가 남아 있거나 표본 부족 |
@@ -255,6 +255,13 @@ def is_series_stale(latest_trade_date: str, today: date) -> bool:
 | `effective_target_pct` | **0.15 근처** | 0.30이면 `m_vol`이 안 물렸다 |
 | `risk_params` | `target_vol_pct=18.0`, `vol_multiplier_min=0.5` | 없으면 필드 추가 실패 |
 | `regime:slot_baseline` | 행 존재 | 없으면 되돌리기 기계 무력 |
+
+⚠️ **2026-08-07 재정정**: 위 `index_daily` 판정 기준을 원래 "최신 = 직전
+거래일"로 적었으나 **항상 참은 아니다.** yfinance는 당일 봉을 정산 전에
+`Close=NaN`으로 돌려줄 때가 있고(2026-08-07 실측), 필터가 이를 걸러내면
+그날 실행에서는 최신 행이 전날로 남는다. 다음 실행이 자동으로 메운다(§4
+`refresh_index_daily`의 매 실행 전체 창 재기록). "최신이 2거래일 이내"가
+맞는 기준이다 — 그대로 두면 정상 동작을 배선 실패로 오판한다.
 
 **예상**: `ramped 0.3078 × m_vol 0.50 = 목표 15.39%` (현재 보유 15.78%).
 사실상 동결 — 신규 매수는 막히고 기존 포지션은 유지된다. **2년 최고 변동성 국면에서 의도한 동작이다.**

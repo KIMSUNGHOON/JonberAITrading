@@ -64,9 +64,12 @@ VOL_MULTIPLIER_MIN: float = 0.5
 # `(prev-0.15)×m_vol < prev`, 즉 `prev < 0.15·m_vol/(m_vol-1)`이라
 # `m_vol=1.5`면 목표가 45%를 넘는 순간 bear 판정이 목표를 1bp도 못 낮춘다.
 #
-# `TARGET_VOL_PCT`/`VOL_MULTIPLIER_MIN`/게이트 경계/`annualized_vol()`은
-# 그대로 둔다 — 축소 방향(고변동성 → 1.0 미만)에서는 이 상수들이 여전히
-# 의미 있게 동작한다(연 30% → 0.6배).
+# `TARGET_VOL_PCT`/`VOL_MULTIPLIER_MIN`은 이후 전략 패널 노브가 됐다
+# (2026-08-07 변동성 방어 정정, 하드 바운드 [10,40]/[0.2,0.8]). 위생
+# 게이트([5,60] 밖이면 무시)는 실제 KOSPI 변동성(최근 101.7%)을 거부해
+# **같은 아크에서 삭제됐다** — 여기 남겨둔다는 서술은 더 이상 사실이
+# 아니다. `annualized_vol()`은 그대로다 — 축소 방향(고변동성 → 1.0
+# 미만)에서는 이 상수들이 여전히 의미 있게 동작한다(연 30% → 0.6배).
 VOL_MULTIPLIER_MAX: float = 1.0
 
 TRADING_DAYS_PER_YEAR: int = 250
