@@ -6,6 +6,9 @@
 끝나고, 수집기 쪽은 "예외가 전파되지 않는가"만 본다.
 """
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from services.telegram.briefing import (
@@ -476,3 +479,211 @@ class TestExposureAbsentIsNotFailure:
 
         with pytest.raises(Exception):
             await isolated_storage_service.get_latest_exposure_shadow()
+
+
+# ---------------------------------------------------------------------------
+# 레짐 판정 블록 (Task 8, 2026-08-07) — /brief와 /exposure 앞에 붙는다.
+# ---------------------------------------------------------------------------
+
+
+class TestFormatBriefPrependsRegime:
+    def test_regime_block_appears_before_allocation(self):
+        from services.telegram.briefing import format_regime
+
+        d = _brief(regime={
+            "regime": "bear", "confidence": 0.7,
+            "anchor_target_pct": 0.55, "effective_target_pct": 0.26,
+            "key_drivers": ["EWY -2.97%"], "degraded": [],
+        })
+        text = format_brief(d)
+        assert format_regime(d.regime).splitlines()[0] in text
+        assert text.index("레짐: bear") < text.index("[자산 배분]")
+
+    def test_absent_regime_shows_no_judgment_not_a_crash(self):
+        text = format_brief(_brief(regime=None))
+        assert "판정 없음" in text
+        assert "316140" in text, "레짐 행이 없어도 나머지 섹션은 살아있어야 한다"
+
+
+class TestCollectBriefRegimeIsIndependentSection:
+    """`storage.get_latest_regime_judgment()`는 DB 오류를 raise한다(계약).
+    이 실패가 `collect_brief` 전체를 삼키면(바깥 `_safe("brief", ...)`가
+    받아 브리핑 전 섹션이 함께 '데이터 없음'으로 접힌다) 레짐 하나 때문에
+    포지션·어제·준비 섹션까지 전부 사라진다 -- exposure_shadow 조회와
+    동일한 섹션-독립 실패 패턴을 지켜야 한다."""
+
+    @pytest.mark.asyncio
+    async def test_regime_row_is_collected(self, isolated_storage_service):
+        import services.telegram.briefing as b
+
+        await isolated_storage_service.insert_regime_judgment(
+            trade_date="2026-08-07", regime="bear", confidence=0.7,
+            rationale="EWY -2.97%", key_drivers=["EWY -2.97%"],
+            anchor_target_pct=0.55, effective_target_pct=0.26,
+            prev_effective_pct=0.30, degraded=[],
+        )
+
+        async def fake_storage():
+            return isolated_storage_service
+
+        b._storage = fake_storage
+        try:
+            data = await b.collect_brief("2026-08-07")
+        finally:
+            import importlib
+            importlib.reload(b)
+
+        assert data.regime is not None
+        assert data.regime["regime"] == "bear"
+
+    @pytest.mark.asyncio
+    async def test_regime_fetch_failure_does_not_lose_other_sections(self, monkeypatch):
+        """직접 try/except 없이 이 실패가 전파되면 바깥 `_safe`가
+        `collect_brief(...)` 전체를 삼켜 브리핑이 통째로 사라진다 --
+        이 테스트는 그 회귀를 잡는다."""
+        import services.telegram.briefing as b
+
+        class Boom:
+            async def get_latest_regime_judgment(self):
+                raise RuntimeError("db down")
+
+            async def get_latest_exposure_shadow(self):
+                return None
+
+            async def get_day_rollup(self, trade_date):
+                return {"trade_date": trade_date, "decisions": 3, "fills": 1}
+
+        async def fake_storage():
+            return Boom()
+
+        monkeypatch.setattr(b, "_storage", fake_storage)
+        data = await b.collect_brief("2026-08-07", prev_date="2026-08-06")
+
+        assert data.regime is None
+        assert data.yesterday is not None, (
+            "레짐 조회 실패가 다른 섹션(어제)까지 삼켰다 -- 직접 try/except가 "
+            "빠졌다는 신호"
+        )
+
+
+class TestCollectRegimeRow:
+    """`/exposure`가 쓰는 독립 수집기. 직접 try/except -- `_safe`를 쓰면
+    '행 없음'과 '조회 실패'가 다시 합쳐진다."""
+
+    @pytest.mark.asyncio
+    async def test_row_present(self, isolated_storage_service):
+        import services.telegram.briefing as b
+
+        await isolated_storage_service.insert_regime_judgment(
+            trade_date="2026-08-07", regime="neutral", confidence=None,
+            rationale="", key_drivers=[], anchor_target_pct=0.45,
+            effective_target_pct=0.30, prev_effective_pct=None, degraded=[],
+        )
+
+        async def fake_storage():
+            return isolated_storage_service
+
+        b._storage = fake_storage
+        try:
+            row = await b.collect_regime_row()
+        finally:
+            import importlib
+            importlib.reload(b)
+
+        assert row is not None
+        assert row["regime"] == "neutral"
+
+    @pytest.mark.asyncio
+    async def test_no_row_returns_none(self, isolated_storage_service):
+        import services.telegram.briefing as b
+
+        async def fake_storage():
+            return isolated_storage_service
+
+        b._storage = fake_storage
+        try:
+            row = await b.collect_regime_row()
+        finally:
+            import importlib
+            importlib.reload(b)
+
+        assert row is None
+
+    @pytest.mark.asyncio
+    async def test_storage_raising_never_propagates(self, monkeypatch):
+        import services.telegram.briefing as b
+
+        class Boom:
+            async def get_latest_regime_judgment(self):
+                raise RuntimeError("db down")
+
+        async def fake_storage():
+            return Boom()
+
+        monkeypatch.setattr(b, "_storage", fake_storage)
+        row = await b.collect_regime_row()  # 예외가 나가면 이 테스트가 실패한다
+
+        assert row is None
+
+
+class TestHandleExposurePrependsRegime:
+    """commands.py의 `/exposure` 핸들러 — `format_exposure`/`collect_exposure`
+    의 기존 계약(ExposureData/None/ExposureUnavailable, 위 테스트들이 잠근
+    삼중 상태)은 건드리지 않고 앞에 레짐 블록만 얹는다."""
+
+    @pytest.mark.asyncio
+    async def test_regime_and_exposure_both_render(self, monkeypatch):
+        import services.telegram.briefing as briefing_module
+        from services.telegram import commands
+
+        monkeypatch.setattr(
+            briefing_module, "collect_regime_row",
+            AsyncMock(return_value={
+                "regime": "bear", "confidence": 0.7,
+                "anchor_target_pct": 0.55, "effective_target_pct": 0.26,
+                "key_drivers": [], "degraded": [],
+            }),
+        )
+        monkeypatch.setattr(
+            briefing_module, "collect_exposure", AsyncMock(return_value=None)
+        )
+
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(reply_text=AsyncMock()),
+            message=None,
+        )
+        await commands.handle_exposure(update, SimpleNamespace(args=[]))
+
+        sent = update.effective_message.reply_text.call_args[0][0]
+        assert "레짐: bear" in sent
+        assert "관측 시작 전" in sent, "기존 /exposure 본문(None 케이스)이 그대로 붙어야 한다"
+
+    @pytest.mark.asyncio
+    async def test_exposure_failure_does_not_hide_regime(self, monkeypatch):
+        """레짐과 노출도는 서로 다른 테이블 — 하나가 죽어도 다른 하나는 나간다."""
+        import services.telegram.briefing as briefing_module
+        from services.telegram import commands
+        from services.telegram.briefing import ExposureUnavailable
+
+        monkeypatch.setattr(
+            briefing_module, "collect_regime_row",
+            AsyncMock(return_value={
+                "regime": "neutral", "confidence": None,
+                "anchor_target_pct": 0.45, "effective_target_pct": 0.30,
+                "key_drivers": [], "degraded": [],
+            }),
+        )
+        monkeypatch.setattr(
+            briefing_module, "collect_exposure",
+            AsyncMock(return_value=ExposureUnavailable()),
+        )
+
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(reply_text=AsyncMock()),
+            message=None,
+        )
+        await commands.handle_exposure(update, SimpleNamespace(args=[]))
+
+        sent = update.effective_message.reply_text.call_args[0][0]
+        assert "레짐: neutral" in sent
+        assert _NO_DATA in sent

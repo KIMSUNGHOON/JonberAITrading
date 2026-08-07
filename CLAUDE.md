@@ -106,6 +106,7 @@ cd backend && pytest -v
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | (required for notifications) |
 | `TELEGRAM_ENABLED` | Enable Telegram | `false` |
 | `AUTONOMY_ENABLED` | 자율 매매 마스터 게이트 (R3) — off면 모든 자율 실행 거부 | `false` |
+| `REGIME_EXPOSURE_ENABLED` | 레짐 인지 노출도 제어 — off면 게이트 검사 8과 슬롯 상향, 토론 프롬프트 주입을 모두 건너뜀 | `false` |
 
 ## Project Structure
 

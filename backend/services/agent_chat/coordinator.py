@@ -15,6 +15,7 @@ import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from agents.llm.backends.base import LLMAllBackendsFailed
+from app.config import get_settings
 from services.agent_chat.models import (
     ChatSession,
     DecisionAction,
@@ -471,6 +472,34 @@ async def _alert_llm_failure(ticker: str, exc: Exception) -> None:
         # CancelledError는 여기서 잡히지 않으므로 그대로 전파된다.
         if not committed:
             _LLM_FAILURE_NOTIFIED.discard(cause)
+
+
+# -------------------------------------------
+# 레짐 인지 노출도 — 초과분 토론 주입 (2026-08-07)
+# -------------------------------------------
+
+
+def format_exposure_context(
+    target_pct: Optional[float], actual_pct: float, regime: Optional[str]
+) -> str:
+    """토론 프롬프트에 들어갈 포트폴리오 상태 한 줄.
+
+    목표를 넘었을 때 **무엇을 팔지는 지시하지 않는다** -- 초과 사실만 주고
+    종목별 판단은 4-에이전트 패널이 각 종목의 데이터를 보고 한다
+    (사용자 결정, 2026-08-07). 강제 청산 엔진을 만들지 않는다.
+    """
+    if target_pct is None:
+        return ""
+    over = actual_pct - target_pct
+    base = (
+        f"포트폴리오 상태: 목표 주식비중 {target_pct * 100:.1f}% / "
+        f"현재 {actual_pct * 100:.1f}%"
+    )
+    if regime:
+        base += f" (레짐 {regime})"
+    if over > 0:
+        base += f" · 초과 {over * 100:.1f}%p — 신규 진입은 게이트가 막고 있다"
+    return base
 
 
 class ChatCoordinator:
@@ -1640,6 +1669,50 @@ class ChatCoordinator:
             strategy_directive, strategy_knobs, consensus_threshold = (
                 await self._build_strategy_context()
             )
+
+            # 레짐 인지 노출도(2026-08-07): 초과 사실만 프롬프트에 한 줄
+            # 얹는다 -- 무엇을 팔지는 지시하지 않는다. 어느 종목을 줄일지는
+            # 4-에이전트 패널이 각 종목의 데이터를 보고 판단한다(사용자
+            # 결정). 강제 청산 엔진 없음 -- 투표 파싱·합의 문턱·실행 경로는
+            # 건드리지 않는다.
+            #
+            # strategy_directive에 얹는 이유: ChatRoom.__init__이 이미 이
+            # 필드를 5개 에이전트(technical/fundamental/sentiment/risk/
+            # moderator) 전원의 시스템 프롬프트에 배포하는 broadcast 경로를
+            # 갖고 있다(base_agent._effective_system_prompt) -- 새 필드나
+            # 새 배선을 추가하지 않고 그 경로에 올라탄다.
+            if get_settings().REGIME_EXPOSURE_ENABLED:
+                try:
+                    actual_pct = (
+                        (total_portfolio - available_cash) / total_portfolio
+                        if total_portfolio and total_portfolio > 0
+                        and available_cash is not None
+                        else None
+                    )
+                    if actual_pct is not None:
+                        from services.trading.regime_judge import get_effective_target
+
+                        target_pct = await get_effective_target()
+                        regime_label = None
+                        try:
+                            _storage = await get_storage_service()
+                            _row = await _storage.get_latest_regime_judgment()
+                            regime_label = (_row or {}).get("regime")
+                        except Exception:
+                            regime_label = None
+                        exposure_line = format_exposure_context(
+                            target_pct, actual_pct, regime_label
+                        )
+                        if exposure_line:
+                            strategy_directive = (
+                                f"{strategy_directive}\n{exposure_line}"
+                                if strategy_directive
+                                else exposure_line
+                            )
+                except Exception as e:
+                    logger.warning(
+                        "exposure_context_injection_failed", ticker=ticker, error=str(e)
+                    )
 
             # US 신호 T4: US AI 크로스마켓 신호(AI밸류체인 종목 + 당일 캐시
             # 존재 시에만; off/결측/비-AI밸류체인이면 None — 주입 안 함).

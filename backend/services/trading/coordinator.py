@@ -2287,13 +2287,20 @@ class ExecutionCoordinator:
             try:
                 # Fetch balance from Kiwoom
                 # AccountBalance is a Pydantic model with:
-                # - evlu_amt: 평가금액 (may include cash, so don't use directly)
+                # - evlu_amt: 유가잔고평가액 -- 주식 평가액 합계, 현금은
+                #   포함하지 않는다 (kt00004 응답의 tot_est_amt에서 파싱;
+                #   services/kiwoom/client.py의 파싱 주석 참고). 예수금까지
+                #   포함한 필드는 aset_evlt_amt로 별도이고 이 모델은 그걸
+                #   쓰지 않는다 -- 2026-08-07 리뷰로 정정: 이 주석이 예전에
+                #   "현금이 섞일 수 있다"고 반대로 적혀 있었다.
                 # - d2_ord_psbl_amt: D+2 주문가능금액 (available cash)
                 # - holdings: list of Holding with individual evlu_amt
                 # - total_value: property (evlu_amt + d2_ord_psbl_amt)
                 balance = await self._kiwoom.get_account_balance()
 
-                # Calculate stock value from holdings (not evlu_amt which may include cash)
+                # 보유종목별 evlu_amt를 합산한다 -- 위 집계 evlu_amt(이미
+                # 주식만, 현금 미포함)와 사실상 같은 값이지만, holdings
+                # 단위로 더해 개별 종목 데이터와 같은 소스를 쓴다.
                 # See kr_stocks.py line 968-970 for reference
                 stock_value = sum(h.evlu_amt for h in balance.holdings)
                 available_cash = balance.d2_ord_psbl_amt

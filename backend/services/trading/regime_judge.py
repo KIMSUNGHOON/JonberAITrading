@@ -247,3 +247,76 @@ async def get_effective_target() -> Optional[float]:
         logger.warning("regime_judgment_stale", trade_date=row["trade_date"])
         return None
     return float(row["effective_target_pct"])
+
+
+async def _get_trading_coordinator():
+    """테스트가 패치할 수 있게 분리한 간접층.
+
+    ⚠️ 실제 싱글턴 접근점은 `app.dependencies.get_trading_coordinator`다
+    (`app/core/dependencies.py`는 이 리포에 없다) — Task 5의
+    `create_messages` 시그니처, Task 7의 `_persist_fields`/클래스명과 같은
+    계열로, 브리프 원문의 추정 경로가 실물과 달랐던 지점이다.
+    """
+    from app.dependencies import get_trading_coordinator
+
+    return await get_trading_coordinator()
+
+
+async def run_daily_regime_cycle() -> None:
+    """08:05 일일 사이클: 판정 → 슬롯 적용. never-raise.
+
+    휴장일에는 아무것도 하지 않는다. ⚠️ 실제 이름은 `is_trading_day`이고
+    `get_holiday_service`는 **async**다 -- 2026-08-06에 존재하지 않는
+    `is_business_day`를 await 없이 불러 넓은 except가 삼키는 바람에
+    휴장일 스킵이 한 번도 작동하지 않았다.
+    """
+    try:
+        from datetime import date as _date
+
+        from services.krx_holiday import get_holiday_service
+
+        svc = await get_holiday_service()
+        if not svc.is_trading_day(_date.today()):
+            logger.info("regime_cycle_skipped_non_trading_day")
+            return
+    except Exception as e:
+        # 영업일 판단이 안 되면 진행한다 -- 판정 한 번이 더 도는 것이
+        # 열린 장에 판정이 없는 것보다 낫다.
+        logger.warning("regime_cycle_trading_day_check_failed", error=str(e))
+
+    try:
+        await judge_regime()
+    except Exception as e:
+        logger.warning("regime_cycle_judge_failed", error=str(e))
+
+    try:
+        coordinator = await _get_trading_coordinator()
+        await coordinator.apply_regime_slots()
+    except Exception as e:
+        logger.warning("regime_cycle_slots_failed", error=str(e))
+
+
+def start_regime_scheduler(hour: int = 8, minute: int = 5):
+    """평일 08:05 — 매크로 수집(08:00) 뒤, 브리핑(08:30) 앞.
+    REGIME_EXPOSURE_ENABLED off면 스케줄러를 띄우지 않는다."""
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+
+    from app.config import get_settings
+
+    try:
+        if not get_settings().REGIME_EXPOSURE_ENABLED:
+            return None
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(
+            run_daily_regime_cycle,
+            CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute),
+            id="regime_daily_cycle",
+            replace_existing=True,
+        )
+        scheduler.start()
+        logger.info("regime_scheduler_started", hour=hour, minute=minute)
+        return scheduler
+    except Exception as e:
+        logger.warning("regime_scheduler_failed", error=str(e))
+        return None
