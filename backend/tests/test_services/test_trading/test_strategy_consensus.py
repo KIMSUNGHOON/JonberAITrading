@@ -307,3 +307,101 @@ def test_consensus_threshold_knob_delta_caps_before_hard_bound():
 def test_consensus_threshold_default_is_0_75_unchanged():
     """절대 원칙: 기본값 0.75 불변 — 전략 미조정 시 배포 직후 거동 동일."""
     assert TradingStrategy().entry_conditions.consensus_threshold == pytest.approx(0.75)
+
+
+# ---------- 변동성 타게팅 (target_vol_pct / vol_multiplier_min, 2026-08-07) ----------
+#
+# Task4 사후 발견: _SCHEMA_INSTRUCTION은 LLM에게 두 노브를 설명했지만 이
+# KNOB_BOUNDS/STRATEGY_VOTE_SCHEMA/apply_consensus의 knob_targets 어디에도
+# 없어 패널 투표가 strategy.position_sizing까지 닿지 못했다("만들어졌으나
+# 닿지 않는다"의 새 사례). 여기서 배선을 닫는다. 바운드는
+# strategy_apply.STRATEGY_MAPPED_FIELDS와 정확히 같아야 한다([10,40]/
+# [0.2,0.8]) — 두 곳이 어긋나면 한쪽이 통과시킨 값을 다른 쪽이 다시 잘라
+# 이중 클램프로 추적이 어려워진다(max_trade_notional_pct 선례와 동일 원칙).
+
+def test_target_vol_pct_knob_bound_is_10_to_40():
+    """단위 회귀 가드: target_vol_pct는 퍼센트 그대로 [10,40] —
+    strategy_apply.py STRATEGY_MAPPED_FIELDS와 동일 바운드로 정합."""
+    assert KNOB_BOUNDS["target_vol_pct"] == (10.0, 40.0)
+
+
+def test_vol_multiplier_min_knob_bound_is_0_2_to_0_8():
+    """단위 회귀 가드: vol_multiplier_min은 분율 그대로 [0.2,0.8] — 상한이
+    0.8인 이유는 1.0이면 전략이 변동성 방어를 통째로 끄기 때문."""
+    assert KNOB_BOUNDS["vol_multiplier_min"] == (0.2, 0.8)
+
+
+def test_target_vol_pct_knob_hard_bounds_clamp():
+    from services.trading.strategy_consensus import clamp_knob
+    assert clamp_knob("target_vol_pct", 55.0) == 40.0
+    assert clamp_knob("target_vol_pct", 3.0) == 10.0
+
+
+def test_vol_multiplier_min_knob_hard_bounds_clamp():
+    from services.trading.strategy_consensus import clamp_knob
+    assert clamp_knob("vol_multiplier_min", 0.95) == 0.8
+    assert clamp_knob("vol_multiplier_min", 0.05) == 0.2
+
+
+def test_target_vol_pct_knob_writes_to_position_sizing():
+    """apply_consensus가 target_vol_pct 제안을 실제로
+    strategy.position_sizing.target_vol_pct에 반영하는지 — knob_targets에
+    없으면 이 테스트는 20.0이 아니라 기본값 18.0을 본다."""
+    current = TradingStrategy()  # target_vol_pct=18.0 (기본)
+    assert current.position_sizing.target_vol_pct == pytest.approx(18.0)
+    votes = [_vote(adjustments={"target_vol_pct": 20.0}, panelist="a"),
+             _vote(adjustments={"target_vol_pct": 20.0}, panelist="b")]
+    out = apply_consensus(current, votes, "defensive", 0.8, "2026-07-15", "rev-1")
+    # 20.0은 하드바운드 안이고 델타캡(18*1.25=22.5) 안이므로 그대로 반영된다.
+    assert out.position_sizing.target_vol_pct == pytest.approx(20.0)
+    # 원본 불변: 중첩 서브모델까지 deep copy여야 함 (shallow copy 회귀 감지)
+    assert current.position_sizing.target_vol_pct == pytest.approx(18.0)
+
+
+def test_target_vol_pct_knob_extreme_suggestion_clamps_to_hard_bound():
+    """현재값을 바운드 상한 근처로 세팅해 델타캡이 아니라 하드바운드가 실제로
+    걸리는 경로도 확인(consensus_threshold 선례와 동일 패턴)."""
+    current = TradingStrategy()
+    current.position_sizing.target_vol_pct = 39.0
+    votes = [_vote(adjustments={"target_vol_pct": 1000.0}, panelist="a"),
+             _vote(adjustments={"target_vol_pct": 1000.0}, panelist="b")]
+    out = apply_consensus(current, votes, "aggressive", 0.8, "2026-07-15", "rev-1")
+    # 델타캡 상한 39*1.25=48.75 > 하드바운드 40 → 하드바운드가 실제 상한
+    assert out.position_sizing.target_vol_pct == pytest.approx(40.0)
+
+
+def test_vol_multiplier_min_knob_writes_to_position_sizing():
+    """apply_consensus가 vol_multiplier_min 제안을 실제로
+    strategy.position_sizing.vol_multiplier_min에 반영하는지 — knob_targets에
+    없으면 이 테스트는 0.6이 아니라 기본값 0.5를 본다."""
+    current = TradingStrategy()  # vol_multiplier_min=0.5 (기본)
+    assert current.position_sizing.vol_multiplier_min == pytest.approx(0.5)
+    votes = [_vote(adjustments={"vol_multiplier_min": 0.6}, panelist="a"),
+             _vote(adjustments={"vol_multiplier_min": 0.6}, panelist="b")]
+    out = apply_consensus(current, votes, "aggressive", 0.8, "2026-07-15", "rev-1")
+    # 0.6은 하드바운드 안이고 델타캡(0.5*1.25=0.625) 안이므로 그대로 반영된다.
+    assert out.position_sizing.vol_multiplier_min == pytest.approx(0.6)
+    assert current.position_sizing.vol_multiplier_min == pytest.approx(0.5)
+
+
+def test_vol_multiplier_min_knob_low_suggestion_clamps_to_hard_bound_then_delta():
+    """극단적으로 낮은 제안 — 하드바운드로 먼저 클램프된 뒤 델타캡이 다시
+    조인다(min_cash_ratio의 test_knob_hard_bounds_clamp_before_delta와 동일
+    패턴)."""
+    current = TradingStrategy()  # vol_multiplier_min=0.5 (기본)
+    votes = [_vote(adjustments={"vol_multiplier_min": 0.01}, panelist="a"),
+             _vote(adjustments={"vol_multiplier_min": 0.01}, panelist="b")]
+    out = apply_consensus(current, votes, "defensive", 0.8, "2026-07-15", "rev-1")
+    # 0.01 → 하드바운드 0.2로 클램프 → 델타캡 하한 0.5*(1-0.25)=0.375가 더
+    # 높아 델타캡이 실제 하한이 된다.
+    assert out.position_sizing.vol_multiplier_min == pytest.approx(0.375)
+
+
+def test_vote_schema_includes_vol_knobs():
+    """target_vol_pct/vol_multiplier_min이 STRATEGY_VOTE_SCHEMA에도 있는지 —
+    없으면 LLM 구조화 출력 자체가 이 키를 거부한다(스키마가 top-level 뿐
+    아니라 adjustments도 검증하지 않으므로 정확히는 '조용히 버려질' 값이지만,
+    스키마에 명시해 두는 것이 계약)."""
+    props = STRATEGY_VOTE_SCHEMA["properties"]["adjustments"]["properties"]
+    assert props["target_vol_pct"] == {"type": ["number", "null"]}
+    assert props["vol_multiplier_min"] == {"type": ["number", "null"]}
