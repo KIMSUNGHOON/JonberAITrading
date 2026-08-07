@@ -10,6 +10,11 @@ clamped_to_bounds).
 
 S-4 (생존 규율, decision D4): risk_budget_pct도 allowlist 소속 — [0.25, 1.5]
 하드 바운드 내 적응(test_risk_budget_pct_clamped_to_bounds).
+
+변동성 타게팅 (2026-08-07): target_vol_pct/vol_multiplier_min도 allowlist
+소속 — [10, 40]/[0.2, 0.8] 하드 바운드 내 적응. 전용 왕복 테스트는
+test_vol_knobs.py (test_strategy_values_are_clamped_into_bounds,
+test_reset_restores_model_defaults).
 """
 
 import pytest
@@ -38,6 +43,7 @@ def test_allowlist_and_denylist_are_disjoint_and_exact():
         "max_single_position_pct", "min_cash_ratio",
         "default_stop_loss_pct", "default_take_profit_pct",
         "max_trade_notional_pct", "risk_budget_pct",
+        "target_vol_pct", "vol_multiplier_min",
     }
     assert GATE_PROTECTED_FIELDS == frozenset({
         "max_daily_loss_pct", "max_open_positions",
@@ -94,7 +100,8 @@ def test_mapping_applies_with_unit_conversion_in_place():
     rp = RiskParameters()
     strategy = _strategy(max_position_pct=0.12, min_cash_ratio=0.25,
                          stop_loss_pct=0.06, take_profit_pct=0.20,
-                         max_trade_notional_pct=20.0, risk_budget_pct=1.0)
+                         max_trade_notional_pct=20.0, risk_budget_pct=1.0,
+                         target_vol_pct=25.0, vol_multiplier_min=0.6)
     rp_id = id(rp)
     changes = apply_strategy_to_risk_params(strategy, rp)
     assert id(rp) == rp_id  # in-place, 객체 교체 없음
@@ -104,9 +111,13 @@ def test_mapping_applies_with_unit_conversion_in_place():
     assert rp.default_take_profit_pct == pytest.approx(20.0)
     assert rp.max_trade_notional_pct == pytest.approx(20.0)
     assert rp.risk_budget_pct == pytest.approx(1.0)
+    assert rp.target_vol_pct == pytest.approx(25.0)
+    assert rp.vol_multiplier_min == pytest.approx(0.6)
     assert set(changes) == set(STRATEGY_MAPPED_FIELDS)
     assert changes["default_stop_loss_pct"] == (pytest.approx(8.0), pytest.approx(6.0))
     assert changes["risk_budget_pct"] == (pytest.approx(0.75), pytest.approx(1.0))
+    assert changes["target_vol_pct"] == (pytest.approx(18.0), pytest.approx(25.0))
+    assert changes["vol_multiplier_min"] == (pytest.approx(0.5), pytest.approx(0.6))
 
 
 def test_mapping_clamps_to_bounds():

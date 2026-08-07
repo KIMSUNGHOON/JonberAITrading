@@ -45,6 +45,16 @@ KNOB_BOUNDS: dict[str, tuple[float, float]] = {
     # EOD 전략 합의가 조정할 수 있는 안전 레일. 위 소수분율 노브들과 같은
     # 단위(0.0-1.0)라 변환 없이 그대로 클램프한다.
     "consensus_threshold": (0.60, 0.85),
+    # 변동성 타게팅 (2026-08-07). PositionSizingRules (10.0-40.0), 퍼센트
+    # 단위 — max_trade_notional_pct와 같은 계열로 변환 없이 그대로 클램프한다.
+    # strategy_apply.py STRATEGY_MAPPED_FIELDS와 동일 [10,40] 바운드로 정합
+    # (두 곳이 어긋나면 이중 클램프가 되어 추적이 어려워진다).
+    "target_vol_pct": (10.0, 40.0),
+    # PositionSizingRules (0.2-0.8), 분율 — consensus_threshold와 같은 계열로
+    # 변환 없이 그대로 클램프한다. strategy_apply.py STRATEGY_MAPPED_FIELDS와
+    # 동일 [0.2,0.8] 바운드로 정합. 상한이 0.8인 이유는 1.0을 허용하면 전략이
+    # 변동성 방어를 통째로 끌 수 있기 때문 — 절대 1.0으로 올리지 않는다.
+    "vol_multiplier_min": (0.2, 0.8),
 }
 
 _INT_KNOBS = {"max_positions"}
@@ -90,6 +100,8 @@ STRATEGY_VOTE_SCHEMA: dict[str, Any] = {
                 "take_profit_pct": {"type": ["number", "null"]},
                 "max_trade_notional_pct": {"type": ["number", "null"]},
                 "consensus_threshold": {"type": ["number", "null"]},
+                "target_vol_pct": {"type": ["number", "null"]},
+                "vol_multiplier_min": {"type": ["number", "null"]},
             },
         },
     },
@@ -154,6 +166,8 @@ def semantic_fingerprint(strategy: TradingStrategy) -> tuple:
         strategy.exit_conditions.take_profit_pct,
         strategy.position_sizing.max_trade_notional_pct,
         strategy.entry_conditions.consensus_threshold,
+        strategy.position_sizing.target_vol_pct,
+        strategy.position_sizing.vol_multiplier_min,
     )
 
 
@@ -210,6 +224,8 @@ def apply_consensus(
         "take_profit_pct": (exits, "take_profit_pct"),
         "max_trade_notional_pct": (sizing, "max_trade_notional_pct"),
         "consensus_threshold": (entry, "consensus_threshold"),
+        "target_vol_pct": (sizing, "target_vol_pct"),
+        "vol_multiplier_min": (sizing, "vol_multiplier_min"),
     }
     for knob, (owner, attr) in knob_targets.items():
         target = _aggregate_knob(electorate, knob)

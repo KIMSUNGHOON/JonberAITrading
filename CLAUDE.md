@@ -29,6 +29,10 @@ The system provides autonomous market analysis with human-in-the-loop (HITL) app
 - **Real-time Updates**: WebSocket connections stream reasoning logs and position updates
 
 - **Markets**: KR stocks (Kiwoom) only — the US/yfinance stack was removed (R2, 2026-07-11) and the Upbit crypto stack was removed (2026-08-01)
+  - ⚠️ `KIWOOM_IS_MOCK=true`는 **주문만** 모의다. 시세는 실물이다 — 2026-08-07에
+    이것을 "합성 시장"으로 오판해 변동성 방어가 꺼진 채 배포된 적이 있다.
+    데이터 진위가 의심되면 `yfinance`(설치돼 있음)로 `005930.KS`·`^KS11`을
+    대조하라. 비용 0이다.
 
 ## Development Commands
 
@@ -107,6 +111,8 @@ cd backend && pytest -v
 | `TELEGRAM_ENABLED` | Enable Telegram | `false` |
 | `AUTONOMY_ENABLED` | 자율 매매 마스터 게이트 (R3) — off면 모든 자율 실행 거부 | `false` |
 | `REGIME_EXPOSURE_ENABLED` | 레짐 인지 노출도 제어 — off면 게이트 검사 8과 슬롯 상향, 토론 프롬프트 주입을 모두 건너뜀 | `false` |
+| `KIWOOM_IS_MOCK` | **주문 실행만** 모의투자 서버로 보낸다 — 시세·지수·재무는 **실제 시장**이다 | `true` |
+| `FINNHUB_API_KEY` | 미국 매크로 (레짐 판정 LLM 입력) | (없으면 매크로 수집 스킵) |
 
 ## Project Structure
 

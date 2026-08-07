@@ -64,14 +64,14 @@ VOL_MULTIPLIER_MIN: float = 0.5
 # `(prev-0.15)×m_vol < prev`, 즉 `prev < 0.15·m_vol/(m_vol-1)`이라
 # `m_vol=1.5`면 목표가 45%를 넘는 순간 bear 판정이 목표를 1bp도 못 낮춘다.
 #
-# `TARGET_VOL_PCT`/`VOL_MULTIPLIER_MIN`/게이트 경계/`annualized_vol()`은
-# 그대로 둔다 — 축소 방향(고변동성 → 1.0 미만)에서는 이 상수들이 여전히
-# 의미 있게 동작한다(연 30% → 0.6배).
+# `TARGET_VOL_PCT`/`VOL_MULTIPLIER_MIN`은 이후 전략 패널 노브가 됐다
+# (2026-08-07 변동성 방어 정정, 하드 바운드 [10,40]/[0.2,0.8]). 위생
+# 게이트([5,60] 밖이면 무시)는 실제 KOSPI 변동성(최근 101.7%)을 거부해
+# **같은 아크에서 삭제됐다** — 여기 남겨둔다는 서술은 더 이상 사실이
+# 아니다. `annualized_vol()`은 그대로다 — 축소 방향(고변동성 → 1.0
+# 미만)에서는 이 상수들이 여전히 의미 있게 동작한다(연 30% → 0.6배).
 VOL_MULTIPLIER_MAX: float = 1.0
 
-# 위생 게이트. 이 밖의 실현 변동성은 시장이 아니라 데이터 소스를 의심한다.
-VOL_GATE_MIN_PCT: float = 5.0
-VOL_GATE_MAX_PCT: float = 60.0
 TRADING_DAYS_PER_YEAR: int = 250
 
 
@@ -130,6 +130,9 @@ def compute_regime_target(
     index_returns: list[float],
     equity: float,
     equity_peak: float,
+    series_stale: bool = False,
+    target_vol_pct: float = TARGET_VOL_PCT,
+    vol_multiplier_min: float = VOL_MULTIPLIER_MIN,
 ) -> TargetExposure:
     """레짐 라벨에서 목표 주식 비중(분율)을 만든다.
 
@@ -160,12 +163,18 @@ def compute_regime_target(
     if vol_ann is None:
         m_vol = 1.0
         degraded.append("index_vol_insufficient")
-    elif not (VOL_GATE_MIN_PCT <= vol_ann <= VOL_GATE_MAX_PCT):
+    elif series_stale:
+        # 시계열이 오래됐으면 값 자체를 못 믿는다. 중립으로 두되 원값은
+        # 그대로 실어 보낸다.
         m_vol = 1.0
-        degraded.append("index_vol_implausible")
+        degraded.append("index_series_stale")
     else:
+        # ⚠️ 위생 게이트를 두지 않는다. 2026-08-06에 넣은 [5, 60]이
+        # 실제 KOSPI 변동성(101.7%, 2년 중 상위 1.1%)을 거부해
+        # **방어가 가장 필요한 날에 정확히 꺼졌다**. "변동성이 크다"는
+        # 저하 사유가 아니라 배수가 반영해야 할 사실이다.
         m_vol = min(VOL_MULTIPLIER_MAX,
-                    max(VOL_MULTIPLIER_MIN, TARGET_VOL_PCT / vol_ann))
+                    max(vol_multiplier_min, target_vol_pct / vol_ann))
 
     m_drawdown = _drawdown_multiplier(equity, equity_peak)
 

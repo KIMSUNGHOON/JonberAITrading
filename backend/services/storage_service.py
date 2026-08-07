@@ -485,6 +485,20 @@ class StorageService:
                     "ON regime_judgment(trade_date)"
                 )
 
+                # index_daily (변동성 계산 전용 지수 종가, 2026-08-07)
+                # 등락률을 저장하지 않는 이유: 레벨과 등락률을 따로 받아
+                # 대조하려던 것이 정확히 이번 사고의 원인이었다. 종가만
+                # 담고 수익률은 계산하면 어긋날 대상이 없다.
+                # trade_date가 PRIMARY KEY라 재수집이 구멍을 메운다.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS index_daily (
+                        trade_date TEXT PRIMARY KEY,
+                        close      REAL NOT NULL,
+                        source     TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
                 # exposure_shadow.e_base/e_max/equity_peak (리뷰 반영,
                 # 2026-08-06): e_base/e_max는 이전까지 호출자가 넘기지 않아
                 # 늘 함수 기본값이었고 행에도 없었다 -- 관측 기간 중 이
@@ -2991,6 +3005,53 @@ class StorageService:
             "degraded": json.loads(row["degraded_json"] or "[]"),
             "created_at": row["created_at"],
         }
+
+    async def upsert_index_daily(
+        self, rows: list[tuple[str, float]], source: str
+    ) -> int:
+        """지수 종가를 upsert하고 쓴 행 수를 돌려준다. 실패-무해(0 반환).
+
+        `INSERT OR REPLACE`라 같은 `trade_date` 재수집이 덮어쓴다 --
+        이것이 구멍 자가치유의 근거다. 프로세스가 며칠 내려가 있어도
+        다음 수집이 창 전체를 다시 쓴다.
+        """
+        if not rows:
+            return 0
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.executemany(
+                    "INSERT OR REPLACE INTO index_daily (trade_date, close, source) "
+                    "VALUES (?, ?, ?)",
+                    [(d, float(c), source) for d, c in rows],
+                )
+                await conn.commit()
+            return len(rows)
+        except Exception as e:
+            logger.warning(f"upsert_index_daily failed: {e}")
+            return 0
+
+    async def get_recent_index_closes(
+        self, limit: int = 21
+    ) -> list[tuple[str, float]]:
+        """최근 `limit`개 (trade_date, close)를 **시간 오름차순**으로.
+
+        기본 21인 이유: 20개 수익률을 만들려면 종가가 21개 필요하다
+        (`VOL_WINDOW=20`).
+
+        행이 없으면 `[]`. **DB 오류는 raise한다** -- 호출자가 '없음'과
+        '못 읽음'을 구별해야 한다(2026-08-06 /exposure 사고).
+        """
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT trade_date, close FROM index_daily "
+                "ORDER BY trade_date DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        return [(r["trade_date"], float(r["close"])) for r in reversed(rows)]
 
     async def get_day_rollup(self, trade_date: str) -> Optional[dict]:
         """하루 요약 — 결정 수·체결 수·실현손익·슬롯 거절 수.

@@ -49,6 +49,7 @@ dependencies:
       - httpx>=0.28.0
 
       # Market Data
+      - yfinance>=1.0.0  # KOSPI(^KS11) index_series.py -- regime volatility input
 
       # Storage & State
       - aiosqlite>=0.20.0

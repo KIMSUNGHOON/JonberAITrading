@@ -55,6 +55,8 @@ async def test_cycle_applies_slots_after_judging():
     coord = MagicMock()
     coord.apply_regime_slots = AsyncMock(return_value={"max_open_positions": 11})
     with patch("services.krx_holiday.get_holiday_service", AsyncMock(return_value=svc)), \
+         patch("services.trading.regime_judge.refresh_index_daily",
+               AsyncMock(return_value=40)), \
          patch("services.trading.regime_judge.judge_regime",
                AsyncMock(return_value={"regime": "bear"})), \
          patch("services.trading.regime_judge._get_trading_coordinator",
@@ -65,7 +67,14 @@ async def test_cycle_applies_slots_after_judging():
 
 @pytest.mark.asyncio
 async def test_cycle_never_raises():
+    """Task 5: `refresh_index_daily`도 패치한다 -- 안 그러면 실제 yfinance
+    네트워크 호출을 타 이 테스트가 격리되지 않는다(리뷰 발견, 2026-08-08).
+    이 diff 이전에는 judge_regime()만 모킹하면 사이클 전체가 격리됐지만,
+    Task 5가 판정 앞에 refresh_index_daily() 호출을 끼워 넣으면서 새
+    네트워크 의존이 생겼다."""
     with patch("services.krx_holiday.get_holiday_service",
+               AsyncMock(side_effect=RuntimeError("boom"))), \
+         patch("services.trading.regime_judge.refresh_index_daily",
                AsyncMock(side_effect=RuntimeError("boom"))), \
          patch("services.trading.regime_judge.judge_regime",
                AsyncMock(side_effect=RuntimeError("boom"))):

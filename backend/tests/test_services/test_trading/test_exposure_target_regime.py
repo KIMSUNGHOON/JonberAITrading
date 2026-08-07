@@ -28,7 +28,8 @@ def _returns_with_annual_vol(vol_ann_pct: float, n: int = 20) -> list[float]:
     return [a if i % 2 == 0 else -a for i in range(n)]
 
 
-def _t(regime="bear", prev=None, seed=0.0855, returns=None, equity=100.0, peak=100.0):
+def _t(regime="bear", prev=None, seed=0.0855, returns=None, equity=100.0,
+       peak=100.0, series_stale=False):
     return compute_regime_target(
         regime_label=regime,
         prev_effective_pct=prev,
@@ -36,7 +37,48 @@ def _t(regime="bear", prev=None, seed=0.0855, returns=None, equity=100.0, peak=1
         index_returns=returns if returns is not None else [],
         equity=equity,
         equity_peak=peak,
+        series_stale=series_stale,
     )
+
+
+def test_real_kospi_volatility_is_not_rejected():
+    """이 케이스가 이번 사고의 원점이다.
+
+    실제 KOSPI 20일 실현 연변동성이 101.7%인데 옛 게이트 [5, 60]이
+    그것을 "말이 안 되는 값"으로 거부해 m_vol=1.0으로 만들었다 —
+    방어가 가장 필요한 날에 정확히 꺼졌다.
+    """
+    # 일간 ±6.4%가 20일 이어지면 연 101% 근처
+    returns = [6.4, -6.4] * 10
+    out = _t(returns=returns)
+
+    assert out.index_vol_annualized is not None
+    assert out.index_vol_annualized > 60.0, "실제로 게이트 밖이던 크기"
+    assert "index_vol_implausible" not in out.degraded, "게이트가 남아 있다"
+    assert out.m_vol == pytest.approx(0.5), "하한까지 깎여야 한다"
+
+
+def test_vol_gate_constants_are_gone():
+    """상수가 남아 있으면 누군가 다시 쓴다."""
+    import services.trading.exposure_target as et
+
+    assert not hasattr(et, "VOL_GATE_MIN_PCT")
+    assert not hasattr(et, "VOL_GATE_MAX_PCT")
+
+
+def test_stale_series_neutralizes_the_multiplier():
+    out = _t(returns=[6.4, -6.4] * 10, series_stale=True)
+    assert out.m_vol == 1.0
+    assert "index_series_stale" in out.degraded
+    assert out.index_vol_annualized is not None, "원값은 그대로 실어야 한다"
+
+
+def test_stale_flag_does_not_open_exposure_upward():
+    """m_vol=1.0은 '깎지 않음'이지 '키움'이 아니다."""
+    fresh = _t(returns=[6.4, -6.4] * 10, series_stale=False)
+    stale = _t(returns=[6.4, -6.4] * 10, series_stale=True)
+    assert stale.target_pct >= fresh.target_pct
+    assert stale.m_vol <= 1.0
 
 
 def test_anchors_are_exactly_the_specified_values():
@@ -93,15 +135,6 @@ def test_vol_insufficient_is_recorded_not_silently_neutral():
     out = _t(returns=[0.1, 0.2])
     assert out.m_vol == 1.0
     assert "index_vol_insufficient" in out.degraded
-
-
-def test_implausible_vol_is_gated_and_raw_value_preserved():
-    """모의 데이터를 걸러내되 원값은 버리지 않는다."""
-    out = _t(returns=[10.0, -12.0, 15.0, -18.0, 11.0, -14.0])
-    assert out.m_vol == 1.0
-    assert "index_vol_implausible" in out.degraded
-    assert out.index_vol_annualized is not None
-    assert out.index_vol_annualized > 60.0
 
 
 # -------------------------------------------
