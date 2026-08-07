@@ -2692,6 +2692,10 @@ class ExecutionCoordinator:
             # 이 메서드를 겨냥한 테스트가 깨진다.
             from services.storage_service import get_storage_service
             from services.trading.exposure_target import compute_regime_target
+            from services.trading.index_series import (
+                closes_to_returns,
+                is_series_stale,
+            )
 
             storage = await get_storage_service()
             trade_date = datetime.now().strftime("%Y-%m-%d")
@@ -2703,15 +2707,25 @@ class ExecutionCoordinator:
             regime_label = (judgment or {}).get("regime") or "bear"
             prev_effective = (judgment or {}).get("prev_effective_pct")
             actual_pct = stock_value / equity if equity > 0 else 0.0
-            index_returns = await storage.get_recent_macro_returns("SPY", limit=20)
+
+            closes = await storage.get_recent_index_closes(limit=21)
+            index_returns = closes_to_returns([c for _, c in closes])
+            series_stale = (
+                is_series_stale(closes[-1][0], datetime.now().date())
+                if closes
+                else False
+            )
 
             target = compute_regime_target(
                 regime_label=regime_label,
                 prev_effective_pct=prev_effective,
                 seed_actual_pct=actual_pct,
-                index_returns=index_returns or [],
+                index_returns=index_returns,
                 equity=equity,
                 equity_peak=equity_peak,
+                series_stale=series_stale,
+                target_vol_pct=float(self.risk_params.target_vol_pct),
+                vol_multiplier_min=float(self.risk_params.vol_multiplier_min),
             )
 
             await storage.insert_exposure_shadow(

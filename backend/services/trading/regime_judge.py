@@ -20,7 +20,14 @@ from services.storage_service import get_storage_service
 from services.trading.exposure_target import (
     JUDGMENT_MAX_AGE_DAYS,
     REGIME_ANCHORS,
+    TARGET_VOL_PCT,
+    VOL_MULTIPLIER_MIN,
     compute_regime_target,
+)
+from services.trading.index_series import (
+    closes_to_returns,
+    is_series_stale,
+    refresh_index_daily,
 )
 from services.trading.macro_snapshot import refresh_macro_snapshot
 
@@ -66,7 +73,11 @@ def _format_macro(snapshot: dict, history: dict[str, list[float]]) -> str:
     return "\n".join(lines)
 
 
-async def judge_regime() -> Optional[dict]:
+async def judge_regime(
+    *,
+    target_vol_pct: float = TARGET_VOL_PCT,
+    vol_multiplier_min: float = VOL_MULTIPLIER_MIN,
+) -> Optional[dict]:
     """오늘의 레짐을 판정하고 목표까지 계산해 1행 적는다. never-raise.
 
     매크로 수집이 실패하면 판정하지 않는다 — 입력 없는 판정은 근거가 없다.
@@ -134,13 +145,26 @@ async def judge_regime() -> Optional[dict]:
         equity, equity_peak, actual_pct, portfolio_degraded = await _portfolio_state()
         degraded.extend(portfolio_degraded)
 
+        # 변동성 입력은 KOSPI다 -- 우리는 한국 주식을 산다.
+        # `TARGET_VOL_PCT=18.0`은 KOSPI 20일 실현 연변동성 중앙값
+        # 20.6%와 맞물리는 값이고, SPY(9~15%)에서는 배수가 상한으로
+        # 클램프돼 영원히 논다(2026-08-07 정정).
+        closes = await storage.get_recent_index_closes(limit=21)
+        index_returns = closes_to_returns([c for _, c in closes])
+        series_stale = (
+            is_series_stale(closes[-1][0], date.today()) if closes else False
+        )
+
         target = compute_regime_target(
             regime_label=regime,
             prev_effective_pct=(prev_row or {}).get("effective_target_pct"),
             seed_actual_pct=actual_pct,
-            index_returns=(await storage.get_recent_macro_returns("SPY", limit=20)) or [],
+            index_returns=index_returns,
             equity=equity,
             equity_peak=equity_peak,
+            series_stale=series_stale,
+            target_vol_pct=target_vol_pct,
+            vol_multiplier_min=vol_multiplier_min,
         )
         degraded.extend(target.degraded)
 
@@ -343,7 +367,26 @@ async def run_daily_regime_cycle() -> None:
         logger.warning("regime_cycle_trading_day_check_failed", error=str(e))
 
     try:
-        await judge_regime()
+        await refresh_index_daily()
+    except Exception as e:
+        # never-raise가 계약이지만 방어적으로 한 겹 더 — 수집 실패가
+        # 판정을 막으면 안 된다(기존 행으로 계산은 계속된다).
+        logger.warning("regime_cycle_index_refresh_failed", error=str(e))
+
+    knobs: dict = {}
+    try:
+        coordinator = await _get_trading_coordinator()
+        rp = getattr(coordinator, "risk_params", None)
+        if rp is not None:
+            knobs = {
+                "target_vol_pct": float(rp.target_vol_pct),
+                "vol_multiplier_min": float(rp.vol_multiplier_min),
+            }
+    except Exception as e:
+        logger.warning("regime_cycle_knob_read_failed", error=str(e))
+
+    try:
+        await judge_regime(**knobs)
     except Exception as e:
         logger.warning("regime_cycle_judge_failed", error=str(e))
 

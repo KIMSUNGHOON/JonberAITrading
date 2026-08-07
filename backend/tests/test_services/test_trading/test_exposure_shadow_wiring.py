@@ -7,12 +7,20 @@ opt-in 격리 없는 테스트가 라이브 storage.db를 덮어써 코디네이
 2026-08-07: `compute_target_exposure`(M_evidence 기반)가
 `compute_regime_target`(레짐 앵커 + 일일 변화 한도)으로 대체되면서
 `coordinator._record_exposure_shadow`는 이제 `storage.get_equity_peak()`/
-`storage.get_latest_regime_judgment()`/`storage.get_recent_macro_returns(
-"SPY", ...)` 세 조회만 쓴다. 옛 `get_latest_regime_label`/
+`storage.get_latest_regime_judgment()`/`storage.get_recent_index_closes(
+limit=21)` 세 조회만 쓴다. 옛 `get_latest_regime_label`/
 `count_round_trips`/`get_recent_index_returns` 경로는 더 이상 쓰이지
 않는다(메서드 자체는 storage_service.py에 orphan으로 남아있지만, 이
 파일은 실제로 쓰이는 새 경로만 검증한다 -- 죽은 경로를 검증하면 "이
 파일을 보면 실제 배선을 알 수 있다"는 약속이 깨진다).
+
+⚠️ 2026-08-07 정정: `index_returns`의 입력이 SPY(`macro_snapshot`)에서
+KOSPI(`index_daily`)로 바뀌었다 — SPY는 우리가 사는 시장이 아니고
+`TARGET_VOL_PCT=18.0`과 짝이 맞지 않아 배수가 영원히 논다(Task 5).
+`_record_exposure_shadow`는 이제 `self.risk_params.target_vol_pct`/
+`vol_multiplier_min`도 `compute_regime_target`에 넘긴다 -- 아래
+`_coord_for_shadow()`가 `risk_params`를 세팅하지 않으면
+`AttributeError`가 나서 바깥 try/except에 조용히 삼켜진다.
 
 한때 이 파일 전체가 module-level `pytest.skip`으로 빠져 있었다 -- 옛
 `compute_target_exposure` import가 깨져 test_trading/ 디렉터리 전체
@@ -190,9 +198,16 @@ class TestGetEquityPeakFailsClosed:
 
 
 def _coord_for_shadow():
-    """_record_exposure_shadow만 실행 가능한 최소 coordinator."""
+    """_record_exposure_shadow만 실행 가능한 최소 coordinator.
+
+    `risk_params`를 명시적으로 세팅한다 -- Task 5에서
+    `_record_exposure_shadow`가 `self.risk_params.target_vol_pct`/
+    `vol_multiplier_min`을 읽게 됐다. `ExecutionCoordinator.__new__`는
+    `__init__`을 거치지 않아 이 속성이 아예 없다 -- 빠뜨리면
+    `AttributeError`가 나서 바깥 try/except에 조용히 삼켜지고
+    `insert_exposure_shadow`가 0번 불린 채로 테스트가 실패한다."""
     from services.trading.coordinator import ExecutionCoordinator
-    from services.trading.models import AccountInfo
+    from services.trading.models import AccountInfo, RiskParameters
 
     c = ExecutionCoordinator.__new__(ExecutionCoordinator)
     c._state = MagicMock()
@@ -200,6 +215,7 @@ def _coord_for_shadow():
         total_equity=497_403_042.0, available_cash=449_360_601.0
     )
     c._state.positions = []
+    c.risk_params = RiskParameters()
     return c
 
 
@@ -208,14 +224,15 @@ def _storage_double(**overrides):
 
     옛 4-헬퍼(get_recent_index_returns/get_latest_regime_label/
     count_round_trips/get_equity_peak) 중 get_equity_peak만 남고 나머지는
-    get_latest_regime_judgment/get_recent_macro_returns로 교체됐다."""
+    get_latest_regime_judgment/get_recent_index_closes로 교체됐다(Task 5:
+    SPY macro_returns → KOSPI index_closes)."""
     storage = MagicMock()
     storage.insert_exposure_shadow = AsyncMock(return_value=True)
     storage.get_equity_peak = AsyncMock(return_value=497_403_042.0)
     storage.get_latest_regime_judgment = AsyncMock(
         return_value={"regime": "neutral", "prev_effective_pct": None}
     )
-    storage.get_recent_macro_returns = AsyncMock(return_value=[])
+    storage.get_recent_index_closes = AsyncMock(return_value=[])
     for key, value in overrides.items():
         setattr(storage, key, value)
     return storage
