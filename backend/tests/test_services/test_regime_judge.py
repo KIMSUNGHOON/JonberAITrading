@@ -70,12 +70,38 @@ async def test_llm_failure_carries_previous_judgment_forward():
 
 @pytest.mark.asyncio
 async def test_unparseable_label_carries_forward_and_is_degraded():
+    """이름대로: 이어받을 직전 판정이 있어야 '이어받기'가 성립한다."""
+    storage = await get_storage_service()
+    await storage.insert_regime_judgment(
+        trade_date=(date.today() - timedelta(days=1)).isoformat(),
+        regime="bull", confidence=0.9, rationale="어제", key_drivers=[],
+        anchor_target_pct=0.80, effective_target_pct=0.40,
+        prev_effective_pct=0.25, degraded=[], macro_snapshot_id=None,
+    )
     with patch("services.trading.regime_judge.refresh_macro_snapshot",
                AsyncMock(return_value=_SNAPSHOT)), \
          patch("services.trading.regime_judge.get_llm_provider",
                return_value=_llm(regime="슈퍼강세")):
         out = await judge_regime()
+    assert out is not None
+    assert out["regime"] == "bull", "직전 판정이 이어져야 한다"
     assert "regime_unparseable" in out["degraded"]
+
+
+@pytest.mark.asyncio
+async def test_unparseable_label_without_prior_writes_nothing():
+    """라벨이 이상하고 직전 판정도 없으면 -- bear조차 폴백으로 쓰지 않는다.
+    임의의 숫자를 만들면 판정 실패가 오히려 노출도 상한을 열 수 있다
+    (예: 실제 비중 13%에서 bear 램프면 28% > 기존 슬롯 천장 21%). 행을 안
+    적어야 게이트가 검사를 건너뛰고 기존 천장이 그대로 남는다."""
+    with patch("services.trading.regime_judge.refresh_macro_snapshot",
+               AsyncMock(return_value=_SNAPSHOT)), \
+         patch("services.trading.regime_judge.get_llm_provider",
+               return_value=_llm(regime="슈퍼강세")):
+        out = await judge_regime()
+    assert out is None
+    storage = await get_storage_service()
+    assert await storage.get_latest_regime_judgment() is None
 
 
 @pytest.mark.asyncio

@@ -107,40 +107,29 @@ async def judge_regime() -> Optional[dict]:
                 rationale = str(out.get("rationale") or "")
                 key_drivers = list(out.get("key_drivers") or [])
             else:
-                # 라벨은 못 믿어도 스냅샷·LLM 응답 자체는 왔다 -- llm_unavailable과
-                # 달리 완전한 공백은 아니다. rationale/key_drivers는 참고용으로
-                # 남겨 둔다 (아래에서 prev_row가 없으면 bear로 정규화될 수 있다).
                 degraded.append("regime_unparseable")
                 logger.warning("regime_judge_unparseable", got=candidate)
-                rationale = str(out.get("rationale") or "")
-                key_drivers = list(out.get("key_drivers") or [])
-                confidence = out.get("confidence")
         except Exception as e:
             degraded.append("llm_unavailable")
             logger.warning("regime_judge_llm_failed", error=str(e))
 
         if regime is None:
-            if prev_row is not None:
-                regime = prev_row["regime"]
-                rationale = f"(직전 판정 유지) {prev_row.get('rationale') or ''}"
-                key_drivers = prev_row.get("key_drivers") or []
-                confidence = prev_row.get("confidence")
-            elif "regime_unparseable" in degraded:
-                # 완전한 공백(llm_unavailable)과 다르다 -- 스냅샷과 LLM 응답은
-                # 받았고 라벨만 못 믿을 뿐이다. 직전 판정도 없으면
-                # exposure_target의 "모르는 라벨 -> 가장 보수적인 앵커" 안전망과
-                # 같은 결로 bear(0.55, 가장 낮은 앵커)로 정규화한다. neutral 같은
-                # 중간값은 절대 만들어내지 않는다 -- 실패 폴백은 노출도를
-                # 위로 열면 안 된다.
-                degraded.append("regime_unparseable_no_fallback_defaulted_bear")
-                logger.warning("regime_judge_unparseable_no_fallback_using_bear")
-                regime = "bear"
-            else:
-                # llm_unavailable이고 직전도 없다 -- 임의의 숫자를 만들지 않는다.
-                # 행을 안 적으면 get_effective_target()이 None을 돌려주고
-                # 게이트는 검사를 건너뛴다(기존 천장이 그대로 남는다).
+            if prev_row is None:
+                # 직전도 없다 -- 실패 유형(llm_unavailable/regime_unparseable)과
+                # 무관하게 임의의 숫자를 만들지 않는다. `bear`조차도 폴백으로
+                # 안 된다 -- 기존 실제 비중(예: 13%)에서 일일 램프(+15%)로
+                # 계산하면 판정 실패가 오히려 상한을 열어버릴 수 있다(스펙 §3
+                # U2: "neutral을 폴백으로 쓰지 않는다"는 원칙은 임의의 숫자 전체에
+                # 적용된다, bear도 예외가 아니다). 행을 안 적으면
+                # get_effective_target()이 None을 돌려주고 게이트는 검사를
+                # 건너뛴다(기존 천장이 그대로 남는다) -- 이것이 스펙이 의도한
+                # "판정 못 함"의 결과다.
                 logger.warning("regime_judge_no_fallback_available")
                 return None
+            regime = prev_row["regime"]
+            rationale = f"(직전 판정 유지) {prev_row.get('rationale') or ''}"
+            key_drivers = prev_row.get("key_drivers") or []
+            confidence = prev_row.get("confidence")
 
         equity, equity_peak, actual_pct = await _portfolio_state()
 
