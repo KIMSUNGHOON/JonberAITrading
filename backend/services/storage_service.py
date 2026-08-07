@@ -463,6 +463,28 @@ class StorageService:
                     "ON macro_snapshot(trade_date)"
                 )
 
+                # regime_judgment (LLM 레짐 판정 + 그 판정이 만든 목표, 2026-08-07)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS regime_judgment (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL UNIQUE,
+                        regime TEXT NOT NULL,
+                        confidence REAL,
+                        rationale TEXT,
+                        key_drivers_json TEXT,
+                        anchor_target_pct REAL NOT NULL,
+                        effective_target_pct REAL NOT NULL,
+                        prev_effective_pct REAL,
+                        degraded_json TEXT,
+                        macro_snapshot_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_regime_judgment_trade_date "
+                    "ON regime_judgment(trade_date)"
+                )
+
                 # exposure_shadow.e_base/e_max/equity_peak (리뷰 반영,
                 # 2026-08-06): e_base/e_max는 이전까지 호출자가 넘기지 않아
                 # 늘 함수 기본값이었고 행에도 없었다 -- 관측 기간 중 이
@@ -2880,6 +2902,85 @@ class StorageService:
             if v is not None:
                 out.append(float(v))
         return out
+
+    # -------------------------------------------
+    # Regime Judgment (LLM 레짐 판정 + 목표 노출도, 2026-08-07)
+    # -------------------------------------------
+
+    async def insert_regime_judgment(
+        self,
+        *,
+        trade_date: str,
+        regime: str,
+        confidence: Optional[float],
+        rationale: Optional[str],
+        key_drivers: Optional[list],
+        anchor_target_pct: float,
+        effective_target_pct: float,
+        prev_effective_pct: Optional[float],
+        degraded: Optional[list],
+        macro_snapshot_id: Optional[str] = None,
+    ) -> bool:
+        """레짐 판정 1행. 같은 날 재판정은 덮어쓴다. 실패-무해."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO regime_judgment
+                    (id, trade_date, regime, confidence, rationale,
+                     key_drivers_json, anchor_target_pct, effective_target_pct,
+                     prev_effective_pct, degraded_json, macro_snapshot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        trade_date,
+                        regime,
+                        confidence,
+                        rationale,
+                        json.dumps(key_drivers or [], ensure_ascii=False),
+                        anchor_target_pct,
+                        effective_target_pct,
+                        prev_effective_pct,
+                        json.dumps(degraded or [], ensure_ascii=False),
+                        macro_snapshot_id,
+                    ),
+                )
+                await conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"insert_regime_judgment failed: {e}")
+            return False
+
+    async def get_latest_regime_judgment(self) -> Optional[dict]:
+        """가장 최근 trade_date의 판정. 행 없으면 None, **DB 오류는 raise**."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                """
+                SELECT trade_date, regime, confidence, rationale,
+                       key_drivers_json, anchor_target_pct, effective_target_pct,
+                       prev_effective_pct, degraded_json, created_at
+                FROM regime_judgment ORDER BY trade_date DESC LIMIT 1
+                """
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "trade_date": row["trade_date"],
+            "regime": row["regime"],
+            "confidence": row["confidence"],
+            "rationale": row["rationale"],
+            "key_drivers": json.loads(row["key_drivers_json"] or "[]"),
+            "anchor_target_pct": row["anchor_target_pct"],
+            "effective_target_pct": row["effective_target_pct"],
+            "prev_effective_pct": row["prev_effective_pct"],
+            "degraded": json.loads(row["degraded_json"] or "[]"),
+            "created_at": row["created_at"],
+        }
 
     async def get_day_rollup(self, trade_date: str) -> Optional[dict]:
         """하루 요약 — 결정 수·체결 수·실현손익·슬롯 거절 수.
