@@ -7,6 +7,24 @@ from services.storage_service import get_storage_service
 pytestmark = pytest.mark.usefixtures("isolated_storage_service")
 
 
+def _llm(regime="bear", confidence=0.72):
+    """`test_regime_judge.py`의 동일 헬퍼와 같은 모양(9곳 전부가 이 관행을
+    쓴다) -- `get_llm_provider`를 패치하지 않으면 이 샌드박스에 설치된
+    `claude` CLI로 라우터가 실제 LLM 호출에 폴백해 성공해버려(비용·
+    비결정성·오프라인 실패), `judge_regime`이 `compute_regime_target`에
+    도달하는지가 우연에 좌우된다(리뷰 발견, 2026-08-08)."""
+    provider = MagicMock()
+    provider.generate_structured = AsyncMock(
+        return_value={
+            "regime": regime,
+            "confidence": confidence,
+            "rationale": "EWY -2.97%로 외국인 이탈",
+            "key_drivers": ["EWY -2.97%"],
+        }
+    )
+    return provider
+
+
 @pytest.mark.asyncio
 async def test_cycle_refreshes_index_before_judging():
     """수집이 판정보다 먼저여야 그날 종가가 변동성에 반영된다."""
@@ -49,9 +67,11 @@ async def test_judge_uses_index_daily_not_spy():
 
     # ⚠️ `judge_regime`은 첫 줄에서 `refresh_macro_snapshot()`을 부르고
     # 실패하면 조기 반환한다 — 패치하지 않으면 compute_regime_target에
-    # 도달조차 못 하고 이 테스트는 공허해진다.
+    # 도달조차 못 하고 이 테스트는 공허해진다. `get_llm_provider`도 같은
+    # 이유로 패치한다 -- 진짜 LLM을 부르면 도달 여부가 우연에 좌우된다.
     _snap = {"quotes": {"SPY": {"chg_pct": -0.16, "prev_close": 769.8}}, "missing": []}
     with patch.object(rj, "refresh_macro_snapshot", AsyncMock(return_value=_snap)), \
+         patch.object(rj, "get_llm_provider", return_value=_llm()), \
          patch.object(rj, "compute_regime_target", _capture):
         await rj.judge_regime()
 
@@ -70,9 +90,11 @@ async def test_judge_passes_the_knobs_through():
         seen.update(kw)
         raise RuntimeError("stop here")
 
-    # 위와 같은 이유로 refresh_macro_snapshot을 패치해야 도달한다.
+    # 위와 같은 이유로 refresh_macro_snapshot과 get_llm_provider를 패치해야
+    # 도달한다.
     _snap = {"quotes": {"SPY": {"chg_pct": -0.16, "prev_close": 769.8}}, "missing": []}
     with patch.object(rj, "refresh_macro_snapshot", AsyncMock(return_value=_snap)), \
+         patch.object(rj, "get_llm_provider", return_value=_llm()), \
          patch.object(rj, "compute_regime_target", _capture):
         await rj.judge_regime(target_vol_pct=33.0, vol_multiplier_min=0.25)
 
