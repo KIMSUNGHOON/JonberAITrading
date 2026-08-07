@@ -63,14 +63,18 @@ class SlotData:
 
 @dataclass
 class ExposureData:
+    """2026-08-07: `m_regime`/`m_evidence`는 여기 없다 -- 레짐 배수는 앵커
+    테이블(`REGIME_ANCHORS`)로, 증거량 배수는 안전장치로 기능하지 못해
+    폐기로 대체됐다. 개념 자체가 없어진 것이지 조회가 실패한 게 아니므로
+    `_NO_DATA`("조회 실패")로 렌더링하면 안 된다 -- 그래서 필드째 뺐다.
+    """
+
     ts: str
     target_pct: float
     actual_pct: Optional[float] = None
     binding: Optional[str] = None
     degraded: Optional[str] = None
-    m_regime: Optional[float] = None
     m_vol: Optional[float] = None
-    m_evidence: Optional[float] = None
     m_drawdown: Optional[float] = None
     index_vol_annualized: Optional[float] = None
     index_vol_n: Optional[int] = None
@@ -286,9 +290,7 @@ def format_exposure(d) -> str:
     lines.append("")
     lines.append("  [성분]")
     for name, val in (
-        ("m_regime", d.m_regime),
         ("m_vol", d.m_vol),
-        ("m_evidence", d.m_evidence),
         ("m_drawdown", d.m_drawdown),
     ):
         lines.append(f"    {name:12} {val if val is not None else _NO_DATA}")
@@ -451,9 +453,7 @@ async def collect_exposure():
         actual_pct=row.get("actual_pct"),
         binding=row.get("binding"),
         degraded=row.get("degraded") or None,
-        m_regime=row.get("m_regime"),
         m_vol=row.get("m_vol"),
-        m_evidence=row.get("m_evidence"),
         m_drawdown=row.get("m_drawdown"),
         index_vol_annualized=row.get("index_vol_annualized"),
         index_vol_n=row.get("index_vol_n"),

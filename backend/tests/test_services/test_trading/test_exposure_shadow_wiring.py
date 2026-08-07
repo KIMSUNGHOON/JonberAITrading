@@ -156,6 +156,38 @@ async def test_daily_perf_snapshot_has_stock_value_column(isolated_storage_servi
     assert "stock_value" in cols
 
 
+class TestGetEquityPeakFailsClosed:
+    """`get_equity_peak`는 여전히 살아있는 배선이다 --
+    `coordinator._record_exposure_shadow`가 지금도 이걸 부른다(옛
+    `get_latest_regime_label`/`count_round_trips`/`get_recent_index_returns`와
+    다르다 -- 그 셋은 `services/`를 grep해도 storage_service.py 밖에서
+    더 이상 안 불려 진짜 orphan이라 이 파일에서 뺐다).
+
+    조회 자체가 실패하면 그럴싸한 기본값(0.0 -- "낙폭 없음")이 아니라
+    `None`을 돌려줘야 한다 -- 실패와 "스냅샷이 아직 없다"(진짜 0.0)를
+    코디네이터가 구분할 수 있어야 하기 때문이다. 리뷰 발견: 이 파일을
+    통째로 재작성하면서 진짜 orphan 3종과 함께 이 테스트까지 지워
+    `get_equity_peak`가 나중에 `except: return 0.0`으로 바뀌어도 아무
+    테스트도 못 잡는 상태가 됐었다."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_read_failure(
+        self, isolated_storage_service, monkeypatch
+    ):
+        import services.storage_service as ss
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(ss.aiosqlite, "connect", _boom)
+        assert await isolated_storage_service.get_equity_peak() is None
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_no_snapshot_yet(self, isolated_storage_service):
+        """스냅샷이 아직 없는 것(정상)과 조회 실패(비정상)는 다른 사실이다."""
+        assert await isolated_storage_service.get_equity_peak() == 0.0
+
+
 def _coord_for_shadow():
     """_record_exposure_shadow만 실행 가능한 최소 coordinator."""
     from services.trading.coordinator import ExecutionCoordinator

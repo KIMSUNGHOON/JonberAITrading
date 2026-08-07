@@ -195,9 +195,9 @@ class TestExposure:
             ts="2026-08-07 09:05:00",
             target_pct=0.12,
             actual_pct=0.098,
-            binding="m_evidence",
+            binding="daily_limit",
             degraded="index_vol_implausible",
-            m_regime=1.2, m_vol=1.0, m_evidence=0.2, m_drawdown=1.0,
+            m_vol=1.0, m_drawdown=1.0,
             index_vol_annualized=112.1, index_vol_n=14,
             n_round_trips=8,
         )
@@ -206,7 +206,7 @@ class TestExposure:
 
     def test_shows_every_component(self):
         text = format_exposure(self._exp())
-        for name in ("m_regime", "m_vol", "m_evidence", "m_drawdown"):
+        for name in ("m_vol", "m_drawdown"):
             assert name in text
 
     def test_degraded_reason_is_visible(self):
@@ -221,6 +221,66 @@ class TestExposure:
     def test_absent_row_says_not_started(self):
         text = format_exposure(None)
         assert "관측 시작 전" in text
+
+
+class TestExposureRegimeFieldsAreGoneNotFailed:
+    """리뷰 발견(2026-08-07): `m_regime`/`m_evidence` 컬럼이
+    `insert_exposure_shadow`에서 항상 NULL이 되도록 바뀐 뒤에도
+    `collect_exposure`/`format_exposure`가 여전히 그 값을 읽어
+    `_pct`/`_NO_DATA` 경로로 렌더링하고 있었다 -- 그래서 관측 행이 있어도
+    `/exposure`가 매번 "m_regime 조회 실패"/"m_evidence 조회 실패"를
+    표시했다. 개념 자체가 없어진 것이지 조회가 실패한 게 아니므로 이건
+    바로 어제(2026-08-06) 고친 "행 없음을 조회 실패로 오보고"하던 버그와
+    같은 종류의 거짓말이다.
+
+    이 테스트는 mock이 아니라 `isolated_storage_service`로 진짜 저장소를
+    거친다 -- `insert_exposure_shadow`가 실제로 무엇을 저장하고
+    `collect_exposure`가 그걸 실제로 어떻게 읽는지까지 검증해야
+    `ExposureData`에 `m_regime`/`m_evidence`를 남겨두고 값만 못 채운
+    회귀(그러면 `row.get()`이 여전히 `None`을 돌려주고 렌더러가 다시
+    `_NO_DATA`를 낸다)도 잡을 수 있다."""
+
+    @pytest.mark.asyncio
+    async def test_observed_row_renders_without_failure_markers(
+        self, isolated_storage_service
+    ):
+        import services.telegram.briefing as b
+        from services.trading.exposure_target import compute_regime_target
+
+        target = compute_regime_target(
+            regime_label="neutral",
+            prev_effective_pct=0.65,
+            seed_actual_pct=0.0994,
+            index_returns=[1.14, -1.14] * 10,
+            equity=497_403_042.0,
+            equity_peak=497_403_042.0,
+        )
+        await isolated_storage_service.insert_exposure_shadow(
+            trade_date="2026-08-07",
+            target=target,
+            equity=497_403_042.0,
+            stock_value=49_426_800.0,
+            actual_pct=0.0994,
+            n_round_trips=None,
+        )
+
+        async def fake_storage():
+            return isolated_storage_service
+
+        b._storage = fake_storage
+        try:
+            data = await b.collect_exposure()
+        finally:
+            import importlib
+            importlib.reload(b)
+
+        text = format_exposure(data)
+        assert _NO_DATA not in text, (
+            f"관측 행이 있는데도 '조회 실패'가 나온다 -- 없어진 성분을 "
+            f"여전히 조회 실패처럼 렌더링하고 있다:\n{text}"
+        )
+        assert "m_regime" not in text, "없어진 개념을 렌더링에 남겨두면 안 된다"
+        assert "m_evidence" not in text, "없어진 개념을 렌더링에 남겨두면 안 된다"
 
 
 class TestBlockReasonScanner:
