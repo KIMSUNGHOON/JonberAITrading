@@ -176,20 +176,31 @@ async def test_analysis_path_full_lineage_e2e(temp_storage):
     assert len(pnl_rows) == 1
     assert pnl_rows[0]["entry_decision_id"] == entry_decision_id
     assert pnl_rows[0]["exit_decision_id"] == exit_decision_id
-    expected_pnl = (75000 - 70000) * 10
+    expected_pnl = (75000 - 70000) * 10  # gross -- 원장은 gross를 그대로 든다
     assert pnl_rows[0]["realized_amount"] == expected_pnl
+
+    # 2026-08-08: 원장이 gross와 net을 나란히 든다. 수수료 편도 2bp + 매도
+    # 증권거래세 23bp -> 매수 700,000*2bp=140, 매도 750,000*2bp=150,
+    # 세금 750,000*23bp=1,725.
+    expected_fee = 140 + 150
+    expected_tax = 1_725
+    expected_net = expected_pnl - expected_fee - expected_tax  # 47,985
+    assert pnl_rows[0]["fee"] == expected_fee
+    assert pnl_rows[0]["tax"] == expected_tax
+    assert pnl_rows[0]["net_amount"] == expected_net
 
     # -- outcome backfilled onto the ENTRY decision (record_kr_realized_pnl_async
     # -> update_decision_outcome, exercised for real via the fire-and-forget
-    # SELL path above) --
+    # SELL path above) -- 학습 신호는 **net**이다(gross면 비용을 못 넘긴
+    # 거래가 "승리"로 학습된다).
     decisions = {
         d["id"]: d for d in await storage.get_agent_chat_decisions(ticker="005930")
     }
-    assert decisions[entry_decision_id]["outcome_realized_pnl"] == expected_pnl
+    assert decisions[entry_decision_id]["outcome_realized_pnl"] == expected_net
     assert decisions[entry_decision_id]["decision_source"] == "analysis"
 
     # -- direct confirmation update_decision_outcome itself reports success --
-    assert await storage.update_decision_outcome(entry_decision_id, expected_pnl) is True
+    assert await storage.update_decision_outcome(entry_decision_id, expected_net) is True
 
     # -- label_and_calibrate scores the entry decision --
     # I3 (final-review fix): persist_analysis_decision now stamps trade_date
@@ -314,13 +325,19 @@ async def test_agent_chat_path_full_lineage_e2e(temp_storage):
     assert len(pnl_rows) == 1
     assert pnl_rows[0]["entry_decision_id"] == entry_decision_id
     assert pnl_rows[0]["exit_decision_id"] == exit_decision_id
-    expected_pnl = (63000 - 70000) * 10
+    expected_pnl = (63000 - 70000) * 10  # gross
     assert pnl_rows[0]["realized_amount"] == expected_pnl
+
+    # 매수 700,000*2bp=140, 매도 630,000*2bp=126, 세금 630,000*23bp=1,449.
+    expected_fee = 140 + 126
+    expected_tax = 1_449
+    expected_net = expected_pnl - expected_fee - expected_tax  # -71,715
+    assert pnl_rows[0]["net_amount"] == expected_net
 
     decisions = {
         d["id"]: d for d in await storage.get_agent_chat_decisions(ticker="005930")
     }
-    assert decisions[entry_decision_id]["outcome_realized_pnl"] == expected_pnl
+    assert decisions[entry_decision_id]["outcome_realized_pnl"] == expected_net
     # decision_source is unset for the normal agent_chat debate path (NULL ==
     # 'agent_chat' by read-consumer convention, spec D1) — never 'analysis'.
     assert decisions[entry_decision_id]["decision_source"] != "analysis"

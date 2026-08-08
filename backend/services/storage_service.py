@@ -583,6 +583,38 @@ class StorageService:
                     {"tax": "INTEGER DEFAULT 0", "cost_source": "TEXT"},
                 )
 
+                # kr_realized_pnl.fee/tax/net_amount/cost_source (순 실현손익,
+                # 2026-08-08): realized_amount는 (exit-entry)*qty 순수 gross라
+                # 수수료도 증권거래세도 빠져 있었다. 그 gross가 그대로
+                # agent_chat_decisions.outcome_realized_pnl로 백필돼
+                # calibration의 에이전트 정오답 채점 → 전략 재가중으로
+                # 흘러가, 비용을 못 넘긴 거래가 "승리"로 학습됐다(라이브
+                # 25행 중 1건이 실제로 부호를 뒤집는다: 005930 gross
+                # +22,008 → net -19,328). realized_amount(gross)는 그대로
+                # 두고 net을 나란히 적는다 — 두 단위가 모두 남아야 한다.
+                #
+                # 비용 기준은 앱 자체 모델(cost_model.compute_fill_cost:
+                # 편도 수수료 2bp + 매도 증권거래세 23bp = 왕복 0.27%)이다.
+                # 모의 브로커는 실제로 왕복 0.90%(수수료 편도 35bp)를
+                # 물리지만 그건 모의 서버 고유 요율이고 실전 키움(왕복
+                # ~0.19~0.23%)의 4.7배다 — 캘리브레이션이 학습해야 하는
+                # 것은 실전에서 일반화되는 문턱이므로 모의의 가혹한 요율이
+                # 아니라 실전에 가까운 모델을 쓴다. cost_source가 어느
+                # 쪽으로 계산됐는지 남기므로('model' = 정상 기록 경로,
+                # 'model_backfill' = scripts/backfill_net_realized_pnl.py의
+                # 일회성 마이그레이션), 나중에 브로커가 체결 단위 수수료를
+                # 주면 그 값으로 갈아탈 수 있다.
+                await self._ensure_columns(
+                    conn,
+                    "kr_realized_pnl",
+                    {
+                        "fee": "INTEGER DEFAULT 0",
+                        "tax": "INTEGER DEFAULT 0",
+                        "net_amount": "REAL",
+                        "cost_source": "TEXT",
+                    },
+                )
+
                 # Regime snapshot index/flow/sentiment 심화 (Phase5): breadth-only
                 # 로 만들어진 기존 db에 지수/수급/파생심리 컬럼을 ALTER로 추가.
                 await self._ensure_columns(
@@ -1142,11 +1174,17 @@ class StorageService:
         record only — the broker ledger (ka10074) remains the source of
         truth for KR realized P&L math.)
 
+        `realized_amount` stays GROSS ((exit-entry)*qty). fee/tax/net_amount
+        carry the cost-adjusted unit alongside it (2026-08-08) — the two
+        units live side by side rather than one replacing the other. Callers
+        that omit them leave net_amount NULL, which every consumer must read
+        as "legacy row, fall back to realized_amount".
+
         Args:
             record: dict with keys id, stk_cd, entry_price, exit_price,
                 quantity, realized_amount, and optionally
                 entry_decision_id/exit_decision_id/holding_period_seconds/
-                entry_at/exit_at/created_at.
+                entry_at/exit_at/created_at/fee/tax/net_amount/cost_source.
 
         Returns:
             True if saved successfully
@@ -1160,8 +1198,9 @@ class StorageService:
                     INSERT INTO kr_realized_pnl
                     (id, stk_cd, entry_price, exit_price, quantity,
                      realized_amount, entry_decision_id, exit_decision_id,
-                     holding_period_seconds, entry_at, exit_at, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     holding_period_seconds, entry_at, exit_at, created_at,
+                     fee, tax, net_amount, cost_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["id"],
@@ -1176,6 +1215,10 @@ class StorageService:
                         record.get("entry_at"),
                         record.get("exit_at"),
                         record.get("created_at", datetime.now()),
+                        record.get("fee", 0),
+                        record.get("tax", 0),
+                        record.get("net_amount"),
+                        record.get("cost_source"),
                     ),
                 )
                 await conn.commit()

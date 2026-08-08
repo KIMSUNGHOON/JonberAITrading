@@ -129,8 +129,15 @@ async def _count_win_loss_trades(storage: Any, trade_date: str) -> tuple[int, in
     when exit_at is unset) starts with the "YYYY-MM-DD" trade_date prefix —
     both timestamp columns are stored via Python's default sqlite3 datetime
     adapter / SQLite's CURRENT_TIMESTAMP, which both begin with that prefix.
-    Positive realized_amount = win, negative = loss, zero counts as neither
-    (mirrors compute_daily_win_loss's day-level flat-day treatment).
+    Positive amount = win, negative = loss, zero counts as neither (mirrors
+    compute_daily_win_loss's day-level flat-day treatment).
+
+    비용 반영 (2026-08-08): 부호는 `net_amount`(수수료 + 매도 증권거래세를
+    뺀 값)로 센다 — gross로 세면 비용을 못 넘긴 거래가 "승리"로 집계된다
+    (라이브 실측: 005930 gross +22,008이지만 net -19,328). `net_amount`가
+    NULL인 행은 그 컬럼이 생기기 전에 쓰인 레거시 행이므로
+    `realized_amount`로 폴백한다 — 그 행들은
+    scripts/backfill_net_realized_pnl.py가 일회성으로 채운다.
     """
     rows = await storage.get_kr_realized_pnl(limit=_KR_REALIZED_PNL_SCAN_LIMIT)
     win_trades = 0
@@ -141,7 +148,9 @@ async def _count_win_loss_trades(storage: Any, trade_date: str) -> tuple[int, in
         stamp = str(row.get("exit_at") or row.get("created_at") or "")
         if not stamp.startswith(trade_date):
             continue
-        amount = row.get("realized_amount")
+        amount = row.get("net_amount")
+        if amount is None:
+            amount = row.get("realized_amount")
         if amount is None:
             continue
         if amount > 0:
