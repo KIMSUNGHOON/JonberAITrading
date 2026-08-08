@@ -7,6 +7,15 @@
 
 두 번째가 없으면 킬스위치가 롤백이 아니라 완화 동작이 된다(C-2).
 
+2026-08-08: **`max_single_position_pct`(종목당 상한)의 소유권을 전략 패널에게
+돌려줬다.** `apply_regime_slots`는 더 이상 그 필드를 건드리지 않는다 — 슬롯
+수만 올린다(`slots_for_target`은 `REGIME_PER_POSITION_PCT`를 기본 인자로 직접
+쓰지 `risk_params`를 읽지 않는다). baseline 저장·복원도 `max_open_positions`
+하나만 다룬다. 그렇지 않으면 패널이 0.10으로 올려도 킬스위치 off나 판정
+만료로 되돌리기가 돌 때마다 `min(0.10, baseline 0.03)`으로 조용히 깎인다 —
+브레이크(슬롯 상한)가 우연히 가리고 있던, 진입 경로의 같은 결함(대입이
+ADD/BUY 어느 쪽에서도 실효값에 못 미치던 문제)의 세 번째 판.
+
 ⚠️ 이 테스트들은 실제 `StorageService`를 탄다(baseline은 별도 app_setting
 키에 산다). 반드시 `temp_storage`로 격리한다 -- 이 리포는 테스트가 라이브
 `storage.db`에 쓴 전력이 있다.
@@ -23,7 +32,13 @@ from services.trading.coordinator import ExecutionCoordinator
 
 pytestmark = pytest.mark.asyncio
 
-_BASELINE = {"max_open_positions": 7, "max_single_position_pct": 0.03}
+# 2026-08-08 이후의 baseline 형태 — max_open_positions만 갖는다.
+_BASELINE = {"max_open_positions": 7}
+
+# 하위호환 테스트 전용 — 수정 이전에 저장됐을 수 있는 옛 형태(`
+# max_single_position_pct` 키 포함). 복원 코드가 이 키를 무시하고도
+# 깨지지 않아야 한다.
+_BASELINE_LEGACY = {"max_open_positions": 7, "max_single_position_pct": 0.03}
 
 
 @pytest.fixture
@@ -65,16 +80,22 @@ async def _seed_baseline(storage, coord, baseline=None):
 # -------------------------------------------
 
 
-async def test_target_raises_slots_and_sets_per_position(temp_storage):
-    c = _coord()
+@pytest.mark.parametrize("panel_pct", [0.03, 0.10])
+async def test_target_raises_slots_without_touching_per_position(
+    temp_storage, panel_pct
+):
+    """**핵심 속성 ①.** 레짐 채널은 슬롯만 올린다 — 종목당 상한은 이제
+    전략 패널 소유이고, 패널이 뭘 정했든(0.03이든 0.10이든) 이 경로가 절대
+    덮어쓰지 않는다."""
+    c = _coord(pct=panel_pct)
     with patch("services.trading.coordinator.get_settings") as gs, \
          patch("services.trading.regime_judge.get_effective_target",
                AsyncMock(return_value=0.55)):
         gs.return_value.REGIME_EXPOSURE_ENABLED = True
         out = await c.apply_regime_slots()
-    assert out == {"max_open_positions": 11, "max_single_position_pct": 0.05}
+    assert out == {"max_open_positions": 11}
     assert c.risk_params.max_open_positions == 11
-    assert c.risk_params.max_single_position_pct == 0.05
+    assert c.risk_params.max_single_position_pct == panel_pct
 
 
 async def test_slots_never_decrease(temp_storage):
@@ -95,6 +116,8 @@ async def test_slots_never_decrease(temp_storage):
 
 
 async def test_first_raise_saves_the_pre_branch_baseline(temp_storage):
+    """baseline에는 `max_open_positions`만 적힌다 — 종목당 상한은 이 경로가
+    상향하지 않으므로 되돌릴 것도 없다."""
     c = _coord()
     with patch("services.trading.coordinator.get_settings") as gs, \
          patch("services.trading.regime_judge.get_effective_target",
@@ -123,9 +146,10 @@ async def test_baseline_is_never_overwritten_by_a_later_raise(temp_storage):
 
 
 async def test_kill_switch_off_restores_the_pre_branch_ceiling(temp_storage):
-    """**이 수정의 핵심 속성.** 킬스위치를 끄면 검사 8이 통째로 사라진다.
-    상향만 남으면 실효 천장이 16 × 5% = 80%인데 그것을 상쇄할 기계가 없다 --
-    끄는 행위가 완화 동작이 된다."""
+    """킬스위치를 끄면 검사 8이 통째로 사라진다. 슬롯 상향만 남으면 실효
+    천장이 부풀어 있는데 그것을 상쇄할 기계가 없다 -- 끄는 행위가 완화
+    동작이 된다(C-2, 슬롯에 한정). 종목당 상한은 이제 패널 소유라 이
+    경로가 건드리지 않는다 -- 아래 전용 테스트 참고."""
     c = _coord(slots=16, pct=0.05)
     await _seed_baseline(temp_storage, c)
 
@@ -134,13 +158,45 @@ async def test_kill_switch_off_restores_the_pre_branch_ceiling(temp_storage):
         out = await c.apply_regime_slots()
 
     assert c.risk_params.max_open_positions == 7
-    assert c.risk_params.max_single_position_pct == 0.03
     assert out["restored"] is True and out["reason"] == "kill_switch_off"
+
+
+async def test_restore_never_touches_panel_per_position_pct(temp_storage):
+    """**핵심 속성 ②.** 패널이 0.03보다 높게(예: 0.10) 올려 둔 종목당 상한은
+    킬스위치 off나 판정 만료로 되돌리기가 돌아도 깎이지 않는다 -- 고쳐지기
+    전이라면 `min(0.10, baseline 0.03) = 0.03`으로 조용히 되돌아갔을
+    값이다(같은 버그의 두 번째 판)."""
+    c = _coord(slots=16, pct=0.10)
+    await _seed_baseline(temp_storage, c)
+
+    with patch("services.trading.coordinator.get_settings") as gs:
+        gs.return_value.REGIME_EXPOSURE_ENABLED = False
+        out = await c.apply_regime_slots()
+
+    assert c.risk_params.max_single_position_pct == 0.10
+    assert "max_single_position_pct" not in out
+
+
+async def test_restore_ignores_legacy_baseline_pct_key(temp_storage):
+    """하위호환: 이 수정 이전에 저장된 baseline 행에는 `max_single_position_pct`
+    키가 남아 있을 수 있다. 복원 코드가 그 키를 참조하지 않아야 하고(참조하면
+    패널 값이 다시 깎인다), 키가 있다는 사실 자체로 깨지지도 않아야 한다."""
+    c = _coord(slots=16, pct=0.10)
+    await _seed_baseline(temp_storage, c, baseline=_BASELINE_LEGACY)
+
+    with patch("services.trading.coordinator.get_settings") as gs:
+        gs.return_value.REGIME_EXPOSURE_ENABLED = False
+        out = await c.apply_regime_slots()
+
+    assert c.risk_params.max_open_positions == 7
+    assert c.risk_params.max_single_position_pct == 0.10
+    assert out["restored"] is True
 
 
 async def test_expired_or_absent_judgment_restores_the_pre_branch_ceiling(temp_storage):
     """판정 5역일 만료·매크로 수집 연속 실패도 검사 8을 스킵시킨다 --
-    `get_effective_target()`이 `None`을 돌려주는 그 경우 전부."""
+    `get_effective_target()`이 `None`을 돌려주는 그 경우 전부. 슬롯만
+    되돌아가고 종목당 상한(패널 소유)은 그대로다."""
     c = _coord(slots=16, pct=0.05)
     await _seed_baseline(temp_storage, c)
 
@@ -151,7 +207,7 @@ async def test_expired_or_absent_judgment_restores_the_pre_branch_ceiling(temp_s
         out = await c.apply_regime_slots()
 
     assert c.risk_params.max_open_positions == 7
-    assert c.risk_params.max_single_position_pct == 0.03
+    assert c.risk_params.max_single_position_pct == 0.05
     assert out["reason"] == "judgment_absent_or_stale"
 
 
@@ -184,8 +240,10 @@ async def test_restore_without_a_baseline_changes_nothing(temp_storage):
 
 
 async def test_restore_never_raises_the_ceiling(temp_storage):
-    """되돌리기는 **내리기만** 한다. 운영자가 baseline보다 더 낮춰 둔 값을
-    복원이 도로 올리면 그것도 "장애가 노출도를 위로 여는" 형태다."""
+    """되돌리기는 슬롯을 **내리기만** 한다. 운영자가 baseline보다 더 낮춰 둔
+    값을 복원이 도로 올리면 그것도 "장애가 노출도를 위로 여는" 형태다.
+    **회귀 가드 ③** — `max_open_positions`의 상향·되돌리기가 여전히
+    작동하는지."""
     c = _coord(slots=4, pct=0.02)
     await _seed_baseline(temp_storage, c)
 
@@ -207,7 +265,7 @@ async def test_restore_is_persisted_so_a_restart_keeps_it(temp_storage):
 
     blob = json.loads(await temp_storage.get_app_setting(c._STATE_KEY))
     assert blob["risk_params"]["max_open_positions"] == 7
-    assert blob["risk_params"]["max_single_position_pct"] == 0.03
+    assert blob["risk_params"]["max_single_position_pct"] == 0.05
 
 
 async def test_start_reconciles_slots_with_the_gate(temp_storage):
@@ -216,7 +274,7 @@ async def test_start_reconciles_slots_with_the_gate(temp_storage):
     기동은 킬스위치와 무관하게 돌기 때문에 여기가 유일하게 확실한 지점이다.
 
     `start()`가 `_restore_state()`로 블롭의 (상향된) risk_params를 되살린
-    **뒤**에 화해가 일어나는지까지 함께 잠근다.
+    **뒤**에 화해가 일어나는지까지 함께 잠근다. **회귀 가드 ③.**
     """
     c = ExecutionCoordinator(kiwoom_client=None)
     await _seed_baseline(temp_storage, c)
@@ -243,7 +301,7 @@ async def test_start_reconciles_slots_with_the_gate(temp_storage):
         await c.start(drain_queue=False)
         try:
             assert c.risk_params.max_open_positions == 7
-            assert c.risk_params.max_single_position_pct == 0.03
+            assert c.risk_params.max_single_position_pct == 0.05
         finally:
             await c.stop()
 
@@ -302,6 +360,6 @@ async def test_persistence_active_uses_the_full_snapshot(temp_storage):
         gs.return_value.REGIME_EXPOSURE_ENABLED = True
         out = await c.apply_regime_slots()
 
-    assert out == {"max_open_positions": 11, "max_single_position_pct": 0.05}
+    assert out == {"max_open_positions": 11}
     c._persist_state.assert_awaited_once()
     c._persist_fields.assert_not_called()
