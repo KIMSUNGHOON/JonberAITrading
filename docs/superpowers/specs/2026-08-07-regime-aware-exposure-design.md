@@ -54,6 +54,17 @@ Yahoo 자체 22일 실현 연변동성 98.2%). 정정 설계는
 5. **종목당 상한** — 5% 고정
 6. **일일 변화 한도** — ±15%p 적용
 
+⚠️ **2026-08-08 정정 (결정 5)**: "종목당 상한 5% 고정"이 실제로는 EOD
+전략 패널이 매일 밤 투표해 기록한 값을 다음날 08:05 `apply_regime_slots`가
+`REGIME_PER_POSITION_PCT`(0.05)로 **무조건 덮어써서**, 패널 값이 거래
+시간에는 한 번도 유효하지 않았던 결함으로 드러났다(`finding-add-blocked-
+by-max-positions`류의 같은 반복 패턴). `fix/per-position-knob-ownership`에서
+소유권을 패널로 되돌렸다 — 종목당 상한은 이제 **패널 소유**이고
+(`strategy_apply.STRATEGY_MAPPED_FIELDS`의 `(0.02, 0.30)` 클램프), 이
+레짐 채널은 더 이상 그 필드를 읽지도 쓰지도 않는다. `REGIME_PER_POSITION_PCT
+= 0.05`는 상수로 남지만 **슬롯 수 계산의 제수**로만 쓰인다(`slots_for_
+target`의 기본 인자). 아래 §3 U3·§4 U4·§6의 관련 서술도 이 정정을 따른다.
+
 ## 3. 만드는 것
 
 ```
@@ -169,7 +180,10 @@ CREATE TABLE IF NOT EXISTS regime_judgment (
 ```python
 REGIME_ANCHORS = {"bull": 0.80, "neutral": 0.65, "bear": 0.55}
 DAILY_TARGET_DELTA_MAX = 0.15      # ±15%p / 판정 1회
-REGIME_PER_POSITION_PCT = 0.05     # 종목당 상한 (고정)
+REGIME_PER_POSITION_PCT = 0.05     # 슬롯 수 계산의 제수(2026-08-08 정정 —
+                                    # `risk_params.max_single_position_pct`에
+                                    # 대입되지 않는다. 종목당 상한은 전략
+                                    # 패널 소유다)
 JUDGMENT_MAX_AGE_DAYS = 5
 ```
 
@@ -279,13 +293,18 @@ if target is not None:            # None = 판정 부재/만료 → 검사 스�
 **슬롯 수 — 올리기만 한다.**
 
 ```python
-max_open_positions = max(현재값, ceil(effective_target / 0.05))
-max_single_position_pct = 0.05
+max_open_positions = max(현재값, ceil(effective_target / REGIME_PER_POSITION_PCT))
 ```
 
 목표가 내려가도 슬롯을 줄이지 않는다. 줄이면 **같은 금액을 더 적은 종목에
 담게 되어 집중도가 오른다** — 축소하려는 의도와 정반대다. 총량 축소는 전적으로
 검사 8이 담당한다.
+
+⚠️ **2026-08-08 정정**: 이 절은 원래 `max_single_position_pct = 0.05`도
+같이 대입한다고 서술했다. **틀렸다.** `ceil(...)`의 분모(`REGIME_PER_
+POSITION_PCT`)는 `slots_for_target`의 기본 인자로 계산에만 쓰이고,
+`risk_params.max_single_position_pct`에는 대입되지 않는다 — 그 필드는
+전략 패널 소유다(§2 결정 5 정정 참고).
 
 | 레짐 | 목표 | 필요 슬롯 |
 |---|---|---|
@@ -295,11 +314,16 @@ max_single_position_pct = 0.05
 
 **되돌리기 — 상향은 검사 8과 생사를 같이한다** (2026-08-07 최종 리뷰 C-2).
 
-첫 상향 **전에** 그때의 값(`max_open_positions`, `max_single_position_pct`)을
-`regime:slot_baseline` app_setting에 **한 번만** 적어 둔다(덮어쓰면 두 번째
-상향이 첫 상향값을 baseline으로 굳혀 래칫이 된다). 코디네이터 상태 블롭이
-아니라 **별도 키**인 것은 `_persist_state()`가 블롭을 매번 처음부터 다시
-만들기 때문이다 — 거기 넣으면 다음 뮤테이션 한 번에 사라진다.
+첫 상향 **전에** 그때의 값(`max_open_positions`만 — 2026-08-08 정정, 아래
+참고)을 `regime:slot_baseline` app_setting에 **한 번만** 적어 둔다(덮어쓰면
+두 번째 상향이 첫 상향값을 baseline으로 굳혀 래칫이 된다). 코디네이터 상태
+블롭이 아니라 **별도 키**인 것은 `_persist_state()`가 블롭을 매번 처음부터
+다시 만들기 때문이다 — 거기 넣으면 다음 뮤테이션 한 번에 사라진다.
+
+⚠️ **2026-08-08 정정**: baseline은 원래 `max_single_position_pct`도 같이
+저장한다고 서술했다. **틀렸다.** 그 필드는 이 채널이 상향한 적이 없으므로
+되돌릴 것도 없다 — baseline에는 `max_open_positions`만 남는다. 기존에
+저장된 행에 옛 키가 남아 있어도(이 정정 이전 배포) 복원 코드가 무시한다.
 
 검사 8이 구속력을 잃는 어떤 경우에도 그 baseline으로 **내려간다**(`min()`
 이라 되돌리기가 노출도를 위로 여는 일은 없다):
@@ -328,6 +352,10 @@ risk_params를 메모리로 되살린 **뒤**, 시작 큐 드레인 **앞**. 순
 레짐 채널은 값이 3개뿐인 룩업이라 드리프트가 구조적으로 불가능하므로, 별도의
 경계 명시 경로로 `max_open_positions`를 쓴다. 봉인의 취지(LLM 자유 드리프트
 차단)는 훼손되지 않는다. `strategy_knob_discarded` 로그는 그대로 남는다.
+
+⚠️ **2026-08-08 정정**: 레짐 채널이 별도 경계 명시 경로로 쓰는 필드는
+이제 `max_open_positions` **하나뿐이다** — `max_single_position_pct`는
+빠졌다(전략 패널 소유로 이관, 위 정정 참고).
 
 ### U5 · 초과분은 강제하지 않는다
 
@@ -365,7 +393,8 @@ risk_params를 메모리로 되살린 **뒤**, 시작 큐 드레인 **앞**. 순
 수정만으로는 실행 중인 프로세스에 반영되지 않는다 — 켤 때와 **양쪽 다**
 재시작해야 한다("재배포 없이 끈다"는 초안의 문장은 부정확했다). 이 사실은
 C-2의 되돌리기와 맞물린다: 끄고 재시작하면 코디네이터 `start()`가
-`regime:slot_baseline`을 보고 슬롯·종목당 상한을 브랜치 이전 값으로 되돌린다.
+`regime:slot_baseline`을 보고 슬롯을 브랜치 이전 값으로 되돌린다(종목당
+상한은 2026-08-08 정정 이후 이 되돌리기의 대상이 아니다 — 전략 패널 소유).
 **끄는 행위가 반드시 롤백이어야지 완화가 되어서는 안 된다** — 운영자의
 자연스러운 대응("이상하다 → 끄자")이 반대 결과를 내면 안 되기 때문이다.
 
@@ -434,16 +463,21 @@ C-2의 되돌리기와 맞물린다: 끄고 재시작하면 코디네이터 `sta
 | 검사 8 배선 | `regime_judgment` 행 존재 + `/exposure`의 목표값이 그 행과 일치 | ⚠️ **게이트 로그 부재로는 판정 불가** — `_deny`만 로그하고 통과는 로그가 없다. 아무것도 거절하지 않으면 로그가 한 줄도 안 나온다 |
 | `index_vol_annualized` (`index_daily` 기준) | **90~110** 근처 (실제 KOSPI) | 9~15면 아직 SPY 잔재 |
 | `degraded` | `index_vol_implausible`이 **없어야** 정상(위생 게이트 삭제됨, 2026-08-07 변동성 방어 정정) | 있으면 게이트 제거가 실패한 것 |
-| `max_single_position_pct` | **0.03 → 0.05** | **불변 = 슬롯 배선 실패.** 첫날 실제로 움직이는 유일한 노브다 |
+| `max_single_position_pct` | **불변** — 전략 패널이 마지막으로 정한 값 그대로(현재 라이브 0.03) | 값이 바뀌면 레짐 채널이 다시 이 필드를 건드리고 있다는 뜻 — 회귀(2026-08-08 정정) |
 | `max_open_positions` | **첫날은 7 유지가 정상**("올리기만" 규칙). 목표가 0.35를 넘는 날부터 상향(`ceil(목표/5%)`) | 첫날 5로 **내려가면** "올리기만" 규칙이 안 걸린 것 |
-| `regime:slot_baseline` (app_settings) | 첫 상향 시 `{"max_open_positions": 7, "max_single_position_pct": 0.03}` 1행 | 없으면 되돌리기(C-2)가 불가능 — 킬스위치가 완화 동작이 된다 |
+| `regime:slot_baseline` (app_settings) | 첫 상향 시 `{"max_open_positions": 7}` 1행(`max_single_position_pct` 키 없음 — 2026-08-08 정정) | 없으면 되돌리기(C-2)가 불가능 — 킬스위치가 완화 동작이 된다 |
 | `/brief` | 레짐과 근거가 표시됨. 조회 실패는 "조회 실패"로, 미실행은 "판정 없음"으로 **구별** | 둘이 같은 문구면 I-3 회귀 |
+
+⚠️ **2026-08-08 정정**: 위 `max_single_position_pct`·`regime:slot_baseline`
+두 행은 원래 "0.03 → 0.05로 바뀌는 것이 정상"이라고 서술했다. **틀렸다** —
+`fix/per-position-knob-ownership` 이후 그 필드의 소유권은 전략 패널이고,
+레짐 채널은 상향도 되돌리기도 하지 않는다.
 
 **첫날 예상값** (실제 주식 비중 ~8.55%에서 시드, bear 판정 가정):
 `anchor=0.55` → `ramped=0.2355` → `m_vol=1.0`(표본부족) × `m_drawdown≈1.0` →
 `effective≈0.235`. 슬롯은 `ceil(0.235/0.05)=5`지만 현재 7이므로 **7 유지**,
-`max_single_position_pct`만 0.03 → 0.05. 실효 천장은 `7 × 5% = 35%`이고 검사 8이
-23.5%에서 먼저 잡는다.
+`max_single_position_pct`는 패널 값(현재 라이브 0.03) 그대로다. 실효 천장은
+`7 × 3% = 21%`이고 검사 8이 23.5%보다 먼저(21%에서) 잡는다.
 
 **수렴값** (매일 bear 지속, `m_vol=1.0` 가정): `0.2355 → 0.3855 → 0.535 → 0.55`
 로 **4거래일**에 앵커 도달, 슬롯은 `ceil(0.55/0.05) = 11`. C-1 이전에는 같은

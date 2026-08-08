@@ -2505,31 +2505,34 @@ class ExecutionCoordinator:
             json.dumps(
                 {
                     "max_open_positions": int(self.risk_params.max_open_positions),
-                    "max_single_position_pct": float(
-                        self.risk_params.max_single_position_pct
-                    ),
                 }
             ),
         )
         logger.info(
             f"[Coordinator] regime_slot_baseline_saved: "
-            f"max_open_positions={self.risk_params.max_open_positions} "
-            f"max_single_position_pct={self.risk_params.max_single_position_pct}"
+            f"max_open_positions={self.risk_params.max_open_positions}"
         )
 
     async def _restore_regime_slot_baseline(self, reason: str) -> Optional[dict]:
-        """상향을 되돌린다 -- 실효 천장을 브랜치 이전 값으로 돌려놓는다.
+        """슬롯 상향을 되돌린다 -- 실효 천장을 브랜치 이전 값으로 돌려놓는다.
 
-        **C-2 (2026-08-07 최종 리뷰)**: 슬롯·종목당 상한의 상향은 게이트
-        검사 8과 생사를 같이해야 한다. 검사 8이 구속력을 잃는 경우
-        (킬스위치 off / 판정 부재·만료)에 상향만 남으면 실효 천장이
-        `16 × 5% = 80%`인데 그것을 상쇄할 기계가 하나도 없다 -- **장애나
-        비활성화가 노출도를 위로 여는** 형태가 된다. 운영자의 자연스러운
-        대응("이상하다 → 끄자")이 정확히 반대 결과를 낸다.
+        **C-2 (2026-08-07 최종 리뷰)**: 슬롯 상향은 게이트 검사 8과 생사를
+        같이해야 한다. 검사 8이 구속력을 잃는 경우(킬스위치 off / 판정
+        부재·만료)에 상향만 남으면 실효 천장이 부풀어 있는데 그것을 상쇄할
+        기계가 하나도 없다 -- **장애나 비활성화가 노출도를 위로 여는** 형태가
+        된다. 운영자의 자연스러운 대응("이상하다 → 끄자")이 정확히 반대
+        결과를 낸다.
 
         `min()`으로 내리기만 한다. 되돌리기가 어떤 경우에도 노출도를 **위로**
         열어서는 안 되기 때문이다(운영자가 baseline보다 더 낮춰 둔 값을
         복원이 도로 올리는 일도 없다).
+
+        2026-08-08: `max_single_position_pct`(종목당 상한)는 더 이상 여기서
+        다루지 않는다 -- 소유권이 전략 패널로 넘어갔고, 이 레짐 채널은 애초에
+        그 필드를 상향한 적이 없으므로(→ `apply_regime_slots`) 되돌릴 것도
+        없다. 기존 baseline 행에 `max_single_position_pct` 키가 남아 있어도
+        (이 수정 이전에 저장된 행) 무시한다 -- 참조하면 패널이 올려 둔 값이
+        조용히 깎인다.
         """
         from services.storage_service import get_storage_service
 
@@ -2549,33 +2552,23 @@ class ExecutionCoordinator:
             int(self.risk_params.max_open_positions),
             int(baseline["max_open_positions"]),
         )
-        new_pct = min(
-            float(self.risk_params.max_single_position_pct),
-            float(baseline["max_single_position_pct"]),
-        )
-        changed = (
-            new_slots != int(self.risk_params.max_open_positions)
-            or new_pct != float(self.risk_params.max_single_position_pct)
-        )
+        changed = new_slots != int(self.risk_params.max_open_positions)
         self.risk_params.max_open_positions = new_slots
-        self.risk_params.max_single_position_pct = new_pct
 
         if changed:
             await self._persist_state()
             logger.info(
                 f"[Coordinator] regime_slots_restored ({reason}): "
-                f"max_open_positions={new_slots} "
-                f"max_single_position_pct={new_pct}"
+                f"max_open_positions={new_slots}"
             )
         return {
             "max_open_positions": new_slots,
-            "max_single_position_pct": new_pct,
             "restored": True,
             "reason": reason,
         }
 
     async def apply_regime_slots(self) -> Optional[dict]:
-        """슬롯 수와 종목당 상한을 게이트 검사 8의 구속력에 맞춘다. never-raise.
+        """슬롯 수를 게이트 검사 8의 구속력에 맞춘다. never-raise.
 
         두 방향이 있다.
 
@@ -2592,8 +2585,17 @@ class ExecutionCoordinator:
         되돌려야 하는 것은 검사가 조용히 **스킵**되는 경우(`target is None`)뿐이다.
 
         `GATE_PROTECTED_FIELDS`는 그대로 둔다. 그 봉인은 전략 패널의 자유
-        서술값을 막기 위한 것이고, 이 경로는 값이 3개뿐인 룩업이라 드리프트가
-        구조적으로 불가능하다.
+        서술값을 막기 위한 것이고, 이 경로는 값이 3개뿐인 룩업(레짐 앵커
+        bull/neutral/bear)이라 드리프트가 구조적으로 불가능하다.
+
+        2026-08-08: `max_single_position_pct`(종목당 상한)는 더 이상 이
+        경로가 건드리지 않는다 -- 소유권이 전략 패널로 넘어갔다
+        (`strategy_apply.STRATEGY_MAPPED_FIELDS`). 이 대입은 애초에
+        불필요했다: `slots_for_target`은 `REGIME_PER_POSITION_PCT`를 기본
+        인자로 직접 받아 슬롯 수를 계산하지 `risk_params`를 읽지 않는다.
+        전에는 매일 밤 EOD 패널이 투표해 기록한 값을 다음날 08:05에
+        무조건 덮어써서, 거래 시간 동안 패널 값이 한 번도 유효하지
+        않았다(같은 리포의 반복 패턴 "만들어졌으나 닿지 않는다").
         """
         try:
             # I-1 (2026-08-07 최종 리뷰): `_persistence_active=False`는 이
@@ -2617,10 +2619,7 @@ class ExecutionCoordinator:
             if not get_settings().REGIME_EXPOSURE_ENABLED:
                 return await self._restore_regime_slot_baseline("kill_switch_off")
 
-            from services.trading.exposure_target import (
-                REGIME_PER_POSITION_PCT,
-                slots_for_target,
-            )
+            from services.trading.exposure_target import slots_for_target
             from services.trading.regime_judge import get_effective_target
 
             target = await get_effective_target()
@@ -2633,11 +2632,13 @@ class ExecutionCoordinator:
             # 이미 상향된 값이 되어 baseline이 무의미해진다.
             await self._save_regime_slot_baseline()
 
+            # `per_position_pct`는 기본 인자(`REGIME_PER_POSITION_PCT`)를
+            # 그대로 쓴다 -- `risk_params.max_single_position_pct`(패널
+            # 소유)를 읽지도, 쓰지도 않는다.
             new_slots = slots_for_target(
                 target, current_max=int(self.risk_params.max_open_positions)
             )
             self.risk_params.max_open_positions = new_slots
-            self.risk_params.max_single_position_pct = REGIME_PER_POSITION_PCT
 
             # `_persistence_active`가 True인 것은 위에서 확인했다(= `_state`가
             # `_restore_state()`를 거친 진짜 데이터). 그래서 전체 스냅샷이
@@ -2647,13 +2648,9 @@ class ExecutionCoordinator:
 
             logger.info(
                 f"[Coordinator] regime_slots_applied: target_pct={target} "
-                f"max_open_positions={new_slots} "
-                f"max_single_position_pct={REGIME_PER_POSITION_PCT}"
+                f"max_open_positions={new_slots}"
             )
-            return {
-                "max_open_positions": new_slots,
-                "max_single_position_pct": REGIME_PER_POSITION_PCT,
-            }
+            return {"max_open_positions": new_slots}
         except Exception as e:
             logger.warning(f"[Coordinator] apply_regime_slots failed: {e}")
             return None

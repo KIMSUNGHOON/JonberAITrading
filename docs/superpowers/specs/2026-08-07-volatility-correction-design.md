@@ -286,13 +286,23 @@ FROM exposure_shadow ORDER BY created_at DESC LIMIT 1;
 **예상**: `ramped 0.3078 × m_vol 0.50 = 목표 15.39%` (현재 보유 15.78%).
 사실상 동결 — 신규 매수는 막히고 기존 포지션은 유지된다. **2년 최고 변동성 국면에서 의도한 동작이다.**
 
-### 슬롯 노브 — 월요일에 움직이는 것은 하나뿐
+### 슬롯 노브 — 월요일에 움직이는 것은 없다
 
 `max_open_positions`는 **7 유지가 정상이다.** `slots_for_target`은 상향만
 하고 하향은 하지 않는데(§6 참고), 목표 0.1538 → `ceil(0.1538/0.05)=4`
 → `max(current_max, 4)`이고 `current_max`는 이미 7이므로 결과도 7이다.
-월요일에 실제로 움직이는 노브는 **`max_single_position_pct` 0.03→0.05
-하나뿐이다.**
+
+⚠️ **2026-08-08 정정**: 이 절은 원래 "월요일에 실제로 움직이는 노브는
+`max_single_position_pct` 0.03→0.05 하나뿐"이라고 서술했다. **틀렸다.**
+`apply_regime_slots`가 `max_single_position_pct`를 대입하던 줄을
+제거했다(`fix/per-position-knob-ownership`) — 그 필드의 소유권이 전략
+패널로 넘어갔기 때문이다(상세는
+`2026-08-07-regime-aware-exposure-design.md`의 정정 참고). 이 대입은
+애초에 불필요했다: `slots_for_target`은 `REGIME_PER_POSITION_PCT`를
+슬롯 계산의 **제수**로만 기본 인자로 직접 받고, `risk_params`를 읽지
+않는다. 결과적으로 **월요일에 이 채널이 움직이는 노브는 하나도 없다** —
+슬롯은 7 유지, 종목당 상한은 전략 패널이 EOD 합의로 정한 값 그대로다
+(현재 라이브 0.03).
 
 ## 8. 남는 위험
 
