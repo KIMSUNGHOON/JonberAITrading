@@ -82,8 +82,14 @@ from typing import Any, Optional, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from services.trading.cost_model import compute_fill_cost  # noqa: E402
-from services.trading.eod_snapshot import (  # noqa: E402
-    _BACKFILL_STK_CD_SENTINEL as SENTINEL_STK_CD,
+
+# 센티널은 **원본**에서 가져온다. `eod_snapshot._BACKFILL_STK_CD_SENTINEL`과
+# `eod_review._BACKFILL_STK_CD_SENTINEL`은 둘 다 자기 주석에 "이 스크립트의
+# 상수를 미러한 것"이라고 적고 있다(그쪽은 services/ -> scripts/ 임포트를
+# 피하려고 일부러 복제했다). 형제 스크립트끼리는 그 제약이 없으므로 미러가
+# 아니라 원본을 임포트해 같은 "ALL"이 네 번째로 늘어나는 것을 막는다.
+from scripts.backfill_realized_pnl import (  # noqa: E402
+    BACKFILL_STK_CD_SENTINEL as SENTINEL_STK_CD,
 )
 
 # -------------------------------------------
@@ -279,6 +285,18 @@ def compute_cost_backfill_plan(
 # -------------------------------------------
 
 
+def _is_missing_table_error(e: sqlite3.OperationalError) -> bool:
+    """`no such table: ...`인가? (`database is locked`와 구별하기 위한 판별)
+
+    sqlite3는 두 경우에 같은 `OperationalError`를 던진다. 하나는 **구조적**
+    부재(재실행해도 그대로)이고 다른 하나는 **일시적** 경합(라이브 앱이
+    storage.db를 물고 있어 busy_timeout을 초과)이다. 둘을 같이 삼키면
+    후자에서 원장만 net으로 커밋되고 결정은 gross로 남는데, 멱등 가드가
+    재시도를 영구히 막아버린다.
+    """
+    return "no such table" in str(e).lower()
+
+
 def _ensure_cost_columns(conn: sqlite3.Connection) -> None:
     """비용 컬럼 4개를 없으면 추가한다(storage_service._ensure_columns의
     스크립트 측 거울). 쓰기 경로에서만 호출된다 -- dry-run은 스키마를
@@ -305,6 +323,7 @@ def apply_cost_backfill(db_path: str, plan: CostBackfillPlan) -> None:
         return
 
     conn = _connect(db_path)
+    committed = False
     try:
         _ensure_cost_columns(conn)
 
@@ -327,14 +346,30 @@ def apply_cost_backfill(db_path: str, plan: CostBackfillPlan) -> None:
                     (net, decision_id),
                 )
             except sqlite3.OperationalError as e:
-                # agent_chat_decisions가 없는 DB(테스트 픽스처/신규 파일)
-                # 에서도 원장 백필은 완결돼야 한다.
-                print(f"  [WARN] 결정 백필 스킵 ({decision_id}): {e}")
+                if not _is_missing_table_error(e):
+                    # `database is locked` 등 **일시적** 실패. 여기서 삼키고
+                    # 커밋하면 원장 행은 net으로 마킹되는데 결정은 gross로
+                    # 남고, 재실행하면 후보가 0이라 멱등 가드가 영구히
+                    # 재시도를 막는다("백필 완료"라고 출력하면서). 커밋 없이
+                    # 전체를 실패시켜 재실행 가능한 상태를 유지한다.
+                    raise
+                # agent_chat_decisions 테이블 자체가 없는 DB(신규 파일/축소
+                # 픽스처)는 구조적 부재이지 일시적 실패가 아니다 -- 재실행이
+                # 고쳐줄 것이 없으므로 원장 백필만 완결하고 넘어간다.
+                print(f"  [WARN] 결정 백필 스킵 (테이블 없음): {e}")
                 break
             plan.updated_decisions += cur.rowcount
 
         conn.commit()
+        committed = True
     finally:
+        if not committed:
+            # 부분 적용 금지 -- 커밋에 도달하지 못했으면 원장 UPDATE도
+            # 되돌린다(close()가 알아서 롤백하지만 의도를 명시한다).
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
         conn.close()
 
 
@@ -410,7 +445,18 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parse_args(argv)
-    run_backfill(db_path=args.db_path, apply=args.apply)
+    try:
+        run_backfill(db_path=args.db_path, apply=args.apply)
+    except sqlite3.Error as e:
+        # 대표 사례: 라이브 앱이 storage.db를 물고 있어 `database is locked`.
+        # 아무것도 커밋되지 않았으므로 원인을 해소한 뒤 그대로 재실행하면
+        # 후보가 다시 잡힌다 -- 0을 돌려주면 호출자가 "완료"로 오해한다.
+        print(f"\nFAIL: 백필이 중단됐습니다 -- 아무것도 커밋되지 않았습니다: {e}")
+        print(
+            "      원인 해소 후(예: 라이브 앱 정지) 그대로 재실행하십시오 "
+            "-- 후보는 그대로 남아 있습니다."
+        )
+        return 1
     return 0
 
 

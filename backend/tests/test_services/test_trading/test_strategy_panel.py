@@ -33,7 +33,10 @@ async def _seed_eod_review(storage, trade_date=_TRADE_DATE, report=None):
                       "win_trades": 1, "loss_trades": 2,
                       "realized_pnl": -100_000, "cumulative_return_pct": -0.02,
                       "exposure": 0.4, "concentration": 0.5},
-        "per_stock": [{"stk_cd": "005930", "realized_amount": -80_000,
+        # 2026-08-08: build_eod_review가 실제로 내는 키와 맞춘다
+        # (realized_amount -> net_realized_amount + cost_adjusted).
+        "per_stock": [{"stk_cd": "005930", "net_realized_amount": -80_000,
+                       "cost_adjusted": True,
                        "entry_decision_id": "d1", "thesis_valid": False}],
         "agents": [{"agent_type": "sentiment", "accuracy": 0.33, "decisions_scored": 3}],
         "regime": {"regime_snapshot_id": "r1", "label": "risk_off", "breadth_ratio": -0.2},

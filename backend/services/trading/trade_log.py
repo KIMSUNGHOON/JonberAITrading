@@ -170,9 +170,9 @@ def _compute_realized_costs(
     미상으로 두고(net=gross, cost_source='model_unavailable') 원장 기록은
     계속한다. 비용 산정 실패로 거래 기록 자체를 잃는 쪽이 더 나쁘다.
     """
-    from services.trading.cost_model import compute_fill_cost
-
     try:
+        from services.trading.cost_model import compute_fill_cost
+
         entry_fee, _ = compute_fill_cost("buy", entry_price, quantity)
         exit_fee, exit_tax = compute_fill_cost("sell", exit_price, quantity)
     except Exception as e:
@@ -217,15 +217,18 @@ async def record_kr_realized_pnl_async(
     """
     from services.storage_service import get_storage_service
 
-    fee, tax, net_amount, cost_source = _compute_realized_costs(
-        entry_price=entry_price,
-        exit_price=exit_price,
-        quantity=quantity,
-        realized_amount=realized_amount,
-        stk_cd=stk_cd,
-    )
-
     try:
+        # never-raise 계약 안쪽에서 산정한다 — `_compute_realized_costs`는
+        # 자체 가드로 비용 실패 시 net=gross로 물러나지만, 그 가드가 못 잡는
+        # 종류의 실패(예: 인자 자체가 산술 불가)까지 이 계약 밖으로 새어
+        # 나가면 안 된다. 밖에 둘 이득이 없다.
+        fee, tax, net_amount, cost_source = _compute_realized_costs(
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=quantity,
+            realized_amount=realized_amount,
+            stk_cd=stk_cd,
+        )
         storage = await get_storage_service()
         record: dict[str, Any] = {
             "id": str(uuid.uuid4()),

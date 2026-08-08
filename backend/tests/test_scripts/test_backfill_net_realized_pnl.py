@@ -12,10 +12,12 @@ import sqlite3
 
 import pytest
 
+import scripts.backfill_net_realized_pnl as bf
 from scripts.backfill_net_realized_pnl import (
     COST_SOURCE_BACKFILL,
     SENTINEL_STK_CD,
     compute_cost_backfill_plan,
+    main,
     read_all_rows,
     run_backfill,
 )
@@ -66,12 +68,15 @@ _SAMSUNG_TAX = 35_216
 _SAMSUNG_NET = -19_328.0
 
 
-def _make_db(tmp_path, rows, decisions=(), name="t.db") -> str:
+def _make_db(
+    tmp_path, rows, decisions=(), name="t.db", with_decisions_table=True
+) -> str:
     db_path = str(tmp_path / name)
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(_LEGACY_SCHEMA)
-        conn.execute(_DECISIONS_SCHEMA)
+        if with_decisions_table:
+            conn.execute(_DECISIONS_SCHEMA)
         for r in rows:
             cols = ", ".join(r.keys())
             marks = ", ".join("?" * len(r))
@@ -364,3 +369,124 @@ def test_read_all_rows_is_read_only_on_a_pre_alter_db(tmp_path):
         "PRAGMA table_info(kr_realized_pnl)"
     )}
     assert "net_amount" not in cols  # 읽기가 스키마를 바꾸지 않았다
+
+
+# -------------------------------------------
+# 6) 부분 실패 — lock은 삼키지 않는다 (리뷰 Important 3)
+# -------------------------------------------
+
+
+class _LockOnDecisionsConnection:
+    """결정 백필 UPDATE에서만 `database is locked`를 내는 프록시 커넥션.
+
+    라이브 앱이 storage.db를 물고 있을 때 `busy_timeout` 초과로 정확히 이
+    예외가 난다. 실제 파일 잠금으로는 **원장 UPDATE부터** 막히므로(SQLite
+    잠금은 DB 파일 단위) "원장은 성공했는데 결정에서 터진" 순간을 재현할
+    수 없다 — 그 지점을 겨냥해 주입한다.
+    """
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    def execute(self, sql, *args, **kwargs):
+        if "agent_chat_decisions" in sql:
+            raise sqlite3.OperationalError("database is locked")
+        return self._inner.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __setattr__(self, name, value):
+        # `read_all_rows`가 `conn.row_factory = sqlite3.Row`를 세팅한다 —
+        # 프록시에 붙이면 안쪽 커넥션이 튜플을 돌려줘 무관한 곳이 깨진다.
+        setattr(self._inner, name, value)
+
+
+def _install_decision_lock(monkeypatch):
+    real_connect = bf._connect
+    monkeypatch.setattr(
+        bf, "_connect", lambda p: _LockOnDecisionsConnection(real_connect(p))
+    )
+
+
+def test_lock_during_decision_backfill_commits_nothing(tmp_path, monkeypatch):
+    db = _make_db(
+        tmp_path,
+        [_SAMSUNG],
+        decisions=[
+            {"id": "dec-samsung", "ticker": "005930",
+             "outcome_realized_pnl": 22_008.0}
+        ],
+    )
+    _install_decision_lock(monkeypatch)
+
+    with pytest.raises(sqlite3.OperationalError):
+        run_backfill(db_path=db, apply=True)
+
+    # (a) 원장도 커밋되지 않았다 -- 부분 적용 금지.
+    row = _fetch(db)[0]
+    assert row["net_amount"] is None
+    assert row["cost_source"] is None
+    # 결정도 gross 그대로.
+    assert _fetch(db, "agent_chat_decisions")[0]["outcome_realized_pnl"] == 22_008.0
+
+
+def test_rerun_after_lock_failure_still_finds_the_candidates(
+    tmp_path, monkeypatch
+):
+    db = _make_db(
+        tmp_path,
+        [_SAMSUNG],
+        decisions=[
+            {"id": "dec-samsung", "ticker": "005930",
+             "outcome_realized_pnl": 22_008.0}
+        ],
+    )
+    _install_decision_lock(monkeypatch)
+    with pytest.raises(sqlite3.OperationalError):
+        run_backfill(db_path=db, apply=True)
+
+    # (b) lock이 풀린 뒤 그대로 재실행하면 후보가 다시 잡히고 완결된다 --
+    # 멱등 가드가 재시도를 영구히 막지 않는다.
+    monkeypatch.undo()
+    plan = run_backfill(db_path=db, apply=True)
+
+    assert len(plan.rows) == 1
+    assert plan.updated_rows == 1
+    assert plan.updated_decisions == 1
+    assert _fetch(db)[0]["net_amount"] == _SAMSUNG_NET
+    assert _fetch(db, "agent_chat_decisions")[0]["outcome_realized_pnl"] == _SAMSUNG_NET
+
+
+def test_lock_failure_exits_non_zero(tmp_path, monkeypatch):
+    db = _make_db(
+        tmp_path,
+        [_SAMSUNG],
+        decisions=[{"id": "dec-samsung", "ticker": "005930",
+                    "outcome_realized_pnl": 22_008.0}],
+    )
+    _install_decision_lock(monkeypatch)
+
+    # (c) 종료코드가 0이 아니다 -- "백필 완료"라고 보고하면 안 된다.
+    assert main(["--db-path", db, "--apply"]) == 1
+
+
+def test_success_exits_zero(tmp_path):
+    db = _make_db(tmp_path, [_SAMSUNG])
+
+    assert main(["--db-path", db, "--apply"]) == 0
+    assert _fetch(db)[0]["net_amount"] == _SAMSUNG_NET
+
+
+def test_missing_decisions_table_is_tolerated_and_ledger_still_commits(
+    tmp_path,
+):
+    """`no such table`은 구조적 부재라 재실행이 고쳐줄 것이 없다 -- lock과
+    달리 원장 백필만 완결하고 넘어간다."""
+    db = _make_db(tmp_path, [_SAMSUNG], with_decisions_table=False)
+
+    plan = run_backfill(db_path=db, apply=True)
+
+    assert plan.updated_rows == 1
+    assert plan.updated_decisions == 0
+    assert _fetch(db)[0]["net_amount"] == _SAMSUNG_NET

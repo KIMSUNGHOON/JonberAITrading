@@ -198,3 +198,160 @@ this branch  :   9 failed, 2441 passed, 21 errors
    수수료를 주면 갈아탈 수 있다.
 5. 🟢 `EOD_FLAT_THRESHOLD_KRW = 10000.0`은 미변경. 090430 결정이 백필 후
    13,461로 문턱을 여전히 넘으므로 라벨(`correct`)은 안 바뀐다.
+
+---
+
+# 라운드 2 — 리뷰 반영 (2026-08-08)
+
+리뷰 지적 6건 전부 반영. 회귀 0(base `609b9b9`와 실패 집합 동일).
+
+## Important 1 — 전략 패널 근거의 단위 불일치 (🔴)
+
+`eod_review._build_per_stock_section`이 gross를 담고 있었고, 그 리포트가
+`strategy_panel.py` → `json.dumps(context)`로 LLM 프롬프트에 통째로 실려
+다음날 노브 조정에 쓰인다. 이번 변경이 캘리브레이션만 net으로 옮기는 바람에
+패널이 보는 근거가 3종으로 갈렸다는 지적 — 타당하다.
+
+③과 **같은 NULL 폴백**을 적용했다(`net_amount`가 있으면 그것, 없으면
+`realized_amount`).
+
+### 키 이름: `realized_amount` → **`net_realized_amount`** (+ `cost_adjusted`)
+
+**바꿨다.** 근거:
+
+1. **소비처가 LLM 프롬프트라 키 이름이 곧 단위 라벨이다.** 이름을 그대로
+   두고 값만 net으로 바꾸면 "이름은 그대로인데 의미가 조용히 바뀐" 상태가
+   된다. 이 리포는 낡은 이름/주석 뒤에서 의미가 바뀌어 실제로 오판한
+   이력이 있다(리뷰 Important 2가 지적한 바로 그 실패 양식).
+2. **저장된 과거 `report_json` 행과 구분이 된다.** `eod_review`는
+   `trade_date` PK로 블롭을 누적하는 표다. 같은 키로 두면 gross 시대 행과
+   net 시대 행이 영구히 구분 불가가 된다.
+3. **깨지는 소비처가 없다.** `per_stock[].realized_amount`의 실소비처는
+   `strategy_panel`(프롬프트 직렬화)뿐이고, `trading.py:1094`의 수동 EOD
+   재생성은 이 섹션을 **키를 읽지 않고 통째로 보존**한다. 프런트엔드
+   참조 0건(`grep -rn "realized_amount" frontend/src` → 없음).
+
+**추가한 `cost_adjusted: bool`**: 폴백이 발동한 행(=`net_amount` NULL)에
+`net_realized_amount`라는 이름을 붙이면 그 행에 한해 이름이 거짓말이 된다.
+불리언 하나로 프롬프트 안에서 자기설명적으로 만들었다 — 패널리스트가
+"이 숫자는 비용 미반영"임을 알고 할인할 수 있다.
+
+테스트: `test_per_stock_reports_net_not_gross`(라이브 부호 반전 행이 net
+−19,328으로 나오고 옛 키가 사라졌는지) ·
+`test_per_stock_survives_json_dumps_for_the_llm_prompt`(실소비 경로).
+기존 `test_build_eod_review_assembles_all_sections`와
+`test_strategy_panel.py`의 픽스처도 새 키로 갱신.
+
+## Important 2 — `PaperFillSettings` 불변식 주석
+
+`app/config.py`의 DESIGN PRINCIPLE이 "소비처는 **정확히 둘**이고 둘 다 그
+출력이 어떤 P&L 산술에도 읽히지 않아 안전하다"고 못 박고 있었는데, 이번
+변경이 **세 번째 소비처**를 추가했고 그 출력은 실제로 읽힌다. 지적대로
+코드가 아니라 주석을 고쳤다:
+
+- "THREE consumers (2026-08-08: was two — the third one's output IS read by
+  arithmetic)"로 정정하고 세 번째 소비처와 그 하류 경로(승패 카운트 → 결정
+  백필 → 정오답 라벨 → 에이전트 정확도 → 전략 재가중, + 패널 근거)를 명시.
+- **왜 이중계상이 아닌가**: 빼는 대상인 `kr_realized_pnl.realized_amount`는
+  `coordinator._apply_sell_fill`이 계산한 `(exit−entry)×qty` 순수 gross로
+  **브로커 수치가 아니고 비용이 한 번도 빠진 적이 없다.** 따라서 비용은
+  정확히 한 번만 빠진다. 그리고 결과가 포지션/자산/avg_price 산술이나
+  `paper_performance`로 **되돌아가지 않는다** — 그쪽은 여전히 브로커 원장
+  그대로다.
+- 새 경계선도 남겼다: "포지션/자산 계산이 `kr_realized_pnl.net_amount`를
+  읽거나, ka10074/kt00004 같은 브로커 수치에서 비용을 빼면 그때는 진짜
+  위반 — 여기부터 확인하라."
+
+## Important 3 — 백필 부분 실패가 재실행으로 복구되지 않던 것 (🔴)
+
+지적이 정확했다. `except sqlite3.OperationalError: … break`가 `no such
+table`과 `database is locked`를 같이 삼켰고, `break` 직후 `conn.commit()`이
+돌아 **원장만 net으로 마킹 → 결정은 gross → 재실행하면 후보 0 → 멱등 가드가
+영구히 재시도를 차단 → 그런데 "백필 완료", 종료코드 0**이었다.
+
+- `_is_missing_table_error()`로 둘을 분리. `no such table`(구조적 부재,
+  재실행이 고칠 것 없음)만 `break`.
+- 그 외 `OperationalError`(lock 등 일시적 실패)는 **re-raise** → `commit()`에
+  도달하지 못하고, `finally`가 명시적으로 `rollback()`.
+- `main()`이 `sqlite3.Error`를 잡아 **종료코드 1** + "아무것도 커밋되지
+  않았습니다 / 원인 해소 후 그대로 재실행하십시오" 안내를 출력.
+
+테스트 4건 추가(프록시 커넥션으로 결정 UPDATE에만 lock 주입 — 실제 파일
+잠금은 DB 파일 단위라 원장 UPDATE부터 막혀서 이 순간을 재현할 수 없다):
+`test_lock_during_decision_backfill_commits_nothing`(원장·결정 둘 다 미커밋) ·
+`test_rerun_after_lock_failure_still_finds_the_candidates`(재실행이 후보를
+다시 잡고 완결) · `test_lock_failure_exits_non_zero` ·
+`test_success_exits_zero`. 추가로
+`test_missing_decisions_table_is_tolerated_and_ledger_still_commits`로
+`no such table` 관용 경로를 고정.
+
+## never-raise — `_compute_realized_costs` 호출을 try 안으로
+
+이동 완료. `from ... import compute_fill_cost`도 헬퍼의 내부 try 안으로
+넣어, 임포트 실패마저 원장 행을 잃지 않고 `model_unavailable`로 물러나게
+했다.
+
+## Minor 4 — 폴백의 식별 속성 고정
+
+`test_cost_model_failure_does_not_lose_the_ledger_row`에 `cost_source ==
+"model_unavailable"` · `net_amount == gross` · `fee == 0` · `tax == 0` 단언
+추가. 결정 백필까지 확인하는
+`test_cost_model_failure_backfills_decision_with_gross_not_zero`도 추가 —
+비용 미상을 "손익 0"으로 학습시키면 안 된다.
+
+## Minor 5 — 센티널을 원본에서 임포트
+
+`scripts.backfill_realized_pnl.BACKFILL_STK_CD_SENTINEL`(원본)에서 임포트하도록
+변경. 지적대로 순환 회피 논거는 `storage_service`에만 해당하고 형제
+스크립트에는 적용되지 않는다. 부수 효과로 임포트가 오히려 가벼워졌다
+(`services.trading.eod_snapshot`은 `services.trading.__init__` →
+`coordinator`를 끌어온다). 런타임 확인: `SENTINEL_STK_CD == 'ALL'`.
+
+---
+
+## 라운드 2 RED 확인
+
+| 되돌린 것 | 실패한 테스트 |
+|-----------|---------------|
+| Important 1 — `eod_review`를 다시 gross로 | **1건**: `test_per_stock_reports_net_not_gross` (22008.0 ≠ −19328.0) |
+| Important 3 — lock/`no such table` 판별 제거(다시 같이 삼킴) | **3건**: `test_lock_during_decision_backfill_commits_nothing` (DID NOT RAISE) · `test_rerun_after_lock_failure_still_finds_the_candidates` (DID NOT RAISE) · `test_lock_failure_exits_non_zero` (**assert 0 == 1** ← 정확히 리뷰가 지적한 "완료라고 보고" 증상) |
+| Minor 4 — 폴백이 `net=0`을 반환하도록 훼손 | **2건**: `test_cost_model_failure_does_not_lose_the_ledger_row` ("비용 미상이면 net == gross") · `test_cost_model_failure_backfills_decision_with_gross_not_zero` (0.0 ≠ 22008.0) |
+
+## 라운드 2 회귀
+
+```
+base 609b9b9 :   9 failed, 2420 passed, 21 errors   (tests/test_services + tests/test_scripts)
+라운드 1     :   9 failed, 2441 passed, 21 errors
+라운드 2     :   9 failed, 2449 passed, 21 errors
+```
+
+실패/에러 **집합이 base와 완전히 동일**(라운드 1 보고서의 목록 그대로).
+신규 통과 누계 +29.
+
+참고로 `tests/test_api/`까지 넓히면 `test_health.py::TestRootEndpoint::
+test_root_returns_api_info` 1건이 더 실패하는데, base 워크트리에서 그
+파일만 돌려 **동일하게 실패함을 확인**했다(루트 엔드포인트 응답 형태,
+이 태스크와 무관).
+
+## 라운드 2 라이브 DB 복사본 재검증
+
+실 DB 미변경. 복사본 대상 `--apply` 재실행 결과 라운드 1과 동일:
+원장 25행 / 결정 5행 갱신, 종료코드 0, 2회차 후보 0.
+
+## 라운드 2 우려사항
+
+1. 🟡 **`eod_review` 키 변경은 저장된 과거 `report_json`을 바꾸지 않는다.**
+   과거 행은 `realized_amount`(gross), 새 행은 `net_realized_amount`(net)를
+   갖는다. 이건 의도한 것(구분 가능성)이지만, 과거 리포트를 표시하는
+   소비처가 나중에 생기면 두 키를 다 볼 줄 알아야 한다. 현재 그런 소비처는
+   없다.
+2. 🟡 **lock 실패 테스트는 프록시 주입이다.** 실제 `database is locked`를
+   결정 UPDATE 지점에서만 발생시키는 것은 SQLite 잠금 단위(DB 파일) 때문에
+   불가능하다. 주입 지점은 실제 코드 경로(`bf._connect`)이므로 로직은
+   진짜로 검증되지만, "실제 lock이 정확히 이 문자열을 낸다"는 전제는
+   sqlite3 구현에 의존한다(`_is_missing_table_error`가 `no such table`
+   부분문자열만 보므로, lock 메시지가 어떻게 바뀌든 안전 방향(fail)으로
+   떨어진다).
+3. 🟡 **배포 순서는 라운드 1과 동일** — 앱 재기동 → `--apply`, 실행 전
+   `storage.db` 백업 권장. 이번 라운드로 **부분 적용 위험이 제거**돼
+   재실행이 안전해졌다.

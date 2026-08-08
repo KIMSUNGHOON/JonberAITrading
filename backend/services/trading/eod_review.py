@@ -132,8 +132,8 @@ async def build_eod_review(
     Returns:
         {"trade_date", "portfolio": {equity, realized_pnl, net_pnl,
         win_trades, loss_trades, cumulative_return_pct, exposure,
-        concentration}, "per_stock": [{stk_cd, realized_amount,
-        entry_decision_id, thesis_valid}], "agents": [{agent_type,
+        concentration}, "per_stock": [{stk_cd, net_realized_amount,
+        cost_adjusted, entry_decision_id, thesis_valid}], "agents": [{agent_type,
         accuracy, decisions_scored}], "regime": {regime_snapshot_id, label,
         breadth_ratio}}. Failure-harmless: missing individual sources
         degrade to None/0/[]; on a totally unexpected failure returns
@@ -227,10 +227,30 @@ async def _build_per_stock_section(
         # missing/unlabeled decision (outcome_label is None) counts as
         # valid rather than penalizing a match we simply couldn't find.
         outcome_label = decision.get("outcome_label") if decision else None
+
+        # 비용 반영 (2026-08-08): 이 섹션은 strategy_panel.py가 json.dumps로
+        # LLM 프롬프트에 통째로 실어 보내는 근거다 — 같은 프롬프트 안의
+        # perf_history.win/loss_trades와 calibration.accuracy가 앱 모델
+        # net(왕복 0.27%)으로 옮겨갔으므로, 여기만 gross로 남으면 패널이
+        # 서로 다른 단위의 숫자를 나란히 놓고 노브를 조정하게 된다.
+        # eod_snapshot._count_win_loss_trades와 **같은 NULL 폴백**을 쓴다.
+        #
+        # 키 이름을 `realized_amount` -> `net_realized_amount`로 바꾼 이유:
+        # 소비처가 LLM 프롬프트라 키 이름이 곧 단위 라벨이다. 이름을 그대로
+        # 두고 값만 net으로 바꾸면 "이름은 그대로인데 의미가 조용히 바뀐"
+        # 상태가 되고, 저장된 과거 report_json 행(gross)과 새 행(net)이
+        # 같은 키로 구분 불가가 된다. `cost_adjusted`는 폴백이 실제로
+        # 발동한 행(net_amount NULL — 비용 모델이 실패했거나 백필 이전 행)을
+        # 프롬프트 안에서 자기설명적으로 만든다.
+        net_amount = r.get("net_amount")
+        cost_adjusted = net_amount is not None
         per_stock.append(
             {
                 "stk_cd": r.get("stk_cd"),
-                "realized_amount": r.get("realized_amount"),
+                "net_realized_amount": (
+                    net_amount if cost_adjusted else r.get("realized_amount")
+                ),
+                "cost_adjusted": cost_adjusted,
                 "entry_decision_id": entry_decision_id,
                 "thesis_valid": outcome_label != "incorrect",
             }

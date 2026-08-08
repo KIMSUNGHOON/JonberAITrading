@@ -275,7 +275,12 @@ async def test_cost_model_failure_does_not_lose_the_ledger_row(
 ):
     """`compute_fill_cost`는 `get_paper_fill_settings()`를 호출한다 —
     설정 구성이 터져도 (a) 예외가 호출자의 매도 경로로 전파되지 않고
-    (b) 원장 행 자체를 잃지 않아야 한다(비용만 미상으로 남는다)."""
+    (b) 원장 행 자체를 잃지 않아야 한다(비용만 미상으로 남는다).
+
+    폴백의 **식별 속성**까지 고정한다: 비용을 모르면 net은 gross와 같아야
+    하고(0이나 임의값이 아니라) `cost_source`가 그 사실을 스스로 밝혀야
+    한다. 이게 없으면 폴백이 net=0을 반환하도록 망가져도 통과한다.
+    """
     import services.trading.cost_model as cost_model
 
     def _boom(*_a, **_kw):
@@ -287,7 +292,41 @@ async def test_cost_model_failure_does_not_lose_the_ledger_row(
 
     rows = await isolated_storage_service.get_kr_realized_pnl(stk_cd="005930")
     assert len(rows) == 1, "비용 계산 실패가 원장 행을 통째로 삼켰다"
-    assert rows[0]["realized_amount"] == _SAMSUNG_GROSS
+    row = rows[0]
+    assert row["realized_amount"] == _SAMSUNG_GROSS
+    assert row["cost_source"] == "model_unavailable"
+    assert row["net_amount"] == _SAMSUNG_GROSS, "비용 미상이면 net == gross"
+    assert row["fee"] == 0
+    assert row["tax"] == 0
+
+
+async def test_cost_model_failure_backfills_decision_with_gross_not_zero(
+    isolated_storage_service, monkeypatch
+):
+    """폴백 경로에서도 결정 백필은 `net_amount`(= gross)를 받는다 —
+    비용 미상을 "손익 0"으로 학습시키면 안 된다."""
+    import services.trading.cost_model as cost_model
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("settings boom")
+
+    monkeypatch.setattr(cost_model, "compute_fill_cost", _boom)
+
+    seen: list = []
+
+    async def _spy(decision_id, amount):
+        seen.append((decision_id, amount))
+        return True
+
+    monkeypatch.setattr(
+        isolated_storage_service, "update_decision_outcome", _spy
+    )
+
+    await trade_log.record_kr_realized_pnl_async(
+        **_samsung_kwargs(entry_decision_id="dec-1")
+    )
+
+    assert seen == [("dec-1", _SAMSUNG_GROSS)]
 
 
 async def test_storage_failure_still_never_raises(monkeypatch):
