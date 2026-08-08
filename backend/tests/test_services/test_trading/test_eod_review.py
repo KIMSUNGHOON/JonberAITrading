@@ -238,10 +238,16 @@ async def test_build_eod_review_assembles_all_sections(tmp_path):
     per_stock = report["per_stock"]
     assert len(per_stock) == 2
     by_stk = {row["stk_cd"]: row for row in per_stock}
-    assert by_stk["005930"]["realized_amount"] == 20000.0
+    # 2026-08-08: 키가 `realized_amount` -> `net_realized_amount`로 바뀌었다
+    # (이 섹션은 strategy_panel이 LLM 프롬프트에 직렬화하는 근거라 키 이름이
+    # 곧 단위 라벨이다). 이 픽스처 행들은 net_amount가 없는 레거시 형태라
+    # gross로 폴백되고, `cost_adjusted`가 그 사실을 프롬프트 안에서 밝힌다.
+    assert by_stk["005930"]["net_realized_amount"] == 20000.0
+    assert by_stk["005930"]["cost_adjusted"] is False
     assert by_stk["005930"]["entry_decision_id"] == win_decision_id
     assert by_stk["005930"]["thesis_valid"] is True
-    assert by_stk["000660"]["realized_amount"] == -25000.0
+    assert by_stk["000660"]["net_realized_amount"] == -25000.0
+    assert by_stk["000660"]["cost_adjusted"] is False
     assert by_stk["000660"]["entry_decision_id"] == loss_decision_id
     assert by_stk["000660"]["thesis_valid"] is False
 
@@ -358,3 +364,85 @@ async def test_build_eod_review_excludes_backfill_all_sentinel_from_per_stock(tm
     stk_cds = {row["stk_cd"] for row in per_stock}
     assert _BACKFILL_STK_CD_SENTINEL not in stk_cds
     assert stk_cds == {"005930", "000660"}
+
+
+async def test_per_stock_reports_net_not_gross(tmp_path):
+    """리뷰 Important 1: 이 섹션은 strategy_panel.py가 json.dumps로 LLM
+    프롬프트에 통째로 실어 보내는 근거다. 같은 프롬프트의
+    perf_history.win/loss_trades와 calibration.accuracy가 앱 모델 net으로
+    옮겨갔으므로 여기만 gross로 남으면 패널이 서로 다른 단위의 숫자를
+    나란히 놓고 노브를 조정하게 된다.
+    """
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    trade_date = "2026-07-22"
+
+    # 라이브 실측 행: gross는 양수인데 net은 음수다.
+    await storage.save_kr_realized_pnl(
+        {
+            "id": str(uuid.uuid4()),
+            "stk_cd": "005930",
+            "entry_price": 273_027.0,
+            "exit_price": 273_420.0,
+            "quantity": 56,
+            "realized_amount": 22_008.0,
+            "fee": 6_120,
+            "tax": 35_216,
+            "net_amount": -19_328.0,
+            "cost_source": "model",
+            "created_at": f"{trade_date} 09:02:08",
+        }
+    )
+    # net_amount가 없는 레거시 행 -> gross로 폴백하되 그 사실을 밝힌다.
+    await storage.save_kr_realized_pnl(
+        {
+            "id": str(uuid.uuid4()),
+            "stk_cd": "000660",
+            "entry_price": 100_000,
+            "exit_price": 95_000,
+            "quantity": 5,
+            "realized_amount": -25_000.0,
+            "created_at": f"{trade_date} 11:00:00",
+        }
+    )
+
+    report = await build_eod_review(
+        storage, _StubCoordinator({}), trade_date, None
+    )
+    by_stk = {r["stk_cd"]: r for r in report["per_stock"]}
+
+    assert by_stk["005930"]["net_realized_amount"] == -19_328.0
+    assert by_stk["005930"]["cost_adjusted"] is True
+    # gross(+22,008)가 프롬프트로 새어 나가면 패널은 이 거래를 승리로 읽는다.
+    assert by_stk["005930"]["net_realized_amount"] < 0
+    assert "realized_amount" not in by_stk["005930"]
+
+    assert by_stk["000660"]["net_realized_amount"] == -25_000.0
+    assert by_stk["000660"]["cost_adjusted"] is False
+
+
+async def test_per_stock_survives_json_dumps_for_the_llm_prompt(tmp_path):
+    """strategy_panel.run_strategy_panel이 context 전체를 json.dumps한다 —
+    새 키가 직렬화 가능해야 한다(그 경로가 이 섹션의 유일한 실소비처다)."""
+    storage = StorageService(db_path=str(tmp_path / "t.db"))
+    trade_date = "2026-07-22"
+    await storage.save_kr_realized_pnl(
+        {
+            "id": str(uuid.uuid4()),
+            "stk_cd": "005930",
+            "entry_price": 273_027.0,
+            "exit_price": 273_420.0,
+            "quantity": 56,
+            "realized_amount": 22_008.0,
+            "net_amount": -19_328.0,
+            "cost_source": "model",
+            "created_at": f"{trade_date} 09:02:08",
+        }
+    )
+
+    report = await build_eod_review(
+        storage, _StubCoordinator({}), trade_date, None
+    )
+    blob = json.dumps(report, ensure_ascii=False, default=str)
+
+    assert "net_realized_amount" in blob
+    assert "cost_adjusted" in blob

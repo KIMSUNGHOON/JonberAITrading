@@ -63,6 +63,12 @@ def _decision_label(outcome_realized_pnl: float, flat_threshold: float) -> str:
     Outcomes are backfilled by Phase 1 onto the ENTRY decision only, so this
     is always judged on an entry (BUY/ADD) basis even though the row that
     triggered the backfill was the matching exit.
+
+    입력이 이제 net이므로(2026-08-08: 수수료 + 매도 증권거래세를 뺀 값이
+    `outcome_realized_pnl`로 백필된다 — trade_log.record_kr_realized_pnl_async)
+    이 문턱(EOD_FLAT_THRESHOLD_KRW)에 남은 역할은 "너무 작아서 신호가
+    아니다" 하나뿐이다. 비용이 아니라 **잡음 대역**이며, 여기에 비용을 또
+    얹으면 이중 계상이다.
     """
     if abs(outcome_realized_pnl) < flat_threshold:
         return "flat"

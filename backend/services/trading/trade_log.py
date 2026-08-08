@@ -147,6 +147,44 @@ async def wait_for_pending_trade_fill_writes() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _compute_realized_costs(
+    *,
+    entry_price: float,
+    exit_price: float,
+    quantity: int,
+    realized_amount: float,
+    stk_cd: str,
+) -> tuple[int, int, float, str]:
+    """(fee, tax, net_amount, cost_source) — 왕복 거래비용을 gross에서 뺀다.
+
+    fee = 매수 수수료 + 매도 수수료, tax = 매도 증권거래세.
+    `compute_fill_cost`는 price/quantity가 0 이하이면 (0, 0)을 돌려주므로
+    그때 net은 gross와 같아진다 — 의도된 동작이다(계좌 백필 집계처럼
+    단가/수량이 없는 행에 가짜 비용을 만들어내지 않는다).
+
+    never-raise: 호출자(`record_kr_realized_pnl_async`)의 계약은 "기록
+    실패가 매도 경로를 절대 깨지 않는다"이고, 그 계약은 원장 행을 잃지
+    않는 것까지 포함한다. `compute_fill_cost` 자체는 순수 함수지만
+    `get_paper_fill_settings()`(pydantic BaseSettings 구성 — 환경변수가
+    깨져 있으면 ValidationError)를 호출하므로, 여기서 터지면 비용만
+    미상으로 두고(net=gross, cost_source='model_unavailable') 원장 기록은
+    계속한다. 비용 산정 실패로 거래 기록 자체를 잃는 쪽이 더 나쁘다.
+    """
+    try:
+        from services.trading.cost_model import compute_fill_cost
+
+        entry_fee, _ = compute_fill_cost("buy", entry_price, quantity)
+        exit_fee, exit_tax = compute_fill_cost("sell", exit_price, quantity)
+    except Exception as e:
+        logger.warning(
+            "kr_realized_pnl_cost_model_failed", stk_cd=stk_cd, error=str(e)
+        )
+        return (0, 0, float(realized_amount), "model_unavailable")
+
+    fee = entry_fee + exit_fee
+    return (fee, exit_tax, float(realized_amount) - fee - exit_tax, "model")
+
+
 async def record_kr_realized_pnl_async(
     *,
     stk_cd: str,
@@ -168,10 +206,29 @@ async def record_kr_realized_pnl_async(
     (Phase1 Task 4/C3a: the single write path `coordinator._apply_sell_fill`
     funnels through, called via the fire-and-forget `record_kr_realized_pnl`
     below since `_apply_sell_fill` is sync and cannot await this directly.)
+
+    거래비용 (2026-08-08): 이 함수는 원장 기록과 결정 outcome 백필을 둘 다
+    하는 유일한 초크포인트다. `realized_amount`는 (exit-entry)*qty 순수
+    gross이고 여기에는 수수료도 증권거래세도 없었다 — 그 gross가 그대로
+    `outcome_realized_pnl`로 백필돼 calibration의 정오답 채점 → 전략
+    재가중으로 흘러가, 비용을 못 넘긴 거래가 "승리"로 학습됐다. 이제
+    `compute_fill_cost` 모델로 왕복 비용을 빼 net을 함께 적고, **결정
+    백필은 net으로** 한다. gross는 원장에 그대로 남는다(두 단위 병존).
     """
     from services.storage_service import get_storage_service
 
     try:
+        # never-raise 계약 안쪽에서 산정한다 — `_compute_realized_costs`는
+        # 자체 가드로 비용 실패 시 net=gross로 물러나지만, 그 가드가 못 잡는
+        # 종류의 실패(예: 인자 자체가 산술 불가)까지 이 계약 밖으로 새어
+        # 나가면 안 된다. 밖에 둘 이득이 없다.
+        fee, tax, net_amount, cost_source = _compute_realized_costs(
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=quantity,
+            realized_amount=realized_amount,
+            stk_cd=stk_cd,
+        )
         storage = await get_storage_service()
         record: dict[str, Any] = {
             "id": str(uuid.uuid4()),
@@ -185,11 +242,15 @@ async def record_kr_realized_pnl_async(
             "entry_at": entry_at,
             "exit_at": exit_at,
             "holding_period_seconds": holding_period_seconds,
+            "fee": fee,
+            "tax": tax,
+            "net_amount": net_amount,
+            "cost_source": cost_source,
         }
         await storage.save_kr_realized_pnl(record)
         if entry_decision_id:
             outcome_updated = await storage.update_decision_outcome(
-                entry_decision_id, realized_amount
+                entry_decision_id, net_amount
             )
             if not outcome_updated:
                 # L4: update_decision_outcome already logged the storage-side
@@ -203,6 +264,7 @@ async def record_kr_realized_pnl_async(
                     "kr_realized_pnl_decision_outcome_backfill_missed",
                     entry_decision_id=entry_decision_id,
                     realized_amount=realized_amount,
+                    net_amount=net_amount,
                 )
     except Exception as e:
         logger.warning(

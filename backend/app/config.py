@@ -297,8 +297,9 @@ class PaperFillSettings(BaseSettings):
       `fill_confirm`, coordinator avg_price, `paper_performance`) — that
       would double-count and desync the app from the broker's own numbers.
 
-      There are exactly two consumers, and both are safe for the same
-      reason — neither one's output is read by any P&L arithmetic:
+      There are THREE consumers (2026-08-08: was two — the third one's
+      output IS read by arithmetic, see below for why that is still not a
+      double-count):
       - `services/trading/fill_costs.py`: KR display-layer cost helper,
         shows a realistic "what would I actually keep if I exited now"
         number without touching the ledger.
@@ -313,6 +314,32 @@ class PaperFillSettings(BaseSettings):
         into the API response model. If a future change makes any P&L
         calculation read `kr_stock_trades.fee`/`.tax`, this principle is
         violated again — check here first.
+      - `services/trading/trade_log.py::_compute_realized_costs` (순
+        실현손익, 2026-08-08): the SAME `compute_fill_cost` applied to a
+        matched entry/exit pair, written to `kr_realized_pnl.fee`/`.tax`/
+        `.net_amount` AND — unlike the two above — actually READ downstream:
+        `eod_snapshot._count_win_loss_trades` (승패 카운트),
+        `agent_chat_decisions.outcome_realized_pnl` (결정 백필) ->
+        `calibration._decision_label` (정오답 라벨) -> 에이전트 정확도 ->
+        전략 재가중, and `eod_review._build_per_stock_section`
+        (`net_realized_amount`, LLM 패널 근거).
+
+        WHY THIS IS NOT THE DOUBLE-COUNT THE PRINCIPLE FORBIDS: the input
+        it subtracts from, `kr_realized_pnl.realized_amount`, is
+        `(exit_price - entry_price) * qty` computed by the app itself in
+        `coordinator._apply_sell_fill` — pure gross, from which no cost has
+        EVER been deducted (it is not a broker figure). So this subtracts
+        cost exactly once, from a number that had none. Crucially, the
+        result never flows BACK into position/equity/avg_price arithmetic
+        or into `paper_performance` — those still come from the broker
+        ledger untouched. What it feeds is the LEARNING signal, which must
+        be cost-aware or the system learns that cost-losing trades are
+        wins. `kr_realized_pnl.realized_amount` (gross) is deliberately
+        preserved alongside `net_amount` so the two units never collapse
+        into one. If a future change makes any POSITION or EQUITY
+        calculation read `kr_realized_pnl.net_amount` — or subtracts cost
+        from a broker-sourced figure such as ka10074/kt00004 — the
+        principle IS violated; check here first.
 
     Rates deliberately err high rather than trying to be exact (real rates
     vary by year/broker/rebate tier and are not this app's concern) — the

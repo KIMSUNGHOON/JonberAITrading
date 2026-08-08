@@ -274,8 +274,13 @@ async def test_record_kr_realized_pnl_async_backfills_decision_outcome(
         **_kwargs(entry_decision_id=did, realized_amount=5555.0)
     )
 
+    # 2026-08-08: 백필되는 값은 gross가 아니라 net이다. _kwargs 기준
+    # (entry 70,000 / exit 72,000 / qty 10) -> 매수수수료 140 + 매도수수료
+    # 144 + 거래세 1,656 = 1,940 -> net 5,555 - 1,940 = 3,615.
+    expected_net = 5555.0 - (140 + 144) - 1_656
     got = await temp_storage.get_agent_chat_decisions(ticker="005930")
-    assert got[0]["outcome_realized_pnl"] == 5555.0
+    assert got[0]["outcome_realized_pnl"] == expected_net
+    assert got[0]["outcome_realized_pnl"] != 5555.0
 
 
 async def test_record_kr_realized_pnl_async_never_raises_on_storage_failure(
