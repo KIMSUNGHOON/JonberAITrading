@@ -1642,6 +1642,13 @@ class PositionManager:
                 # 기본값("User-initiated close")으로 떨어지는데, 그 기본값은
                 # handle_alert_action의 진짜 사람 조작 전용이다.
                 reason=_EXIT_REASON_TO_SOURCE_LABEL.get(reason, "방어청산"),
+                # 2026-08-10 재제출 가드(089860): 이 호출은 **자율 방어 매도**다
+                # — 같은 종목의 미체결 SELL 위에 전량 청산을 다시 얹으면 브로커가
+                # 800033(매도가능수량 부족)으로 거부한다. 코디네이터의 G1/G2/G3를
+                # 켠다. `_close_position`은 사람이 직접 누른 청산
+                # (handle_alert_action/REST)과 **같은 메서드**라 기본값은 False이고,
+                # 자율 경로만 여기서 명시적으로 켠다.
+                defensive=True,
             )
 
             if result is None:
@@ -2012,6 +2019,9 @@ class PositionManager:
                 return
 
             from app.dependencies import get_trading_coordinator
+            from services.trading.coordinator import (
+                ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT,
+            )
 
             trading_coord = await get_trading_coordinator()
             result = await trading_coord._reduce_position(
@@ -2020,6 +2030,10 @@ class PositionManager:
                 # 경로 라벨을 넘긴다 — 미전달 시 코디네이터 기본값
                 # ("Autonomous partial reduce")로 떨어진다.
                 reason=_EXIT_REASON_TO_SOURCE_LABEL.get(reason, "방어청산"),
+                # 2026-08-10 재제출 가드 — `_execute_close_position`과 같은 이유
+                # (자율 경로). 미체결 SELL이 예약한 수량 위에 축소를 또 내면
+                # 브로커가 거부한다.
+                defensive=True,
             )
 
             if result is None:
@@ -2032,6 +2046,26 @@ class PositionManager:
                     ticker=position.ticker,
                 )
                 await self._notify_reduce_ledger_desync(position, clamped_quantity)
+                return
+
+            if result.status == ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT:
+                # 재제출 가드(G1/G2/G3)가 억제했다 — 원장은 멀쩡하고 주문도
+                # 실패하지 않았다. 정상 동작이므로 **통지하지 않는다**:
+                # `_notify_reduce_ledger_desync`("포지션이 없어…수동 확인이
+                # 필요합니다")도 `_notify_reduce_unfilled`도 전부 사실과 다르다.
+                # 2026-07-28 ADD 유동성 캡 선례와 같은 처리다 — 다만 그쪽은
+                # "차단" 통지를 래치와 함께 보냈고 여기는 아예 보내지 않는다:
+                # 억제 사유(미체결 SELL/쿨다운)는 최대 3분 안에 저절로 풀리는
+                # 일시적 상태라 사람이 할 조치가 없고, 코디네이터가 이미
+                # `defensive_sell_suppressed` WARNING을 에피소드당 1회 남긴다.
+                # 억제된 것은 재량적 부분 축소이지 손절이 아니다(손절은
+                # `_execute_close_position` 경로).
+                logger.info(
+                    "partial_reduce_suppressed_by_resubmit_guard",
+                    ticker=position.ticker,
+                    requested_quantity=clamped_quantity,
+                    detail=result.message,
+                )
                 return
 
             filled = result.filled_quantity

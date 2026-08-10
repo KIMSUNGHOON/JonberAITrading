@@ -29,7 +29,22 @@ class TrackedOrderStatus(str, Enum):
     TRACKING = "tracking"    # Placed, waiting for (more) fills
     FILLED = "filled"        # filled_quantity reached total_quantity
     EXPIRED = "expired"      # Stale — dropped by expire_stale without a fill
-    CANCELLED = "cancelled"  # Cancelled before fully filling
+    # ⚠️ CANCELLED는 **프로덕션 코드 어디에서도 대입되지 않는다**(2026-08-10
+    # 전수 확인). 브로커 취소를 앱이 알 수 있는 경로가 배선돼 있지 않기
+    # 때문이다 — 미체결 조회(ka10075, `kiwoom/client.py: get_pending_orders`)는
+    # 읽기 전용 REST 라우트에서만 쓰이고 이 추적기에 연결돼 있지 않다.
+    #
+    # 따라서 TRACKING을 벗어나는 길은 실질적으로 **둘뿐**이다:
+    #   apply_fills (ka10076 누적 체결이 total_quantity를 채움) → FILLED
+    #   expire_stale (날짜 경과 / 장 마감)                      → EXPIRED
+    #
+    # "취소되면 알아서 풀리겠지"라고 가정하지 말 것. 실 KRX 시장가 주문은
+    # 잔량 자동 취소가 원칙인데 그 취소는 여기 반영되지 않아, 그런 주문은
+    # 장 마감까지 TRACKING으로 남는다. `tracking()`을 억제/차단의 근거로
+    # 쓰는 소비자는 반드시 나이 상한 같은 자체 방어를 둬야 한다 — 실제 사례:
+    # `ExecutionCoordinator._defensive_sell_suppression_reason`의 G2
+    # (`DEFENSIVE_SELL_PENDING_MAX_AGE_SEC`).
+    CANCELLED = "cancelled"  # (미사용 — 위 주석 참고)
 
 
 class TrackedOrder(BaseModel):
