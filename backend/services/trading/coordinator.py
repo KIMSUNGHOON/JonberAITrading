@@ -381,14 +381,26 @@ class ExecutionCoordinator:
         self._defensive_sell_pending_max_age_sec: float = (
             DEFENSIVE_SELL_PENDING_MAX_AGE_SEC
         )
-        # M4: 억제 로그의 에피소드 래치 — 종목별로 **마지막에 WARNING으로 남긴
-        # 사유**. RiskMonitor는 1초 틱이라 래치가 없으면 G2 에피소드 하나가
-        # 초당 WARNING을 낸다(이 리포에는 회전 없는 FileHandler로 35GB 단일
-        # 로그를 만든 이력이 있다). `monitor_gate_denied_notified`와 같은 형태로
-        # 에피소드당 1회만 WARNING, 반복은 DEBUG로 떨어뜨리고, 억제가 풀리거나
-        # **사유가 바뀌면** 다시 WARNING이 나가게 재무장한다(pending_sell →
-        # no_position 전이는 그 자체가 정보다).
-        self._defensive_sell_suppress_logged: dict[str, str] = {}
+        # M4: 억제 로그의 에피소드 래치 — **(종목, 호출 경로)별**로 마지막에
+        # WARNING으로 남긴 사유. RiskMonitor는 1초 틱이라 래치가 없으면 G2
+        # 에피소드 하나가 초당 WARNING을 낸다(이 리포에는 회전 없는
+        # FileHandler로 35GB 단일 로그를 만든 이력이 있다).
+        # `monitor_gate_denied_notified`와 같은 형태로 에피소드당 1회만 WARNING,
+        # 반복은 DEBUG로 떨어뜨리고, 억제가 풀리거나 **사유가 바뀌면** 다시
+        # WARNING이 나가게 재무장한다(pending_sell → no_position 전이는 그 자체가
+        # 정보다).
+        #
+        # M5(리뷰 2라운드): 키에 `source`가 들어간다. ticker만 키로 쓰면 두
+        # 방어 엔진(risk_monitor 1초 / position_manager_* 30초)이 같은 사유로
+        # 억제될 때 **먼저 온 쪽만** WARNING이고 다른 엔진은 DEBUG로만 남아,
+        # "한쪽 엔진만 보고 다른 쪽을 놓치는" 이 리포의 반복 실패 양식이 로그
+        # 층에서 재현된다. 경로가 3개뿐이라 최대 3배(에피소드당 3줄)로 여전히
+        # 유계다.
+        self._defensive_sell_suppress_logged: dict[tuple[str, str], str] = {}
+        # 리뷰 2라운드 Important 2: `defensive_sell_stale_pending_ignored`의
+        # **ord_no 단위** 래치. WARNING을 이미 낸 미체결 주문번호 집합이며,
+        # 그 주문이 `tracking()`에서 빠지면 자동으로 정리된다(아래 G2 루프 앞).
+        self._stale_pending_logged: set[str] = set()
 
     def _defensive_sell_suppression_reason(
         self, ticker: str, position: Optional[ManagedPosition]
@@ -460,7 +472,14 @@ class ExecutionCoordinator:
 
         # G2
         now = datetime.now()
-        for tracked in self.fill_tracker.tracking():
+        tracking = self.fill_tracker.tracking()
+        # stale 로그 래치 정리 — 추적기에서 사라진 ord_no는 래치도 푼다(같은
+        # 주문번호가 재사용되면 다시 WARNING이 나가야 한다). `tracking()`은
+        # 수십 건 규모라 매 호출 O(n) 교집합이 무해하다.
+        if self._stale_pending_logged:
+            self._stale_pending_logged &= {o.ord_no for o in tracking}
+
+        for tracked in tracking:
             if tracked.ticker != ticker or tracked.side != "sell":
                 continue
             if (tracked.total_quantity - tracked.filled_quantity) <= 0:
@@ -469,12 +488,37 @@ class ExecutionCoordinator:
             # 나이 상한 — 위 docstring의 "🔴 나이 상한" 참고. `placed_at`은
             # 벽시계(datetime)다: 단조시계는 재시작을 못 넘는데 이 값은
             # `to_payload`로 영속돼 재시작 뒤에도 살아 있어야 하므로 선택지가
-            # 없다. 시계가 뒤로 튀어 age가 음수가 되면 "신선함"으로 판정돼
-            # 억제가 유지되는데, 그 경우는 G3 쿨다운(단조시계)이 여전히
-            # 상한을 걸고 있고 다음 폴에서 정상 복귀한다.
-            age_seconds = (now - tracked.placed_at).total_seconds()
-            if age_seconds >= self._defensive_sell_pending_max_age_sec:
-                logger.warning(
+            # 없다.
+            #
+            # ⚠️ 시계 이상은 **stale 쪽으로** 해석한다(음수 age 포함). 이
+            # 브랜치의 비대칭 논증이 그대로 적용된다 — 신뢰할 수 없는 나이를
+            # "신선함"으로 읽으면 결과가 무방비인데, stale로 읽으면 최악이
+            # 거부 1회다. (이전 주석은 "G3 쿨다운이 상한을 걸고 다음 폴에서
+            # 복귀한다"고 적었는데 **틀렸다**: G3는 억제기이지 해제기가 아니라
+            # G2 억제를 풀어줄 수 없고, 복귀도 "다음 폴"이 아니라 되감긴
+            # 시간만큼 걸린다.)
+            #
+            # M6: tz-aware `placed_at`이 섞여 들어오면 naive `now`와의 뺄셈이
+            # `TypeError`를 던지는데, `_execute_order_from_monitor`에는 이걸
+            # 잡는 except가 없어 **매 틱 손절이 통째로 실패**한다. 오늘의
+            # 왕복 경로(`model_dump(mode="json")` ↔ `model_validate`)는 naive
+            # 전용이라 도달 경로가 없지만, 비용이 2줄이고 실패 양식이
+            # "방어가 영영 안 나감"이라 방어적으로 정규화한다.
+            placed_at = tracked.placed_at
+            if placed_at.tzinfo is not None:
+                placed_at = placed_at.astimezone().replace(tzinfo=None)
+            age_seconds = (now - placed_at).total_seconds()
+
+            if age_seconds < 0 or age_seconds >= self._defensive_sell_pending_max_age_sec:
+                # 리뷰 2라운드 Important 2: 이 WARNING은 M4 래치 **밖**이라
+                # RiskMonitor 1초 틱에서 초당 1줄이 나갔다(낡은 TRACKING이 남아
+                # 있는 한 계속, G3가 억제 중인 29초 구간에도 — G2 루프가 G3보다
+                # 먼저 돌기 때문). 약 0.9MB/시간·종목. M4로 막으려던 바로 그
+                # 양식이라 같은 처방을 쓴다: **ord_no 단위** 래치.
+                # ticker가 아니라 ord_no가 키인 이유 — stale은 특정 **주문**의
+                # 속성이고, `_reduce_position`이 전량 클램프로 `_close_position`에
+                # 위임할 때 같은 제출에 두 줄이 남던 것도 이걸로 함께 사라진다.
+                message = (
                     f"[Coordinator] defensive_sell_stale_pending_ignored: "
                     f"{ticker} ord_no={tracked.ord_no} "
                     f"age_seconds={age_seconds:.0f} "
@@ -483,6 +527,11 @@ class ExecutionCoordinator:
                     f"수 있다. 억제 근거로 쓰지 않고 제출을 허용한다"
                     f"(최악 = 800033 거부 1회, 대안 = 마감까지 무방비)"
                 )
+                if tracked.ord_no in self._stale_pending_logged:
+                    logger.debug(message)
+                else:
+                    self._stale_pending_logged.add(tracked.ord_no)
+                    logger.warning(message)
                 continue
 
             return "pending_sell"
@@ -513,16 +562,20 @@ class ExecutionCoordinator:
         관문마다 구별되는 `reason=`을 남겨 사후에 "왜 안 나갔나"를 로그만으로
         판별할 수 있게 한다(`no_position`/`pending_sell`/`cooldown`).
 
-        M4 에피소드 래치: 같은 종목이 같은 사유로 연속 억제되는 동안에는 첫
-        번째만 WARNING이고 나머지는 DEBUG다. RiskMonitor가 1초 틱이라 래치가
-        없으면 3분짜리 G2 에피소드 하나가 WARNING 180줄을 만든다. 억제가
-        풀리거나 사유가 바뀌면 래치가 재무장돼 다음 WARNING이 반드시 나간다 —
-        즉 **어떤 억제 에피소드도 WARNING 없이 지나가지 않는다**.
+        M4 에피소드 래치: 같은 (종목, 호출 경로)가 같은 사유로 연속 억제되는
+        동안에는 첫 번째만 WARNING이고 나머지는 DEBUG다. RiskMonitor가 1초
+        틱이라 래치가 없으면 3분짜리 G2 에피소드 하나가 WARNING 180줄을 만든다.
+        억제가 풀리거나 사유가 바뀌면 래치가 재무장돼 다음 WARNING이 반드시
+        나간다 — 즉 **어떤 억제 에피소드도 WARNING 없이 지나가지 않는다**.
+        M5(리뷰 2라운드): 키가 (ticker, source)라 두 방어 엔진이 같은 사유로
+        억제될 때 **양쪽 다** 한 줄씩 남는다(한쪽만 보고 다른 쪽을 놓치지
+        않도록).
         """
         reason = self._defensive_sell_suppression_reason(ticker, position)
+        latch_key = (ticker, source)
         if reason is None:
             # 억제가 풀렸다 — 래치 재무장(다음 에피소드는 다시 WARNING).
-            self._defensive_sell_suppress_logged.pop(ticker, None)
+            self._defensive_sell_suppress_logged.pop(latch_key, None)
             return None
 
         held = position.quantity if position is not None else 0
@@ -533,10 +586,10 @@ class ExecutionCoordinator:
             f"{[o.ord_no for o in self.fill_tracker.tracking() if o.ticker == ticker and o.side == 'sell']} "
             f"— 방어는 취소되지 않는다(미체결 주문/다음 틱이 이어받는다)"
         )
-        if self._defensive_sell_suppress_logged.get(ticker) == reason:
+        if self._defensive_sell_suppress_logged.get(latch_key) == reason:
             logger.debug(message)
         else:
-            self._defensive_sell_suppress_logged[ticker] = reason
+            self._defensive_sell_suppress_logged[latch_key] = reason
             logger.warning(message)
         return reason
 
@@ -3470,18 +3523,29 @@ class ExecutionCoordinator:
             # 그쪽에서 다시 걸리지는 않는다(같은 판정을 두 번 하는 셈이고,
             # 여기서 통과했으면 그쪽도 통과한다).
             #
-            # ⚠️ `_close_position`과 달리 여기서는 `None`을 돌려주면 **안 된다**
-            # (리뷰 Important 2). 호출자
-            # `PositionManager._execute_reduce_position`의 `None` 분기는 오직
-            # "코디네이터 원장에 포지션 없음"을 뜻해 🚨
+            # ⚠️ **일시적** 억제(G2/G3)에서는 `None`을 돌려주면 안 된다.
+            # 호출자 `PositionManager._execute_reduce_position`의 `None` 분기는
+            # 오직 "코디네이터 원장에 포지션 없음"을 뜻해 🚨
             # `_notify_reduce_ledger_desync`("...포지션이 없어 주문이 접수되지
-            # 않았습니다... 수동 확인이 필요합니다")를 발사하는데, 억제 시엔
-            # 포지션이 멀쩡히 있으므로 사실과 다른 경보다. `filled<=0` 분기의
-            # `_notify_reduce_unfilled`도 마찬가지다. 2026-07-28 ADD 유동성 캡이
-            # 정확히 이 결함이었고 `ORDER_STATUS_REJECTED_LIQUIDITY_CAP`라는
-            # **구별 가능한 반환**으로 봉합했다 — 같은 방식을 그대로 쓴다.
+            # 않았습니다... 수동 확인이 필요합니다")를 발사하는데, 미체결
+            # SELL/쿨다운은 포지션이 멀쩡히 있는 상태라 사실과 다른 경보다.
+            # `filled<=0` 분기의 `_notify_reduce_unfilled`도 마찬가지다.
+            # 2026-07-28 ADD 유동성 캡이 정확히 이 결함이었고
+            # `ORDER_STATUS_REJECTED_LIQUIDITY_CAP`라는 **구별 가능한 반환**으로
+            # 봉합했다 — 같은 방식을 그대로 쓴다.
             # (`_close_position`의 `None`은 원래부터 "스킵, 감시 유지"로 정확히
             #  해석되고 있어 대칭이 깨진 곳은 reduce 하나다.)
+            #
+            # 🔴 단, **G1(`no_position`)은 예외로 기존 `None` 계약에 그대로
+            # 떨어뜨린다**(리뷰 2라운드 Important 1). 이 메서드는 `position`이
+            # None이면 이미 위에서 `None`을 돌려주므로, 여기까지 와서 G1이
+            # 발동하는 유일한 조건은 **원장에 포지션이 있는데 `quantity <= 0`**
+            # 이다. 그건 180초 안에 자동 해제되는 일시 상태가 아니라 **자가
+            # 치유되지 않는 진짜 원장 불일치**(PM은 116주, 코디네이터는 0주)이고,
+            # `_notify_reduce_ledger_desync`가 정확히 그것 때문에 존재한다.
+            # 브랜치 이전에도 `sell_qty = min(quantity, 0) <= 0` → `None` →
+            # desync 통지로 흘렀다. 허위 경보를 없애려다 **진짜 경보를 삼키면**
+            # 같은 계열의 실수를 반대 방향으로 반복하는 것이다.
             suppressed = (
                 self._defensive_sell_suppressed(
                     ticker, position, source="position_manager_reduce"
@@ -3489,6 +3553,13 @@ class ExecutionCoordinator:
                 if defensive
                 else None
             )
+            if suppressed == "no_position":
+                logger.warning(
+                    f"[Coordinator] Reduce for {ticker}: 원장에 포지션이 있으나 "
+                    f"수량이 0 이하다 — 자가 치유되지 않는 원장 불일치이므로 "
+                    f"기존 None 계약(desync 통지)으로 떨어뜨린다"
+                )
+                return None
             if suppressed is not None:
                 return OrderResult(
                     order_id="",

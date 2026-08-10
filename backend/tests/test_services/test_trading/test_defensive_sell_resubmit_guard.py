@@ -834,3 +834,205 @@ async def test_suppression_latch_rearms_after_release(caplog):
     await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
 
     assert _suppression_reasons(caplog) == ["pending_sell", "pending_sell"]
+
+
+# -------------------------------------------
+# 리뷰 2라운드 Important 1 — 진짜 원장 불일치 경보를 삼키면 안 된다
+# -------------------------------------------
+#
+# `_reduce_position`은 position이 None이면 이미 위에서 None을 돌려준다. 따라서
+# 여기까지 와서 G1(`no_position`)이 발동하는 유일한 조건은 **원장에 포지션이
+# 있는데 quantity <= 0** — 180초 안에 자동 해제되는 일시 상태가 아니라 자가
+# 치유되지 않는 진짜 원장 불일치(PM 116주 vs 코디네이터 0주)다.
+# 브랜치 이전에는 `sell_qty = min(q, 0) <= 0` → None → desync 통지로 흘렀다.
+
+
+async def test_reduce_zero_quantity_position_returns_none_not_suppressed():
+    """🔴 G1 억제는 SUPPRESSED가 아니라 기존 `None` 계약으로 떨어져야 한다 —
+    그래야 desync 통지가 살아 있다."""
+    coord = _coordinator(quantity=116)
+    next(p for p in coord._state.positions if p.ticker == TICKER).quantity = 0
+    rec = _Recorder(coord)
+
+    result = await coord._reduce_position(TICKER, 100, defensive=True)
+
+    assert result is None, "SUPPRESSED로 돌려주면 진짜 원장 불일치 경보가 사라진다"
+    assert rec.count == 0
+
+
+async def test_position_manager_reduce_zero_quantity_still_alerts_desync(monkeypatch):
+    """PM 종단: 코디네이터 수량이 0으로 어긋난 상태는 여전히 desync 경보를
+    낸다(억제 분기가 삼키면 안 된다)."""
+    from unittest.mock import AsyncMock
+
+    import app.dependencies as deps
+    from services.agent_chat.position_manager import PositionManager
+
+    pm = PositionManager()
+    position = pm.add_position(
+        ticker=TICKER, stock_name="비에이치아이", quantity=116,
+        avg_price=39_000.0, current_price=41_600.0,
+    )
+
+    # 실제 코디네이터를 쓴다 — 이 경로의 반환 계약 자체가 검증 대상이다.
+    coord = _coordinator(quantity=116)
+    next(p for p in coord._state.positions if p.ticker == TICKER).quantity = 0
+    _Recorder(coord)
+    monkeypatch.setattr(deps, "get_trading_coordinator", AsyncMock(return_value=coord))
+    pm._notify_reduce_ledger_desync = AsyncMock()
+
+    await pm._execute_reduce_position(position, 30, "agent_decision_reduce_partial")
+
+    pm._notify_reduce_ledger_desync.assert_awaited_once()
+
+
+# -------------------------------------------
+# 리뷰 2라운드 Important 2 — stale 로그가 틱마다 나가면 안 된다
+# -------------------------------------------
+
+
+async def test_stale_pending_log_is_latched_per_order(caplog):
+    """🔴 `defensive_sell_stale_pending_ignored`는 M4 래치 **밖**이라 1초 틱에서
+    초당 1줄이 나갔다(≈0.9MB/시간·종목). ord_no 단위로 래치한다."""
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(
+        _pending_sell(age_seconds=DEFENSIVE_SELL_PENDING_MAX_AGE_SEC + 1)
+    )
+    # 브로커가 거부해 포지션이 유지되게 한다 — 체결되면 G1(no_position)이 먼저
+    # 잡아 G2 루프(=stale 판정 지점)까지 오지 않아 래치가 시험되지 않는다.
+    # 이게 라이브의 실제 모양이기도 하다: 낡은 TRACKING이 남아 있고 트리거도
+    # 살아 있는 상태.
+    _rej = _result(_sell_order(116, 36_000.0), filled=0, status="rejected")
+    rec = _Recorder(coord, results=[_rej] * 10)
+
+    for _ in range(10):
+        await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+
+    # 제출은 G3 쿨다운 때문에 1회지만, stale 판정은 10틱 전부 일어났다
+    # (G2 루프가 G3보다 먼저 돌기 때문 — 리뷰가 지적한 바로 그 구간).
+    assert rec.count == 1
+    assert coord._state.positions, "포지션이 유지돼야 G2 루프를 반복해서 탄다"
+    stale = [r for r in caplog.records
+             if "defensive_sell_stale_pending_ignored" in r.getMessage()]
+    assert len(stale) == 1, "틱마다 WARNING이 나가면 로그가 폭증한다(≈0.9MB/h·종목)"
+
+
+async def test_stale_pending_log_rearms_for_a_new_order(caplog):
+    """🔴 래치가 영구 침묵이면 안 된다 — 추적기에서 빠지면 재무장된다."""
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(
+        _pending_sell(ord_no="OLD1", age_seconds=DEFENSIVE_SELL_PENDING_MAX_AGE_SEC + 1)
+    )
+    # 브로커가 거부해 포지션이 유지되게 한다 — 체결되면 G1(no_position)이 먼저
+    # 잡아 두 번째 호출이 G2 루프까지 오지 않는다.
+    _rej = _result(_sell_order(116, 36_000.0), filled=0, status="rejected")
+    _Recorder(coord, results=[_rej, _rej])
+
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+    coord._last_defensive_sell_at.clear()  # G3는 이 테스트의 관심사가 아니다
+
+    coord.fill_tracker.expire_stale(None)  # OLD1이 tracking()에서 빠진다
+    coord.fill_tracker.register(
+        _pending_sell(ord_no="OLD2", age_seconds=DEFENSIVE_SELL_PENDING_MAX_AGE_SEC + 1)
+    )
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+
+    stale = [r.getMessage() for r in caplog.records
+             if "defensive_sell_stale_pending_ignored" in r.getMessage()]
+    assert len(stale) == 2
+    assert "ord_no=OLD1" in stale[0] and "ord_no=OLD2" in stale[1]
+
+
+async def test_stale_pending_log_once_across_reduce_delegation(caplog):
+    """`_reduce_position`이 전량 클램프로 `_close_position`에 위임하면 같은
+    제출에서 판정이 두 번 도는데, stale 로그는 한 줄이어야 한다."""
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(
+        _pending_sell(age_seconds=DEFENSIVE_SELL_PENDING_MAX_AGE_SEC + 1)
+    )
+    rec = _Recorder(coord)
+
+    # 요청 수량 >= 보유 → 전량 클램프 → _close_position 위임
+    result = await coord._reduce_position(TICKER, 500, defensive=True)
+
+    assert result is not None and rec.count == 1
+    stale = [r for r in caplog.records
+             if "defensive_sell_stale_pending_ignored" in r.getMessage()]
+    assert len(stale) == 1
+
+
+# -------------------------------------------
+# 리뷰 2라운드 Minor 3 — 음수 age는 신뢰 불가 → stale
+# -------------------------------------------
+
+
+async def test_negative_age_is_treated_as_stale(caplog):
+    """시계가 뒤로 튀어 `placed_at`이 미래가 되면 나이를 신뢰할 수 없다.
+    이 브랜치의 비대칭 논증(최악 = 거부 1회 vs 무방비)대로 stale로 읽는다."""
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(_pending_sell(age_seconds=-3600))  # 1시간 미래
+    rec = _Recorder(coord)
+
+    assert await coord._execute_order_from_monitor(_sell_order(116, 36_000.0)) is True
+    assert rec.count == 1
+    assert _suppression_reasons(caplog) == []
+    assert any("defensive_sell_stale_pending_ignored" in r.getMessage()
+               for r in caplog.records)
+
+
+# -------------------------------------------
+# 리뷰 2라운드 M5 — 두 엔진이 각각 한 줄씩 남는다
+# -------------------------------------------
+
+
+async def test_suppression_warning_is_per_engine(caplog):
+    """ticker만 키로 쓰면 먼저 온 엔진만 WARNING이고 다른 엔진은 DEBUG로만
+    남는다 — "한쪽만 보고 다른 쪽을 놓친" 이력이 있는 리포에서는 관측 손실."""
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(_pending_sell())
+    _Recorder(coord)
+
+    # 엔진 1: RiskMonitor
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+    # 엔진 2: PositionManager
+    await coord._close_position(TICKER, defensive=True)
+    # 각 엔진의 반복은 여전히 억제된다
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+    await coord._close_position(TICKER, defensive=True)
+
+    messages = [r.getMessage() for r in caplog.records
+                if "defensive_sell_suppressed" in r.getMessage()]
+    assert len(messages) == 2
+    assert any("source=risk_monitor" in m for m in messages)
+    assert any("source=position_manager_close" in m for m in messages)
+
+
+# -------------------------------------------
+# 리뷰 2라운드 M6 — tz-aware placed_at이 손절을 죽이면 안 된다
+# -------------------------------------------
+
+
+async def test_tz_aware_placed_at_does_not_break_the_guard():
+    """naive `now`와의 뺄셈이 TypeError를 던지면
+    `_execute_order_from_monitor`에 except가 없어 **매 틱 손절이 통째로
+    실패**한다. 오늘 도달 경로는 없지만 실패 양식이 치명적이라 정규화한다."""
+    from datetime import timezone
+
+    coord = _coordinator(quantity=116)
+    tracked = _pending_sell(age_seconds=10)
+    # 진짜 tz-aware 값(같은 순간을 UTC로 표현) — naive `now`와 그냥 빼면
+    # TypeError다.
+    tracked.placed_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    coord.fill_tracker.register(tracked)
+    rec = _Recorder(coord)
+
+    # 예외 없이 정상 판정돼야 한다(UTC 10초 전 = 상한 이내 → 억제).
+    submitted = await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+
+    assert submitted is False
+    assert rec.count == 0
