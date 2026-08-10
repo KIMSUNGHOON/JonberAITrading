@@ -131,6 +131,7 @@ def compute_regime_target(
     equity: float,
     equity_peak: float,
     series_stale: bool = False,
+    series_lagging: Optional[bool] = False,
     target_vol_pct: float = TARGET_VOL_PCT,
     vol_multiplier_min: float = VOL_MULTIPLIER_MIN,
 ) -> TargetExposure:
@@ -161,12 +162,22 @@ def compute_regime_target(
 
     vol_ann, vol_n = annualized_vol(index_returns)
     if vol_ann is None:
-        m_vol = 1.0
+        # ⚠️ **열화 폴백은 범위의 방어적인 끝이다**(2026-08-11). 배수는
+        # 축소 전용(`VOL_MULTIPLIER_MAX = 1.0`)이라 `1.0`은 "전혀 깎지
+        # 않는다"는 뜻 -- 범위에서 **가장 관대한** 값이다. 예전엔 여기가
+        # 1.0이라, 지수 시계열을 못 읽었다는 이유만으로 목표 노출도가
+        # 15.1% → 30.2%로 **두 배**가 될 수 있었다(라이브 실측).
+        #
+        # 우리는 변동성을 **모르는** 것이지 **낮은** 것이 아니다. 모를 때
+        # 깎지 않는 선택은 "시장이 잠잠하다고 가정한다"와 같고, 이
+        # 시스템이 실제로 만난 KOSPI 연변동성은 101.78%였다. 이 리포의
+        # 원칙은 "어떤 실패도 노출도를 위로 열지 않는다"다.
+        m_vol = vol_multiplier_min
         degraded.append("index_vol_insufficient")
     elif series_stale:
-        # 시계열이 오래됐으면 값 자체를 못 믿는다. 중립으로 두되 원값은
-        # 그대로 실어 보낸다.
-        m_vol = 1.0
+        # 시계열이 오래됐으면 값 자체를 못 믿는다. 위와 같은 이유로
+        # 하한(가장 방어적인 끝)으로 떨어뜨리고 원값은 그대로 실어 보낸다.
+        m_vol = vol_multiplier_min
         degraded.append("index_series_stale")
     else:
         # ⚠️ 위생 게이트를 두지 않는다. 2026-08-06에 넣은 [5, 60]이
@@ -175,6 +186,20 @@ def compute_regime_target(
         # 저하 사유가 아니라 배수가 반영해야 할 사실이다.
         m_vol = min(VOL_MULTIPLIER_MAX,
                     max(vol_multiplier_min, target_vol_pct / vol_ann))
+
+    # 지연(`index_daily` 최신 행이 직전 **거래일**보다 이전)은 **관측
+    # 신호일 뿐 배수를 바꾸지 않는다**. 거래일 하루 뒤진 것이 20일
+    # 변동성을 의미 있게 바꾸지 않기 때문이다. 배수를 바꾸는 것은
+    # `series_stale`(7역일)과 표본 부족(`vol_ann is None`) 둘뿐이고, 이
+    # 분리를 지키지 않으면 하루짜리 외부 공백이 노출도를 흔든다.
+    #
+    # 3-상태다: `True`=지연, `False`=최신(또는 검사 안 함 -- 기본값),
+    # `None`=달력을 못 읽어 **모름**. 모름을 "지연 아님"으로 접으면
+    # 달력이 죽은 날 공백이 영원히 안 보인다.
+    if series_lagging:
+        degraded.append("index_series_lagging")
+    elif series_lagging is None:
+        degraded.append("index_series_lag_unknown")
 
     m_drawdown = _drawdown_multiplier(equity, equity_peak)
 

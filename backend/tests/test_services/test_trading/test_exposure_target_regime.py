@@ -11,6 +11,7 @@ from services.trading.exposure_target import (
     TARGET_CEILING,
     TRADING_DAYS_PER_YEAR,
     VOL_MULTIPLIER_MAX,
+    VOL_MULTIPLIER_MIN,
     compute_regime_target,
     slots_for_target,
 )
@@ -29,15 +30,29 @@ def _returns_with_annual_vol(vol_ann_pct: float, n: int = 20) -> list[float]:
 
 
 def _t(regime="bear", prev=None, seed=0.0855, returns=None, equity=100.0,
-       peak=100.0, series_stale=False):
+       peak=100.0, series_stale=False, series_lagging=False, vol_min=None):
+    """기본 표본은 **목표 변동성과 정확히 같은** 18% -- `m_vol == 1.0`이라
+    램프·앵커·클램프를 보는 테스트에서 배수가 잡음이 되지 않는다.
+
+    ⚠️ 예전 기본값은 `[]`(표본 없음)였다. 2026-08-11부터 표본 부족은
+    열화이고 배수가 하한(0.5)으로 떨어지므로, `[]`를 계속 기본으로 두면
+    램프를 보려던 테스트가 전부 열화 경로를 타게 된다.
+    """
+    kw = {}
+    if vol_min is not None:
+        kw["vol_multiplier_min"] = vol_min
     return compute_regime_target(
         regime_label=regime,
         prev_effective_pct=prev,
         seed_actual_pct=seed,
-        index_returns=returns if returns is not None else [],
+        index_returns=(
+            returns if returns is not None else _returns_with_annual_vol(18.0)
+        ),
         equity=equity,
         equity_peak=peak,
         series_stale=series_stale,
+        series_lagging=series_lagging,
+        **kw,
     )
 
 
@@ -66,18 +81,32 @@ def test_vol_gate_constants_are_gone():
     assert not hasattr(et, "VOL_GATE_MAX_PCT")
 
 
-def test_stale_series_neutralizes_the_multiplier():
+def test_stale_series_falls_back_to_the_defensive_end():
+    """시계열이 오래됐으면 **가장 방어적인 배수**로 떨어진다(2026-08-11).
+
+    이전에는 `1.0`(= 전혀 깎지 않음, 축소 전용 범위에서 가장 관대한 끝)이었다.
+    변동성을 **모르는** 것을 "낮다"로 읽은 것이고, 데이터를 못 읽었다는
+    이유만으로 노출도 상한이 두 배가 됐다.
+    """
     out = _t(returns=[6.4, -6.4] * 10, series_stale=True)
-    assert out.m_vol == 1.0
+    assert out.m_vol == pytest.approx(VOL_MULTIPLIER_MIN)
+    assert out.m_vol != 1.0
     assert "index_series_stale" in out.degraded
     assert out.index_vol_annualized is not None, "원값은 그대로 실어야 한다"
 
 
 def test_stale_flag_does_not_open_exposure_upward():
-    """m_vol=1.0은 '깎지 않음'이지 '키움'이 아니다."""
-    fresh = _t(returns=[6.4, -6.4] * 10, series_stale=False)
-    stale = _t(returns=[6.4, -6.4] * 10, series_stale=True)
-    assert stale.target_pct >= fresh.target_pct
+    """열화가 노출도를 위로 여는 일은 없어야 한다.
+
+    ⚠️ 고변동성 표본으로 비교하면 신선한 쪽도 이미 하한(0.5)이라 두 값이
+    같아져 가드가 공허해진다. **저변동성 표본**(신선하면 `m_vol=1.0`)으로
+    비교해야 "열화가 관대한 끝으로 가는가"를 실제로 본다.
+    """
+    calm = _returns_with_annual_vol(11.1)
+    fresh = _t(regime="bear", prev=0.65, returns=calm, series_stale=False)
+    stale = _t(regime="bear", prev=0.65, returns=calm, series_stale=True)
+    assert fresh.m_vol == pytest.approx(1.0), "저변동성이면 깎지 않는다"
+    assert stale.target_pct < fresh.target_pct
     assert stale.m_vol <= 1.0
 
 
@@ -133,8 +162,114 @@ def test_unknown_regime_is_degraded_and_treated_as_bear():
 
 def test_vol_insufficient_is_recorded_not_silently_neutral():
     out = _t(returns=[0.1, 0.2])
-    assert out.m_vol == 1.0
+    assert out.m_vol == pytest.approx(VOL_MULTIPLIER_MIN)
+    assert out.m_vol != 1.0
     assert "index_vol_insufficient" in out.degraded
+
+
+# -------------------------------------------
+# 열화 폴백은 방어적인 끝으로 (2026-08-11, 외부 데이터 공백)
+#
+# 발단: `index_daily`에 2026-08-10(월) 종가가 통째로 빠졌다. 코드 결함이
+# 아니라 Yahoo가 아직 안 올린 **외부 데이터 공백**이었다. 문제는 우리가
+# 그 공백에 어떻게 반응하느냐였다 — 폴백이 `1.0`(축소 전용 범위에서 가장
+# 관대한 끝)이라, 못 읽었다는 이유로 목표 노출도가 15.1% → 30.2%로 하루
+# 만에 두 배가 될 수 있었다.
+# -------------------------------------------
+
+
+def test_degraded_fallbacks_are_the_defensive_end_not_the_permissive_one():
+    """두 열화 분기 **모두** 하한으로 떨어진다.
+
+    `VOL_MULTIPLIER_MAX == 1.0`이므로 배수 범위는 [vol_multiplier_min, 1.0]
+    이고 `1.0`은 "전혀 깎지 않는다"는 뜻이다 — 범위의 관대한 끝이다.
+    """
+    insufficient = _t(returns=[0.1, 0.2])
+    stale = _t(returns=[6.4, -6.4] * 10, series_stale=True)
+
+    for out in (insufficient, stale):
+        assert out.m_vol == pytest.approx(VOL_MULTIPLIER_MIN)
+        assert out.m_vol < VOL_MULTIPLIER_MAX
+
+
+def test_degraded_fallback_follows_the_panel_knob():
+    """폴백은 전략 패널의 `vol_multiplier_min`을 따른다.
+
+    패널이 이 노브를 올린 것은 "이보다 세게 방어하지 말라"는 지시이므로
+    열화 폴백도 그 지시 안에 있어야 한다. 상수를 따로 박으면 노브가
+    말한 하한과 폴백이 어긋난다.
+    """
+    for kw in ({"returns": [0.1, 0.2]},
+               {"returns": [6.4, -6.4] * 10, "series_stale": True}):
+        assert _t(vol_min=0.3, **kw).m_vol == pytest.approx(0.3)
+        assert _t(vol_min=0.8, **kw).m_vol == pytest.approx(0.8)
+
+
+def test_data_gap_cannot_double_the_target():
+    """라이브 실측 회귀(2026-08-11).
+
+    직전 목표 15.2%에서 램프하면 `ramped = 0.302`. 옛 폴백(1.0)이면
+    목표가 30.2%로 **정확히 두 배**가 됐다. 새 폴백에서는 신선한 날의
+    값(15.1%)을 넘지 않아야 한다.
+    """
+    live_vol = _returns_with_annual_vol(101.78)
+    fresh = _t(regime="bear", prev=0.152, returns=live_vol)
+    assert fresh.m_vol == pytest.approx(0.5)
+    assert fresh.target_pct == pytest.approx(0.151)
+
+    stale = _t(regime="bear", prev=0.152, returns=live_vol, series_stale=True)
+    assert stale.target_pct <= fresh.target_pct
+    assert stale.target_pct != pytest.approx(0.302)
+
+
+def test_normal_path_is_unchanged():
+    """회귀 가드 — 열화가 아닌 날의 산술은 손대지 않았다."""
+    live_vol = _returns_with_annual_vol(101.78)
+    out = _t(regime="bear", prev=0.152, returns=live_vol)
+    assert out.index_vol_annualized == pytest.approx(101.78)
+    assert out.m_vol == pytest.approx(0.5)          # 18.0/101.78 → 하한 0.5
+    assert out.m_drawdown == pytest.approx(1.0)
+    assert out.target_pct == pytest.approx(0.151)
+    assert out.degraded == []
+
+    # 목표 18%·저변동성 쪽 정상 경로도 그대로 (배수가 상한에 붙는다)
+    calm = _t(regime="neutral", prev=0.65, returns=_returns_with_annual_vol(11.1))
+    assert calm.m_vol == pytest.approx(1.0)
+    assert calm.target_pct == pytest.approx(REGIME_ANCHORS["neutral"])
+    assert calm.degraded == []
+
+
+# -------------------------------------------
+# 지연은 **관측 신호**다 — 배수를 바꾸지 않는다
+# -------------------------------------------
+
+
+def test_lagging_series_is_recorded_but_does_not_move_the_multiplier():
+    """거래일 하루 뒤진 것이 20일 변동성을 의미 있게 바꾸지 않는다.
+
+    배수를 바꾸는 것은 `series_stale`(7역일)과 표본 부족뿐이다. 지연에
+    배수를 물리면 하루짜리 공백이 노출도를 흔들게 된다.
+    """
+    calm = _returns_with_annual_vol(11.1)
+    base = _t(regime="neutral", prev=0.65, returns=calm)
+    lagging = _t(regime="neutral", prev=0.65, returns=calm, series_lagging=True)
+
+    assert "index_series_lagging" in lagging.degraded
+    assert lagging.m_vol == pytest.approx(base.m_vol)
+    assert lagging.target_pct == pytest.approx(base.target_pct)
+
+
+def test_lag_unknown_is_a_distinct_tag():
+    """달력 조회가 실패해 지연 여부를 **모르는** 것은 "지연 아님"과 다른
+    사실이다. 둘을 합치면 달력이 죽은 날 공백이 영원히 안 보인다."""
+    out = _t(series_lagging=None, returns=_returns_with_annual_vol(11.1))
+    assert "index_series_lag_unknown" in out.degraded
+    assert "index_series_lagging" not in out.degraded
+
+
+def test_no_lag_tag_when_series_is_current():
+    out = _t(returns=_returns_with_annual_vol(11.1), series_lagging=False)
+    assert not any("lag" in tag for tag in out.degraded)
 
 
 # -------------------------------------------

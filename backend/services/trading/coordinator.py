@@ -2980,6 +2980,7 @@ class ExecutionCoordinator:
             from services.trading.exposure_target import compute_regime_target
             from services.trading.index_series import (
                 closes_to_returns,
+                evaluate_series_lag,
                 is_series_stale,
             )
 
@@ -3001,6 +3002,14 @@ class ExecutionCoordinator:
                 if closes
                 else False
             )
+            # 거래일 기준 지연 -- 관측 신호일 뿐 배수는 안 바꾼다. 이 행이
+            # `/exposure`가 읽는 곳이라, 여기 안 실리면 폰에서 공백이
+            # 안 보인다.
+            series_lagging = (
+                evaluate_series_lag(closes[-1][0], datetime.now().date()).lagging
+                if closes
+                else False
+            )
 
             target = compute_regime_target(
                 regime_label=regime_label,
@@ -3010,6 +3019,7 @@ class ExecutionCoordinator:
                 equity=equity,
                 equity_peak=equity_peak,
                 series_stale=series_stale,
+                series_lagging=series_lagging,
                 target_vol_pct=float(self.risk_params.target_vol_pct),
                 vol_multiplier_min=float(self.risk_params.vol_multiplier_min),
             )

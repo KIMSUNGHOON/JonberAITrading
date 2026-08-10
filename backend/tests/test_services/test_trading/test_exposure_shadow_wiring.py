@@ -331,6 +331,55 @@ class TestExposureShadowRecording:
         assert kwargs["target"].anchor_pct == pytest.approx(0.55)  # bear
         assert "regime_unknown" not in kwargs["target"].degraded
 
+    @pytest.mark.asyncio
+    async def test_trading_day_lag_reaches_the_recorded_row(self):
+        """거래일 기준 지연이 `exposure_shadow.degraded`에 닿아야 한다 --
+        `/exposure`가 읽는 곳이 여기다. 닿지 않으면 폰에서 공백이 안 보인다.
+
+        ⚠️ `evaluate_series_lag`를 패치하지 않으면 실물
+        `KRXHolidayService`가 만들어져 라이브 `data/holidays.db`에
+        `CREATE TABLE`을 친다."""
+        from services.trading.index_series import SeriesLag
+
+        coord = _coord_for_shadow()
+        storage = _storage_double(
+            get_recent_index_closes=AsyncMock(
+                return_value=[(f"2026-07-{d:02d}", 100.0 + d) for d in range(1, 22)]
+            ),
+        )
+        lag = SeriesLag(lagging=True, latest=None, expected=None,
+                        trading_days_behind=1)
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.trading.index_series.evaluate_series_lag",
+                   return_value=lag) as lag_spy, \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        lag_spy.assert_called_once()
+        assert lag_spy.call_args.args[0] == "2026-07-21"
+        target = storage.insert_exposure_shadow.await_args.kwargs["target"]
+        assert "index_series_lagging" in target.degraded
+
+    @pytest.mark.asyncio
+    async def test_degraded_multiplier_falls_back_to_the_defensive_end(self):
+        """지수 시계열이 없으면(`get_recent_index_closes` → `[]`) 배수는
+        하한으로 떨어져야 한다. 옛 폴백(1.0)은 못 읽었다는 이유로 상한을
+        두 배로 열었다."""
+        coord = _coord_for_shadow()
+        storage = _storage_double()
+
+        with patch("services.trading.coordinator.is_krx_open_cached", return_value=True), \
+             patch("services.storage_service.get_storage_service",
+                   new=AsyncMock(return_value=storage)):
+            await coord._record_exposure_shadow()
+
+        target = storage.insert_exposure_shadow.await_args.kwargs["target"]
+        assert "index_vol_insufficient" in target.degraded
+        assert target.m_vol == pytest.approx(coord.risk_params.vol_multiplier_min)
+        assert target.m_vol != 1.0
+
 
 class TestObservationOnlyContract:
     """이 유닛은 사이징을 건드리지 않는다 -- 계약을 코드로 고정한다."""
