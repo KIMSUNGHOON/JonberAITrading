@@ -40,14 +40,18 @@
   * test_clean_stop_loss_still_submits
 """
 
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pytest
 
 import services.autonomy as autonomy_pkg
 from services.autonomy import GateDecision
 from services.kiwoom.models import FilledOrder
-from services.trading.coordinator import ExecutionCoordinator
+from services.trading.coordinator import (
+    DEFENSIVE_SELL_PENDING_MAX_AGE_SEC,
+    ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT,
+    ExecutionCoordinator,
+)
 from services.trading.models import (
     ManagedPosition,
     OrderRequest,
@@ -143,7 +147,9 @@ def _sell_order(quantity, price, reason="Take-profit auto-execution") -> OrderRe
     )
 
 
-def _pending_sell(remaining=116, total=361, ord_no="0005305") -> TrackedOrder:
+def _pending_sell(
+    remaining=116, total=361, ord_no="0005305", age_seconds=0.0
+) -> TrackedOrder:
     return TrackedOrder(
         ord_no=ord_no,
         ticker=TICKER,
@@ -151,6 +157,7 @@ def _pending_sell(remaining=116, total=361, ord_no="0005305") -> TrackedOrder:
         side="sell",
         total_quantity=total,
         filled_quantity=total - remaining,
+        placed_at=datetime.now() - timedelta(seconds=age_seconds),
         trade_date=date.today().strftime("%Y%m%d"),
     )
 
@@ -518,7 +525,10 @@ async def test_reduce_position_defensive_suppressed_by_pending_sell(caplog):
 
     result = await coord._reduce_position(TICKER, 100, defensive=True)
 
-    assert result is None
+    # 리뷰 Important 2: `None`이 아니라 **구별 가능한** 결과다 — 호출자의
+    # None 분기는 "원장 불일치"만 뜻하므로 허위 desync 경보가 나간다.
+    assert result is not None
+    assert result.status == ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT
     assert rec.count == 0
     assert _suppression_reasons(caplog) == ["pending_sell"]
 
@@ -561,3 +571,266 @@ async def test_position_manager_close_passes_defensive_flag(monkeypatch):
 
     coord_stub._close_position.assert_awaited_once()
     assert coord_stub._close_position.await_args.kwargs.get("defensive") is True
+
+
+# -------------------------------------------
+# 리뷰 Important 3 — G2 나이 상한 (유일하게 남았던 무방비 창)
+# -------------------------------------------
+#
+# `TRACKING` → 종료 상태로 가는 길은 실질적으로 둘뿐이다: ka10076 누적 체결
+# (apply_fills → FILLED)과 장 마감/날짜 경과(expire_stale → EXPIRED).
+# `TrackedOrderStatus.CANCELLED`는 프로덕션 어디서도 대입되지 않고, 미체결
+# 조회(ka10075)도 추적기에 배선돼 있지 않다. 따라서 접수는 됐는데 체결로
+# 대사되지 않는 매도(실 KRX 시장가 잔량 자동 취소 / ord_no 불일치 / pending
+# 등록 후 사후 거부)는 마감까지 TRACKING으로 남아 그 종목의 모든 방어 매도를
+# 억제한다. 나이 상한이 그 창을 닫는다.
+
+
+async def test_g2_ignores_stale_pending_sell_and_submits(caplog):
+    """상한을 넘긴 미체결 SELL은 억제 근거로 쓰지 않는다 — 제출을 허용한다.
+
+    최악의 결과는 800033 거부 1회(= 수정 전과 같은 동작)인 반면, 상한이
+    없으면 결과는 마감까지 무방비다."""
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(
+        _pending_sell(age_seconds=DEFENSIVE_SELL_PENDING_MAX_AGE_SEC + 1)
+    )
+    rec = _Recorder(coord)
+
+    submitted = await coord._execute_order_from_monitor(
+        _sell_order(116, 36_000.0, reason="Stop-loss auto-execution")
+    )
+
+    assert submitted is True
+    assert rec.count == 1
+    assert _suppression_reasons(caplog) == []
+    # 구별되는 관측 포인트 — 라이브에서 이 로그를 세면 된다.
+    stale = [r.getMessage() for r in caplog.records
+             if "defensive_sell_stale_pending_ignored" in r.getMessage()]
+    assert len(stale) == 1
+    assert "ord_no=0005305" in stale[0]
+    assert "age_seconds=" in stale[0]
+    # 낡은 주문은 추적기에서 지우지 않는다 — 사후 체결이 오면
+    # apply_fills가 여전히 정상 대사해야 한다.
+    assert len(coord.fill_tracker.tracking()) == 1
+
+
+async def test_g2_still_suppresses_pending_sell_within_age_cap(caplog):
+    """회귀 가드: 상한이 너무 짧아 **정상적으로 작동 중인** 주문을 무시하면
+    안 된다. 라이브(089860)에서 부분체결 잔량은 약 90초 뒤에 사후 체결됐다 —
+    그 시점에 재제출을 허용했다면 800033을 자초했을 것이다."""
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(_pending_sell(age_seconds=90))
+    rec = _Recorder(coord)
+
+    assert await coord._execute_order_from_monitor(_sell_order(116, 36_000.0)) is False
+    assert rec.count == 0
+    assert _suppression_reasons(caplog) == ["pending_sell"]
+
+
+async def test_g2_age_cap_is_per_order_not_per_ticker():
+    """낡은 주문 하나가 있어도 **신선한** 미체결 SELL이 함께 있으면 억제는
+    유지된다 — 상한은 주문 단위 판정이지 종목 단위 해제가 아니다."""
+    coord = _coordinator(quantity=300)
+    coord.fill_tracker.register(
+        _pending_sell(ord_no="OLD", age_seconds=DEFENSIVE_SELL_PENDING_MAX_AGE_SEC + 1)
+    )
+    coord.fill_tracker.register(_pending_sell(ord_no="FRESH", age_seconds=5))
+    rec = _Recorder(coord)
+
+    assert await coord._execute_order_from_monitor(_sell_order(300, 36_000.0)) is False
+    assert rec.count == 0
+
+
+# -------------------------------------------
+# 리뷰 Important 2 — 억제가 허위 Telegram 경보를 내면 안 된다
+# -------------------------------------------
+#
+# 2026-07-28 선례: ADD 유동성 캡이 0주에 None을 돌려주자 호출자가 "원장
+# 불일치"로 오분류해 🚨 허위 경보를 반복했고,
+# `ORDER_STATUS_REJECTED_LIQUIDITY_CAP`라는 구별 가능한 반환으로 봉합했다.
+# reduce 억제도 정확히 같은 모양이라 같은 방식을 쓴다.
+
+
+async def test_reduce_suppression_returns_distinguishable_result_not_none():
+    """`None`은 호출자에게 오직 '원장에 포지션 없음'을 뜻한다 — 억제는 그것과
+    구별돼야 한다."""
+    coord = _coordinator(quantity=361)
+    coord.fill_tracker.register(_pending_sell())
+    rec = _Recorder(coord)
+
+    result = await coord._reduce_position(TICKER, 100, defensive=True)
+
+    assert result is not None, "None이면 호출자가 원장 불일치로 오진한다"
+    assert result.status == ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT
+    assert "pending_sell" in (result.message or "")
+    assert rec.count == 0
+    # 원장 불일치(진짜 None)와의 대조군은 아래 별도 테스트.
+
+
+async def test_reduce_returns_none_only_for_real_ledger_desync():
+    """회귀 가드: 진짜 원장 불일치는 여전히 None이어야 한다 — 그래야 desync
+    통지가 살아 있다."""
+    coord = _coordinator(quantity=0)  # 코디네이터 원장에 포지션 없음
+    _Recorder(coord)
+
+    assert await coord._reduce_position(TICKER, 100, defensive=True) is None
+
+
+async def test_position_manager_reduce_suppression_sends_no_false_alert(monkeypatch):
+    """PM 쪽 종단: 억제 결과를 받으면 desync/미체결 통지를 **둘 다** 보내지
+    않고, 감시 수량도 건드리지 않는다."""
+    from unittest.mock import AsyncMock
+
+    import app.dependencies as deps
+    from services.agent_chat.position_manager import PositionManager
+    from services.trading.models import OrderResult as _OR
+
+    pm = PositionManager()
+    position = pm.add_position(
+        ticker=TICKER, stock_name="비에이치아이", quantity=116,
+        avg_price=39_000.0, current_price=41_600.0,
+    )
+
+    coord_stub = AsyncMock()
+    coord_stub._reduce_position = AsyncMock(return_value=_OR(
+        order_id="", ticker=TICKER, side=OrderSide.SELL,
+        requested_quantity=30, filled_quantity=0, avg_price=0,
+        status=ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT,
+        message="방어 매도 재제출 가드 — pending_sell",
+    ))
+    monkeypatch.setattr(deps, "get_trading_coordinator", AsyncMock(return_value=coord_stub))
+
+    pm._notify_reduce_ledger_desync = AsyncMock()
+    pm._notify_reduce_unfilled = AsyncMock()
+
+    await pm._execute_reduce_position(position, 30, "agent_decision_reduce_partial")
+
+    pm._notify_reduce_ledger_desync.assert_not_awaited()
+    pm._notify_reduce_unfilled.assert_not_awaited()
+    assert pm._positions[TICKER].quantity == 116  # 수량 불변
+
+
+async def test_position_manager_reduce_desync_still_alerts(monkeypatch):
+    """회귀 가드(가장 중요): 진짜 원장 불일치(None)는 여전히 경보를 낸다 —
+    억제 분기가 desync 감지를 삼키면 안 된다."""
+    from unittest.mock import AsyncMock
+
+    import app.dependencies as deps
+    from services.agent_chat.position_manager import PositionManager
+
+    pm = PositionManager()
+    position = pm.add_position(
+        ticker=TICKER, stock_name="비에이치아이", quantity=116,
+        avg_price=39_000.0, current_price=41_600.0,
+    )
+
+    coord_stub = AsyncMock()
+    coord_stub._reduce_position = AsyncMock(return_value=None)
+    monkeypatch.setattr(deps, "get_trading_coordinator", AsyncMock(return_value=coord_stub))
+    pm._notify_reduce_ledger_desync = AsyncMock()
+
+    await pm._execute_reduce_position(position, 30, "agent_decision_reduce_partial")
+
+    pm._notify_reduce_ledger_desync.assert_awaited_once()
+
+
+async def test_position_manager_reduce_passes_defensive_flag(monkeypatch):
+    """M6 대칭 테스트: close뿐 아니라 reduce 배선도 고정한다 — 이 리포는
+    '한쪽만 고쳐 다른 쪽에서 재발' 이력이 여러 번이다."""
+    from unittest.mock import AsyncMock
+
+    import app.dependencies as deps
+    from services.agent_chat.position_manager import PositionManager
+    from services.trading.models import OrderResult as _OR
+
+    pm = PositionManager()
+    position = pm.add_position(
+        ticker=TICKER, stock_name="비에이치아이", quantity=116,
+        avg_price=39_000.0, current_price=41_600.0,
+    )
+
+    coord_stub = AsyncMock()
+    coord_stub._reduce_position = AsyncMock(return_value=_OR(
+        order_id="R", ticker=TICKER, side=OrderSide.SELL,
+        requested_quantity=30, filled_quantity=30, avg_price=41_600, status="filled",
+    ))
+    monkeypatch.setattr(deps, "get_trading_coordinator", AsyncMock(return_value=coord_stub))
+
+    await pm._execute_reduce_position(position, 30, "agent_decision_reduce_partial")
+
+    coord_stub._reduce_position.assert_awaited_once()
+    assert coord_stub._reduce_position.await_args.kwargs.get("defensive") is True
+
+
+# -------------------------------------------
+# 리뷰 M4 — 억제 로그 에피소드 래치
+# -------------------------------------------
+#
+# RiskMonitor는 1초 틱이라 래치가 없으면 3분짜리 G2 에피소드 하나가 WARNING
+# 180줄을 만든다. 이 리포에는 회전 없는 FileHandler로 35GB 단일 로그를 만든
+# 이력이 있다. 단, 어떤 에피소드도 WARNING 없이 지나가서는 안 된다.
+
+
+async def test_suppression_logs_warning_once_per_episode(caplog):
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(_pending_sell())
+    rec = _Recorder(coord)
+
+    for _ in range(10):
+        assert await coord._execute_order_from_monitor(
+            _sell_order(116, 36_000.0)
+        ) is False
+
+    assert rec.count == 0  # 억제는 10회 전부 유효
+    assert _suppression_reasons(caplog) == ["pending_sell"]  # WARNING은 1회
+
+
+async def test_suppression_logs_again_when_reason_changes(caplog):
+    """사유 전이(pending_sell → no_position)는 그 자체가 정보다 — 삼키면
+    안 된다."""
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(_pending_sell())
+    _Recorder(coord)
+
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+    coord._remove_position(TICKER)
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+
+    assert _suppression_reasons(caplog) == ["pending_sell", "no_position"]
+
+
+async def test_suppression_latch_rearms_after_release(caplog):
+    """🔴 억제가 풀렸다가 다시 걸리면 반드시 다시 WARNING이 나간다 — 래치가
+    영구히 침묵하면 안 된다."""
+    caplog.set_level("WARNING")
+    coord = _coordinator(quantity=116)
+    coord.fill_tracker.register(_pending_sell())
+    rec = _Recorder(coord)
+
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))  # 억제 #1
+
+    # 미체결이 만료돼 억제가 풀리고 실제로 제출된다 → 래치 재무장.
+    coord.fill_tracker.expire_stale(None)
+    coord._last_defensive_sell_at.clear()
+    assert await coord._execute_order_from_monitor(_sell_order(116, 36_000.0)) is True
+    assert rec.count == 1
+
+    # 새 미체결 SELL → 새 에피소드 → 다시 WARNING.
+    coord._add_position(
+        ManagedPosition(
+            ticker=TICKER, stock_name="비에이치아이", quantity=116,
+            avg_price=39_000.0, current_price=41_600.0,
+            stop_loss_mode=StopLossMode.AGENT_AUTO,
+        )
+    )
+    coord.fill_tracker.register(_pending_sell(ord_no="SECOND"))
+    await coord._execute_order_from_monitor(_sell_order(116, 36_000.0))
+
+    assert _suppression_reasons(caplog) == ["pending_sell", "pending_sell"]

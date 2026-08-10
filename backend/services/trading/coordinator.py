@@ -74,6 +74,33 @@ logger = logging.getLogger(__name__)
 # (매도가능수량 부족)으로 거부하면서 Kiwoom 레이트리밋만 갉아먹는다.
 DEFENSIVE_SELL_COOLDOWN_SEC = 30.0
 
+# G2 나이 상한: 미체결 SELL을 **억제 근거로 신뢰하는** 최대 시간(초).
+# 이 값을 넘긴 `TRACKING` 주문은 브로커 예약이 이미 풀렸는데 앱만 모르는
+# 상태일 수 있으므로 억제에 쓰지 않는다(사유·안전성 논증은
+# `_defensive_sell_suppression_reason`의 G2 항목 참고).
+#
+# 180초인 근거:
+#   * 하한 — 2026-08-10 라이브(089860)에서 부분체결된 시장가 매도의 잔량이
+#     **약 90초 뒤에** 사후 체결됐다(로그 2445 → 2537). 상한이 그보다 낮으면
+#     정상적으로 "작동 중"인 주문에 대고 무의미한 재제출을 시작한다. 관측된
+#     정착 시간의 2배를 잡는다.
+#   * 상한 — ka10076 폴이 30초 주기이므로 180초 = 연속 **6폴**. 여섯 번의
+#     브로커 스냅샷에서 한 번도 대사되지 않은 매도는 앱이 관측할 수 있는
+#     어떤 의미로도 "작동 중"이 아니다.
+#   * `fill_tracker`에는 재량 **지정가** 매도도 들어가고 그건 정당하게 오래
+#     걸릴 수 있다 — 그래도 논리는 그대로다: 그 주문을 무시하고 방어 매도를
+#     내면 최악이 거부 1회(G3가 30초에 한 번으로 묶는다)인 반면, 신뢰하면
+#     최악이 마감까지 무방비다.
+DEFENSIVE_SELL_PENDING_MAX_AGE_SEC = 180.0
+
+# 방어 매도가 재제출 가드(G1/G2/G3)에 막혔을 때의 OrderResult.status.
+# `None`(= 코디네이터 원장에 포지션 없음)과 반드시 구별돼야 한다 —
+# `ORDER_STATUS_REJECTED_LIQUIDITY_CAP`(2026-07-28)와 정확히 같은 선례다:
+# 호출자(`PositionManager._execute_reduce_position`)의 `None` 분기는 오직
+# "원장 불일치"를 뜻해 🚨 desync 통지를 발사하는데, 억제 시엔 포지션이 멀쩡히
+# 있으므로 그 통지는 사실과 다르다. 억제는 정상 동작이지 원장 문제가 아니다.
+ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT = "suppressed_defensive_resubmit"
+
 
 # DS-5: discovery EOD-chain scan-trigger wait, behind the DISCOVERY_ENABLED
 # kill switch (app/config.py). SC-2 (docs/superpowers/specs/
@@ -351,6 +378,17 @@ class ExecutionCoordinator:
         # 구멍을 메운다.
         self._last_defensive_sell_at: dict[str, float] = {}
         self._defensive_sell_cooldown_sec: float = DEFENSIVE_SELL_COOLDOWN_SEC
+        self._defensive_sell_pending_max_age_sec: float = (
+            DEFENSIVE_SELL_PENDING_MAX_AGE_SEC
+        )
+        # M4: 억제 로그의 에피소드 래치 — 종목별로 **마지막에 WARNING으로 남긴
+        # 사유**. RiskMonitor는 1초 틱이라 래치가 없으면 G2 에피소드 하나가
+        # 초당 WARNING을 낸다(이 리포에는 회전 없는 FileHandler로 35GB 단일
+        # 로그를 만든 이력이 있다). `monitor_gate_denied_notified`와 같은 형태로
+        # 에피소드당 1회만 WARNING, 반복은 DEBUG로 떨어뜨리고, 억제가 풀리거나
+        # **사유가 바뀌면** 다시 WARNING이 나가게 재무장한다(pending_sell →
+        # no_position 전이는 그 자체가 정보다).
+        self._defensive_sell_suppress_logged: dict[str, str] = {}
 
     def _defensive_sell_suppression_reason(
         self, ticker: str, position: Optional[ManagedPosition]
@@ -385,6 +423,25 @@ class ExecutionCoordinator:
             해제는 자동이다 — `apply_fills`가 전량 체결 시 FILLED로,
             `expire_stale`이 만료 시 EXPIRED로 상태를 바꾸면 그 주문은
             `tracking()`에서 빠진다. 영구 래치가 아니다.
+            🔴 **나이 상한**(`DEFENSIVE_SELL_PENDING_MAX_AGE_SEC`): 위 두 해제
+            경로가 전부다 — `TrackedOrderStatus.CANCELLED`는 enum에만 있고
+            프로덕션 어디서도 대입되지 않으며, 미체결 조회(ka10075)는
+            읽기 전용 REST 라우트에서만 쓰이고 추적기에 배선돼 있지 않다
+            (`pending_order_tracker.py`의 CANCELLED 주석 참고). 그래서 접수는
+            됐는데 체결로 대사되지 않는 매도 — ①시장가 잔량이 브로커에서 자동
+            취소된 경우(실 KRX 시장가는 잔량 자동 취소가 원칙) ②placement의
+            `order_id`와 ka10076의 `ord_no`가 어긋난 경우 ③`pending`으로
+            등록됐다가 사후 거부된 경우 — 는 **마감까지 TRACKING으로 남고**
+            그동안 그 종목의 모든 방어 매도가 억제된다.
+            억제의 정당화("브로커가 그 수량을 이미 예약 중")는 추적기의 믿음이
+            사실일 때만 성립하는데, 위 셋은 예약이 이미 풀렸는데 앱만 모르는
+            상태다. 그래서 나이가 상한을 넘긴 미체결 SELL은 **억제 근거로
+            쓰지 않는다**.
+            ⚠️ 나이 상한을 넘겨 제출한 결과의 최악은 `800033` 거부 **한 번**
+            — 즉 수정 전과 정확히 같은 동작이다. 반면 상한이 없으면 결과는
+            **마감까지 무방비**다. 거부는 API 호출 하나를 쓰고, 막힌 손절은
+            돈을 잃는다. 게다가 G3 쿨다운이 재시도를 30초에 한 번으로 묶으므로
+            폭주하지 않는다.
 
         G3 `cooldown` — G1·G2가 못 잡는 백스톱. 주문이 **미체결 등록도 없이**
             즉시 거부되면(브로커가 접수 자체를 거절) 추적기에 아무것도 남지
@@ -402,11 +459,33 @@ class ExecutionCoordinator:
             return "no_position"
 
         # G2
+        now = datetime.now()
         for tracked in self.fill_tracker.tracking():
             if tracked.ticker != ticker or tracked.side != "sell":
                 continue
-            if (tracked.total_quantity - tracked.filled_quantity) > 0:
-                return "pending_sell"
+            if (tracked.total_quantity - tracked.filled_quantity) <= 0:
+                continue
+
+            # 나이 상한 — 위 docstring의 "🔴 나이 상한" 참고. `placed_at`은
+            # 벽시계(datetime)다: 단조시계는 재시작을 못 넘는데 이 값은
+            # `to_payload`로 영속돼 재시작 뒤에도 살아 있어야 하므로 선택지가
+            # 없다. 시계가 뒤로 튀어 age가 음수가 되면 "신선함"으로 판정돼
+            # 억제가 유지되는데, 그 경우는 G3 쿨다운(단조시계)이 여전히
+            # 상한을 걸고 있고 다음 폴에서 정상 복귀한다.
+            age_seconds = (now - tracked.placed_at).total_seconds()
+            if age_seconds >= self._defensive_sell_pending_max_age_sec:
+                logger.warning(
+                    f"[Coordinator] defensive_sell_stale_pending_ignored: "
+                    f"{ticker} ord_no={tracked.ord_no} "
+                    f"age_seconds={age_seconds:.0f} "
+                    f"remaining={tracked.total_quantity - tracked.filled_quantity} "
+                    f"— 추적기는 아직 TRACKING이지만 브로커 예약이 이미 풀렸을 "
+                    f"수 있다. 억제 근거로 쓰지 않고 제출을 허용한다"
+                    f"(최악 = 800033 거부 1회, 대안 = 마감까지 무방비)"
+                )
+                continue
+
+            return "pending_sell"
 
         # G3
         last_at = self._last_defensive_sell_at.get(ticker)
@@ -424,26 +503,42 @@ class ExecutionCoordinator:
         position: Optional[ManagedPosition],
         *,
         source: str,
-    ) -> bool:
-        """`_defensive_sell_suppression_reason`의 로깅 래퍼.
+    ) -> Optional[str]:
+        """`_defensive_sell_suppression_reason`의 로깅 래퍼. 억제 사유를
+        그대로 돌려준다(제출해도 되면 None) — 호출자가 사유를 하류 계약에
+        실어야 하기 때문이다(`_reduce_position`의
+        `ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT` 메시지 참고).
 
         **모든 억제는 로그로 남는다** — 침묵이 성공으로 오인되면 안 된다.
         관문마다 구별되는 `reason=`을 남겨 사후에 "왜 안 나갔나"를 로그만으로
         판별할 수 있게 한다(`no_position`/`pending_sell`/`cooldown`).
+
+        M4 에피소드 래치: 같은 종목이 같은 사유로 연속 억제되는 동안에는 첫
+        번째만 WARNING이고 나머지는 DEBUG다. RiskMonitor가 1초 틱이라 래치가
+        없으면 3분짜리 G2 에피소드 하나가 WARNING 180줄을 만든다. 억제가
+        풀리거나 사유가 바뀌면 래치가 재무장돼 다음 WARNING이 반드시 나간다 —
+        즉 **어떤 억제 에피소드도 WARNING 없이 지나가지 않는다**.
         """
         reason = self._defensive_sell_suppression_reason(ticker, position)
         if reason is None:
-            return False
+            # 억제가 풀렸다 — 래치 재무장(다음 에피소드는 다시 WARNING).
+            self._defensive_sell_suppress_logged.pop(ticker, None)
+            return None
 
         held = position.quantity if position is not None else 0
-        logger.warning(
+        message = (
             f"[Coordinator] defensive_sell_suppressed: {ticker} "
             f"reason={reason} source={source} held={held} "
             f"pending_sells="
             f"{[o.ord_no for o in self.fill_tracker.tracking() if o.ticker == ticker and o.side == 'sell']} "
             f"— 방어는 취소되지 않는다(미체결 주문/다음 틱이 이어받는다)"
         )
-        return True
+        if self._defensive_sell_suppress_logged.get(ticker) == reason:
+            logger.debug(message)
+        else:
+            self._defensive_sell_suppress_logged[ticker] = reason
+            logger.warning(message)
+        return reason
 
     def _note_defensive_sell_submitted(self, ticker: str) -> None:
         """G3 쿨다운의 기준 시각을 찍는다. **실제 제출 직전**에만 부른다 —
@@ -1823,7 +1918,7 @@ class ExecutionCoordinator:
             # 거부 통지 래치)을 오염시킬 이유가 없다.
             if is_sell and self._defensive_sell_suppressed(
                 order.ticker, position, source="risk_monitor"
-            ):
+            ) is not None:
                 return False
 
             gate = await check_autonomy(
@@ -3255,7 +3350,7 @@ class ExecutionCoordinator:
             # 유지한다(무방비 방치가 아니다).
             if defensive and self._defensive_sell_suppressed(
                 ticker, position, source="position_manager_close"
-            ):
+            ) is not None:
                 return None
 
             order = OrderRequest(
@@ -3374,10 +3469,37 @@ class ExecutionCoordinator:
             # 한 번만 판정한다 — 위임 호출은 `defensive`를 그대로 넘기되
             # 그쪽에서 다시 걸리지는 않는다(같은 판정을 두 번 하는 셈이고,
             # 여기서 통과했으면 그쪽도 통과한다).
-            if defensive and self._defensive_sell_suppressed(
-                ticker, position, source="position_manager_reduce"
-            ):
-                return None
+            #
+            # ⚠️ `_close_position`과 달리 여기서는 `None`을 돌려주면 **안 된다**
+            # (리뷰 Important 2). 호출자
+            # `PositionManager._execute_reduce_position`의 `None` 분기는 오직
+            # "코디네이터 원장에 포지션 없음"을 뜻해 🚨
+            # `_notify_reduce_ledger_desync`("...포지션이 없어 주문이 접수되지
+            # 않았습니다... 수동 확인이 필요합니다")를 발사하는데, 억제 시엔
+            # 포지션이 멀쩡히 있으므로 사실과 다른 경보다. `filled<=0` 분기의
+            # `_notify_reduce_unfilled`도 마찬가지다. 2026-07-28 ADD 유동성 캡이
+            # 정확히 이 결함이었고 `ORDER_STATUS_REJECTED_LIQUIDITY_CAP`라는
+            # **구별 가능한 반환**으로 봉합했다 — 같은 방식을 그대로 쓴다.
+            # (`_close_position`의 `None`은 원래부터 "스킵, 감시 유지"로 정확히
+            #  해석되고 있어 대칭이 깨진 곳은 reduce 하나다.)
+            suppressed = (
+                self._defensive_sell_suppressed(
+                    ticker, position, source="position_manager_reduce"
+                )
+                if defensive
+                else None
+            )
+            if suppressed is not None:
+                return OrderResult(
+                    order_id="",
+                    ticker=ticker,
+                    side=OrderSide.SELL,
+                    requested_quantity=quantity,
+                    filled_quantity=0,
+                    avg_price=0,
+                    status=ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT,
+                    message=f"방어 매도 재제출 가드 — {suppressed}",
+                )
 
             sell_qty = min(quantity, position.quantity)
             if sell_qty <= 0:
