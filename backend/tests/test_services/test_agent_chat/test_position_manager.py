@@ -2189,7 +2189,7 @@ class TestApplyDecisionHonestyP0:
         closed = []
         fake_coord = MagicMock()
 
-        async def _close(ticker, decision_id=None, reason=None):
+        async def _close(ticker, decision_id=None, reason=None, **kwargs):
             closed.append(ticker)
             return MagicMock()  # non-None -- coordinator proceeded (N3)
 
@@ -2219,7 +2219,7 @@ class TestApplyDecisionHonestyP0:
         closed = []
         fake_coord = MagicMock()
 
-        async def _close(ticker, decision_id=None, reason=None):
+        async def _close(ticker, decision_id=None, reason=None, **kwargs):
             closed.append(ticker)
             return MagicMock()  # non-None -- coordinator proceeded (N3)
 
@@ -2304,7 +2304,7 @@ class TestApplyDecisionReducePartialP1:
         reduce_calls = []
         fake_coord = MagicMock()
 
-        async def _reduce(ticker, quantity, decision_id=None, reason=None):
+        async def _reduce(ticker, quantity, decision_id=None, reason=None, **kwargs):
             reduce_calls.append((ticker, quantity))
             return _order_result(filled_quantity=quantity)
 
@@ -2349,7 +2349,7 @@ class TestApplyDecisionReducePartialP1:
         reduce_calls = []
         fake_coord = MagicMock()
 
-        async def _reduce(ticker, quantity, decision_id=None, reason=None):
+        async def _reduce(ticker, quantity, decision_id=None, reason=None, **kwargs):
             reduce_calls.append((ticker, quantity))
             return _order_result(filled_quantity=quantity)
 
@@ -2396,7 +2396,7 @@ class TestApplyDecisionReducePartialP1:
 
         fake_coord = MagicMock()
 
-        async def _reduce(ticker, quantity, decision_id=None, reason=None):
+        async def _reduce(ticker, quantity, decision_id=None, reason=None, **kwargs):
             return _order_result(filled_quantity=0, requested_quantity=quantity)
 
         fake_coord._reduce_position = _reduce
@@ -2477,7 +2477,7 @@ class TestApplyDecisionReducePartialP1:
 
         fake_coord = MagicMock()
 
-        async def _reduce(ticker, quantity, decision_id=None, reason=None):
+        async def _reduce(ticker, quantity, decision_id=None, reason=None, **kwargs):
             # Simulate the coordinator's own clamp/ledger actually selling
             # the full 100 (e.g. its ManagedPosition only held 100 too, and
             # the clamp there collapsed the request into a full close).
@@ -3339,7 +3339,7 @@ class TestStrategicReevalTriggerP3:
         closed = []
         fake_trading_coord = MagicMock()
 
-        async def _close(ticker, decision_id=None, reason=None):
+        async def _close(ticker, decision_id=None, reason=None, **kwargs):
             closed.append((ticker, decision_id))
             return MagicMock()  # non-None -- coordinator proceeded (N3)
 
@@ -3444,7 +3444,7 @@ class TestDecisionIdLineageL3:
         close_calls = []
         fake_coord = MagicMock()
 
-        async def _close(ticker, decision_id=None, reason=None):
+        async def _close(ticker, decision_id=None, reason=None, **kwargs):
             close_calls.append((ticker, decision_id))
 
         fake_coord._close_position = _close
@@ -3614,7 +3614,7 @@ class TestS2AutoStopLossDefaultAndHitlFallback:
         closed = []
         fake_coord = MagicMock()
 
-        async def _close(ticker, decision_id=None, reason=None):
+        async def _close(ticker, decision_id=None, reason=None, **kwargs):
             closed.append(ticker)
             return MagicMock()  # non-None -- coordinator proceeded (N3)
 
@@ -3653,7 +3653,7 @@ class TestS2AutoStopLossDefaultAndHitlFallback:
         closed = []
         fake_coord = MagicMock()
 
-        async def _close(ticker, decision_id=None, reason=None):
+        async def _close(ticker, decision_id=None, reason=None, **kwargs):
             closed.append(ticker)
 
         fake_coord._close_position = _close
@@ -3698,7 +3698,7 @@ class TestS2AutoStopLossDefaultAndHitlFallback:
         closed = []
         fake_coord = MagicMock()
 
-        async def _close(ticker, decision_id=None, reason=None):
+        async def _close(ticker, decision_id=None, reason=None, **kwargs):
             closed.append(ticker)
 
         fake_coord._close_position = _close
@@ -3877,7 +3877,7 @@ class TestN3CoordinatorSkipKeepsMonitoring:
 
         fake_coord = MagicMock()
 
-        async def _close(ticker, decision_id=None, reason=None):
+        async def _close(ticker, decision_id=None, reason=None, **kwargs):
             return None  # coordinator skipped: in-flight guard / not found
 
         fake_coord._close_position = _close
@@ -3924,7 +3924,7 @@ class TestN3CoordinatorSkipKeepsMonitoring:
 
         fake_coord = MagicMock()
 
-        async def _close(ticker, decision_id=None, reason=None):
+        async def _close(ticker, decision_id=None, reason=None, **kwargs):
             return MagicMock()  # a real OrderResult stand-in -- non-None
 
         fake_coord._close_position = _close

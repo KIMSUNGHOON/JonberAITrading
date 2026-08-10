@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import math
+import time
 import uuid
 from datetime import datetime, date
 from typing import Optional, List, Callable, Awaitable
@@ -58,6 +59,20 @@ from services.background_scanner.scanner import ScanStatus, get_background_scann
 from services.discovery.orchestrator import run_discovery_pipeline
 
 logger = logging.getLogger(__name__)
+
+
+# G3 (방어 매도 재제출 가드): 같은 종목의 두 방어 매도 **제출** 사이의 최소
+# 간격(초). 30초인 근거 — 이 값보다 짧게 잡아도 새로 알 수 있는 것이 없다:
+#   * RiskMonitor는 1초 틱(`risk_monitor.py` `asyncio.sleep(1)`)이라 트리거
+#     자체는 초당 재발동하지만,
+#   * 브로커 진실이 앱으로 들어오는 유일한 창구인 ka10076 폴
+#     (`_poll_tracked_fills`)은 30초 스케줄러 틱(`_queue_scheduler_interval`)에
+#     묶여 있고,
+#   * 두 번째 방어 엔진 PositionManager의 감시 주기도 30초다.
+# 즉 30초는 "직전 제출의 결과를 아직 모르는 구간"의 길이다. 그 구간 안의
+# 재제출은 정보 없이 같은 주문을 다시 내는 것이고, 브로커는 그것을 800033
+# (매도가능수량 부족)으로 거부하면서 Kiwoom 레이트리밋만 갉아먹는다.
+DEFENSIVE_SELL_COOLDOWN_SEC = 30.0
 
 
 # DS-5: discovery EOD-chain scan-trigger wait, behind the DISCOVERY_ENABLED
@@ -323,6 +338,118 @@ class ExecutionCoordinator:
         # other coroutine, so `_acquire_defensive_exit_guard` is atomic by
         # construction without any explicit synchronization primitive.
         self._defensive_exit_inflight: set = set()
+
+        # 방어 매도 재제출 가드 G3 (2026-08-10 라이브 사고, 089860): 종목별
+        # 마지막 방어 매도 **제출 시각**(time.monotonic()). 벽시계가 아니라
+        # 단조시계여야 한다 — NTP 보정/서머타임이 쿨다운을 음수로 만들거나
+        # 영원히 만료되지 않게 하면 안 된다.
+        #
+        # ⚠️ `_defensive_exit_inflight`(동시성 가드)와 목적이 다르다. 저것은
+        # 같은 순간 두 코루틴이 겹치는 것을 막고 `finally`에서 즉시 풀린다 —
+        # **순차** 재발동(RiskMonitor가 1초 뒤 같은 트리거를 다시 쏘는 것)은
+        # 그대로 통과했고, 그것이 이 사고의 기전이었다. 이 dict는 그 시간축
+        # 구멍을 메운다.
+        self._last_defensive_sell_at: dict[str, float] = {}
+        self._defensive_sell_cooldown_sec: float = DEFENSIVE_SELL_COOLDOWN_SEC
+
+    def _defensive_sell_suppression_reason(
+        self, ticker: str, position: Optional[ManagedPosition]
+    ) -> Optional[str]:
+        """방어 매도(손절·익절·자율 청산)를 제출하면 안 되는 사유를 돌려준다
+        (제출해도 되면 None).
+
+        2026-08-10 09:00 라이브 사고(089860)에서 나온 세 관문이다. 익절 361주가
+        245주만 부분체결되자 포지션이 116주로 축소돼 RiskMonitor에 재등록됐고,
+        가격이 여전히 익절선 위라 즉시 재발동했다. 그런데 그 116주는 **미체결
+        주문이 브로커에서 이미 잡고 있어** 매도가능수량이 0이었다 → 800033
+        "모의투자 매도가능수량이 부족합니다". 세 번째 발동은 포지션이 제거된
+        뒤(보유 0주)에 일어났다.
+
+        G1 `no_position` — 보유하지 않은 것을 팔지 않는다. 하류의
+            `_apply_sell_position_delta`가 이미 "SELL fill has no local
+            position to reconcile — skipping"을 경고한다: 포지션 없이 진행하는
+            것은 이미 깨진 경로다.
+
+        G2 `pending_sell` — 같은 종목의 미체결 SELL이 있으면 제출하지 않는다.
+            ⚠️ **이 관문이 방어를 약화시키지 않는 이유**: 브로커에 걸려 있는
+            미체결 SELL은 그 수량을 **이미 예약**하고 있다. 매도가능수량 =
+            보유 − 예약이므로, 재제출해도 그 수량은 팔리지 않는다(그것이
+            800033이다). 즉 G2는 방어를 취소하는 것이 아니라 **불가능한 요청을
+            걸러내는 것**이고, 실제 방어는 이미 브로커에서 작동 중이다 —
+            미체결 주문 그 자체가 나가 있는 손절/익절이다.
+            전량 방어 청산에서는 요청 수량 = 보유 ≥ 매도가능수량이므로 G2가
+            막는 주문은 **브로커가 어차피 거부할 주문**과 정확히 같은 집합이다
+            (현상 유지보다 나쁠 수 없다). 유일한 손해는 예약분보다 작은
+            **부분 축소**를 통째로 미루는 것인데, 그 경로(`_reduce_position`)의
+            호출자는 재량적 트림이지 손절이 아니다.
+            해제는 자동이다 — `apply_fills`가 전량 체결 시 FILLED로,
+            `expire_stale`이 만료 시 EXPIRED로 상태를 바꾸면 그 주문은
+            `tracking()`에서 빠진다. 영구 래치가 아니다.
+
+        G3 `cooldown` — G1·G2가 못 잡는 백스톱. 주문이 **미체결 등록도 없이**
+            즉시 거부되면(브로커가 접수 자체를 거절) 추적기에 아무것도 남지
+            않고 포지션은 그대로라, 트리거가 매 틱 재발동한다. 반드시 시간으로
+            한정된다(`DEFENSIVE_SELL_COOLDOWN_SEC`, 기본 30초) — 영구 래치가
+            되면 억제된 손절 = 무방비 포지션이 된다.
+
+        판정 순서는 G1 → G2 → G3이다. 위 라이브 로그의 2차 발동은
+        `pending_sell`, 3차 발동은 `no_position`으로 각각 구별돼야 하는데,
+        1차 제출이 세워둔 쿨다운이 먼저 걸리면 둘 다 `cooldown`으로 뭉개져
+        사후 규명이 불가능해진다.
+        """
+        # G1
+        if position is None or position.quantity <= 0:
+            return "no_position"
+
+        # G2
+        for tracked in self.fill_tracker.tracking():
+            if tracked.ticker != ticker or tracked.side != "sell":
+                continue
+            if (tracked.total_quantity - tracked.filled_quantity) > 0:
+                return "pending_sell"
+
+        # G3
+        last_at = self._last_defensive_sell_at.get(ticker)
+        if (
+            last_at is not None
+            and (time.monotonic() - last_at) < self._defensive_sell_cooldown_sec
+        ):
+            return "cooldown"
+
+        return None
+
+    def _defensive_sell_suppressed(
+        self,
+        ticker: str,
+        position: Optional[ManagedPosition],
+        *,
+        source: str,
+    ) -> bool:
+        """`_defensive_sell_suppression_reason`의 로깅 래퍼.
+
+        **모든 억제는 로그로 남는다** — 침묵이 성공으로 오인되면 안 된다.
+        관문마다 구별되는 `reason=`을 남겨 사후에 "왜 안 나갔나"를 로그만으로
+        판별할 수 있게 한다(`no_position`/`pending_sell`/`cooldown`).
+        """
+        reason = self._defensive_sell_suppression_reason(ticker, position)
+        if reason is None:
+            return False
+
+        held = position.quantity if position is not None else 0
+        logger.warning(
+            f"[Coordinator] defensive_sell_suppressed: {ticker} "
+            f"reason={reason} source={source} held={held} "
+            f"pending_sells="
+            f"{[o.ord_no for o in self.fill_tracker.tracking() if o.ticker == ticker and o.side == 'sell']} "
+            f"— 방어는 취소되지 않는다(미체결 주문/다음 틱이 이어받는다)"
+        )
+        return True
+
+    def _note_defensive_sell_submitted(self, ticker: str) -> None:
+        """G3 쿨다운의 기준 시각을 찍는다. **실제 제출 직전**에만 부른다 —
+        게이트 거부/억제는 제출이 아니므로 쿨다운을 시작시키면 안 된다(그러면
+        게이트가 풀린 직후 30초를 공짜로 더 무방비로 만든다)."""
+        self._last_defensive_sell_at[ticker] = time.monotonic()
 
     def _acquire_defensive_exit_guard(self, ticker: str) -> bool:
         """Atomically claim `ticker` for an in-flight defensive SELL exit.
@@ -1687,6 +1814,18 @@ class ExecutionCoordinator:
                 (p for p in self._state.positions if p.ticker == order.ticker), None
             )
 
+            # 재제출 가드 G1/G2/G3 (2026-08-10 라이브 사고, 089860) — 위
+            # `_acquire_defensive_exit_guard`는 **동시성** 가드라 `finally`에서
+            # 즉시 풀리고, RiskMonitor가 1초 뒤 같은 트리거를 다시 쏘는
+            # **순차** 재발동은 그대로 통과했다. 사유별 판정/근거는
+            # `_defensive_sell_suppression_reason` 참고. 게이트 검사보다
+            # 앞에 둔다: 애초에 낼 수 없는 주문으로 게이트 판정(그리고 그
+            # 거부 통지 래치)을 오염시킬 이유가 없다.
+            if is_sell and self._defensive_sell_suppressed(
+                order.ticker, position, source="risk_monitor"
+            ):
+                return False
+
             gate = await check_autonomy(
                 "kiwoom",
                 action="SELL",
@@ -1709,6 +1848,8 @@ class ExecutionCoordinator:
                 # Gate allowed again: clear the latch so a future denial notifies.
                 position.monitor_gate_denied_notified = False
 
+            if is_sell:
+                self._note_defensive_sell_submitted(order.ticker)
             result = await self._execute_order(order)
             # Important 4: 브로커 거부는 예외가 아니라 정상 결과로 온다 —
             # _apply_sell_fill의 filled_quantity<=0 가드는 무통지이므로
@@ -3037,6 +3178,7 @@ class ExecutionCoordinator:
         decision_id: Optional[str] = None,
         _skip_inflight_guard: bool = False,
         reason: Optional[str] = None,
+        defensive: bool = False,
     ) -> Optional[OrderResult]:
         """Close a position at market price.
 
@@ -3079,6 +3221,16 @@ class ExecutionCoordinator:
         self-deny (the ticker is already "in flight", owned by the very call
         that's delegating); skipping applies ONLY to that one internal call
         site, never to an external caller.
+
+        `defensive` (2026-08-10, 089860 재제출 사고): True면 재제출 가드
+        G1/G2/G3(`_defensive_sell_suppression_reason`)를 적용한다. 이 메서드는
+        **두 번째 방어 엔진**(PositionManager 30초 틱 →
+        `_execute_close_position`)이 지나는 경로이자 동시에 **사람이 직접 누른
+        청산**(`handle_alert_action` CLOSE_POSITION, REST
+        `/api/trading/positions/{ticker}/close`)의 경로이기도 하다. 자율 방어만
+        억제하고 사람의 조작은 건드리지 않기 위해 호출자가 명시적으로 켠다 —
+        기본값 False라 사람 경로는 기존 동작 그대로다. 사람의 지시를 조용히
+        삼키는 것은 이 가드가 고치려는 결함보다 나쁘다.
         """
         if not _skip_inflight_guard and not self._acquire_defensive_exit_guard(ticker):
             return None
@@ -3091,6 +3243,19 @@ class ExecutionCoordinator:
 
             if not position:
                 logger.warning(f"[Coordinator] Position {ticker} not found")
+                return None
+
+            # 재제출 가드 — PositionManager(30초 틱)도 RiskMonitor(1초 틱)와
+            # 똑같이 미체결 SELL 위에 전량 청산을 다시 얹을 수 있다(같은
+            # 800033). 이 경로의 자율 게이트(`check_autonomy`)는 호출자인
+            # `_execute_close_position`에 있고 여기 도달했다면 이미 통과한
+            # 상태다. None 반환은 이 메서드에 **이미 존재하는** "스킵" 계약
+            # (in-flight 가드/포지션 없음)이라 호출자가 이미 다룬다 —
+            # `close_position_skipped_kept_monitored`로 로그하고 감시를
+            # 유지한다(무방비 방치가 아니다).
+            if defensive and self._defensive_sell_suppressed(
+                ticker, position, source="position_manager_close"
+            ):
                 return None
 
             order = OrderRequest(
@@ -3114,6 +3279,8 @@ class ExecutionCoordinator:
                 session_id=decision_id,
             )
 
+            if defensive:
+                self._note_defensive_sell_submitted(ticker)
             result = await self._execute_order(order)
             # Important 4: 브로커 거부는 예외가 아니라 정상 결과로 온다 —
             # 아래 _apply_sell_fill의 filled_quantity<=0 가드는 무통지이므로
@@ -3140,6 +3307,7 @@ class ExecutionCoordinator:
         quantity: int,
         decision_id: Optional[str] = None,
         reason: Optional[str] = None,
+        defensive: bool = False,
     ) -> Optional[OrderResult]:
         """Place a SELL order for a SPECIFIC quantity — a partial reduce, not
         a full close (P1, 2026-07-15,
@@ -3184,6 +3352,12 @@ class ExecutionCoordinator:
         guards against (see its docstring) — acquired ONCE here at the top
         and held across the delegated `_close_position(_skip_inflight_guard=
         True)` call below, so the delegation never tries to re-acquire it.
+
+        `defensive` (2026-08-10, 089860 재제출 사고): 재제출 가드 G1/G2/G3를
+        적용한다 — `_close_position`과 같은 의미(그 docstring 참고). 오늘의
+        유일한 호출자(`PositionManager._execute_reduce_position`)는 자율
+        경로라 True를 넘기지만, 기본값은 `_close_position`과 대칭을 맞춰
+        False로 둔다(사람 경로가 나중에 생겨도 조용히 삼켜지지 않도록).
         """
         if not self._acquire_defensive_exit_guard(ticker):
             return None
@@ -3194,6 +3368,15 @@ class ExecutionCoordinator:
             )
             if not position:
                 logger.warning(f"[Coordinator] Position {ticker} not found for reduce")
+                return None
+
+            # 재제출 가드. 위임 분기(`_close_position`)로 내려가기 **전에**
+            # 한 번만 판정한다 — 위임 호출은 `defensive`를 그대로 넘기되
+            # 그쪽에서 다시 걸리지는 않는다(같은 판정을 두 번 하는 셈이고,
+            # 여기서 통과했으면 그쪽도 통과한다).
+            if defensive and self._defensive_sell_suppressed(
+                ticker, position, source="position_manager_reduce"
+            ):
                 return None
 
             sell_qty = min(quantity, position.quantity)
@@ -3214,6 +3397,9 @@ class ExecutionCoordinator:
                 return await self._close_position(
                     ticker, decision_id=decision_id, _skip_inflight_guard=True,
                     reason=reason,
+                    # 재제출 가드도 그대로 넘긴다 — 위임된 쪽이 실제 제출
+                    # 지점이므로 G3 쿨다운 타임스탬프는 거기서 찍혀야 한다.
+                    defensive=defensive,
                 )
 
             order = OrderRequest(
@@ -3229,6 +3415,8 @@ class ExecutionCoordinator:
                 session_id=decision_id,
             )
 
+            if defensive:
+                self._note_defensive_sell_submitted(ticker)
             result = await self._execute_order(order)
             # Important 4: 브로커 거부는 예외가 아니라 정상 결과로 온다 —
             # 아래 _apply_sell_fill의 filled_quantity<=0 가드는 무통지이므로

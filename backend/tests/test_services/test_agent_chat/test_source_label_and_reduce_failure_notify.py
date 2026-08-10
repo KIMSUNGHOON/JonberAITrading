@@ -70,7 +70,7 @@ async def test_close_position_threads_accurate_source_label(reason, expected_lab
     gate = GateDecision(allowed=True, reason="ok", check="all")
     captured = {}
 
-    async def _close(ticker, decision_id=None, reason=None):
+    async def _close(ticker, decision_id=None, reason=None, **kwargs):
         captured["reason"] = reason
         return MagicMock(status="filled", filled_quantity=position.quantity)
 
@@ -99,7 +99,7 @@ async def test_reduce_position_threads_accurate_source_label():
     gate = GateDecision(allowed=True, reason="ok", check="all")
     captured = {}
 
-    async def _reduce(ticker, quantity, decision_id=None, reason=None):
+    async def _reduce(ticker, quantity, decision_id=None, reason=None, **kwargs):
         captured["reason"] = reason
         return MagicMock(status="filled", filled_quantity=quantity)
 

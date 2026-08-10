@@ -1642,6 +1642,13 @@ class PositionManager:
                 # 기본값("User-initiated close")으로 떨어지는데, 그 기본값은
                 # handle_alert_action의 진짜 사람 조작 전용이다.
                 reason=_EXIT_REASON_TO_SOURCE_LABEL.get(reason, "방어청산"),
+                # 2026-08-10 재제출 가드(089860): 이 호출은 **자율 방어 매도**다
+                # — 같은 종목의 미체결 SELL 위에 전량 청산을 다시 얹으면 브로커가
+                # 800033(매도가능수량 부족)으로 거부한다. 코디네이터의 G1/G2/G3를
+                # 켠다. `_close_position`은 사람이 직접 누른 청산
+                # (handle_alert_action/REST)과 **같은 메서드**라 기본값은 False이고,
+                # 자율 경로만 여기서 명시적으로 켠다.
+                defensive=True,
             )
 
             if result is None:
@@ -2020,6 +2027,10 @@ class PositionManager:
                 # 경로 라벨을 넘긴다 — 미전달 시 코디네이터 기본값
                 # ("Autonomous partial reduce")로 떨어진다.
                 reason=_EXIT_REASON_TO_SOURCE_LABEL.get(reason, "방어청산"),
+                # 2026-08-10 재제출 가드 — `_execute_close_position`과 같은 이유
+                # (자율 경로). 미체결 SELL이 예약한 수량 위에 축소를 또 내면
+                # 브로커가 거부한다.
+                defensive=True,
             )
 
             if result is None:
