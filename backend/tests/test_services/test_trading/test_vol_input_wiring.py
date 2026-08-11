@@ -25,6 +25,17 @@ def _llm(regime="bear", confidence=0.72):
     return provider
 
 
+def _lag(lagging, behind=None):
+    from services.trading.index_series import SeriesLag
+
+    return SeriesLag(
+        lagging=lagging,
+        latest=None,
+        expected=None,
+        trading_days_behind=behind,
+    )
+
+
 @pytest.mark.asyncio
 async def test_cycle_refreshes_index_before_judging():
     """수집이 판정보다 먼저여야 그날 종가가 변동성에 반영된다."""
@@ -70,8 +81,12 @@ async def test_judge_uses_index_daily_not_spy():
     # 도달조차 못 하고 이 테스트는 공허해진다. `get_llm_provider`도 같은
     # 이유로 패치한다 -- 진짜 LLM을 부르면 도달 여부가 우연에 좌우된다.
     _snap = {"quotes": {"SPY": {"chg_pct": -0.16, "prev_close": 769.8}}, "missing": []}
+    # ⚠️ `evaluate_series_lag`도 패치한다 -- 안 그러면 실물
+    # `KRXHolidayService`가 만들어져 라이브 `data/holidays.db`에
+    # `CREATE TABLE`을 친다(2026-08-11 지연 검사 배선).
     with patch.object(rj, "refresh_macro_snapshot", AsyncMock(return_value=_snap)), \
          patch.object(rj, "get_llm_provider", return_value=_llm()), \
+         patch.object(rj, "evaluate_series_lag", return_value=_lag(False)), \
          patch.object(rj, "compute_regime_target", _capture):
         await rj.judge_regime()
 
@@ -100,6 +115,42 @@ async def test_judge_passes_the_knobs_through():
 
     assert seen.get("target_vol_pct") == pytest.approx(33.0)
     assert seen.get("vol_multiplier_min") == pytest.approx(0.25)
+
+
+@pytest.mark.asyncio
+async def test_judge_wires_the_trading_day_lag_into_the_target():
+    """거래일 기준 지연이 판정 행의 `degraded`에 닿아야 한다.
+
+    닿지 않으면 공백은 여전히 보이지 않는다 -- 오늘(2026-08-11) 아침에
+    `degraded`가 `[]`로 비어 있어 08-10 종가 누락을 아무도 몰랐다.
+    """
+    from unittest.mock import MagicMock as _MM
+
+    storage = await get_storage_service()
+    await storage.upsert_index_daily(
+        [(f"2026-07-{d:02d}", 100.0 * (1.064 if d % 2 else 0.936))
+         for d in range(1, 22)],
+        source="test",
+    )
+    seen = {}
+
+    def _capture(**kw):
+        seen.update(kw)
+        raise RuntimeError("stop here")
+
+    from services.trading import regime_judge as rj
+
+    lag_spy = _MM(return_value=_lag(True, behind=1))
+    _snap = {"quotes": {"SPY": {"chg_pct": -0.16, "prev_close": 769.8}}, "missing": []}
+    with patch.object(rj, "refresh_macro_snapshot", AsyncMock(return_value=_snap)), \
+         patch.object(rj, "get_llm_provider", return_value=_llm()), \
+         patch.object(rj, "evaluate_series_lag", lag_spy), \
+         patch.object(rj, "compute_regime_target", _capture):
+        await rj.judge_regime()
+
+    lag_spy.assert_called_once()
+    assert lag_spy.call_args.args[0] == "2026-07-21", "시계열의 최신 행으로 물어야 한다"
+    assert seen.get("series_lagging") is True
 
 
 @pytest.mark.asyncio

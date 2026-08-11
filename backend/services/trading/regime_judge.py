@@ -26,6 +26,7 @@ from services.trading.exposure_target import (
 )
 from services.trading.index_series import (
     closes_to_returns,
+    evaluate_series_lag,
     is_series_stale,
     refresh_index_daily,
 )
@@ -154,6 +155,14 @@ async def judge_regime(
         series_stale = (
             is_series_stale(closes[-1][0], date.today()) if closes else False
         )
+        # 수집(`refresh_index_daily`, 사이클이 바로 앞에서 돌린다) 직후의
+        # 거래일 기준 지연 검사. 배수는 안 바꾸고 `degraded`에만 남는다 --
+        # 08-10(월) 종가 누락 때 `degraded`가 `[]`라 아무도 몰랐다.
+        series_lagging = (
+            evaluate_series_lag(closes[-1][0], date.today()).lagging
+            if closes
+            else False
+        )
 
         target = compute_regime_target(
             regime_label=regime,
@@ -163,6 +172,7 @@ async def judge_regime(
             equity=equity,
             equity_peak=equity_peak,
             series_stale=series_stale,
+            series_lagging=series_lagging,
             target_vol_pct=target_vol_pct,
             vol_multiplier_min=vol_multiplier_min,
         )

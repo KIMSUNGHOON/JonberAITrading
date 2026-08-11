@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import math
+from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Optional
+from typing import Any, Optional
 
 import structlog
 import yfinance as yf
@@ -62,11 +63,106 @@ def is_series_stale(latest_trade_date: str, today: date) -> bool:
     파싱이 실패하면 **True**(노후로 취급) -- 모르는 것을 신선하다고
     보면 안 된다.
     """
-    try:
-        latest = datetime.strptime(latest_trade_date, "%Y-%m-%d").date()
-    except (ValueError, TypeError):
+    latest = _parse_trade_date(latest_trade_date)
+    if latest is None:
         return True
     return (today - latest).days > INDEX_SERIES_MAX_AGE_DAYS
+
+
+def _parse_trade_date(value: Any) -> Optional[date]:
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+# -------------------------------------------
+# 거래일 기준 지연 검사 (2026-08-11)
+#
+# `is_series_stale`은 7**역일**이라 거래일로 치면 약 5일이다 -- 거래일
+# 하루가 통째로 빠져도 아무 신호가 없다. 2026-08-10(월) KOSPI 종가가
+# Yahoo에 안 올라온 날, 수집은 성공했고(`index_series_refreshed
+# rows=39 last=2026-08-07`) `degraded`는 `[]`였다. 공백을 우연히
+# 조회하다 발견했다.
+#
+# ⚠️ 이 검사는 **관측 신호**다 -- `m_vol`을 바꾸지 않는다. 거래일 하루
+# 뒤진 것이 20일 변동성을 의미 있게 바꾸지 않기 때문이다. 배수를 바꾸는
+# 것은 `is_series_stale`(7역일)과 표본 부족(`annualized_vol` → None)이다.
+# -------------------------------------------
+
+
+@dataclass(frozen=True)
+class SeriesLag:
+    """시계열이 직전 거래일보다 뒤졌는지.
+
+    `lagging`은 **3-상태**다 -- `True`(지연) / `False`(최신) /
+    `None`(판정 불가). 달력 조회 실패를 `False`로 접으면 달력이 죽은 날
+    공백이 영원히 안 보인다("오류와 부재를 합치지 않는다").
+    """
+
+    lagging: Optional[bool]
+    latest: Optional[date]
+    expected: Optional[date]          # 직전 거래일
+    trading_days_behind: Optional[int]
+
+
+_LAG_UNKNOWN = SeriesLag(lagging=None, latest=None, expected=None,
+                         trading_days_behind=None)
+
+
+def _default_holiday_service():
+    """KRX 거래일 달력. **lazy import** -- `services/discovery/ledger.py:53`과
+    같은 이유로, 이 모듈을 import하는 것만으로 krx_holiday의
+    apscheduler/aiohttp 의존이 딸려오지 않게 한다."""
+    from services.krx_holiday import get_holiday_service_sync
+
+    return get_holiday_service_sync()
+
+
+def evaluate_series_lag(
+    latest_trade_date: str,
+    today: date,
+    holiday_service: Optional[Any] = None,
+) -> SeriesLag:
+    """`index_daily` 최신 행이 **직전 거래일**보다 이전이면 지연이다.
+
+    never-raise -- 달력을 못 읽으면 `lagging=None`(모름)을 돌려준다.
+    노출도 계산이 이 검사 때문에 멈추면 관측 신호가 방어를 죽이는 셈이다.
+
+    직전 거래일을 기준으로 삼는 이유: 오늘 종가는 장이 닫히기 전에는
+    존재하지 않는다. 08:05 판정 시점에 있어야 할 최신 행은 어제(거래일
+    기준)의 종가다. 그래서 월요일 아침의 금요일 종가나 연휴 다음날의
+    연휴 전 종가는 **지연이 아니다** -- KRX 달력이 그 판단을 한다.
+    """
+    latest = _parse_trade_date(latest_trade_date)
+    if latest is None:
+        logger.warning("index_series_lag_unknown",
+                       reason="unparseable", latest=str(latest_trade_date))
+        return _LAG_UNKNOWN
+
+    try:
+        svc = holiday_service if holiday_service is not None else _default_holiday_service()
+        expected = svc.get_previous_trading_day(today)
+        if latest >= expected:
+            return SeriesLag(lagging=False, latest=latest, expected=expected,
+                             trading_days_behind=0)
+        # 빠진 거래일 수 = [latest, expected] 구간의 거래일 수 - 1(latest 자신).
+        # `services/discovery/ledger.py::_trading_days_elapsed`와 같은 관행.
+        days = svc.get_trading_days_in_range(latest, expected)
+        behind = len(days) - 1 if days and days[0] == latest else len(days)
+    except Exception as e:
+        logger.warning("index_series_lag_unknown", reason="calendar_failed",
+                       latest=latest.isoformat(), error=str(e))
+        return _LAG_UNKNOWN
+
+    logger.warning(
+        "index_series_lagging",
+        latest=latest.isoformat(),
+        expected=expected.isoformat(),
+        trading_days_behind=behind,
+    )
+    return SeriesLag(lagging=True, latest=latest, expected=expected,
+                     trading_days_behind=behind)
 
 
 def _fetch_history(lookback_days: int) -> list[tuple[str, float]]:

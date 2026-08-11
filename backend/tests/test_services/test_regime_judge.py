@@ -8,6 +8,22 @@ from services.trading.regime_judge import get_effective_target, judge_regime
 
 pytestmark = pytest.mark.usefixtures("isolated_storage_service")
 
+
+@pytest.fixture(autouse=True)
+def _no_real_holiday_calendar():
+    """거래일 지연 검사(2026-08-11)가 실물 `KRXHolidayService`를 만들지
+    않게 한다 -- `HolidayStorage.__init__`이 `data/holidays.db`에
+    `CREATE TABLE`을 친다. 이 파일은 달력이 아니라 판정·클램프를 본다."""
+    from services.trading.index_series import SeriesLag
+
+    with patch(
+        "services.trading.regime_judge.evaluate_series_lag",
+        return_value=SeriesLag(lagging=False, latest=None, expected=None,
+                               trading_days_behind=0),
+    ):
+        yield
+
+
 _SNAPSHOT = {
     "quotes": {"EWY": {"chg_pct": -2.97, "prev_close": 169.1},
                "SPY": {"chg_pct": -0.16, "prev_close": 769.8}},
@@ -195,6 +211,26 @@ async def _seed_prior(effective: float = 0.20):
     return storage
 
 
+async def _seed_fresh_index():
+    """`m_vol == 1.0`이 되는 신선한 KOSPI 시계열을 깔아 둔다.
+
+    ⚠️ 2026-08-11부터 표본 부족(`index_daily`가 비어 있음)은 **열화**이고
+    `m_vol`이 하한(0.5)으로 떨어진다 -- 그래야 데이터를 못 읽은 것이
+    노출도를 위로 열지 않는다. 이 파일의 클램프 테스트들은 변동성이
+    아니라 `_clamp_when_defense_unreliable`을 보는 것이므로, 배수가
+    산수에 끼어들지 않도록 정상 입력을 명시적으로 만들어 준다(±0.5%
+    → 연 8%대 → 배수는 상한 1.0에 붙는다).
+    """
+    storage = await get_storage_service()
+    rows = [
+        ((date.today() - timedelta(days=20 - i)).isoformat(),
+         100.0 if i % 2 == 0 else 100.5)
+        for i in range(21)
+    ]
+    await storage.upsert_index_daily(rows, source="test")
+    return storage
+
+
 @pytest.mark.asyncio
 async def test_portfolio_query_failure_is_recorded_in_degraded():
     """계좌 조회 자체가 실패하면(equity/stock_value를 모름) 판정 행의
@@ -223,6 +259,7 @@ async def test_portfolio_unavailable_clamps_target_to_the_previous_one():
     남는 안전 배수다. 계좌를 못 읽으면 `_drawdown_multiplier(0,0)`이 1.0을
     돌려주므로 그날은 방어가 통째로 없다 -- 그런 날 목표가 **오르면** 안 된다.
     """
+    await _seed_fresh_index()
     await _seed_prior(effective=0.20)
     with patch("app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
                AsyncMock(side_effect=RuntimeError("kiwoom down"))), \
@@ -262,7 +299,8 @@ async def test_portfolio_unavailable_without_prior_writes_nothing():
 @pytest.mark.asyncio
 async def test_equity_peak_unavailable_also_clamps():
     """고점을 못 읽어도 결과는 같다 -- `m_drawdown`이 무감쇠 1.0이 된다."""
-    storage = await _seed_prior(effective=0.20)
+    storage = await _seed_fresh_index()
+    await _seed_prior(effective=0.20)
     balance = MagicMock(evlu_amt=1_000_000.0, d2_ord_psbl_amt=500_000.0)
     client = MagicMock()
     client.get_account_balance = AsyncMock(return_value=balance)
@@ -285,7 +323,8 @@ async def test_equity_peak_unavailable_also_clamps():
 async def test_healthy_portfolio_state_is_not_clamped():
     """정상 조회에서는 클램프가 절대 걸리지 않는다 -- 안 그러면 목표가
     영원히 못 오른다(램프 자체가 죽는다)."""
-    storage = await _seed_prior(effective=0.20)
+    storage = await _seed_fresh_index()
+    await _seed_prior(effective=0.20)
     balance = MagicMock(evlu_amt=1_000_000.0, d2_ord_psbl_amt=500_000.0)
     client = MagicMock()
     client.get_account_balance = AsyncMock(return_value=balance)

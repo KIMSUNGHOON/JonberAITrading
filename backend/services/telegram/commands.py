@@ -782,5 +782,6 @@ register_command(
     "exposure", handle_exposure,
     summary="목표 노출도와 성분", group="지금 상태",
     detail="목적: 지금 얼마나 실려야 하는가, 무엇이 그것을 묶고 있나",
-    caution="degraded가 비어 있지 않으면 그 성분은 신뢰할 수 없어 중립 처리된 것",
+    caution="degraded가 비어 있지 않으면 그 성분을 못 믿어 방어적으로 눌러둔 것"
+            " — index_series_lagging은 거래일 공백 관측 신호라 배수는 안 바뀐다",
 )
