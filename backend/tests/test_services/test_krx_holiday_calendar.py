@@ -914,3 +914,39 @@ async def test_http_session_has_a_short_timeout():
         assert 0 < session.timeout.total <= 30, "타임아웃이 없거나 너무 길다"
     finally:
         await fetcher.close()
+
+
+def test_market_hours_fallback_does_not_cache_failure(monkeypatch):
+    """일시적 실패가 프로세스 수명 내내 폴백을 비우지 않는다(M5).
+
+    예전 판은 `except`를 지나서도 캐시에 빈 집합을 넣었다. 휴장일 0개는
+    **모든 평일이 거래일**이라는 뜻이라, 파생 한 번 실패가 그 프로세스의
+    남은 수명 동안 휴장일 판정을 통째로 무력화했다.
+    """
+    from services.trading.market_hours import MarketHoursService
+
+    saved = MarketHoursService._fallback_cache
+    try:
+        MarketHoursService._fallback_cache = None
+
+        boom = {"n": 0}
+
+        def _explode(self, year):
+            boom["n"] += 1
+            raise RuntimeError("일시적 실패")
+
+        monkeypatch.setattr(KRXHolidayFetcher, "_get_known_holidays", _explode)
+
+        first = MarketHoursService.fallback_holidays()
+        assert first == set()
+        assert boom["n"] > 0
+        assert MarketHoursService._fallback_cache is None, (
+            "실패 결과가 캐시됐다 -- 이후 호출이 영원히 빈 집합을 받는다"
+        )
+
+        # 원인이 사라지면 다음 호출이 회복돼야 한다.
+        monkeypatch.undo()
+        second = MarketHoursService.fallback_holidays()
+        assert date(2026, 8, 17) in second
+    finally:
+        MarketHoursService._fallback_cache = saved
