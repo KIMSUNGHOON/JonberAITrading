@@ -69,6 +69,12 @@ def _current_knobs(strategy: Optional[TradingStrategy]) -> dict:
         "stop_loss_pct": strategy.exit_conditions.stop_loss_pct,
         "take_profit_pct": strategy.exit_conditions.take_profit_pct,
         "max_trade_notional_pct": strategy.position_sizing.max_trade_notional_pct,
+        # 변동성 타게팅 노브 — 패널이 투표할 수 있는데도 현행 값이 컨텍스트에
+        # 없었다. strategy_panel._exposure_mechanics가 이 두 값으로 지금
+        # m_vol이 어디에 묶여 있는지를 계산하므로, 빠지면 그 블록이
+        # "모름"으로 저하된다(추정값을 대신 넣지는 않는다).
+        "target_vol_pct": strategy.position_sizing.target_vol_pct,
+        "vol_multiplier_min": strategy.position_sizing.vol_multiplier_min,
     }
 
 
