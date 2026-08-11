@@ -50,6 +50,9 @@ dependencies:
 
       # Market Data
       - yfinance>=1.0.0  # KOSPI(^KS11) index_series.py -- regime volatility input
+      # 음력→양력 변환. krx_holiday/fetcher.py가 설날·부처님오신날·추석을
+      # 계산한다(손입력 표를 대체). 순수 파이썬·의존성 0·유효 범위 ~2050.
+      - korean_lunar_calendar>=0.3.1
 
       # Storage & State
       - aiosqlite>=0.20.0

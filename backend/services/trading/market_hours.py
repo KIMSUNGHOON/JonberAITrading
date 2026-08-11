@@ -79,6 +79,21 @@ class MarketHoursService:
     _fallback_cache: Optional[Set[date]] = None
 
     @classmethod
+    def fallback_years(cls) -> list:
+        """폴백이 파생할 연도 창 -- **오늘을 따라 움직인다**.
+
+        예전에는 krx_holiday의 손입력 표 키(2024·2025·2026 고정)를 그대로
+        썼다. 그 표가 계산으로 바뀐 지금 그 목록은 존재하지 않고, 설령
+        있었어도 2027년 1월에 창이 통째로 말라붙었을 것이다.
+
+        `올해-1 ~ 올해+2`인 이유: 폴백은 프로세스 수명 동안 한 번만
+        파생되므로 연말에 기동해도 다음 해가 들어 있어야 하고(+2),
+        직전 해는 EOD 소급 조회가 밟는다(-1).
+        """
+        this_year = datetime.now(KST).year
+        return list(range(this_year - 1, this_year + 3))
+
+    @classmethod
     def fallback_holidays(cls) -> Set[date]:
         """폴백 휴장일 -- krx_holiday의 규칙 엔진에서 1회 파생 후 캐시.
 
@@ -86,17 +101,27 @@ class MarketHoursService:
         빈 집합이 들어가, 일시적 실패 한 번이 프로세스 수명 내내 폴백
         휴장일을 비웠다(휴장일 0개 = 모든 평일이 거래일). 실패해도 예외는
         내지 않는다 -- 그 경우 주말 규칙만 남고 호출자는 계속 동작한다.
+
+        ⚠️ **연도 루프는 한 해씩 격리한다.** 창이 음력 계산 상한(2050)을
+        넘기 시작하는 2049년부터는 창의 마지막 해가 반드시 실패하는데,
+        하나의 try로 묶여 있으면 그 한 해 때문에 폴백 **전체**가 빈 집합이
+        된다. 부분 달력을 조용히 내지 않는다는 원칙은 **한 연도 안**에서
+        지켜지는 것이고, 창은 원래부터 일부 연도만 담는다.
         """
         if cls._fallback_cache is not None:
             return cls._fallback_cache
 
         derived: Set[date] = set()
+        failed: list = []
         try:
             from services.krx_holiday.fetcher import KRXHolidayFetcher
 
             fetcher = KRXHolidayFetcher()
-            for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
-                derived.update(h.date for h in fetcher._get_known_holidays(year))
+            for year in cls.fallback_years():
+                try:
+                    derived.update(h.date for h in fetcher._get_known_holidays(year))
+                except Exception as e:
+                    failed.append(f"{year}: {e}")
         except Exception as e:
             logger.error(
                 "market_hours_fallback_holidays_unavailable",
@@ -105,6 +130,23 @@ class MarketHoursService:
                      "캐시하지 않으므로 다음 호출에서 재시도한다.",
             )
             return derived  # 캐시하지 않는다 -- 다음 호출에서 다시 시도
+
+        if failed:
+            logger.error(
+                "market_hours_fallback_year_unavailable",
+                years=failed,
+                hint="해당 연도의 휴장일이 폴백에서 빠졌다 -- 그 해 평일은 "
+                     "전부 거래일로 보인다. 나머지 연도는 정상 파생됐다.",
+            )
+
+        if not derived:
+            logger.error(
+                "market_hours_fallback_holidays_unavailable",
+                error="; ".join(failed) or "no years derived",
+                hint="휴장일 폴백이 비었다 -- 주말 규칙만 적용된다. "
+                     "캐시하지 않으므로 다음 호출에서 재시도한다.",
+            )
+            return derived  # 캐시하지 않는다
 
         cls._fallback_cache = derived
         return cls._fallback_cache

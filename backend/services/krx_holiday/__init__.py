@@ -9,11 +9,15 @@ from .fetcher import (
     HolidayInfo,
     IncompleteHolidayDataError,
     KRXHolidayFetcher,
+    LUNAR_CALC_MAX_YEAR,
+    LUNAR_CALC_MIN_YEAR,
     SOURCE_FALLBACK_TABLE,
     SOURCE_KRX_API,
     SOURCE_UNKNOWN,
     SUBSTITUTE_HOLIDAY_NAME,
+    compute_lunar_holidays,
     compute_substitute_holidays,
+    lunar_calendar_available,
 )
 from .storage import HolidayStorage
 from .service import (
@@ -35,7 +39,11 @@ __all__ = [
     "SOURCE_FALLBACK_TABLE",
     "SOURCE_UNKNOWN",
     "SUBSTITUTE_HOLIDAY_NAME",
+    "LUNAR_CALC_MIN_YEAR",
+    "LUNAR_CALC_MAX_YEAR",
+    "compute_lunar_holidays",
     "compute_substitute_holidays",
+    "lunar_calendar_available",
     "get_holiday_service",
     "get_holiday_service_sync",
 ]
