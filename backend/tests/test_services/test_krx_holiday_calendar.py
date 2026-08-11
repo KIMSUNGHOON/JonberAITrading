@@ -17,7 +17,7 @@
 주입하지 않으면 라이브 `backend/data/holidays.db`를 건드린다.
 """
 
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -484,3 +484,97 @@ async def test_telegram_briefing_style_call_still_works(svc, offline_fetcher):
         await svc.close()
 
     assert svc.is_trading_day(date(2026, 8, 11)) is True
+
+
+def test_market_hours_fallback_is_derived_not_a_second_copy():
+    """`market_hours`의 폴백 표는 사본이 아니라 같은 규칙 엔진의 파생물이다.
+
+    수정 전에는 손입력 사본이었고 krx_holiday의 표와 **똑같은 결손**을
+    갖고 있었다(2026 대체공휴일 4일 전부 + 2025-03-03 누락). 사본을
+    남겨 두면 두 판정 경로가 조용히 갈린다.
+    """
+    from services.trading.market_hours import MarketHoursService
+
+    MarketHoursService._fallback_cache = None  # 파생 경로를 실제로 태운다
+    fallback = MarketHoursService.fallback_holidays()
+
+    fetcher = KRXHolidayFetcher()
+    for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
+        expected = {h.date for h in fetcher._get_known_holidays(year)}
+        actual = {d for d in fallback if d.year == year}
+        assert actual == expected, f"{year} 폴백이 규칙 엔진과 다르다"
+
+    # 오늘의 실제 피해 4일이 폴백에도 들어 있어야 한다.
+    for d in [date(2026, 3, 2), date(2026, 5, 25), date(2026, 8, 17), date(2026, 10, 5)]:
+        assert d in fallback
+
+
+@pytest.mark.asyncio
+async def test_initialize_repairs_an_incomplete_year(svc, offline_fetcher, monkeypatch):
+    """**재기동만으로** 이미 저장된 틀린 달력이 교정된다.
+
+    라이브 DB의 2026년은 대체공휴일 4일이 빠진 16행 상태였다. 예전
+    `initialize()`의 기준은 "행이 있는가"(`has_year_data`)라서 그 16행이
+    스스로를 갱신에서 **영원히 제외했다** -- 재기동해도 고쳐지지 않는다.
+    기준을 `is_year_complete`로 바꾸면 부팅이 곧 교정이 된다.
+    """
+    import services.krx_holiday.service as service_module
+
+    # 라이브 상태 재현: 대체공휴일 없는 2026 달력을 coverage 마커 없이 저장.
+    fetcher = KRXHolidayFetcher()
+    partial = [
+        h for h in fetcher._get_known_holidays(2026)
+        if h.name != SUBSTITUTE_HOLIDAY_NAME
+    ]
+    svc.storage.save_holidays(partial)
+    assert svc.storage.has_year_data(2026)          # 행은 있고
+    assert not svc.storage.is_year_complete(2026)   # 완전하지는 않다
+    assert svc.is_trading_day(date(2026, 8, 17)) is True  # 아직 틀렸다
+
+    # 시스템 시계와 무관하게 결정적으로: current_year=2026으로 고정.
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 11, 9, 0, 0)
+
+    monkeypatch.setattr(service_module, "datetime", _FixedDatetime)
+
+    try:
+        await svc.initialize(fetch_if_empty=True)
+    finally:
+        await svc.close()
+
+    assert svc.storage.is_year_complete(2026)
+    assert svc.is_trading_day(date(2026, 8, 17)) is False
+
+
+@pytest.mark.asyncio
+async def test_initialize_skips_years_already_complete(svc, offline_fetcher, monkeypatch):
+    """완전하게 저장된 연도는 부팅마다 다시 받지 않는다."""
+    import services.krx_holiday.service as service_module
+
+    await svc.update_holidays(2026)
+    assert svc.storage.is_year_complete(2026)
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 11, 9, 0, 0)
+
+    monkeypatch.setattr(service_module, "datetime", _FixedDatetime)
+
+    calls = []
+    original = svc.fetcher.fetch_holidays_with_source
+
+    async def _spy(year):
+        calls.append(year)
+        return await original(year)
+
+    svc.fetcher.fetch_holidays_with_source = _spy
+    try:
+        await svc.initialize(fetch_if_empty=True)
+    finally:
+        await svc.close()
+
+    assert 2026 not in calls   # 완전 → 건너뜀
+    assert 2027 in calls       # 표가 못 덮는 해 → 재시도하고 ERROR를 남긴다

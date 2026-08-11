@@ -58,47 +58,47 @@ class MarketHoursService:
     Fallback to hardcoded holidays if service is unavailable.
     """
 
-    # Fallback Korean public holidays (used when KRXHolidayService unavailable)
-    FALLBACK_HOLIDAYS = {
-        # 2025
-        date(2025, 1, 1),   # New Year
-        date(2025, 1, 28),  # Lunar New Year
-        date(2025, 1, 29),
-        date(2025, 1, 30),
-        date(2025, 3, 1),   # Independence Movement Day
-        date(2025, 5, 5),   # Children's Day
-        date(2025, 5, 6),   # Buddha's Birthday (substitute)
-        date(2025, 6, 6),   # Memorial Day
-        date(2025, 8, 15),  # Liberation Day
-        date(2025, 10, 3),  # National Foundation Day
-        date(2025, 10, 5),  # Chuseok Eve
-        date(2025, 10, 6),  # Chuseok
-        date(2025, 10, 7),  # Chuseok
-        date(2025, 10, 8),  # Substitute
-        date(2025, 10, 9),  # Hangul Day
-        date(2025, 12, 25), # Christmas
-        date(2025, 12, 31), # Year End
-        # 2026
-        date(2026, 1, 1),   # New Year
-        date(2026, 2, 16),  # Lunar New Year
-        date(2026, 2, 17),
-        date(2026, 2, 18),
-        date(2026, 3, 1),   # Independence Movement Day
-        date(2026, 5, 5),   # Children's Day
-        date(2026, 5, 24),  # Buddha's Birthday
-        date(2026, 6, 6),   # Memorial Day
-        date(2026, 8, 15),  # Liberation Day
-        date(2026, 9, 24),  # Chuseok
-        date(2026, 9, 25),
-        date(2026, 9, 26),
-        date(2026, 10, 3),  # National Foundation Day
-        date(2026, 10, 9),  # Hangul Day
-        date(2026, 12, 25), # Christmas
-        date(2026, 12, 31), # Year End
-    }
+    # KRXHolidayService를 못 쓸 때만 쓰이는 폴백 휴장일 집합.
+    #
+    # ⚠️ 예전에는 여기에 날짜를 **손으로 적은 사본**이 있었고, krx_holiday의
+    # 하드코딩 표와 **똑같은 결손**을 갖고 있었다(2026-08-11 실측):
+    #   2026-03-02 · 2026-05-25 · 2026-08-17 · 2026-10-05 (대체공휴일 전부)
+    #   2025-03-03 (삼일절 대체공휴일)
+    # 사본이 둘이면 어긋날 때 어느 쪽이 맞는지 알 수 없고, 실제로 둘 다
+    # 같은 방식으로 틀려 있었다. 그래서 사본을 없애고 **같은 규칙 엔진에서
+    # 파생**시킨다.
+    #
+    # import는 지연시킨다 -- 아래 `_get_holiday_service`가 순환 import를
+    # 피하려고 그러는 것과 같은 이유이고, 여기서는 apscheduler(krx_holiday
+    # 패키지 __init__이 끌어온다)를 모든 market_hours 임포터에 얹지 않기
+    # 위해서이기도 하다. 파생이 실패해도 예외를 내지 않는다 -- 그 경우
+    # 휴장일 집합이 비고 주말 규칙만 남는다(호출자는 계속 동작한다).
+    _fallback_cache: Optional[Set[date]] = None
+
+    @classmethod
+    def fallback_holidays(cls) -> Set[date]:
+        """폴백 휴장일 -- krx_holiday의 규칙 엔진에서 1회 파생 후 캐시."""
+        if cls._fallback_cache is None:
+            derived: Set[date] = set()
+            try:
+                from services.krx_holiday.fetcher import KRXHolidayFetcher
+
+                fetcher = KRXHolidayFetcher()
+                for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
+                    derived.update(
+                        h.date for h in fetcher._get_known_holidays(year)
+                    )
+            except Exception as e:
+                logger.error(
+                    "market_hours_fallback_holidays_unavailable",
+                    error=str(e),
+                    hint="휴장일 폴백이 비었다 -- 주말 규칙만 적용된다.",
+                )
+            cls._fallback_cache = derived
+        return cls._fallback_cache
 
     def __init__(self):
-        self._holiday_cache: Set[date] = set(self.FALLBACK_HOLIDAYS)
+        self._holiday_cache: Set[date] = set(self.fallback_holidays())
         self._holiday_service = None
         self._holiday_service_checked = False
 

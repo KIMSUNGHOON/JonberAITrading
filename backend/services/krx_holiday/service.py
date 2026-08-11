@@ -83,9 +83,23 @@ class KRXHolidayService:
         # Check if we need to fetch data
         if fetch_if_empty:
             # Check current and next year
+            #
+            # ⚠️ 기준은 "행이 있는가"(has_year_data)가 아니라 "**완전한**
+            # 달력으로 저장된 적이 있는가"(is_year_complete)다. 행 존재만
+            # 보면 이미 틀린 달력이 영원히 자기 자신을 갱신에서 제외한다 --
+            # 라이브 DB의 2026년 16행(대체공휴일 4일 누락)과 2027년 9행
+            # (설날·추석 통째로 누락)이 정확히 그 상태였고, 재기동해도
+            # 스스로 고쳐지지 않았다.
+            #
+            # 완전한 배치로 한 번 저장되면 마커가 찍혀 다음 부팅부터는
+            # 건너뛴다. 표가 덮지 못하는 연도(예: 2027)는 매 부팅 재시도
+            # 하며 ERROR를 남긴다 -- 조용히 지나가는 것보다 낫다.
             for year in [current_year, current_year + 1]:
-                if not self.storage.has_year_data(year):
-                    logger.info(f"No holiday data for {year}, fetching...")
+                if not self.storage.is_year_complete(year):
+                    logger.info(
+                        f"Holiday calendar for {year} is missing or incomplete, "
+                        f"fetching..."
+                    )
                     await self.update_holidays(year)
 
         self._initialized = True
