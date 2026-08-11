@@ -5,11 +5,70 @@
 
 ---
 
-## 0. 라이브 상태 (2026-08-11 마감 시점)
+## 0-A. 🔴 현재 시스템은 **정지 상태**다 — 먼저 기동할 것
+
+2026-08-11 17:28에 사용자가 PC 재부팅을 위해 백엔드·프론트엔드를 정상 종료했다
+(`Application shutdown complete`, 미체결 주문 0건, 포트 해제 확인).
+
+### 기동 명령
+
+```bash
+cd /Users/sunghoonk/Workspaces/JonberAITrading/backend && \
+nohup /Users/sunghoonk/anaconda3/envs/agentic-trading/bin/python run_dev.py \
+  > ../debug/backend-$(date +%Y%m%d-%H%M).log 2>&1 &
+```
+
+⚠️ **conda 인터프리터를 절대 경로로 쓸 것.** `python run_dev.py`는 base 환경을 타서
+`ModuleNotFoundError: uvicorn`으로 죽는다. 2026-08-11 장중에 이걸로 1분간 무방비가 됐다.
+
+프론트엔드(필요시): `cd frontend && npm run dev` (포트 5173)
+
+**기한: 2026-08-12 08:05 전.** 그때 레짐 판정 사이클이 돌고 09:00에 개장한다.
+장이 닫혀 있는 동안은 포지션이 안 움직이므로 보호 공백은 생기지 않는다.
+
+### 기동 후 확인
+
+```bash
+grep -aE "Restored .* positions|holiday_service_initialized|Traceback" debug/backend-*.log | tail -3
+curl -s http://127.0.0.1:8000/api/trading/positions | python3 -m json.tool
+```
+
+| 확인 | 합격 |
+|---|---|
+| 복원 로그 | `[Coordinator] Restored 5 positions, ... daily_count=3` |
+| 달력 | `holiday_service_initialized ... untrusted_years=[]` |
+| 기동 오류 | `Traceback` 0건 |
+| 손절가 5종 | 316140 31,154 · 004370 351,075 · 028670 5,520 · 030000 17,765 · 207940 1,404,840 |
+| 모드 | `mode=active` |
+
+### 🔴 반드시 확인할 것 — 028670 수량 불일치
+
+**영속된 코디네이터 스냅샷은 028670이 3,115주인데, 브로커에는 3,470주가 있다.**
+16:35 시간외 체결 355주(209+146)가 원장(`kr_stock_trades`)에는 들어갔으나
+포지션 스냅샷에는 반영되지 않은 채 종료됐다.
+
+리컨실러가 브로커 잔고와 대조해 메우게 되어 있다(30초 스케줄러 2틱마다 ≈60초).
+**기동 후 5분쯤 지나 3,470주로 맞춰졌는지 확인할 것.**
+
+```bash
+curl -s http://127.0.0.1:8000/api/trading/positions | python3 -c "
+import json,sys
+r=json.load(sys.stdin); r=r.get('data') or r
+if isinstance(r,dict): r=r.get('positions') or []
+for p in r:
+    if p.get('ticker')=='028670': print('028670:', p.get('quantity'), '주  (3470이면 정상, 3115면 리컨실러 미작동)')"
+```
+
+3,115주 그대로면 리컨실러가 안 도는 것이고 별도 조치가 필요하다.
+방치하면 손절 발동 시 355주가 덜 팔린다.
+
+---
+
+## 0-B. 정지 직전 라이브 상태 (2026-08-11 17:28)
 
 | 항목 | 값 |
 |---|---|
-| 프로세스 | **PID 70185** (17:15 기동) · 포트 8000 |
+| 프로세스 | PID 70185 (17:15 기동, **17:28 정상 종료**) · 포트 8000 |
 | 코드 | `4107ec9` · 브랜치 `read-trading-prompt-dgm5U` |
 | 계좌 | equity ₩499,000,954 · 현금 ₩427,855,838 · 주식 ₩71,145,116 (14.26%) |
 | 모드 | `mode=active` |
