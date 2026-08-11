@@ -209,6 +209,9 @@ def _mechanics_skeleton() -> dict:
         "target_vol_pct": None,
         "vol_multiplier_min": None,
         "m_vol_unclamped": None,
+        # `m_vol`이 위 비율에서 나왔는가. False면 엔진이 열화 폴백을 썼다는
+        # 뜻이라 `m_vol_unclamped`와 `m_vol`이 안 맞는 것이 **정상**이다.
+        "m_vol_from_ratio": None,
         "m_vol": None,
         "m_vol_binding": "unknown",
         "m_drawdown_used": None,
@@ -301,7 +304,15 @@ def _vol_min_candidates(current: Optional[float]) -> list[float]:
 
 
 async def _exposure_mechanics(storage: Any, knobs: dict) -> dict:
-    """노출도 산식의 **현재 상태**. 절대 raise하지 않는다.
+    """노출도 산식의 **현재 상태**.
+
+    ⚠️ **계약**: 알려진 실패(조회 예외·데이터 없음·엔진 예외)에서는 raise
+    하지 않고 `unknown` + `None`으로 저하한다. 다만 "절대"를 보증하는 것은
+    이 함수가 아니라 `build_strategy_context`의 바깥 겹이다 -- 여기서 못 본
+    예외가 나면 그쪽이 `status:"error"` 블록으로 받는다(2026-08-11 리뷰 3).
+    엔진이 던질 수 있다는 것은 실제 사례가 있다: 21일 종가가 완전히 평탄하면
+    `annualized_vol`이 `0.0`을 돌려주고 `compute_regime_target`의
+    `target_vol_pct / vol_ann`이 ZeroDivisionError가 된다.
 
     ⚠️ **엔진의 열화 규칙을 두 번째로 복사하지 않는다**(2026-08-11 리뷰,
     Important 3). `m_vol`도, 열화 시 폴백도, 다음 목표도 전부
@@ -358,6 +369,11 @@ async def _exposure_mechanics(storage: Any, knobs: dict) -> dict:
     block["regime_label"] = regime_label
     block["prev_target_pct"] = prev_target
     block["current_target_pct"] = prev_target
+    if known_label is not None:
+        # 판정 행에 **기록된** 앵커를 먼저 싣는다. 아래 엔진 계산이 같은
+        # 값으로 덮어쓰지만, 엔진이 던지는 날에도 이 사실은 남아야 한다
+        # (2026-08-11 리뷰 3: 저하 경로에서 알던 것까지 잃지 않는다).
+        block["regime_anchor_pct"] = _as_float(judgment.get("anchor_target_pct"))
 
     # --- 실제 노출도 · 낙폭 배수 입력 (관측 원장)
     shadow: Optional[dict] = None
@@ -409,7 +425,20 @@ async def _exposure_mechanics(storage: Any, knobs: dict) -> dict:
 
     # 레짐 라벨별 계산. `m_vol`은 라벨과 무관해야 하지만 그것도 **확인해서**
     # 쓴다 -- 엔진의 구조를 가정하지 않는다.
-    per_anchor = {label: engine(label=label) for label in REGIME_ANCHORS}
+    #
+    # ⚠️ 엔진 호출을 감싸는 이유(2026-08-11 리뷰 3): 여기서 예외가 나면
+    # 바깥 겹이 받긴 하지만 그때는 **이미 알아낸 사실까지 전부 None**이
+    # 된다(노브·레짐 앵커·직전 목표·실제 노출도). 엔진의 실패 조건을
+    # 여기서 흉내 내지 않으면서도(사본 금지) 우아하게 저하하는 방법은
+    # 부르고 받는 것이다 -- 어떤 이유로 던지든 같은 자리에서 걸린다.
+    try:
+        per_anchor = {label: engine(label=label) for label in REGIME_ANCHORS}
+    except Exception as e:
+        logger.warning(f"[StrategyPanel] exposure projection failed: {e}")
+        unknown.append("engine_projection")
+        block["unknown"] = unknown
+        block["status"] = "partial"
+        return block
     m_vols = {t.m_vol for t in per_anchor.values()}
 
     primary = per_anchor[known_label] if known_label else None
@@ -431,10 +460,16 @@ async def _exposure_mechanics(storage: Any, knobs: dict) -> dict:
     vol_ann = any_target.index_vol_annualized
     block["realized_vol_annualized_pct"] = vol_ann
     block["realized_vol_samples"] = any_target.index_vol_n
-    if vol_ann is None:
+    if not vol_ann:                      # None 또는 0.0(완전 평탄) 둘 다
         unknown.append("realized_vol")
     else:
         block["m_vol_unclamped"] = target_vol / vol_ann
+    # ⚠️ `m_vol_unclamped`는 **입력에서 계산한 비율**이지 엔진이 반드시 쓴
+    # 값이 아니다. 시계열이 노후하거나 표본이 부족하면 엔진은 이 비율을
+    # 버리고 자기 폴백을 쓰므로, 그때 `m_vol_unclamped`와 `m_vol`이 나란히
+    # 있으면 모순처럼 보인다(2026-08-11 리뷰 2). 그래서 **패널이 볼 수 있는
+    # 플래그**로 구별한다 -- 코드 주석은 프롬프트에 실리지 않는다.
+    block["m_vol_from_ratio"] = bool(vol_ann) and not stale
     block["m_vol"] = m_vol
     block["m_drawdown_used"] = any_target.m_drawdown
 

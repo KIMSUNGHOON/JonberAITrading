@@ -384,6 +384,58 @@ async def test_stale_series_matches_the_engine_and_stays_self_consistent(tmp_pat
     )
 
 
+async def test_degraded_ratio_is_flagged_not_left_contradictory(tmp_path):
+    """리뷰 2. 열화 시 `m_vol_unclamped`(0.216)와 `m_vol`이 나란히 있으면
+    모순처럼 보인다 -- 비율이 **엔진 입력이 아니었다**는 것을 패널이 볼 수
+    있어야 한다(코드 주석은 프롬프트에 안 실린다)."""
+    fresh = (await _context(tmp_path / "fresh"))["exposure_mechanics"]
+    assert fresh["m_vol_from_ratio"] is True
+    assert fresh["m_vol_unclamped"] is not None
+
+    stale = (await _context(tmp_path / "stale",
+                            latest=date.today() - timedelta(days=30))
+             )["exposure_mechanics"]
+    assert stale["m_vol_from_ratio"] is False
+    # 비율 자체는 참인 사실이라 남긴다 -- 시계열이 회복되면 어디로 갈지가 보인다.
+    assert stale["m_vol_unclamped"] == pytest.approx(_LIVE_TARGET_VOL / _LIVE_VOL_PCT,
+                                                     rel=1e-6)
+
+    none_vol = (await _context(tmp_path / "novol", with_index=False)
+                )["exposure_mechanics"]
+    assert none_vol["m_vol_from_ratio"] is False
+    assert none_vol["m_vol_unclamped"] is None
+
+
+async def test_flat_index_series_does_not_stop_the_panel(tmp_path):
+    """리뷰 3. 21일 종가가 완전히 평탄하면 실현변동성이 0.0이 되고
+    엔진의 `target_vol_pct / vol_ann`이 ZeroDivisionError를 던진다.
+    패널이 멈추지 않아야 하고, **이미 알아낸 사실까지 잃지 않아야** 한다."""
+    storage = StorageService(db_path=str(tmp_path / "storage.db"))
+    await _seed_eod_review(storage)
+    rows = [((date.today() - timedelta(days=20 - i)).isoformat(), 100.0)
+            for i in range(21)]
+    assert await storage.upsert_index_daily(rows, source="test")
+    await _seed_judgment(storage)
+    await _seed_shadow(storage)
+
+    context = await build_strategy_context(storage, _TRADE_DATE, dict(_KNOBS))
+
+    assert context is not None
+    block = context["exposure_mechanics"]
+    # 바깥 겹(status="error")까지 안 가고 여기서 저하한다.
+    assert block["status"] == "partial"
+    assert "engine_projection" in block["unknown"]
+    assert block["m_vol"] is None
+    assert block["convergence"]["target_pct"] is None
+    # ⭐ 알던 사실은 살아남는다 -- 이것이 이 가드의 존재 이유다.
+    assert block["target_vol_pct"] == pytest.approx(22.0)
+    assert block["vol_multiplier_min"] == pytest.approx(0.5)
+    assert block["regime_label"] == "bear"
+    assert block["regime_anchor_pct"] == pytest.approx(0.55)
+    assert block["current_target_pct"] == pytest.approx(_LIVE_EFFECTIVE)
+    assert block["actual_exposure_pct"] == pytest.approx(_LIVE_ACTUAL)
+
+
 async def test_missing_index_data_does_not_stop_the_panel(tmp_path):
     context = await _context(tmp_path, with_index=False)
 
@@ -615,10 +667,20 @@ async def test_end_to_end_live_knobs_reach_the_panel_prompt(tmp_path):
 # ------------------------------------------------- 8. 프레이밍 중립성
 
 def _knob_segments(text: str, knob: str) -> list[str]:
-    """노브 이름이 나오는 **줄**. 설명은 노브당 한 줄(불릿)이라 줄이
-    자연스러운 단위다 -- 문장으로 쪼개면 같은 불릿의 상·하향 서술이
-    서로 다른 조각으로 흩어진다."""
+    """노브 이름이 나오는 **모든 줄**. 권고 어휘 검사는 넓을수록 좋다."""
     return [s for s in re.split(r"\n", text) if knob in s]
+
+
+def _knob_bullets(text: str, knob: str) -> list[str]:
+    """그 노브의 **방향 서술 불릿**만(`- `로 시작하는 줄).
+
+    ⚠️ 대칭 단언에 `_knob_segments`를 쓰면 위양성이 난다(2026-08-11 리뷰 1).
+    첫 줄의 노브 목록에는 두 노브 이름이 **둘 다** 들어 있고, 그 줄에
+    `consensus_threshold`를 설명하는 "낮추면 진입 기회가 늘고"가 있다.
+    그래서 불릿의 하향 서술을 통째로 지워도 첫 줄이 대신 단언을 만족시켜
+    **대칭 가드의 하향 절반이 아무것도 안 지키는** 상태였다.
+    """
+    return [s for s in text.split("\n") if s.lstrip().startswith("- ") and knob in s]
 
 
 async def test_knob_description_states_the_floor_and_the_dead_zone():
@@ -650,15 +712,20 @@ async def test_knob_description_is_symmetric_and_non_directive():
     from services.trading.strategy_panel import _SCHEMA_INSTRUCTION
 
     for knob in ("vol_multiplier_min", "target_vol_pct"):
-        segs = " ".join(_knob_segments(_SCHEMA_INSTRUCTION, knob))
+        bullets = _knob_bullets(_SCHEMA_INSTRUCTION, knob)
+        assert bullets, f"{knob}: 방향 서술 불릿이 없다"
+        segs = " ".join(bullets)
         assert "올리면" in segs, f"{knob}: 상향 효과 서술이 없다"
         assert "낮추면" in segs, f"{knob}: 하향 효과 서술이 없다"
 
     # 방어의 세기라는 프레이밍이 상향 쪽에도 붙어 있다.
     assert "방어" in _SCHEMA_INSTRUCTION
 
+    # 권고 어휘는 **모든** 줄에서 본다(불릿 밖에 숨겨도 잡히게).
     directive = ("올리십시오", "올리세요", "높이십시오", "높이세요", "낮추십시오",
-                 "낮추세요", "줄이십시오", "권장", "추천", "바람직", "해야 합니다")
+                 "낮추세요", "줄이십시오", "권장", "추천", "바람직", "해야 합니다",
+                 # 동의어 -- 완전한 목록은 불가능하지만 흔한 우회는 막는다.
+                 "편이 낫", "편이 좋", "것이 낫", "것이 좋", "제안하십시오", "권합니다")
     for knob in ("vol_multiplier_min", "target_vol_pct"):
         for seg in _knob_segments(_SCHEMA_INSTRUCTION, knob):
             for word in directive:
