@@ -192,6 +192,43 @@ def test_degraded_fallbacks_are_the_defensive_end_not_the_permissive_one():
         assert out.m_vol < VOL_MULTIPLIER_MAX
 
 
+def test_degraded_fallback_still_obeys_the_shrink_only_ceiling():
+    """폴백도 **축소 전용 계약** 안에 있어야 한다(리뷰 지적, 2026-08-11).
+
+    정상 분기는 `min(VOL_MULTIPLIER_MAX, max(...))`로 1.0에 묶이는데,
+    열화 분기가 외부 입력 `vol_multiplier_min`을 클램프 없이 쓰면
+    **열화일이 정상일보다 관대해질 수 있다** -- knob=1.5에서 열화
+    `m_vol`이 1.5가 되어 bear 앵커 0.55가 천장 0.80까지 증폭됐다
+    (리뷰어 프로브 실측). 옛 폴백은 리터럴 `1.0`(= `VOL_MULTIPLIER_MAX`)
+    이라 구조적으로 불가능하던 것이 이번 수정으로 열렸다.
+
+    라이브 도달 경로는 없다(`models.py:298`의 `Field(ge=0.2, le=0.8)`,
+    `strategy_apply.py:64`/`strategy_consensus.py:57`의 클램프,
+    `PUT /risk-params` 미노출). 그래도 여기서 막는 이유는 **폴백의
+    안전성이 다른 파일 4곳의 선언이 아니라 이 함수 자체로 보장돼야**
+    하기 때문이다 -- 그 바운드가 바뀌거나 영속 블롭이 오염되면
+    (`_restore_state`의 `setattr`은 `validate_assignment`가 없어 검증을
+    안 탄다) 논증이 무너진다.
+    """
+    absurd = VOL_MULTIPLIER_MAX + 0.5     # 바운드를 벗어난 값이 흘러든 경우
+    for kw in ({"returns": [0.1, 0.2]},
+               {"returns": [6.4, -6.4] * 10, "series_stale": True}):
+        out = _t(vol_min=absurd, **kw)
+        assert out.m_vol == pytest.approx(VOL_MULTIPLIER_MAX)
+        assert out.m_vol <= VOL_MULTIPLIER_MAX
+
+    # 열화가 정상보다 관대해지는 일이 없어야 한다 -- 그것이 이 가드의 핵심.
+    healthy = _t(returns=_returns_with_annual_vol(11.1), vol_min=absurd)
+    assert healthy.m_vol == pytest.approx(VOL_MULTIPLIER_MAX)
+    assert _t(vol_min=absurd, returns=[0.1, 0.2]).m_vol <= healthy.m_vol
+
+    # 앵커를 넘겨 증폭시키지 않는다 -- 리뷰어 프로브가 실제로 본 증상은
+    # bear 0.55가 천장 0.80으로 올라가고 binding이 "ceiling"이 되는 것.
+    amplified = _t(regime="bear", prev=0.55, returns=[0.1, 0.2], vol_min=absurd)
+    assert amplified.target_pct <= REGIME_ANCHORS["bear"]
+    assert amplified.binding != "ceiling"
+
+
 def test_degraded_fallback_follows_the_panel_knob():
     """폴백은 전략 패널의 `vol_multiplier_min`을 따른다.
 

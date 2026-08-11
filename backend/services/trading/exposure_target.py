@@ -172,12 +172,23 @@ def compute_regime_target(
         # 깎지 않는 선택은 "시장이 잠잠하다고 가정한다"와 같고, 이
         # 시스템이 실제로 만난 KOSPI 연변동성은 101.78%였다. 이 리포의
         # 원칙은 "어떤 실패도 노출도를 위로 열지 않는다"다.
-        m_vol = vol_multiplier_min
+        #
+        # `min(VOL_MULTIPLIER_MAX, ...)`로 한 번 더 묶는 이유(리뷰 지적):
+        # `vol_multiplier_min`은 **외부 입력**이라 이 함수 혼자로는 그
+        # 범위를 알 수 없다. 클램프 없이 쓰면 노브가 1.0을 넘는 순간
+        # **열화일이 정상일보다 관대해진다**(정상 분기는 이미 상한에
+        # 묶여 있다) -- 실측으로 knob=1.5에서 bear 앵커 0.55가 천장
+        # 0.80까지 증폭됐다. 옛 폴백은 리터럴 `1.0`이라 구조적으로
+        # 불가능하던 사건이다. 라이브 도달 경로는 없지만(`models.py`의
+        # `Field(ge=0.2, le=0.8)` 외 3중 클램프), 폴백의 안전성이 **다른
+        # 파일의 선언이 아니라 이 함수 자체로** 보장돼야 한다.
+        m_vol = min(VOL_MULTIPLIER_MAX, vol_multiplier_min)
         degraded.append("index_vol_insufficient")
     elif series_stale:
         # 시계열이 오래됐으면 값 자체를 못 믿는다. 위와 같은 이유로
-        # 하한(가장 방어적인 끝)으로 떨어뜨리고 원값은 그대로 실어 보낸다.
-        m_vol = vol_multiplier_min
+        # 하한(가장 방어적인 끝)으로 떨어뜨리되 축소 전용 천장 안에
+        # 머문다. 원값은 그대로 실어 보낸다.
+        m_vol = min(VOL_MULTIPLIER_MAX, vol_multiplier_min)
         degraded.append("index_series_stale")
     else:
         # ⚠️ 위생 게이트를 두지 않는다. 2026-08-06에 넣은 [5, 60]이
