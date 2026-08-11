@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+from datetime import date
 from typing import Any, Optional
 
 from agents.llm.tasks import TaskType
@@ -27,7 +29,15 @@ from agents.llm_provider import get_llm_provider
 
 from services.discovery.ledger import get_discovery_performance
 
-from .strategy_consensus import STRATEGY_VOTE_SCHEMA
+from .exposure_target import (
+    DAILY_TARGET_DELTA_MAX,
+    REGIME_ANCHORS,
+    VOL_MULTIPLIER_MAX,
+    VOL_WINDOW,
+    annualized_vol,
+)
+from .index_series import closes_to_returns, is_series_stale
+from .strategy_consensus import KNOB_BOUNDS, STRATEGY_VOTE_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +60,23 @@ _SCHEMA_INSTRUCTION = (
     "퍼센트 숫자로 제안), consensus_threshold(4-에이전트 토론의 매수/매도 합의 "
     "문턱, 소수분율 0.60~0.85 — 낮추면 진입 기회가 늘고 오탐도 늘며, 높이면 "
     "반대), "
-    "target_vol_pct(변동성 타게팅 기준, 퍼센트 10~40 — 이 변동성에서 전량 "
-    "사이즈로 간다. 시장 실현변동성이 이보다 높으면 노출을 줄인다), "
-    "vol_multiplier_min(변동성 축소 하한, 분율 0.2~0.8 — 아무리 변동성이 "
-    "높아도 이 배수 아래로는 안 줄인다). "
+    "target_vol_pct(변동성 타게팅 기준, 퍼센트 10~40), "
+    "vol_multiplier_min(변동성 축소 배수의 하한, 분율 0.2~0.8). "
     "제안 값은 현행 값에서 크게 벗어나면 "
-    "시스템이 안전 한도로 잘라냅니다."
+    "시스템이 안전 한도로 잘라냅니다.\n"
+    "target_vol_pct와 vol_multiplier_min은 따로 노는 노브가 아니라 하나의 "
+    "축소 배수를 만듭니다: m_vol = clamp(target_vol_pct ÷ 시장 실현변동성, "
+    "vol_multiplier_min, 1.0), 그리고 목표 노출도 = 레짐앵커(일일 변화 한도로 "
+    "제한) × m_vol × 낙폭배수. 이 배수는 **축소 전용**입니다 — 나눗셈 결과가 "
+    "1.0을 넘어도 1.0에서 잘리므로 target_vol_pct를 올리는 것만으로는 앵커 "
+    "위로 못 갑니다. 반대쪽에도 끝이 있습니다: 실현변동성이 충분히 높아 "
+    "나눗셈 결과가 vol_multiplier_min 아래로 내려가면 m_vol은 그 하한에 "
+    "고정되고, **그 구간에서는 target_vol_pct를 허용 범위(10~40) 안에서 어떻게 "
+    "바꿔도 m_vol이 1bp도 변하지 않습니다**(하한을 만드는 것은 "
+    "vol_multiplier_min뿐입니다). 지금 어느 구간에 있는지, 하한을 벗어나려면 "
+    "target_vol_pct가 얼마여야 하는지, 각 선택이 목표를 어디로 수렴시키는지는 "
+    "컨텍스트의 exposure_mechanics 블록에 실제 값으로 들어 있습니다 — 그 "
+    "숫자를 근거로 판단하십시오."
 )
 
 PANELISTS: dict[str, str] = {
@@ -83,6 +104,247 @@ PANELISTS: dict[str, str] = {
         "stop_loss_pct)를 제안하는 것이 당신의 책무입니다. " + _SCHEMA_INSTRUCTION
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# exposure_mechanics — 패널이 자기가 돌리는 노브의 효과를 볼 수 있게 하는 블록
+#
+# 2026-08-11 라이브에서 드러난 것: 실현변동성이 101.7%까지 오르자
+# `m_vol = clamp(22.0/101.7, 0.5, 1.0)`가 **하한에 박혔고**, 그 구간에서는
+# `target_vol_pct`가 산수에서 통째로 소거된다(하한을 벗어나려면 50.9가
+# 필요한데 그 노브의 허용 상한은 40이다). 패널은 전날 EOD에 정확히 그
+# 무효인 노브를 18→22로 올렸다 -- 값은 정상 적용됐고 클램프도 안 걸려
+# `strategy_knob_discarded`조차 나지 않으니, 패널에게는 자기 투표가
+# 무효였다는 것을 알 방법이 없었다.
+#
+# 그래서 **사실만** 준다: 지금 어디에 묶여 있는지, 그것을 푸는 데 필요한
+# 값이 허용 범위 안인지 밖인지, 같은 설정이 유지되면 목표가 어디로
+# 수렴하는지. 무엇을 할지는 패널이 정한다.
+#
+# ⚠️ 전부 **라이브 상태에서 계산한다**. 하드코딩한 설명문은 변동성이
+# 바뀌는 순간 조용히 틀려지고, 이 리포는 그 결함을 반복해 왔다.
+# ---------------------------------------------------------------------------
+
+_EXPOSURE_FORMULA = (
+    "목표 = clamp(레짐앵커, 직전목표 ± daily_ramp_max) × m_vol × m_drawdown, "
+    "m_vol = clamp(target_vol_pct ÷ 실현변동성(연율,%), vol_multiplier_min, 1.0)"
+)
+
+_CONVERGENCE_ASSUMES = (
+    "같은 레짐 라벨·같은 실현변동성·같은 노브가 유지되고 m_drawdown=1.0일 때 "
+    "목표가 반복 적용으로 수렴하는 값. min(daily_ramp_max×m/(1−m), 앵커×m)."
+)
+
+
+def convergence_target_pct(
+    anchor_pct: float, m: float, ramp: float = DAILY_TARGET_DELTA_MAX
+) -> tuple[float, str]:
+    """사상 `f(p) = min(anchor, p + ramp) × m`의 고정점과, 무엇이 그것을 정했는지.
+
+    - 앵커가 구속하지 않으면 `p* = ramp × m / (1 − m)` ("ramp")
+    - 앵커가 구속하면 `p* = anchor × m` ("anchor")
+    - 실제 수렴점은 둘 중 **작은 값**
+
+    ⚠️ `m ≥ 1.0`이면 첫 식이 발산한다 -- 0으로 나누지 않고 `anchor × m`을
+    돌려준다(축소 전용 계약상 `m > 1.0`은 나오지 않지만 방어한다).
+    """
+    by_anchor = anchor_pct * m
+    if m <= 0.0:
+        return 0.0, "m_vol"
+    if m >= 1.0:
+        return by_anchor, "anchor"
+    by_ramp = ramp * m / (1.0 - m)
+    return (by_ramp, "ramp") if by_ramp < by_anchor else (by_anchor, "anchor")
+
+
+def _as_float(value: Any) -> Optional[float]:
+    """숫자면 float, 아니면 None. NaN/±inf도 None이다 -- 그런 값이 블록에
+    실리면 패널이 그것을 측정값으로 읽는다."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _m_vol_binding(raw: float, vol_min: float) -> str:
+    if raw < vol_min:
+        return "floor"
+    if raw > VOL_MULTIPLIER_MAX:
+        return "ceiling"
+    return "free"
+
+
+def _vol_min_candidates(current: Optional[float]) -> list[float]:
+    """`vol_multiplier_min`의 허용 범위를 훑는 후보값. 범위는 KNOB_BOUNDS에서
+    읽는다 -- 표를 손으로 적어두면 바운드가 바뀌는 날 조용히 틀려진다."""
+    lo, hi = KNOB_BOUNDS["vol_multiplier_min"]
+    step = 0.1
+    out: list[float] = []
+    x = lo
+    while x <= hi + 1e-9:
+        out.append(round(x, 2))
+        x += step
+    if current is not None and lo <= current <= hi:
+        out.append(round(current, 2))
+    return sorted(set(out))
+
+
+async def _exposure_mechanics(storage: Any, knobs: dict) -> dict:
+    """노출도 산식의 **현재 상태**. 절대 raise하지 않는다.
+
+    전략 재평가는 하루 한 번뿐이라 여기서 예외가 나면 그날 전략이 통째로
+    갱신되지 않는다. 그래서 모르는 값은 `None` + `unknown` 목록으로
+    남기고 진행한다 -- 그럴듯한 기본값을 채우면 패널이 그것을 사실로
+    읽는다.
+    """
+    unknown: list[str] = []
+
+    target_vol = _as_float(knobs.get("target_vol_pct"))
+    vol_min = _as_float(knobs.get("vol_multiplier_min"))
+    if target_vol is None:
+        unknown.append("target_vol_pct")
+    if vol_min is None:
+        unknown.append("vol_multiplier_min")
+
+    # --- 실현변동성 (지수 시계열)
+    vol_ann: Optional[float] = None
+    vol_n = 0
+    stale: Optional[bool] = None
+    index_latest: Optional[str] = None
+    try:
+        closes = await storage.get_recent_index_closes(limit=VOL_WINDOW + 1)
+    except Exception as e:
+        logger.warning(f"[StrategyPanel] index closes unavailable: {e}")
+        closes = []
+        unknown.append("index_series")
+    if closes:
+        index_latest = closes[-1][0]
+        stale = is_series_stale(index_latest, date.today())
+        vol_ann, vol_n = annualized_vol(closes_to_returns([c for _, c in closes]))
+    if vol_ann is None and "index_series" not in unknown:
+        unknown.append("realized_vol")
+
+    # --- 레짐 판정 (앵커·직전 목표·현재 목표)
+    judgment: Optional[dict] = None
+    try:
+        judgment = await storage.get_latest_regime_judgment()
+    except Exception as e:
+        logger.warning(f"[StrategyPanel] regime judgment unavailable: {e}")
+        unknown.append("regime_judgment")
+    regime_label = (judgment or {}).get("regime")
+    anchor = _as_float((judgment or {}).get("anchor_target_pct"))
+    if anchor is None and regime_label in REGIME_ANCHORS:
+        anchor = REGIME_ANCHORS[regime_label]
+    if anchor is None:
+        unknown.append("regime_anchor")
+    prev_target = _as_float((judgment or {}).get("effective_target_pct"))
+
+    # --- 실제 노출도 (관측 원장)
+    shadow: Optional[dict] = None
+    try:
+        shadow = await storage.get_latest_exposure_shadow()
+    except Exception as e:
+        logger.warning(f"[StrategyPanel] exposure shadow unavailable: {e}")
+        unknown.append("exposure_shadow")
+
+    # --- m_vol
+    m_vol: Optional[float] = None
+    m_vol_raw: Optional[float] = None
+    binding = "unknown"
+    if vol_ann is not None and vol_ann > 0 and target_vol is not None and vol_min is not None:
+        m_vol_raw = target_vol / vol_ann
+        if stale:
+            # 시계열을 못 믿으면 엔진이 배수를 중립(1.0)으로 둔다 -- 계산된
+            # 비율이 아니라 실제로 쓰이는 값을 적는다.
+            m_vol, binding = 1.0, "stale_override"
+        else:
+            m_vol = min(VOL_MULTIPLIER_MAX, max(vol_min, m_vol_raw))
+            binding = _m_vol_binding(m_vol_raw, vol_min)
+
+    # --- 램프가 앵커를 붙잡고 있는가 (다음 판정 기준)
+    ramped: Optional[float] = None
+    anchor_binds: Optional[bool] = None
+    projected: Optional[float] = None
+    if anchor is not None and prev_target is not None:
+        ramped = max(prev_target - DAILY_TARGET_DELTA_MAX,
+                     min(anchor, prev_target + DAILY_TARGET_DELTA_MAX))
+        anchor_binds = ramped == anchor
+        if m_vol is not None:
+            projected = ramped * m_vol
+
+    # --- target_vol_pct로 하한을 벗어날 수 있는가
+    tv_lo, tv_hi = KNOB_BOUNDS["target_vol_pct"]
+    needed: Optional[float] = None
+    can_lift: Optional[bool] = None
+    if vol_ann is not None and vol_min is not None:
+        # m_vol이 하한을 벗어나려면 target_vol_pct / vol > vol_min.
+        needed = vol_min * vol_ann
+        can_lift = needed < tv_hi
+
+    # --- 수렴점
+    conv_pct: Optional[float] = None
+    conv_binds: Optional[str] = None
+    by_anchor_table: Optional[dict] = None
+    by_vol_min_table: Optional[dict] = None
+    if m_vol is not None:
+        by_anchor_table = {
+            label: convergence_target_pct(a, m_vol)[0]
+            for label, a in REGIME_ANCHORS.items()
+        }
+        if anchor is not None:
+            conv_pct, conv_binds = convergence_target_pct(anchor, m_vol)
+            by_vol_min_table = {}
+            for cand in _vol_min_candidates(vol_min):
+                cand_m = min(VOL_MULTIPLIER_MAX, max(cand, m_vol_raw))
+                cand_pct, cand_binds = convergence_target_pct(anchor, cand_m)
+                by_vol_min_table[f"{cand:g}"] = {
+                    "m_vol": cand_m,
+                    "target_pct": cand_pct,
+                    "binds_on": cand_binds,
+                }
+
+    return {
+        "status": "ok" if not unknown else "partial",
+        "unknown": unknown,
+        "formula": _EXPOSURE_FORMULA,
+
+        "realized_vol_annualized_pct": vol_ann,
+        "realized_vol_samples": vol_n,
+        "index_latest_date": index_latest,
+        "index_series_stale": stale,
+
+        "target_vol_pct": target_vol,
+        "vol_multiplier_min": vol_min,
+        "m_vol_unclamped": m_vol_raw,
+        "m_vol": m_vol,
+        "m_vol_binding": binding,
+        "m_drawdown_latest": _as_float((shadow or {}).get("m_drawdown")),
+
+        "regime_label": regime_label,
+        "regime_anchor_pct": anchor,
+        "daily_ramp_max": DAILY_TARGET_DELTA_MAX,
+        "prev_target_pct": prev_target,
+        "ramped_pct": ramped,
+        "anchor_is_binding": anchor_binds,
+        "next_target_pct_projected": projected,
+
+        "current_target_pct": prev_target,
+        "actual_exposure_pct": _as_float((shadow or {}).get("actual_pct")),
+        "actual_exposure_as_of": (shadow or {}).get("created_at"),
+
+        "target_vol_pct_to_lift_m_vol": needed,
+        "target_vol_pct_allowed_range": [tv_lo, tv_hi],
+        "target_vol_pct_can_lift_m_vol": can_lift,
+
+        "convergence": {
+            "assumes": _CONVERGENCE_ASSUMES,
+            "target_pct": conv_pct,
+            "binds_on": conv_binds,
+            "by_regime_anchor": by_anchor_table,
+            "by_vol_multiplier_min": by_vol_min_table,
+        },
+    }
 
 
 def _latest_per_key(rows: list[dict], key: str) -> list[dict]:
@@ -134,6 +396,27 @@ async def build_strategy_context(
         logger.warning(f"[StrategyPanel] get_discovery_performance failed: {e}")
         discovery_performance = None
 
+    # 노출도 역학. `_exposure_mechanics`가 자체적으로 never-raise지만, 여기서
+    # 한 겹 더 받는다 -- 이 블록 하나가 EOD 전략 갱신 전체를 멈추면
+    # 그날 전략이 통째로 안 바뀐다(재평가는 하루 한 번뿐이다).
+    try:
+        exposure_mechanics = await _exposure_mechanics(storage, current_strategy_knobs or {})
+    except Exception as e:
+        logger.warning(f"[StrategyPanel] exposure mechanics failed: {e}")
+        exposure_mechanics = {
+            "status": "error",
+            "unknown": ["all"],
+            "error": str(e),
+            "formula": _EXPOSURE_FORMULA,
+            "m_vol": None,
+            "m_vol_binding": "unknown",
+            "convergence": {
+                "assumes": _CONVERGENCE_ASSUMES, "target_pct": None,
+                "binds_on": None, "by_regime_anchor": None,
+                "by_vol_multiplier_min": None,
+            },
+        }
+
     return {
         "trade_date": trade_date,
         "eod_review": report,
@@ -174,6 +457,7 @@ async def build_strategy_context(
         ],
         "current_strategy": current_strategy_knobs,
         "discovery_performance": discovery_performance,
+        "exposure_mechanics": exposure_mechanics,
     }
 
 
