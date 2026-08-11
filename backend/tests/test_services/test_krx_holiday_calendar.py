@@ -1,4 +1,4 @@
-"""KRX 거래일 달력 — 대체공휴일 규칙 · 폴백 정직성 · 표 유효기간.
+"""KRX 거래일 달력 — 대체공휴일 규칙 · 폴백 정직성 · 음력 계산.
 
 배경(2026-08-11 라이브 실측): KRX 연동은 죽어 있고(OTP 200/text-html,
 직접 호출 404) 모든 갱신이 조용히 하드코딩 표로 떨어지고 있었다.
@@ -7,28 +7,44 @@
 2026에서 끝나 2027부터는 설날·추석이 사라진 **부분 데이터**가 정상처럼
 보였다.
 
-이 파일은 그 셋을 각각 못 박는다:
+이 파일은 그 넷을 각각 못 박는다:
   A. 대체공휴일을 표가 아니라 **규칙**으로 (법 제3조)
   B. 폴백을 썼다는 사실이 **데이터와 로그에** 남는다
-  C. 음력 표에 없는 연도는 **조용한 부분 데이터로 흘러가지 않는다**
+  C. 계산할 수 없는 연도는 **조용한 부분 데이터로 흘러가지 않는다**
+  D. 음력 공휴일도 표가 아니라 **계산**으로 (korean_lunar_calendar)
 
 ⚠️ DB에 닿는 테스트는 전부 tmp_path로 경로를 주입한다 --
 `KRXHolidayService()`는 생성만으로 `CREATE TABLE`을 돌리므로 경로를
 주입하지 않으면 라이브 `backend/data/holidays.db`를 건드린다.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
+import services.krx_holiday.fetcher as fetcher_module
 from services.krx_holiday.fetcher import (
     IncompleteHolidayDataError,
     KRXHolidayFetcher,
+    LUNAR_CALC_MAX_YEAR,
+    LUNAR_CALC_MIN_YEAR,
+    LUNAR_HOLIDAY_RULES,
     SOURCE_FALLBACK_TABLE,
     SUBSTITUTE_HOLIDAY_NAME,
+    compute_lunar_holidays,
     compute_substitute_holidays,
+    lunar_calendar_available,
 )
 from services.krx_holiday.service import KRXHolidayService
+
+
+# 계산이 실제로 덮는 연도 중 회귀 가드로 훑을 구간.
+# (라이브러리 상한 2050까지 전부 훑는다 -- 27년 x 3회 변환이 ~0.1초다.)
+_COVERED_SAMPLE_YEARS = range(2024, LUNAR_CALC_MAX_YEAR + 1)
+
+# 라이브러리가 지원하지 않는 첫 연도. "표에 없는 연도"를 대신해 C 계열
+# 테스트의 실패 케이스로 쓴다.
+_OUT_OF_RANGE_YEAR = LUNAR_CALC_MAX_YEAR + 1
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +56,49 @@ def _substitutes(year: int) -> set:
     """그 해 폴백 달력이 **규칙으로 계산한** 대체공휴일 날짜 집합."""
     holidays = KRXHolidayFetcher()._get_known_holidays(year)
     return {h.date for h in holidays if h.name == SUBSTITUTE_HOLIDAY_NAME}
+
+
+def _dates_named(year: int, *names: str) -> set:
+    """그 해 달력에서 주어진 이름들의 날짜 집합."""
+    return {
+        h.date for h in KRXHolidayFetcher()._get_known_holidays(year)
+        if h.name in names
+    }
+
+
+def _a_weekday(year: int, month: int = 11) -> date:
+    """그 해 그 달의 첫 평일.
+
+    ⚠️ 날짜를 손으로 고르면 안 된다 -- 2051-02-04는 토요일이라 주말 규칙이
+    먼저 걸려 "달력을 모른다" 경로에 도달하지 못한다(초판이 2030년용
+    날짜를 그대로 옮겨 실제로 그렇게 됐다).
+
+    ⚠️ 기본 달이 11월인 이유: 공휴일이 **하나도 없는** 유일한 구간이다.
+    3월이면 삼일절, 6월이면 현충일을 고를 수 있는데, 지금은 범위 밖 연도라
+    달력이 비어 무해해도 그 연도가 계산 가능해지는 순간 의미가 뒤집힌다.
+    """
+    d = date(year, month, 1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def _missing_markers(year: int):
+    """그 해 달력에서 빠진 필수 항목(설날·추석). 빈 리스트면 완전하다."""
+    from services.krx_holiday.fetcher import missing_required_markers
+
+    return missing_required_markers(KRXHolidayFetcher()._get_known_holidays(year))
+
+
+@pytest.fixture
+def no_lunar_library(monkeypatch):
+    """`korean_lunar_calendar` import 실패를 재현한다.
+
+    fetcher는 모듈 전역 `KoreanLunarCalendar`를 통해서만 라이브러리에
+    닿으므로, 그것을 None으로 만들면 `ImportError`로 떨어진 상태와
+    구별되지 않는다.
+    """
+    monkeypatch.setattr(fetcher_module, "KoreanLunarCalendar", None)
 
 
 def _all_dates(year: int) -> set:
@@ -196,22 +255,31 @@ def test_rule_recovers_substitutes_the_hardcoded_table_had_lost():
     assert date(2025, 3, 3) in _substitutes(2025)
 
 
-def test_hardcoded_substitute_entries_are_gone():
-    """출처는 하나여야 한다 -- 손입력 `대체공휴일` 항목은 표에서 제거됐다.
+def test_no_hand_maintained_holiday_table_remains():
+    """출처는 하나여야 한다 -- 손입력 날짜 표는 코드에서 사라졌다.
 
-    두 출처가 공존하면 어긋날 때 어느 쪽이 맞는지 알 수 없다.
+    두 출처가 공존하면 어긋날 때 어느 쪽이 맞는지 알 수 없다. 고정
+    공휴일(`FIXED_HOLIDAYS`)만 표로 남고, 음력은 계산·대체는 규칙이다.
     """
-    table = KRXHolidayFetcher.LUNAR_HOLIDAYS
-    for year, entries in table.items():
-        names = [name for _m, _d, name in entries]
-        assert SUBSTITUTE_HOLIDAY_NAME not in names, (
-            f"{year} 음력 표에 손입력 대체공휴일이 남아 있다: {names}"
-        )
+    assert not hasattr(KRXHolidayFetcher, "LUNAR_HOLIDAYS"), (
+        "손입력 음력 표가 남아 있다 -- 계산과 표 두 출처가 공존한다"
+    )
+    rule_names = {r.name for r in LUNAR_HOLIDAY_RULES}
+    rule_names |= {r.neighbour_name for r in LUNAR_HOLIDAY_RULES if r.neighbour_name}
+    assert SUBSTITUTE_HOLIDAY_NAME not in rule_names, (
+        f"음력 규칙에 손입력 대체공휴일이 남아 있다: {sorted(rule_names)}"
+    )
+    fixed_names = {n for _m, _d, n in KRXHolidayFetcher.FIXED_HOLIDAYS}
+    assert SUBSTITUTE_HOLIDAY_NAME not in fixed_names
 
 
 def test_substitute_never_lands_on_an_existing_holiday_or_weekend():
-    """대체일은 주말에도, 이미 공휴일인 날에도 앉지 않는다(전 연도)."""
-    for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
+    """대체일은 주말에도, 이미 공휴일인 날에도 앉지 않는다(전 연도).
+
+    ⚠️ 훑는 구간이 손입력 표 3개 연도에서 **계산이 덮는 27개 연도 전부**로
+    넓어졌다. 표였을 때는 불가능했던 검사다.
+    """
+    for year in _COVERED_SAMPLE_YEARS:
         holidays = KRXHolidayFetcher()._get_known_holidays(year)
         subs = [h for h in holidays if h.name == SUBSTITUTE_HOLIDAY_NAME]
         originals = {h.date for h in holidays if h.name != SUBSTITUTE_HOLIDAY_NAME}
@@ -251,8 +319,10 @@ def test_substitute_rule_sets_partition_every_holiday_name():
 
     # (b) 달력의 모든 이름이 분류돼 있다.
     names = {n for _m, _d, n in KRXHolidayFetcher.FIXED_HOLIDAYS}
-    for entries in KRXHolidayFetcher.LUNAR_HOLIDAYS.values():
-        names.update(n for _m, _d, n in entries)
+    for rule in LUNAR_HOLIDAY_RULES:
+        names.add(rule.name)
+        if rule.neighbour_name:
+            names.add(rule.neighbour_name)
 
     assert unclassified_holiday_names(names) == set(), (
         f"분류되지 않은 공휴일 이름: {sorted(unclassified_holiday_names(names))}"
@@ -360,7 +430,9 @@ async def test_status_surfaces_source_and_untrusted_years(svc, offline_fetcher):
     assert before["source"] is None
     assert before["year_sources"] == {}
     assert 2026 in before["untrusted_years"]
-    assert before["fallback_covers_years"] == sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS)
+    # 유효기간은 이제 표의 키 목록이 아니라 **계산 가능 구간**이다.
+    assert before["fallback_covers_years"] == KRXHolidayFetcher.coverage_description()
+    assert str(LUNAR_CALC_MAX_YEAR) in before["fallback_covers_years"]
 
     try:
         await svc.update_holidays(2026)
@@ -370,9 +442,10 @@ async def test_status_surfaces_source_and_untrusted_years(svc, offline_fetcher):
     after = svc.get_status()
     assert after["source"] == SOURCE_FALLBACK_TABLE
     assert after["year_sources"][2026] == SOURCE_FALLBACK_TABLE
-    assert after["total_holidays"] == 20      # 2026 = 고정9 + 음력7 + 대체4
+    assert after["total_holidays"] == 21      # 2026 = 고정10 + 음력7 + 대체4
     assert 2026 not in after["untrusted_years"]
-    assert 2027 in after["untrusted_years"]   # 표가 못 덮는 해는 계속 잡힌다
+    # 2027은 계산은 가능하지만 **아직 저장하지 않았다** -- 진단에 계속 잡힌다.
+    assert 2027 in after["untrusted_years"]
 
 
 def test_untrusted_years_includes_years_with_zero_rows(svc):
@@ -387,31 +460,39 @@ def test_untrusted_years_includes_years_with_zero_rows(svc):
 
 
 # ===========================================================================
-# C. 표의 유효기간
+# C. 계산이 불가능한 연도 — 조용한 부분 데이터 금지
 # ===========================================================================
 
 
-def test_year_without_lunar_data_fails_explicitly():
-    """음력 표에 없는 연도는 부분 데이터를 조용히 돌려주지 않는다.
+def test_year_beyond_library_range_fails_explicitly():
+    """라이브러리가 못 다루는 연도는 부분 데이터를 조용히 돌려주지 않는다.
 
-    수정 전에는 2030을 물으면 `fixed_holidays`만 9개 돌려주고 설날·추석이
-    통째로 빠진 채 정상처럼 보였다. 라이브 DB의 2027행 9개가 실물 증거다.
+    예전에는 손입력 표에 없는 연도(2027~)를 물으면 `fixed_holidays`만
+    9개 돌려주고 설날·추석이 통째로 빠진 채 정상처럼 보였다. 라이브 DB의
+    2027행 9개가 실물 증거다. 이제 그 벽은 2050으로 밀렸지만 **벽 자체는
+    남아 있어야 한다** -- 2051에서 같은 실패가 재발하면 안 된다.
     """
     with pytest.raises(IncompleteHolidayDataError):
-        KRXHolidayFetcher()._get_known_holidays(2030)
+        KRXHolidayFetcher()._get_known_holidays(_OUT_OF_RANGE_YEAR)
+
+
+def test_year_without_lunar_library_fails_explicitly(no_lunar_library):
+    """라이브러리가 아예 없으면 어느 연도도 부분 달력을 만들지 않는다."""
+    with pytest.raises(IncompleteHolidayDataError):
+        KRXHolidayFetcher()._get_known_holidays(2027)
 
 
 @pytest.mark.asyncio
 async def test_uncovered_year_is_not_persisted(svc, offline_fetcher):
     """부분 데이터는 저장 계층에 도달하지 않는다."""
     try:
-        saved = await svc.update_holidays(2030)
+        saved = await svc.update_holidays(_OUT_OF_RANGE_YEAR)
     finally:
         await svc.close()
 
     assert saved == 0
-    assert svc.storage.get_year_stats().get(2030, 0) == 0
-    assert not svc.storage.has_year_data(2030)
+    assert svc.storage.get_year_stats().get(_OUT_OF_RANGE_YEAR, 0) == 0
+    assert not svc.storage.has_year_data(_OUT_OF_RANGE_YEAR)
 
 
 @pytest.mark.asyncio
@@ -419,19 +500,20 @@ async def test_uncovered_year_does_not_break_the_covered_one(svc, offline_fetche
     """한 해가 실패해도 다른 해 갱신은 계속된다(시스템이 멈추지 않는다)."""
     try:
         await svc.update_holidays(2026)
-        await svc.update_holidays(2030)
+        await svc.update_holidays(_OUT_OF_RANGE_YEAR)
     finally:
         await svc.close()
 
     assert svc.storage.has_year_data(2026)
-    assert not svc.storage.has_year_data(2030)
+    assert not svc.storage.has_year_data(_OUT_OF_RANGE_YEAR)
 
 
 def test_fallback_coverage_is_queryable():
-    """호출자가 표의 유효기간을 직접 물어볼 수 있다."""
+    """호출자가 계산 유효기간을 직접 물어볼 수 있다."""
     assert KRXHolidayFetcher.covers_year(2026) is True
-    assert KRXHolidayFetcher.covers_year(2030) is False
-    assert max(KRXHolidayFetcher.LUNAR_HOLIDAYS) >= 2026
+    assert KRXHolidayFetcher.covers_year(2027) is True   # ← 이것이 이 태스크다
+    assert KRXHolidayFetcher.covers_year(_OUT_OF_RANGE_YEAR) is False
+    assert LUNAR_CALC_MAX_YEAR >= 2050
 
 
 # ---------------------------------------------------------------------------
@@ -445,20 +527,36 @@ def test_is_trading_day_never_raises(svc):
     노출도 계산·장중 판정·EOD 체인이 전부 이 불리언 위에 서 있다.
     """
     for d in [
-        date(2026, 8, 17),   # 대체공휴일(데이터 없음)
-        date(2030, 2, 4),    # 표 밖 연도
-        date(2030, 2, 2),    # 표 밖 연도 + 주말
-        date(1900, 1, 1),    # 극단
+        date(2026, 8, 17),                    # 대체공휴일(데이터 없음)
+        date(_OUT_OF_RANGE_YEAR, 2, 4),       # 계산 범위 밖 연도
+        date(_OUT_OF_RANGE_YEAR, 2, 2),       # 계산 범위 밖 + 주말
+        date(1900, 1, 1),                     # 극단
         date(2099, 12, 31),
     ]:
         assert isinstance(svc.is_trading_day(d), bool)
 
 
+def test_is_trading_day_never_raises_without_lunar_library(svc, no_lunar_library):
+    """라이브러리가 없어도 `is_trading_day`는 예외 없이 불리언만 돌려준다.
+
+    ⚠️ 이 계약이 깨지면 달력 의존성 하나가 노출도 계산·장중 판정·EOD
+    체인을 통째로 무너뜨린다. 세 번째 상태("모른다")는 예외가 아니라
+    `get_trading_day_verdict().trusted`로 드러나야 한다.
+    """
+    for d in [date(2027, 2, 8), date(2027, 9, 15), date(2027, 6, 30)]:
+        assert isinstance(svc.is_trading_day(d), bool)
+    verdict = svc.get_trading_day_verdict(date(2027, 2, 8))
+    assert verdict.trusted is False
+
+
 def test_range_and_neighbour_helpers_never_raise_on_uncovered_years(svc):
-    """소비처가 실제로 부르는 파생 API도 표 밖 연도에서 예외를 안 낸다."""
-    assert isinstance(svc.get_previous_trading_day(date(2030, 2, 4)), date)
-    assert isinstance(svc.get_next_trading_day(date(2030, 2, 4)), date)
-    days = svc.get_trading_days_in_range(date(2030, 2, 1), date(2030, 2, 28))
+    """소비처가 실제로 부르는 파생 API도 범위 밖 연도에서 예외를 안 낸다."""
+    far = _a_weekday(_OUT_OF_RANGE_YEAR, month=2)
+    assert isinstance(svc.get_previous_trading_day(far), date)
+    assert isinstance(svc.get_next_trading_day(far), date)
+    days = svc.get_trading_days_in_range(
+        date(_OUT_OF_RANGE_YEAR, 2, 1), date(_OUT_OF_RANGE_YEAR, 2, 28)
+    )
     assert isinstance(days, list) and days
 
 
@@ -468,7 +566,7 @@ def test_unknown_is_distinguishable_from_trading_day(svc):
     불리언은 살아 있는 채로(=시스템이 멈추지 않는다) 신뢰 여부를
     별도 축으로 물어볼 수 있어야 한다.
     """
-    verdict = svc.get_trading_day_verdict(date(2030, 2, 4))
+    verdict = svc.get_trading_day_verdict(_a_weekday(_OUT_OF_RANGE_YEAR))
     assert verdict.is_trading_day is True   # 시스템은 계속 돈다
     assert verdict.trusted is False         # 그러나 이건 근거 없는 True다
     assert verdict.reason
@@ -593,6 +691,9 @@ def test_market_hours_fallback_is_derived_not_a_second_copy():
     수정 전에는 손입력 사본이었고 krx_holiday의 표와 **똑같은 결손**을
     갖고 있었다(2026 대체공휴일 4일 전부 + 2025-03-03 누락). 사본을
     남겨 두면 두 판정 경로가 조용히 갈린다.
+
+    ⚠️ 파생 구간도 손입력 표의 키(2024~2026 고정)가 아니라 **오늘 기준
+    이동 창**이 됐다. 표였을 때는 이 창이 2027년 1월에 통째로 말라붙었다.
     """
     from services.trading.market_hours import MarketHoursService
 
@@ -602,10 +703,17 @@ def test_market_hours_fallback_is_derived_not_a_second_copy():
         fallback = MarketHoursService.fallback_holidays()
 
         fetcher = KRXHolidayFetcher()
-        for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
+        years = MarketHoursService.fallback_years()
+        assert len(years) >= 3
+        for year in years:
             expected = {h.date for h in fetcher._get_known_holidays(year)}
             actual = {d for d in fallback if d.year == year}
             assert actual == expected, f"{year} 폴백이 규칙 엔진과 다르다"
+
+        # 창이 **오늘을 따라 움직인다** -- 올해와 내년이 반드시 들어 있다.
+        today = date.today()
+        assert today.year in years
+        assert today.year + 1 in years
 
         # 오늘의 실제 피해 4일이 폴백에도 들어 있어야 한다.
         for d in [date(2026, 3, 2), date(2026, 5, 25),
@@ -613,6 +721,45 @@ def test_market_hours_fallback_is_derived_not_a_second_copy():
             assert d in fallback
     finally:
         # M11: 클래스 상태를 원복한다 -- 안 하면 테스트 간 오염된다.
+        MarketHoursService._fallback_cache = saved
+
+
+def test_market_hours_fallback_survives_one_unusable_year(monkeypatch):
+    """창 안의 한 해가 계산 불가여도 나머지 해가 통째로 사라지지 않는다.
+
+    2049년이 되면 창(`올해-1 ~ 올해+2`)이 라이브러리 상한 2050을 넘는다.
+    연도 루프가 하나의 try로 묶여 있으면 그 한 해 때문에 **폴백 전체가
+    빈 집합**이 되고, 휴장일 0개 = 모든 평일이 거래일이 된다. 이 태스크가
+    없애려는 실패 형태 그 자체라 미리 못 박는다.
+
+    ⚠️ 못 쓰게 만드는 해는 창의 **첫 해**여야 한다. 초판은 마지막 해를
+    골랐는데, 그러면 격리를 제거해도 앞선 해들이 이미 `derived`에 쌓여
+    있어 테스트가 통과했다 -- 가드가 아니라 장식이었다(RED 재현 실패로
+    발각). 첫 해가 죽으면 격리 없는 구현은 빈 집합을 돌려준다.
+    """
+    from services.trading.market_hours import MarketHoursService
+
+    saved = MarketHoursService._fallback_cache
+    real = KRXHolidayFetcher._get_known_holidays
+    try:
+        MarketHoursService._fallback_cache = None
+        years = MarketHoursService.fallback_years()
+        doomed = years[0]
+
+        def _selective(self, year):
+            if year == doomed:
+                raise IncompleteHolidayDataError(f"{year} 계산 불가(주입)")
+            return real(self, year)
+
+        monkeypatch.setattr(KRXHolidayFetcher, "_get_known_holidays", _selective)
+
+        fallback = MarketHoursService.fallback_holidays()
+        assert fallback, "한 해가 실패했다고 폴백 전체가 비었다"
+        assert not any(d.year == doomed for d in fallback)
+        assert any(d.year == years[-1] for d in fallback)
+        # 쓸 수 있는 결과는 캐시돼야 한다 -- 매 호출 재파생은 실패 취급이다.
+        assert MarketHoursService._fallback_cache is not None
+    finally:
         MarketHoursService._fallback_cache = saved
 
 
@@ -950,3 +1097,473 @@ def test_market_hours_fallback_does_not_cache_failure(monkeypatch):
         assert date(2026, 8, 17) in second
     finally:
         MarketHoursService._fallback_cache = saved
+
+
+# ===========================================================================
+# D. 음력 공휴일 = 계산 (표가 아니라)
+# ===========================================================================
+#
+# 손입력 표는 2024·2025·2026만 갖고 있었다. 2027년 1월이 되면 설날이
+# **거래일로 보인다** -- 지금은 ERROR로 드러나지만(`holiday_calendar_
+# untrusted_years years=[2027]`) 스스로 고쳐지지는 않는다.
+#
+# 음력→양력 변환은 `korean_lunar_calendar`(순수 파이썬, 의존성 0)로 한다.
+#   설날 = 음력 1/1 · 부처님오신날 = 음력 4/8 · 추석 = 음력 8/15
+#   설날·추석은 전날·당일·다음날 3일 연휴(제2조제4호·제9호)
+
+
+# 검증된 실측 대조표. **이것이 라이브러리를 신뢰할 근거 그 자체**이고,
+# 계산이 표를 대체해도 되는지를 가르는 유일한 증거다.
+_VERIFIED_LUNAR_SOLAR = {
+    2024: {"설날": date(2024, 2, 10), "석가탄신일": date(2024, 5, 15),
+           "추석": date(2024, 9, 17)},
+    2025: {"설날": date(2025, 1, 29), "석가탄신일": date(2025, 5, 5),
+           "추석": date(2025, 10, 6)},
+    2026: {"설날": date(2026, 2, 17), "석가탄신일": date(2026, 5, 24),
+           "추석": date(2026, 9, 25)},
+}
+
+
+@pytest.mark.parametrize("year", sorted(_VERIFIED_LUNAR_SOLAR))
+def test_computed_lunar_dates_reproduce_the_verified_years(year):
+    """가장 중요한 가드: 계산이 **제거된 손입력 값과 정확히 일치**한다.
+
+    2024·2025·2026 세 해의 설날·석가탄신일·추석 9건. 하나라도 어긋나면
+    라이브러리를 신뢰할 근거가 없어지고, 계산으로 표를 대체한 결정
+    자체가 무효가 된다.
+    """
+    expected = _VERIFIED_LUNAR_SOLAR[year]
+    for name, solar in expected.items():
+        assert _dates_named(year, name) == {solar}, f"{year} {name}"
+
+
+@pytest.mark.parametrize("year", sorted(_VERIFIED_LUNAR_SOLAR))
+def test_computed_lunar_holiday_runs_reproduce_the_verified_years(year):
+    """연휴 3일(전날·당일·다음날)도 제거된 표와 정확히 일치한다."""
+    expected = _VERIFIED_LUNAR_SOLAR[year]
+    for label, run_name in (("설날", "설날 연휴"), ("추석", "추석 연휴")):
+        day = expected[label]
+        assert _dates_named(year, label, run_name) == {
+            day - timedelta(days=1), day, day + timedelta(days=1)
+        }, f"{year} {label} 연휴"
+
+
+def test_2027_lunar_calendar_exists_at_all():
+    """2027 -- 손입력 표가 끝나 **조용히 사라지던** 바로 그 해.
+
+    설날 2/7(일) 연휴 2/6·2/7·2/8 · 석가탄신일 5/13 · 추석 9/15(수)
+    연휴 9/14·9/15·9/16.
+    """
+    assert _dates_named(2027, "설날", "설날 연휴") == {
+        date(2027, 2, 6), date(2027, 2, 7), date(2027, 2, 8)
+    }
+    assert _dates_named(2027, "석가탄신일") == {date(2027, 5, 13)}
+    assert _dates_named(2027, "추석", "추석 연휴") == {
+        date(2027, 9, 14), date(2027, 9, 15), date(2027, 9, 16)
+    }
+    assert _missing_markers(2027) == []
+
+
+def test_2027_seollal_on_sunday_produces_a_substitute():
+    """⭐ 규칙 엔진이 **계산된 음력 날짜 위에서도 작동한다**.
+
+    2027 설날은 2/7(일)이다. 일요일은 제2조제1호의 공휴일이므로 설날
+    연휴가 "다른 공휴일과 겹친" 경우(제3조①)에 해당해 대체일이 생긴다.
+    연휴 2/6(토)·2/7(일)·2/8(월) 다음의 첫 비공휴일 평일 = **2/9(화)**.
+
+    이 테스트는 음력 계산과 대체공휴일 규칙이 **실제로 맞물려 있다**는
+    증거다 -- 둘 중 하나만 있으면 통과할 수 없다.
+    """
+    subs = _substitutes(2027)
+    assert date(2027, 2, 9) in subs
+    # 2/6(토)은 트리거가 아니다 -- 설날 연휴에 토요일은 대체 사유가 아니므로
+    # 2월 대체일은 정확히 하나여야 한다.
+    assert len([d for d in subs if d.month == 2]) == 1
+
+
+def test_2028_chuseok_collides_with_gaecheonjeol():
+    """⭐ 2028 추석 당일 10/3(화)이 **개천절과 겹친다**.
+
+    요일은 평일이지만 "다른 공휴일과 겹칠 경우"에 해당해 대체일이 생긴다.
+    연휴 10/2(월)·10/3(화)·10/4(수) 다음의 첫 비공휴일 평일 = **10/5(목)**.
+
+    겹침은 같은 날 두 이름이 동시에 존재할 때만 성립하므로, 음력 계산이
+    개천절(고정)과 같은 달력 위에 올라가 있어야만 발현한다.
+    """
+    holidays = KRXHolidayFetcher()._get_known_holidays(2028)
+    names_on_1003 = {h.name for h in holidays if h.date == date(2028, 10, 3)}
+    assert names_on_1003 == {"추석", "개천절"}, names_on_1003
+
+    subs = _substitutes(2028)
+    assert date(2028, 10, 5) in subs
+    # 겹쳤다고 대체가 둘이 되지는 않는다(같은 날 → 하나).
+    assert len([d for d in subs if d.month == 10 and d.day <= 6]) == 1
+
+
+def test_every_covered_year_has_all_three_lunar_holidays():
+    """계산이 덮는 27개 연도 **전부**에 설날·석가탄신일·추석이 있다.
+
+    표였을 때는 3개 연도가 전부였다. 빠진 연도가 있으면
+    `missing_required_markers`가 잡아 그 해가 신뢰 상태가 되지 못한다.
+    """
+    for year in _COVERED_SAMPLE_YEARS:
+        holidays = KRXHolidayFetcher()._get_known_holidays(year)
+        names = {h.name for h in holidays}
+        assert "설날" in names, year
+        assert "추석" in names, year
+        assert "석가탄신일" in names, year
+        assert _missing_markers(year) == [], year
+
+
+def test_lunar_holidays_stay_inside_their_own_year():
+    """연휴 전날/다음날이 연도 경계를 넘지 않는다.
+
+    넘으면 `HolidayInfo.year`와 실제 날짜의 연도가 갈려 저장 계층의
+    연도별 완전성 회계가 어긋난다. 음력 1/1은 양력 1월 하순~2월 하순,
+    음력 8/15는 9~10월이라 구조적으로 불가능하지만 **가정을 못 박는다**.
+    """
+    for year in _COVERED_SAMPLE_YEARS:
+        for h in compute_lunar_holidays(year):
+            assert h.date.year == year, f"{year}: {h.name} {h.date}"
+            assert h.year == year
+
+
+def test_declared_upper_bound_matches_the_library():
+    """선언한 유효 범위가 **라이브러리의 실제 한계와 일치**한다.
+
+    2050은 임의의 숫자가 아니라 `korean_lunar_calendar` 0.4.0의
+    `setLunarDate`가 True를 돌려주는 마지막 해다. 라이브러리가 갱신돼
+    범위가 넓어지면 이 테스트가 실패하면서 상수를 올리라고 알려준다 --
+    상한이 조용히 낡지 않게 하는 장치다.
+    """
+    from korean_lunar_calendar import KoreanLunarCalendar
+
+    ok = KoreanLunarCalendar()
+    assert ok.setLunarDate(LUNAR_CALC_MAX_YEAR, 1, 1, False) is True
+
+    beyond = KoreanLunarCalendar()
+    assert beyond.setLunarDate(LUNAR_CALC_MAX_YEAR + 1, 1, 1, False) is False
+
+    floor = KoreanLunarCalendar()
+    assert floor.setLunarDate(LUNAR_CALC_MIN_YEAR, 1, 1, False) is True
+
+    below = KoreanLunarCalendar()
+    assert below.setLunarDate(LUNAR_CALC_MIN_YEAR - 1, 1, 1, False) is False
+
+
+def test_coverage_follows_library_availability(no_lunar_library):
+    """라이브러리가 없으면 **어느 연도도 덮지 못한다**고 정직하게 말한다."""
+    assert lunar_calendar_available() is False
+    assert KRXHolidayFetcher.covers_year(2027) is False
+    desc = KRXHolidayFetcher.coverage_description()
+    assert "korean_lunar_calendar" in desc
+
+
+def test_dependency_is_declared_not_just_installed():
+    """`korean_lunar_calendar`가 **선언**돼 있다(내 노트북에만 깔린 게 아니라).
+
+    이 태스크의 실패 형태를 그대로 되풀이하지 않기 위한 가드다: 라이브러리를
+    라이브 conda 환경에 손으로만 설치하면 여기서는 전부 통과하지만, 새 환경을
+    `conda env create` / `pip install -r requirements.txt`로 만들면 **음력
+    공휴일이 통째로 사라진다**. 손입력 표가 2027년에 말라붙는 것과 같은 사건이
+    설치 축에서 재발하는 것이다.
+
+    import 가능 여부(`lunar_calendar_available()`)로는 절대 잡히지 않는다 --
+    그건 지금 이 프로세스에 깔려 있느냐만 말해 준다.
+    """
+    from pathlib import Path
+
+    here = Path(__file__).resolve()
+    backend_dir = here.parents[2]
+    repo_root = here.parents[3]
+
+    for path in (backend_dir / "requirements.txt", repo_root / "environment.yml"):
+        assert path.exists(), path
+        declared = [
+            line for line in path.read_text(encoding="utf-8").splitlines()
+            if "korean_lunar_calendar" in line
+            and not line.lstrip().startswith("#")
+        ]
+        assert declared, f"{path.name}에 korean_lunar_calendar 선언이 없다"
+
+
+def test_coverage_description_names_the_range_when_available():
+    assert lunar_calendar_available() is True
+    desc = KRXHolidayFetcher.coverage_description()
+    assert str(LUNAR_CALC_MAX_YEAR) in desc
+    assert "korean_lunar_calendar" in desc
+
+
+# ---------------------------------------------------------------------------
+# D-C 교차: 계산 실패가 **조용한 부분 데이터**로 새지 않는다
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_missing_library_leaves_the_year_untrusted_and_logs_error(
+    svc, offline_fetcher, no_lunar_library, caplog
+):
+    """import 실패 → 그 해는 저장되지 않고 `untrusted`로 남으며 ERROR가 난다.
+
+    ⚠️ 이 태스크에서 가장 중요한 경로다. 고정 공휴일 9개만 돌려주면
+    설날·추석이 빠진 달력이 **정상처럼** 보이고, 그건 라이브 DB의 2027년
+    9행이 이미 저지른 실패다(그때는 표가 없어서, 이번엔 라이브러리가
+    없어서 -- 형태가 같다).
+    """
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    try:
+        saved = await svc.update_holidays(2027)
+    finally:
+        await svc.close()
+
+    assert saved == 0, "부분 달력이 저장됐다"
+    assert not svc.storage.has_year_data(2027)
+    assert not svc.storage.is_year_complete(2027)
+    assert 2027 in svc.get_status()["untrusted_years"]
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "달력을 못 만들었는데 ERROR 로그가 하나도 없다"
+    blob = " ".join(r.getMessage() for r in errors)
+    assert "korean_lunar_calendar" in blob, blob
+
+
+@pytest.mark.asyncio
+async def test_out_of_range_year_leaves_the_year_untrusted_and_logs_error(
+    svc, offline_fetcher, caplog
+):
+    """범위 밖 연도(2051)도 같은 경로로 흐른다 -- 조용히 틀리지 않는다."""
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    try:
+        saved = await svc.update_holidays(_OUT_OF_RANGE_YEAR)
+    finally:
+        await svc.close()
+
+    assert saved == 0
+    assert not svc.storage.is_year_complete(_OUT_OF_RANGE_YEAR)
+    assert svc.get_trading_day_verdict(
+        _a_weekday(_OUT_OF_RANGE_YEAR)
+    ).trusted is False
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    blob = " ".join(r.getMessage() for r in errors)
+    assert str(LUNAR_CALC_MAX_YEAR) in blob, blob
+
+
+def test_fixed_only_calendar_is_refused_by_the_marker_backstop():
+    """이중 방어: 설령 고정분만 흘러 나가도 완전성 마커가 막는다.
+
+    `_get_known_holidays`의 예외가 1차 방어고, `missing_required_markers`
+    (원격 경로용)가 2차다. 라이브러리 없이 만들 수 있는 유일한 달력인
+    고정 9종은 2차에서도 반드시 걸러져야 한다.
+    """
+    from services.krx_holiday.fetcher import missing_required_markers
+
+    fixed_only = KRXHolidayFetcher()._fixed_holidays(2027)
+    assert len(fixed_only) == 10
+    assert sorted(missing_required_markers(fixed_only)) == ["설날", "추석"]
+
+
+@pytest.mark.asyncio
+async def test_2027_calendar_becomes_trusted_end_to_end(svc, offline_fetcher):
+    """종단: 2027이 **부팅만으로** 신뢰 가능한 달력이 된다.
+
+    이 태스크 전에는 `update_holidays(2027)`가 아무것도 저장하지 못했고
+    (`holiday_calendar_untrusted_years years=[2027]`), 연초가 되면 설날이
+    거래일로 보였다.
+    """
+    try:
+        saved = await svc.update_holidays(2027)
+    finally:
+        await svc.close()
+
+    assert saved > 0
+    assert svc.storage.is_year_complete(2027)
+    assert 2027 not in svc.get_status()["untrusted_years"]
+
+    # 설날 연휴 3일 + 일요일이 만든 대체일 2/9(화)까지 전부 비거래일.
+    for d in [date(2027, 2, 8), date(2027, 2, 9), date(2027, 9, 14),
+              date(2027, 9, 15), date(2027, 9, 16), date(2027, 5, 13)]:
+        assert svc.is_trading_day(d) is False, f"{d}가 거래일로 나왔다"
+
+    # 없는 휴일을 만들어내지도 않는다.
+    assert svc.is_trading_day(date(2027, 2, 10)) is True
+    assert svc.is_trading_day(date(2027, 9, 17)) is True
+
+
+# ===========================================================================
+# E. 근로자의 날 (5/1) — 관공서 공휴일이 아닌 시장 휴장일
+# ===========================================================================
+#
+# `FIXED_HOLIDAYS`에 없어서 시스템이 5월 1일을 **거래일로 봤다.** KRX는 그날
+# 증권·파생·채권 시장을 전부 휴장한다.
+#
+# 실증(yfinance `^KS11` 봉 존재 여부, 2026-08-11):
+#   2023-05-01(월) 없음 · 2024-05-01(수) 없음 · 2025-05-01(목) 없음
+#   → 전부 평일인데 봉이 없다 = 휴장 확정.
+#
+# ⚠️ 그런데 **대체공휴일은 붙지 않는다.** 근로자의 날은 관공서의 공휴일에 관한
+# 규정 제2조의 공휴일이 아니라 근로기준법 제55조의 유급휴일이라, 제3조의
+# 적용 대상도 아니고 "다른 공휴일"도 될 수 없다.
+#
+# 실증(같은 조회):
+#   2021-05-01(토) → 2021-05-03(월) 봉 **있음** = 대체일 없음
+#   2022-05-01(일) → 2022-05-02(월) 봉 **있음** = 대체일 없음
+#
+# 이걸 놓치면 **열린 장을 닫힌 것으로 보는 반대 방향 결함**이 된다.
+
+
+def test_labor_day_exists_in_every_covered_year():
+    """5/1이 어느 해에도 달력에 있다. 계산이 덮는 27개 연도 전수."""
+    for year in _COVERED_SAMPLE_YEARS:
+        assert _dates_named(year, "근로자의날") == {date(year, 5, 1)}, year
+
+
+@pytest.mark.parametrize("year,weekday_name", [
+    (2024, "수"), (2025, "목"), (2026, "금"), (2028, "월"),
+])
+def test_labor_day_weekdays_are_non_trading(year, weekday_name):
+    """평일인 5/1은 **비거래일**이다.
+
+    2024·2025는 yfinance로 실증한 해다(봉 없음). 2026·2028은 같은 규칙의
+    미래 적용 — 2028-05-01(월)이 다음 타격 지점이다.
+    """
+    d = date(year, 5, 1)
+    assert "월화수목금토일"[d.weekday()] == weekday_name
+    assert d in _all_dates(year)
+
+
+@pytest.mark.asyncio
+async def test_labor_day_is_non_trading_end_to_end(svc, offline_fetcher):
+    """종단: 저장까지 거쳐도 5/1이 비거래일로 판정된다."""
+    try:
+        await svc.update_holidays(2026)
+    finally:
+        await svc.close()
+
+    assert svc.is_trading_day(date(2026, 5, 1)) is False
+    info = svc.get_holiday_info(date(2026, 5, 1))
+    assert info is not None and info.name == "근로자의날"
+    # 앞뒤 평일은 그대로 거래일이다 -- 없는 휴일을 만들지 않는다.
+    assert svc.is_trading_day(date(2026, 4, 30)) is True
+    assert svc.is_trading_day(date(2026, 5, 4)) is True
+
+
+def test_labor_day_saturday_gets_no_substitute():
+    """음성 케이스: 2027-05-01(토)에 대체공휴일이 생기지 않는다.
+
+    근로자의 날은 제3조의 대상이 아니다(관공서 공휴일이 아니라 근로기준법상
+    유급휴일). `SUBSTITUTE_EXCLUDED`에서 빼면 05-03(월)이 튀어나오며 실패한다.
+
+    2027년 5월에는 다른 대체 사유가 없다(석가탄신일 5/13 목 · 어린이날 5/5 수)
+    -- 그래서 "5월 대체일 0건"이 곧 근로자의 날에 대한 판정이다.
+    """
+    subs = _substitutes(2027)
+    assert date(2027, 5, 3) not in subs
+    assert not [d for d in subs if d.month == 5], subs
+
+
+def test_labor_day_sunday_gets_no_substitute():
+    """음성 케이스: 2033-05-01(일)에도 대체공휴일이 생기지 않는다.
+
+    토요일보다 강한 조건이다 -- 일요일은 제2조제1호의 **공휴일**이라
+    대상 공휴일이었다면 반드시 대체일이 붙는다(같은 해 광복절·개천절이
+    그렇게 동작한다). 근로자의 날에만 안 붙는 것이 등급의 증거다.
+
+    2033년 5월의 다른 공휴일은 어린이날 5/5(목)·석가탄신일 5/6(금)으로
+    둘 다 평일이라 대체 사유가 없다.
+    """
+    assert date(2033, 5, 1).weekday() == 6
+    subs = _substitutes(2033)
+    assert date(2033, 5, 2) not in subs
+    assert not [d for d in subs if d.month == 5], subs
+
+
+def test_labor_day_cannot_be_the_other_holiday_in_a_collision():
+    """⭐ 근로자의 날은 "다른 공휴일과 겹쳤다"의 **상대가 될 수 없다.**
+
+    2001-05-01(화)은 근로자의 날이자 **석가탄신일**이었다(음력 4/8이 5/1에
+    떨어진 실제 해: 1906·1952·1963·1982·2001). 석가탄신일은 제3조② 대상이라
+    "다른 공휴일과 겹칠 경우" 대체일이 붙는데, 상대가 근로자의 날이면
+    **겹친 것이 아니다** -- 제2조의 공휴일이 아니기 때문이다.
+
+    `_STATUTORY_EXCLUDED_FROM_COLLISION`에서 근로자의날을 빼면 05-02(수)가
+    생기며 실패한다. `SUBSTITUTE_EXCLUDED`(자기 자신의 대체 여부)만으로는
+    막히지 않는 별개의 축이다 -- 여기서 트리거되는 것은 석가탄신일이다.
+    """
+    holidays = KRXHolidayFetcher()._get_known_holidays(2001)
+    names_on_0501 = {h.name for h in holidays if h.date == date(2001, 5, 1)}
+    assert names_on_0501 == {"석가탄신일", "근로자의날"}, names_on_0501
+    assert date(2001, 5, 1).weekday() < 5   # 화요일 -- 요일이 아니라 겹침이 쟁점
+
+    subs = {h.date for h in holidays if h.name == SUBSTITUTE_HOLIDAY_NAME}
+    assert date(2001, 5, 2) not in subs, subs
+
+
+def test_labor_day_is_classified_as_excluded():
+    """등급이 실제로 '적용 제외'다 -- 오늘 봉합한 거부권 경로를 탄다."""
+    from services.krx_holiday.fetcher import classify_holiday_name
+
+    assert classify_holiday_name("근로자의날") == "excluded"
+    assert "근로자의날" in KRXHolidayFetcher.SUBSTITUTE_EXCLUDED
+
+
+@pytest.mark.asyncio
+async def test_calendar_without_labor_day_is_not_trusted(svc, monkeypatch):
+    """근로자의 날이 빠진 달력은 **완전한 것으로 표시되지 않는다.**
+
+    이게 리뷰가 짚은 진짜 구멍이다: 예전 `_REQUIRED_HOLIDAY_MARKERS`는
+    설날·추석만 봐서, 5/1이 통째로 빠진 달력이 `complete`로 저장됐다 --
+    "빠진 달력이 완전한 것으로 표시된다"는 이 아크가 계속 고쳐 온 실패
+    형태 그 자체가 다른 공휴일에서 살아 있었다.
+
+    원격(KRX) 경로에는 이 마커 말고 다른 검증이 없으므로, KRX 복구 시점에
+    터질 잠복 결함이기도 하다.
+    """
+    from services.krx_holiday.fetcher import (
+        HolidayFetchResult,
+        SOURCE_KRX_API,
+        missing_required_markers,
+    )
+
+    full = KRXHolidayFetcher()._get_known_holidays(2026)
+    without_labor_day = [h for h in full if h.name != "근로자의날"]
+    assert len(without_labor_day) == len(full) - 1
+
+    assert missing_required_markers(without_labor_day) == ["근로자의날"]
+    assert missing_required_markers(full) == []
+
+    async def _no_labor_day(year):
+        return HolidayFetchResult(without_labor_day, SOURCE_KRX_API)
+
+    monkeypatch.setattr(svc.fetcher, "fetch_holidays_with_source", _no_labor_day)
+
+    try:
+        saved = await svc.update_holidays(2026)
+    finally:
+        await svc.close()
+
+    assert saved == len(without_labor_day)          # 행은 저장하되
+    assert not svc.storage.is_year_complete(2026)   # 신뢰하지 않는다
+    assert 2026 in svc.get_status()["untrusted_years"]
+
+
+def test_labor_day_marker_accepts_krx_name_variants():
+    """마커는 별칭을 받는다 -- 원격이 다른 표기를 써도 오탐하지 않는다.
+
+    마커 오탐의 대가는 "그 해가 영원히 untrusted"(시끄럽지만 안전)이고
+    미탐의 대가는 "닫힌 장에 매매"(조용하고 위험)다. 그래도 오탐을 줄일
+    수 있는 만큼은 줄인다 -- KRX 표기가 확인되지 않았기 때문이다.
+    """
+    from services.krx_holiday.fetcher import missing_required_markers
+
+    base = KRXHolidayFetcher()._get_known_holidays(2026)
+    for variant in ("근로자의날", "근로자의 날", "노동절"):
+        renamed = [
+            h._replace(name=variant) if h.name == "근로자의날" else h
+            for h in base
+        ]
+        assert missing_required_markers(renamed) == [], variant

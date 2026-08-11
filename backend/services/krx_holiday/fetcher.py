@@ -18,6 +18,20 @@ from datetime import datetime, date, timedelta
 from typing import List, Dict, Optional, NamedTuple, Sequence
 import aiohttp
 
+# 음력→양력 변환. 순수 파이썬 92KB, 의존성 0(PyPI korean_lunar_calendar).
+#
+# ⚠️ **없으면 None으로 남긴다 -- import 실패가 모듈 로드를 깨뜨리면 안 된다.**
+# 이 모듈은 부팅 경로(lifespan)와 장중 1초 루프(market_hours)가 둘 다
+# 밟으므로, 여기서 ImportError가 나가면 달력 하나 때문에 매매가 통째로
+# 멈춘다. 대신 아래 `compute_lunar_holidays()`가 **명시적으로 실패**해
+# 그 연도가 신뢰 불가로 남는다(부분 달력을 조용히 만들지 않는다).
+#
+# 테스트는 이 전역을 None으로 바꿔 import 실패 상태를 재현한다.
+try:  # pragma: no cover - 설치 여부에 따라 갈리는 분기
+    from korean_lunar_calendar import KoreanLunarCalendar
+except ImportError:  # pragma: no cover
+    KoreanLunarCalendar = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -123,15 +137,32 @@ SUBSTITUTE_ON_OTHER_HOLIDAY_ONLY = frozenset({
 #   12/31 "연말"은 법정공휴일이 아니라 KRX 자체 휴장일이라 애초에 대상이
 #   아니고, 아래 `_STATUTORY_EXCLUDED_FROM_COLLISION`에 의해 "다른 공휴일과
 #   겹쳤다"는 판정에서도 빠진다.
+#   "근로자의날"(5/1)은 관공서 공휴일이 아니라 **근로기준법 제55조의
+#   유급휴일**이다. 시장은 닫지만 제3조의 대상이 아니다.
+#     실증(yfinance `^KS11` 봉 존재 여부, 2026-08-11):
+#       2021-05-01(토) → 05-03(월) 봉 **있음** = 대체일 없음
+#       2022-05-01(일) → 05-02(월) 봉 **있음** = 대체일 없음
+#     일요일에도 안 붙는다는 것이 등급의 증거다 -- 제3조 대상이었다면
+#     반드시 붙는다(같은 규칙이 광복절·개천절에서는 붙는다).
 #
 # ⚠️ 이 상수는 `compute_substitute_holidays()`에서 **트리거 집합보다 먼저**
 # 평가된다. 그래야 법 개정으로 어떤 공휴일이 대체 대상에서 빠졌을 때
 # 유지보수자가 이름을 여기에 추가하는 것만으로 실제로 꺼진다 -- 트리거
 # 집합에서 지우는 것을 잊어도 거부권이 이긴다.
-SUBSTITUTE_EXCLUDED = frozenset({"신정", "현충일", "연말"})
+SUBSTITUTE_EXCLUDED = frozenset({"신정", "현충일", "연말", "근로자의날"})
 
-# 겹침 판정에서 제외 -- 법정공휴일이 아니어서 "다른 공휴일"이 될 수 없다.
-_STATUTORY_EXCLUDED_FROM_COLLISION = frozenset({"연말"})
+# 겹침 판정에서 제외 -- 관공서 공휴일(제2조)이 아니어서 **"다른 공휴일"이
+# 될 수 없다**.
+#
+# ⚠️ 위 `SUBSTITUTE_EXCLUDED`와 **축이 다르다.** 저건 "이 공휴일 **자신에게**
+# 대체일이 붙는가", 이건 "이 이름이 **남의** 대체일을 트리거할 수 있는가"다.
+# 근로자의 날은 둘 다 아니어야 한다:
+#   2001-05-01(화)은 근로자의 날이자 **석가탄신일**이었다(음력 4/8이 5/1에
+#   떨어진 해: 1906·1952·1963·1982·2001). 석가탄신일은 제3조② 대상이라
+#   "다른 공휴일과 겹칠 경우" 대체일이 붙는데, 상대가 근로자의 날이면
+#   **겹친 것이 아니다**. 여기 없으면 05-02에 없는 휴장일이 생겨
+#   **열린 장을 닫힌 것으로 보는 반대 방향 결함**이 된다.
+_STATUTORY_EXCLUDED_FROM_COLLISION = frozenset({"연말", "근로자의날"})
 
 # 세 집합은 달력에 등장하는 모든 이름을 **빠짐없이·겹치지 않게** 나눠야
 # 한다. 분류되지 않은 이름은 조용히 "대체 없음"으로 처리되는데, 그건
@@ -176,9 +207,27 @@ def unclassified_holiday_names(names) -> set:
 #
 # 검사 방식은 **행 수 하한이 아니라 이름 존재**다. 행 수는 해마다 달라
 # 임계값이 자의적이지만, 설날·추석은 어느 해에도 반드시 있다(음력 고정).
+#
+# ⚠️ "근로자의날"을 넣은 이유(2026-08-11). 이 목록이 설날·추석뿐이던 동안
+# **5/1이 통째로 빠진 달력이 `complete`로 저장됐다** -- 실제로 `FIXED_HOLIDAYS`
+# 에 근로자의 날이 없어서 라이브 달력 전체가 그 상태였고, 마커는 그것을
+# 잡지 못했다. "빠진 달력이 완전한 것으로 표시된다"는 이 아크가 계속 고쳐 온
+# 실패 형태 그 자체다.
+#   - 자격: 5/1은 어느 해에도 무조건 휴장이다(실증: ^KS11에 2023-05-01 월·
+#     2024-05-01 수·2025-05-01 목 봉이 전부 없다). "이게 없으면 그 해 달력을
+#     못 믿는다"는 마커의 의미에 정확히 부합한다.
+#   - 어디서 일하는가: 폴백 경로에서는 `FIXED_HOLIDAYS`가 코드라 항상 나오므로
+#     동어반복이다. 실제로 일하는 곳은 **원격(KRX) 경로** -- 거기엔 이 마커
+#     말고 다른 검증이 없고, KRX 복구가 백로그에 있다.
+#   - 오탐 비용 vs 미탐 비용: 오탐(KRX가 다른 표기를 써서 그 해가 untrusted)은
+#     시끄럽지만 안전하고 `is_trading_day`는 계속 동작한다. 미탐(5/1 빠진
+#     달력을 신뢰)은 조용하고 위험하다 -- 닫힌 장에 자율매매가 돌아 주문이
+#     전량 거부되고 EOD 체인이 유령 거래일을 원장에 쓴다.
+#   - 오탐은 별칭으로 줄인다(KRX 표기가 확인되지 않았기 때문).
 _REQUIRED_HOLIDAY_MARKERS = (
     ("설날", ("설날", "설날 연휴")),
     ("추석", ("추석", "추석 연휴")),
+    ("근로자의날", ("근로자의날", "근로자의 날", "노동절")),
 )
 
 
@@ -297,6 +346,151 @@ def compute_substitute_holidays(
     return substitutes
 
 
+# ---------------------------------------------------------------------------
+# 음력 공휴일 (관공서의 공휴일에 관한 규정 제2조 제4·6·9호)
+# ---------------------------------------------------------------------------
+#
+# 예전에는 여기 대신 `LUNAR_HOLIDAYS`라는 손입력 딕셔너리가 있었고
+# **2024·2025·2026 세 해뿐**이었다. 2027년 1월이 되면 설날이 거래일로
+# 보이는 구조였다 -- 대체공휴일에서 이미 한 번 겪은 실패("표가 조용히
+# 낡는다")와 같은 형태다. 그래서 같은 처방을 쓴다: 표를 지우고 계산한다.
+#
+# 세 공휴일은 전부 **평달**이라 윤달 인자는 항상 False다.
+#   설날       = 음력 1/1  → 전날·당일·다음날 3일 (제2조제4호)
+#   부처님오신날 = 음력 4/8               (제2조제6호)
+#   추석       = 음력 8/15 → 전날·당일·다음날 3일 (제2조제9호)
+#
+# ⚠️ **여기에 대체공휴일을 넣지 말 것.** 대체일은 위
+# `compute_substitute_holidays()`가 규칙으로 계산한다. 출처가 둘이면
+# 어긋날 때 어느 쪽이 맞는지 알 수 없다.
+
+
+class LunarHolidayRule(NamedTuple):
+    """음력 날짜 → 공휴일. `neighbour_name`이 있으면 전날·다음날도 공휴일."""
+    lunar_month: int
+    lunar_day: int
+    name: str
+    neighbour_name: Optional[str]
+
+
+LUNAR_HOLIDAY_RULES = (
+    LunarHolidayRule(1, 1, "설날", "설날 연휴"),
+    LunarHolidayRule(4, 8, "석가탄신일", None),
+    LunarHolidayRule(8, 15, "추석", "추석 연휴"),
+)
+
+# 계산 유효 범위 -- **라이브러리의 실제 한계**다(임의의 정책값이 아니다).
+#
+# 실측(2026-08-11, korean_lunar_calendar 0.4.0): `setLunarDate()`가
+# 1000~2050년에 True, 999년과 2051년에 False를 돌려준다. 범위 밖은
+# 조용히 틀린 날짜가 아니라 **False**로 알려주므로, 아래 계산은 그것을
+# 확인하고 명시적으로 실패한다.
+#
+# 상한이 조용히 낡지 않도록 테스트가 라이브러리에 직접 물어 대조한다
+# (`test_declared_upper_bound_matches_the_library`). 라이브러리가 갱신돼
+# 범위가 넓어지면 그 테스트가 실패하며 이 상수를 올리라고 알려준다.
+LUNAR_CALC_MIN_YEAR = 1000
+LUNAR_CALC_MAX_YEAR = 2050
+
+# 라이브러리가 없을 때 사용자가 해야 할 일. 예외 메시지·로그에 그대로 실린다.
+_LUNAR_INSTALL_HINT = (
+    "pip install korean_lunar_calendar (순수 파이썬·의존성 0). "
+    "environment.yml · backend/requirements.txt에 선언돼 있다."
+)
+
+
+def lunar_calendar_available() -> bool:
+    """음력 변환 라이브러리를 쓸 수 있는가."""
+    return KoreanLunarCalendar is not None
+
+
+def lunar_year_supported(year: int) -> bool:
+    """라이브러리가 그 연도를 다룰 수 있는가(선언된 범위 기준)."""
+    return LUNAR_CALC_MIN_YEAR <= year <= LUNAR_CALC_MAX_YEAR
+
+
+def solar_date_of_lunar(year: int, month: int, day: int) -> Optional[date]:
+    """평달 음력 날짜 → 양력 날짜. 변환할 수 없으면 None.
+
+    None을 돌려주는 경우는 셋이다: 라이브러리 없음 · 범위 밖 연도 ·
+    라이브러리가 변환을 거부. **어느 쪽도 조용한 근사치를 내지 않는다.**
+    """
+    if KoreanLunarCalendar is None:
+        return None
+
+    cal = KoreanLunarCalendar()
+    # 네 번째 인자 = 윤달 여부. 설날·부처님오신날·추석은 전부 평달이다.
+    if not cal.setLunarDate(year, month, day, False):
+        return None
+
+    try:
+        return date.fromisoformat(cal.SolarIsoFormat()[:10])
+    except (TypeError, ValueError) as e:  # pragma: no cover - 방어선
+        logger.error(
+            "lunar_solar_conversion_unparsable year=%d lunar=%d/%d error=%s",
+            year, month, day, e,
+        )
+        return None
+
+
+def compute_lunar_holidays(year: int) -> List[HolidayInfo]:
+    """그 해의 음력 공휴일을 **계산**한다(연휴 전날·다음날 포함).
+
+    Raises:
+        IncompleteHolidayDataError: 라이브러리가 없거나 · 연도가 범위
+            밖이거나 · 변환이 실패했을 때. 고정 공휴일만 돌려주는 선택지는
+            없다 -- 설날·추석이 빠진 달력은 "휴장일이 적다"가 "거래일이
+            많다"로 접혀 없느니만 못하다(라이브 DB의 2027년 9행이 실물
+            증거다).
+    """
+    if KoreanLunarCalendar is None:
+        raise IncompleteHolidayDataError(
+            f"{year}년 음력 공휴일(설날·부처님오신날·추석)을 계산할 수 없다: "
+            f"korean_lunar_calendar 라이브러리가 없다. {_LUNAR_INSTALL_HINT} "
+            f"고정 공휴일만 반환하면 설날·추석이 빠진 달력이 정상처럼 보이므로 "
+            f"반환하지 않는다."
+        )
+
+    if not lunar_year_supported(year):
+        raise IncompleteHolidayDataError(
+            f"{year}년은 음력 변환 유효 범위 밖이다"
+            f"({LUNAR_CALC_MIN_YEAR}~{LUNAR_CALC_MAX_YEAR}, "
+            f"korean_lunar_calendar의 한계). 이 해의 달력은 KRX 연동이 "
+            f"복구되거나 라이브러리가 범위를 넓혀야 만들 수 있다."
+        )
+
+    out: List[HolidayInfo] = []
+    for rule in LUNAR_HOLIDAY_RULES:
+        solar = solar_date_of_lunar(year, rule.lunar_month, rule.lunar_day)
+        if solar is None:
+            raise IncompleteHolidayDataError(
+                f"{year}년 '{rule.name}'(음력 {rule.lunar_month}/{rule.lunar_day}) "
+                f"양력 변환에 실패했다. 부분 달력을 반환하지 않는다."
+            )
+
+        days = [(solar, rule.name)]
+        if rule.neighbour_name:
+            days.append((solar - timedelta(days=1), rule.neighbour_name))
+            days.append((solar + timedelta(days=1), rule.neighbour_name))
+
+        for d, name in days:
+            # 연휴 앞뒤가 연도를 넘으면 저장 계층의 연도별 완전성 회계가
+            # 어긋난다. 음력 1/1은 양력 1월 하순~2월 하순, 음력 8/15는
+            # 9~10월이라 구조적으로 불가능하지만, 조용히 어긋나느니
+            # 시끄럽게 실패한다.
+            if d.year != year:
+                raise IncompleteHolidayDataError(
+                    f"{year}년 '{name}' 계산 결과 {d}가 연도 경계를 넘었다 -- "
+                    f"음력 변환 결과가 예상 범위를 벗어났다."
+                )
+            out.append(HolidayInfo(
+                date=d, day_of_week=_weekday_name(d), name=name, year=year,
+            ))
+
+    out.sort(key=lambda h: h.date)
+    return out
+
+
 class KRXHolidayFetcher:
     """
     Fetches KRX market holidays using the open.krx.co.kr API.
@@ -317,9 +511,18 @@ class KRXHolidayFetcher:
     HOLIDAY_BLD = "MKD/01/0110/01100305/mkd01100305_01"
 
     # 고정 공휴일 -- 어느 해든 같은 날짜다.
+    #
+    # ⚠️ 전부 관공서 공휴일인 것은 아니다. "연말"(12/31)은 KRX 자체 휴장일,
+    # "근로자의날"(5/1)은 근로기준법 제55조의 유급휴일이다. 시장이 닫는다는
+    # 점은 같지만 대체공휴일 규칙에서는 다르게 취급된다(위 세 등급 상수 참조).
     FIXED_HOLIDAYS = (
         (1, 1, "신정"),
         (3, 1, "삼일절"),
+        # 근로자의 날. KRX는 증권·파생·채권 시장을 전부 휴장한다.
+        # 실증(yfinance ^KS11): 2023-05-01(월)·2024-05-01(수)·2025-05-01(목)
+        # 전부 평일인데 봉이 없다. 2026-08-11까지 이 줄이 없어서 시스템이
+        # 5/1을 거래일로 봤다 -- 다음 타격 지점은 2028-05-01(월)이었다.
+        (5, 1, "근로자의날"),
         (5, 5, "어린이날"),
         (6, 6, "현충일"),
         (8, 15, "광복절"),
@@ -329,46 +532,10 @@ class KRXHolidayFetcher:
         (12, 31, "연말"),  # 법정공휴일이 아닌 KRX 자체 휴장일
     )
 
-    # 음력 공휴일 -- 해마다 날짜가 달라 손으로 채운다.
-    #
-    # ⚠️ **여기 없는 연도는 폴백 달력을 만들 수 없다.** 고정분만 돌려주면
-    # 설날·추석이 빠진 채 정상처럼 보이므로, `_get_known_holidays`가
-    # `IncompleteHolidayDataError`로 명시적으로 실패한다.
-    # 여기에 새 연도를 추가하는 것이 유일한 연장 방법이다(음력 계산
-    # 라이브러리가 이 환경에 없다 -- 백로그).
-    #
-    # ⚠️ `"대체공휴일"`을 손으로 넣지 말 것. 대체일은
-    # `compute_substitute_holidays()`가 규칙으로 계산한다 -- 출처가
-    # 둘이면 어긋날 때 어느 쪽이 맞는지 알 수 없다.
-    LUNAR_HOLIDAYS: Dict[int, Sequence] = {
-        2024: (
-            (2, 9, "설날 연휴"),
-            (2, 10, "설날"),
-            (2, 11, "설날 연휴"),
-            (5, 15, "석가탄신일"),
-            (9, 16, "추석 연휴"),
-            (9, 17, "추석"),
-            (9, 18, "추석 연휴"),
-        ),
-        2025: (
-            (1, 28, "설날 연휴"),
-            (1, 29, "설날"),
-            (1, 30, "설날 연휴"),
-            (5, 5, "석가탄신일"),  # 2025년 석가탄신일은 5/5 (어린이날과 겹침)
-            (10, 5, "추석 연휴"),
-            (10, 6, "추석"),
-            (10, 7, "추석 연휴"),
-        ),
-        2026: (
-            (2, 16, "설날 연휴"),
-            (2, 17, "설날"),
-            (2, 18, "설날 연휴"),
-            (5, 24, "석가탄신일"),
-            (9, 24, "추석 연휴"),
-            (9, 25, "추석"),
-            (9, 26, "추석 연휴"),
-        ),
-    }
+    # ⚠️ 음력 공휴일 표(`LUNAR_HOLIDAYS`)는 **제거됐다.** 2024·2025·2026만
+    # 손으로 들어 있어 2027년 1월이면 설날이 거래일로 보이는 구조였다.
+    # 이제 `compute_lunar_holidays(year)`가 매번 계산한다 -- 고정 공휴일
+    # 표(`FIXED_HOLIDAYS`)만 표로 남는다(어느 해든 같은 날짜라 낡지 않는다).
 
     # 규칙 상수는 모듈 상수를 그대로 노출한다(호출자가 한 곳만 보면 되도록).
     SUBSTITUTE_ON_WEEKEND_OR_HOLIDAY = SUBSTITUTE_ON_WEEKEND_OR_HOLIDAY
@@ -414,8 +581,31 @@ class KRXHolidayFetcher:
 
     @classmethod
     def covers_year(cls, year: int) -> bool:
-        """폴백 표가 그 연도의 **완전한** 달력을 만들 수 있는가."""
-        return year in cls.LUNAR_HOLIDAYS
+        """폴백 경로가 그 연도의 **완전한** 달력을 만들 수 있는가.
+
+        예전에는 "손입력 표에 그 해가 있는가"였다. 이제는 "음력을 계산할
+        수 있는가" -- 라이브러리가 있고 연도가 유효 범위 안이면 참이다.
+        실제 변환 실패는 `compute_lunar_holidays()`가 다시 잡는다(이중 방어).
+        """
+        return lunar_calendar_available() and lunar_year_supported(year)
+
+    @classmethod
+    def coverage_description(cls) -> str:
+        """유효기간을 사람이 읽을 한 줄로. 부팅 진단 로그에 실린다.
+
+        예전에는 표의 키 목록(`[2024, 2025, 2026]`)이었다. 이제는 구간이라
+        문자열이 정직하다 -- 그리고 라이브러리가 없으면 그 사실 자체가
+        여기 드러난다(빈 목록은 "덮는 연도가 없다"로만 보여 원인을 숨긴다).
+        """
+        if not lunar_calendar_available():
+            return (
+                "unavailable -- korean_lunar_calendar 미설치라 음력 공휴일을 "
+                f"계산할 수 없다. {_LUNAR_INSTALL_HINT}"
+            )
+        return (
+            f"computed {LUNAR_CALC_MIN_YEAR}-{LUNAR_CALC_MAX_YEAR} "
+            f"(korean_lunar_calendar)"
+        )
 
     async def _get_otp(self, year: int) -> Optional[str]:
         """
@@ -555,9 +745,9 @@ class KRXHolidayFetcher:
         """
         logger.error(
             "krx_holiday_fetch_failed_using_%s year=%d -- KRX 원격 경로(OTP·직접)"
-            "가 모두 실패해 하드코딩 폴백 표로 달력을 만든다. 이 값은 KRX에서 "
-            "받은 것이 아니다. 표가 덮는 연도: %s",
-            SOURCE_FALLBACK_TABLE, year, sorted(self.LUNAR_HOLIDAYS),
+            "가 모두 실패해 로컬 폴백(고정 표 + 음력 계산 + 대체공휴일 규칙)으로 "
+            "달력을 만든다. 이 값은 KRX에서 받은 것이 아니다. 유효 범위: %s",
+            SOURCE_FALLBACK_TABLE, year, self.coverage_description(),
         )
 
         return self._get_known_holidays(year)
@@ -621,33 +811,22 @@ class KRXHolidayFetcher:
         return out
 
     def _get_known_holidays(self, year: int) -> List[HolidayInfo]:
-        """그 해의 폴백 달력 = 고정 + 음력 + **규칙으로 계산한 대체공휴일**.
+        """그 해의 폴백 달력 = 고정 표 + **계산한 음력** + **규칙 대체공휴일**.
+
+        세 부분 중 손으로 유지되는 것은 `FIXED_HOLIDAYS`뿐이고, 그건 어느
+        해든 같은 날짜라 낡지 않는다.
 
         Raises:
-            IncompleteHolidayDataError: 음력 표에 그 연도가 없을 때.
-                부분 달력을 조용히 반환하면 "휴장일이 적다"가 "거래일이
-                많다"로 접힌다 -- 라이브 DB의 2027년 9행이 그 결과다.
+            IncompleteHolidayDataError: 음력을 계산할 수 없을 때(라이브러리
+                없음 · 범위 밖 연도 · 변환 실패). 부분 달력을 조용히
+                반환하면 "휴장일이 적다"가 "거래일이 많다"로 접힌다 --
+                라이브 DB의 2027년 9행이 그 결과다.
         """
-        if not self.covers_year(year):
-            raise IncompleteHolidayDataError(
-                f"폴백 표에 {year}년 음력 공휴일(설날·추석·석가탄신일)이 없다. "
-                f"현재 표가 덮는 연도: {sorted(self.LUNAR_HOLIDAYS)}. "
-                f"고정 공휴일만 반환하면 설날·추석이 빠진 달력이 정상처럼 "
-                f"보이므로 반환하지 않는다. "
-                f"services/krx_holiday/fetcher.py의 LUNAR_HOLIDAYS에 "
-                f"{year}년을 추가하거나 KRX 연동을 복구할 것."
-            )
+        # 음력을 **먼저** 계산한다. 실패하면 고정분을 만들기도 전에 나가야
+        # 부분 달력이 존재할 수 있는 창 자체가 없다.
+        lunar = compute_lunar_holidays(year)
 
-        base = self._fixed_holidays(year)
-        for month, day, name in self.LUNAR_HOLIDAYS[year]:
-            try:
-                d = date(year, month, day)
-            except ValueError:
-                continue
-            base.append(HolidayInfo(
-                date=d, day_of_week=_weekday_name(d), name=name, year=year,
-            ))
-
+        base = self._fixed_holidays(year) + lunar
         holidays = base + compute_substitute_holidays(base)
         holidays.sort(key=lambda h: h.date)
         return holidays
@@ -690,7 +869,9 @@ async def test_fetcher():
     fetcher = KRXHolidayFetcher()
 
     try:
-        for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
+        this_year = date.today().year
+        print(f"coverage: {KRXHolidayFetcher.coverage_description()}")
+        for year in range(this_year, this_year + 3):
             result = await fetcher.fetch_holidays_with_source(year)
             print(f"\n=== KRX Holidays {year} "
                   f"({len(result.holidays)} days, source={result.source}) ===")

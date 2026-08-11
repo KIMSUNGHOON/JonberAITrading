@@ -27,6 +27,11 @@ pandas>=2.2.0
 numpy>=1.26.0
 yfinance>=1.0.0  # KOSPI(^KS11) index_series.py -- regime volatility input
 
+# 음력→양력 변환. krx_holiday/fetcher.py가 설날·부처님오신날·추석을 계산한다
+# (손입력 표를 대체). 순수 파이썬·의존성 0·유효 범위 ~2050.
+# ⚠️ 없으면 그 연도 달력이 저장되지 않고 untrusted로 남는다(부팅 시 ERROR).
+korean_lunar_calendar>=0.3.1
+
 # -------------------------------------------
 # Async & HTTP Client
 # -------------------------------------------

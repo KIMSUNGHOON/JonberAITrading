@@ -242,9 +242,9 @@ class KRXHolidayService:
             "krx_calendar_untrusted year=%d -- 이 연도의 완전한 휴장일 달력이 "
             "저장돼 있지 않다. 거래일 판정은 '주말 아님 + 아는 휴일 아님'으로만 "
             "내려지고 있어, 모르는 휴장일은 **거래일로 보인다**. "
-            "update_holidays(%d)를 돌리거나 fetcher.LUNAR_HOLIDAYS에 그 해를 "
-            "추가할 것. (신뢰 필요한 호출자는 get_trading_day_verdict().trusted 참조)",
-            year, year,
+            "update_holidays(%d)를 돌릴 것. 계산 유효 범위: %s. "
+            "(신뢰 필요한 호출자는 get_trading_day_verdict().trusted 참조)",
+            year, year, KRXHolidayFetcher.coverage_description(),
         )
 
     def is_trading_day(self, check_date: date) -> bool:
@@ -429,7 +429,10 @@ class KRXHolidayService:
             "source": source,
             "year_sources": year_sources,
             "untrusted_years": untrusted,
-            "fallback_covers_years": sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS),
+            # 손입력 표의 키 목록이었으나, 이제 유효기간은 **계산 가능
+            # 구간**이라 한 줄 설명이 정직하다. 라이브러리가 없으면 그
+            # 사실이 여기 드러난다.
+            "fallback_covers_years": KRXHolidayFetcher.coverage_description(),
         }
 
 
