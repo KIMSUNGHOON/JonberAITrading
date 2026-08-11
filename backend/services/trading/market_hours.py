@@ -68,33 +68,45 @@ class MarketHoursService:
     # 같은 방식으로 틀려 있었다. 그래서 사본을 없애고 **같은 규칙 엔진에서
     # 파생**시킨다.
     #
-    # import는 지연시킨다 -- 아래 `_get_holiday_service`가 순환 import를
-    # 피하려고 그러는 것과 같은 이유이고, 여기서는 apscheduler(krx_holiday
-    # 패키지 __init__이 끌어온다)를 모든 market_hours 임포터에 얹지 않기
-    # 위해서이기도 하다. 파생이 실패해도 예외를 내지 않는다 -- 그 경우
-    # 휴장일 집합이 비고 주말 규칙만 남는다(호출자는 계속 동작한다).
+    # import는 **함수 안에서** 한다 -- 아래 `_get_holiday_service`가 순환
+    # import를 피하려 그러는 것과 같은 자리다.
+    #
+    # ⚠️ 지연의 효과를 정확히 적어 둔다: `from services.krx_holiday.fetcher
+    # import ...`도 패키지 `__init__`을 먼저 실행하므로 **apscheduler를
+    # 피하지는 못한다**(초판 주석이 이 메커니즘을 틀리게 적었다). 실제
+    # 효과는 import 시점을 모듈 로드에서 **첫 사용 시점으로 미루는 것**이고,
+    # 그래서 순환 import가 성립하지 않는다.
     _fallback_cache: Optional[Set[date]] = None
 
     @classmethod
     def fallback_holidays(cls) -> Set[date]:
-        """폴백 휴장일 -- krx_holiday의 규칙 엔진에서 1회 파생 후 캐시."""
-        if cls._fallback_cache is None:
-            derived: Set[date] = set()
-            try:
-                from services.krx_holiday.fetcher import KRXHolidayFetcher
+        """폴백 휴장일 -- krx_holiday의 규칙 엔진에서 1회 파생 후 캐시.
 
-                fetcher = KRXHolidayFetcher()
-                for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
-                    derived.update(
-                        h.date for h in fetcher._get_known_holidays(year)
-                    )
-            except Exception as e:
-                logger.error(
-                    "market_hours_fallback_holidays_unavailable",
-                    error=str(e),
-                    hint="휴장일 폴백이 비었다 -- 주말 규칙만 적용된다.",
-                )
-            cls._fallback_cache = derived
+        ⚠️ **실패는 캐시하지 않는다.** 예전에는 `except`를 지나서도 캐시에
+        빈 집합이 들어가, 일시적 실패 한 번이 프로세스 수명 내내 폴백
+        휴장일을 비웠다(휴장일 0개 = 모든 평일이 거래일). 실패해도 예외는
+        내지 않는다 -- 그 경우 주말 규칙만 남고 호출자는 계속 동작한다.
+        """
+        if cls._fallback_cache is not None:
+            return cls._fallback_cache
+
+        derived: Set[date] = set()
+        try:
+            from services.krx_holiday.fetcher import KRXHolidayFetcher
+
+            fetcher = KRXHolidayFetcher()
+            for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
+                derived.update(h.date for h in fetcher._get_known_holidays(year))
+        except Exception as e:
+            logger.error(
+                "market_hours_fallback_holidays_unavailable",
+                error=str(e),
+                hint="휴장일 폴백이 비었다 -- 주말 규칙만 적용된다. "
+                     "캐시하지 않으므로 다음 호출에서 재시도한다.",
+            )
+            return derived  # 캐시하지 않는다 -- 다음 호출에서 다시 시도
+
+        cls._fallback_cache = derived
         return cls._fallback_cache
 
     def __init__(self):

@@ -118,15 +118,80 @@ SUBSTITUTE_ON_OTHER_HOLIDAY_ONLY = frozenset({
     "추석 연휴",    # 제2조제9호 (전날·다음날)
 })
 
-# 적용 제외.
+# 적용 제외 -- **명시적 거부권**이다(암묵적 "어느 집합에도 없음"이 아니라).
 #   신정(제3호)·현충일(제8호)은 법이 제3조 대상에서 뺐다.
 #   12/31 "연말"은 법정공휴일이 아니라 KRX 자체 휴장일이라 애초에 대상이
 #   아니고, 아래 `_STATUTORY_EXCLUDED_FROM_COLLISION`에 의해 "다른 공휴일과
 #   겹쳤다"는 판정에서도 빠진다.
+#
+# ⚠️ 이 상수는 `compute_substitute_holidays()`에서 **트리거 집합보다 먼저**
+# 평가된다. 그래야 법 개정으로 어떤 공휴일이 대체 대상에서 빠졌을 때
+# 유지보수자가 이름을 여기에 추가하는 것만으로 실제로 꺼진다 -- 트리거
+# 집합에서 지우는 것을 잊어도 거부권이 이긴다.
 SUBSTITUTE_EXCLUDED = frozenset({"신정", "현충일", "연말"})
 
 # 겹침 판정에서 제외 -- 법정공휴일이 아니어서 "다른 공휴일"이 될 수 없다.
 _STATUTORY_EXCLUDED_FROM_COLLISION = frozenset({"연말"})
+
+# 세 집합은 달력에 등장하는 모든 이름을 **빠짐없이·겹치지 않게** 나눠야
+# 한다. 분류되지 않은 이름은 조용히 "대체 없음"으로 처리되는데, 그건
+# 이번에 봉합한 결함("빠진 것이 정상처럼 보인다")과 같은 형태다.
+_ALL_CLASSIFIED = (
+    SUBSTITUTE_ON_WEEKEND_OR_HOLIDAY
+    | SUBSTITUTE_ON_OTHER_HOLIDAY_ONLY
+    | SUBSTITUTE_EXCLUDED
+)
+
+
+def classify_holiday_name(name: str) -> str:
+    """공휴일 이름 → 대체공휴일 등급.
+
+    Returns:
+        "weekend_or_holiday" (제3조②) | "other_holiday_only" (제3조①)
+        | "excluded" (적용 제외) | "unclassified" (셋 어디에도 없음)
+    """
+    if name in SUBSTITUTE_EXCLUDED:
+        return "excluded"          # 거부권 우선
+    if name in SUBSTITUTE_ON_WEEKEND_OR_HOLIDAY:
+        return "weekend_or_holiday"
+    if name in SUBSTITUTE_ON_OTHER_HOLIDAY_ONLY:
+        return "other_holiday_only"
+    return "unclassified"
+
+
+def unclassified_holiday_names(names) -> set:
+    """세 상수 어디에도 속하지 않는 이름들(대체공휴일 자신은 제외)."""
+    return {
+        n for n in names
+        if n != SUBSTITUTE_HOLIDAY_NAME and n not in _ALL_CLASSIFIED
+    }
+
+
+# 한 해 달력이 "완전하다"고 부르기 위한 최소 조건.
+#
+# 폴백 경로는 `IncompleteHolidayDataError`가 막지만 **원격 경로에는 아무
+# 검증이 없었다** -- KRX가 3행짜리 응답을 주면 그 해가 신뢰 상태로 저장된다.
+# C가 봉합한 것과 정확히 같은 실패 형태(부분 데이터가 정상으로 보인다)라
+# KRX 복구 시점에 터질 잠복 결함이었다.
+#
+# 검사 방식은 **행 수 하한이 아니라 이름 존재**다. 행 수는 해마다 달라
+# 임계값이 자의적이지만, 설날·추석은 어느 해에도 반드시 있다(음력 고정).
+_REQUIRED_HOLIDAY_MARKERS = (
+    ("설날", ("설날", "설날 연휴")),
+    ("추석", ("추석", "추석 연휴")),
+)
+
+
+def missing_required_markers(holidays: Sequence[HolidayInfo]) -> List[str]:
+    """완전한 달력이라면 반드시 있어야 할 항목 중 빠진 것.
+
+    빈 리스트면 완전하다고 볼 수 있다.
+    """
+    names = {h.name for h in holidays}
+    return [
+        label for label, aliases in _REQUIRED_HOLIDAY_MARKERS
+        if not names.intersection(aliases)
+    ]
 
 
 def compute_substitute_holidays(
@@ -167,6 +232,18 @@ def compute_substitute_holidays(
     occupied = set(by_date)
     substitutes: List[HolidayInfo] = []
 
+    # 분류되지 않은 이름은 조용히 넘어가지 않는다 -- 새 공휴일이 표에
+    # 들어왔는데 등급을 안 정하면 대체일이 영원히 안 생긴다.
+    unknown = unclassified_holiday_names({n for ns in by_date.values() for n in ns})
+    if unknown:
+        logger.error(
+            "substitute_rule_unclassified_holiday_names names=%s -- 이 이름들은 "
+            "SUBSTITUTE_ON_WEEKEND_OR_HOLIDAY · SUBSTITUTE_ON_OTHER_HOLIDAY_ONLY · "
+            "SUBSTITUTE_EXCLUDED 어디에도 없어 대체공휴일이 계산되지 않는다. "
+            "셋 중 하나에 넣을 것.",
+            sorted(unknown),
+        )
+
     for d in sorted(by_date):
         names = by_date[d]
 
@@ -177,11 +254,15 @@ def compute_substitute_holidays(
         is_saturday = d.weekday() == 5
         is_sunday = d.weekday() == 6
 
+        # 등급 판정. `classify_holiday_name`이 **적용 제외를 먼저** 보므로
+        # 거부권이 트리거 집합을 이긴다.
+        grades = {classify_holiday_name(n) for n in names}
+
         triggered = False
-        if any(n in SUBSTITUTE_ON_WEEKEND_OR_HOLIDAY for n in names):
+        if "weekend_or_holiday" in grades:
             # 제3조② -- 토·일·다른 공휴일
             triggered = is_saturday or is_sunday or collides_with_other_holiday
-        elif any(n in SUBSTITUTE_ON_OTHER_HOLIDAY_ONLY for n in names):
+        elif "other_holiday_only" in grades:
             # 제3조① -- 다른 공휴일만(일요일은 제2조제1호로 공휴일)
             triggered = is_sunday or collides_with_other_holiday
 
@@ -297,10 +378,26 @@ class KRXHolidayFetcher:
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
 
+    # KRX 원격 호출 타임아웃(초).
+    #
+    # ⚠️ aiohttp 기본값은 `ClientTimeout(total=300)`이다. `initialize()`는
+    # `current_year+1`을 매 부팅 검사하는데 그 해는 **구조적으로 영원히
+    # 불완전하다**(표가 항상 뒤처진다). 따라서 부팅마다 죽은 엔드포인트로
+    # OTP + 직접 호출 2회가 반드시 나간다. KRX가 404 대신 **무응답**이 되면
+    # 기본값에서는 2 x 300s = 최대 10분간 부팅이 블로킹된다 --
+    # `get_holiday_service()`가 lifespan에서 await되기 때문이고, 이 리포의
+    # "장중 재시작 = 무방비 창"을 그만큼 넓힌다.
+    #
+    # 10초인 이유: 정상 응답은 1초 안쪽이고(실측 404가 즉답), 휴장일 달력은
+    # 부팅을 지연시킬 만큼 급한 데이터가 아니다. 최악이 2 x 10s = 20초로
+    # 묶인다. 실패하면 폴백 표가 받으므로 짧은 타임아웃의 대가는 없다.
+    REQUEST_TIMEOUT_SECONDS = 10
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.REQUEST_TIMEOUT_SECONDS),
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     "Accept": "application/json, text/javascript, */*; q=0.01",

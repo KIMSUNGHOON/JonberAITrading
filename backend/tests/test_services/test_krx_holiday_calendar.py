@@ -223,17 +223,88 @@ def test_substitute_never_lands_on_an_existing_holiday_or_weekend():
             seen.add(s.date)
 
 
-def test_substitute_rule_is_pure_and_table_driven():
-    """규칙은 순수 함수이고 대상 집합은 상수다 -- 코드에 흩어져 있지 않다."""
-    assert isinstance(KRXHolidayFetcher.SUBSTITUTE_ON_WEEKEND_OR_HOLIDAY, frozenset)
-    assert isinstance(KRXHolidayFetcher.SUBSTITUTE_ON_OTHER_HOLIDAY_ONLY, frozenset)
-    assert isinstance(KRXHolidayFetcher.SUBSTITUTE_EXCLUDED, frozenset)
-    # 두 등급은 서로소여야 한다(한 이름이 두 규칙을 타면 결과가 모호해진다).
-    assert not (
-        KRXHolidayFetcher.SUBSTITUTE_ON_WEEKEND_OR_HOLIDAY
-        & KRXHolidayFetcher.SUBSTITUTE_ON_OTHER_HOLIDAY_ONLY
+def test_substitute_rule_sets_partition_every_holiday_name():
+    """세 상수는 달력의 모든 이름을 **빠짐없이·겹치지 않게** 나눈다.
+
+    리뷰 지적: 예전 판은 `isinstance` 3개 + 두 트리거 집합의 서로소만
+    봤다. 그건 무게가 없다 -- 세 상수를 전부 비워도 통과했다.
+
+    여기서는 (a) 세 집합이 **셋 다** 서로소이고 (b) `FIXED_HOLIDAYS` ·
+    `LUNAR_HOLIDAYS`에 등장하는 모든 이름이 정확히 한 등급으로 분류되는지
+    본다. 분류되지 않은 이름은 조용히 "대체 없음"이 되는데, 그게 이번에
+    봉합한 결함과 같은 형태다.
+    """
+    from services.krx_holiday.fetcher import (
+        classify_holiday_name,
+        unclassified_holiday_names,
     )
+
+    a = KRXHolidayFetcher.SUBSTITUTE_ON_WEEKEND_OR_HOLIDAY
+    b = KRXHolidayFetcher.SUBSTITUTE_ON_OTHER_HOLIDAY_ONLY
+    c = KRXHolidayFetcher.SUBSTITUTE_EXCLUDED
+
+    # (a) 셋 다 서로소 -- 예전에는 a∩b만 봤다.
+    assert not (a & b), f"트리거 두 집합이 겹친다: {a & b}"
+    assert not (a & c), f"제외와 토·일 트리거가 겹친다: {a & c}"
+    assert not (b & c), f"제외와 연휴 트리거가 겹친다: {b & c}"
+    assert a and b and c, "세 집합 중 빈 것이 있다"
+
+    # (b) 달력의 모든 이름이 분류돼 있다.
+    names = {n for _m, _d, n in KRXHolidayFetcher.FIXED_HOLIDAYS}
+    for entries in KRXHolidayFetcher.LUNAR_HOLIDAYS.values():
+        names.update(n for _m, _d, n in entries)
+
+    assert unclassified_holiday_names(names) == set(), (
+        f"분류되지 않은 공휴일 이름: {sorted(unclassified_holiday_names(names))}"
+    )
+    for n in names:
+        assert classify_holiday_name(n) != "unclassified", n
+
+    # 알려진 등급이 실제로 그 등급이다.
+    assert classify_holiday_name("광복절") == "weekend_or_holiday"
+    assert classify_holiday_name("추석 연휴") == "other_holiday_only"
+    assert classify_holiday_name("현충일") == "excluded"
+    assert classify_holiday_name("신정") == "excluded"
+
     assert compute_substitute_holidays([]) == []
+
+
+def test_excluded_constant_has_veto_power():
+    """`SUBSTITUTE_EXCLUDED`는 장식이 아니라 **트리거보다 먼저 평가된다.**
+
+    리뷰 지적: 예전 판에서 이 상수는 정의만 되고
+    `compute_substitute_holidays()`가 한 번도 참조하지 않았다. 제외는
+    "두 트리거 집합 어디에도 없음"이라는 암묵적 방식으로만 성립했고,
+    그래서 주석의 "세 상수만 고치면 된다"가 거짓이었다 -- 법 개정으로
+    어떤 공휴일이 대체 대상에서 빠져 유지보수자가 이름을 여기 추가해도
+    **조용히 무시**됐다.
+
+    이 테스트는 그 시나리오를 그대로 태운다: 트리거 집합에 남아 있는
+    이름을 제외 목록에 넣으면 대체일이 실제로 사라져야 한다.
+    """
+    import services.krx_holiday.fetcher as fetcher_module
+
+    # 2026-08-15(토) 광복절 → 평소에는 08-17 대체가 생긴다.
+    base = [
+        h for h in KRXHolidayFetcher()._get_known_holidays(2026)
+        if h.name != SUBSTITUTE_HOLIDAY_NAME
+    ]
+    assert date(2026, 8, 17) in {
+        h.date for h in compute_substitute_holidays(base)
+    }
+
+    # 이제 "광복절"을 **트리거 집합에 남겨 둔 채** 제외 목록에만 추가한다.
+    original = fetcher_module.SUBSTITUTE_EXCLUDED
+    try:
+        fetcher_module.SUBSTITUTE_EXCLUDED = original | {"광복절"}
+        subs = {h.date for h in compute_substitute_holidays(base)}
+        assert date(2026, 8, 17) not in subs, (
+            "제외 목록에 넣었는데 대체일이 계속 생성된다 -- 거부권이 없다"
+        )
+        # 다른 공휴일의 대체일은 그대로여야 한다(과잉 차단 아님).
+        assert date(2026, 10, 5) in subs
+    finally:
+        fetcher_module.SUBSTITUTE_EXCLUDED = original
 
 
 # ===========================================================================
@@ -277,12 +348,42 @@ async def test_fallback_use_is_logged_as_an_error(svc, offline_fetcher, caplog):
     assert SOURCE_FALLBACK_TABLE in blob
 
 
-def test_status_surfaces_source_and_untrusted_years(svc):
-    """`get_status()`가 출처와 신뢰 못 하는 연도를 드러낸다(부팅 로그용)."""
+@pytest.mark.asyncio
+async def test_status_surfaces_source_and_untrusted_years(svc, offline_fetcher):
+    """`get_status()`가 출처와 신뢰 못 하는 연도를 **값으로** 드러낸다.
+
+    리뷰 지적: 예전 판은 키 존재만 봐서 값이 전부 None이어도 통과했다.
+    여기서는 갱신 전/후의 값 변화를 본다.
+    """
+    # 갱신 전: 아무것도 없고, 올해·내년이 신뢰 불가로 잡혀야 한다.
+    before = svc.get_status()
+    assert before["source"] is None
+    assert before["year_sources"] == {}
+    assert 2026 in before["untrusted_years"]
+    assert before["fallback_covers_years"] == sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS)
+
+    try:
+        await svc.update_holidays(2026)
+    finally:
+        await svc.close()
+
+    after = svc.get_status()
+    assert after["source"] == SOURCE_FALLBACK_TABLE
+    assert after["year_sources"][2026] == SOURCE_FALLBACK_TABLE
+    assert after["total_holidays"] == 20      # 2026 = 고정9 + 음력7 + 대체4
+    assert 2026 not in after["untrusted_years"]
+    assert 2027 in after["untrusted_years"]   # 표가 못 덮는 해는 계속 잡힌다
+
+
+def test_untrusted_years_includes_years_with_zero_rows(svc):
+    """행이 **0인** 연도도 부팅 진단에 잡힌다.
+
+    리뷰 지적(M8): `get_year_stats()`만 보면 달력이 통째로 없는 해는
+    아예 나타나지 않아, 가장 위험한 상태가 가장 조용해진다.
+    """
     status = svc.get_status()
-    assert "source" in status
-    assert "year_sources" in status
-    assert "untrusted_years" in status
+    assert status["year_stats"] == {}          # 저장된 행이 하나도 없는데
+    assert status["untrusted_years"], "행 0인 연도가 진단에서 빠졌다"
 
 
 # ===========================================================================
@@ -495,18 +596,24 @@ def test_market_hours_fallback_is_derived_not_a_second_copy():
     """
     from services.trading.market_hours import MarketHoursService
 
-    MarketHoursService._fallback_cache = None  # 파생 경로를 실제로 태운다
-    fallback = MarketHoursService.fallback_holidays()
+    saved = MarketHoursService._fallback_cache
+    try:
+        MarketHoursService._fallback_cache = None  # 파생 경로를 실제로 태운다
+        fallback = MarketHoursService.fallback_holidays()
 
-    fetcher = KRXHolidayFetcher()
-    for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
-        expected = {h.date for h in fetcher._get_known_holidays(year)}
-        actual = {d for d in fallback if d.year == year}
-        assert actual == expected, f"{year} 폴백이 규칙 엔진과 다르다"
+        fetcher = KRXHolidayFetcher()
+        for year in sorted(KRXHolidayFetcher.LUNAR_HOLIDAYS):
+            expected = {h.date for h in fetcher._get_known_holidays(year)}
+            actual = {d for d in fallback if d.year == year}
+            assert actual == expected, f"{year} 폴백이 규칙 엔진과 다르다"
 
-    # 오늘의 실제 피해 4일이 폴백에도 들어 있어야 한다.
-    for d in [date(2026, 3, 2), date(2026, 5, 25), date(2026, 8, 17), date(2026, 10, 5)]:
-        assert d in fallback
+        # 오늘의 실제 피해 4일이 폴백에도 들어 있어야 한다.
+        for d in [date(2026, 3, 2), date(2026, 5, 25),
+                  date(2026, 8, 17), date(2026, 10, 5)]:
+            assert d in fallback
+    finally:
+        # M11: 클래스 상태를 원복한다 -- 안 하면 테스트 간 오염된다.
+        MarketHoursService._fallback_cache = saved
 
 
 @pytest.mark.asyncio
@@ -578,3 +685,232 @@ async def test_initialize_skips_years_already_complete(svc, offline_fetcher, mon
 
     assert 2026 not in calls   # 완전 → 건너뜀
     assert 2027 in calls       # 표가 못 덮는 해 → 재시도하고 ERROR를 남긴다
+
+
+# ===========================================================================
+# 부팅 통합 경로 (리뷰 Critical 1)
+# ===========================================================================
+#
+# 앞선 테스트들은 전부 `svc.initialize()`를 **직접** 불렀다. 그래서 라이브
+# 부팅이 실제로 지나가는 문(`get_holiday_service()` 싱글턴)을 아무도 안
+# 밟았고, 거기서 교정이 통째로 건너뛰어지는 것을 놓쳤다. 이 리포 메모리의
+# `start()` / `_persist_state()` 사례와 같은 형태다.
+
+
+@pytest.fixture
+def reset_singleton():
+    """`services.krx_holiday.service`의 모듈 전역 싱글턴을 격리·복원한다."""
+    import services.krx_holiday.service as service_module
+
+    saved = service_module._holiday_service
+    service_module._holiday_service = None
+    yield service_module
+    service_module._holiday_service = None
+    service_module._holiday_service = saved
+
+
+@pytest.mark.asyncio
+async def test_boot_path_repairs_calendar_even_when_sync_caller_wins_the_race(
+    tmp_path, offline_fetcher, reset_singleton, monkeypatch
+):
+    """🔴 라이브 부팅 순서 재현 — sync 호출자가 싱글턴을 **먼저** 만든다.
+
+    실제 순서(main.py):
+      1. `_boot_auto_resume()` → risk_monitor 1초 루프 태스크 생성
+      2. 다음 await에서 그 루프가 tick → `is_krx_open_cached()`
+         → `MarketHoursService._is_krx_holiday()`
+         → **`get_holiday_service_sync()`가 초기화 없이 싱글턴 생성**
+      3. lifespan의 `await get_holiday_service()`
+
+    3번이 `if _holiday_service is None:` 안에서 initialize를 부르면
+    2번이 만든 인스턴스를 보고 **건너뛴다** → `update_holidays()`가 영영
+    안 돌고 2026년이 16행 그대로 남는다. 평일 부팅에서만 발생한다.
+    """
+    service_module = reset_singleton
+
+    # 라이브 DB 대신 tmp 경로를 쓰도록 싱글턴 생성자를 묶는다.
+    db_path = str(tmp_path / "holidays.db")
+    real_cls = service_module.KRXHolidayService
+    monkeypatch.setattr(
+        service_module, "KRXHolidayService",
+        lambda *a, **kw: real_cls(db_path=db_path),
+    )
+
+    # --- 라이브 상태 재현: 대체공휴일 4일이 빠진 2026 달력, coverage 마커 없음
+    seed = real_cls(db_path=db_path)
+    partial = [
+        h for h in KRXHolidayFetcher()._get_known_holidays(2026)
+        if h.name != SUBSTITUTE_HOLIDAY_NAME
+    ]
+    seed.storage.save_holidays(partial)
+    assert seed.storage.has_year_data(2026)
+    assert not seed.storage.is_year_complete(2026)
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 11, 9, 0, 0)
+
+    monkeypatch.setattr(service_module, "datetime", _FixedDatetime)
+
+    # --- 1) sync 경로가 먼저 싱글턴을 만든다 (risk_monitor 루프가 하는 일)
+    early = service_module.get_holiday_service_sync()
+    assert service_module._holiday_service is not None
+    assert early._initialized is False
+    assert early.is_trading_day(date(2026, 8, 17)) is True  # 아직 틀렸다
+
+    # --- 2) lifespan이 뒤늦게 async 경로를 탄다
+    svc = await service_module.get_holiday_service()
+    try:
+        assert svc is early, "같은 싱글턴이어야 한다"
+        assert svc._initialized is True, "부팅 경로가 초기화를 건너뛰었다"
+
+        # --- 교정이 실제로 일어났는가
+        assert svc.storage.is_year_complete(2026)
+        assert svc.is_trading_day(date(2026, 8, 17)) is False
+        assert svc.is_trading_day(date(2026, 10, 5)) is False
+        assert svc.is_trading_day(date(2026, 9, 28)) is True
+
+        # --- 배포 검증 기준: untrusted_years에 2026이 남으면 교정 실패다
+        status = svc.get_status()
+        assert 2026 not in status["untrusted_years"]
+    finally:
+        await svc.close()
+
+
+@pytest.mark.asyncio
+async def test_boot_path_is_idempotent(tmp_path, offline_fetcher, reset_singleton, monkeypatch):
+    """`get_holiday_service()`를 여러 번 불러도 재초기화하지 않는다.
+
+    `initialize()`를 `if` 밖으로 뺐으므로 매 호출마다 실행되는데,
+    `_initialized` 자기 방어가 실제로 작동하는지 못 박는다.
+    """
+    service_module = reset_singleton
+    db_path = str(tmp_path / "holidays.db")
+    real_cls = service_module.KRXHolidayService
+    monkeypatch.setattr(
+        service_module, "KRXHolidayService",
+        lambda *a, **kw: real_cls(db_path=db_path),
+    )
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 11, 9, 0, 0)
+
+    monkeypatch.setattr(service_module, "datetime", _FixedDatetime)
+
+    svc = await service_module.get_holiday_service()
+    try:
+        calls = []
+        original = svc.fetcher.fetch_holidays_with_source
+
+        async def _spy(year):
+            calls.append(year)
+            return await original(year)
+
+        svc.fetcher.fetch_holidays_with_source = _spy
+
+        again = await service_module.get_holiday_service()
+        assert again is svc
+        assert calls == [], "두 번째 호출이 다시 갱신을 시도했다"
+    finally:
+        await svc.close()
+
+
+# ===========================================================================
+# 원격 경로 완전성 검사 (리뷰 Important 4) · 네트워크 타임아웃 (Important 3)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_remote_response_is_not_trusted_without_completeness_check(
+    svc, monkeypatch
+):
+    """KRX가 **짧은 응답**을 줘도 그 해가 신뢰 상태가 되지 않는다.
+
+    폴백 경로는 `IncompleteHolidayDataError`가 막지만 원격 경로에는 아무
+    검증이 없었다 -- KRX가 3행짜리 응답을 주면 C가 봉합한 것과 정확히
+    같은 실패(부분 데이터가 정상으로 보임)가 재발한다. KRX 복구가
+    백로그에 있으므로 그때 터질 잠복 결함이었다.
+    """
+    from services.krx_holiday.fetcher import (
+        HolidayFetchResult,
+        HolidayInfo,
+        SOURCE_KRX_API,
+    )
+
+    truncated = [
+        HolidayInfo(date=date(2026, 1, 1), day_of_week="목", name="신정", year=2026),
+        HolidayInfo(date=date(2026, 3, 1), day_of_week="일", name="삼일절", year=2026),
+        HolidayInfo(date=date(2026, 12, 25), day_of_week="금", name="크리스마스", year=2026),
+    ]
+
+    async def _short(year):
+        return HolidayFetchResult(truncated, SOURCE_KRX_API)
+
+    monkeypatch.setattr(svc.fetcher, "fetch_holidays_with_source", _short)
+
+    try:
+        saved = await svc.update_holidays(2026)
+    finally:
+        await svc.close()
+
+    assert saved == 3                                   # 행은 저장하되
+    assert not svc.storage.is_year_complete(2026)       # 신뢰하지 않는다
+    assert svc.storage.get_source(2026) == SOURCE_KRX_API
+    assert svc.get_trading_day_verdict(date(2026, 8, 18)).trusted is False
+
+
+@pytest.mark.asyncio
+async def test_complete_remote_response_is_trusted(svc, monkeypatch):
+    """설날·추석이 들어 있는 정상 원격 응답은 신뢰 상태가 된다(과잉 차단 아님)."""
+    from services.krx_holiday.fetcher import HolidayFetchResult, SOURCE_KRX_API
+
+    full = KRXHolidayFetcher()._get_known_holidays(2026)
+
+    async def _full(year):
+        return HolidayFetchResult(full, SOURCE_KRX_API)
+
+    monkeypatch.setattr(svc.fetcher, "fetch_holidays_with_source", _full)
+
+    try:
+        await svc.update_holidays(2026)
+    finally:
+        await svc.close()
+
+    assert svc.storage.is_year_complete(2026)
+    assert svc.storage.get_source(2026) == SOURCE_KRX_API
+
+
+def test_missing_required_markers_detects_lunar_gaps():
+    """완전성 검사는 **행 수가 아니라 이름**으로 본다."""
+    from services.krx_holiday.fetcher import missing_required_markers
+
+    full = KRXHolidayFetcher()._get_known_holidays(2026)
+    assert missing_required_markers(full) == []
+
+    no_chuseok = [h for h in full if not h.name.startswith("추석")]
+    assert missing_required_markers(no_chuseok) == ["추석"]
+
+    fixed_only = KRXHolidayFetcher()._fixed_holidays(2027)
+    assert sorted(missing_required_markers(fixed_only)) == ["설날", "추석"]
+
+
+@pytest.mark.asyncio
+async def test_http_session_has_a_short_timeout():
+    """부팅이 죽은 엔드포인트에 오래 매달리지 않는다.
+
+    aiohttp 기본은 total=300s이고, `initialize()`는 `current_year+1`이
+    **구조적으로 영원히 불완전**하므로 매 부팅마다 원격 호출 2회가 반드시
+    나간다. KRX가 404 대신 무응답이 되면 기본값에서는 최대 10분간 부팅이
+    블로킹된다(lifespan에서 await되므로 장중 재시작의 무방비 창이 그만큼
+    넓어진다).
+    """
+    fetcher = KRXHolidayFetcher()
+    try:
+        session = await fetcher._get_session()
+        assert session.timeout.total == KRXHolidayFetcher.REQUEST_TIMEOUT_SECONDS
+        assert 0 < session.timeout.total <= 30, "타임아웃이 없거나 너무 길다"
+    finally:
+        await fetcher.close()

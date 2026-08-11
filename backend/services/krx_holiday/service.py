@@ -16,6 +16,7 @@ from .fetcher import (
     IncompleteHolidayDataError,
     KRXHolidayFetcher,
     HolidayInfo,
+    missing_required_markers,
 )
 from .storage import HolidayStorage
 
@@ -136,19 +137,32 @@ class KRXHolidayService:
                 result = await self.fetcher.fetch_holidays_with_source(y)
 
                 if result.holidays:
-                    # `complete_years`를 넘기는 유일한 지점 -- 여기까지 온
-                    # 배치는 원격 응답이거나 폴백 표의 **완전한** 연도다
-                    # (불완전한 연도는 IncompleteHolidayDataError로 위에서
-                    # 끊긴다). 조각 데이터가 완전한 척할 통로가 없다.
+                    # `complete_years`를 넘기는 유일한 지점이므로, 여기서
+                    # **완전성을 실제로 확인한다.**
+                    #
+                    # 폴백 경로는 IncompleteHolidayDataError가 위에서 막지만
+                    # **원격 경로는 아무 검증이 없었다** -- KRX가 3행짜리
+                    # 응답을 주면 그 해가 신뢰 상태로 저장된다. C가 봉합한
+                    # 것과 같은 실패 형태라, KRX 복구 시점에 터질 잠복
+                    # 결함이었다. 이제 두 경로가 같은 문을 통과한다.
+                    missing = missing_required_markers(result.holidays)
+                    if missing:
+                        logger.error(
+                            f"Refusing to mark {y} complete (source={result.source}): "
+                            f"필수 항목 누락 {missing} -- 행 {len(result.holidays)}개를 "
+                            f"저장하되 신뢰 상태로 표시하지 않는다."
+                        )
                     saved = self.storage.save_holidays(
                         result.holidays,
                         source=result.source,
-                        complete_years=[y],
+                        complete_years=[] if missing else [y],
                     )
                     total_saved += saved
-                    self._untrusted_warned.discard(y)
+                    if not missing:
+                        self._untrusted_warned.discard(y)
                     logger.info(
-                        f"Updated {saved} holidays for {y} (source={result.source})"
+                        f"Updated {saved} holidays for {y} (source={result.source}, "
+                        f"complete={not missing})"
                     )
                 else:
                     logger.warning(f"No holidays fetched for {y}")
@@ -387,15 +401,22 @@ class KRXHolidayService:
         stats = self.storage.get_year_stats()
         last_update = self.storage.get_last_update()
 
+        # ⚠️ 검사 대상은 "저장된 연도"(`stats`)만이 아니다. 행이 0인 연도는
+        # `get_year_stats()`에 아예 안 나타나므로, 그것만 보면 **달력이
+        # 통째로 없는 해가 진단에서 빠진다** -- 가장 위험한 상태가 가장
+        # 조용해진다. 운영상 의미 있는 창(올해·내년)을 항상 포함시킨다.
+        current_year = datetime.now().year
+        years_to_check = set(stats) | {current_year, current_year + 1}
+
         try:
             source = self.storage.get_source()
             year_sources = self.storage.get_year_sources()
             untrusted = sorted(
-                y for y in stats if not self.storage.is_year_complete(y)
+                y for y in years_to_check if not self.storage.is_year_complete(y)
             )
         except Exception as e:
             logger.warning(f"Could not read holiday metadata: {e}")
-            source, year_sources, untrusted = None, {}, sorted(stats)
+            source, year_sources, untrusted = None, {}, sorted(years_to_check)
 
         return {
             "initialized": self._initialized,
@@ -420,6 +441,26 @@ async def get_holiday_service() -> KRXHolidayService:
     """
     Get singleton KRXHolidayService instance.
 
+    ⚠️ `initialize()`는 **`if` 밖에서** 부른다. 안에 두면 싱글턴이 이미
+    존재할 때 초기화가 통째로 건너뛰어진다 -- 그리고 라이브 부팅에서는
+    실제로 그렇게 된다:
+
+        main.py:328  _boot_auto_resume() → TradingCoordinator.start()
+                     → risk_monitor의 1초 루프 태스크 생성
+        main.py:333  다음 await(Telegram HTTP)에서 그 루프가 즉시 tick
+                     → _check_all_positions() → is_krx_open_cached()
+                     → MarketHoursService._is_krx_holiday()
+                     → **get_holiday_service_sync()가 초기화 없이 싱글턴 생성**
+        main.py:352  await get_holiday_service() → non-None을 보고 건너뜀
+
+    결과: `update_holidays()`가 영영 돌지 않아 이미 저장된 틀린 달력이
+    교정되지 않는다(2026년 16행 + `coverage_2026` 미기록). 평일 부팅에서만
+    발생한다 -- 주말이면 `_get_krx_session`이 요일 검사에서 조기 반환해
+    휴일 조회에 도달하지 않으므로, "장 마감 후 재기동"이 정확히 실패하는
+    조건이다.
+
+    `initialize()`는 `self._initialized`로 자기 방어하므로 재호출은 무해하다.
+
     Returns:
         Initialized KRXHolidayService
     """
@@ -427,7 +468,9 @@ async def get_holiday_service() -> KRXHolidayService:
 
     if _holiday_service is None:
         _holiday_service = KRXHolidayService()
-        await _holiday_service.initialize()
+
+    # 싱글턴이 sync 경로에서 먼저 만들어졌더라도 여기서 반드시 초기화된다.
+    await _holiday_service.initialize()
 
     return _holiday_service
 
