@@ -17,16 +17,20 @@
 
 import json
 import math
+import re
 from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from services.storage_service import StorageService
+from services.trading.index_series import closes_to_returns
+from services.trading.strategy_consensus import MAX_RELATIVE_DELTA
 from services.trading.exposure_target import (
     DAILY_TARGET_DELTA_MAX,
     REGIME_ANCHORS,
     TargetExposure,
+    compute_regime_target,
 )
 from services.trading.strategy_panel import (
     build_strategy_context,
@@ -45,6 +49,10 @@ _TRADE_DATE = "2026-08-11"
 _LIVE_VOL_PCT = 101.7
 _LIVE_TARGET_VOL = 22.0
 _LIVE_VOL_MIN = 0.5
+_LIVE_EFFECTIVE = 0.15102547685952483
+_LIVE_ACTUAL = 0.14182
+_LIVE_EQUITY = 500_000_000.0
+_LIVE_PEAK = 505_000_000.0
 
 _KNOBS = {
     "risk_tolerance": "moderate",
@@ -97,7 +105,7 @@ async def _seed_index(storage, vol_pct: float = _LIVE_VOL_PCT, n: int = 21,
 
 
 async def _seed_judgment(storage, regime: str = "bear",
-                         effective: float = 0.15102547685952483,
+                         effective: float = _LIVE_EFFECTIVE,
                          trade_date: str = _TRADE_DATE):
     assert await storage.insert_regime_judgment(
         trade_date=trade_date,
@@ -112,7 +120,9 @@ async def _seed_judgment(storage, regime: str = "bear",
     )
 
 
-async def _seed_shadow(storage, actual_pct: float = 0.14182,
+async def _seed_shadow(storage, actual_pct: float = _LIVE_ACTUAL,
+                       equity: float = _LIVE_EQUITY,
+                       equity_peak: float = _LIVE_PEAK,
                        trade_date: str = _TRADE_DATE):
     target = TargetExposure(
         target_pct=0.1505, m_vol=0.5, m_drawdown=0.991,
@@ -120,22 +130,43 @@ async def _seed_shadow(storage, actual_pct: float = 0.14182,
         degraded=[], index_vol_annualized=_LIVE_VOL_PCT, index_vol_n=20,
     )
     assert await storage.insert_exposure_shadow(
-        trade_date=trade_date, target=target, equity=500_000_000,
-        stock_value=500_000_000 * actual_pct, actual_pct=actual_pct,
-        n_round_trips=None, equity_peak=505_000_000,
+        trade_date=trade_date, target=target, equity=equity,
+        stock_value=equity * actual_pct, actual_pct=actual_pct,
+        n_round_trips=None, equity_peak=equity_peak,
+    )
+
+
+def _engine(*, regime="bear", vol_pct=_LIVE_VOL_PCT, n=21,
+            tv=_LIVE_TARGET_VOL, vmin=_LIVE_VOL_MIN,
+            prev=_LIVE_EFFECTIVE, seed=_LIVE_ACTUAL,
+            equity=_LIVE_EQUITY, peak=_LIVE_PEAK,
+            stale=False, returns=None):
+    """블록이 무엇을 말해야 하는지의 **기준은 엔진 자신**이다.
+
+    기대값을 손으로 적으면 그것이 곧 엔진 규칙의 두 번째 사본이 되고,
+    엔진이 바뀌는 날(`fix/index-series-fail-closed`의 fail-closed 폴백)
+    테스트가 낡은 동작을 고정해버린다. 그래서 여기서도 계산하지 않고
+    `compute_regime_target`을 부른다.
+    """
+    if returns is None:
+        returns = closes_to_returns(_closes_for_vol(vol_pct, n))
+    return compute_regime_target(
+        regime_label=regime, prev_effective_pct=prev, seed_actual_pct=seed,
+        index_returns=returns, equity=equity, equity_peak=peak,
+        series_stale=stale, target_vol_pct=tv, vol_multiplier_min=vmin,
     )
 
 
 async def _context(tmp_path, *, vol_pct=_LIVE_VOL_PCT, regime="bear",
                    knobs=None, with_index=True, with_judgment=True,
-                   n=21, latest=None):
+                   n=21, latest=None, equity=_LIVE_EQUITY, peak=_LIVE_PEAK):
     storage = StorageService(db_path=str(tmp_path / "storage.db"))
     await _seed_eod_review(storage)
     if with_index:
         await _seed_index(storage, vol_pct, n=n, latest=latest)
     if with_judgment:
         await _seed_judgment(storage, regime=regime)
-        await _seed_shadow(storage)
+        await _seed_shadow(storage, equity=equity, equity_peak=peak)
     return await build_strategy_context(
         storage, _TRADE_DATE, dict(knobs if knobs is not None else _KNOBS)
     )
@@ -152,6 +183,7 @@ async def test_live_state_is_visible_to_the_panel(tmp_path):
 
     assert block["status"] == "ok"
     assert block["unknown"] == []
+    assert block["projection_degraded"] == []
 
     assert block["realized_vol_annualized_pct"] == pytest.approx(_LIVE_VOL_PCT, rel=1e-6)
     assert block["realized_vol_samples"] == 20
@@ -160,17 +192,20 @@ async def test_live_state_is_visible_to_the_panel(tmp_path):
     assert block["target_vol_pct"] == pytest.approx(22.0)
     assert block["vol_multiplier_min"] == pytest.approx(0.5)
 
-    # 22 / 101.7 = 0.2163 -> 하한 0.5로 클램프
+    # 22 / 101.7 = 0.2163 -> 하한 0.5로 클램프 (엔진 값과 일치)
     assert block["m_vol_unclamped"] == pytest.approx(22.0 / _LIVE_VOL_PCT, rel=1e-6)
+    assert block["m_vol"] == pytest.approx(_engine().m_vol)
     assert block["m_vol"] == pytest.approx(0.5)
     assert block["m_vol_binding"] == "floor"
 
+    # 허용 범위 어느 쪽으로 밀어도 배수가 안 움직인다.
+    assert block["target_vol_pct_can_lift_m_vol"] is False
+    assert block["target_vol_pct_can_lower_m_vol"] is False
     # 하한을 벗어나려면 0.5 × 101.7 = 50.85 -- 허용 상한 40 밖이다.
     assert block["target_vol_pct_to_lift_m_vol"] == pytest.approx(
         0.5 * _LIVE_VOL_PCT, rel=1e-6
     )
     assert block["target_vol_pct_allowed_range"] == [10.0, 40.0]
-    assert block["target_vol_pct_can_lift_m_vol"] is False
 
     # 앵커는 램프에 묶여 한 번도 구속하지 않는다.
     assert block["regime_label"] == "bear"
@@ -183,8 +218,8 @@ async def test_live_state_is_visible_to_the_panel(tmp_path):
     assert block["convergence"]["binds_on"] == "ramp"
 
     # 실제/목표가 나란히 보인다.
-    assert block["current_target_pct"] == pytest.approx(0.15102547685952483)
-    assert block["actual_exposure_pct"] == pytest.approx(0.14182)
+    assert block["current_target_pct"] == pytest.approx(_LIVE_EFFECTIVE)
+    assert block["actual_exposure_pct"] == pytest.approx(_LIVE_ACTUAL)
 
 
 async def test_vol_multiplier_min_table_shows_the_alternatives(tmp_path):
@@ -193,9 +228,9 @@ async def test_vol_multiplier_min_table_shows_the_alternatives(tmp_path):
     table = context["exposure_mechanics"]["convergence"]["by_vol_multiplier_min"]
 
     assert "0.5" in table and "0.8" in table
-    # 하한을 올리면 m_vol이 그대로 따라 올라간다(현재 raw 0.216 < 모든 후보).
-    assert table["0.5"]["m_vol"] == pytest.approx(0.5)
-    assert table["0.8"]["m_vol"] == pytest.approx(0.8)
+    # 후보별 m_vol도 엔진이 낸 값이어야 한다.
+    for key, row in table.items():
+        assert row["m_vol"] == pytest.approx(_engine(vmin=float(key)).m_vol)
     # 0.5 -> 0.15, 0.8 -> min(0.15·0.8/0.2, 0.55·0.8) = min(0.60, 0.44) = 0.44
     assert table["0.5"]["target_pct"] == pytest.approx(0.15)
     assert table["0.8"]["target_pct"] == pytest.approx(0.44)
@@ -203,6 +238,25 @@ async def test_vol_multiplier_min_table_shows_the_alternatives(tmp_path):
     keys = sorted(table, key=float)
     values = [table[k]["target_pct"] for k in keys]
     assert values == sorted(values)
+
+
+async def test_table_shows_how_many_eod_runs_a_choice_takes(tmp_path):
+    """1회 EOD당 25% 상대 이동 상한(MAX_RELATIVE_DELTA) -- 표에 없으면
+    0.5 → 0.8이 즉시 도달 가능한 선택지로 보인다(리뷰 M8)."""
+    context = await _context(tmp_path)
+    block = context["exposure_mechanics"]
+    table = block["convergence"]["by_vol_multiplier_min"]
+
+    assert block["knob_max_relative_move_per_eod"] == pytest.approx(MAX_RELATIVE_DELTA)
+    assert table["0.5"]["min_eod_runs"] == 0          # 현행 값
+    assert table["0.8"]["min_eod_runs"] == 3          # 0.5→0.625→0.781→0.8
+    assert table["0.2"]["min_eod_runs"] == 4          # 하향도 같은 상한
+
+    # 실제로 3회가 맞는지 clamp 자체로 확인한다(상수 재구현 아님).
+    v = 0.5
+    for _ in range(3):
+        v = min(0.8, v * (1 + MAX_RELATIVE_DELTA))
+    assert v == pytest.approx(0.8)
 
 
 # ---------------------------------------------- 2. 앵커가 결과를 안 바꾼다
@@ -250,8 +304,9 @@ async def test_low_vol_lets_the_anchor_bind(tmp_path):
     assert bear["exposure_mechanics"]["convergence"]["target_pct"] == pytest.approx(0.44)
     assert bear["exposure_mechanics"]["convergence"]["binds_on"] == "anchor"
 
-    # 이 구간에서는 target_vol_pct가 실제로 m_vol을 움직인다.
+    # 이 구간에서는 target_vol_pct가 실제로 m_vol을 양방향으로 움직인다.
     assert bull["exposure_mechanics"]["target_vol_pct_can_lift_m_vol"] is True
+    assert bull["exposure_mechanics"]["target_vol_pct_can_lower_m_vol"] is True
 
 
 # ----------------------------------------------- 4. m = 1.0 에서 0으로 안 나눈다
@@ -266,15 +321,68 @@ async def test_m_one_does_not_divide_by_zero():
 
 
 async def test_m_vol_ceiling_when_vol_is_tiny(tmp_path):
-    """실현변동성이 target_vol보다 낮으면 배수가 1.0에 포화한다(축소 전용)."""
+    """실현변동성이 target_vol보다 낮으면 배수가 1.0에 포화한다(축소 전용).
+
+    변동성 5%에서는 허용 하한(10)으로 내려도 10/5 = 2.0이라 여전히 천장이다
+    -- 이 국면에서는 target_vol_pct가 **양방향 모두** 죽어 있다."""
     context = await _context(tmp_path, vol_pct=5.0)
     block = context["exposure_mechanics"]
+    assert block["m_vol"] == pytest.approx(_engine(vol_pct=5.0).m_vol)
     assert block["m_vol"] == pytest.approx(1.0)
     assert block["m_vol_binding"] == "ceiling"
+    assert block["target_vol_pct_can_lift_m_vol"] is False
+    assert block["target_vol_pct_to_lift_m_vol"] is None
+    assert block["target_vol_pct_can_lower_m_vol"] is False
     assert block["convergence"]["target_pct"] == pytest.approx(0.55)
 
 
-# ------------------------------------- 5. 데이터 없음: 멈추지 않고, 가짜도 없다
+async def test_ceiling_but_the_knob_still_cuts_downward(tmp_path):
+    """변동성 15%: 지금은 천장이지만 허용 하한(10)으로 내리면 10/15 = 0.667로
+    실제로 줄어든다 -- '천장 = 노브가 죽었다'가 아니다."""
+    context = await _context(tmp_path, vol_pct=15.0)
+    block = context["exposure_mechanics"]
+    assert block["m_vol"] == pytest.approx(1.0)
+    assert block["m_vol_binding"] == "free"   # 한쪽으로는 움직인다
+    assert block["target_vol_pct_can_lift_m_vol"] is False
+    assert block["target_vol_pct_can_lower_m_vol"] is True
+
+
+# ------------------------- 5. 저하 경로: 엔진과 같은 값 · 가짜 숫자 없음
+
+async def test_stale_series_matches_the_engine_and_stays_self_consistent(tmp_path):
+    """⚠️ 리뷰 Important 3. 시계열 노후 시 엔진이 무엇을 하든(현재 1.0,
+    fail-closed 수정 뒤 min(1.0, vol_min)) 블록이 **같은 값**을 말해야
+    하고, 표도 그 상태에서 계산돼야 한다.
+
+    기대값을 상수로 적지 않는다 -- 그러면 이 테스트가 곧 엔진 규칙의
+    세 번째 사본이 된다.
+    """
+    stale_day = date.today() - timedelta(days=30)
+    context = await _context(tmp_path, latest=stale_day)
+    block = context["exposure_mechanics"]
+
+    assert block["index_series_stale"] is True
+    expected = _engine(stale=True)
+    assert block["m_vol"] == pytest.approx(expected.m_vol)
+    assert "index_series_stale" in block["projection_degraded"]
+    assert block["next_target_pct_projected"] == pytest.approx(expected.target_pct)
+
+    # 블록 안에서 서로 모순이 없다: 격자의 각 후보도 같은 stale 상태의
+    # 엔진 값이어야 하고, m_vol이 같으면 수렴점도 같아야 한다.
+    table = block["convergence"]["by_vol_multiplier_min"]
+    for key, row in table.items():
+        assert row["m_vol"] == pytest.approx(_engine(stale=True, vmin=float(key)).m_vol)
+    by_m: dict = {}
+    for row in table.values():
+        by_m.setdefault(round(row["m_vol"], 12), set()).add(round(row["target_pct"], 12))
+    for m_value, targets in by_m.items():
+        assert len(targets) == 1, f"m_vol {m_value}인데 수렴점이 갈린다: {targets}"
+
+    # 대표 수렴점도 같은 m_vol에서 나온 값이어야 한다.
+    assert block["convergence"]["target_pct"] == pytest.approx(
+        convergence_target_pct(REGIME_ANCHORS["bear"], expected.m_vol)[0]
+    )
+
 
 async def test_missing_index_data_does_not_stop_the_panel(tmp_path):
     context = await _context(tmp_path, with_index=False)
@@ -285,15 +393,13 @@ async def test_missing_index_data_does_not_stop_the_panel(tmp_path):
     block = context["exposure_mechanics"]
     assert block["status"] == "partial"
     assert "realized_vol" in block["unknown"]
-    # 그럴듯한 가짜 숫자를 넣지 않는다.
+    # 측정값을 지어내지 않는다.
     assert block["realized_vol_annualized_pct"] is None
-    assert block["m_vol"] is None
-    assert block["m_vol_binding"] == "unknown"
-    assert block["target_vol_pct_to_lift_m_vol"] is None
-    assert block["target_vol_pct_can_lift_m_vol"] is None
-    assert block["convergence"]["target_pct"] is None
-    assert block["convergence"]["by_regime_anchor"] is None
-    assert block["convergence"]["by_vol_multiplier_min"] is None
+    assert block["m_vol_unclamped"] is None
+    # 배수는 엔진의 열화 폴백 그대로다(사본 아님) + 이유를 함께 적는다.
+    expected = _engine(returns=[])
+    assert block["m_vol"] == pytest.approx(expected.m_vol)
+    assert "index_vol_insufficient" in block["projection_degraded"]
     # 아는 사실(노브·앵커)은 그대로 남는다.
     assert block["target_vol_pct"] == pytest.approx(22.0)
     assert block["regime_anchor_pct"] == pytest.approx(0.55)
@@ -305,7 +411,8 @@ async def test_too_few_index_samples_is_unknown_not_a_guess(tmp_path):
     assert block["status"] == "partial"
     assert block["realized_vol_annualized_pct"] is None
     assert block["realized_vol_samples"] == 3
-    assert block["m_vol"] is None
+    assert block["m_vol"] == pytest.approx(_engine(n=4).m_vol)
+    assert "index_vol_insufficient" in block["projection_degraded"]
 
 
 async def test_missing_regime_judgment_is_unknown_not_a_guess(tmp_path):
@@ -319,10 +426,21 @@ async def test_missing_regime_judgment_is_unknown_not_a_guess(tmp_path):
     assert block["current_target_pct"] is None
     assert block["actual_exposure_pct"] is None
     assert block["anchor_is_binding"] is None
+    assert block["next_target_pct_projected"] is None
     assert block["convergence"]["target_pct"] is None
+    assert block["convergence"]["by_vol_multiplier_min"] is None
     # 앵커에 의존하지 않는 사실은 살아남는다.
     assert block["m_vol"] == pytest.approx(0.5)
     assert block["convergence"]["by_regime_anchor"]["bear"] == pytest.approx(0.15)
+
+
+async def test_missing_shadow_row_is_listed_as_unknown(tmp_path):
+    """행이 **없는** 것도 모르는 것이다 -- 예외만 unknown에 넣으면
+    regime_anchor 쪽과 비대칭이 된다(리뷰 M6)."""
+    context = await _context(tmp_path, with_judgment=False)
+    block = context["exposure_mechanics"]
+    assert "exposure_shadow" in block["unknown"]
+    assert "m_drawdown" in block["unknown"]
 
 
 async def test_storage_failure_degrades_to_explicit_unknown(tmp_path):
@@ -340,8 +458,28 @@ async def test_storage_failure_degrades_to_explicit_unknown(tmp_path):
     assert context is not None
     block = context["exposure_mechanics"]
     assert block["status"] in ("partial", "error")
-    assert block["m_vol"] is None
+    assert "index_series" in block["unknown"]
+    assert "regime_judgment" in block["unknown"]
+    assert block["realized_vol_annualized_pct"] is None
     assert block["convergence"]["target_pct"] is None
+
+
+async def test_error_path_keeps_the_same_key_set(tmp_path):
+    """실패 블록이 키를 생략하면 '데이터 없음'과 '기능 없음'이 구별되지
+    않는다(리뷰 M5)."""
+    ok = (await _context(tmp_path))["exposure_mechanics"]
+
+    storage = StorageService(db_path=str(tmp_path / "b" / "storage.db"))
+    await _seed_eod_review(storage)
+    with patch("services.trading.strategy_panel._exposure_mechanics",
+               side_effect=RuntimeError("boom")):
+        context = await build_strategy_context(storage, _TRADE_DATE, dict(_KNOBS))
+    err = context["exposure_mechanics"]
+
+    assert err["status"] == "error"
+    assert set(ok) <= set(err)
+    assert set(err["convergence"]) == set(ok["convergence"])
+    assert err["m_vol"] is None and err["convergence"]["target_pct"] is None
 
 
 async def test_missing_knobs_are_not_backfilled_with_module_defaults(tmp_path):
@@ -351,10 +489,44 @@ async def test_missing_knobs_are_not_backfilled_with_module_defaults(tmp_path):
     assert block["target_vol_pct"] is None
     assert block["vol_multiplier_min"] is None
     assert block["m_vol"] is None
+    assert block["convergence"]["by_regime_anchor"] is None
     assert "target_vol_pct" in block["unknown"]
 
 
-# --------------------------------------------- 6. 블록이 실제로 프롬프트에 닿는다
+# --------------------------------- 6. 다음 목표는 m_drawdown을 포함한다
+
+async def test_projected_next_target_includes_drawdown_multiplier(tmp_path):
+    """리뷰 Important 2. `ramped × m_vol`로 재계산하면 낙폭 국면에서
+    최대 233% 과대가 된다 -- 엔진이 낸 값을 그대로 실어야 한다."""
+    equity, peak = 60_000_000.0, 100_000_000.0   # 낙폭 40% -> m_drawdown 바닥
+    context = await _context(tmp_path, equity=equity, peak=peak)
+    block = context["exposure_mechanics"]
+
+    expected = _engine(equity=equity, peak=peak)
+    assert block["next_target_pct_projected"] == pytest.approx(expected.target_pct)
+    assert block["m_drawdown_used"] == pytest.approx(expected.m_drawdown)
+    assert expected.m_drawdown < 0.5   # 방어가 실제로 물린 국면
+
+    # 낙폭을 빼먹은 값(ramped × m_vol)과 **다르다**.
+    naive = block["ramped_pct"] * block["m_vol"]
+    assert block["next_target_pct_projected"] < naive * 0.9
+    assert "m_drawdown" in block["next_target_assumes"]
+
+
+async def test_unknown_drawdown_is_declared_not_silently_one(tmp_path):
+    context = await _context(tmp_path, with_judgment=False)
+    block = context["exposure_mechanics"]
+    assert "m_drawdown" in block["unknown"]
+
+
+# --------------------------------------------- 7. 블록이 실제로 프롬프트에 닿는다
+
+def _block_from_prompt(provider) -> dict:
+    messages = provider.generate_structured.await_args_list[0].args[0]
+    sent = "\n".join(str(m.content) for m in messages)
+    payload = json.loads(sent[sent.index("{"):])
+    return payload["exposure_mechanics"]
+
 
 async def test_block_reaches_the_panelist_prompt(tmp_path):
     """컨텍스트에만 있고 직렬화에서 빠지면 아무 소용이 없다 -- 종단 확인."""
@@ -369,14 +541,10 @@ async def test_block_reaches_the_panelist_prompt(tmp_path):
         await run_strategy_panel(context)
 
     assert provider.generate_structured.await_count == 3
-    messages = provider.generate_structured.await_args_list[0].args[0]
-    sent = "\n".join(str(m.content) for m in messages)
-
-    assert "exposure_mechanics" in sent
-    payload = json.loads(sent[sent.index("{"):])["exposure_mechanics"]
-    assert payload["m_vol_binding"] == "floor"
-    assert payload["target_vol_pct_can_lift_m_vol"] is False
-    assert payload["convergence"]["target_pct"] == pytest.approx(0.15)
+    block = _block_from_prompt(provider)
+    assert block["m_vol_binding"] == "floor"
+    assert block["target_vol_pct_can_lift_m_vol"] is False
+    assert block["convergence"]["target_pct"] == pytest.approx(0.15)
 
 
 async def test_orchestrator_hands_the_vol_knobs_to_the_context():
@@ -400,7 +568,6 @@ async def test_end_to_end_live_knobs_reach_the_panel_prompt(tmp_path):
     전략에 박힌 22.0이 실제 프롬프트의 exposure_mechanics에 나타나고,
     그 블록이 'm_vol은 하한에 있고 target_vol_pct로는 못 푼다'를 말한다.
     """
-    from services.trading import strategy_orchestrator
     from services.trading.strategy import TradingStrategy
     from services.trading.strategy_orchestrator import run_strategy_consensus
 
@@ -433,10 +600,8 @@ async def test_end_to_end_live_knobs_reach_the_panel_prompt(tmp_path):
 
     assert result["ok"] is True, result
     assert provider.generate_structured.await_count == 3
-    messages = provider.generate_structured.await_args_list[0].args[0]
-    sent = "\n".join(str(m.content) for m in messages)
+    block = _block_from_prompt(provider)
 
-    block = json.loads(sent[sent.index("{"):])["exposure_mechanics"]
     assert block["status"] == "ok"
     assert block["target_vol_pct"] == pytest.approx(22.0)
     assert block["m_vol_binding"] == "floor"
@@ -447,14 +612,54 @@ async def test_end_to_end_live_knobs_reach_the_panel_prompt(tmp_path):
     assert block["convergence"]["target_pct"] == pytest.approx(0.15)
 
 
+# ------------------------------------------------- 8. 프레이밍 중립성
+
+def _knob_segments(text: str, knob: str) -> list[str]:
+    """노브 이름이 나오는 **줄**. 설명은 노브당 한 줄(불릿)이라 줄이
+    자연스러운 단위다 -- 문장으로 쪼개면 같은 불릿의 상·하향 서술이
+    서로 다른 조각으로 흩어진다."""
+    return [s for s in re.split(r"\n", text) if knob in s]
+
+
 async def test_knob_description_states_the_floor_and_the_dead_zone():
     """노브 설명이 '축소에 하한이 있다'와 '그 구간에서 target_vol_pct가
     소거된다'를 말한다. 라이브 수치는 프롬프트 상수에 박지 않는다."""
     from services.trading.strategy_panel import _SCHEMA_INSTRUCTION
 
     assert "m_vol" in _SCHEMA_INSTRUCTION
-    assert "vol_multiplier_min" in _SCHEMA_INSTRUCTION
     assert "exposure_mechanics" in _SCHEMA_INSTRUCTION
+    # base의 프레이밍 한 절이 살아 있다 -- 이 노브가 '방어의 상한'이라는
+    # 것을 프롬프트에서 말하는 유일한 문장이었다(리뷰 Important 1).
+    assert "이 배수 아래로는 안 줄인다" in _SCHEMA_INSTRUCTION
     # 낡을 라이브 수치가 상수에 박혀 있지 않다.
     assert "101" not in _SCHEMA_INSTRUCTION
     assert "50.9" not in _SCHEMA_INSTRUCTION
+    # 허용 범위는 블록이 라이브로 싣는다 -- 문단에 두 번째 사본을 만들지
+    # 않는다(리뷰 M4).
+    assert _SCHEMA_INSTRUCTION.count("10~40") == 1
+    assert _SCHEMA_INSTRUCTION.count("0.2~0.8") == 1
+
+
+async def test_knob_description_is_symmetric_and_non_directive():
+    """이 태스크의 최우선 속성: 사실을 주되 **조종하지 않는다**.
+
+    존재/부재 단언만으로는 문단을 '올리십시오'로 바꿔도 통과한다 --
+    그래서 (a) 두 노브 모두 상·하향이 같이 서술되는지 (b) 노브 이름이
+    나오는 문장에 권고 어휘가 없는지를 본다.
+    """
+    from services.trading.strategy_panel import _SCHEMA_INSTRUCTION
+
+    for knob in ("vol_multiplier_min", "target_vol_pct"):
+        segs = " ".join(_knob_segments(_SCHEMA_INSTRUCTION, knob))
+        assert "올리면" in segs, f"{knob}: 상향 효과 서술이 없다"
+        assert "낮추면" in segs, f"{knob}: 하향 효과 서술이 없다"
+
+    # 방어의 세기라는 프레이밍이 상향 쪽에도 붙어 있다.
+    assert "방어" in _SCHEMA_INSTRUCTION
+
+    directive = ("올리십시오", "올리세요", "높이십시오", "높이세요", "낮추십시오",
+                 "낮추세요", "줄이십시오", "권장", "추천", "바람직", "해야 합니다")
+    for knob in ("vol_multiplier_min", "target_vol_pct"):
+        for seg in _knob_segments(_SCHEMA_INSTRUCTION, knob):
+            for word in directive:
+                assert word not in seg, f"{knob} 문장에 권고 어휘 '{word}'"
