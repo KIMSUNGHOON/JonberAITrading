@@ -727,6 +727,11 @@ def test_market_hours_fallback_survives_one_unusable_year(monkeypatch):
     연도 루프가 하나의 try로 묶여 있으면 그 한 해 때문에 **폴백 전체가
     빈 집합**이 되고, 휴장일 0개 = 모든 평일이 거래일이 된다. 이 태스크가
     없애려는 실패 형태 그 자체라 미리 못 박는다.
+
+    ⚠️ 못 쓰게 만드는 해는 창의 **첫 해**여야 한다. 초판은 마지막 해를
+    골랐는데, 그러면 격리를 제거해도 앞선 해들이 이미 `derived`에 쌓여
+    있어 테스트가 통과했다 -- 가드가 아니라 장식이었다(RED 재현 실패로
+    발각). 첫 해가 죽으면 격리 없는 구현은 빈 집합을 돌려준다.
     """
     from services.trading.market_hours import MarketHoursService
 
@@ -735,7 +740,7 @@ def test_market_hours_fallback_survives_one_unusable_year(monkeypatch):
     try:
         MarketHoursService._fallback_cache = None
         years = MarketHoursService.fallback_years()
-        doomed = years[-1]
+        doomed = years[0]
 
         def _selective(self, year):
             if year == doomed:
@@ -747,7 +752,9 @@ def test_market_hours_fallback_survives_one_unusable_year(monkeypatch):
         fallback = MarketHoursService.fallback_holidays()
         assert fallback, "한 해가 실패했다고 폴백 전체가 비었다"
         assert not any(d.year == doomed for d in fallback)
-        assert any(d.year == years[0] for d in fallback)
+        assert any(d.year == years[-1] for d in fallback)
+        # 쓸 수 있는 결과는 캐시돼야 한다 -- 매 호출 재파생은 실패 취급이다.
+        assert MarketHoursService._fallback_cache is not None
     finally:
         MarketHoursService._fallback_cache = saved
 
