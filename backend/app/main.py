@@ -355,7 +355,20 @@ async def lifespan(app: FastAPI):
             "holiday_service_initialized",
             total_holidays=status.get("total_holidays", 0),
             years=list(status.get("year_stats", {}).keys()),
+            # 출처와 신뢰 못 하는 연도를 부팅 로그에 드러낸다 -- 이게 없으면
+            # KRX 연동이 죽어 폴백 표를 쓰고 있다는 사실이 보이지 않는다.
+            source=status.get("source"),
+            year_sources=status.get("year_sources"),
+            untrusted_years=status.get("untrusted_years"),
         )
+        if status.get("untrusted_years"):
+            logger.error(
+                "holiday_calendar_untrusted_years",
+                years=status.get("untrusted_years"),
+                fallback_covers=status.get("fallback_covers_years"),
+                hint="해당 연도는 완전한 달력이 저장돼 있지 않아 모르는 휴장일이 "
+                     "거래일로 보인다. update_holidays(year) 필요.",
+            )
 
         # Start automatic update scheduler (monthly on 1st at 6:00 AM)
         holiday_service.start_scheduler(update_day=1, update_hour=6)
