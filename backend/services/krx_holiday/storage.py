@@ -9,12 +9,26 @@ import logging
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
-from typing import List, Optional, Set, Dict
+from typing import Dict, Iterable, List, Optional, Set
 from contextlib import contextmanager
 
-from .fetcher import HolidayInfo
+from .fetcher import HolidayInfo, SOURCE_UNKNOWN
 
 logger = logging.getLogger(__name__)
+
+# holiday_metadata 키 규약.
+#   last_update       -- 마지막 쓰기 시각(기존 키, 유지)
+#   source            -- 마지막 쓰기의 출처 (krx_api | fallback_table | unknown)
+#   source_<year>     -- 그 연도 행들의 출처
+#   coverage_<year>   -- "complete"일 때만 그 해 달력을 신뢰한다.
+#
+# `last_update`만 있던 시절에는 성공과 실패가 구별되지 않았다 -- 라이브
+# DB의 2026-08-01 갱신은 정상처럼 보였지만 실제로는 KRX에 닿은 적이 없다.
+# `coverage_<year>`가 없는 연도는 **출처 불명**으로 취급한다: 배포 직후
+# 라이브 DB의 2026·2027이 정확히 그 상태이고, 그게 보여야 한다.
+_META_LAST_UPDATE = "last_update"
+_META_SOURCE = "source"
+COVERAGE_COMPLETE = "complete"
 
 
 class HolidayStorage:
@@ -99,12 +113,25 @@ class HolidayStorage:
             conn.commit()
             logger.debug(f"Initialized holiday database at {self.db_path}")
 
-    def save_holidays(self, holidays: List[HolidayInfo]) -> int:
+    def save_holidays(
+        self,
+        holidays: List[HolidayInfo],
+        source: str = SOURCE_UNKNOWN,
+        complete_years: Optional[Iterable[int]] = None,
+    ) -> int:
         """
         Save holidays to database.
 
         Args:
             holidays: List of HolidayInfo objects
+            source: 이 배치의 출처 (`krx_api` | `fallback_table` | `unknown`).
+                기본값이 `unknown`인 이유: 이 메서드를 직접 부르는 곳(테스트
+                픽스처 등)이 출처를 모른 채 쓰기 때문이다. 모르면 모른다고
+                남기지, 성공으로 위장하지 않는다.
+            complete_years: 이 배치가 **완전한** 달력을 담는 연도들.
+                여기 적힌 연도만 `coverage_<year>=complete`가 찍히고,
+                그 연도만 신뢰 상태가 된다. 넘기지 않으면 마커를 쓰지
+                않는다 -- 조각 데이터가 완전한 척하지 못하게.
 
         Returns:
             Number of holidays saved (new + updated)
@@ -137,14 +164,22 @@ class HolidayStorage:
                 except Exception as e:
                     logger.error(f"Error saving holiday {holiday.date}: {e}")
 
-            # Update metadata
-            cursor.execute("""
-                INSERT INTO holiday_metadata (key, value, updated_at)
-                VALUES ('last_update', ?, ?)
-                ON CONFLICT(key) DO UPDATE SET
-                    value = excluded.value,
-                    updated_at = excluded.updated_at
-            """, (datetime.now().isoformat(), datetime.now().isoformat()))
+            # Update metadata -- 시각뿐 아니라 **출처와 완전성**을 남긴다.
+            now = datetime.now().isoformat()
+            meta = {_META_LAST_UPDATE: now, _META_SOURCE: source}
+            for y in sorted({h.year for h in holidays}):
+                meta[f"{_META_SOURCE}_{y}"] = source
+            for y in sorted(set(complete_years or ())):
+                meta[f"coverage_{y}"] = COVERAGE_COMPLETE
+
+            for key, value in meta.items():
+                cursor.execute("""
+                    INSERT INTO holiday_metadata (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                """, (key, value, now))
 
             conn.commit()
 
@@ -152,8 +187,45 @@ class HolidayStorage:
         self._cache_loaded = False
         self._holiday_cache.clear()
 
-        logger.info(f"Saved {saved_count} holidays to database")
+        logger.info(
+            f"Saved {saved_count} holidays to database (source={source})"
+        )
         return saved_count
+
+    # ------------------------------------------------------------------
+    # metadata accessors
+    # ------------------------------------------------------------------
+
+    def get_metadata(self, key: str) -> Optional[str]:
+        """holiday_metadata의 단일 값. 없으면 None."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT value FROM holiday_metadata WHERE key = ?", (key,)
+            )
+            row = cursor.fetchone()
+            return row["value"] if row else None
+
+    def get_source(self, year: Optional[int] = None) -> Optional[str]:
+        """달력의 출처. `year`를 주면 그 연도 행들의 출처.
+
+        None은 "기록이 없다" -- 이 수정 이전에 쓰인 행들이 그렇다.
+        """
+        key = _META_SOURCE if year is None else f"{_META_SOURCE}_{year}"
+        return self.get_metadata(key)
+
+    def is_year_complete(self, year: int) -> bool:
+        """그 해 달력을 **완전한 것으로 신뢰해도 되는가**.
+
+        행이 있다는 것만으로는 부족하다 -- 라이브 DB의 2027년 9행은
+        설날·추석이 통째로 빠진 고정 공휴일뿐인데도 존재는 한다.
+        `coverage_<year>=complete` 마커가 명시적으로 찍혀야 한다.
+        """
+        return self.get_metadata(f"coverage_{year}") == COVERAGE_COMPLETE
+
+    def get_year_sources(self) -> Dict[int, Optional[str]]:
+        """저장된 연도 → 출처."""
+        return {y: self.get_source(y) for y in self.get_year_stats()}
 
     def get_holidays(self, year: Optional[int] = None) -> List[HolidayInfo]:
         """
