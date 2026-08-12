@@ -270,3 +270,60 @@ async def test_refresh_uses_the_designed_source_label():
     ):
         await refresh_index_daily()
     assert captured["source"] == INDEX_SOURCE
+
+
+# ---- 지연 경고 래치 (2026-08-12) ----
+#
+# `index_daily`는 08:05 수집이 Yahoo의 전일 종가 반영보다 일러 **상시 1거래일
+# 뒤진다**. 그래서 이 경고는 장중 감시 루프에서 5분마다, 하루 288회 찍혔다.
+# 매번 같은 말을 하는 경고는 정보가 아니라 소음이고, 진짜 수집 실패가 났을 때
+# 구별되지 않는다. 같은 (latest, expected) 조합에 대해서는 한 번만 남긴다.
+
+
+def _count_lag_warnings(idx, monkeypatch):
+    """`logger.warning` 호출 중 index_series_lagging 건수만 센다."""
+    calls = []
+    real = idx.logger.warning
+
+    def _spy(event, *a, **k):
+        if event == "index_series_lagging":
+            calls.append((event, k))
+        return real(event, *a, **k) if False else None
+
+    monkeypatch.setattr(idx.logger, "warning", _spy)
+    return calls
+
+
+def test_lagging_warning_is_latched_while_the_gap_is_unchanged(monkeypatch):
+    """같은 지연 상태가 이어지는 동안에는 한 번만 경고한다."""
+    import services.trading.index_series as idx
+
+    idx._LAST_LAG_LOG_KEY = None
+    calls = _count_lag_warnings(idx, monkeypatch)
+
+    for _ in range(3):
+        lag = idx.evaluate_series_lag(
+            "2026-08-10", date(2026, 8, 12), holiday_service=_FakeCalendar()
+        )
+        assert lag.lagging is True  # 판정 자체는 매번 정상이어야 한다
+
+    assert len(calls) == 1
+
+
+def test_lagging_warning_fires_again_when_the_gap_changes(monkeypatch):
+    """래치는 **침묵**이 아니다 — 지연이 깊어지면 다시 말해야 한다.
+
+    이게 없으면 '하루 뒤짐'으로 한 번 찍힌 뒤 '사흘 뒤짐'이 되어도 조용하다."""
+    import services.trading.index_series as idx
+
+    idx._LAST_LAG_LOG_KEY = None
+    calls = _count_lag_warnings(idx, monkeypatch)
+
+    idx.evaluate_series_lag(
+        "2026-08-10", date(2026, 8, 12), holiday_service=_FakeCalendar()
+    )
+    idx.evaluate_series_lag(  # 같은 latest, 하루 지난 today → 지연이 깊어졌다
+        "2026-08-10", date(2026, 8, 13), holiday_service=_FakeCalendar()
+    )
+
+    assert len(calls) == 2

@@ -761,3 +761,53 @@ class TestHandleExposurePrependsRegime:
         sent = update.effective_message.reply_text.call_args[0][0]
         assert "레짐: neutral" in sent
         assert _NO_DATA in sent
+
+
+class TestDegradedTagsAreReadable:
+    """저하 태그는 폰에서 사람이 읽는다 — 코드 식별자를 그대로 던지지 않는다.
+
+    2026-08-12에 사용자가 `/exposure`를 치고 `⚠️ index_series_lagging`을 보고
+    "이건 무슨 문제냐"고 물었다. 실패가 아니라 "판정은 났고 입력 하나가
+    낡았다"는 꼬리표인데, 식별자만으로는 그 구별이 전달되지 않는다.
+
+    다만 원문도 함께 남긴다 — 로그(`index_series_lagging`)와 대조해야 원인을
+    추적할 수 있고, 그 대조가 이 태그를 만든 이유다.
+    """
+
+    def _row(self, degraded):
+        return {
+            "regime": "bull",
+            "confidence": 0.72,
+            "effective_target_pct": 0.1199,
+            "anchor_target_pct": 0.8,
+            "degraded": degraded,
+        }
+
+    def test_known_tag_is_translated_and_keeps_the_identifier(self):
+        from services.telegram.briefing import format_regime
+
+        out = format_regime(self._row(["index_series_lagging"]))
+
+        assert "지수 시계열" in out          # 사람이 읽을 말
+        assert "보수적" in out               # 위험 방향까지 알려준다
+        assert "index_series_lagging" in out  # 로그와 대조할 원문
+
+    def test_unknown_tag_survives_verbatim(self):
+        """번역표에 없는 태그가 조용히 사라지면, 새로 생긴 저하 사유가
+        폰에서 영영 안 보인다 — 표시 계층이 정보를 삼키면 안 된다."""
+        from services.telegram.briefing import format_regime
+
+        out = format_regime(self._row(["some_new_tag_2027"]))
+
+        assert "some_new_tag_2027" in out
+
+    def test_multiple_tags_are_all_shown(self):
+        from services.telegram.briefing import format_regime
+
+        out = format_regime(
+            self._row(["index_series_lagging", "equity_peak_unavailable"])
+        )
+
+        assert "index_series_lagging" in out
+        assert "equity_peak_unavailable" in out
+        assert "고점" in out

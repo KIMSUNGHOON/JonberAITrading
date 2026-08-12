@@ -109,6 +109,15 @@ class SeriesLag:
 _LAG_UNKNOWN = SeriesLag(lagging=None, latest=None, expected=None,
                          trading_days_behind=None)
 
+# 마지막으로 경고를 남긴 (latest, expected) 조합. 같은 조합이 이어지는 동안은
+# 침묵한다 -- `evaluate_series_lag`는 08:05 판정뿐 아니라 **장중 감시 루프에서도
+# 5분마다** 호출되는데, `index_daily`는 08:05 수집이 Yahoo의 전일 종가 반영보다
+# 일러 상시 1거래일 뒤진다. 2026-08-12에 하루 288회 페이스로 같은 줄이 찍혔다.
+# 매번 같은 말을 하는 경고는 정보가 아니라 소음이고, 진짜 수집 실패가 났을 때
+# 구별되지 않는다. 지연이 **깊어지면** 키가 바뀌므로 다시 말한다 -- 래치는
+# 침묵이 아니다.
+_LAST_LAG_LOG_KEY: Optional[tuple] = None
+
 
 def _default_holiday_service():
     """KRX 거래일 달력. **lazy import** -- `services/discovery/ledger.py:53`과
@@ -155,12 +164,16 @@ def evaluate_series_lag(
                        latest=latest.isoformat(), error=str(e))
         return _LAG_UNKNOWN
 
-    logger.warning(
-        "index_series_lagging",
-        latest=latest.isoformat(),
-        expected=expected.isoformat(),
-        trading_days_behind=behind,
-    )
+    global _LAST_LAG_LOG_KEY
+    log_key = (latest, expected)
+    if _LAST_LAG_LOG_KEY != log_key:
+        _LAST_LAG_LOG_KEY = log_key
+        logger.warning(
+            "index_series_lagging",
+            latest=latest.isoformat(),
+            expected=expected.isoformat(),
+            trading_days_behind=behind,
+        )
     return SeriesLag(lagging=True, latest=latest, expected=expected,
                      trading_days_behind=behind)
 

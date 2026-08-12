@@ -112,6 +112,36 @@ class RegimeUnavailable:
     """
 
 
+# 저하 태그 → 사람이 읽을 설명. 폰에서 보는 사람에게 코드 식별자를 그대로
+# 던지면 "실패"로 읽힌다 — 대부분은 "판정은 났고 입력 하나가 낡았다"는
+# 꼬리표다. 위험 방향(노출도가 열리는지 닫히는지)까지 한 줄에 담는다.
+#
+# ⚠️ 표에 없는 태그는 **원문 그대로** 보여준다(아래 `_describe_degraded`).
+# 표시 계층이 모르는 태그를 삼키면, 새로 생긴 저하 사유가 폰에서 영영 안 보인다.
+_DEGRADED_LABELS: dict[str, str] = {
+    "index_series_lagging": "지수 시계열이 거래일 기준으로 뒤짐 — 노출도는 보수적으로 계산됨",
+    "index_series_stale": "지수 시계열이 7일 이상 낡음 — 노출도는 보수적으로 계산됨",
+    "index_series_lag_unknown": "지수 지연 여부를 판정 못 함(달력 조회 실패)",
+    "index_vol_insufficient": "지수 변동성 표본 부족 — 변동성 배수를 신뢰할 수 없음",
+    "equity_peak_unavailable": "계좌 고점 조회 실패 — 낙폭 방어 배수를 믿을 수 없음",
+    "portfolio_state_unavailable": "계좌 조회 실패 — 실제 비중을 못 읽음",
+    "target_clamped_defense_unreliable": "방어 배수를 못 믿어 목표를 직전 값 이하로 눌러둠",
+    "regime_unparseable": "LLM 응답을 해석 못 함 — 직전 판정을 잇는 중",
+    "llm_unavailable": "LLM 호출 실패 — 직전 판정을 잇는 중",
+    "regime_unknown": "레짐 라벨 미상",
+}
+
+
+def _describe_degraded(tag: str) -> str:
+    """알려진 태그면 `설명 (원문)`, 모르는 태그면 원문 그대로.
+
+    원문을 항상 남기는 이유: 로그(`index_series_lagging` 등)와 대조해야
+    원인을 추적할 수 있고, 그 대조가 이 태그를 만든 목적이다.
+    """
+    label = _DEGRADED_LABELS.get(tag)
+    return f"{label} ({tag})" if label else tag
+
+
 def format_regime(row) -> str:
     """오늘의 레짐 판정 블록. 세 상태를 구별한다 -- 조용히 중립을
     보여주면 '판정 못 함'과 '중립으로 판정함'이 구별되지 않는다.
@@ -132,8 +162,8 @@ def format_regime(row) -> str:
     ]
     for d in (row.get("key_drivers") or [])[:3]:
         lines.append(f"   · {d}")
-    if row.get("degraded"):
-        lines.append(f"   ⚠️ {', '.join(row['degraded'])}")
+    for tag in row.get("degraded") or []:
+        lines.append(f"   ⚠️ {_describe_degraded(tag)}")
     return "\n".join(lines)
 
 
