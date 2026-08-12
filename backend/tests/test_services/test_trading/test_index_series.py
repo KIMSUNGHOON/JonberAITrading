@@ -327,3 +327,91 @@ def test_lagging_warning_fires_again_when_the_gap_changes(monkeypatch):
     )
 
     assert len(calls) == 2
+
+
+# ---- 장중 재수집과 당일 진행 봉 (2026-08-12) ----
+#
+# 08:05 수집만으로는 전일 종가를 못 받는다 — Yahoo가 그 시각에 아직 안 낸다
+# (2026-08-12 실측: 08:12에 없고 12:28에 있음). 그래서 09:30 재수집을 붙이는데,
+# 장중에 부르면 히스토리에 **오늘 진행 봉**이 섞여 온다(12:28 6,629.37 →
+# 12:33 6,626.09, 움직이는 중). 그것을 확정 종가로 upsert하면 변동성 계산이
+# 오염되고, 장 마감 후에도 그 값이 남는다. 오늘 날짜는 저장하지 않는다.
+
+
+@pytest.mark.asyncio
+async def test_refresh_skips_todays_in_progress_bar():
+    hist = _fake_history([("2026-08-11", 6345.53), ("2026-08-12", 6626.09)])
+    tk = MagicMock()
+    tk.history = MagicMock(return_value=hist)
+    with patch("services.trading.index_series.yf.Ticker", return_value=tk):
+        n = await refresh_index_daily(today=date(2026, 8, 12))
+
+    assert n == 1
+    storage = await get_storage_service()
+    got = await storage.get_recent_index_closes()
+    assert [d for d, _ in got] == ["2026-08-11"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_writes_nothing_when_only_todays_bar_is_available():
+    """개장 직후 재수집처럼 확정 행이 하나도 없으면 아무것도 쓰지 않는다 —
+    빈 upsert를 성공으로 보고하면 '수집됐다'는 거짓 신호가 된다."""
+    hist = _fake_history([("2026-08-12", 6626.09)])
+    tk = MagicMock()
+    tk.history = MagicMock(return_value=hist)
+    with patch("services.trading.index_series.yf.Ticker", return_value=tk):
+        assert await refresh_index_daily(today=date(2026, 8, 12)) is None
+
+    storage = await get_storage_service()
+    assert await storage.get_recent_index_closes() == []
+
+
+# ---- 09:30 재수집 스케줄러 (2026-08-12) ----
+
+
+@pytest.mark.asyncio
+async def test_index_refresh_scheduler_registers_a_weekday_job():
+    """08:05 수집이 전일 종가를 놓치는 것을 09:30 재수집이 메운다.
+
+    2026-08-12 실측: 08:12에 08-11 종가가 없고 12:28에 있었다 — 08:05 단독
+    수집은 구조적으로 항상 1거래일 뒤진다.
+
+    ⚠️ async인 이유: `AsyncIOScheduler.start()`가 실행 중인 이벤트 루프를
+    요구한다. 동기 테스트로 쓰면 `no running event loop`로 죽어 **아무것도
+    검증하지 않은 채** never-raise 경로만 타게 된다(실제로 처음에 그랬다).
+    """
+    import services.trading.index_series as idx
+
+    idx._refresh_scheduler = None
+    sched = idx.start_index_refresh_scheduler(hour=9, minute=30)
+    try:
+        assert sched is not None
+        jobs = sched.get_jobs()
+        assert [j.id for j in jobs] == ["index_daily_refresh"]
+        assert "day_of_week='mon-fri'" in str(jobs[0].trigger)
+        assert "hour='9'" in str(jobs[0].trigger)
+        assert "minute='30'" in str(jobs[0].trigger)
+    finally:
+        if sched is not None:
+            sched.shutdown(wait=False)
+        idx._refresh_scheduler = None
+
+
+@pytest.mark.asyncio
+async def test_index_refresh_scheduler_never_raises():
+    """기동 경로에서 부른다 — 실패가 앱을 죽이면 안 된다.
+
+    루프가 있는 async 컨텍스트에서 돌려야 patch한 예외가 실제로 발동한다.
+    동기 테스트였다면 루프 부재로 None이 나와 **patch 없이도 통과**했다.
+    """
+    import services.trading.index_series as idx
+
+    idx._refresh_scheduler = None
+    try:
+        with patch(
+            "apscheduler.schedulers.asyncio.AsyncIOScheduler.start",
+            side_effect=RuntimeError("boom"),
+        ):
+            assert idx.start_index_refresh_scheduler() is None
+    finally:
+        idx._refresh_scheduler = None

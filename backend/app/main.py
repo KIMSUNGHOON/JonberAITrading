@@ -409,6 +409,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("regime_scheduler_init_failed", error=str(e))
 
+    # 지수 시계열 09:30 재수집. 08:05 사이클 시점에는 Yahoo가 아직 전일
+    # KOSPI 종가를 안 낸다(2026-08-12 실측: 08:12 없음 → 12:28 있음) —
+    # 그 결과 `index_series_lagging`이 매일 떴다. 레짐 스케줄러와 독립이다:
+    # 시계열은 REGIME_EXPOSURE_ENABLED와 무관하게 변동성 계산에 쓰인다.
+    try:
+        from services.trading.index_series import start_index_refresh_scheduler
+
+        start_index_refresh_scheduler()
+        logger.info("index_refresh_scheduler_wired")
+    except Exception as e:
+        logger.warning("index_refresh_scheduler_init_failed", error=str(e))
+
     # Initialize the LLM router (best-effort CLI/HTTP health probes for /api/llm/stats)
     try:
         from agents.llm.router import get_router

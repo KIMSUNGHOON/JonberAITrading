@@ -192,9 +192,20 @@ def _fetch_history(lookback_days: int) -> list[tuple[str, float]]:
 
 async def refresh_index_daily(
     lookback_days: int = INDEX_LOOKBACK_DAYS,
+    today: Optional[date] = None,
 ) -> Optional[int]:
     """최근 `lookback_days`의 KOSPI 종가를 upsert하고 쓴 행 수를 돌려준다.
     never-raise -- 실패는 `None`.
+
+    **오늘 날짜 행은 저장하지 않는다.** 장중에 부르면(09:30 재수집)
+    yfinance 히스토리에 아직 확정되지 않은 **진행 봉**이 섞여 온다
+    (2026-08-12 실측: 12:28 6,629.37 → 12:33 6,626.09). 그것을 확정 종가로
+    굳히면 변동성 계산이 오염되고 장 마감 후에도 틀린 값이 남는다.
+    08:05 수집은 장 시작 전이라 이 문제가 없었다 -- 장중 재수집을 붙이면서
+    생긴 위험이라 여기서 막는다.
+
+    `today`는 테스트가 날짜를 고정하려고 주입한다(`evaluate_series_lag`와
+    같은 관행). 프로덕션은 항상 생략한다.
 
     ⚠️ `upsert_index_daily`는 실패-무해(0 반환)라 반환값을 검사하지 않으면
     쓰기가 실패해도 성공을 보고하게 된다.
@@ -204,6 +215,12 @@ async def refresh_index_daily(
     except Exception as e:
         logger.warning("index_series_fetch_failed", error=str(e))
         return None
+
+    cutoff = (today or date.today()).isoformat()
+    intraday = [d for d, _ in rows if d >= cutoff]
+    if intraday:
+        rows = [(d, c) for d, c in rows if d < cutoff]
+        logger.info("index_series_intraday_bar_skipped", dates=intraday)
 
     if not rows:
         logger.warning("index_series_empty", ticker=INDEX_TICKER)
@@ -225,3 +242,48 @@ async def refresh_index_daily(
         rows=written, first=rows[0][0], last=rows[-1][0],
     )
     return written
+
+
+_refresh_scheduler = None
+
+
+def start_index_refresh_scheduler(hour: int = 9, minute: int = 30):
+    """평일 hour:minute에 `refresh_index_daily`를 한 번 더 돌린다.
+
+    **왜 두 번 수집하나**: 08:05 사이클(`run_daily_regime_cycle`) 시점에는
+    Yahoo가 아직 전일 KOSPI 종가를 내놓지 않는다. 2026-08-12 실측 --
+    08:12 조회에 08-11 종가가 없고, 12:28 조회에는 있었다(6,345.53, 전날
+    17:55에 본 값과 동일 = 확정치). 그래서 08:05 단독 수집은 구조적으로
+    항상 1거래일 뒤지고, `index_series_lagging`이 **매일** 떴다.
+
+    도착 시각을 08:12~12:28 구간까지만 좁혀 놓은 상태라 09:30은 보수적인
+    추정이다. 놓치더라도 손해는 없다 -- 다음 날 08:05 수집이 어차피 40일치를
+    통째로 다시 받는다. 이 잡은 "더 일찍 메운다"이지 "유일한 기회"가 아니다.
+
+    ⚠️ 장중 호출이라 `refresh_index_daily`의 **당일 봉 제외**가 짝을 이룬다.
+    그것 없이 이 스케줄러만 켜면 진행 봉이 확정치로 굳는다.
+
+    `start_regime_scheduler`와 같은 형태 -- 기동 시 1회 호출, 실패해도 앱을
+    죽이지 않는다.
+    """
+    global _refresh_scheduler
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+
+    try:
+        if _refresh_scheduler is not None:
+            return _refresh_scheduler
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(
+            refresh_index_daily,
+            CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute),
+            id="index_daily_refresh",
+            replace_existing=True,
+        )
+        scheduler.start()
+        _refresh_scheduler = scheduler
+        logger.info("index_refresh_scheduler_started", hour=hour, minute=minute)
+        return scheduler
+    except Exception as e:
+        logger.warning("index_refresh_scheduler_failed", error=str(e))
+        return None
