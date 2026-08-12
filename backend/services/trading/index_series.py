@@ -28,6 +28,9 @@ logger = structlog.get_logger(__name__)
 
 INDEX_TICKER: str = "^KS11"
 INDEX_SOURCE: str = "yfinance:^KS11"
+# 토스 경로로 들어온 행. 원장에서 "어느 소스에서 왔는지"를 구별할 수
+# 있어야 나중에 두 소스의 값 차이를 대조할 수 있다.
+INDEX_SOURCE_TOSS: str = "toss:KOSPI"
 INDEX_LOOKBACK_DAYS: int = 40
 
 # 최신 행이 이보다 오래되면 시계열을 못 믿는다. 7역일인 이유: 설·추석
@@ -190,9 +193,30 @@ def _fetch_history(lookback_days: int) -> list[tuple[str, float]]:
     ]
 
 
+async def _fetch_from_toss(toss, lookback_days: int) -> Optional[list[tuple[str, float]]]:
+    """토스 KOSPI 일봉. 실패하면 `None`(호출자가 yfinance로 폴백).
+
+    ⚠️ 실패를 **삼키지 않고 로그에 남긴다.** 특히 `TossIpBlockedError`는
+    "데이터 없음"이 아니라 "IP 화이트리스트가 깨졌다"는 뜻이고, 그대로 두면
+    토스 경로가 영원히 죽어 있다. 폴백이 있어 수집 자체는 멈추지 않지만
+    사람이 알아야 고칠 수 있다.
+    """
+    if toss is None or not getattr(toss, "enabled", False):
+        return None
+    try:
+        rows = await toss.get_index_candles("KOSPI", interval="1d", count=lookback_days)
+    except Exception as e:
+        logger.warning(
+            "index_series_toss_failed", error=str(e), error_type=type(e).__name__
+        )
+        return None
+    return rows or None
+
+
 async def refresh_index_daily(
     lookback_days: int = INDEX_LOOKBACK_DAYS,
     today: Optional[date] = None,
+    toss=None,
 ) -> Optional[int]:
     """최근 `lookback_days`의 KOSPI 종가를 upsert하고 쓴 행 수를 돌려준다.
     never-raise -- 실패는 `None`.
@@ -210,11 +234,19 @@ async def refresh_index_daily(
     ⚠️ `upsert_index_daily`는 실패-무해(0 반환)라 반환값을 검사하지 않으면
     쓰기가 실패해도 성공을 보고하게 된다.
     """
-    try:
-        rows = await asyncio.to_thread(_fetch_history, lookback_days)
-    except Exception as e:
-        logger.warning("index_series_fetch_failed", error=str(e))
-        return None
+    # 토스 우선, yfinance 폴백 (2026-08-12).
+    # yfinance는 08:05 수집 시점에 전일 종가를 안 내놔 상시 1거래일
+    # 뒤졌다. 토스는 전일은 물론 **당일 종가까지** 준다 — 실호출 확인:
+    # 08-12 6579.04 / 08-11 6345.53 / 08-10 6299.66.
+    rows = await _fetch_from_toss(toss, lookback_days)
+    source = INDEX_SOURCE_TOSS if rows else INDEX_SOURCE
+
+    if rows is None:
+        try:
+            rows = await asyncio.to_thread(_fetch_history, lookback_days)
+        except Exception as e:
+            logger.warning("index_series_fetch_failed", error=str(e))
+            return None
 
     cutoff = (today or date.today()).isoformat()
     intraday = [d for d, _ in rows if d >= cutoff]
@@ -228,7 +260,7 @@ async def refresh_index_daily(
 
     try:
         storage = await get_storage_service()
-        written = await storage.upsert_index_daily(rows, source=INDEX_SOURCE)
+        written = await storage.upsert_index_daily(rows, source=source)
     except Exception as e:
         logger.warning("index_series_persist_failed", error=str(e))
         return None
@@ -245,6 +277,18 @@ async def refresh_index_daily(
 
 
 _refresh_scheduler = None
+
+
+async def _refresh_with_toss() -> Optional[int]:
+    """09:30 스케줄러용 래퍼 — 토스 클라이언트를 주입한다.
+
+    `add_job`에 `refresh_index_daily`를 직접 걸면 `toss=None`이 되어
+    yfinance만 쓴다(= 상시 1거래일 지연이 그대로다). 배선이 빠져도
+    예외가 안 나므로 조용히 사라지는 종류의 실수다.
+    """
+    from services.toss import get_toss_client
+
+    return await refresh_index_daily(toss=get_toss_client())
 
 
 def start_index_refresh_scheduler(hour: int = 9, minute: int = 30):
@@ -275,7 +319,7 @@ def start_index_refresh_scheduler(hour: int = 9, minute: int = 30):
             return _refresh_scheduler
         scheduler = AsyncIOScheduler()
         scheduler.add_job(
-            refresh_index_daily,
+            _refresh_with_toss,
             CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute),
             id="index_daily_refresh",
             replace_existing=True,

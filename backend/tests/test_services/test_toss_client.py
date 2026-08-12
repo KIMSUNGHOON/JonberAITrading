@@ -111,3 +111,32 @@ async def test_missing_credentials_disable_the_client():
     """`.env`에 키가 없으면 조용히 죽는 대신 명시적으로 비활성이어야 한다."""
     c = TossClient(client_id=None, client_secret=None, http=_FakeHttp({}))
     assert c.enabled is False
+
+
+# ---- 싱글턴 팩토리 (T2 배선) ----
+
+
+async def test_factory_returns_disabled_client_without_credentials(monkeypatch):
+    """자격증명이 없으면 `enabled=False` 클라이언트를 준다 — None을
+    돌려주면 호출자가 매번 None 검사를 해야 하고, 빠뜨리면 AttributeError로
+    EOD 체인이 죽는다."""
+    import services.toss as toss_mod
+    from app.config import get_settings
+
+    monkeypatch.setattr(toss_mod, "_client", None, raising=False)
+    s = get_settings()
+    monkeypatch.setattr(s, "TOSS_CLIENT_ID", None, raising=False)
+    monkeypatch.setattr(s, "TOSS_CLIENT_SECRET", None, raising=False)
+
+    c = toss_mod.get_toss_client()
+    assert c.enabled is False
+
+
+async def test_factory_is_a_singleton(monkeypatch):
+    """호출마다 새로 만들면 토큰 캐시가 무의미해진다."""
+    import services.toss as toss_mod
+
+    monkeypatch.setattr(toss_mod, "_client", None, raising=False)
+    a = toss_mod.get_toss_client()
+    b = toss_mod.get_toss_client()
+    assert a is b

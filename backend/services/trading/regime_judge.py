@@ -377,7 +377,11 @@ async def run_daily_regime_cycle() -> None:
         logger.warning("regime_cycle_trading_day_check_failed", error=str(e))
 
     try:
-        await refresh_index_daily()
+        # 토스 우선(지연 없음) / yfinance 폴백. 자격증명이 없으면
+        # enabled=False 객체가 와서 조용히 yfinance로 떨어진다.
+        from services.toss import get_toss_client
+
+        await refresh_index_daily(toss=get_toss_client())
     except Exception as e:
         # never-raise가 계약이지만 방어적으로 한 겹 더 — 수집 실패가
         # 판정을 막으면 안 된다(기존 행으로 계산은 계속된다).

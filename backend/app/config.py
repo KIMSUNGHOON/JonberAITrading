@@ -85,6 +85,14 @@ class Settings(BaseSettings):
     KIWOOM_ACCOUNT_NO: str | None = None
     KIWOOM_IS_MOCK: bool = True  # True: 모의투자, False: 실거래
 
+    # 토스증권 Open API (2026-08-12). Kiwoom을 대체하지 않고 **병행**한다 —
+    # 지수 일봉을 지연 없이 주고(yfinance는 상시 1거래일 뒤진다) 레이트리밋이
+    # 10배 넉넉하지만, PER·PBR·EPS는 없어 펀더멘탈은 Kiwoom을 계속 쓴다.
+    # ⚠️ 발급 화면에 등록한 IP만 허용된다 — 미등록 IP는 전 API가 403이다.
+    # 문서: docs/TOSS_OPENAPI_GUIDE.md
+    TOSS_CLIENT_ID: str | None = None
+    TOSS_CLIENT_SECRET: str | None = None
+
     # Per-API-ID minimum interval (seconds) between two requests to the SAME
     # Kiwoom api_id (e.g. ka10001). Kiwoom error 1700 ("허용된 API 요청 개수를
     # 초과") is a PER-API-ID limit — distinct from 1701 (total) and 1702

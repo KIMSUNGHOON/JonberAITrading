@@ -415,3 +415,93 @@ async def test_index_refresh_scheduler_never_raises():
             assert idx.start_index_refresh_scheduler() is None
     finally:
         idx._refresh_scheduler = None
+
+
+# ---- 토스 소스 (T2, 2026-08-12) ----
+#
+# yfinance는 08:05 수집 시점에 전일 종가를 안 내놔 index_daily가 상시
+# 1거래일 뒤졌다(그래서 259ab7a로 09:30 재수집을 붙였다). 토스는 전일은
+# 물론 **당일 종가까지** 준다 — 실호출 확인: 08-12 6579.04 / 08-11 6345.53.
+#
+# ⚠️ 그래서 당일 진행 봉 제외 가드가 토스 경로에도 반드시 걸려야 한다.
+# 장중에 호출하면 오늘 봉이 확정 전이다.
+
+
+class _FakeToss:
+    def __init__(self, rows, boom=None):
+        self.rows = rows
+        self.boom = boom
+        self.calls = 0
+        self.enabled = True
+
+    async def get_index_candles(self, symbol="KOSPI", *, interval="1d", count=100):
+        self.calls += 1
+        if self.boom:
+            raise self.boom
+        return self.rows
+
+
+@pytest.mark.asyncio
+async def test_toss_source_is_preferred_and_labeled(tmp_path):
+    """토스가 성공하면 그 값을 쓰고 source도 토스로 남긴다 — 나중에
+    '어느 소스에서 온 행인지'를 원장에서 구별할 수 있어야 한다."""
+    import services.trading.index_series as idx
+
+    toss = _FakeToss([("2026-08-11", 6345.53), ("2026-08-10", 6299.66)])
+    n = await refresh_index_daily(today=date(2026, 8, 12), toss=toss)
+
+    assert n == 2
+    assert toss.calls == 1
+    storage = await get_storage_service()
+    got = await storage.get_recent_index_closes(limit=5)
+    assert dict(got)["2026-08-11"] == pytest.approx(6345.53)
+
+
+@pytest.mark.asyncio
+async def test_toss_todays_bar_is_still_excluded(tmp_path):
+    """토스는 당일 봉도 준다. 259ab7a의 제외 가드가 여기에도 걸려야 한다."""
+    import services.trading.index_series as idx
+
+    toss = _FakeToss([
+        ("2026-08-12", 6579.04),   # 오늘 — 장중이면 확정 전이다
+        ("2026-08-11", 6345.53),
+    ])
+    n = await refresh_index_daily(today=date(2026, 8, 12), toss=toss)
+
+    assert n == 1
+    storage = await get_storage_service()
+    got = dict(await storage.get_recent_index_closes(limit=5))
+    assert "2026-08-12" not in got
+    assert got["2026-08-11"] == pytest.approx(6345.53)
+
+
+@pytest.mark.asyncio
+async def test_toss_failure_falls_back_to_yfinance(tmp_path):
+    """토스가 죽어도 수집이 멈추면 안 된다 — yfinance가 폴백이다.
+    403(IP 화이트리스트)도 여기로 떨어지지만, 클라이언트가 전용 예외를
+    올리므로 로그에서 구별된다."""
+    import services.trading.index_series as idx
+
+    toss = _FakeToss([], boom=RuntimeError("403 edge-blocked"))
+    hist = _fake_history([("2026-08-11", 6345.53)])
+    tk = MagicMock()
+    tk.history = MagicMock(return_value=hist)
+
+    with patch("services.trading.index_series.yf.Ticker", return_value=tk):
+        n = await refresh_index_daily(today=date(2026, 8, 12), toss=toss)
+
+    assert n == 1
+    assert tk.history.called
+
+
+@pytest.mark.asyncio
+async def test_no_toss_client_uses_yfinance(tmp_path):
+    """`toss=None`이면 기존 동작 그대로 — 회귀 없음."""
+    hist = _fake_history([("2026-08-11", 6345.53)])
+    tk = MagicMock()
+    tk.history = MagicMock(return_value=hist)
+
+    with patch("services.trading.index_series.yf.Ticker", return_value=tk):
+        n = await refresh_index_daily(today=date(2026, 8, 12))
+
+    assert n == 1
