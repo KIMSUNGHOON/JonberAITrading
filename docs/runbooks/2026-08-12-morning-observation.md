@@ -19,6 +19,11 @@
 > |---|---|---|
 > | `f5af713` (12:21) | 지연 경고 래치 + 저하 태그 사람말 번역 | ✅ **실증 완료** — 42건/4h → 1건/17분 |
 > | `259ab7a` (12:46) | 09:30 재수집 + 당일 진행 봉 제외 | ✅ 스케줄러 등록 확인 · **첫 실행 08-13 09:30** |
+> | `948e9ea` | 라이브 DB 가드 (autouse 리다이렉트) | ✅ 회귀 0 · 위반 테스트 **16개** 적발 |
+> | `04fec8b`+`32a6db3` | Telegram·Kiwoom 엔드포인트 가드 | ✅ 회귀 0 · Kiwoom 접속 **39건** 차단 |
+>
+> ⭐ 가드 작업이 두 가지를 드러냈다: **워크트리 규칙은 Kiwoom을 막지 못했고**(URL이 코드에
+> 하드코딩), **teardown보다 오래 사는 폴링 태스크**는 function 스코프 가드를 우회한다.
 >
 > **예약 알람**(세션 전용 — 세션이 끊기면 사라진다. 그때는 이 문서가 대신한다):
 > `6159351a` 08-12 15:40 EOD · `ad8f7ac1` 08-13 08:10 개장 전 · `a94f4424` 08-13 09:35 재수집 판정
@@ -392,20 +397,37 @@ sqlite3 -readonly "file:backend/data/holidays.db?mode=ro" \
    14% 진행에 5분이 걸렸으니 완주하면 35분 이상 그 상태다(그래서 중단했다).
    Kiwoom 레이트리밋도 공유한다.
 
-   | 실행 위치 | 라이브 백엔드 피해 |
+   | 실행 위치 | Telegram 폴링 강탈 |
    |---|---|
-   | 메인 리포 | **18건** 폴링 강탈 |
-   | 워크트리 | **0건** (`.env`가 없어 봇 접속이 구조적으로 불가) |
+   | 메인 리포 | **18건** |
+   | 워크트리 | **0건** (`.env`가 없어 토큰이 없다) |
 
-   워크트리가 안전한 진짜 이유는 세 가지다: `backend/data/`에 DB가 없고, **`.env`가 없고**,
-   따라서 Telegram·Kiwoom 자격증명이 아예 없다. **가드는 규칙의 대체가 아니라 그물이다.**
+   ### 🔴 그런데 워크트리도 Kiwoom에는 안전하지 않았다 (2026-08-12 발견)
+
+   `32a6db3`의 엔드포인트 가드를 켜고 **워크트리에서** 전체 스위트를 돌렸더니
+   **39건이 차단됐고 전부 `mockapi.kiwoom.com`이었다.** Telegram은 0건이다.
+
+   차이는 자격증명의 **출처**다:
+
+   | | 출처 | 워크트리에서 |
+   |---|---|---|
+   | Telegram | `.env`의 `TELEGRAM_BOT_TOKEN` | 없음 → 시도조차 안 함 |
+   | Kiwoom | **URL이 코드에 하드코딩**(`client.py:214-215`) | **39건 시도** |
+
+   인증은 실패하지만 **요청 자체는 나가 레이트리밋을 소모한다.** 개장 직후 `ka10001`
+   초과가 상시로 나는 것과 무관하지 않을 수 있다.
+
+   ⭐ **워크트리 규칙은 필요조건이었지 충분조건이 아니었다.** `.env` 부재는 Telegram만
+   막는다. 코드에 URL이 박힌 것은 어디서 돌리든 나간다 — 이 가드가 그 구멍을 처음 드러냈다.
+
+   **가드는 규칙의 대체가 아니라 그물이고, 규칙 혼자로는 구멍이 있었다. 둘 다 필요하다.**
 3. ~~**`kill`은 어시스턴트 권한 밖이다.**~~ **정정(2026-08-12): 세션에 따라 다르다.**
    08-12 세션에서는 어시스턴트가 `kill -TERM 22135`를 직접 실행해 성공했다. **먼저 시도해 보고,
    거부되면** 사용자에게 `! kill -TERM <PID>` 실행을 요청할 것 — 무조건 요청부터 하면 왕복이 는다.
 4. **`git stash` 금지** — 워크트리 여럿이 스택을 공유한다.
 5. **장중 재시작 금지가 기본** — 손절이 이 프로세스에만 있고 브로커에 스탑이 없다.
 6. pytest 출력의 ANSI 색상 때문에 `grep "^FAILED"`가 0건을 반환한다. `sed 's/\x1b\[[0-9;]*m//g'`.
-7. **전체 스위트 기준선 = 21 failed / 3,244 passed / 1 skipped** (`948e9ea`, 워크트리, 6분 27초).
+7. **전체 스위트 기준선 = 21 failed / 3,249 passed / 1 skipped** (`04fec8b`, 워크트리, 6분 30초).
    측정 조건을 함께 적는다 — 조건이 다르면 숫자가 달라진다:
    ```bash
    git worktree add --detach <tmp> <commit>
@@ -414,8 +436,9 @@ sqlite3 -readonly "file:backend/data/holidays.db?mode=ro" \
    ```
    ⚠️ **21건 중 6건은 Telegram 인증 테스트**다 — 워크트리에 `.env`가 없어 토큰이 없기 때문이고,
    메인에서 돌리면 이 6건은 통과할 수 있다. **기준선은 환경에 따라 다르다.**
-   (직전 기준선 "21 failed / 3,230 passed"에서 passed가 +14 늘어난 것은 `--import-mode=importlib`로
-   새로 실행된 충돌 파일 11건과 가드 테스트 5건 때문이다. failed 수는 그대로 — **회귀 0**.)
+   (옛 기준선 "21 failed / 3,230 passed"에서 passed가 +19 늘어난 것은 `--import-mode=importlib`로
+   새로 실행된 충돌 파일 11건 + DB 가드 5건 + 엔드포인트 가드 5건 때문이다.
+   failed 수는 세 번 측정 내내 **21로 고정** — 가드 3종 전부 **회귀 0**.)
 8. ✅ ~~**동명 테스트 파일이 수집을 죽인다**~~ — `948e9ea`로 봉합(`--import-mode=importlib`).
    `tests/services/`와 `tests/test_services/test_trading/`에 `test_risk_monitor_alert_dedup.py`가
    **둘 다 실재**하고 `__init__.py`가 없어, 기본 import 모드에서 basename이 충돌해
@@ -429,7 +452,15 @@ sqlite3 -readonly "file:backend/data/holidays.db?mode=ro" \
 10. **기동 후 서버 리스닝까지 5~40초.** 그 전 `curl`은 `HTTP 000`이다. 죽은 게 아니다
     (08-11 37초 · 08-12 5초·11초 — 편차가 크다).
 11. zsh에서 `grep --include=*.py`는 glob 확장으로 실패한다 — `--include="*.py"`로 따옴표를 칠 것.
-12. 🔴 **파괴적 부작용이 있는 RED는 안전장치를 먼저 단언하라.**
+12. 🔴 **teardown보다 오래 사는 것은 function 스코프로 못 막는다.**
+    `updater.start_polling()`은 폴링 **태스크**를 만들고 즉시 반환한다(`receiver.py:20`).
+    function 스코프 monkeypatch는 테스트가 끝나면 되돌아가는데 그 태스크는 계속 살아
+    라이브 봇을 폴링한다. 2026-08-12에 transport 가드만 넣었다가 이걸로 샜다 —
+    `getMe`는 막혔는데(RuntimeError 로그 확인) 충돌은 18→**39건**으로 늘고
+    테스트 종료 후인 05:32까지 이어졌다.
+    ⭐ **막을 지점은 요청이 아니라 태스크 생성이다.** `Updater.start_polling` 자체를
+    차단하고 픽스처를 **세션 스코프**로 올려야 한다(`32a6db3`).
+13. 🔴 **파괴적 부작용이 있는 RED는 안전장치를 먼저 단언하라.**
     2026-08-12에 라이브 DB 가드를 TDD로 만들면서, 경로 검증을 쓰기 **뒤에** 뒀다:
     ```python
     await storage.set_app_setting(...)                   # ← 가드 없는 RED에서 실제로 실행됐다
@@ -454,7 +485,8 @@ sqlite3 -readonly "file:backend/data/holidays.db?mode=ro" \
 | 🟡 | 체결 원장 중복 — 같은 체결이 31초 간격으로 두 번 기록 (사용자: 별건) | 2026-08-07 |
 | 🟡 | `kr_realized_pnl` 1행 = 거래가 아니라 부분체결 슬라이스 | 2026-08-09 |
 | ✅ | ~~**테스트 DB 오염을 코드가 못 막는다**~~ — `948e9ea`로 conftest autouse 가드 배포. 라이브 경로를 tmp로 돌리고 세션 끝에 위반 테스트를 이름으로 보고한다. 회귀 0(21 failed 동일) | 2026-08-12 |
-| 🔴 | **Telegram·Kiwoom에는 가드가 없다** — 메인에서 스위트를 돌리면 라이브 봇 폴링을 빼앗는다(실측 `Conflict: terminated by other getUpdates` **18건**). 장중이면 손절 통지가 유실된다. `.env` 부재를 강제하거나 conftest에서 네트워크 자격증명을 비우는 가드가 필요 | 2026-08-12 |
+| ✅ | ~~**Telegram·Kiwoom에는 가드가 없다**~~ — `04fec8b`+`32a6db3` 배포. httpx 전송 계층에서 `api.telegram.org`·`api.kiwoom.com`·`mockapi.kiwoom.com`을 차단하고, `Updater.start_polling`을 태스크 생성 전에 막는다(세션 스코프). 회귀 0 | 2026-08-12 |
+| 🟡 | **테스트가 Kiwoom에 39건 붙고 있었다** — 워크트리에서도. URL이 코드에 하드코딩(`client.py:214-215`)이라 `.env` 부재로도 안 막힌다. 가드가 지금은 차단하지만, 근본은 각 테스트가 `httpx.MockTransport`/`respx`를 쓰는 것이다. 목록은 스위트 실행 시 RuntimeError 메시지로 드러난다 | 2026-08-12 |
 | 🟡 | **격리 없이 라이브 DB 경로를 여는 테스트 16개** — 가드가 막고는 있지만 근본은 각 파일이 `isolated_storage_service`를 쓰는 것이다. 목록은 스위트 실행 시 `LIVE-DB GUARD` 블록에 찍힌다 | 2026-08-12 |
 | 🟡 | **중복 테스트 파일 정리** — `tests/services/test_risk_monitor_alert_dedup.py`(4건)는 `tests/test_services/test_trading/`의 7건이 사실상 포함한다. 고유한 것은 `test_alert_history_records_every_call_regardless_of_dedup` 하나. 흡수 후 구 파일 제거 | 2026-08-12 |
 | 🟡 | **Telegram Markdown 파싱 실패가 상시화** — 08-04부터 반복. plain 폴백이 100% 살리고 있어 유실은 없지만(08-12 실측 2/2), 결정 텍스트의 이스케이프 누락이라는 원인은 그대로 | 2026-08-12 |
