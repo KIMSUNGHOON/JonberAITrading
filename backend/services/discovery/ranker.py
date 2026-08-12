@@ -147,6 +147,18 @@ class Candidate:
     # candidates go through the normal composite/threshold/LLM gates.
     universe_partial: bool = False
 
+    # 승격 판단 재료 (2026-08-12). `services/discovery/enrich.py`가 상위
+    # top_n 후보에만 채우고, `_build_llm_messages`가 프롬프트에 싣는다.
+    #
+    # ⚠️ 수집 실패/미조회는 None(빈 리스트)으로 남고 **후보를 탈락시키지
+    # 않는다** -- 재료 부재는 부정 신호가 아니다. 밸류에이션으로 기계적
+    # 배제를 하지 않는 이유는 설계 §3 참조(PER 57.89 종목이 승격 다음날
+    # +30%, 가장 싼 PER 12.06이 5거래일 -32.48%).
+    per: Optional[float] = None
+    pbr: Optional[float] = None
+    market_cap: Optional[int] = None
+    news_headlines: list[str] = field(default_factory=list)
+
 
 @dataclass
 class PromoteSummary:
