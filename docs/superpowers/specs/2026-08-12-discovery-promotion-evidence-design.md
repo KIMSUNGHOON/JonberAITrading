@@ -130,7 +130,7 @@ U4 원장에 재료와 LLM 판단 근거를 함께 기록
 | 컬럼 | 용도 |
 |---|---|
 | `per` · `pbr` · `market_cap` | 밸류에이션과 fwd 수익률의 상관을 나중에 실측 |
-| `news_count` · `news_sentiment` | 호재 유무가 실제로 유효한지 |
+| `news_count` | 호재 유무가 실제로 유효한지 |
 | `llm_rationale` · `llm_confidence` | LLM이 **무엇을 근거로** 통과/반려했는지 (지금은 버려진다) |
 
 측정 없이는 이 작업 전체가 무의미하다. 지금 원장은 `composite`와 `skip_reason`만 남긴다.
@@ -162,8 +162,11 @@ async def enrich_fundamentals(candidates, *, top_n=25, fetch=None) -> None
 async def enrich_news(candidates, *, top_n=25, days=7, max_items=5, fetch=None) -> None
 ```
 
-- `services/news`(naver + sentiment) 재사용
-- EOD 체인이 그만큼 길어진다(현재 약 65분) — 캐시 TTL과 헤드라인 상한으로 억제
+- `services/news`(naver) 재사용. **감성 점수는 만들지 않는다** —
+  `analyze_stock_news_sentiment`는 종목당 LLM을 1회 더 태워 top 25면 **+25회**이고 EOD
+  체인(약 65분)이 그만큼 길어진다. 헤드라인을 승격 LLM이 직접 읽게 하면 호출이 늘지 않고
+  중간 요약으로 인한 정보 손실도 없다. 따라서 U4에 `news_sentiment` 컬럼도 만들지 않는다.
+- EOD 체인이 그만큼 길어진다(현재 약 65분) — 헤드라인 상한으로 억제
 
 ### U3 — 프롬프트 확장
 
@@ -230,7 +233,6 @@ U1의 `fetch`를 주입형으로 두는 것이 이 확장의 접합부다.
 - **워치 Drop은 여전히 미해결.** 이 작업은 **유입**을 개선한다. 이미 들어와 있는 26종과
   앞으로도 쌓일 종목의 **퇴출** 규칙은 별도 설계가 필요하다. 다만 승격 품질이 오르면
   Drop의 시급성은 낮아진다.
-</content>
 
 ---
 
