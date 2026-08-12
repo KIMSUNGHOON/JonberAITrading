@@ -66,3 +66,25 @@ async def test_localhost_is_not_blocked():
             pytest.fail("가드가 localhost를 막았다 — 차단 목록이 너무 넓다")
         except Exception:
             pass  # ConnectError 등은 정상
+
+
+# ---- 폴링 태스크 차단 (2026-08-12, transport 가드가 샌 뒤 추가) ----
+#
+# transport 가드만으로는 부족했다. `updater.start_polling()`은 **백그라운드
+# 태스크**를 만들고 즉시 반환한다(receiver.py:20 주석이 그렇게 설명한다).
+# 그 태스크는 픽스처 teardown으로 monkeypatch가 되돌려진 **뒤에도 계속
+# 살아서** 라이브 봇을 폴링한다.
+#
+# 실측: 엔드포인트 가드를 넣고 메인에서 API 계층을 돌렸더니 가드가 `getMe`는
+# 막았는데(로그에 RuntimeError 확인) 충돌은 18 → 39건으로 **늘었다**.
+# 05:26~05:32까지 이어졌다 -- 테스트가 끝난 뒤에도 태스크가 돌고 있었다는 뜻이다.
+#
+# 태스크가 생기기 전에 막는다.
+
+
+@pytest.mark.asyncio
+async def test_telegram_polling_cannot_start():
+    from telegram.ext import Updater
+
+    with pytest.raises(RuntimeError, match="라이브 엔드포인트|폴링"):
+        await Updater.start_polling(object())

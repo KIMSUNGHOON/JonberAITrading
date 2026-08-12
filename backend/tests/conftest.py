@@ -359,13 +359,30 @@ def _assert_not_live_endpoint(url) -> None:
             )
 
 
-@pytest.fixture(autouse=True)
-def guard_live_endpoints(monkeypatch):
-    """라이브 Telegram/Kiwoom 호스트로 나가는 httpx 요청을 전송 직전에 막는다."""
+@pytest.fixture(scope="session", autouse=True)
+def guard_live_endpoints():
+    """라이브 Telegram/Kiwoom으로 나가는 요청을 막는다.
+
+    **세션 스코프인 이유** (2026-08-12에 function 스코프로 만들었다가 샜다):
+    `updater.start_polling()`은 **백그라운드 태스크**를 만들고 즉시 반환한다
+    (`receiver.py:20` 주석이 그렇게 설명한다). 그 태스크는 픽스처 teardown으로
+    monkeypatch가 되돌려진 **뒤에도 살아서** 라이브 봇을 계속 폴링한다.
+    실측: transport 가드만 넣고 메인에서 API 계층을 돌렸더니 `getMe`는 막혔는데
+    (로그에 RuntimeError 확인) 충돌은 18 → 39건으로 **늘었고** 테스트가 끝난
+    뒤인 05:32까지 이어졌다.
+
+    그래서 두 겹으로 막는다:
+      1. `Updater.start_polling` -- 태스크가 **생기기 전에** 차단
+      2. httpx transport -- 그 외 모든 라이브 호스트 요청
+
+    monkeypatch는 function 스코프 전용이라 여기서는 직접 setattr한다.
+    """
     import httpx
+    from telegram.ext import Updater
 
     real_async = httpx.AsyncHTTPTransport.handle_async_request
     real_sync = httpx.HTTPTransport.handle_request
+    real_polling = Updater.start_polling
 
     async def _guarded_async(self, request):
         _assert_not_live_endpoint(request.url)
@@ -375,11 +392,24 @@ def guard_live_endpoints(monkeypatch):
         _assert_not_live_endpoint(request.url)
         return real_sync(self, request)
 
-    monkeypatch.setattr(
-        httpx.AsyncHTTPTransport, "handle_async_request", _guarded_async
-    )
-    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _guarded_sync)
-    yield
+    async def _blocked_polling(self, *args, **kwargs):
+        raise RuntimeError(
+            "테스트가 라이브 Telegram 폴링(getUpdates)을 시작하려 했다. "
+            "이 태스크는 테스트가 끝난 뒤에도 살아남아 운영 봇의 폴링을 "
+            "빼앗는다 -- 2026-08-12에 실제로 39건 충돌했다. "
+            "`start_receiver`를 부르는 테스트는 `Application`을 mock하거나 "
+            "`updater.start_polling`을 직접 patch할 것."
+        )
+
+    httpx.AsyncHTTPTransport.handle_async_request = _guarded_async
+    httpx.HTTPTransport.handle_request = _guarded_sync
+    Updater.start_polling = _blocked_polling
+    try:
+        yield
+    finally:
+        httpx.AsyncHTTPTransport.handle_async_request = real_async
+        httpx.HTTPTransport.handle_request = real_sync
+        Updater.start_polling = real_polling
 
 
 _LINEAGE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "storage.db"
