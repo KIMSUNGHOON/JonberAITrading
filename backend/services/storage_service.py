@@ -212,6 +212,27 @@ class StorageService:
                     )
                 """)
 
+                # 승격 판단 재료 + LLM 근거 (2026-08-12). 기존 DB 파일에는
+                # CREATE TABLE IF NOT EXISTS가 no-op이라 ALTER로 붙인다.
+                # 이 컬럼 이전 행은 NULL로 남는다 -- "재료 없음"과 "기능
+                # 이전"은 trade_date로 구별한다(배포 2026-08-12).
+                #
+                # 왜 필요한가: 지금 원장은 composite와 skip_reason만 남기고
+                # LLM이 무엇을 근거로 통과/반려했는지는 통째로 버린다.
+                # 재료를 늘려도 그 효과를 사후에 측정할 수 없다.
+                await self._ensure_columns(
+                    conn,
+                    "discovery_candidates",
+                    {
+                        "per": "REAL",
+                        "pbr": "REAL",
+                        "market_cap": "INTEGER",
+                        "news_count": "INTEGER",
+                        "llm_rationale": "TEXT",
+                        "llm_confidence": "REAL",
+                    },
+                )
+
                 # App settings table (generic key-value; e.g. trading_mode:kiwoom)
                 # — runtime settings that must survive restarts (R3).
                 await conn.execute("""
@@ -2445,6 +2466,15 @@ class StorageService:
                         row.get("promoted"),
                         row.get("skip_reason"),
                         row.get("close_price"),
+                        # 승격 판단 재료 + LLM 근거 (2026-08-12). 없으면
+                        # NULL -- 수집 실패가 원장 기록 자체를 막으면
+                        # "무엇을 놓쳤는지"조차 남지 않는다.
+                        row.get("per"),
+                        row.get("pbr"),
+                        row.get("market_cap"),
+                        row.get("news_count"),
+                        row.get("llm_rationale"),
+                        row.get("llm_confidence"),
                     ))
 
                 await conn.executemany(
@@ -2452,8 +2482,10 @@ class StorageService:
                     INSERT INTO discovery_candidates
                     (id, trade_date, ticker, name, composite_score,
                      strategy_scores_json, regime_label, rank, llm_verdict_json,
-                     promoted, skip_reason, close_price)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     promoted, skip_reason, close_price,
+                     per, pbr, market_cap, news_count,
+                     llm_rationale, llm_confidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     data,
                 )

@@ -629,3 +629,46 @@ class TestBackfillCatchesUpAfterAMissedDay:
         assert calls == []
         got = (await st.get_discovery_candidates(ticker="005930"))[0]
         assert got["fwd_1d"] == pytest.approx(0.01)
+
+
+# ---------------------------------------------------------------------------
+# 승격 판단 재료 + LLM 근거 (U4, 2026-08-12)
+#
+# 측정 없이는 "재료를 늘린 것이 효과가 있었나"를 영원히 알 수 없다.
+# 지금 원장은 composite와 skip_reason만 남기고, LLM이 무엇을 근거로
+# 통과/반려했는지는 통째로 버려진다.
+# ---------------------------------------------------------------------------
+
+
+class TestEvidenceColumns:
+    @pytest.mark.asyncio
+    async def test_evidence_columns_roundtrip(self, tmp_path):
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        row = _candidate_row(
+            per=57.89,
+            pbr=6.51,
+            market_cap=1_200_000_000_000,
+            news_count=3,
+            llm_rationale="태양광 수주 모멘텀",
+            llm_confidence=0.72,
+        )
+        await st.save_discovery_candidates([row])
+
+        got = (await st.get_discovery_candidates(ticker="005930"))[0]
+        assert got["per"] == pytest.approx(57.89)
+        assert got["pbr"] == pytest.approx(6.51)
+        assert got["market_cap"] == 1_200_000_000_000
+        assert got["news_count"] == 3
+        assert got["llm_rationale"] == "태양광 수주 모멘텀"
+        assert got["llm_confidence"] == pytest.approx(0.72)
+
+    @pytest.mark.asyncio
+    async def test_evidence_columns_are_optional(self, tmp_path):
+        """재료를 못 구한 종목도 저장돼야 한다 — 수집 실패가 원장 기록을
+        막으면 '무엇을 놓쳤는지'조차 남지 않는다."""
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        await st.save_discovery_candidates([_candidate_row()])
+
+        got = (await st.get_discovery_candidates(ticker="005930"))[0]
+        assert got["per"] is None
+        assert got["news_count"] is None
