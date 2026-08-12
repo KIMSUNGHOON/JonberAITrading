@@ -124,3 +124,69 @@ async def enrich_news(
             logger.warning("discovery_news_failed", ticker=c.ticker, error=str(e))
             continue
         c.news_headlines = [str(h) for h in (items or [])][:max_items]
+
+
+# 하드 차단 대상. 밸류에이션 필터는 2026-08-12에 기각됐지만(설계 §3)
+# 이 셋은 성질이 다르다 -- "강세장이면 밸류에이션을 무시하고 급등한다"는
+# 반론이 정리매매·투자위험·투자경고에는 성립하지 않는다.
+_BLOCKING_WARNINGS = frozenset({
+    "LIQUIDATION_TRADING",   # 정리매매 — 상장폐지 절차
+    "INVESTMENT_RISK",       # 투자위험
+    "INVESTMENT_WARNING",    # 투자경고
+})
+
+
+def _warning_codes(items: Any) -> list[str]:
+    """응답 원소가 dict(`{"type": ...}`)든 문자열이든 코드 리스트로 만든다.
+
+    실호출(2026-08-12)에서는 정상 종목만 조회해 빈 배열만 봤다 -- 원소
+    모양을 확정하지 못했으므로 둘 다 받는다.
+    """
+    out: list[str] = []
+    for it in items or []:
+        if isinstance(it, dict):
+            code = it.get("type") or it.get("code") or it.get("warningType")
+        else:
+            code = it
+        if code:
+            out.append(str(code).upper())
+    return out
+
+
+async def enrich_warnings(
+    candidates: list,
+    *,
+    top_n: int = 25,
+    fetch=None,
+) -> None:
+    """시장경보를 붙이고, 차단 대상이면 후보를 탈락시킨다 (in-place).
+
+    🔴 **조회 실패는 차단하지 않는다(fail-open).** 403 한 번에 그날 후보가
+    전멸하면 그것은 "안전"이 아니라 "발굴 정지"다. 실패는 로그에만 남긴다.
+
+    Args:
+        fetch: `async (ticker) -> list`. `None`이면 통째로 스킵.
+    """
+    if fetch is None:
+        return
+
+    for c in _reviewable(candidates, top_n):
+        try:
+            items = await fetch(c.ticker)
+        except Exception as e:
+            logger.warning(
+                "discovery_warnings_failed", ticker=c.ticker, error=str(e)
+            )
+            continue
+
+        codes = _warning_codes(items)
+        c.market_warnings = codes
+
+        blocking = [w for w in codes if w in _BLOCKING_WARNINGS]
+        if blocking:
+            c.quality_filter_passed = False
+            c.skip_reason = f"market_warning:{','.join(blocking)}"
+            logger.info(
+                "discovery_blocked_by_market_warning",
+                ticker=c.ticker, warnings=blocking,
+            )

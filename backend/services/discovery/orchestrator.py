@@ -55,7 +55,7 @@ from typing import Any, Optional
 import structlog
 
 from services.discovery.ledger import backfill_forward_returns
-from services.discovery.enrich import enrich_fundamentals, enrich_news
+from services.discovery.enrich import enrich_fundamentals, enrich_news, enrich_warnings
 from services.discovery.ranker import llm_review_top, promote_candidates, rank_candidates
 
 logger = structlog.get_logger()
@@ -268,6 +268,24 @@ def _make_news_fetch():
     return _fetch
 
 
+def _make_warnings_fetch():
+    """토스 `warnings` 조회기. 클라이언트가 비활성이면 `None`(수집 스킵)."""
+    try:
+        from services.toss import get_toss_client
+    except Exception as e:  # noqa: BLE001
+        logger.warning("discovery_toss_unavailable", error=str(e))
+        return None
+
+    client = get_toss_client()
+    if not getattr(client, "enabled", False):
+        return None
+
+    async def _fetch(ticker: str):
+        return await client.get_warnings(ticker)
+
+    return _fetch
+
+
 async def run_discovery_pipeline(
     *,
     coordinator: Any,
@@ -339,6 +357,13 @@ async def run_discovery_pipeline(
             fetch=_make_stock_info_fetch(getattr(coordinator, "_kiwoom", None)),
         )
         await enrich_news(candidates, top_n=_LLM_REVIEW_TOP_N, fetch=_make_news_fetch())
+        # 시장경보(토스). 밸류에이션과 달리 **하드 차단**한다 --
+        # 정리매매·투자위험에는 "강세장이면 급등한다"가 성립하지 않는다.
+        # 조회 실패는 차단하지 않는다(fail-open) -- 403 한 번에 그날 승격이
+        # 전멸하면 "안전"이 아니라 "발굴 정지"다.
+        await enrich_warnings(
+            candidates, top_n=_LLM_REVIEW_TOP_N, fetch=_make_warnings_fetch()
+        )
 
         await llm_review_top(candidates, top_n=_LLM_REVIEW_TOP_N)
         promote_summary = await promote_candidates(coordinator, storage, candidates)

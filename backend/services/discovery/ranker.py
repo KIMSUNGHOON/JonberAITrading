@@ -158,6 +158,10 @@ class Candidate:
     pbr: Optional[float] = None
     market_cap: Optional[int] = None
     news_headlines: list[str] = field(default_factory=list)
+    # 시장경보(토스 `warnings`). 밸류에이션과 달리 **하드 차단이 정당한**
+    # 유일한 신호다 -- "강세장이면 무시하고 급등한다"는 반론이
+    # 정리매매·투자위험에는 성립하지 않는다. 단기과열·VI는 기록만 한다.
+    market_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
