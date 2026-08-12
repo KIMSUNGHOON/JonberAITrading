@@ -370,19 +370,74 @@ sqlite3 -readonly "file:backend/data/holidays.db?mode=ro" \
    `updated_at`이 스위트 실행 시각과 겹치는 행, 특히 `check_interval:5` / `max_concurrent:10` 같은
    **픽스처 냄새가 나는 값**을 찾는다. 기본값과 우연히 같은 값(`max_concurrent:3`)은 구별되지 않으니
    `updated_at`이 1차 단서다.
+
+   ### ✅ 2026-08-12: DB는 코드로 막았다 — 그러나 규칙은 그대로다
+
+   `948e9ea`로 conftest에 **autouse 가드**를 넣었다. 라이브 `storage.db`/`holidays.db` 경로를
+   여는 시도를 tmp 샌드박스로 돌리고(`db_path=None` 기본 경로까지), 세션 끝에 어떤 테스트가
+   그랬는지 이름으로 보고한다. **실측 16개 테스트가 라이브 경로를 열려 하고 있었다** —
+   `test_approval_pending_ssot.py`(5건) · `test_autonomy_injector.py` ·
+   `test_kr_analysis_sm_migration.py` · `test_status_routes_ssot.py` ·
+   `test_websocket_session.py` · `test_hitl_execution_routing.py` · `test_watch_refresh_loop.py` 등.
+
+   🔴 **그래도 메인에서 돌리지 마라. DB는 겹치는 자원의 일부일 뿐이다.**
+   2026-08-12 실측 — 메인에서 스위트를 돌리자 라이브 백엔드 로그에 이것이 쌓였다:
+
+   ```
+   telegram_receiver_polling_error
+     error='Conflict: terminated by other getUpdates request'   ← 18건
+   ```
+
+   **테스트가 라이브 Telegram 봇의 폴링을 빼앗았다.** 장중이었다면 손절·익절 통지가 유실된다.
+   14% 진행에 5분이 걸렸으니 완주하면 35분 이상 그 상태다(그래서 중단했다).
+   Kiwoom 레이트리밋도 공유한다.
+
+   | 실행 위치 | 라이브 백엔드 피해 |
+   |---|---|
+   | 메인 리포 | **18건** 폴링 강탈 |
+   | 워크트리 | **0건** (`.env`가 없어 봇 접속이 구조적으로 불가) |
+
+   워크트리가 안전한 진짜 이유는 세 가지다: `backend/data/`에 DB가 없고, **`.env`가 없고**,
+   따라서 Telegram·Kiwoom 자격증명이 아예 없다. **가드는 규칙의 대체가 아니라 그물이다.**
 3. ~~**`kill`은 어시스턴트 권한 밖이다.**~~ **정정(2026-08-12): 세션에 따라 다르다.**
    08-12 세션에서는 어시스턴트가 `kill -TERM 22135`를 직접 실행해 성공했다. **먼저 시도해 보고,
    거부되면** 사용자에게 `! kill -TERM <PID>` 실행을 요청할 것 — 무조건 요청부터 하면 왕복이 는다.
 4. **`git stash` 금지** — 워크트리 여럿이 스택을 공유한다.
 5. **장중 재시작 금지가 기본** — 손절이 이 프로세스에만 있고 브로커에 스탑이 없다.
 6. pytest 출력의 ANSI 색상 때문에 `grep "^FAILED"`가 0건을 반환한다. `sed 's/\x1b\[[0-9;]*m//g'`.
-7. **전체 스위트 기준선 = 21 failed** (`4107ec9` 기준 3,230 passed). 이 21건은 전부 base부터 있던 것이다.
-8. **원장 합을 브로커 잔고에 더하지 말 것.** 원장 체결 누적은 **이미 잔고 그 자체**다.
+7. **전체 스위트 기준선 = 21 failed / 3,244 passed / 1 skipped** (`948e9ea`, 워크트리, 6분 27초).
+   측정 조건을 함께 적는다 — 조건이 다르면 숫자가 달라진다:
+   ```bash
+   git worktree add --detach <tmp> <commit>
+   cd <tmp>/backend && /Users/sunghoonk/anaconda3/envs/agentic-trading/bin/python \
+     -m pytest -q --no-header -p no:cacheprovider --no-cov
+   ```
+   ⚠️ **21건 중 6건은 Telegram 인증 테스트**다 — 워크트리에 `.env`가 없어 토큰이 없기 때문이고,
+   메인에서 돌리면 이 6건은 통과할 수 있다. **기준선은 환경에 따라 다르다.**
+   (직전 기준선 "21 failed / 3,230 passed"에서 passed가 +14 늘어난 것은 `--import-mode=importlib`로
+   새로 실행된 충돌 파일 11건과 가드 테스트 5건 때문이다. failed 수는 그대로 — **회귀 0**.)
+8. ✅ ~~**동명 테스트 파일이 수집을 죽인다**~~ — `948e9ea`로 봉합(`--import-mode=importlib`).
+   `tests/services/`와 `tests/test_services/test_trading/`에 `test_risk_monitor_alert_dedup.py`가
+   **둘 다 실재**하고 `__init__.py`가 없어, 기본 import 모드에서 basename이 충돌해
+   `Interrupted: 1 error during collection`으로 스위트가 통째로 죽었다. `__pycache__`를 지워도 재발한다.
+   ⚠️ **`import-mode`는 ini 키가 아니라 CLI 옵션이다.** ini에 쓰면 `Unknown config option` 경고만
+   뜨고 조용히 무시된다 — `addopts`에 넣어야 한다. 검증 없이는 "고쳤다"고 오인하기 쉽다.
+9. **원장 합을 브로커 잔고에 더하지 말 것.** 원장 체결 누적은 **이미 잔고 그 자체**다.
    2026-08-11에 이 문서가 직접 밟았다 — "스냅샷 3,115 + 오늘 체결 355 = 브로커 3,470"으로 계산해
    존재하지 않는 불일치를 🔴 경보로 적었다. 실제 브로커는 3,115였다. 불일치를 주장하려면
    `/api/kr_stocks/positions`(kt00004 직접 조회)로 **대조**해야 한다 — 산수로 만들면 안 된다.
-9. **기동 후 서버 리스닝까지 ~40초.** 그 전 `curl`은 `HTTP 000`이다. 죽은 게 아니다.
-10. zsh에서 `grep --include=*.py`는 glob 확장으로 실패한다 — `--include="*.py"`로 따옴표를 칠 것.
+10. **기동 후 서버 리스닝까지 5~40초.** 그 전 `curl`은 `HTTP 000`이다. 죽은 게 아니다
+    (08-11 37초 · 08-12 5초·11초 — 편차가 크다).
+11. zsh에서 `grep --include=*.py`는 glob 확장으로 실패한다 — `--include="*.py"`로 따옴표를 칠 것.
+12. 🔴 **파괴적 부작용이 있는 RED는 안전장치를 먼저 단언하라.**
+    2026-08-12에 라이브 DB 가드를 TDD로 만들면서, 경로 검증을 쓰기 **뒤에** 뒀다:
+    ```python
+    await storage.set_app_setting(...)                   # ← 가드 없는 RED에서 실제로 실행됐다
+    assert Path(storage.db_path) != _LIVE_STORAGE
+    ```
+    가드가 없는 RED 단계에서 그 쓰기가 실행돼 **08-11과 똑같은 값으로 라이브를 덮었다**(백업 복구).
+    재현 테스트를 쓰다가 사고를 재현한 것이다. 검사를 쓰기 **앞**으로 옮기면 RED가 안전장치에서
+    멈춰 부작용에 닿지 않는다.
 
 ---
 
@@ -398,7 +453,10 @@ sqlite3 -readonly "file:backend/data/holidays.db?mode=ro" \
 | 🟡 | `coordinator.py:2991` `equity_peak or 0.0`이 조회 실패(None)와 스냅샷 없음(0.0)을 뭉갬 → 섀도 경로의 `m_drawdown`이 조용히 1.0 | 2026-08-11 리뷰 |
 | 🟡 | 체결 원장 중복 — 같은 체결이 31초 간격으로 두 번 기록 (사용자: 별건) | 2026-08-07 |
 | 🟡 | `kr_realized_pnl` 1행 = 거래가 아니라 부분체결 슬라이스 | 2026-08-09 |
-| 🔴 | **테스트 DB 오염을 코드가 못 막는다** — 규칙("워크트리에서 돌려라")이 메모리·문서에만 있고 **명령 자체에 붙어 있지 않다.** 08-03과 08-11에 같은 키가 두 번 오염됐다. `isolated_storage_service`를 autouse로 바꾸거나, 라이브 DB 경로 감지 시 스위트를 거부하는 conftest 가드가 근본 해결 | 2026-08-12 |
+| ✅ | ~~**테스트 DB 오염을 코드가 못 막는다**~~ — `948e9ea`로 conftest autouse 가드 배포. 라이브 경로를 tmp로 돌리고 세션 끝에 위반 테스트를 이름으로 보고한다. 회귀 0(21 failed 동일) | 2026-08-12 |
+| 🔴 | **Telegram·Kiwoom에는 가드가 없다** — 메인에서 스위트를 돌리면 라이브 봇 폴링을 빼앗는다(실측 `Conflict: terminated by other getUpdates` **18건**). 장중이면 손절 통지가 유실된다. `.env` 부재를 강제하거나 conftest에서 네트워크 자격증명을 비우는 가드가 필요 | 2026-08-12 |
+| 🟡 | **격리 없이 라이브 DB 경로를 여는 테스트 16개** — 가드가 막고는 있지만 근본은 각 파일이 `isolated_storage_service`를 쓰는 것이다. 목록은 스위트 실행 시 `LIVE-DB GUARD` 블록에 찍힌다 | 2026-08-12 |
+| 🟡 | **중복 테스트 파일 정리** — `tests/services/test_risk_monitor_alert_dedup.py`(4건)는 `tests/test_services/test_trading/`의 7건이 사실상 포함한다. 고유한 것은 `test_alert_history_records_every_call_regardless_of_dedup` 하나. 흡수 후 구 파일 제거 | 2026-08-12 |
 | 🟡 | **Telegram Markdown 파싱 실패가 상시화** — 08-04부터 반복. plain 폴백이 100% 살리고 있어 유실은 없지만(08-12 실측 2/2), 결정 텍스트의 이스케이프 누락이라는 원인은 그대로 | 2026-08-12 |
 | 🟡 | **`agent-chat` 실행 중에는 설정을 영속할 수 없다** — `start()`가 `if self._running: return`(coordinator.py:606)으로 조기 반환해 `_persist_runtime_state()`(:659)에 못 닿는다. 값을 바꾸려면 `stop→start`가 필요한데 `stop()`이 진행 중 토론을 `room.cancel()`한다. 별도 `PATCH /agent-chat/config`가 있으면 장중에도 안전하게 바꾼다 | 2026-08-12 |
 
