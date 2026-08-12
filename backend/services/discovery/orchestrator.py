@@ -55,6 +55,7 @@ from typing import Any, Optional
 import structlog
 
 from services.discovery.ledger import backfill_forward_returns
+from services.discovery.enrich import enrich_fundamentals, enrich_news
 from services.discovery.ranker import llm_review_top, promote_candidates, rank_candidates
 
 logger = structlog.get_logger()
@@ -224,6 +225,49 @@ def _make_close_on_date(kiwoom):
     return _close_on_date
 
 
+def _make_stock_info_fetch(kiwoom):
+    """`enrich_fundamentals(fetch=...)`에 넣을 Kiwoom `ka10001` 조회기.
+
+    클라이언트가 없으면 `None`을 돌려준다 -- 그러면 수집이 통째로 스킵되고
+    기존 동작(재료 없이 지표만)이 그대로 남는다. 기본 구현을 몰래
+    끌어오지 않는 것과 같은 이유로, 여기서 `None`을 돌려주는 것이
+    "조용히 도는 것"보다 낫다.
+    """
+    if kiwoom is None:
+        return None
+
+    async def _fetch(ticker: str):
+        return await kiwoom.get_stock_info(ticker)
+
+    return _fetch
+
+
+def _make_news_fetch():
+    """`enrich_news(fetch=...)`에 넣을 네이버 뉴스 헤드라인 조회기.
+
+    서비스를 못 만들면 `None` -- 수집을 건너뛸 뿐 파이프라인은 계속 돈다.
+    `NewsService`는 한 번만 만들어 재사용한다(종목마다 새로 만들면 세션이
+    쌓인다).
+    """
+    try:
+        from services.news import create_news_service
+    except Exception as e:  # noqa: BLE001 -- import 실패도 "수집 불가"일 뿐
+        logger.warning("discovery_news_service_unavailable", error=str(e))
+        return None
+
+    holder: dict = {}
+
+    async def _fetch(ticker: str, name: str):
+        if "svc" not in holder:
+            holder["svc"] = await create_news_service()
+        result = await holder["svc"].search_stock_news(
+            stock_code=ticker, stock_name=name, count=5
+        )
+        return [a.title for a in (getattr(result, "articles", None) or [])]
+
+    return _fetch
+
+
 async def run_discovery_pipeline(
     *,
     coordinator: Any,
@@ -281,6 +325,21 @@ async def run_discovery_pipeline(
             return summary
 
         candidates = await rank_candidates(storage, SCANNER_DB_PATH, trade_date)
+
+        # 승격 판단 재료 (2026-08-12). LLM 리뷰 **앞**에 와야 프롬프트에
+        # 실린다 -- 뒤에 오면 U1~U3이 통째로 무의미해지는데 예외도 로그도
+        # 남지 않아 조용히 사라진다. `top_n`은 `llm_review_top`과 같은
+        # 값이어야 재료를 모은 종목과 프롬프트를 받는 종목이 일치한다.
+        #
+        # 수집기는 fetch가 None이면 통째로 스킵한다 -- Kiwoom 클라이언트가
+        # 없거나 뉴스 서비스를 못 만들면 재료 없이 기존대로 돈다(회귀 없음).
+        await enrich_fundamentals(
+            candidates,
+            top_n=_LLM_REVIEW_TOP_N,
+            fetch=_make_stock_info_fetch(getattr(coordinator, "_kiwoom", None)),
+        )
+        await enrich_news(candidates, top_n=_LLM_REVIEW_TOP_N, fetch=_make_news_fetch())
+
         await llm_review_top(candidates, top_n=_LLM_REVIEW_TOP_N)
         promote_summary = await promote_candidates(coordinator, storage, candidates)
 

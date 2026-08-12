@@ -1529,3 +1529,52 @@ async def test_close_on_date_never_raises_on_api_failure():
     fn = _make_close_on_date(kw)
 
     assert await fn("005930", "2026-08-06") is None
+
+
+# ---------------------------------------------------------------------------
+# U5: 재료 수집 배선 (2026-08-12)
+#
+# 수집이 LLM 리뷰 **앞**에 와야 프롬프트에 실린다. 뒤에 오면 U1~U3이
+# 통째로 무의미해지는데, 예외도 로그도 남지 않아 조용히 사라진다.
+# ---------------------------------------------------------------------------
+
+
+async def test_pipeline_enriches_before_llm_review(monkeypatch, storage, coordinator):
+    import services.discovery.orchestrator as om
+
+    order: list[str] = []
+
+    async def _spy_fund(cands, **kw):
+        order.append("fundamentals")
+
+    async def _spy_news(cands, **kw):
+        order.append("news")
+
+    async def _spy_review(cands, top_n=25):
+        order.append("llm_review")
+
+    async def _spy_rank(*a, **kw):
+        return []
+
+    async def _spy_promote(*a, **kw):
+        from services.discovery.ranker import PromoteSummary
+
+        order.append("promote")
+        return PromoteSummary(trade_date="2026-08-12", total_candidates=0)
+
+    monkeypatch.setattr(om, "rank_candidates", _spy_rank)
+    monkeypatch.setattr(om, "enrich_fundamentals", _spy_fund)
+    monkeypatch.setattr(om, "enrich_news", _spy_news)
+    monkeypatch.setattr(om, "llm_review_top", _spy_review)
+    monkeypatch.setattr(om, "promote_candidates", _spy_promote)
+
+    summary = await om.run_discovery_pipeline(
+        coordinator=coordinator, storage=storage,
+        scanner=_FakeScanner([_scan_result("005930", 70_000)]),
+        trade_date="2026-08-12", scan_ok=True,
+    )
+
+    assert summary is not None
+    assert order.index("llm_review") > order.index("fundamentals")
+    assert order.index("llm_review") > order.index("news")
+    assert order.index("promote") > order.index("llm_review")

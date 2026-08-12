@@ -813,6 +813,18 @@ async def _persist_ledger(storage, candidates: list[Candidate]) -> None:
                 "promoted": 1 if c.promoted else 0,
                 "skip_reason": c.skip_reason,
                 "close_price": c.close_price,
+                # 승격 판단 재료 + LLM 근거 (2026-08-12). 상위 top_n
+                # 후보만 값이 있고 나머지는 None -- 그것도 사실이므로
+                # 그대로 적는다. `llm_verdict`의 rationale/confidence는
+                # 지금까지 llm_verdict_json 안에만 있어 SQL로 집계할 수
+                # 없었다. 별도 컬럼으로 꺼내야 "무엇을 근거로 통과시켰나"를
+                # fwd 수익률과 나란히 놓고 볼 수 있다.
+                "per": c.per,
+                "pbr": c.pbr,
+                "market_cap": c.market_cap,
+                "news_count": len(c.news_headlines or []),
+                "llm_rationale": (c.llm_verdict or {}).get("rationale"),
+                "llm_confidence": (c.llm_verdict or {}).get("confidence"),
             }
         )
 
