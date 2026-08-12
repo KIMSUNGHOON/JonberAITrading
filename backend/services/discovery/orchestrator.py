@@ -182,6 +182,48 @@ async def _notify_promotions(candidates: Any, promote_summary: Any, trade_date: 
         logger.warning("discovery_promotion_notify_failed", trade_date=trade_date, error=str(e))
 
 
+def _make_close_on_date(kiwoom):
+    """`backfill_forward_returns(close_on_date=...)`에 넣을 과거 종가 조회기.
+
+    `(ticker, "YYYY-MM-DD") -> 종가 | None`. 클라이언트가 없으면 `None`을
+    돌려주는 함수를 만들어 준다 -- 그러면 따라잡기가 통째로 스킵되고
+    기존 동작(정상 슬롯만 채움)이 그대로 남는다.
+
+    **종목당 일봉 1회.** `get_daily_chart`는 600봉을 주므로 한 번 받아
+    `{YYYYMMDD: 종가}`로 펼쳐 두면 그 종목의 fwd_1d/5d/20d를 전부 커버한다.
+    Kiwoom은 ~1.4 req/s이고 2026-08-12에 22종 연속 조회만으로 ka10001
+    초과가 실제로 났다 -- 슬롯마다 조회하면 그 한도를 바로 넘는다.
+
+    never-raise: 조회가 실패하면 `None`. 호출자는 그것을 "채우지 않는다"로
+    해석한다(비어 있는 편이 의미가 바뀐 값보다 낫다). EOD 체인 안에서
+    도는 코드라 예외가 새면 뒤 단계가 통째로 죽는다.
+    """
+    cache: dict[str, dict[str, float]] = {}
+
+    async def _close_on_date(ticker: str, day: str) -> Optional[float]:
+        if kiwoom is None or not ticker or not day:
+            return None
+        if ticker not in cache:
+            try:
+                rows = await kiwoom.get_daily_chart(ticker)
+            except Exception as e:
+                logger.warning(
+                    "discovery_fwd_daily_chart_failed", ticker=ticker, error=str(e)
+                )
+                cache[ticker] = {}
+                return None
+            table: dict[str, float] = {}
+            for r in rows or []:
+                dt = getattr(r, "dt", None)
+                close = getattr(r, "clos_prc", None)
+                if dt and close:
+                    table[str(dt)] = float(close)
+            cache[ticker] = table
+        return cache[ticker].get(day.replace("-", ""))
+
+    return _close_on_date
+
+
 async def run_discovery_pipeline(
     *,
     coordinator: Any,
@@ -219,7 +261,12 @@ async def run_discovery_pipeline(
     """
     try:
         price_lookup = _build_price_lookup(scanner)
-        backfilled = await backfill_forward_returns(storage, price_lookup, trade_date)
+        backfilled = await backfill_forward_returns(
+            storage,
+            price_lookup,
+            trade_date,
+            close_on_date=_make_close_on_date(getattr(coordinator, "_kiwoom", None)),
+        )
 
         summary: dict[str, Any] = {
             "trade_date": trade_date,

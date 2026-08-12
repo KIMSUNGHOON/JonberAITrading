@@ -1447,3 +1447,80 @@ async def test_run_discovery_scan_falls_back_to_static_timeout_when_universe_mis
 
     assert result is True
     assert captured_timeouts == [coordinator_module._DISCOVERY_SCAN_TIMEOUT_SECONDS]
+
+
+# ---------------------------------------------------------------------------
+# C-2: fwd 따라잡기 배선 (2026-08-12)
+#
+# `backfill_forward_returns(close_on_date=...)`는 주입될 때만 따라잡는다.
+# 여기서 실제 일봉 조회를 붙인다. 종목당 **1회**만 조회해야 한다 --
+# Kiwoom은 ~1.4 req/s이고, 08-12에 22종 연속 조회만으로 ka10001 초과가
+# 실제로 났다.
+# ---------------------------------------------------------------------------
+
+
+class _FakeChartRow:
+    def __init__(self, dt: str, clos_prc: int):
+        self.dt = dt
+        self.clos_prc = clos_prc
+
+
+class _CountingKiwoom:
+    """호출 횟수를 세는 가짜 Kiwoom -- 종목당 1회 조회를 증명한다."""
+
+    def __init__(self, charts: dict, boom: bool = False):
+        self.charts = charts
+        self.calls: list[str] = []
+        self.boom = boom
+
+    async def get_daily_chart(self, stk_cd: str, base_dt=None, upd_stkpc_tp="1"):
+        self.calls.append(stk_cd)
+        if self.boom:
+            raise RuntimeError("kiwoom down")
+        return self.charts.get(stk_cd, [])
+
+
+async def test_close_on_date_returns_that_days_close():
+    from services.discovery.orchestrator import _make_close_on_date
+
+    kw = _CountingKiwoom({"005930": [_FakeChartRow("20260806", 72100)]})
+    fn = _make_close_on_date(kw)
+
+    assert await fn("005930", "2026-08-06") == 72100
+
+
+async def test_close_on_date_returns_none_for_a_missing_day():
+    """거래정지·상장폐지·조회범위 밖 -- 없는 날은 None이어야 한다.
+    호출자(`_catch_up_missed_slots`)가 이 None을 보고 슬롯을 비워 둔다."""
+    from services.discovery.orchestrator import _make_close_on_date
+
+    kw = _CountingKiwoom({"005930": [_FakeChartRow("20260806", 72100)]})
+    fn = _make_close_on_date(kw)
+
+    assert await fn("005930", "2026-08-07") is None
+
+
+async def test_close_on_date_fetches_each_ticker_only_once():
+    """같은 종목의 여러 슬롯(fwd_1d·fwd_5d·fwd_20d)을 채워도 조회는 1회다."""
+    from services.discovery.orchestrator import _make_close_on_date
+
+    kw = _CountingKiwoom(
+        {"005930": [_FakeChartRow("20260806", 72100), _FakeChartRow("20260807", 73000)]}
+    )
+    fn = _make_close_on_date(kw)
+
+    await fn("005930", "2026-08-06")
+    await fn("005930", "2026-08-07")
+    await fn("005930", "2026-08-06")
+
+    assert kw.calls == ["005930"]
+
+
+async def test_close_on_date_never_raises_on_api_failure():
+    """EOD 체인 안에서 돈다 -- 예외가 새면 그 뒤 단계가 통째로 죽는다."""
+    from services.discovery.orchestrator import _make_close_on_date
+
+    kw = _CountingKiwoom({}, boom=True)
+    fn = _make_close_on_date(kw)
+
+    assert await fn("005930", "2026-08-06") is None
