@@ -403,9 +403,13 @@ async def test_pipeline_scan_not_ok_still_attempts_backfill_with_partial_prices(
     trade_date = "2026-07-20"
     calls = {}
 
-    async def _spy_backfill(storage, price_lookup, td):
+    async def _spy_backfill(storage, price_lookup, td, *, close_on_date=None, **kw):
         calls["price_lookup"] = price_lookup
         calls["trade_date"] = td
+        # C-2 배선 회귀 가드: 파이프라인이 과거 종가 조회기를 **실제로**
+        # 넘겨야 `_catch_up_missed_slots`가 돈다. 주입이 빠지면 따라잡기가
+        # 조용히 사라지고(예외도 로그도 없다) 놓친 슬롯이 영구히 빈다.
+        calls["close_on_date"] = close_on_date
         return 0
 
     monkeypatch.setattr(orchestrator_module, "backfill_forward_returns", _spy_backfill)
@@ -419,6 +423,7 @@ async def test_pipeline_scan_not_ok_still_attempts_backfill_with_partial_prices(
 
     assert summary is not None
     assert calls["price_lookup"] == {"005930": 70_000.0}
+    assert callable(calls["close_on_date"])  # C-2 배선이 살아 있다
     assert calls["trade_date"] == trade_date
 
 
