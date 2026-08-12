@@ -315,6 +315,73 @@ def guard_live_databases(request, tmp_path_factory, monkeypatch):
     yield
 
 
+# -------------------------------------------
+# 라이브 외부 엔드포인트 가드 (2026-08-12)
+#
+# 위 DB 가드는 **파일만** 막는다. 2026-08-12에 메인 체크아웃에서 스위트를
+# 돌리자 라이브 백엔드 로그에 이것이 18건 쌓였다:
+#
+#   telegram_receiver_polling_error
+#     error='Conflict: terminated by other getUpdates request'
+#
+# **테스트가 라이브 Telegram 봇의 폴링을 빼앗았다.** 장중이었다면 손절·익절
+# 통지가 유실된다. Kiwoom도 같은 레이트리밋을 공유한다.
+#
+# 워크트리가 안전한 진짜 이유는 DB 부재가 아니라 **`.env` 부재 = 자격증명
+# 부재**였다. 여기서는 자격증명을 건드리지 않는다(비우면 설정 관련 테스트가
+# 무더기로 다르게 동작한다) -- **전송 계층에서 호스트만** 막는다.
+# PTB 22.5(`telegram.request.HTTPXRequest`)와 Kiwoom 클라이언트가 둘 다
+# httpx를 쓰므로 한 지점이면 둘 다 커버된다.
+#
+# ⚠️ 명시된 호스트만 막는다. localhost/testserver/mock 서버는 그대로
+# 통과해야 한다 -- 무차별로 막으면 기존 스위트가 통째로 깨진다.
+# `MockTransport`를 쓰는 테스트는 애초에 이 경로를 안 탄다(정상).
+# -------------------------------------------
+
+_LIVE_ENDPOINT_HOSTS = (
+    "api.telegram.org",
+    "api.kiwoom.com",
+    "mockapi.kiwoom.com",  # 모의투자도 막는다 -- KIWOOM_IS_MOCK은 **주문만**
+                           # 모의고 레이트리밋·세션은 실물과 같은 자원이다
+)
+
+
+def _assert_not_live_endpoint(url) -> None:
+    host = (getattr(url, "host", "") or "").lower()
+    for blocked in _LIVE_ENDPOINT_HOSTS:
+        if host == blocked or host.endswith("." + blocked):
+            raise RuntimeError(
+                f"테스트가 라이브 엔드포인트 {host} 에 접속하려 했다 "
+                f"({url}). 라이브 Telegram 폴링을 빼앗거나 Kiwoom "
+                f"레이트리밋을 소모한다 -- 2026-08-12에 실제로 18건 발생했다. "
+                f"httpx.MockTransport나 respx로 대체하거나, 해당 호출을 "
+                f"patch할 것."
+            )
+
+
+@pytest.fixture(autouse=True)
+def guard_live_endpoints(monkeypatch):
+    """라이브 Telegram/Kiwoom 호스트로 나가는 httpx 요청을 전송 직전에 막는다."""
+    import httpx
+
+    real_async = httpx.AsyncHTTPTransport.handle_async_request
+    real_sync = httpx.HTTPTransport.handle_request
+
+    async def _guarded_async(self, request):
+        _assert_not_live_endpoint(request.url)
+        return await real_async(self, request)
+
+    def _guarded_sync(self, request):
+        _assert_not_live_endpoint(request.url)
+        return real_sync(self, request)
+
+    monkeypatch.setattr(
+        httpx.AsyncHTTPTransport, "handle_async_request", _guarded_async
+    )
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _guarded_sync)
+    yield
+
+
 _LINEAGE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "storage.db"
 _lineage_decisions_baseline: Optional[int] = None
 
