@@ -533,9 +533,19 @@ async def rank_candidates(storage, scanner_db_path, trade_date: str) -> list[Can
 # ---------------------------------------------------------------------------
 
 _LLM_SYSTEM_PROMPT = (
-    "당신은 보수적인 한국 주식 발굴 스크리너의 최종 검토자다. 아래 정량 팩터 "
-    "요약만 근거로 이 종목이 신규 관심종목(워치리스트) 등록 후보로 적합한지 "
-    "판단하라. 확실하지 않으면 반려하라(suitable=false).\n\n"
+    "당신은 보수적인 한국 주식 발굴 스크리너의 최종 검토자다. 아래 정량 팩터와 "
+    "펀더멘탈·최근 뉴스를 **함께** 보고 이 종목이 신규 관심종목(워치리스트) "
+    "등록 후보로 적합한지 판단하라.\n\n"
+    "판단 지침:\n"
+    "- **밸류에이션만으로 반려하지 마라.** PER/PBR이 높다는 사실 **단독**은 "
+    "배제 사유가 아니다. 2026-08 실측: PER 57.89 종목이 승격 다음날 +30%, "
+    "가장 싼 PER 12.06 종목이 5거래일 만에 -32%였다. 강세장·테마·수급이 "
+    "밸류에이션을 압도하는 경우가 실재한다.\n"
+    "- **재료가 '미상'인 것을 부정 신호로 읽지 마라.** 수집 실패와 나쁜 값은 "
+    "다르다.\n"
+    "- 뉴스가 있으면 그 내용이 팩터 점수를 **설명하는지** 보라. 모멘텀이 높은데 "
+    "설명할 재료가 전혀 없다면 그 사실 자체를 rationale에 쓰라.\n"
+    "- 확실하지 않으면 반려하라(suitable=false).\n\n"
     "반드시 아래 JSON 스키마 하나만 출력하라 — 그 외 텍스트, 설명, 마크다운, "
     "코드펜스는 절대 포함하지 마라:\n"
     '{"suitable": <bool>, "confidence": <0.0~1.0 사이 숫자>, '
@@ -564,6 +574,28 @@ def _build_llm_messages(candidate: Candidate) -> list:
         f"종가: {candidate.close_price}\n"
         f"발굴 랭킹: #{candidate.rank}\n"
     )
+
+    # 승격 판단 재료 (2026-08-12). `services/discovery/enrich.py`가 상위
+    # top_n 후보에만 채운다 -- 없으면 "미상"이라고 **쓴다**. 빼버리면 LLM이
+    # "나쁘다"와 "모른다"를 구별할 수 없다(flow의 기존 관행과 같다).
+    def _shown(v: Any) -> str:
+        return "미상" if v is None else f"{v}"
+
+    mc = candidate.market_cap
+    mc_str = f"{mc / 1e12:.2f}조" if mc else "미상"
+    user_prompt += (
+        f"[밸류에이션] PER {_shown(candidate.per)} · PBR {_shown(candidate.pbr)}"
+        f" · 시총 {mc_str}\n"
+        f"  (업종 평균 PER 12~15배 / PBR 1.0배 — 참고치일 뿐 배제 기준이 아니다)\n"
+    )
+
+    heads = candidate.news_headlines or []
+    if heads:
+        lines = "\n".join(f"  - {h}" for h in heads)
+        user_prompt += f"[최근 뉴스] {len(heads)}건\n{lines}\n"
+    else:
+        user_prompt += "[최근 뉴스] 없음 — 부정신호 아님\n"
+
     return [
         SystemMessage(content=_LLM_SYSTEM_PROMPT),
         HumanMessage(content=user_prompt),

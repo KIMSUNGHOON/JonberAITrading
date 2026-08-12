@@ -1652,3 +1652,69 @@ async def test_watched_stock_source_backward_compat_restore(temp_storage):
     restored = {w.ticker: w for w in coord2.get_watch_list()}
     assert restored["005930"].source == "discovery"
     assert restored["000660"].source == "manual"
+
+
+# ---------------------------------------------------------------------------
+# U3: 프롬프트가 판단 재료를 싣는다 (2026-08-12)
+#
+# LLM이 종목명과 지표 4개만 보고 suitable을 답하던 것을 고친다.
+# 시스템 프롬프트의 "정량 팩터 요약만" 한 줄이 새 재료를 통째로
+# 무력화하므로 그것부터 지운다.
+# ---------------------------------------------------------------------------
+
+
+class TestPromptCarriesEvidence:
+    def _cand(self, **kw):
+        from services.discovery.ranker import Candidate
+
+        base = dict(
+            ticker="005930", name="삼성전자", trade_date="2026-08-12",
+            regime_label="neutral", threshold=0.55, daily_cap=5, weights={},
+            universe_fallback=False, quality_filter_passed=True,
+            composite=0.61, rank=3, close_price=70000.0,
+            raw_scores={"momentum": 0.7, "pullback": 0.5, "flow": 0.4, "meanrev": 0.2},
+        )
+        base.update(kw)
+        return Candidate(**base)
+
+    def _text(self, **kw):
+        from services.discovery.ranker import _build_llm_messages
+
+        return _build_llm_messages(self._cand(**kw))[-1].content
+
+    def test_fundamentals_appear_in_the_prompt(self):
+        text = self._text(per=57.89, pbr=6.51, market_cap=1_200_000_000_000)
+        assert "57.89" in text
+        assert "6.51" in text
+
+    def test_missing_fundamentals_are_labeled_not_omitted(self):
+        """값이 없으면 '미상'이라고 **쓴다**. 빼버리면 LLM이 '나쁘다'와
+        '모른다'를 구별할 수 없다 — flow가 이미 쓰는 관행이다."""
+        assert "미상" in self._text()
+
+    def test_news_headlines_appear(self):
+        assert "HBM4 양산 개시" in self._text(news_headlines=["HBM4 양산 개시"])
+
+    def test_absent_news_is_not_a_negative_signal(self):
+        assert "부정신호 아님" in self._text(news_headlines=[])
+
+    def test_system_prompt_no_longer_restricts_to_quant_factors(self):
+        """이 문구가 남아 있으면 U1·U2가 아무 효과도 못 낸다."""
+        from services.discovery.ranker import _LLM_SYSTEM_PROMPT
+
+        assert "정량 팩터 요약만" not in _LLM_SYSTEM_PROMPT
+
+    def test_system_prompt_forbids_valuation_only_rejection(self):
+        """밸류에이션 단독 배제를 금지한다 — 실측 근거가 프롬프트에 있어야
+        LLM이 PER 669배 성장주를 기계적으로 반려하지 않는다."""
+        from services.discovery.ranker import _LLM_SYSTEM_PROMPT
+
+        assert "단독" in _LLM_SYSTEM_PROMPT
+
+    def test_json_schema_instruction_survives(self):
+        """프롬프트를 갈아엎으면서 출력 계약을 잃으면 _parse_llm_verdict가
+        전부 parse_failed로 떨어진다."""
+        from services.discovery.ranker import _LLM_SYSTEM_PROMPT
+
+        assert '"suitable"' in _LLM_SYSTEM_PROMPT
+        assert "코드펜스" in _LLM_SYSTEM_PROMPT
