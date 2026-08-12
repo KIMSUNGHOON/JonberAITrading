@@ -522,3 +522,110 @@ class TestPerformanceSinceTradeDatePushdown:
 
         assert "meanrev" in summary
         assert summary["meanrev"]["candidates"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 놓친 슬롯 따라잡기 (2026-08-12)
+#
+# 라이브 실측: 2026-08-06에 EOD 체인이 돌지 않았다(strategy_revisions와
+# discovery_candidates 둘 다 08-05 -> 08-07로 건너뛴다). 그 하루가
+# 유일한 기회였던 두 슬롯이 영구히 비었다:
+#   - 07-30 승격 3건의 fwd_5d  (08-06이 5거래일째)
+#   - 08-05 승격 3건의 fwd_1d  (08-06이 1거래일째)
+#
+# 원인은 `elapsed == N` 정확 일치 + 따라잡기 부재다. 다음날은 elapsed가
+# N+1이라 어떤 분기에도 걸리지 않는다.
+#
+# ⚠️ `elapsed >= N`으로 바꾸는 것은 오답이다. fwd_value는
+# `price_lookup[ticker] / close_price - 1`이고 price_lookup은 **오늘**
+# 종가다 -- elapsed=7에 채우면 "5일 수익률" 자리에 7일 수익률이 들어가
+# 원장이 조용히 오염된다. 따라잡을 때는 **N거래일째 종가**를 따로 구해야 한다.
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillCatchesUpAfterAMissedDay:
+    @pytest.mark.asyncio
+    async def test_missed_slot_is_filled_with_the_day_n_close_not_todays(
+        self, tmp_path, holiday_svc
+    ):
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        start = date(2026, 6, 1)
+        await st.save_discovery_candidates(
+            [_candidate_row(trade_date=start.isoformat(), close_price=70000.0)]
+        )
+
+        day5 = _nth_trading_day_after(holiday_svc, start, 5)
+        day7 = _nth_trading_day_after(holiday_svc, start, 7)  # 이틀 걸렀다
+
+        async def _close_on(ticker: str, day: str):
+            return {day5.isoformat(): 72100.0}.get(day)
+
+        filled = await backfill_forward_returns(
+            st,
+            {"005930": 99999.0},  # 오늘 종가 — fwd_5d에 쓰이면 오염이다
+            day7.isoformat(),
+            holiday_service=holiday_svc,
+            close_on_date=_close_on,
+        )
+
+        assert filled == 1
+        got = (await st.get_discovery_candidates(ticker="005930"))[0]
+        # day5 종가 기준이어야 한다. 오늘 종가(99999)를 썼다면 ~0.4286이 된다.
+        assert got["fwd_5d"] == pytest.approx(72100.0 / 70000.0 - 1.0)
+
+    @pytest.mark.asyncio
+    async def test_catchup_skips_when_the_day_n_close_is_unavailable(
+        self, tmp_path, holiday_svc
+    ):
+        """일봉을 못 구하면 **채우지 않는다.**
+
+        오늘 종가로 대신 채우면 슬롯의 의미가 바뀌어 원장이 조용히
+        오염된다 -- 비어 있는 편이 틀린 값보다 낫다."""
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        start = date(2026, 6, 1)
+        await st.save_discovery_candidates(
+            [_candidate_row(trade_date=start.isoformat(), close_price=70000.0)]
+        )
+        day7 = _nth_trading_day_after(holiday_svc, start, 7)
+
+        async def _close_on(ticker: str, day: str):
+            return None  # 상장폐지·거래정지·조회실패
+
+        filled = await backfill_forward_returns(
+            st, {"005930": 99999.0}, day7.isoformat(),
+            holiday_service=holiday_svc, close_on_date=_close_on,
+        )
+
+        assert filled == 0
+        got = (await st.get_discovery_candidates(ticker="005930"))[0]
+        assert got["fwd_5d"] is None
+
+    @pytest.mark.asyncio
+    async def test_exact_slot_needs_no_daily_close_fetch(self, tmp_path, holiday_svc):
+        """평상시(elapsed == N)에는 일봉을 조회하지 않는다.
+
+        매일 도는 경로에 불필요한 조회가 붙으면 Kiwoom 레이트리밋
+        (~1.4 req/s)을 먹는다 -- 2026-08-12에 22종 조회만으로도 ka10001
+        초과가 실제로 났다."""
+        st = StorageService(db_path=str(tmp_path / "storage.db"))
+        start = date(2026, 6, 1)
+        await st.save_discovery_candidates(
+            [_candidate_row(trade_date=start.isoformat(), close_price=70000.0)]
+        )
+        day1 = _nth_trading_day_after(holiday_svc, start, 1)
+
+        calls: list = []
+
+        async def _close_on(ticker: str, day: str):
+            calls.append((ticker, day))
+            return 1.0
+
+        filled = await backfill_forward_returns(
+            st, {"005930": 70700.0}, day1.isoformat(),
+            holiday_service=holiday_svc, close_on_date=_close_on,
+        )
+
+        assert filled == 1
+        assert calls == []
+        got = (await st.get_discovery_candidates(ticker="005930"))[0]
+        assert got["fwd_1d"] == pytest.approx(0.01)

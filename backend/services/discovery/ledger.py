@@ -99,11 +99,110 @@ def _trading_day_n_before(holiday_service, end: date, n: int) -> date:
     return d
 
 
+# 따라잡기가 거슬러 올라가는 최대 거래일. `fwd_20d`가 가장 먼 슬롯이라
+# 그보다 오래된 행은 어떤 슬롯도 새로 채울 게 없다.
+_MAX_FWD_HORIZON = 20
+
+
+def _trading_day_n_after(holiday_service, start: date, n: int) -> Optional[date]:
+    """`start`로부터 정확히 `n` 거래일 뒤. 범위를 못 만들면 None.
+
+    `_trading_day_n_before`의 반대 방향이고, 같은
+    `get_trading_days_in_range` 프리미티브를 쓴다(테스트 헬퍼는
+    `get_next_trading_day`를 쓰므로 둘은 여전히 독립 경로다).
+    역일 여유 `n*3+10`은 최장 연휴(설·추석)를 넉넉히 덮는다.
+    """
+    try:
+        days = holiday_service.get_trading_days_in_range(
+            start, start + timedelta(days=n * 3 + 10)
+        )
+    except Exception:
+        return None
+    if not days or days[0] != start or len(days) <= n:
+        return None
+    return days[n]
+
+
+async def _catch_up_missed_slots(
+    storage,
+    end_date: date,
+    holiday_service,
+    close_on_date,
+    limit: int,
+) -> int:
+    """EOD 체인이 걸러서 영구히 비어버린 슬롯을 뒤늦게 채운다.
+
+    2026-08-06에 체인이 안 돌아 07-30분 `fwd_5d`와 08-05분 `fwd_1d`가
+    비었다 -- `elapsed == N` 정확 일치라 다음날은 N+1이 되어 어떤 분기에도
+    안 걸린다.
+
+    ⚠️ **오늘 종가를 쓰면 안 된다.** `fwd_5d`는 "5거래일째 수익률"이라
+    뒤늦게 채울 때도 **그날 종가**로 계산해야 한다. `close_on_date`가
+    그 값을 돌려주지 못하면 **채우지 않는다** -- 비어 있는 편이 의미가
+    바뀐 값보다 낫다.
+    """
+    oldest = _trading_day_n_before(holiday_service, end_date, _MAX_FWD_HORIZON)
+    rows = await storage.get_discovery_candidates(
+        since_trade_date=oldest.isoformat(), unfilled_fwd_only=True, limit=20_000
+    )
+
+    filled = 0
+    for row in rows:
+        if filled >= limit:
+            logger.info("discovery_fwd_catchup_limited", limit=limit)
+            break
+
+        ticker = row.get("ticker")
+        close_price = row.get("close_price")
+        row_trade_date = row.get("trade_date")
+        if not ticker or not row_trade_date or not close_price:
+            continue
+        try:
+            start_date = _parse_date(row_trade_date)
+        except ValueError:
+            continue
+
+        elapsed = _trading_days_elapsed(holiday_service, start_date, end_date)
+
+        for n, slot in ((1, "fwd_1d"), (5, "fwd_5d"), (20, "fwd_20d")):
+            # `>` 로 좁힌다 -- `==`는 위의 정상 경로가 price_lookup으로
+            # 이미 처리했다(그쪽이 API 호출 0회라 항상 우선한다).
+            if elapsed <= n or row.get(slot) is not None:
+                continue
+            day_n = _trading_day_n_after(holiday_service, start_date, n)
+            if day_n is None:
+                continue
+            try:
+                px = await close_on_date(ticker, day_n.isoformat())
+            except Exception as e:
+                logger.warning(
+                    "discovery_fwd_catchup_lookup_failed",
+                    ticker=ticker, day=day_n.isoformat(), error=str(e),
+                )
+                continue
+            if not px or px <= 0:
+                continue
+            ok = await storage.update_discovery_forward_returns(
+                row["id"], **{slot: (px / close_price) - 1.0}
+            )
+            if ok:
+                filled += 1
+                logger.info(
+                    "discovery_fwd_catchup_filled",
+                    ticker=ticker, slot=slot,
+                    trade_date=row_trade_date, day_n=day_n.isoformat(),
+                    elapsed=elapsed,
+                )
+    return filled
+
+
 async def backfill_forward_returns(
     storage,
     price_lookup: dict[str, float],
     trade_date: str,
     holiday_service=None,
+    close_on_date=None,
+    catchup_limit: int = 50,
 ) -> int:
     """
     Fill in fwd_1d/fwd_5d/fwd_20d on past discovery_candidates rows whose
@@ -186,6 +285,13 @@ async def backfill_forward_returns(
         )
         if ok:
             filled += 1
+
+    # 놓친 슬롯 따라잡기. `close_on_date`가 없으면 건너뛴다 -- 과거 종가를
+    # 구할 방법이 없는데 오늘 종가로 대신 채우면 원장이 조용히 오염된다.
+    if close_on_date is not None:
+        filled += await _catch_up_missed_slots(
+            storage, end_date, holiday_service, close_on_date, catchup_limit
+        )
 
     return filled
 
