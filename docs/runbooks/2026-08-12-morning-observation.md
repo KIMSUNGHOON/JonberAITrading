@@ -4,7 +4,11 @@
 > **이 문서는 다음 세션이 이어받기 위한 것이다.**
 > 전 세션의 감시(Monitor)·예약(cron)·컨텍스트는 세션 종료와 함께 사라졌다.
 >
-> **대기 중인 관측 3건**: ① 방어 매도 재제출 억제(미검증 3일째) · ② 패널 노출도 역학(내일 15:35 첫 EOD) · ③ `index_daily` 2거래일 지연(내일 08:05 자동 복구 예상).
+> **관측 3건**: ① 방어 매도 재제출 억제(**미검증 4일째**) · ② 패널 노출도 역학(15:35 첫 EOD 대기) · ③ `index_daily` 지연(08-12 08:05 관측 완료 — 아래 참조).
+>
+> 🔴 **2026-08-12 11:04 — agent-chat 엔진이 3거래일간 꺼져 있던 것을 발견·복구.**
+> 원인은 08-11 테스트 스위트의 라이브 DB 오염(**함정 2번** 참조). 개장 후 2시간 4분간
+> 토론 0건이었고 손절만 돌고 있었다. 재기동 체크리스트에 agent-chat이 없던 것이 화근 — **§0-A에 추가했다.**
 
 ---
 
@@ -23,9 +27,32 @@
 | 노브 | 종목당 0.03 · `max_open_positions` **7** · `target_vol_pct` 22.0 · `vol_multiplier_min` 0.4 |
 | 모드 | `mode=active` · Traceback 0건 |
 | LLM 라우터 | openrouter ✅ / claude_cli ✅ / codex_cli ❌ |
+| **agent-chat** | 🔴 **`is_running: false`였다 — 이 표가 그때 놓친 항목** (2026-08-12 11:04 복구) |
 
 ⚠️ 서버가 리스닝을 시작하기까지 **약 40초**가 걸린다(LLM 라우터 헬스체크). 그 전의
 `curl`은 `HTTP 000`을 돌려준다 — 죽은 것이 아니다. `Uvicorn running`을 로그에서 확인할 것.
+
+### 🔴 재기동 후 반드시 확인 — 엔진은 **둘**이다
+
+`mode=active`는 **trading 엔진**만 말한다. 자율매매의 토론·의결은 **agent-chat**이라는
+별개 엔진이고, 부팅 자동 재개도 **따로** 판정된다. 한쪽만 보면 절반을 놓친다.
+
+```bash
+grep -a "boot_auto_resume_complete" debug/backend-*.log | tail -1
+#   합격: agent_chat=True trading=True   ← 둘 다 True여야 한다
+curl -s http://127.0.0.1:8000/api/agent-chat/status | python3 -m json.tool
+#   합격: "is_running": true · "check_interval_minutes": 1   (5면 테스트 오염, 함정 2번)
+```
+
+`agent_chat=False`면 **body 없이** 시작한다(body를 주면 현재 값을 덮어쓴다):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/agent-chat/start -H "Content-Type: application/json"
+```
+
+⚠️ **꺼져 있어도 손절은 돈다** — RiskMonitor는 trading 엔진 쪽이다. 그래서 증상이
+"주문이 안 나간다"뿐이고, 포지션을 보고 있으면 정상으로 보인다. 2026-08-12에 개장 후
+**2시간 4분** 동안 토론 0건이었는데 손익 화면은 멀쩡했다.
 
 ### 기동 명령 (재시작이 필요할 때)
 
@@ -270,7 +297,28 @@ sqlite3 -readonly "file:backend/data/holidays.db?mode=ro" \
    ```
    nohup /Users/sunghoonk/anaconda3/envs/agentic-trading/bin/python run_dev.py > ../debug/<log> 2>&1 &
    ```
-2. **전체 테스트 스위트는 반드시 워크트리에서.** 메인 리포에서 돌리면 라이브 DB에 쓴다. 2026-08-11에 `holidays.db`에 실제로 썼다(`isolated_storage_service` 픽스처는 `storage_service`만 덮고 `KRXHolidayService`는 자기 기본 경로를 따로 갖는다).
+2. 🔴 **전체 테스트 스위트는 반드시 워크트리에서.** 메인 리포에서 돌리면 라이브 DB에 쓴다.
+   2026-08-11 13:2x~13:3x에 **두 DB가 동시에 오염됐다**:
+   - `holidays.db` — 즉시 발견 (데이터가 우연히 정확해 피해 없음)
+   - **`storage.db`의 `app_settings` — 3거래일 뒤에야 발견** 🔴
+
+   **`agent_chat:coordinator_state`가 `{"running": false, "check_interval": 5, ...}`로 덮였다.**
+   `check_interval: 5`는 프로덕션 기본값(**1**, `coordinator.py:528`)이 아니라 **테스트 픽스처 값**이다
+   (`test_coordinator.py:39`, `test_runtime_persist.py:22`) — 이것이 오염의 물증이었다.
+
+   ⚠️ **오염과 발현이 분리된다.** 쓰는 순간에는 증상이 전혀 없다 — 실행 중인 프로세스는 메모리
+   상태로 계속 돈다(실제로 13:35 오염 후 **17:14까지 정상 작동**했다). **다음 재기동에서야** 터진다.
+   그래서 "테스트 돌린 날 멀쩡했다"는 안전의 증거가 아니다.
+
+   메인 리포에서 스위트를 돌려버렸다면, **그날 안에 아래를 조회해 오염 여부를 확인할 것**:
+   ```bash
+   sqlite3 -readonly -header -column "file:backend/data/storage.db?mode=ro" \
+    "SELECT key, substr(value,1,70) value, substr(updated_at,1,19) upd
+     FROM app_settings ORDER BY updated_at DESC LIMIT 10;"
+   ```
+   `updated_at`이 스위트 실행 시각과 겹치는 행, 특히 `check_interval:5` / `max_concurrent:10` 같은
+   **픽스처 냄새가 나는 값**을 찾는다. 기본값과 우연히 같은 값(`max_concurrent:3`)은 구별되지 않으니
+   `updated_at`이 1차 단서다.
 3. **`kill`은 어시스턴트 권한 밖이다.** 사용자에게 `! kill -TERM <PID>` 실행을 요청할 것.
 4. **`git stash` 금지** — 워크트리 여럿이 스택을 공유한다.
 5. **장중 재시작 금지가 기본** — 손절이 이 프로세스에만 있고 브로커에 스탑이 없다.
