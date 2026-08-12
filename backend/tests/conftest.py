@@ -231,6 +231,90 @@ async def isolated_storage_service(tmp_path, monkeypatch):
     monkeypatch.setattr(storage_service_module, "_storage_service", None)
 
 
+# -------------------------------------------
+# 라이브 DB 가드 (2026-08-12) — 탐지가 아니라 **차단**
+#
+# 위 L-6 트립와이어는 `agent_chat_decisions`의 *행 수 증가*만 보고, 그것도
+# 경고만 한다. 그래서 다음을 **구조적으로 놓친다**:
+#
+#   `app_settings` 오염은 UPDATE라 행 수가 변하지 않는다.
+#
+# 2026-08-03과 2026-08-11에 **같은 키가 두 번** 그렇게 덮였다 --
+# `agent_chat:coordinator_state`가 테스트 픽스처 값
+# `{"running": false, "check_interval": 5, "max_concurrent": 3}`으로. 08-11
+# 오염은 **3거래일 뒤** 재기동에서야 발현해, 그동안 자율 토론 엔진이 꺼진
+# 채로 돌았다(손절만 작동해 증상이 "주문이 안 나간다" 하나뿐이었다).
+#
+# 규칙("전체 스위트는 워크트리에서")이 메모리와 문서에만 있고 **명령 자체에
+# 붙어 있지 않은 것**이 근본 원인이었다. 그래서 여기서 강제한다.
+#
+# **왜 실패가 아니라 리다이렉트인가**: 라이브 경로를 열려는 테스트를 즉시
+# 실패시키면 격리가 없는 기존 파일 9개가 한꺼번에 깨진다. 리다이렉트는
+# 메인 체크아웃을 **워크트리와 같은 상태**로 만들 뿐이라(워크트리에는
+# `storage.db`가 없다) 동작 변화가 예측 가능하다. 대신 침묵하지 않는다 --
+# 세션 끝에 리다이렉트된 테스트를 전부 이름으로 보고한다.
+# -------------------------------------------
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_LIVE_DB_FILES = {
+    (_DATA_DIR / "storage.db").resolve(),
+    (_DATA_DIR / "holidays.db").resolve(),
+}
+_live_db_offenders: set = set()
+
+
+def _sandbox_target(original, sandbox: Path) -> Optional[Path]:
+    """`original`이 라이브 DB면 샌드박스 안의 같은 이름 경로, 아니면 None."""
+    if original is None:
+        return None
+    try:
+        resolved = Path(original).resolve()
+    except (OSError, ValueError, TypeError):
+        return None
+    return sandbox / resolved.name if resolved in _LIVE_DB_FILES else None
+
+
+@pytest.fixture(autouse=True)
+def guard_live_databases(request, tmp_path_factory, monkeypatch):
+    """라이브 `storage.db`/`holidays.db`를 여는 시도를 tmp로 돌린다.
+
+    `db_path=None`(기본 경로)까지 잡는 것이 핵심이다 -- 실제 사고 경로인
+    `get_storage_service()` 싱글턴이 바로 그 형태로 만들어진다. 명시적
+    경로만 막으면 정작 막아야 할 것을 놓친다.
+    """
+    import services.krx_holiday.storage as holiday_storage_module
+
+    sandbox = tmp_path_factory.mktemp("live-db-guard")
+    nodeid = request.node.nodeid
+
+    real_storage_init = storage_service_module.StorageService.__init__
+    real_holiday_init = holiday_storage_module.HolidayStorage.__init__
+
+    def _storage_init(self, db_path=None):
+        requested = db_path if db_path is not None else storage_service_module.DEFAULT_DB_PATH
+        target = _sandbox_target(requested, sandbox)
+        if target is not None:
+            _live_db_offenders.add(nodeid)
+            db_path = target
+        real_storage_init(self, db_path)
+
+    def _holiday_init(self, db_path=None):
+        requested = db_path if db_path is not None else _DATA_DIR / "holidays.db"
+        target = _sandbox_target(requested, sandbox)
+        if target is not None:
+            _live_db_offenders.add(nodeid)
+            db_path = str(target)
+        real_holiday_init(self, db_path)
+
+    monkeypatch.setattr(
+        storage_service_module.StorageService, "__init__", _storage_init
+    )
+    monkeypatch.setattr(
+        holiday_storage_module.HolidayStorage, "__init__", _holiday_init
+    )
+    yield
+
+
 _LINEAGE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "storage.db"
 _lineage_decisions_baseline: Optional[int] = None
 
@@ -257,7 +341,41 @@ def pytest_sessionstart(session):  # noqa: D103 - pytest hook, not a fixture
     _lineage_decisions_baseline = _count_live_agent_chat_decisions()
 
 
+def _report_live_db_redirects(session) -> None:
+    """가드가 몇 번, 어떤 테스트에서 발동했는지 세션 끝에 알린다.
+
+    리다이렉트는 사고를 **막지만** 원인을 고치지는 않는다. 조용히 넘어가면
+    "격리 없이 라이브 경로를 여는 테스트"가 계속 늘어나고, 워크트리 밖에서
+    돌릴 때만 가드에 의존하게 된다. 이름을 찍어 두면 점진적으로 고칠 수 있다.
+    """
+    if not _live_db_offenders:
+        return
+    terminal = session.config.pluginmanager.get_plugin("terminalreporter")
+    names = sorted(_live_db_offenders)
+    shown = names[:15]
+    lines = [
+        "",
+        "=" * 70,
+        f"LIVE-DB GUARD: {len(names)}개 테스트가 라이브 DB 경로를 열려고 했고,",
+        "모두 tmp 샌드박스로 돌렸다(라이브 파일은 안전하다).",
+        "",
+        "이 테스트들은 `isolated_storage_service` 픽스처를 쓰도록 고치는 것이",
+        "근본 해결이다 -- 가드는 그물이지 설계가 아니다:",
+        "",
+    ]
+    lines += [f"  - {n}" for n in shown]
+    if len(names) > len(shown):
+        lines.append(f"  ... 외 {len(names) - len(shown)}개")
+    lines.append("=" * 70)
+    message = "\n".join(lines)
+    if terminal is not None:
+        terminal.write_line(message, yellow=True, bold=True)
+    else:
+        print(message)
+
+
 def pytest_sessionfinish(session, exitstatus):  # noqa: D103 - pytest hook
+    _report_live_db_redirects(session)
     if _lineage_decisions_baseline is None:
         return
     after = _count_live_agent_chat_decisions()
