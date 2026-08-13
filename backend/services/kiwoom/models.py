@@ -5,11 +5,14 @@ Data models for Kiwoom Securities REST API requests and responses.
 Based on KiwoomRESTAPI.xlsx specification.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+# 키움 서버 시간대 (토큰 expires_dt 비교 기준)
+KST = timezone(timedelta(hours=9))
 
 
 class OrderType(str, Enum):
@@ -52,8 +55,11 @@ class KiwoomToken(BaseModel):
 
     @property
     def is_expired(self) -> bool:
-        """토큰 만료 여부 확인"""
-        return datetime.now() >= self.expires_dt
+        """토큰 만료 여부 확인 (KST 기준; naive expires_dt는 KST로 간주)"""
+        expires = self.expires_dt
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=KST)
+        return datetime.now(KST) >= expires
 
     @property
     def authorization_header(self) -> str:
@@ -174,6 +180,9 @@ class OrderResponse(BaseModel):
     """주문 응답 (kt10000~kt10003)"""
 
     ord_no: str = Field(..., description="주문번호")
+    base_orig_ord_no: Optional[str] = Field(
+        default=None, description="모주문번호 (정정/취소 응답 — 주문 체인 추적용)"
+    )
     dmst_stex_tp: Optional[str] = Field(default=None, description="거래소구분")
     return_code: int = Field(..., description="응답코드")
     return_msg: str = Field(..., description="응답메시지")
@@ -262,6 +271,36 @@ class FilledOrder(BaseModel):
     buy_sell_tp: str = Field(..., description="매수매도구분")
 
 
+class DailyRealizedPnlRow(BaseModel):
+    """일자별 실현손익 행 (ka10074 dt_rlzt_pl 아이템)"""
+
+    dt: str = Field(..., description="일자 (YYYYMMDD)")
+    buy_amount: int = Field(default=0, description="매수금액")
+    sell_amount: int = Field(default=0, description="매도금액")
+    sell_pnl: int = Field(default=0, description="당일매도손익 (부호 보존)")
+    commission: int = Field(default=0, description="당일매매수수료")
+    tax: int = Field(default=0, description="당일매매세금")
+
+
+class RealizedPnl(BaseModel):
+    """기간 실현손익 (ka10074 응답).
+
+    daily-loss 브레이커와 성과 리포트의 데이터 소스 — realized_pnl은
+    부호를 보존한다 (손실 음수).
+    """
+
+    strt_dt: str = Field(..., description="조회 시작일 (YYYYMMDD)")
+    end_dt: str = Field(..., description="조회 종료일 (YYYYMMDD)")
+    total_buy_amount: int = Field(default=0, description="총매수금액")
+    total_sell_amount: int = Field(default=0, description="총매도금액")
+    realized_pnl: int = Field(default=0, description="실현손익 (부호 보존)")
+    commission: int = Field(default=0, description="매매수수료")
+    tax: int = Field(default=0, description="매매세금")
+    daily: list[DailyRealizedPnlRow] = Field(
+        default_factory=list, description="일자별 실현손익 (손익 발생 일자만)"
+    )
+
+
 class MarketType(str, Enum):
     """시장 구분 (ka10099 mrkt_tp)"""
 
@@ -290,13 +329,13 @@ class StockListItem(BaseModel):
 
     @property
     def is_kospi(self) -> bool:
-        """코스피 종목 여부"""
-        return self.market_code in ("10", "0") or "코스피" in self.market_name
+        """코스피 종목 여부 (marketCode 도메인: 0=코스피, 10=코스닥 — 종목정보.md:3148)"""
+        return self.market_code == "0" or "코스피" in self.market_name
 
     @property
     def is_kosdaq(self) -> bool:
         """코스닥 종목 여부"""
-        return self.market_code == "20" or "코스닥" in self.market_name
+        return self.market_code == "10" or "코스닥" in self.market_name
 
     @property
     def is_normal(self) -> bool:

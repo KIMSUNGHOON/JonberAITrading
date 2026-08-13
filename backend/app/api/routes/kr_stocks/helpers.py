@@ -4,24 +4,48 @@ Korean Stock Route Helpers
 Helper functions for Korean stock routes.
 """
 
+from typing import Optional
+
 from fastapi import HTTPException, status
 
 from app.api.routes.settings import (
     get_kiwoom_app_key,
     get_kiwoom_secret_key,
 )
-from .constants import kr_stock_sessions
 
 
-def get_kr_stock_session(session_id: str) -> dict:
-    """Get session or raise 404."""
-    session = kr_stock_sessions.get(session_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Korean stock session {session_id} not found",
+async def find_active_kr_session(stk_cd: str) -> Optional[dict]:
+    """Return the first RUNNING/AWAITING_APPROVAL session for `stk_cd`, if any.
+
+    P2-3: the KR producer (kr_stocks/analysis.py) writes ONLY to the
+    SessionManager now -- so the SessionManager is the sole read source here
+    too. `/analysis/start` itself no longer calls this: its dedup check is
+    now folded into the atomic `SessionManager.create_session_if_no_active`
+    reservation, which closes the check-then-create race directly instead of
+    relying on a read here being followed by a separate synchronous write.
+    This helper remains for any other caller that needs a plain "is this
+    ticker active?" read (and for its own direct test coverage).
+    """
+    from services.session_manager import (
+        KIND_ANALYSIS,
+        MarketType,
+        SessionStatus,
+        get_session_manager,
+    )
+
+    manager = await get_session_manager()
+    for sm_status in (SessionStatus.RUNNING, SessionStatus.AWAITING_APPROVAL):
+        # P4-1: kind='analysis' only -- a discussion (or other non-analysis
+        # producer) session sharing the SM store must never be picked up as
+        # an "active session" here.
+        sessions = await manager.get_all_sessions(
+            market_type=MarketType.KIWOOM, status=sm_status, kind=KIND_ANALYSIS
         )
-    return session
+        for sm_session in sessions.values():
+            if (sm_session.stk_cd or sm_session.ticker) == stk_cd:
+                return sm_session.to_legacy_dict()
+
+    return None
 
 
 def check_kiwoom_api_keys() -> None:
@@ -35,7 +59,3 @@ def check_kiwoom_api_keys() -> None:
             detail="Kiwoom API keys not configured. Please configure in Settings.",
         )
 
-
-def get_kr_stock_sessions() -> dict:
-    """Get reference to Korean stock sessions (for WebSocket, approval routes)."""
-    return kr_stock_sessions

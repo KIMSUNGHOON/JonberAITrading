@@ -204,7 +204,7 @@ export interface AnalysisHistoryItem {
   analyses: AnalysisSummary[];
 
   // Trade proposal
-  tradeProposal: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal: KRStockTradeProposal | null;
 
   // Reasoning summary (condensed from full log)
   reasoningSummary: string | null;
@@ -212,22 +212,6 @@ export interface AnalysisHistoryItem {
   // Metadata
   duration: number | null;  // Analysis duration in ms
   dataVersion: string;  // Schema version for migration
-}
-
-export interface TradeProposal {
-  id: string;
-  ticker: string;
-  action: TradeAction;
-  quantity: number;
-  entry_price: number | null;
-  stop_loss: number | null;
-  take_profit: number | null;
-  risk_score: number;
-  position_size_pct: number;
-  rationale: string;
-  bull_case: string;
-  bear_case: string;
-  created_at: string;
 }
 
 export interface Position {
@@ -244,18 +228,6 @@ export interface SessionInfo {
   ticker: string;
   status: SessionStatus;
   created_at?: string;
-}
-
-export interface AnalysisStatus {
-  session_id: string;
-  ticker: string;
-  status: SessionStatus;
-  current_stage: string | null;
-  awaiting_approval: boolean;
-  trade_proposal: TradeProposal | null;
-  analyses: AnalysisSummary[];
-  reasoning_log: string[];
-  error: string | null;
 }
 
 // -------------------------------------------
@@ -281,11 +253,6 @@ export interface WSStatusMessage {
   };
 }
 
-export interface WSProposalMessage {
-  type: 'proposal';
-  data: TradeProposal;
-}
-
 export interface WSPositionMessage {
   type: 'position';
   data: Position;
@@ -305,8 +272,8 @@ export interface WSCompleteMessage {
 
 export type ChatMessageRole = 'user' | 'assistant' | 'system' | 'proposal';
 
-// Union type for all proposal types
-export type AnyTradeProposal = TradeProposal | CoinTradeProposal | KRStockTradeProposal;
+// Union type for all proposal types (single-market union — see MarketType)
+export type AnyTradeProposal = KRStockTradeProposal;
 
 export interface ChatMessage {
   id: string;
@@ -355,10 +322,6 @@ export interface ChartConfig {
 // API Request Types
 // -------------------------------------------
 
-export interface AnalysisRequest {
-  ticker: string;
-}
-
 export type ApprovalDecision = 'approved' | 'rejected' | 'modified' | 'cancelled';
 
 export interface ApprovalRequest {
@@ -377,16 +340,6 @@ export interface ApiResponse<T> {
   error?: string;
 }
 
-export interface StartAnalysisResponse {
-  session_id: string;
-  ticker: string;
-  status: string;
-  message: string;
-}
-
-// Alias for backward compatibility
-export type AnalysisResponse = StartAnalysisResponse;
-
 export interface ApprovalResponse {
   session_id: string;
   decision: string;
@@ -396,202 +349,13 @@ export interface ApprovalResponse {
 }
 
 // -------------------------------------------
-// Coin (Cryptocurrency) Types
-// -------------------------------------------
-
-export interface CoinMarketInfo {
-  market: string;
-  korean_name: string;
-  english_name: string;
-  market_warning: string | null;
-}
-
-export interface CoinAnalysisRequest {
-  market: string;
-  query?: string;
-}
-
-export interface CoinAnalysisResponse {
-  session_id: string;
-  market: string;
-  status: string;
-  message: string;
-}
-
-export interface CoinTradeProposal {
-  id: string;
-  market: string;
-  korean_name: string | null;
-  action: TradeAction;
-  quantity: number;
-  entry_price: number | null;
-  stop_loss: number | null;
-  take_profit: number | null;
-  risk_score: number;
-  position_size_pct: number;
-  rationale: string;
-  bull_case: string;
-  bear_case: string;
-  created_at: string;
-}
-
-export interface CoinAnalysisStatus {
-  session_id: string;
-  market: string;
-  korean_name: string | null;
-  status: SessionStatus;
-  current_stage: string | null;
-  awaiting_approval: boolean;
-  trade_proposal: CoinTradeProposal | null;
-  analyses: AnalysisSummary[];
-  reasoning_log: string[];
-  error: string | null;
-}
-
-// -------------------------------------------
 // Settings Types
 // -------------------------------------------
 
-export interface UpbitApiKeyStatus {
-  is_configured: boolean;
-  access_key_masked: string | null;
-  trading_mode: string;
-  is_valid: boolean | null;
-  last_validated: string | null;
-}
-
-export interface UpbitApiKeyRequest {
-  access_key: string;
-  secret_key: string;
-}
-
-export interface UpbitApiKeyResponse {
-  success: boolean;
-  message: string;
-  status: UpbitApiKeyStatus;
-}
-
-export interface UpbitValidateResponse {
-  is_valid: boolean;
-  message: string;
-  account_count: number | null;
-}
-
 export interface SettingsStatus {
-  upbit: UpbitApiKeyStatus;
   llm_provider: string;
   llm_model: string;
   market_data_mode: string;
-}
-
-// -------------------------------------------
-// Coin Trading Types
-// -------------------------------------------
-
-export interface CoinAccount {
-  currency: string;
-  balance: number;
-  locked: number;
-  avg_buy_price: number;
-  avg_buy_price_modified: boolean;
-  unit_currency: string;
-}
-
-export interface CoinAccountListResponse {
-  accounts: CoinAccount[];
-  total_krw_value: number | null;
-}
-
-export interface CoinPosition {
-  market: string;
-  currency: string;
-  quantity: number;
-  avg_entry_price: number;
-  current_price: number;
-  unrealized_pnl: number;
-  unrealized_pnl_pct: number;
-  stop_loss: number | null;
-  take_profit: number | null;
-  session_id: string | null;
-  created_at: string;
-}
-
-export interface CoinPositionListResponse {
-  positions: CoinPosition[];
-  total_value_krw: number;
-  total_pnl: number;
-  total_pnl_pct: number;
-}
-
-export type OrderSide = 'bid' | 'ask';
-export type OrderType = 'limit' | 'price' | 'market';
-export type OrderState = 'wait' | 'watch' | 'done' | 'cancel';
-
-export interface CoinOrder {
-  uuid: string;
-  side: OrderSide;
-  ord_type: OrderType;
-  price: number | null;
-  state: OrderState;
-  market: string;
-  created_at: string;
-  volume: number | null;
-  remaining_volume: number | null;
-  reserved_fee: number | null;
-  remaining_fee: number | null;
-  paid_fee: number | null;
-  locked: number | null;
-  executed_volume: number | null;
-  trades_count: number | null;
-}
-
-export interface CoinOrderListResponse {
-  orders: CoinOrder[];
-  total: number;
-}
-
-export interface CoinOrderRequest {
-  market: string;
-  side: OrderSide;
-  ord_type: OrderType;
-  price?: number;
-  volume?: number;
-}
-
-export interface CoinTradeRecord {
-  id: string;
-  session_id: string | null;
-  market: string;
-  side: OrderSide;
-  order_type: string;
-  price: number;
-  volume: number;
-  executed_volume: number;
-  fee: number;
-  total_krw: number;
-  state: string;
-  order_uuid: string | null;
-  created_at: string;
-}
-
-export interface CoinTradeListResponse {
-  trades: CoinTradeRecord[];
-  total: number;
-  page: number;
-  limit: number;
-}
-
-export interface CoinTicker {
-  market: string;
-  trade_price: number;
-  change: string;
-  change_rate: number;
-  change_price: number;
-  high_price: number;
-  low_price: number;
-  trade_volume: number;
-  acc_trade_price_24h: number;
-  timestamp: string;
 }
 
 // -------------------------------------------
@@ -642,6 +406,14 @@ export interface KRStockAnalysisResponse {
   stk_nm: string | null;
   status: string;
   message: string;
+  // P4: additive dedup + position-awareness flags (backend
+  // services/analysis dedup). `duplicate` means this response reuses an
+  // already in-progress session for `stk_cd` instead of starting a new
+  // one; `position_exists` means `stk_cd` is already held (position-aware
+  // ADD/REDUCE/HOLD analysis, not a fresh BUY entry). Optional so
+  // callers/tests built against the pre-P4 response shape keep compiling.
+  duplicate?: boolean;
+  position_exists?: boolean;
 }
 
 export interface KRStockTradeProposal {
@@ -779,7 +551,7 @@ export interface KRStockAccountResponse {
 // Multi-Session Support Types
 // -------------------------------------------
 
-export type MarketType = 'stock' | 'coin' | 'kiwoom';
+export type MarketType = 'kiwoom';
 
 /**
  * Unified session data for multi-session support.
@@ -787,19 +559,34 @@ export type MarketType = 'stock' | 'coin' | 'kiwoom';
  */
 export interface SessionData {
   sessionId: string;
-  ticker: string;           // stock: ticker, coin: market, kiwoom: stk_cd
+  ticker: string;           // kiwoom: stk_cd
   displayName: string;      // Human-readable name (종목명)
   marketType: MarketType;
   status: SessionStatus;
   currentStage: string | null;
   reasoningLog: string[];
   analyses: AnalysisSummary[];
-  tradeProposal: TradeProposal | CoinTradeProposal | KRStockTradeProposal | null;
+  tradeProposal: KRStockTradeProposal | null;
   awaitingApproval: boolean;
+  // R3 autonomous mode: ISO timestamp of the pending auto-approve deadline
+  // (from WS status frames while an autonomous approval grace window is open).
+  // null whenever the session is not awaiting an autonomous approval.
+  autoApproveAt: string | null;
   activePosition: Position | null;
   error: string | null;
   createdAt: Date;
   updatedAt: Date;
+}
+
+// -------------------------------------------
+// R3: Trading Mode (Autonomous | HITL) Types
+// -------------------------------------------
+
+export type TradingMode = 'hitl' | 'autonomous';
+
+export interface TradingModeResponse {
+  kiwoom: TradingMode;
+  master_enabled: boolean;
 }
 
 // Kiwoom Settings Types
@@ -918,7 +705,9 @@ export interface IndicatorsSummaryResponse {
 // Auto-Trading Types
 // -------------------------------------------
 
-export type TradingMode = 'active' | 'paused' | 'stopped';
+// Auto-trading ENGINE state (renamed from TradingMode to avoid colliding with
+// the R3 per-market Autonomous|HITL TradingMode above).
+export type AutoTradingMode = 'active' | 'paused' | 'stopped';
 export type StopLossMode = 'user_approval' | 'agent_auto';
 export type PositionStatus = 'pending' | 'partial' | 'filled' | 'closing' | 'closed';
 export type AlertType =
@@ -934,11 +723,14 @@ export type AlertType =
   | 'news_alert';
 
 export interface TradingRiskParameters {
+  max_trade_notional_pct: number;
   max_single_position_pct: number;
   min_cash_ratio: number;
   max_total_stock_pct: number;
   sudden_move_threshold_pct: number;
   max_daily_trades: number;
+  max_daily_loss_pct: number;
+  max_open_positions: number;
   stop_loss_mode: StopLossMode;
   take_profit_mode: StopLossMode;
 }
@@ -985,7 +777,7 @@ export interface TradingAlert {
 }
 
 export interface TradingState {
-  mode: TradingMode;
+  mode: AutoTradingMode;
   account: TradingAccountInfo;
   positions: ManagedPosition[];
   pending_orders: unknown[];
@@ -1029,11 +821,14 @@ export interface TradingAlertActionRequest {
 }
 
 export interface TradingRiskParamsUpdateRequest {
+  max_trade_notional_pct?: number;
   max_single_position_pct?: number;
   min_cash_ratio?: number;
   max_total_stock_pct?: number;
   sudden_move_threshold_pct?: number;
   max_daily_trades?: number;
+  max_daily_loss_pct?: number;
+  max_open_positions?: number;
   stop_loss_mode?: string;
   take_profit_mode?: string;
 }
@@ -1144,6 +939,13 @@ export interface WatchedStock {
   risk_score: number;
   created_at: string;
   updated_at: string;
+  // FI-3: provenance -- 'manual' (user/analysis-flow add, backend default)
+  // vs 'discovery' (regime-weighted ranking auto-promotion). Already
+  // present on GET /trading/operations' watching rows (models.py::
+  // WatchedStock.source); optional here since older callers/fixtures
+  // predate the field and the FE treats a missing value identically to
+  // 'manual' (see OperationsPanel.WatchingColumn).
+  source?: string;
 }
 
 export interface WatchListResponse {
@@ -1238,6 +1040,13 @@ export interface ScanResultsResponse {
 export interface StartScanRequest {
   notify_progress?: boolean;
   custom_stocks?: [string, string][];
+  // P1-5 (backend, default False): when true, scan results feed straight
+  // into the server watch-list and from there the autonomous watch-monitor
+  // /queue pipeline. Surfaced as an explicit opt-in toggle in
+  // DiscoverySection (P2 funnel Phase 1, P1-b) — declared here so that
+  // wiring no longer needs a variable-typed workaround to slip past the
+  // excess-property check.
+  auto_promote_enabled?: boolean;
 }
 
 // -------------------------------------------
@@ -1266,6 +1075,10 @@ export interface AgentChatCoordinatorStatus {
   total_sessions: number;
   check_interval_minutes: number;
   max_concurrent_discussions: number;
+  // P1-3: ISO timestamp of the last executed watch-list tick; null until the
+  // first tick fires. Used for loop-liveness (a dead scheduler still
+  // reporting is_running=true should not display as active).
+  last_check_at?: string | null;
 }
 
 export interface AgentChatStartCoordinatorRequest {
@@ -1457,4 +1270,341 @@ export interface MarketStatus {
   next_open: string | null;
   next_close: string | null;
   countdown_seconds: number;
+}
+
+// ─── Operations pipeline board (2026-07-13) ───
+
+export interface OperationsAnalyzing {
+  session_id: string;
+  ticker: string;
+  name: string | null;
+  status: string;
+  current_stage: string | null;
+  started_at: string | null;
+}
+
+export interface OperationsAwaiting {
+  session_id: string;
+  ticker: string;
+  name: string | null;
+  proposal: Record<string, unknown> | null;
+  auto_approve_at: string | null;
+  // Zombie-resurrection guard: false when the sm row's status is
+  // AWAITING_APPROVAL but its state["awaiting_approval"] flag was already
+  // cleared (e.g. a cancel whose mirror failed) — approve/reject would 400.
+  actionable?: boolean;
+}
+
+export interface OperationsOpenOrder {
+  order_id: string;
+  stk_cd: string;
+  stk_nm: string | null;
+  side: 'buy' | 'sell';
+  price: number | null;
+  quantity: number;
+  remaining_quantity: number;
+  executed_quantity: number;
+  created_at: string | null;
+}
+
+export interface OperationsPendingBuy {
+  queue: Array<Record<string, unknown>> | null;
+  open_orders: OperationsOpenOrder[] | null;
+}
+
+export interface OperationsHolding {
+  ticker: string;
+  name: string | null;
+  quantity: number;
+  avg_price: number;
+  current_price: number;
+  pnl: number;
+  pnl_pct: number;
+  stop_loss: number | null;
+  take_profit: number | null;
+}
+
+export interface OperationsFill {
+  ticker: string;
+  name: string | null;
+  side: 'buy' | 'sell';
+  quantity: number;
+  price: number;
+  time: string;
+}
+
+export interface OperationsResponse {
+  analyzing: OperationsAnalyzing[] | null;
+  awaiting: OperationsAwaiting[] | null;
+  watching: Array<Record<string, unknown>> | null;
+  pending_buy: OperationsPendingBuy;
+  holding: OperationsHolding[] | null;
+  today_fills: OperationsFill[] | null;
+  errors: Record<string, string>;
+}
+
+// -------------------------------------------
+// Performance (TUX4 — 성과 가시화)
+// -------------------------------------------
+
+export interface PerformanceDailyPoint {
+  dt: string; // YYYYMMDD
+  pnl: number; // signed daily realized P&L
+  cumulative_pnl: number; // signed running total over the queried period
+}
+
+export interface PerformancePnlSummary {
+  strt_dt: string;
+  end_dt: string;
+  realized_pnl_total: number;
+  commission: number;
+  tax: number;
+  net_pnl: number;
+  trade_days: number;
+  win_days: number;
+  loss_days: number;
+  flat_days: number;
+  win_rate_pct: number | null;
+  daily: PerformanceDailyPoint[];
+}
+
+export interface PerformanceAssetSummary {
+  current_asset: number;
+  base_asset: number | null;
+  cumulative_return_pct: number | null;
+}
+
+export interface PerformanceResponse {
+  pnl: PerformancePnlSummary | null;
+  asset: PerformanceAssetSummary | null;
+  errors: Record<string, string>;
+}
+
+// -------------------------------------------
+// EOD Report (E3-1..E3-5 -- 장마감 요약)
+// -------------------------------------------
+// Mirrors services/trading/eod_digest.py's build_eod_digest section
+// shapes exactly (each section is independently failure-harmless server
+// side: a broken source degrades only its own section to null/[], never
+// raises) plus the GET /api/trading/eod-report response envelope from
+// app/api/routes/trading.py's get_eod_report handler.
+
+export interface EodDigestWatchItem {
+  ticker: string | null;
+  stock_name: string | null;
+  signal: string | null;
+  confidence: number | null;
+  current_price: number | null;
+  target_entry_price: number | null;
+  gap_pct: number | null;
+}
+
+export interface EodDigestAccount {
+  deposit: number | null;
+  total_equity: number | null;
+  daily_realized_pnl: number | null;
+  cumulative_return_pct: number | null;
+}
+
+export interface EodDigestHolding {
+  ticker: string | null;
+  stock_name: string | null;
+  quantity: number | null;
+  avg_price: number | null;
+  current_price: number | null;
+  unrealized_pnl: number | null;
+  unrealized_pnl_pct: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+}
+
+export interface EodDigestStrategyKnobs {
+  stop_loss_pct: number | null;
+  take_profit_pct: number | null;
+  max_position_pct: number | null;
+  max_trade_notional_pct: number | null;
+}
+
+export interface EodDigestStrategy {
+  stance: string | null;
+  rationale_excerpt: string | null;
+  key_knobs: EodDigestStrategyKnobs;
+  changed: boolean;
+}
+
+export interface EodDigestRegime {
+  label: string | null;
+  index_kospi_chg_pct: number | null;
+  index_kosdaq_chg_pct: number | null;
+  // FI-2/FI-3: SC-3's scan breadth (% of the day's universe the discovery
+  // scan actually completed, 0-100) -- backend now forwards this
+  // (eod_digest.py::_build_regime_section), null when no breadth was
+  // recorded for the snapshot (e.g. discovery never ran that day).
+  scan_coverage_pct?: number | null;
+}
+
+// FI-3: mirrors eod_digest.py::_build_discovery_section's promoted-row
+// shape verbatim (ticker/name/composite_score/top_strategy_tag).
+export interface EodDigestDiscoveryPromoted {
+  ticker: string | null;
+  name: string | null;
+  composite_score: number | null;
+  top_strategy_tag: string | null;
+}
+
+// FI-3: mirrors _build_discovery_section's prev_day summary (yesterday's
+// candidates' fwd_1d forward-return backfill status).
+export interface EodDigestDiscoveryPrevDay {
+  trade_date: string | null;
+  candidate_count: number;
+  fwd_1d_filled_count: number;
+  // Raw fraction (e.g. 0.0123 == +1.23%), NOT pre-scaled like
+  // cumulative_return_pct -- see eod_digest.py/ledger.py's
+  // `(price / close_price) - 1.0`. Render with an explicit *100, do not
+  // reuse fmtPct() as-is.
+  avg_fwd_1d: number | null;
+}
+
+export interface EodDigestDiscovery {
+  promoted: EodDigestDiscoveryPromoted[];
+  skip_counts: Record<string, number>;
+  total_candidates: number;
+  prev_day: EodDigestDiscoveryPrevDay | null;
+}
+
+export interface EodDigest {
+  trade_date: string | null;
+  watch: EodDigestWatchItem[];
+  account: EodDigestAccount;
+  holdings: EodDigestHolding[];
+  strategy: EodDigestStrategy | null;
+  regime: EodDigestRegime | null;
+  // Only present when GET /eod-report's manual POST /run path computed it
+  // (_compute_staleness_note) -- absent on the normal market-close chain's
+  // digest, and always absent/null when strategy+regime are both current.
+  staleness_note?: string | null;
+  // FI-3: build_eod_digest (backend) always includes this key going
+  // forward (DS-5), but report_json rows persisted before DS-5 landed
+  // simply lack it -- optional (not just nullable) so those old rows still
+  // type-check; the renderer treats missing exactly like null (block
+  // hidden, "기존 불변" per the FI-3 brief).
+  discovery?: EodDigestDiscovery | null;
+  error?: string;
+}
+
+// FI-4: mirrors GET /trading/discovery/candidates row shape verbatim
+// (backend app/api/routes/trading.py::DiscoveryCandidateResponse). This is
+// the dedicated ledger page's per-row shape -- broader than FI-3's
+// EodDigestDiscoveryPromoted (which only carries the EOD digest's promoted
+// summary fields), since the ledger page also needs skip_reason/rank/
+// regime_label/close_price/the full fwd_1d/5d/20d triple for ANY row
+// (promoted or skipped), not just today's promotions.
+export interface DiscoveryCandidate {
+  id: string | null;
+  trade_date: string | null;
+  ticker: string | null;
+  name: string | null;
+  composite_score: number | null;
+  top_strategy_tag: string | null;
+  regime_label: string | null;
+  rank: number | null;
+  promoted: boolean;
+  skip_reason: string | null;
+  close_price: number | null;
+  // Raw fractions (e.g. 0.0123 == +1.23%), same convention as
+  // EodDigestDiscoveryPrevDay.avg_fwd_1d -- render with an explicit *100
+  // (see PerformancePanel.tsx/DiscoveryLedgerPanel.tsx's local fmtFwdPct),
+  // never reuse fmtPct() as-is.
+  fwd_1d: number | null;
+  fwd_5d: number | null;
+  fwd_20d: number | null;
+}
+
+export interface DiscoveryCandidatesResponse {
+  candidates: DiscoveryCandidate[];
+  // Row count on THIS page, not the total match count (mirrors
+  // GET /trading/watch-list's `count` convention -- see FI-2 report).
+  count: number;
+}
+
+// FI-4: mirrors GET /trading/discovery/performance's per-tag bucket
+// (backend DiscoveryPerformanceBucket).
+export interface DiscoveryPerformanceBucket {
+  candidates: number;
+  promoted: number;
+  // Raw fractions, same fmtFwdPct convention as DiscoveryCandidate.fwd_1d.
+  avg_fwd_1d: number | null;
+  avg_fwd_5d: number | null;
+  // Raw fraction (e.g. 0.5 == 50% of promoted-then-tracked rows finished
+  // fwd_5d positive) -- render as `(n * 100).toFixed(0)}%`.
+  hit_rate_5d: number | null;
+}
+
+export interface DiscoveryPerformanceResponse {
+  days: number;
+  by_strategy_tag: Record<string, DiscoveryPerformanceBucket>;
+}
+
+export interface EodReportResponse {
+  trade_date: string;
+  created_at: string;
+  // Absent on report rows saved before E3-2 landed (pre-digest schema).
+  digest?: EodDigest | null;
+  narrative?: string | null;
+}
+
+// GET /api/trading/discovery/us-signal -- backend app/api/routes/trading.py UsSignalResponse
+export interface UsSignalComponent {
+  ticker: string;
+  weight: number;
+  change_pct: number | null; // 이미 퍼센트(Finnhub dp)
+}
+export interface UsSignalCurationItem {
+  ticker: string;
+  name: string;
+  signal_type?: string | null; // "memory" | "accel" (v2 서브신호 배지)
+}
+// v2: overall과 별도 산출되는 memory/accel/demand 서브신호. components는
+// {ticker: change_pct}(이미 퍼센트, weight 아님) -- overall의 UsSignalComponent[]와 shape 다름.
+export interface UsSubSignal {
+  signal: number | null;
+  signal_pct: number | null;
+  components: Record<string, number>;
+}
+export interface UsSignalResponse {
+  enabled: boolean;
+  as_of: string | null;
+  signal_pct: number | null;
+  signal: number | null;
+  components: UsSignalComponent[];
+  computed_at: string | null;
+  curation: UsSignalCurationItem[];
+  sub_signals?: { memory?: UsSubSignal; accel?: UsSubSignal; demand?: UsSubSignal } | null;
+}
+
+/** GET /api/trading/pnl-summary — 버킷별 평가금 수익률의 한 칸. */
+export interface PnlSummaryEquityReturn {
+  pct: number;
+  /** 분모 출처: 기간 시작 직전 종가 / 기준자산 */
+  basis: 'prior_close' | 'base_asset';
+  /**
+   * 이 수익률의 분자(end_equity)를 만든 스냅샷의 거래일 (YYYY-MM-DD).
+   * 장중에는 오늘자 스냅샷이 아직 없어 직전 영업일 종가 기준이므로, 화면에
+   * 함께 표시해 "이 %가 언제 것인지" 드러낸다.
+   */
+  trade_date: string;
+}
+
+/**
+ * GET /api/trading/pnl-summary.
+ *
+ * `realized`(브로커 ka10074)와 `equity_return`(로컬 스냅샷)은 독립 소스라
+ * 각각 null이 될 수 있고, 그때 `errors`에 사유가 담긴다. 미실현손익은 이
+ * 응답에 없다 — PositionsPanel이 이미 가진 /operations 데이터에서 합산한다.
+ */
+export interface PnlSummaryResponse {
+  realized: Record<string, number> | null;
+  equity_return: Record<string, PnlSummaryEquityReturn> | null;
+  as_of: string;
+  errors: Record<string, string>;
 }

@@ -7,7 +7,7 @@ Currently supports Naver News API with caching layer.
 
 from .base import NewsProvider, NewsArticle, NewsSearchResult, QuotaExceededError, NewsProviderError
 from .naver import NaverNewsProvider
-from .service import NewsService
+from .service import NewsService, create_news_service
 from .sentiment import NewsSentimentAnalyzer, NewsSentimentResult, analyze_stock_news_sentiment
 
 __all__ = [
@@ -18,6 +18,7 @@ __all__ = [
     "NewsProviderError",
     "NaverNewsProvider",
     "NewsService",
+    "create_news_service",
     "NewsSentimentAnalyzer",
     "NewsSentimentResult",
     "analyze_stock_news_sentiment",

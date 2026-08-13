@@ -1,0 +1,829 @@
+# 2026-08-12(수) 아침 관측 런북
+
+> 작성: 2026-08-11 17:20 · **갱신: 2026-08-13 09:45**.
+> **이 문서는 다음 세션이 이어받기 위한 것이다.**
+> 전 세션의 감시(Monitor)·예약(cron)·컨텍스트는 세션 종료와 함께 사라졌다.
+>
+> ## ⭐ 2026-08-13 EOD — **축소가 멈췄고, 패널이 원인을 스스로 규명했다**
+>
+> ### ① 판정: 단방향 축소 루프가 **아니다**
+>
+> `vol_multiplier_min` **0.3 유지**(5거래일 만에 처음 안 내려감). `risk_officer`가 0.25를
+> 제안했으나 합의에서 기각. 그리고 **세 패널리스트가 독립적으로** 4일간의 관측을
+> 기계적으로 설명했다:
+>
+> ```
+> m_vol_unclamped = target_vol_pct / 실현변동성 = 22.0 / 97.33 = 0.2260
+>                 < vol_multiplier_min 0.30   →  m_vol이 하한에 고정된 구간
+> ```
+>
+> **이 구간에서 `target_vol_pct`는 무력하다.** 아무리 내려도 `m_vol`은 1bp도 안 변하고,
+> 29.20 위로 **올려야** 풀린다. 그런데 EOD 1회 상대이동 한도 25%로 22.0 → 최대 27.5까지만
+> 가능하다. → **이번 회차에 `target_vol_pct` 조정은 완전 무효.** 그래서 제안 자체를 안 했다.
+>
+> 유지한 이유도 명시적이다: *"엔진 목표가 이미 8.01% → 6.81%로 **자동 축소 중**이라
+> 방어를 더 얹으면 **이중 계상**"*. 0.30 유지 시 수렴 6.43%, 0.25면 5.0%, 0.20이면 4.38%.
+>
+> ⭐ **내가 4일간 "레짐 라벨이 결과에 도달 못 한다"고 관측하던 것의 정확한 원인이다.**
+> 라벨이 아니라 **실현변동성 97.33%가 m_vol을 하한에 붙여놨기 때문**이고, 그 상태에서는
+> 레짐이 무엇이든 결과가 같다. 패널이 먼저 찾았다.
+>
+> **실현변동성 연율 97.33%** = 일간 σ **6.13%**. 그래서 손절을 넓혔다:
+>
+> | 노브 | 08-12 | **08-13** | 근거 |
+> |---|---|---|---|
+> | `vol_multiplier_min` | 0.30 | **0.30 유지** | 이중 계상 회피 |
+> | `stop_loss_pct` | 0.075 | **0.085** | 7.5%는 1.22σ — 노이즈에 털린다 |
+> | `take_profit_pct` | 0.0925 | **0.09** | |
+> | `consensus_threshold` | 0.72 | **0.75** | 08-12 0승 4패 + fundamental 정확도 **0.000** |
+> | `max_position_pct` | 0.0275 | **0.02625** | |
+> | `min_cash_ratio` | 0.35 | **0.375** | |
+> | `max_trade_notional_pct` | 8.0 | **7.0** | |
+>
+> 🔴 **다음 관측**: 목표는 여전히 8.01% → **6.81%**로 내려간다. 노브가 아니라 **ramp 수렴**
+> 때문이다. 축소가 멈춘 것이 아니라 **패널이 개입해 멈춘 것**이다. 실현변동성이 60% 아래로
+> 내려오면 패널이 `vol_multiplier_min` 복원을 검토하겠다고 명시했다 — 그날을 기다린다.
+>
+> ### ② 승격 게이트 재료 주입 첫 EOD — 2/3 성공
+>
+> | 확인 | 기준 | 실측 | |
+> |---|---|---|---|
+> | top-25 `per`/`pbr` | 채워짐 | **25/25** | ✅ |
+> | `llm_rationale`·`llm_confidence` | 채워짐 | **25/25** | ✅ |
+> | `news_count` | 일부 >0 | **0/25** | 🔴 |
+> | `skip_reason market_warning:%` | 없어도 정상 | 0건 (조회 자체가 429로 실패) | ⚠️ |
+>
+> ⭐ **밸류에이션 무시가 실증됐다.** 승격 1종 = **NHN 181710, PER 69.89**.
+> `llm_rationale`: *"모멘텀 0.80으로 강한 상승 추세와 유동성(0.556)이 종합 점수 문턱을
+> 상회하며, NHN의 **웹툰·게임·결제 사업 성장 기대**가 주가를 뒷받침"* — 지표가 아니라
+> 사업을 봤고, PER 69.89를 이유로 반려하지 않았다. U3 프롬프트 교체가 의도대로 작동한다.
+> (대조: rank 2 자이에스앤디 PER 13.05는 승격 안 됨. 그 종목이 5거래일 −32.48% 낸 그 종목이다.)
+>
+> ### 🔴 새 결함 2건 (둘 다 어제 내가 만든 것)
+>
+> **1. 뉴스 주입이 한 번도 작동한 적이 없다**
+> ```
+> 07:37:02.397 discovery_news_service_unavailable
+>   error="cannot import name 'create_news_service' from 'services..."
+> ```
+> `services/news/__init__.py`가 `create_news_service`를 export하지 않는다(실제 위치는
+> `services/news/service.py:242`). **잘못된 import가 두 곳** — `discovery/orchestrator.py:292`
+> (어제 배포, 오늘 실패의 원인)와 `reports/collect.py:116`(오늘 만든 것, **같은 버그**).
+> 두 테스트 모두 `fetch`를 **목으로 주입**해서 이 버그를 못 잡았다.
+> ⭐ **교훈: 팩토리가 `None`을 돌려주는 fail-open 경로는 목으로 검증되지 않는다.**
+>
+> **2. 토스 시장경보가 429로 전멸**
+> ```
+> 07:37:02.885 → .935 → 03.017   (50~80ms 간격 = 약 15~20 req/s)
+> /api/v1/stocks/375500/warnings returned 429   × 13건
+> ```
+> `enrich_fundamentals`에는 `min_interval=1.0`을 넣었는데 **`enrich_warnings`에는 간격
+> 제어를 아예 안 넣었다.** fail-open이라 발굴은 멈추지 않았지만 **오늘 시장경보 하드
+> 차단이 작동하지 않았다** — 정리매매 종목이 있었다면 걸러지지 않았다.
+>
+> ### ③ fwd 따라잡기 — 작동하지만 상한에 걸린다
+>
+> ```
+> 08-05  fwd_1d:  0 → 48   ✅ 따라잡기 발동
+> 07-30  fwd_5d:  0 → 0    ❌ 그대로
+> ```
+> `catchup_limit=50`에 정확히 걸렸다(48건). 08-05가 한도를 다 쓰고 07-30 차례가 오지 않았다.
+> **회복에 여러 EOD가 걸린다.** 내가 스펙에 넣은 상한인데 회복 속도를 예상하지 못했다.
+> `fwd_20d`는 여전히 0 — 첫 도달은 **08-19경**이 정상이다.
+>
+> ### ④ 그 외
+> PID **82180** · `mode=active` · Traceback **0** · **오늘 체결 0건**
+> Kiwoom `유량` 초과 26건이 있었으나 `discovery_fundamentals_failed` 0건 — 재시도로 복구.
+>
+> ---
+>
+> ## ✅ 2026-08-13 개장 점검 — 전 항목 합격 (예약 알람 2건 모두 종료)
+>
+> | 시각 | 항목 | 결과 |
+> |---|---|---|
+> | 08:10 | 생존 · agent-chat · 레짐 · 손절 | ✅ PID **82180** 9h11m 무중단 · `agent_chat=True` · Traceback 0 |
+> | 09:35 | 🔴 09:30 재수집 첫 실행 | ✅ **합격** — §index_daily 판정 절 참조 |
+>
+> ⭐ **토스 연동의 두 목적이 하루에 둘 다 실증됐다** — 지연 해소는 **08:05**에,
+> 진행 봉 차단은 **09:30**에. `index_series_lagging`은 이제 뜨지 않는다(로그 0건).
+>
+> **08-13 레짐**: `bull` 0.78 · `degraded=[]` · **목표 노출도 8.01%** (08-12 11.99%에서 하락).
+> 어제 EOD에서 패널이 `vol_multiplier_min`을 0.4→**0.3**으로, 종목당 상한을 **0.0275**로
+> 스스로 조인 결과다. **레짐 4일 관측: 15.38% → 15.10% → 11.99% → 8.01% — 라벨과 무관하게 단조 감소.**
+>
+> **관측 3건 — 08-12 EOD 기준 전부 진전**:
+> ① 방어 매도 억제 → 🟡 **분모 1건 생김**(손절 실발동), 관문은 여전히 미시험(이유 규명됨)
+> ② 패널 노출도 역학 → ✅ **정보를 줬다** (3배 선택지를 보고 오히려 조임)
+> ③ `index_daily` 지연 → ✅ 규명·배포 완료, 08-13 09:35 첫 판정
+>
+> **08-12 실매매**: 13:25 316140 손절 청산 549주(실현 **−149,716**) → 13:37 086790 신규 51주.
+> agent-chat 재가동(11:04) 후 2시간 21분 만의 첫 실매매다.
+>
+> ### 2026-08-12에 일어난 일
+>
+> 🔴 **11:04 — agent-chat 엔진이 3거래일간 꺼져 있던 것을 발견·복구.**
+> 원인은 08-11 테스트 스위트의 라이브 DB 오염(**함정 2번**). 개장 후 2시간 4분간 토론 0건이었고
+> 손절만 돌고 있었다. 재기동 체크리스트에 agent-chat이 없던 것이 화근 — **§0-A에 추가했다.**
+> 이후 `max_concurrent`를 3→**10**으로 올리고 영속화(재기동 후 복원 확인).
+>
+> **배포 2건** (둘 다 라이브·TDD·회귀 0):
+>
+> | 커밋 | 내용 | 상태 |
+> |---|---|---|
+> | `f5af713` (12:21) | 지연 경고 래치 + 저하 태그 사람말 번역 | ✅ **실증 완료** — 42건/4h → 1건/17분 |
+> | `259ab7a` (12:46) | 09:30 재수집 + 당일 진행 봉 제외 | ✅ **08-13 09:30 첫 실행 합격** — 진행 봉 1행 실제 제외 |
+> | `948e9ea` | 라이브 DB 가드 (autouse 리다이렉트) | ✅ 회귀 0 · 위반 테스트 **16개** 적발 |
+> | `04fec8b`+`32a6db3` | Telegram·Kiwoom 엔드포인트 가드 | ✅ 회귀 0 · Kiwoom 접속 **39건** 차단 |
+> | `75cf5e6`+`06d0c07` | fwd 슬롯 따라잡기 + 일봉 배선 | ✅ 라이브 (22:59 재기동, PID **82180**) |
+> | `7c0f87c`~`1470055` | 승격 게이트 재료 주입(U1~U5) + 토스 연동(T1~T3) | ✅ 라이브 · 회귀 0 · **라이브 DB에 `toss:KOSPI` 39행 실수집 확인** |
+> | `b4b71f1` | 승격 게이트 스펙(펀더멘탈+뉴스) | 📄 설계만 — 구현 계획 대기 |
+> | `f0c37a0` | 토스증권 Open API 조사 | 📄 `docs/TOSS_OPENAPI_GUIDE.md` |
+>
+> ⭐ 가드 작업이 두 가지를 드러냈다: **워크트리 규칙은 Kiwoom을 막지 못했고**(URL이 코드에
+> 하드코딩), **teardown보다 오래 사는 폴링 태스크**는 function 스코프 가드를 우회한다.
+>
+> **예약 알람**(세션 전용 — 세션이 끊기면 사라진다. 그때는 이 문서가 대신한다):
+> ~~`c1a0ff15` 08-12 16:40 EOD~~ · ~~`ad8f7ac1` 08-13 08:10~~ · ~~`a94f4424` 08-13 09:35~~ — **3건 모두 소진**
+> (`6159351a` 15:40 EOD는 1시간 일러 헛돌았다 — 아래 §EOD 타이밍)
+>
+> ⚠️ **08-13 이후로 예약된 알람이 없다.** 다음 관측이 필요하면 새로 걸어야 한다.
+> 다음 거래일 = **08-14(금)** · **08-18(화)**. **08-17(월)은 대체공휴일 휴장.**
+
+---
+
+## 0-A. ✅ 시스템은 **기동되어 있다** (2026-08-12 12:46 재기동 완료)
+
+이 절은 *재시작이 필요할 때*를 위한 참조다. 08-12에 배포로 두 번 재시작했다
+(12:21 `f5af713`, 12:46 `259ab7a`). **장중 재시작 공백은 각각 5초·11초**였다.
+
+| 확인 | 2026-08-12 12:46 실측 |
+|---|---|
+| 백엔드 | **PID 28626** · 포트 8000 · `259ab7a` · 로그 `debug/backend-20260812-1246.log` |
+| 프론트엔드 | 포트 5173 · HTTP 200 · 프록시 → 127.0.0.1:8000 (PID 2977, 08-11 17:49부터 무중단) |
+| 복원 | `Restored 5 positions, 7 queued trades, 48 watched stocks, daily_count=0` |
+| 손절가 5종 | 전부 아래 §0-B 값과 일치 |
+| 달력 | `untrusted_years=[]` · 08-15 광복절 + **08-17 대체공휴일** 둘 다 등록 |
+| 노브 | 종목당 0.03 · `max_open_positions` **7** · `target_vol_pct` 22.0 · `vol_multiplier_min` 0.4 |
+| 모드 | `mode=active` · Traceback 0건 |
+| **agent-chat** | ✅ `agent_chat=True trading=True` · `max_concurrent=10` 복원 |
+| **신규 스케줄러** | ✅ `index_refresh_scheduler_started hour=9 minute=30` → `index_refresh_scheduler_wired` |
+| LLM 라우터 | openrouter ✅ / claude_cli ✅ / codex_cli ❌ |
+
+⚠️ 리스닝까지 **5~40초**. 그 전의 `curl`은 `HTTP 000`을 돌려준다 — 죽은 것이 아니다.
+`Uvicorn running`을 로그에서 확인할 것(08-11엔 37초, 08-12엔 5초·11초 걸렸다).
+
+### 🔴 재기동 후 반드시 확인 — 엔진은 **둘**이다
+
+`mode=active`는 **trading 엔진**만 말한다. 자율매매의 토론·의결은 **agent-chat**이라는
+별개 엔진이고, 부팅 자동 재개도 **따로** 판정된다. 한쪽만 보면 절반을 놓친다.
+
+```bash
+grep -a "boot_auto_resume_complete" debug/backend-*.log | tail -1
+#   합격: agent_chat=True trading=True   ← 둘 다 True여야 한다
+curl -s http://127.0.0.1:8000/api/agent-chat/status | python3 -m json.tool
+#   합격: "is_running": true · "check_interval_minutes": 1   (5면 테스트 오염, 함정 2번)
+```
+
+`agent_chat=False`면 **body 없이** 시작한다(body를 주면 현재 값을 덮어쓴다):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/agent-chat/start -H "Content-Type: application/json"
+```
+
+⚠️ **꺼져 있어도 손절은 돈다** — RiskMonitor는 trading 엔진 쪽이다. 그래서 증상이
+"주문이 안 나간다"뿐이고, 포지션을 보고 있으면 정상으로 보인다. 2026-08-12에 개장 후
+**2시간 4분** 동안 토론 0건이었는데 손익 화면은 멀쩡했다.
+
+### 기동 명령 (재시작이 필요할 때)
+
+```bash
+cd /Users/sunghoonk/Workspaces/JonberAITrading/backend && \
+nohup /Users/sunghoonk/anaconda3/envs/agentic-trading/bin/python run_dev.py \
+  > ../debug/backend-$(date +%Y%m%d-%H%M).log 2>&1 &
+```
+
+⚠️ **conda 인터프리터를 절대 경로로 쓸 것.** `python run_dev.py`는 base 환경을 타서
+`ModuleNotFoundError: uvicorn`으로 죽는다. 2026-08-11 장중에 이걸로 1분간 무방비가 됐다.
+
+프론트엔드(필요시): `cd frontend && npm run dev` (포트 5173)
+
+**기한: 2026-08-12 08:05 전.** 그때 레짐 판정 사이클이 돌고 09:00에 개장한다.
+장이 닫혀 있는 동안은 포지션이 안 움직이므로 보호 공백은 생기지 않는다.
+
+### 기동 후 확인
+
+```bash
+grep -aE "Restored .* positions|holiday_service_initialized|Traceback" debug/backend-*.log | tail -3
+curl -s http://127.0.0.1:8000/api/trading/positions | python3 -m json.tool
+```
+
+| 확인 | 합격 |
+|---|---|
+| 복원 로그 | `[Coordinator] Restored 5 positions, ... daily_count=3` |
+| 달력 | `holiday_service_initialized ... untrusted_years=[]` |
+| 기동 오류 | `Traceback` 0건 |
+| 손절가 5종 | **§0-B 표를 볼 것** — 이 자리에 있던 `316140 31,154`는 08-12 13:25 청산으로 **폐기됐다** |
+| 모드 | `mode=active` |
+
+> ⚠️ **손절가 목록은 한 곳에만 둔다(§0-B).** 이 표에 값을 복사해 두면 로테이션이
+> 일어난 다음날 낡은 값과 대조하게 된다 — 실제로 08-13 09:35 알람이 이미 없는
+> `316140 31,154`를 기대값으로 들고 있었다.
+
+### ✅ 028670 수량 — **불일치는 없었다 (이 문서의 최초 서술이 오경보였다)**
+
+이 문서는 처음에 "스냅샷 3,115 vs **브로커 3,470**"이라고 적었다. **틀렸다.**
+2026-08-11 17:55에 브로커를 직접 조회해 확인한 결과:
+
+| 출처 | 수량 |
+|---|---|
+| 브로커 실조회 (`/api/kr_stocks/positions` → `get_account_balance()`, kt00004) | **3,115** |
+| 원장 `kr_stock_trades` 체결 누적 (buy 18행, sell 0) | **3,115** |
+| 코디네이터 스냅샷 | **3,115** |
+
+**세 숫자가 전부 같다.** 3,470은 3,115 **+** 355를 더해 만든 숫자였는데, 그 355주는
+**이미 3,115 안에 포함**돼 있었다 — 즉 이중 계상이다.
+
+원장이 16:35 체결의 정체를 설명한다:
+
+| 시각 | 주문 | 주문량 | 체결 |
+|---|---|---|---|
+| 09:07:47 | `0018558` | 207 | **61** (부분) |
+| 16:35:05 | `0018558` | — | **146** (잔량 — 61+146=207 완결) |
+| 16:35:05 | `0018653` | 209 | 209 (별개 신규 주문) |
+
+146은 오전 주문의 잔량 체결이고 209는 별개 주문이다. 둘 다 정상이며 누적에 이미 반영돼 있다.
+
+⚠️ **따라서 리컨실러가 조용한 것은 정상이다** — 교정할 드리프트가 없다.
+`_queue_scheduler_loop`(coordinator.py:4845)는 장중 게이트가 없어 마감 후에도 30초마다 돌고
+2틱마다 `reconcile()`을 부르지만, `_fix_positions`는 `quantity != broker_qty`일 때만 로그를 남긴다.
+
+**교훈: 원장 합을 브로커 잔고에 "더하지" 말 것.** 원장 누적은 이미 잔고 그 자체다.
+불일치를 주장하려면 브로커를 **직접 조회**해 대조해야 한다 — 위 표의 세 줄이 그 방법이다.
+
+---
+
+## 0-B. 라이브 상태 (2026-08-13 09:39 실측) — **여기가 손절가의 유일한 출처다**
+
+| 항목 | 값 |
+|---|---|
+| 프로세스 | **PID 82180** (08-12 22:59 기동, 09:39 기준 10h40m 무중단) · 포트 8000 |
+| 코드 | **`c9e35ad`** · 브랜치 `read-trading-prompt-dgm5U` (origin 동기화 완료) |
+| 모드 | `mode=active` · `daily_trades` **0**/10 · 08-13 체결 **0건** (09:39 현재) |
+| 포지션 | **5종** — 004370(25) · 028670(3,115) · 030000(739) · 086790(51) · 207940(7) |
+| agent-chat | `running=true` · `check_interval=1` · **`max_concurrent=10`** · 개장 후 `starting_discussion` **25건** |
+| 오늘 목표 | `effective_target_pct` **8.01%** (bull, 신뢰 78%) · `degraded=[]` |
+| 노브 | 종목당 **0.0275** · 슬롯 7 · `target_vol_pct` **22.0** · `vol_multiplier_min` **0.3** |
+| 로그 | `debug/backend-20260812-2259-toss.log` · Traceback 0 |
+
+### 🔴 손절가 5종 (2026-08-13 09:39)
+
+| 종목 | 수량 | 현재가 | **손절** | 여유 |
+|---|---|---|---|---|
+| 004370 | 25 | 392,500 | **351,075** | +11.8% |
+| 028670 | 3,115 | 5,830 | **5,520** | +5.6% |
+| 030000 | 739 | 18,810 | **17,765** | +5.9% |
+| 086790 | 51 | 131,500 | **118,496** | +11.0% |
+| 207940 | 7 | 1,559,000 | **1,404,840** | +11.0% |
+
+⚠️ **`316140 31,154`는 폐기됐다.** 08-12 13:25에 전량 청산됐는데 이 문서 §0-A와
+08-13 09:35 알람이 그 값을 기대값으로 들고 있었다. **손절가를 두 곳에 적지 말 것** —
+로테이션 다음날 반드시 어긋난다.
+
+**08-12 로테이션 실측** (`kr_stock_trades` / `kr_realized_pnl`):
+
+```
+13:25~13:26  316140  SELL 549주 @33,106~33,150  net −198,860 (진입 33,406)
+13:37~13:38  086790  BUY   51주 @128,200
+```
+
+086790은 08-13 09:39에 131,500 — **+2.6%**. 316140 손실은 아직 회수 전이다.
+
+⚠️ **PID는 재시작하면 바뀐다.** `pgrep -f "agentic-trading/bin/python run_dev.py" | head -1`
+(`ps|grep|awk`는 여러 줄을 반환해 `kill`이 실패한다 — **함정 3번**).
+
+### ✅ 레짐 라벨이 결과에 도달하지 못한 이유 — **08-13 EOD에 규명됐다**
+
+| 일자 | 레짐 | anchor | `vol_multiplier_min` | **eff** |
+|---|---|---|---|---|
+| 08-10 | bull | 0.80 | 0.5 | 15.38% |
+| 08-11 | bear | 0.55 | 0.5 | 15.10% |
+| 08-12 | **bull** | 0.80 | 0.4 | **11.99%** |
+| 08-13 | **bull** | 0.80 | **0.3** | **8.01%** |
+| 08-14 | — | — | **0.3 유지** | **6.81%** (예정) |
+
+⭐ **원인은 라벨이 아니라 `m_vol` 하한 고정이었다.** 08-13 EOD에서 패널 셋이 독립적으로
+같은 계산에 도달했다:
+
+```
+m_vol_unclamped = target_vol_pct / 실현변동성 = 22.0 / 97.33 = 0.2260
+                < vol_multiplier_min 0.30      →  하한에 고정
+```
+
+이 구간에서는 **레짐이 무엇이든 결과가 같다** — `target_vol_pct`를 내려도 `m_vol`이
+안 변하고(29.20 **위로** 올려야 풀린다), EOD 1회 이동 한도 25%로는 22.0 → 27.5까지가
+전부라 오늘 조정은 무효다. 실현변동성 97.33%가 정상화되기 전에는 레짐 채널이 닫혀 있다.
+
+🔴 **08-13에 축소는 멈췄다**(`vol_multiplier_min` 유지, 5거래일 만에 처음). 다만 목표는
+ramp 수렴 때문에 8.01% → **6.81%**로 계속 내려간다. **멈춘 것은 노브이지 목표가 아니다.**
+
+**다음 관측**: 패널이 명시한 복원 조건 — **실현변동성 60% 아래 + breadth 양전환**.
+그날 `vol_multiplier_min`이 올라가는지가 레짐 채널이 다시 열리는 신호다.
+설계 문서가 예고한 "램프가 먼저 묶어 앵커가 구속 조건이 안 된다"가 관측으로 확인된 것이다.
+
+---
+
+## 🟡 관측 ① — 방어 매도 재제출 억제: **분모가 생겼다, 관문은 아직 미시험** (2026-08-12)
+
+**08-12 13:25에 손절이 실제로 발동했다** — 배포(`9485c44`) 후 첫 분모다.
+
+```
+13:25:19  position_event  event_type=stop_loss_hit  ticker=316140
+          [OrderAgent] Executing order: sell 549 @ 33,100 → 3분할
+          Order 2c609ed2: 0/183 · 207a60a4: 0/183 · 9d109d34: 0/183   ← 전부 미체결
+          [Coordinator] SELL for 316140 did not fill — position retained
+13:25:31  position_removed / position_closed  reason=stop_loss
+13:25:59  실제 체결 92+183+183+91 = 549주 전량 (실현 −149,716)
+```
+
+| | |
+|---|---|
+| 분모(손절 발동) | **1건** |
+| `defensive_sell_suppressed` | 0 |
+| `800033` | 0 |
+
+**관문이 안 걸린 이유가 설명된다**: 첫 주문 3건이 전부 미체결됐지만 코디네이터가
+**즉시 `position_removed`** 해서 **재발동 조건 자체가 생기지 않았다.** 미체결 잔량은
+추적에 등록됐고 40초 뒤 체결됐다. 08-10 사고(부분체결 → 축소 수량으로 재등록 → 재발동)와는
+경로가 다르다.
+
+### 🔴 이 관측에서 밟은 함정 — grep 패턴이 실제 문구와 달랐다
+
+이 문서는 분모를 `"Stop-loss triggered"`로 세라고 적어 왔다. **그런 문구는 없다.**
+실제는 `event_type=stop_loss_hit`이다. 08-12에 그것으로 세다가 **분모 0**을 관측하고
+"미시험"으로 보고할 뻔했다 — 실제로는 손절이 발동한 날이었다.
+
+**올바른 패턴**:
+```bash
+grep -ac "stop_loss_hit"        # 손절 발동
+grep -ac "take_profit_hit"      # 익절 발동
+grep -ac "auto_executing_event" # 실제 실행(발동 ≠ 실행)
+grep -ac "did not fill"         # 미체결 → 재제출 시나리오의 입구
+```
+⚠️ `stop_loss_hit` 2건 vs `auto_executing_event` 1건처럼 **발동과 실행 건수가 다르다.**
+둘을 함께 세야 한다.
+
+---
+
+## (원본) 관측 ① — 방어 매도 재제출 억제
+
+**배포**: 2026-08-10 (`9485c44`). **이틀째 미검증.**
+
+2026-08-10 09:00에 089860 익절이 부분체결되자, 축소된 수량으로 재등록된 포지션이 즉시 재발동했는데 그 수량은 미체결 주문이 이미 예약하고 있어 `800033 매도가능수량 부족`으로 거부됐다. 세 관문(G1 보유 없음 · G2 미체결 SELL · G3 30초 쿨다운)을 넣었다.
+
+### 신호 읽는 법 — 침묵을 성공으로 읽지 말 것
+
+```bash
+L=/Users/sunghoonk/Workspaces/JonberAITrading/debug/backend-lunar-20260811.log
+for p in defensive_sell_suppressed defensive_sell_stale_pending_ignored 800033 \
+         "Stop-loss triggered" "Take-profit triggered"; do
+  echo "$p: $(grep -ac "$p" "$L")"
+done
+```
+
+| 신호 | 읽는 법 |
+|---|---|
+| `defensive_sell_suppressed` (reason=`no_position`\|`pending_sell`\|`cooldown`) | ✅ **관문 발동 — 유일하게 "작동한다"를 증명하는 신호** |
+| `defensive_sell_stale_pending_ignored` | 🔴 180초 창에 걸린 주문. **`ord_no` 기준 `sort -u`로 셀 것**(래치가 있어 에피소드당 1줄) |
+| `800033` 재발 | 관문을 우회한 경로가 있다는 뜻. 발동 직전 로그와 함께 볼 것 |
+| **손절/익절 발동 건수** | **분모.** 이게 0이면 관문 신호가 0인 것에 아무 의미가 없다 |
+
+⚠️ **판정 규칙**: 관문 신호가 0줄이고 분모도 0이면 **"잘 되고 있다"가 아니라 "아직 시험되지 않았다"** 로 보고할 것. 관문 발동 조건(방어 매도 → 부분체결 → 재발동)이 안 오면 로그는 성공했을 때와 **글자 하나까지 같다.**
+
+2026-08-11 실적: 손절 0 / 익절 0 / `800033` 0 → **정보 없음.**
+
+### 알려진 잔여 위험
+
+`defensive_sell_stale_pending_ignored`가 뜨면 그 종목은 최대 180초간 방어가 억제될 수 있다. 근본 해결은 `ka10075`를 `fill_tracker`에 배선해 `CANCELLED`를 실제로 대입하는 것(백로그).
+
+---
+
+## ✅ 관측 ② — 전략 패널의 노출도 역학: **정보를 줬다** (2026-08-12 16:43 첫 관측)
+
+| | 08-10 | 08-11 | **08-12** |
+|---|---|---|---|
+| stance | aggressive | defensive | **defensive** (합의 0.70) |
+| `vol_multiplier_min` | 0.5 | 0.4 | **0.3** |
+| 종목당 상한 | 0.0375 | 0.03 | **0.0275** |
+| 슬롯 | 10 | 10 | **8** |
+| 수렴 목표 | 15.0% | 10.0% | **≈6~7%** |
+
+역학 블록은 `by_vol_multiplier_min` 격자에 **0.8(수렴 44%, 현재의 3배)** 을 중립적으로 실었다.
+패널은 그것을 보고 **세 노브를 전부 조였다.**
+
+🔴 **판정: 유혹이 아니라 정보였다.** 08-11에 우려한 방향("블록이 44% 선택지를 쥐여줘
+노출도를 3배로")의 **정반대**다. 3배 선택지를 명시적으로 보여줘도 패널은 더 방어적으로 갔다.
+
+**블록이 실제로 실렸다는 근거**: `_exposure_mechanics`는 `build_strategy_context`에서
+무조건 호출되고(`strategy_panel.py:611`), 실패할 때만
+`[StrategyPanel] exposure mechanics failed`를 남긴다 — **그 경고가 0건**이다.
+⚠️ 성공 시엔 로그가 없다. "`exposure_mechanics` 검색 0건"을 "안 들어갔다"로 읽지 말 것 —
+**실패 로그의 부재가 성공의 증거**인 구조다.
+
+**남은 관측**: 1회 관측이다. 패널이 계속 조이면 목표가 6% 아래로 갈 수 있다.
+노브 1회당 ±25% 제한이 있으니 0.3→0.225가 다음 하한이다. **어디서 멈추는지**가 다음 질문이다.
+
+---
+
+## (원본 설계 메모) 관측 ② — 전략 패널의 노출도 역학
+
+**배포**: 2026-08-11 (`3eafb8f`). **08-11 EOD는 재시작 전이라 블록을 못 봤다. 08-12가 처음이다.**
+
+### ⏰ EOD 타이밍 — 15:35이 아니라 **16:35**다 (2026-08-12 정정)
+
+이 문서는 "15:35 EOD"라고 적어 왔다. **틀렸다.** `strategy_revisions`의 생성 시각이
+6일 내내 같다:
+
+| 일자 | `created_at` (UTC) | KST |
+|---|---|---|
+| 08-11 | 07:35:05 | **16:35** |
+| 08-10 | 07:35:19 | 16:35 |
+| 08-07 | 07:36:12 | 16:36 |
+| 08-05 · 08-04 · 08-03 | 07:35:57 · 07:41:33 · 07:37:50 | 16:35~16:41 |
+
+**구조**: EOD는 스케줄러 잡이 아니다. `coordinator.py:4404` 부근의
+`elif not is_open and self._market_was_open:` — **`open→closed` 엣지**가 트리거고,
+거기서 `run_eod_review` → `run_strategy_consensus` → 발굴 파이프라인이 이어진다.
+LLM을 여러 번 타서 **약 65분** 걸린다. 15:30 마감 → 16:35 완료.
+
+⚠️ **15:40에 조회하면 어제 행이 최신으로 보인다.** 08-12에 그 함정을 실제로 밟아
+알람이 헛돌았다. 마감 직후의 "행이 없다"는 실패가 아니라 **아직 도는 중**이다.
+판정은 **16:40 이후**에 하고, 그때도 없으면 `[error`·`eod`·`strategy_consensus`
+로그를 볼 것.
+
+### 왜 만들었나
+
+목표 노출도 = `ramped(레짐앵커) × m_vol × m_drawdown`, `m_vol = min(1.0, max(vol_multiplier_min, target_vol_pct / 실현변동성))`.
+
+KOSPI 실현변동성이 **101.7%**라 `m_vol`이 하한에 박혀 있다. 그래서:
+- **레짐 라벨이 결과에 도달하지 못한다** — bull/neutral/bear 앵커가 전부 같은 목표를 낸다(램프가 먼저 묶어 앵커가 구속 조건이 안 됨)
+- 패널이 8-10에 `target_vol_pct`를 18→22로 올렸으나 **효과 0**. 하한 탈출에 필요한 값은 **50.9**인데 그 노브의 상한은 **40** — 최대치를 불러도 아무 일도 안 일어난다
+
+수렴점: `p* = min(ramp·m/(1−m), anchor·m)`
+
+| `vol_multiplier_min` | 수렴 목표 |
+|---|---|
+| 0.4 (**현재**) | **10.0%** |
+| 0.5 | 15.0% |
+| 0.6 | 22.5% |
+| 0.8 | 44%~60% |
+
+### 무엇을 볼 것인가
+
+```bash
+sqlite3 -readonly "file:backend/data/storage.db?mode=ro" \
+"SELECT trade_date, stance,
+ json_extract(strategy_json,'\$.position_sizing.max_position_pct') per_pos,
+ json_extract(strategy_json,'\$.position_sizing.target_vol_pct') tgt_vol,
+ json_extract(strategy_json,'\$.position_sizing.vol_multiplier_min') vol_min
+ FROM strategy_revisions ORDER BY trade_date DESC LIMIT 5;"
+```
+
+이력:
+
+| 일자 | 스탠스 | 종목당 | tgt_vol | vol_min |
+|---|---|---|---|---|
+| 08-11 | **defensive** | 0.03 | 22.0 | **0.4** |
+| 08-10 | aggressive | 0.0375 | 22.0 | 0.5 |
+| 08-07 | neutral | 0.03 | — | — |
+
+**08-11에 패널이 `vol_min`을 0.5→0.4로 스스로 낮췄다**(목표 15%→10%). 역학 블록 **없이** 내린 판단이다.
+
+⚠️ **판정 기준**: 블록은 `by_vol_multiplier_min` 격자에 0.8(수렴 44%, 현재의 3배)을 **중립적으로** 싣는다. 내일 패널이 그걸 보고 어느 쪽으로 투표하는지가 **이 작업이 정보를 준 것인지 유혹을 준 것인지**를 가른다.
+
+**급격한 이동은 구조적으로 불가능하다** — 노브 1회당 ±25%(0.4→0.5가 최대), 목표는 하루 ±15%p. 0.4→0.8까지 최소 3회 EOD, 노출도 10%→44%까지 **6거래일 이상**이고 중간에 되돌릴 창이 여러 번 있다.
+
+블록이 프롬프트에 실제로 들어갔는지 확인하려면 `exposure_mechanics` 키가 패널 컨텍스트 직렬화에 있는지 보면 된다(`strategy_panel.build_strategy_context`).
+
+---
+
+## ✅ 관측 ③ — `index_daily` 지연: 원인 규명·배포 완료 (2026-08-12)
+
+**"자동 복구될 것"이라던 08-11의 예상은 절반만 맞았다.** 08-12 08:05 수집에서 08-10은
+들어왔지만 **08-11이 없었다.** 지연이 해소된 게 아니라 **한 칸씩 밀려가는 정상 상태**였다.
+
+### 확정된 원인 — 08:05가 Yahoo 반영보다 이르다
+
+| 시각 (KST) | `^KS11` 최신 봉 |
+|---|---|
+| 08-12 **08:12** 조회 | 08-10 (08-11 **없음**) |
+| 08-12 **12:28** 조회 | **08-11 도착** (6,345.53) |
+
+**08-11 종가 6,345.53은 08-11 17:55에 본 값과 완전히 같다.** 즉 그것은 확정치였다 —
+KOSPI는 15:30 마감이라 그 시각엔 이미 확정이다.
+
+⭐ **08-11에 내가 "그건 잠정치였다"고 판단한 것은 틀렸다.** 그 오판으로 "마감 후 수집은
+잠정치를 굳힌다"며 수정을 보류했었다. 잠정인 것은 전일 종가가 아니라 **당일 봉**이다.
+
+### 배포 (`259ab7a`, 2026-08-12 12:46 라이브)
+
+**① 평일 09:30 재수집** — `start_index_refresh_scheduler`(`index_series.py`),
+`app/main.py`에서 배선(`index_refresh_scheduler_wired`). 레짐 스케줄러와 **독립**이다.
+
+**② 당일 진행 봉 제외** — `refresh_index_daily`가 오늘 날짜 행을 저장하지 않는다.
+🔴 **이 둘은 분리 불가다.** 장중 재수집은 확정 전 봉을 끌고 온다(실측: 12:28 6,629.37 →
+12:33 6,626.09, 움직이는 중). 스케줄러만 켜면 진행 봉이 확정 종가로 굳는다.
+08:05 수집은 장 시작 전이라 이 위험이 없었다 — 장중 재수집이 새로 만든 것이다.
+
+### ✅ 첫 실행 판정 — 2026-08-13 09:35 **합격 (알람 `a94f4424` 종료)**
+
+```bash
+sqlite3 -readonly -header -column "file:backend/data/storage.db?mode=ro" \
+ "SELECT trade_date, ROUND(close,2) close, source, substr(created_at,1,19) written
+  FROM index_daily ORDER BY trade_date DESC LIMIT 4;"
+L=$(ls -t debug/backend-2026*.log | head -1)
+grep -a "index_series_refreshed\|index_series_intraday_bar_skipped" "$L" | tail -3
+```
+
+실측 로그:
+
+```
+2026-08-13 00:30:00.312  index_series_intraday_bar_skipped  dates=['2026-08-13']
+2026-08-13 00:30:00.318  index_series_refreshed             first=2026-08-12 rows=39
+```
+
+| 확인 | 합격 기준 | 08-13 실측 |
+|---|---|---|
+| 최신 `trade_date` | **전일** | ✅ 2026-08-12 · 6,579.04 · `toss:KOSPI` |
+| 🔴 **오늘 날짜 행** | **없어야 한다** | ✅ **0건** |
+| `index_series_refreshed` | 09:30~09:31에 1건 | ✅ 09:30:00 정각 |
+| `index_series_intraday_bar_skipped` | 있으면 제외가 실제 발동 | ✅ `dates=['2026-08-13']` |
+
+⭐ **가드가 실전에서 발동했다.** 토스가 40행을 줬고 그중 오늘 진행 봉 1행을 버려 39행을
+썼다. 가드가 없었으면 장중에 움직이는 값이 오늘의 확정 종가로 굳었다.
+
+🔴 **그런데 이 문서가 예고한 판정 시점이 틀렸다.** 아래처럼 적어뒀었다:
+
+> *"`degraded_json`의 `index_series_lagging`은 08-13에도 남아 있는 게 정상이다 —
+> 사라지는 것은 08-14 판정부터다."*
+
+**틀렸다. 08-13 08:05에 이미 사라졌다.**
+
+```
+08-12 판정  degraded=["index_series_lagging"]
+08-13 판정  degraded=[]        ← 09:30이 아니라 08:05에 해소
+```
+
+원인: **08:05 사이클도 토스를 쓴다**(`run_daily_regime_cycle`). 토스는 yfinance와 달리
+08:05에 이미 전일 종가를 갖고 있다. 그래서 09:30 재수집이 오늘 한 일은 "빠진 것을 메운 것"이
+아니라 **"진행 봉을 버린 것"**이다 — 2차 방어이지 1차 해소 수단이 아니다.
+
+⚠️ **교훈**: 데이터 소스를 교체하면서 *교체 전 소스를 전제로 쓴 판정 기준*을 그대로
+남겨뒀다. 소스가 바뀌면 관측 계획도 다시 써야 한다.
+
+### 곁가지 — 경고 래치 (`f5af713`, 12:21 라이브)
+
+`evaluate_series_lag`는 장중 감시 루프에서도 호출되는데 `logger.warning`에 래치가 없어
+같은 줄이 5분마다 찍혔다. `(latest, expected)` 키로 래치했다. **지연이 깊어지면 다시 말한다.**
+
+**실증 완료**: 배포 전 **42건/4시간** → 배포 후 **1건/17분**.
+🔴 분모도 확인했다 — 같은 창에 로그가 매분 찍혀 루프는 살아 있었다(침묵의 원인이 래치임을 확증).
+
+⚠️ 위험 방향은 아니다 — `stale` 판정이 나도 `m_vol`이 하한(방어적)으로 떨어져 노출도가
+**열리지 않는다**(2026-08-11 봉합).
+
+---
+
+## 08:05 레짐 사이클 정기 점검
+
+```bash
+DB="file:/Users/sunghoonk/Workspaces/JonberAITrading/backend/data/storage.db?mode=ro"
+sqlite3 -readonly -header -column "$DB" \
+ "SELECT trade_date, regime, confidence, degraded_json, ROUND(effective_target_pct,6) eff
+  FROM regime_judgment ORDER BY created_at DESC LIMIT 2;"
+sqlite3 -readonly "$DB" "SELECT COUNT(*)||'행, 최신 '||MAX(trade_date) FROM index_daily;"
+```
+
+| 확인 | 합격 |
+|---|---|
+| `regime_judgment` 1행 | **08:05** (08:00 아님 — 수집이 `judge_regime()` 안 인라인) |
+| `degraded_json` | 비어 있음. `index_series_lagging`이 뜨면 지수 수집이 거래일 기준으로 뒤졌다는 뜻 |
+| `index_daily` 최신 | **08-11** (현재 08-07 — 08-10·08-11 두 날이 함께 채워져야 한다. **관측 ③ 참조**) |
+| 종목당 상한 | **0.03 유지** (레짐 채널이 덮어쓰지 않는다는 실증, 3일째) |
+| 슬롯 | 7 유지 (`max_open_positions`, 17:49 실측 확인) |
+
+---
+
+## 달력 (2026-08-17 광복절 대체공휴일이 6일 뒤)
+
+부팅 로그에 **`holiday_calendar_untrusted_years`가 있으면 실패**다. 2026-08-11 배포 후 `untrusted_years=[]`가 정상.
+
+```bash
+grep -a "holiday_service_initialized\|untrusted_years" debug/backend-*.log | tail -2
+sqlite3 -readonly "file:backend/data/holidays.db?mode=ro" \
+ "SELECT year, COUNT(*) FROM krx_holidays GROUP BY year;"   # 2026:20, 2027:22
+```
+
+**2026-08-17(월)이 휴장일로 인식되는지**가 그날 아침의 확인 사항이다.
+
+---
+
+## 🔴 2026-08-06에 EOD 체인이 통째로 안 돌았다 — 파급을 다 못 셌다
+
+08-12에 fwd 백필 결함을 파다가 확인한 사실이다.
+
+```
+strategy_revisions  : 08-03 08-04 08-05 [08-06 없음] 08-07 08-10 08-11 08-12
+discovery_candidates: 08-03 08-04 08-05 [08-06 없음] 08-07 08-10 08-11 08-12
+```
+
+그날 하루가 빠지면서 **그날이 유일한 기회였던 것들이 영구히 사라졌다.** 확인된 피해:
+
+| 잃은 것 | 이유 |
+|---|---|
+| 07-30 승격 3건의 `fwd_5d` | 08-06이 5거래일째 |
+| 08-05 승격 3건의 `fwd_1d` | 08-06이 1거래일째 |
+| 08-06 EOD 리뷰·전략 개정 | 그날 `strategy_revisions` 행 없음 |
+| 08-06 발굴 스캔·승격 | 그날 후보 0건 |
+
+⚠️ **이 목록이 전부라는 보장이 없다.** EOD 체인은 `write_daily_snapshot` →
+`run_eod_review` → `run_strategy_consensus` → `reconcile_trade_ledger` → 발굴
+파이프라인으로 이어지는 긴 사슬이고, 각 단계가 "그날 1회"를 전제한다. **따라잡기가 있는
+단계와 없는 단계를 아직 전수 조사하지 않았다.**
+
+- `index_series`: ✅ 자가치유 (매 실행이 창 전체를 upsert)
+- `discovery_candidates.fwd_*`: ✅ 08-12에 따라잡기 추가(`75cf5e6`)
+- `write_daily_snapshot` · `run_eod_review` · `reconcile_trade_ledger`: ❓ **미조사**
+
+`index_series.py` 상단 주석이 같은 병을 "07-21·08-06 실제 누락"으로 기록한다 —
+**같은 날이 최소 세 곳을 갉아먹었다.**
+
+---
+
+## ⚠️ 이 리포의 함정 (전 세션에서 실제로 밟은 것)
+
+1. **기동 명령에 conda 인터프리터를 절대 경로로 쓸 것.**
+   `python run_dev.py`는 base 환경을 타서 `ModuleNotFoundError: uvicorn`으로 죽는다. 2026-08-11 장중에 이걸로 1분간 무방비가 됐다.
+   ```
+   nohup /Users/sunghoonk/anaconda3/envs/agentic-trading/bin/python run_dev.py > ../debug/<log> 2>&1 &
+   ```
+2. 🔴 **전체 테스트 스위트는 반드시 워크트리에서.** 메인 리포에서 돌리면 라이브 DB에 쓴다.
+   2026-08-11 13:2x~13:3x에 **두 DB가 동시에 오염됐다**:
+   - `holidays.db` — 즉시 발견 (데이터가 우연히 정확해 피해 없음)
+   - **`storage.db`의 `app_settings` — 3거래일 뒤에야 발견** 🔴
+
+   **`agent_chat:coordinator_state`가 `{"running": false, "check_interval": 5, ...}`로 덮였다.**
+   `check_interval: 5`는 프로덕션 기본값(**1**, `coordinator.py:528`)이 아니라 **테스트 픽스처 값**이다
+   (`test_coordinator.py:39`, `test_runtime_persist.py:22`) — 이것이 오염의 물증이었다.
+
+   ⚠️ **오염과 발현이 분리된다.** 쓰는 순간에는 증상이 전혀 없다 — 실행 중인 프로세스는 메모리
+   상태로 계속 돈다(실제로 13:35 오염 후 **17:14까지 정상 작동**했다). **다음 재기동에서야** 터진다.
+   그래서 "테스트 돌린 날 멀쩡했다"는 안전의 증거가 아니다.
+
+   메인 리포에서 스위트를 돌려버렸다면, **그날 안에 아래를 조회해 오염 여부를 확인할 것**:
+   ```bash
+   sqlite3 -readonly -header -column "file:backend/data/storage.db?mode=ro" \
+    "SELECT key, substr(value,1,70) value, substr(updated_at,1,19) upd
+     FROM app_settings ORDER BY updated_at DESC LIMIT 10;"
+   ```
+   `updated_at`이 스위트 실행 시각과 겹치는 행, 특히 `check_interval:5` / `max_concurrent:10` 같은
+   **픽스처 냄새가 나는 값**을 찾는다. 기본값과 우연히 같은 값(`max_concurrent:3`)은 구별되지 않으니
+   `updated_at`이 1차 단서다.
+
+   ### ✅ 2026-08-12: DB는 코드로 막았다 — 그러나 규칙은 그대로다
+
+   `948e9ea`로 conftest에 **autouse 가드**를 넣었다. 라이브 `storage.db`/`holidays.db` 경로를
+   여는 시도를 tmp 샌드박스로 돌리고(`db_path=None` 기본 경로까지), 세션 끝에 어떤 테스트가
+   그랬는지 이름으로 보고한다. **실측 16개 테스트가 라이브 경로를 열려 하고 있었다** —
+   `test_approval_pending_ssot.py`(5건) · `test_autonomy_injector.py` ·
+   `test_kr_analysis_sm_migration.py` · `test_status_routes_ssot.py` ·
+   `test_websocket_session.py` · `test_hitl_execution_routing.py` · `test_watch_refresh_loop.py` 등.
+
+   🔴 **그래도 메인에서 돌리지 마라. DB는 겹치는 자원의 일부일 뿐이다.**
+   2026-08-12 실측 — 메인에서 스위트를 돌리자 라이브 백엔드 로그에 이것이 쌓였다:
+
+   ```
+   telegram_receiver_polling_error
+     error='Conflict: terminated by other getUpdates request'   ← 18건
+   ```
+
+   **테스트가 라이브 Telegram 봇의 폴링을 빼앗았다.** 장중이었다면 손절·익절 통지가 유실된다.
+   14% 진행에 5분이 걸렸으니 완주하면 35분 이상 그 상태다(그래서 중단했다).
+   Kiwoom 레이트리밋도 공유한다.
+
+   | 실행 위치 | Telegram 폴링 강탈 |
+   |---|---|
+   | 메인 리포 | **18건** |
+   | 워크트리 | **0건** (`.env`가 없어 토큰이 없다) |
+
+   ### 🔴 그런데 워크트리도 Kiwoom에는 안전하지 않았다 (2026-08-12 발견)
+
+   `32a6db3`의 엔드포인트 가드를 켜고 **워크트리에서** 전체 스위트를 돌렸더니
+   **39건이 차단됐고 전부 `mockapi.kiwoom.com`이었다.** Telegram은 0건이다.
+
+   차이는 자격증명의 **출처**다:
+
+   | | 출처 | 워크트리에서 |
+   |---|---|---|
+   | Telegram | `.env`의 `TELEGRAM_BOT_TOKEN` | 없음 → 시도조차 안 함 |
+   | Kiwoom | **URL이 코드에 하드코딩**(`client.py:214-215`) | **39건 시도** |
+
+   인증은 실패하지만 **요청 자체는 나가 레이트리밋을 소모한다.** 개장 직후 `ka10001`
+   초과가 상시로 나는 것과 무관하지 않을 수 있다.
+
+   ⭐ **워크트리 규칙은 필요조건이었지 충분조건이 아니었다.** `.env` 부재는 Telegram만
+   막는다. 코드에 URL이 박힌 것은 어디서 돌리든 나간다 — 이 가드가 그 구멍을 처음 드러냈다.
+
+   **가드는 규칙의 대체가 아니라 그물이고, 규칙 혼자로는 구멍이 있었다. 둘 다 필요하다.**
+3. ~~**`kill`은 어시스턴트 권한 밖이다.**~~ **정정(2026-08-12): 세션에 따라 다르다.**
+   08-12 세션에서는 어시스턴트가 `kill -TERM 22135`를 직접 실행해 성공했다. **먼저 시도해 보고,
+   거부되면** 사용자에게 `! kill -TERM <PID>` 실행을 요청할 것 — 무조건 요청부터 하면 왕복이 는다.
+4. **`git stash` 금지** — 워크트리 여럿이 스택을 공유한다.
+5. **장중 재시작 금지가 기본** — 손절이 이 프로세스에만 있고 브로커에 스탑이 없다.
+6. pytest 출력의 ANSI 색상 때문에 `grep "^FAILED"`가 0건을 반환한다. `sed 's/\x1b\[[0-9;]*m//g'`.
+7. **전체 스위트 기준선 = 21 failed / 3,249 passed / 1 skipped** (`04fec8b`, 워크트리, 6분 30초).
+   측정 조건을 함께 적는다 — 조건이 다르면 숫자가 달라진다:
+   ```bash
+   git worktree add --detach <tmp> <commit>
+   cd <tmp>/backend && /Users/sunghoonk/anaconda3/envs/agentic-trading/bin/python \
+     -m pytest -q --no-header -p no:cacheprovider --no-cov
+   ```
+   ⚠️ **21건 중 6건은 Telegram 인증 테스트**다 — 워크트리에 `.env`가 없어 토큰이 없기 때문이고,
+   메인에서 돌리면 이 6건은 통과할 수 있다. **기준선은 환경에 따라 다르다.**
+   (옛 기준선 "21 failed / 3,230 passed"에서 passed가 +19 늘어난 것은 `--import-mode=importlib`로
+   새로 실행된 충돌 파일 11건 + DB 가드 5건 + 엔드포인트 가드 5건 때문이다.
+   failed 수는 세 번 측정 내내 **21로 고정** — 가드 3종 전부 **회귀 0**.)
+8. ✅ ~~**동명 테스트 파일이 수집을 죽인다**~~ — `948e9ea`로 봉합(`--import-mode=importlib`).
+   `tests/services/`와 `tests/test_services/test_trading/`에 `test_risk_monitor_alert_dedup.py`가
+   **둘 다 실재**하고 `__init__.py`가 없어, 기본 import 모드에서 basename이 충돌해
+   `Interrupted: 1 error during collection`으로 스위트가 통째로 죽었다. `__pycache__`를 지워도 재발한다.
+   ⚠️ **`import-mode`는 ini 키가 아니라 CLI 옵션이다.** ini에 쓰면 `Unknown config option` 경고만
+   뜨고 조용히 무시된다 — `addopts`에 넣어야 한다. 검증 없이는 "고쳤다"고 오인하기 쉽다.
+9. **원장 합을 브로커 잔고에 더하지 말 것.** 원장 체결 누적은 **이미 잔고 그 자체**다.
+   2026-08-11에 이 문서가 직접 밟았다 — "스냅샷 3,115 + 오늘 체결 355 = 브로커 3,470"으로 계산해
+   존재하지 않는 불일치를 🔴 경보로 적었다. 실제 브로커는 3,115였다. 불일치를 주장하려면
+   `/api/kr_stocks/positions`(kt00004 직접 조회)로 **대조**해야 한다 — 산수로 만들면 안 된다.
+10. **기동 후 서버 리스닝까지 5~40초.** 그 전 `curl`은 `HTTP 000`이다. 죽은 게 아니다
+    (08-11 37초 · 08-12 5초·11초 — 편차가 크다).
+11. zsh에서 `grep --include=*.py`는 glob 확장으로 실패한다 — `--include="*.py"`로 따옴표를 칠 것.
+12. 🔴 **teardown보다 오래 사는 것은 function 스코프로 못 막는다.**
+    `updater.start_polling()`은 폴링 **태스크**를 만들고 즉시 반환한다(`receiver.py:20`).
+    function 스코프 monkeypatch는 테스트가 끝나면 되돌아가는데 그 태스크는 계속 살아
+    라이브 봇을 폴링한다. 2026-08-12에 transport 가드만 넣었다가 이걸로 샜다 —
+    `getMe`는 막혔는데(RuntimeError 로그 확인) 충돌은 18→**39건**으로 늘고
+    테스트 종료 후인 05:32까지 이어졌다.
+    ⭐ **막을 지점은 요청이 아니라 태스크 생성이다.** `Updater.start_polling` 자체를
+    차단하고 픽스처를 **세션 스코프**로 올려야 한다(`32a6db3`).
+13. 🔴 **PID를 잡는 명령이 단일 값을 반환하는지 확인하라.**
+    ```bash
+    PID=$(ps -eo pid,command | grep "[r]un_dev.py" | awk '{print $1}')   # 🔴 여러 줄
+    PID=$(pgrep -f "agentic-trading/bin/python run_dev.py" | head -1)     # ✅
+    ```
+    2026-08-12 22:58에 앞의 형태를 써서 `kill: illegal pid: 28626\n81883...`로 종료가
+    **실패**했는데, 스크립트가 그대로 새 인스턴스를 띄워 **두 프로세스가 Telegram 봇을
+    두고 싸웠다**(충돌 45건). `kill` 실패를 확인하지 않고 다음 단계로 넘어간 것이 화근이다.
+    재기동 스크립트는 **종료를 확인한 뒤에만** 기동해야 한다.
+14. 🔴 **파괴적 부작용이 있는 RED는 안전장치를 먼저 단언하라.**
+    2026-08-12에 라이브 DB 가드를 TDD로 만들면서, 경로 검증을 쓰기 **뒤에** 뒀다:
+    ```python
+    await storage.set_app_setting(...)                   # ← 가드 없는 RED에서 실제로 실행됐다
+    assert Path(storage.db_path) != _LIVE_STORAGE
+    ```
+    가드가 없는 RED 단계에서 그 쓰기가 실행돼 **08-11과 똑같은 값으로 라이브를 덮었다**(백업 복구).
+    재현 테스트를 쓰다가 사고를 재현한 것이다. 검사를 쓰기 **앞**으로 옮기면 RED가 안전장치에서
+    멈춰 부작용에 닿지 않는다.
+
+---
+
+## 백로그 (우선순위 순)
+
+| | 항목 | 근거 |
+|---|---|---|
+| 🔴 | **`market_hours` 경로가 관측 밖** — 자율매매의 실제 관문 `is_krx_open_cached()` → `_is_krx_holiday()` → `is_holiday()`는 `get_trading_day_verdict`도 ERROR 래치도 안 거친다. **1초/30초 게이트는 여전히 완전히 조용하다.** 달력 데이터는 옳아졌지만 "틀렸을 때 알 수 있는가"는 아직 아니다 | 2026-08-11 리뷰 |
+| 🔴 | **`ka10075` 배선** — `fill_tracker`가 `CANCELLED`를 실제로 대입하면 방어 매도의 180초 창이 사라진다 | 2026-08-10 리뷰 |
+| 🔴 | **KRX API 복구** — `open.krx.co.kr` OTP가 HTML 반환, 직접 호출 404. `source=fallback_table`이 계속 찍히는 게 정상이 아니라는 신호 | 2026-08-11 |
+| 🟡 | **`연말`(12/31) 고정** — KRX 폐장일은 연말 최종 영업일 기준이라 12/31이 주말인 해(2028·2033)에 실제 휴장일이 빠질 수 있음. **미검증** | 2026-08-11 리뷰 |
+| 🟡 | 램프 재계산이 `strategy_panel`에 잔존 사본 — `TargetExposure`에 `ramped`를 노출시키는 것이 근본 해결 | 2026-08-11 리뷰 |
+| 🟡 | `coordinator.py:2991` `equity_peak or 0.0`이 조회 실패(None)와 스냅샷 없음(0.0)을 뭉갬 → 섀도 경로의 `m_drawdown`이 조용히 1.0 | 2026-08-11 리뷰 |
+| 🔴 | **EOD 체인의 "그날 1회" 단계를 전수 조사** — 08-06 미실행으로 최소 세 곳이 영구 손실됐다. `write_daily_snapshot`·`run_eod_review`·`reconcile_trade_ledger`에 따라잡기가 있는지 미확인 | 2026-08-12 |
+| 🔴 | **승격 게이트가 지표만 본다** — 펀더멘탈·뉴스가 시스템에 있는데 승격 **후** 토론에서야 쓰인다. 설계 완료(`b4b71f1`), 구현 대기 | 2026-08-12 |
+| 🟡 | **`KIWOOM_APP_KEY`/`SECRET_KEY`/`NAVER_CLIENT_SECRET`을 `SecretStr`로** — pytest assertion이 `Settings` 객체를 덤프하면 평문으로 찍힌다(08-12 실제 발생). `SecretStr`인 OpenRouter·Finnhub는 마스킹됐다 | 2026-08-12 |
+| 🟡 | **워치 Drop 규칙** — 시간·성과 기반 퇴출이 없다. `WATCH_TOTAL_CAP=30`뿐이고 26/30이라 한 번도 작동 안 함. 07-22 승격분이 3주째 잔류. 승격 품질이 오르면 시급성은 낮아진다 | 2026-08-12 |
+| 🟡 | 체결 원장 중복 — 같은 체결이 31초 간격으로 두 번 기록 (사용자: 별건) | 2026-08-07 |
+| 🟡 | `kr_realized_pnl` 1행 = 거래가 아니라 부분체결 슬라이스 | 2026-08-09 |
+| ✅ | ~~**테스트 DB 오염을 코드가 못 막는다**~~ — `948e9ea`로 conftest autouse 가드 배포. 라이브 경로를 tmp로 돌리고 세션 끝에 위반 테스트를 이름으로 보고한다. 회귀 0(21 failed 동일) | 2026-08-12 |
+| ✅ | ~~**Telegram·Kiwoom에는 가드가 없다**~~ — `04fec8b`+`32a6db3` 배포. httpx 전송 계층에서 `api.telegram.org`·`api.kiwoom.com`·`mockapi.kiwoom.com`을 차단하고, `Updater.start_polling`을 태스크 생성 전에 막는다(세션 스코프). 회귀 0 | 2026-08-12 |
+| 🟡 | **테스트가 Kiwoom에 39건 붙고 있었다** — 워크트리에서도. URL이 코드에 하드코딩(`client.py:214-215`)이라 `.env` 부재로도 안 막힌다. 가드가 지금은 차단하지만, 근본은 각 테스트가 `httpx.MockTransport`/`respx`를 쓰는 것이다. 목록은 스위트 실행 시 RuntimeError 메시지로 드러난다 | 2026-08-12 |
+| 🟡 | **격리 없이 라이브 DB 경로를 여는 테스트 16개** — 가드가 막고는 있지만 근본은 각 파일이 `isolated_storage_service`를 쓰는 것이다. 목록은 스위트 실행 시 `LIVE-DB GUARD` 블록에 찍힌다 | 2026-08-12 |
+| 🟡 | **중복 테스트 파일 정리** — `tests/services/test_risk_monitor_alert_dedup.py`(4건)는 `tests/test_services/test_trading/`의 7건이 사실상 포함한다. 고유한 것은 `test_alert_history_records_every_call_regardless_of_dedup` 하나. 흡수 후 구 파일 제거 | 2026-08-12 |
+| 🟡 | **Telegram Markdown 파싱 실패가 상시화** — 08-04부터 반복. plain 폴백이 100% 살리고 있어 유실은 없지만(08-12 실측 2/2), 결정 텍스트의 이스케이프 누락이라는 원인은 그대로 | 2026-08-12 |
+| 🟡 | **`agent-chat` 실행 중에는 설정을 영속할 수 없다** — `start()`가 `if self._running: return`(coordinator.py:606)으로 조기 반환해 `_persist_runtime_state()`(:659)에 못 닿는다. 값을 바꾸려면 `stop→start`가 필요한데 `stop()`이 진행 중 토론을 `room.cancel()`한다. 별도 `PATCH /agent-chat/config`가 있으면 장중에도 안전하게 바꾼다 | 2026-08-12 |
+
+---
+
+## 참고 — 확인된 정상 동작
+
+- **시간외 단일가(15:40~18:00)에 체결이 난다.** 2026-08-11 16:35에 028670 355주 매수. `market_hours.py:261`에 정의된 정상 세션이다 — 이상 아님.
+- 게이트 검사 8이 처음 물렸다(08-11, 439090 BUY 거부: `projected 15.87% > cap 15.10%`). 산수 검증 완료, 정상.
+- **개장 직후 `ka10001` rate limit이 1~2건 난다.** 재시도로 전부 복구되고 `kiwoom_rate_limit_exhausted`는 0건이다 — 조치 불필요(08-11·08-12 연속 확인).
+- **`agent-chat` 기동 직후 첫 체크가 즉시 실행된다**(`next_run_time=datetime.now()`, coordinator.py:635). 그래서 "재기동 직후 토론 0건인 창"은 **존재하지 않는다** — 08-12에 그 창을 노렸다가 진행 중 4건을 취소시켰다.
+- **저하 태그는 실패가 아니다.** `/exposure`·`/brief`의 `⚠️` 줄은 "판정은 났고 입력 하나가 낡았다"는 꼬리표다. `f5af713` 이후 사람 말 + 원문 병기로 나온다.

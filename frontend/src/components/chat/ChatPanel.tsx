@@ -64,34 +64,6 @@ export function ChatPanel() {
       };
     }
 
-    // Check Coin session
-    if (!activeAnalysis && state.coin.activeSessionId) {
-      activeAnalysis = {
-        ticker: state.coin.market,
-        displayName: state.coin.market,
-        marketType: 'coin',
-        status: state.coin.status,
-        recommendation: state.coin.tradeProposal?.action,
-        entryPrice: state.coin.tradeProposal?.entry_price ?? undefined,
-        stopLoss: state.coin.tradeProposal?.stop_loss ?? undefined,
-        takeProfit: state.coin.tradeProposal?.take_profit ?? undefined,
-      };
-    }
-
-    // Check Stock (US) session
-    if (!activeAnalysis && state.stock.activeSessionId) {
-      activeAnalysis = {
-        ticker: state.stock.ticker,
-        displayName: state.stock.ticker,
-        marketType: 'stock',
-        status: state.stock.status,
-        recommendation: state.stock.tradeProposal?.action,
-        entryPrice: state.stock.tradeProposal?.entry_price ?? undefined,
-        stopLoss: state.stock.tradeProposal?.stop_loss ?? undefined,
-        takeProfit: state.stock.tradeProposal?.take_profit ?? undefined,
-      };
-    }
-
     // Get recent trade decisions from history
     const recentDecisions: Array<{
       ticker: string;

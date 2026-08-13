@@ -2,98 +2,74 @@
  * PositionsPage Component
  *
  * Full-page view of positions across all markets.
- * - Coin positions
  * - Kiwoom positions
  * - Stock positions
  */
 
 import { ArrowLeft } from 'lucide-react';
 import { useStore } from '@/store';
-import { CoinPositionPanel } from '@/components/coin/CoinPositionPanel';
-import { CoinAccountBalance } from '@/components/coin/CoinAccountBalance';
-import { CoinOpenOrders } from '@/components/coin/CoinOpenOrders';
+import { useGoTo } from '@/hooks/useNav';
 import { KiwoomPositionPanel, KiwoomAccountBalance, KiwoomOpenOrders } from '@/components/kiwoom';
+import { PnlSummaryStrip } from '@/components/terminal/panels/PnlSummaryStrip';
 
 interface PositionsPageProps {
   onBack?: () => void;
 }
 
 export function PositionsPage({ onBack }: PositionsPageProps) {
-  const setCurrentView = useStore((state) => state.setCurrentView);
-  const activeMarket = useStore((state) => state.activeMarket);
+  const goTo = useGoTo();
   const kiwoomApiConfigured = useStore((state) => state.kiwoomApiConfigured);
-  const upbitApiConfigured = useStore((state) => state.upbitApiConfigured);
 
   const handleBack = () => {
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('dashboard');
+      goTo('dashboard');
     }
   };
 
   return (
-    <div className="h-full flex flex-col bg-surface">
+    <div className="h-full flex flex-col bg-canvas">
       {/* Header */}
-      <div className="flex items-center gap-3 px-6 py-4 border-b border-border bg-surface-dark">
+      <div className="flex items-center gap-3 px-4 py-2.5 border-b border-hairline bg-card">
         <button
           onClick={handleBack}
-          className="p-2 rounded-lg hover:bg-surface transition-colors"
+          className="p-1.5 rounded hover:bg-elevated transition-colors"
           title="Back to Dashboard"
         >
-          <ArrowLeft className="w-5 h-5 text-gray-400" />
+          <ArrowLeft className="w-4 h-4 text-muted" />
         </button>
         <div>
-          <h1 className="text-xl font-semibold">Positions</h1>
-          <p className="text-sm text-gray-500">View your holdings across all markets</p>
+          <h1 className="text-sm font-semibold">Positions</h1>
+          <p className="text-[11px] text-dim">View your holdings across all markets</p>
         </div>
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto p-6">
-        <div className="max-w-6xl mx-auto space-y-6">
-          {/* Coin Positions */}
-          {(activeMarket === 'coin' || upbitApiConfigured) && (
-            <section>
-              <h2 className="text-lg font-semibold mb-3">Crypto Positions</h2>
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                <CoinAccountBalance />
-                <CoinPositionPanel />
-              </div>
-              <div className="mt-4">
-                <CoinOpenOrders />
-              </div>
-            </section>
-          )}
-
+      <div className="flex-1 overflow-y-auto p-3">
+        <div className="max-w-6xl mx-auto space-y-4">
           {/* Kiwoom Positions */}
-          {(activeMarket === 'kiwoom' || kiwoomApiConfigured) && (
+          {kiwoomApiConfigured && (
             <section>
-              <h2 className="text-lg font-semibold mb-3">Korean Stock Positions</h2>
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <h2 className="text-[11px] font-semibold uppercase tracking-wide text-muted mb-2">Korean Stock Positions</h2>
+              {/* 기간 손익 요약 — 계좌·보유 카드 위에 전폭으로 얹는다. 미실현손익은
+                  아래 KiwoomPositionPanel의 "총 손익"이 이미 보여주므로 여기선 빼고
+                  일/주/월/누적만 그린다(같은 숫자를 한 화면에 두 번 띄우지 않는다). */}
+              <PnlSummaryStrip />
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
                 <KiwoomAccountBalance />
                 <KiwoomPositionPanel />
               </div>
-              <div className="mt-4">
+              <div className="mt-3">
                 <KiwoomOpenOrders />
               </div>
             </section>
           )}
 
-          {/* Placeholder for US Stock positions */}
-          {activeMarket === 'stock' && (
-            <section>
-              <h2 className="text-lg font-semibold mb-3">US Stock Positions</h2>
-              <div className="card p-8 text-center">
-                <p className="text-gray-500">US Stock position tracking coming soon</p>
-              </div>
-            </section>
-          )}
-
           {/* Empty state */}
-          {!upbitApiConfigured && !kiwoomApiConfigured && activeMarket !== 'stock' && (
-            <div className="card p-8 text-center">
-              <p className="text-gray-500">
+          {!kiwoomApiConfigured && (
+            <div className="card p-5 text-center">
+              <p className="text-dim text-sm">
                 Configure your API keys in Settings to view positions
               </p>
             </div>

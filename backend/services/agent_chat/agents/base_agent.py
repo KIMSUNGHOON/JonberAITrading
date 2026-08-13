@@ -9,6 +9,7 @@ from typing import List, Optional
 
 import structlog
 
+from agents.llm.tasks import TaskType
 from agents.llm_provider import get_llm_provider
 from services.agent_chat.models import (
     AgentMessage,
@@ -38,12 +39,26 @@ class BaseDiscussionAgent(ABC):
         self.agent_type = agent_type
         self.agent_name = agent_name
         self.llm = get_llm_provider()
+        # Phase4: active TradingStrategy directive, distributed per-room by
+        # ChatRoom.__init__. None when no strategy is active/reachable.
+        self.strategy_directive: Optional[str] = None
 
     @property
     @abstractmethod
     def system_prompt(self) -> str:
         """System prompt for this agent's persona."""
         pass
+
+    def _effective_system_prompt(self) -> str:
+        """페르소나 프롬프트 + (있으면) 활성 전략 지침. 전략은 참고 프레임이며
+        에이전트의 독립 판단을 대체하지 않는다는 문구를 포함한다."""
+        if not self.strategy_directive:
+            return self.system_prompt
+        return (
+            f"{self.system_prompt}\n\n"
+            "## 활성 전략 지침 (운용 프레임 — 당신의 독립적 분석을 대체하지 않음)\n"
+            f"{self.strategy_directive}"
+        )
 
     @property
     @abstractmethod
@@ -97,12 +112,33 @@ class BaseDiscussionAgent(ABC):
             response = await self.llm.generate(messages)
             return response
         except Exception as e:
+            # 실패를 문자열로 반환하지 않는다. 그렇게 하면 에러가 토론에 정상 의견처럼
+            # 흘러들어 합의 불성립이 가짜 NO_ACTION이 되고, 원장에 실제 판단이 아닌
+            # 결정이 쌓인다(2026-08-03 라이브에서 중재자 결정이 0.2ms 만에 나왔다).
+            # chat_room.start()가 이 예외를 잡아 세션을 CANCELLED로 표시한다.
             logger.error(
                 "llm_call_failed",
                 agent=self.agent_name,
                 error=str(e),
             )
-            return f"분석 중 오류 발생: {str(e)}"
+            raise
+
+    async def _structured_vote(self, messages, *, schema: dict, task=TaskType.GROUP_CHAT):
+        """Return the validated structured-vote dict, or None on any failure
+        (the caller then uses the regex fallback path). `self.llm` is the shared
+        provider facade; generate_structured raises ValueError on parse/missing keys.
+        """
+        try:
+            return await self.llm.generate_structured(messages, schema, task=task)
+        except Exception as e:
+            # Broad by design: this method's contract is "dict or None so the
+            # caller uses the regex fallback". ValueError/KeyError (parse/missing
+            # keys) AND router-level failures (LLMAllBackendsFailed, timeout,
+            # network — all Exception, not ValueError) must degrade to regex,
+            # never escape vote() and get the vote dropped from consensus.
+            # (CancelledError subclasses BaseException, so it still propagates.)
+            logger.warning("structured_vote_failed", agent=self.agent_type.value, error=str(e))
+            return None
 
     @abstractmethod
     async def analyze(self, context: MarketContext) -> AgentMessage:

@@ -1,14 +1,14 @@
 """
 Trading Strategy Module
 
-Provides strategy configuration, presets, and the strategy engine
-for making trading decisions based on analysis results.
+Provides strategy configuration and presets for making trading
+decisions based on analysis results.
 """
 
 import json
 import logging
 from enum import Enum
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -66,6 +66,20 @@ class EntryConditions(BaseModel):
     avoid_high_volatility: bool = Field(default=True)
     prefer_dividend: bool = Field(default=False)
 
+    # Phase4: 기회감지 임계 (agent_chat coordinator._detect_opportunity 소비).
+    # KNOB_BOUNDS 밖 = EOD LLM 합의가 조정 불가, 수동 전략 편집 전용.
+    # 기본값은 기존 하드코딩(0.03 / 0.75)과 동일 — 전략 없음=거동 불변.
+    entry_proximity_pct: float = Field(default=0.03, ge=0.005, le=0.10)
+    opportunity_min_confidence: float = Field(default=0.75, ge=0.5, le=0.95)
+
+    # E-3 (진입 활성화): 4-에이전트 합의 문턱 — agent_chat 세션 생성 시 활성
+    # 전략에서 읽어 ChatSession.consensus_threshold/ChatRoom에 주입(coordinator.
+    # _build_strategy_context — 조회 실패/전략 없음=기존 하드코딩 0.75로 진행,
+    # 거동 불변). strategy_consensus.KNOB_BOUNDS[0.60,0.85]가 EOD 합의 조정
+    # 범위를 이 Field 범위보다 더 좁게 제한한다. 기본값 0.75는 models.py의
+    # ChatSession/chat_room.py의 기존 하드코딩과 동일 — 배포 직후 거동 불변.
+    consensus_threshold: float = Field(default=0.75, ge=0.5, le=0.9)
+
 
 class ExitConditions(BaseModel):
     """Conditions for exiting a position"""
@@ -97,6 +111,22 @@ class PositionSizingRules(BaseModel):
     max_sector_concentration: float = Field(default=0.30, ge=0.10, le=1.0)
     max_positions: int = Field(default=10, ge=1, le=50)
 
+    # Phase5 결정B: 1건당 명목 상한(% of equity) — strategy_apply가 [5,30] 하드
+    # 바운드로 클램프해 RiskParameters.max_trade_notional_pct에 매핑(자율 사이징).
+    max_trade_notional_pct: float = Field(default=15.0, ge=0.5, le=50.0)
+
+    # S-4 (생존 규율 — decision D4): R 기반 사이징 예산 — strategy_apply가
+    # [0.25, 1.5] 하드 바운드로 클램프해 RiskParameters.risk_budget_pct에
+    # 매핑. 기본값(0.75)은 RiskParameters 모델 기본값과 동일 — 전략 없음/
+    # 미조정=거동 불변.
+    risk_budget_pct: float = Field(default=0.75, ge=0.1, le=3.0)
+
+    # 변동성 타게팅 노브 (2026-08-07). 상수에서 전략 소유로 옮겼다 --
+    # 매크로 국면이 바뀌면 위험 취향도 바뀌어야 하는데, 사람이 손으로
+    # 고른 상수는 두 달 만에 낡았다.
+    target_vol_pct: float = Field(default=18.0, ge=10.0, le=40.0)
+    vol_multiplier_min: float = Field(default=0.5, ge=0.2, le=0.8)
+
 
 class TradingStrategy(BaseModel):
     """Complete trading strategy configuration"""
@@ -126,28 +156,6 @@ class TradingStrategy(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     is_active: bool = Field(default=True)
-
-
-class EntryDecision(BaseModel):
-    """Decision for entering a position"""
-    action: str  # BUY, SELL, HOLD, SKIP
-    confidence: int = Field(ge=0, le=100)
-    entry_price: Optional[float] = None
-    position_size_pct: Optional[float] = None
-    stop_loss_price: Optional[float] = None
-    take_profit_price: Optional[float] = None
-    rationale: str = ""
-    key_factors: List[str] = Field(default_factory=list)
-    strategy_alignment: int = Field(default=0, ge=0, le=100)  # How well it fits the strategy
-
-
-class ExitDecision(BaseModel):
-    """Decision for exiting a position"""
-    action: str  # HOLD, STOP_LOSS, TAKE_PROFIT, STRATEGIC_EXIT, EMERGENCY_EXIT
-    urgency: str = "normal"  # normal, high, critical
-    reason: str = ""
-    recommended_price: Optional[float] = None
-    partial_exit_pct: Optional[float] = None  # For partial exits
 
 
 # -------------------------------------------
@@ -193,6 +201,7 @@ STRATEGY_PRESETS: Dict[StrategyPreset, TradingStrategy] = {
             min_cash_ratio=0.30,
             max_total_stock_pct=0.70,
             adjust_by_risk_score=True,
+            max_trade_notional_pct=10.0,
         ),
     ),
 
@@ -235,6 +244,7 @@ STRATEGY_PRESETS: Dict[StrategyPreset, TradingStrategy] = {
             max_position_pct=0.15,
             min_cash_ratio=0.20,
             max_total_stock_pct=0.80,
+            max_trade_notional_pct=25.0,
         ),
     ),
 
@@ -276,6 +286,7 @@ STRATEGY_PRESETS: Dict[StrategyPreset, TradingStrategy] = {
         position_sizing=PositionSizingRules(
             max_position_pct=0.12,
             min_cash_ratio=0.25,
+            max_trade_notional_pct=15.0,
         ),
     ),
 
@@ -317,6 +328,7 @@ STRATEGY_PRESETS: Dict[StrategyPreset, TradingStrategy] = {
             max_position_pct=0.15,
             min_cash_ratio=0.25,
             max_positions=8,
+            max_trade_notional_pct=12.0,
         ),
     ),
 }

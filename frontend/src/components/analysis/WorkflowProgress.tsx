@@ -20,6 +20,7 @@ import {
   Home,
 } from 'lucide-react';
 import { useStore } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import type { SessionStatus } from '@/types';
 
 // Workflow stages for Stock analysis (matching backend KRStockAnalysisStage enum)
@@ -34,26 +35,13 @@ const STOCK_WORKFLOW_STAGES = [
   { id: 'execution', label: '체결', icon: Rocket, description: 'Trade execution' },
 ] as const;
 
-// Workflow stages for Coin analysis (matching backend CoinAnalysisStage enum)
-const COIN_WORKFLOW_STAGES = [
-  { id: 'data_collection', label: 'Data Collection', icon: GitBranch, description: 'Collecting market data' },
-  { id: 'technical', label: 'Technical Analysis', icon: LineChart, description: 'Price patterns & indicators' },
-  { id: 'market_analysis', label: 'Market Analysis', icon: Building2, description: 'Market trends & orderbook' },
-  { id: 'sentiment', label: 'Sentiment Analysis', icon: MessageSquare, description: 'Market sentiment & news' },
-  { id: 'risk', label: 'Risk Assessment', icon: Shield, description: 'Risk evaluation & position sizing' },
-  { id: 'synthesis', label: 'Synthesis', icon: Brain, description: 'Combining all analyses' },
-  { id: 'approval', label: 'Human Approval', icon: UserCheck, description: 'Awaiting your decision' },
-  { id: 'execution', label: 'Execution', icon: Rocket, description: 'Trade execution' },
-] as const;
-
-// Helper to detect if ticker is coin market (contains '-')
-function isCoinMarket(ticker: string): boolean {
-  return ticker.includes('-');
-}
-
-// Get appropriate workflow stages based on ticker
-function getWorkflowStages(ticker: string) {
-  return isCoinMarket(ticker) ? COIN_WORKFLOW_STAGES : STOCK_WORKFLOW_STAGES;
+// Get workflow stages for a ticker. Was a coin/stock branch pre-coin-removal
+// (2026-08-01) — MarketType is 'kiwoom'-only now, so this always resolves
+// to the stock stages; kept as a function (rather than inlining
+// STOCK_WORKFLOW_STAGES at each call site) so a future market addition
+// doesn't require touching every caller.
+function getWorkflowStages(_ticker: string) {
+  return STOCK_WORKFLOW_STAGES;
 }
 
 type StageStatus = 'pending' | 'in_progress' | 'completed';
@@ -66,7 +54,7 @@ interface WorkflowProgressProps {
 
 export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgressProps) {
   const reset = useStore((state) => state.reset);
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
 
   // Get appropriate stages based on ticker type
   const WORKFLOW_STAGES = useMemo(() => getWorkflowStages(ticker), [ticker]);
@@ -74,7 +62,7 @@ export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgr
   // Handle cancel/return to home
   const handleCancel = () => {
     reset();
-    setCurrentView('dashboard');
+    goTo('dashboard');
   };
 
   // Calculate stage statuses
@@ -113,19 +101,19 @@ export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgr
       <div className="flex items-center justify-between mb-4">
         <div>
           <h3 className="font-semibold text-lg">Workflow Progress</h3>
-          <p className="text-sm text-gray-400">
-            Analyzing <span className="text-blue-400 font-medium">{ticker}</span>
+          <p className="text-sm text-muted">
+            Analyzing <span className="text-accent font-medium">{ticker}</span>
           </p>
         </div>
         <div className="flex items-center gap-3">
           <div className="text-right">
-            <span className="text-2xl font-bold text-blue-400">{progressPercent}%</span>
-            <p className="text-xs text-gray-400">Complete</p>
+            <span className="text-2xl font-bold text-accent tabular-nums">{progressPercent}%</span>
+            <p className="text-xs text-muted">Complete</p>
           </div>
           {/* Cancel/Home Button */}
           <button
             onClick={handleCancel}
-            className="p-2 rounded-lg bg-surface hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-colors"
+            className="p-2 rounded-lg bg-elevated hover:bg-red-500/20 text-muted hover:text-red-400 transition-colors"
             title="Cancel and return to home"
           >
             <Home className="w-5 h-5" />
@@ -134,9 +122,9 @@ export function WorkflowProgress({ currentStage, status, ticker }: WorkflowProgr
       </div>
 
       {/* Progress Bar */}
-      <div className="h-2 bg-surface rounded-full mb-6 overflow-hidden">
+      <div className="h-2 bg-elevated rounded-full mb-6 overflow-hidden">
         <div
-          className="h-full bg-gradient-to-r from-blue-500 to-purple-500 transition-all duration-500 ease-out"
+          className="h-full bg-accent transition-all duration-500 ease-out"
           style={{ width: `${progressPercent}%` }}
         />
       </div>
@@ -177,10 +165,11 @@ interface StageItemProps {
 }
 
 function StageItem({ stage, status, icon: Icon }: StageItemProps) {
+  // active -> accent, done -> up (bullish/complete), pending -> dim (neutral, not started).
   const statusColors = {
-    pending: 'bg-surface-light text-gray-500 border-gray-700',
-    in_progress: 'bg-blue-500/20 text-blue-400 border-blue-500 ring-2 ring-blue-500/30',
-    completed: 'bg-green-500/20 text-green-400 border-green-500',
+    pending: 'bg-elevated text-dim border-hairline',
+    in_progress: 'bg-accent/20 text-accent border-accent ring-2 ring-accent/30',
+    completed: 'bg-up/20 text-up border-up',
   };
 
   const StatusIcon = status === 'completed'
@@ -209,8 +198,8 @@ function StageItem({ stage, status, icon: Icon }: StageItemProps) {
       {/* Label */}
       <span className={`
         mt-2 text-xs text-center font-medium leading-tight
-        ${status === 'in_progress' ? 'text-blue-400' :
-          status === 'completed' ? 'text-green-400' : 'text-gray-500'}
+        ${status === 'in_progress' ? 'text-accent' :
+          status === 'completed' ? 'text-up' : 'text-dim'}
       `}>
         {stage.label}
       </span>
@@ -218,8 +207,8 @@ function StageItem({ stage, status, icon: Icon }: StageItemProps) {
       {/* Status Indicator */}
       <StatusIcon className={`
         w-3 h-3 mt-1
-        ${status === 'completed' ? 'text-green-400' :
-          status === 'in_progress' ? 'text-blue-400 animate-spin' : 'text-gray-600'}
+        ${status === 'completed' ? 'text-up' :
+          status === 'in_progress' ? 'text-accent animate-spin' : 'text-dim'}
       `} />
     </div>
   );
@@ -233,14 +222,14 @@ function CurrentStageDetail({ stage }: CurrentStageDetailProps) {
   if (!stage) return null;
 
   return (
-    <div className="mt-4 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+    <div className="mt-4 p-3 bg-accent/10 border border-accent/30 rounded-lg">
       <div className="flex items-center gap-3">
-        <div className="w-10 h-10 bg-blue-500/20 rounded-lg flex items-center justify-center">
-          <Loader2 className="w-5 h-5 text-blue-400 animate-spin" />
+        <div className="w-10 h-10 bg-accent/20 rounded-lg flex items-center justify-center">
+          <Loader2 className="w-5 h-5 text-accent animate-spin" />
         </div>
         <div>
-          <p className="font-medium text-blue-400">{stage.label}</p>
-          <p className="text-sm text-gray-400">{stage.description}</p>
+          <p className="font-medium text-accent">{stage.label}</p>
+          <p className="text-sm text-muted">{stage.description}</p>
         </div>
       </div>
     </div>
@@ -259,20 +248,20 @@ export function WorkflowProgressCompact({ currentStage, status, ticker = '' }: {
     Math.round(((currentIndex + 0.5) / stages.length) * 100);
 
   return (
-    <div className="flex items-center gap-3 px-3 py-2 bg-surface-light rounded-lg">
+    <div className="flex items-center gap-3 px-3 py-2 bg-elevated rounded-lg">
       {status === 'running' && (
-        <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+        <Loader2 className="w-4 h-4 text-accent animate-spin" />
       )}
       <div className="flex-1 min-w-0">
         <div className="flex items-center justify-between text-xs">
-          <span className="text-gray-400 truncate">
+          <span className="text-muted truncate">
             {stage?.label || 'Starting...'}
           </span>
-          <span className="text-blue-400 font-medium">{progressPercent}%</span>
+          <span className="text-accent font-medium tabular-nums">{progressPercent}%</span>
         </div>
-        <div className="h-1 bg-surface rounded-full mt-1">
+        <div className="h-1 bg-card rounded-full mt-1">
           <div
-            className="h-full bg-blue-500 rounded-full transition-all duration-300"
+            className="h-full bg-accent rounded-full transition-all duration-300"
             style={{ width: `${progressPercent}%` }}
           />
         </div>

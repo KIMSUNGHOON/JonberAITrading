@@ -8,7 +8,9 @@ Participates in group discussions with risk management perspective.
 from typing import List, Optional
 
 import structlog
+from langchain_core.messages import HumanMessage, SystemMessage
 
+from agents.llm.tasks import TaskType
 from services.agent_chat.agents.base_agent import BaseDiscussionAgent
 from services.agent_chat.models import (
     AgentMessage,
@@ -18,6 +20,7 @@ from services.agent_chat.models import (
     MessageType,
     VoteType,
 )
+from services.agent_chat.vote_schema import RISK_VOTE_SCHEMA
 
 logger = structlog.get_logger()
 
@@ -49,20 +52,27 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 - 적정 포지션 크기를 계산합니다
 - 손절/익절 수준을 제안합니다
 - 포트폴리오 집중도를 관리합니다
-- 하방 리스크를 경계합니다
+- 손실 리스크와 기회비용(진입하지 않아 놓치는 상승 가능성)을 함께 살핍니다
 
 토론 참여 방식:
-- 리스크 관점에서 보수적인 의견을 제시합니다
+- 손실 리스크와 기회비용을 양면으로 평가하는 의견을 제시합니다
 - 다른 분석가의 낙관적 전망에 리스크 요인을 제기합니다
-- 항상 손실 가능성을 고려합니다
+- 손실 가능성과 기회비용을 함께 고려합니다
 - 포트폴리오 전체 관점에서 판단합니다
 
 응답 형식:
 - 핵심 리스크 요인 명시
 - 변동성/유동성 데이터
 - 권장 포지션 크기와 손절선
-- 최악의 시나리오 고려"""
+- 최악의 시나리오와 기회비용을 함께 고려"""
 
+    # ⚠️ `{liquidity_context}` 안에 유동성 수치 줄과 그에 대한 판정 지시문이
+    # **함께** 들어온다(services/agent_chat/liquidity_note.build_liquidity_note).
+    # 판정 지시문을 이 템플릿 본문으로 다시 끌어올리지 마라 — 값이 없을 때
+    # (chart_df 빈 DF / total_portfolio 결측 / ADTV 표본 부족) 수치 줄만
+    # 사라지고 "위 참여율을 판정하라"는 지시만 남아 LLM이 존재하지 않는
+    # 수치를 지어내거나 근거 없이 반대표를 던진다(최종 리뷰 Blocking1).
+    # 보유/신규에 따라 지시문 자체가 달라지는 것도 그 함수의 책임이다.
     @property
     def analysis_prompt_template(self) -> str:
         return """## 리스크 평가 요청
@@ -77,6 +87,8 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 
 ### 변동성 데이터
 - 일일 변동: {price_change_pct:+.2f}%
+{us_market_context}
+{liquidity_context}
 
 ---
 
@@ -114,6 +126,9 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 
 100자 이내로 간결하게 응답하세요."""
 
+    # `{liquidity_context}`는 analysis와 **동일한** 문자열(수치 + 판정 지시문)
+    # 이다 — 판정 지시문이 note 안으로 들어가면서 analysis에만 기준이 있던
+    # 두 단계 비대칭이 구조적으로 해소된다(최종 리뷰 Blocking1).
     @property
     def vote_prompt_template(self) -> str:
         return """## 최종 투표 요청
@@ -128,11 +143,14 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 - 일일 변동: {price_change_pct:+.2f}%
 - 투자 가능: {available_cash}
 - 기존 포지션: {position_info}
+{us_market_context}
+{liquidity_context}
 
 ---
 
 토론 내용과 리스크 분석을 종합하여 최종 투표해주세요.
-리스크 관리자로서 보수적으로 판단하세요.
+리스크 관리자로서 손실 리스크와 기회비용(진입하지 않아 놓치는 상승 가능성)을
+양면으로 평가해 판단하세요.
 
 투표 옵션:
 - STRONG_BUY: 강력 매수 (리스크 매우 낮음)
@@ -147,7 +165,16 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
 권장 포지션: [포트폴리오 대비 %]
 손절가: [현재가 대비 -%]
 익절가: [현재가 대비 +%]
-근거: [핵심 리스크 요인]"""
+근거: [핵심 리스크 요인]
+
+응답은 다음 키를 가진 JSON 객체로도 반환하세요:
+- "vote": strong_buy / buy / hold / sell / strong_sell / abstain 중 하나
+- "confidence": 0.0~1.0 사이 숫자
+- "reasoning": 투표 근거 (한국어)
+- "key_factors": 핵심 근거 문자열 배열
+- "suggested_position_pct": 권장 포지션 비중(%) 숫자
+- "suggested_stop_loss_pct": 권장 손절 폭(%) 숫자
+- "suggested_take_profit_pct": 권장 익절 폭(%) 숫자"""
 
     async def analyze(self, context: MarketContext) -> AgentMessage:
         """Present initial risk assessment."""
@@ -168,9 +195,11 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             available_cash=available_cash,
             total_portfolio=total_portfolio,
             position_info=position_info,
+            us_market_context=context.us_market_context or "",
+            liquidity_context=context.liquidity_context or "",
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         confidence = self._parse_confidence(response)
 
         # Risk agent calculates risk parameters
@@ -227,7 +256,7 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             available_cash=available_cash,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         # Risk agent often raises concerns
         msg_type = MessageType.OPINION
@@ -267,16 +296,45 @@ class RiskDiscussionAgent(BaseDiscussionAgent):
             price_change_pct=context.price_change_pct,
             available_cash=available_cash,
             position_info=position_info,
+            us_market_context=context.us_market_context or "",
+            liquidity_context=context.liquidity_context or "",
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        risk_level = self._calculate_risk_level(context)
+
+        messages = [
+            SystemMessage(content=self._effective_system_prompt()),
+            HumanMessage(content=prompt),
+        ]
+        data = await self._structured_vote(messages, schema=RISK_VOTE_SCHEMA, task=TaskType.RISK)
+        if data is not None:
+            try:
+                return AgentVote(
+                    agent_type=self.agent_type,
+                    vote=VoteType(str(data["vote"]).strip().lower()),
+                    confidence=float(data["confidence"]),
+                    reasoning=data.get("reasoning") or "",
+                    key_factors=data.get("key_factors") or [],
+                    suggested_position_pct=data.get("suggested_position_pct")
+                        if data.get("suggested_position_pct") is not None
+                        else self._calculate_position_size(risk_level),
+                    suggested_stop_loss_pct=data.get("suggested_stop_loss_pct")
+                        if data.get("suggested_stop_loss_pct") is not None
+                        else self._calculate_stop_loss(risk_level),
+                    suggested_take_profit_pct=data.get("suggested_take_profit_pct")
+                        if data.get("suggested_take_profit_pct") is not None
+                        else self._calculate_take_profit(risk_level),
+                )
+            except (ValueError, KeyError, TypeError):
+                pass  # malformed structured payload (incl. null confidence) -> regex fallback
+
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         vote_type = self._parse_vote(response)
         confidence = self._parse_confidence(response)
         key_factors = self._extract_key_factors(response)
 
         # Extract risk parameters from response
-        risk_level = self._calculate_risk_level(context)
         position_pct = self._parse_position_pct(response) or self._calculate_position_size(risk_level)
         stop_loss_pct = self._parse_stop_loss_pct(response) or self._calculate_stop_loss(risk_level)
         take_profit_pct = self._parse_take_profit_pct(response) or self._calculate_take_profit(risk_level)

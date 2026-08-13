@@ -15,22 +15,22 @@ import {
   DollarSign,
   Newspaper,
   Shield,
-  MessageSquare,
-  CheckCircle,
   TrendingUp,
   TrendingDown,
   Minus,
   AlertCircle,
-  Wifi,
-  WifiOff,
 } from 'lucide-react';
 import { getAgentChatSessionDetail } from '@/api/client';
 import { useAgentChatWebSocket } from '@/hooks/useAgentChatWebSocket';
+import { pnlColor } from '@/utils/pnl';
+import { ReadingPane } from '@/components/common/ReadingPane';
+import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
 import type {
   AgentChatSessionDetail,
   AgentChatMessage,
   AgentChatDecision,
   AgentChatVote,
+  AgentChatVoteType,
   AgentChatAgentType,
   AgentChatSessionStatus,
 } from '@/types';
@@ -40,38 +40,42 @@ interface ChatSessionViewerProps {
   onClose: () => void;
 }
 
+// Agent-category IDENTITY map (not directional) -> which analyst produced
+// this message/vote. Colors stay raw hues per category; `fundamental`'s green
+// is agent-category identity, NOT a bullish vote (see voteColor/actionColor
+// below for the actual DIRECTIONAL BUY/SELL colors -> @/utils/pnl).
 const agentConfig: Record<
   AgentChatAgentType,
   { icon: React.ReactNode; color: string; bgColor: string; name: string }
 > = {
   technical: {
     icon: <BarChart2 className="w-4 h-4" />,
-    color: 'text-blue-400',
-    bgColor: 'bg-blue-500/20',
+    color: 'text-blue-400', // color-ok: agent-category identity, not directional
+    bgColor: 'bg-blue-500/20', // color-ok: agent-category identity, not directional
     name: 'Technical',
   },
   fundamental: {
     icon: <DollarSign className="w-4 h-4" />,
-    color: 'text-green-400',
-    bgColor: 'bg-green-500/20',
+    color: 'text-green-400', // color-ok: agent-category identity (fundamental analyst), not directional
+    bgColor: 'bg-green-500/20', // color-ok: agent-category identity (fundamental analyst), not directional
     name: 'Fundamental',
   },
   sentiment: {
     icon: <Newspaper className="w-4 h-4" />,
-    color: 'text-purple-400',
-    bgColor: 'bg-purple-500/20',
+    color: 'text-purple-400', // color-ok: agent-category identity, not directional
+    bgColor: 'bg-purple-500/20', // color-ok: agent-category identity, not directional
     name: 'Sentiment',
   },
   risk: {
     icon: <Shield className="w-4 h-4" />,
-    color: 'text-yellow-400',
-    bgColor: 'bg-yellow-500/20',
+    color: 'text-yellow-400', // color-ok: agent-category identity, not directional
+    bgColor: 'bg-yellow-500/20', // color-ok: agent-category identity, not directional
     name: 'Risk',
   },
   moderator: {
     icon: <User className="w-4 h-4" />,
-    color: 'text-gray-400',
-    bgColor: 'bg-gray-500/20',
+    color: 'text-muted',
+    bgColor: 'bg-muted/20',
     name: 'Moderator',
   },
 };
@@ -94,23 +98,23 @@ function MessageBubble({ message }: { message: AgentChatMessage }) {
   const config = agentConfig[message.agent_type] || agentConfig.moderator;
 
   return (
-    <div className="flex gap-3 p-3 hover:bg-gray-800/50 rounded-lg">
+    <div className="flex gap-3 p-3 hover:bg-elevated/50 rounded-lg">
       <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${config.bgColor}`}>
         {config.icon}
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-1">
           <span className={`font-medium ${config.color}`}>{message.agent_name}</span>
-          <span className="text-xs text-gray-500">{formatTime(message.timestamp)}</span>
+          <span className="text-xs text-dim">{formatTime(message.timestamp)}</span>
           {message.confidence !== null && (
-            <span className="text-xs px-1.5 py-0.5 bg-gray-700 rounded text-gray-400">
+            <span className="text-xs px-1.5 py-0.5 bg-elevated rounded text-muted tabular-nums">
               {(message.confidence * 100).toFixed(0)}% confidence
             </span>
           )}
         </div>
-        <div className="text-sm text-gray-300 whitespace-pre-wrap">{message.content}</div>
+        <ReadingPane><MarkdownRenderer content={message.content} /></ReadingPane>
         {message.data && Object.keys(message.data).length > 0 && (
-          <div className="mt-2 p-2 bg-gray-800 rounded text-xs text-gray-400">
+          <div className="mt-2 p-2 bg-elevated rounded text-xs text-muted">
             <pre className="overflow-x-auto">{JSON.stringify(message.data, null, 2)}</pre>
           </div>
         )}
@@ -119,125 +123,168 @@ function MessageBubble({ message }: { message: AgentChatMessage }) {
   );
 }
 
-function VoteCard({ vote }: { vote: AgentChatVote }) {
-  const config = agentConfig[vote.agent_type] || agentConfig.moderator;
-  const voteColor =
-    vote.vote === 'STRONG_BUY' || vote.vote === 'BUY'
-      ? 'text-green-400'
-      : vote.vote === 'STRONG_SELL' || vote.vote === 'SELL'
-      ? 'text-red-400'
-      : 'text-gray-400';
+const VOTE_LABEL: Record<AgentChatVoteType, string> = {
+  STRONG_BUY: 'S.BUY',
+  BUY: 'BUY',
+  HOLD: 'HOLD',
+  SELL: 'SELL',
+  STRONG_SELL: 'S.SELL',
+  ABSTAIN: 'ABS',
+};
 
+// Vote DIRECTIONAL color -> @/utils/pnl (app-wide ACTION map): STRONG_BUY/BUY
+// bullish -> up, STRONG_SELL/SELL bearish -> down, HOLD neutral, ABSTAIN dim.
+function voteColor(v: AgentChatVoteType): string {
+  if (v === 'STRONG_BUY' || v === 'BUY') return pnlColor(1);
+  if (v === 'SELL' || v === 'STRONG_SELL') return pnlColor(-1);
+  if (v === 'HOLD') return 'text-muted';
+  return 'text-dim';
+}
+
+export function VoteBlotter({ votes }: { votes: AgentChatVote[] }) {
   return (
-    <div className="p-3 bg-gray-800 rounded-lg">
-      <div className="flex items-center justify-between mb-2">
-        <div className="flex items-center gap-2">
-          <div className={`w-6 h-6 rounded-full flex items-center justify-center ${config.bgColor}`}>
-            {config.icon}
-          </div>
-          <span className={`text-sm font-medium ${config.color}`}>{config.name}</span>
-        </div>
-        <span className={`font-bold ${voteColor}`}>{vote.vote}</span>
-      </div>
-      <div className="text-xs text-gray-400 space-y-1">
-        <div className="flex justify-between">
-          <span>Confidence:</span>
-          <span>{(vote.confidence * 100).toFixed(0)}%</span>
-        </div>
-        <div className="flex justify-between">
-          <span>Weight:</span>
-          <span>{vote.weight}</span>
-        </div>
-        <div className="flex justify-between">
-          <span>Score:</span>
-          <span>{vote.weighted_score.toFixed(2)}</span>
-        </div>
-      </div>
-      {vote.reasoning && (
-        <p className="mt-2 text-xs text-gray-500">{vote.reasoning}</p>
-      )}
+    <table className="w-full text-[12px] tabular-nums">
+      <thead>
+        <tr className="text-[10px] uppercase tracking-wide text-dim border-b border-hairline">
+          <th className="text-left font-semibold px-2.5 py-1.5">Agent</th>
+          <th className="text-right font-semibold px-2.5 py-1.5">Vote</th>
+          <th className="text-right font-semibold px-2.5 py-1.5">Conf</th>
+          <th className="text-right font-semibold px-2.5 py-1.5">Wgt</th>
+          <th className="text-right font-semibold px-2.5 py-1.5">Score</th>
+        </tr>
+      </thead>
+      <tbody className="text-muted">
+        {votes.map((v, i) => {
+          const config = agentConfig[v.agent_type] || agentConfig.moderator;
+          return (
+            <tr key={i} className="border-b border-hairline/60">
+              <td className="text-left px-2.5 h-6">
+                <span className="inline-flex items-center gap-1.5 font-semibold text-ink">
+                  <span className={`${config.color} text-[8px] leading-none`}>●</span>
+                  {config.name}
+                </span>
+              </td>
+              <td className={`text-right px-2.5 font-semibold ${voteColor(v.vote)}`}>{VOTE_LABEL[v.vote]}</td>
+              <td className="text-right px-2.5 text-dim">{(v.confidence * 100).toFixed(0)}%</td>
+              <td className="text-right px-2.5 text-muted">{v.weight.toFixed(2)}</td>
+              <td className="text-right px-2.5 text-muted">{v.weighted_score.toFixed(2)}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function TicketKV({ label, value, valueClass }: { label: string; value: string; valueClass?: string }) {
+  return (
+    <div className="bg-card px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wide text-dim">{label}</div>
+      <div className={`text-sm font-medium tabular-nums ${valueClass ?? 'text-ink'}`}>{value}</div>
     </div>
   );
 }
 
-function DecisionPanel({ decision, ticker, stockName }: { decision: AgentChatDecision; ticker: string; stockName: string }) {
+function ConsensusTicket({
+  decision,
+  ticker,
+  stockName,
+}: {
+  decision: AgentChatDecision;
+  ticker: string;
+  stockName: string;
+}) {
   const actionIcon =
     decision.action === 'BUY' || decision.action === 'ADD' ? (
-      <TrendingUp className="w-6 h-6" />
+      <TrendingUp className="w-4 h-4" />
     ) : decision.action === 'SELL' || decision.action === 'REDUCE' ? (
-      <TrendingDown className="w-6 h-6" />
+      <TrendingDown className="w-4 h-4" />
     ) : (
-      <Minus className="w-6 h-6" />
+      <Minus className="w-4 h-4" />
     );
 
+  // ACTION DIRECTIONAL -> @/utils/pnl (text-only badge; no card background).
   const actionColor =
     decision.action === 'BUY' || decision.action === 'ADD'
-      ? 'text-green-400 bg-green-500/20 border-green-500/30'
+      ? pnlColor(1)
       : decision.action === 'SELL' || decision.action === 'REDUCE'
-      ? 'text-red-400 bg-red-500/20 border-red-500/30'
-      : 'text-gray-400 bg-gray-500/20 border-gray-500/30';
+      ? pnlColor(-1)
+      : 'text-muted';
+
+  const consensusPct = Math.round(decision.consensus_level * 100);
 
   return (
-    <div className={`p-6 rounded-xl border ${actionColor}`}>
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-3">
+    <div className="bg-card border border-hairline rounded">
+      {/* Header: ACTION (text-only) + symbol + confidence */}
+      <div className="flex items-center gap-2.5 px-3 py-2 border-b border-hairline">
+        <span className={`inline-flex items-center gap-1.5 text-base font-bold ${actionColor}`}>
           {actionIcon}
-          <div>
-            <div className="text-2xl font-bold">{decision.action}</div>
-            <div className="text-sm opacity-75">{stockName} ({ticker})</div>
-          </div>
-        </div>
-        <div className="text-right">
-          <div className="text-xl font-bold">{(decision.confidence * 100).toFixed(0)}%</div>
-          <div className="text-sm opacity-75">Confidence</div>
-        </div>
+          {decision.action}
+        </span>
+        <span className="text-sm text-ink font-semibold">{stockName}</span>
+        <span className="text-xs text-dim">({ticker})</span>
+        <span className="ml-auto text-xs text-muted">
+          CONF <span className="text-ink font-bold tabular-nums">{(decision.confidence * 100).toFixed(0)}%</span>
+        </span>
       </div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-        <div className="p-3 bg-gray-900/50 rounded-lg">
-          <div className="text-xs text-gray-400">Consensus</div>
-          <div className="text-lg font-medium text-white">
-            {(decision.consensus_level * 100).toFixed(0)}%
-          </div>
+      {/* Consensus bar + 75% display gate */}
+      <div className="flex items-center gap-2.5 px-3 py-2 border-b border-hairline">
+        <span className="text-[10px] text-muted">CONSENSUS</span>
+        <span className="text-sm font-bold tabular-nums text-ink">{consensusPct}%</span>
+        <div className="flex-1 h-1.5 rounded bg-elevated relative">
+          <span
+            className="absolute inset-y-0 left-0 rounded bg-accent transition-[width] duration-500"
+            style={{ width: `${Math.min(100, Math.max(0, consensusPct))}%` }}
+          />
+          {/* 75% gate is a display constant, not an enforced backend threshold. */}
+          <span className="absolute top-[-3px] bottom-[-3px] left-[75%] w-0.5 bg-warn" />
         </div>
-        <div className="p-3 bg-gray-900/50 rounded-lg">
-          <div className="text-xs text-gray-400">Entry Price</div>
-          <div className="text-lg font-medium text-white">{formatPrice(decision.entry_price)}</div>
-        </div>
-        <div className="p-3 bg-gray-900/50 rounded-lg">
-          <div className="text-xs text-gray-400">Stop Loss</div>
-          <div className="text-lg font-medium text-red-400">{formatPrice(decision.stop_loss)}</div>
-        </div>
-        <div className="p-3 bg-gray-900/50 rounded-lg">
-          <div className="text-xs text-gray-400">Take Profit</div>
-          <div className="text-lg font-medium text-green-400">{formatPrice(decision.take_profit)}</div>
-        </div>
+        <span className="text-[11px] text-muted">gate 75%</span>
       </div>
 
+      {/* Entry / Stop / Take KV */}
+      <div className="grid grid-cols-3 gap-px bg-hairline border-b border-hairline">
+        <TicketKV label="ENTRY" value={formatPrice(decision.entry_price)} />
+        <TicketKV label="STOP" value={formatPrice(decision.stop_loss)} valueClass="text-down" />
+        <TicketKV label="TAKE" value={formatPrice(decision.take_profit)} valueClass="text-up" />
+      </div>
+
+      {/* Rationale — editorial reading pane (prose) */}
       {decision.rationale && (
-        <div className="mb-4">
-          <div className="text-sm font-medium text-gray-300 mb-2">Rationale</div>
-          <p className="text-sm text-gray-400">{decision.rationale}</p>
+        <div className="px-3 py-2 border-b border-hairline">
+          <div className="text-[10px] uppercase tracking-wide text-dim mb-1">Rationale</div>
+          <ReadingPane>
+            <MarkdownRenderer content={decision.rationale} />
+          </ReadingPane>
         </div>
       )}
 
+      {/* Key factors — dense list */}
       {decision.key_factors.length > 0 && (
-        <div className="mb-4">
-          <div className="text-sm font-medium text-gray-300 mb-2">Key Factors</div>
-          <ul className="list-disc list-inside text-sm text-gray-400 space-y-1">
-            {decision.key_factors.map((factor, i) => (
-              <li key={i}>{factor}</li>
+        <div className="px-3 py-2 border-b border-hairline">
+          <div className="text-[10px] uppercase tracking-wide text-dim mb-1">Key Factors</div>
+          <ul className="text-xs text-muted space-y-0.5">
+            {decision.key_factors.map((f, i) => (
+              <li key={i} className="flex gap-1.5">
+                <span className="text-dim flex-none">·</span>
+                {f}
+              </li>
             ))}
           </ul>
         </div>
       )}
 
+      {/* Dissent — dense list */}
       {decision.dissenting_opinions.length > 0 && (
-        <div>
-          <div className="text-sm font-medium text-gray-300 mb-2">Dissenting Opinions</div>
-          <ul className="list-disc list-inside text-sm text-gray-400 space-y-1">
-            {decision.dissenting_opinions.map((opinion, i) => (
-              <li key={i}>{opinion}</li>
+        <div className="px-3 py-2">
+          <div className="text-[10px] uppercase tracking-wide text-dim mb-1">Dissent</div>
+          <ul className="text-xs text-muted space-y-0.5">
+            {decision.dissenting_opinions.map((o, i) => (
+              <li key={i} className="flex gap-1.5">
+                <span className="text-dim flex-none">·</span>
+                {o}
+              </li>
             ))}
           </ul>
         </div>
@@ -339,22 +386,22 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
-        <RefreshCw className="w-8 h-8 animate-spin text-blue-500" />
+        <RefreshCw className="w-8 h-8 animate-spin text-accent" />
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
+      <div className="bg-card rounded border border-hairline p-6">
         <button
           onClick={onClose}
-          className="flex items-center gap-2 text-gray-400 hover:text-white mb-4"
+          className="flex items-center gap-2 text-muted hover:text-ink mb-4"
         >
           <ArrowLeft className="w-5 h-5" />
-          Back
+          목록
         </button>
-        <div className="flex items-center gap-3 text-red-400">
+        <div className="flex items-center gap-3 text-down">
           <AlertCircle className="w-5 h-5" />
           {error}
         </div>
@@ -365,99 +412,79 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
   if (!session) return null;
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <button
-          onClick={onClose}
-          className="flex items-center gap-2 text-gray-400 hover:text-white"
-        >
-          <ArrowLeft className="w-5 h-5" />
-          Back to Dashboard
+    <div className="space-y-3">
+      {/* Breadcrumb (R5-P2-UX B2): 종목/상태/← 목록 in one line. Selecting a
+          session no longer full-page-swaps (AgentChatDashboard is now
+          master-detail — the session list stays visible alongside this
+          pane), but this still gives a persistent "where am I" anchor at the
+          top of the detail pane itself. */}
+      <div className="flex items-center gap-3 border-b border-hairline pb-2">
+        <button onClick={onClose} className="flex items-center gap-1.5 text-xs text-muted hover:text-ink">
+          <ArrowLeft className="w-4 h-4" />
+          목록
         </button>
-        <div className="flex items-center gap-3">
-          {/* WebSocket Connection Status */}
+        <span className="text-dim text-xs">/</span>
+        <span className="text-xs font-medium text-ink truncate">
+          {session.stock_name} ({session.ticker})
+        </span>
+        <span
+          className={`text-[10px] font-mono uppercase ${
+            session.status === 'decided'
+              ? 'text-up'
+              : session.status === 'error'
+              ? 'text-down'
+              : 'text-accent'
+          }`}
+        >
+          {session.status}
+        </span>
+        <div className="ml-auto flex items-center gap-3">
           {isActiveSession && (
-            <div className="flex items-center gap-2">
+            <span className="text-[11px] font-mono">
               {isConnected ? (
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-green-500/10 rounded-lg">
-                  <Wifi className="w-4 h-4 text-green-400" />
-                  <span className="text-xs text-green-400">Live</span>
-                </div>
+                <span className="text-up">● live</span>
               ) : connectionState === 'connecting' || connectionState === 'reconnecting' ? (
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-yellow-500/10 rounded-lg">
-                  <RefreshCw className="w-4 h-4 text-yellow-400 animate-spin" />
-                  <span className="text-xs text-yellow-400">Connecting...</span>
-                </div>
+                <span className="text-warn">◌ connecting…</span>
               ) : (
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-gray-500/10 rounded-lg">
-                  <WifiOff className="w-4 h-4 text-gray-400" />
-                  <span className="text-xs text-gray-400">Polling</span>
-                </div>
+                <span className="text-muted">○ polling</span>
               )}
-            </div>
+            </span>
           )}
-          <button
-            onClick={fetchSession}
-            className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
-          >
-            <RefreshCw className="w-5 h-5" />
+          <button onClick={fetchSession} className="p-1 text-muted hover:text-ink hover:bg-elevated rounded">
+            <RefreshCw className="w-4 h-4" />
           </button>
         </div>
       </div>
 
-      {/* Session Info */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <h2 className="text-xl font-semibold text-white">
-              {session.stock_name} ({session.ticker})
-            </h2>
-            <p className="text-sm text-gray-400">
-              Session: {session.id.slice(0, 8)}...
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <span
-              className={`px-3 py-1 rounded-full text-sm ${
-                session.status === 'decided'
-                  ? 'bg-green-500/20 text-green-400'
-                  : session.status === 'error'
-                  ? 'bg-red-500/20 text-red-400'
-                  : 'bg-blue-500/20 text-blue-400'
-              }`}
-            >
-              {session.status}
-            </span>
-          </div>
+      {/* Session strip */}
+      <div className="border-b border-hairline pb-2">
+        <div className="flex items-baseline gap-2">
+          <h2 className="text-sm font-semibold text-ink">{session.stock_name}</h2>
+          <span className="text-xs text-dim">({session.ticker})</span>
+          <span className="text-[10px] text-dim">· {session.id.slice(0, 8)}</span>
+          <span
+            className={`ml-auto text-[11px] font-mono uppercase ${
+              session.status === 'decided'
+                ? 'text-up'
+                : session.status === 'error'
+                ? 'text-down'
+                : 'text-accent'
+            }`}
+          >
+            {session.status}
+          </span>
         </div>
-
-        {/* Stats */}
-        <div className="grid grid-cols-4 gap-4 text-center">
-          <div className="p-3 bg-gray-800 rounded-lg">
-            <div className="text-lg font-bold text-white">{session.rounds.length}</div>
-            <div className="text-xs text-gray-400">Rounds</div>
-          </div>
-          <div className="p-3 bg-gray-800 rounded-lg">
-            <div className="text-lg font-bold text-white">{session.messages.length}</div>
-            <div className="text-xs text-gray-400">Messages</div>
-          </div>
-          <div className="p-3 bg-gray-800 rounded-lg">
-            <div className="text-lg font-bold text-white">{session.votes.length}</div>
-            <div className="text-xs text-gray-400">Votes</div>
-          </div>
-          <div className="p-3 bg-gray-800 rounded-lg">
-            <div className="text-lg font-bold text-white">
-              {(session.consensus_level * 100).toFixed(0)}%
-            </div>
-            <div className="text-xs text-gray-400">Consensus</div>
-          </div>
+        <div className="mt-1 flex gap-3 text-[11px] font-mono tabular-nums text-muted">
+          <span>ROUNDS <span className="text-ink">{session.rounds.length}</span></span>
+          <span>MSGS <span className="text-ink">{session.messages.length}</span></span>
+          <span>VOTES <span className="text-ink">{session.votes.length}</span></span>
+          <span>CONSENSUS <span className="text-ink">{(session.consensus_level * 100).toFixed(0)}%</span></span>
         </div>
       </div>
 
       {/* Decision (if available) */}
       {session.decision && (
-        <DecisionPanel
+        <ConsensusTicket
           decision={session.decision}
           ticker={session.ticker}
           stockName={session.stock_name}
@@ -466,26 +493,20 @@ export function ChatSessionViewer({ sessionId, onClose }: ChatSessionViewerProps
 
       {/* Votes */}
       {session.votes.length > 0 && (
-        <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-          <h3 className="text-lg font-medium text-white mb-4 flex items-center gap-2">
-            <CheckCircle className="w-5 h-5 text-green-400" />
-            Agent Votes
-          </h3>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {session.votes.map((vote, i) => (
-              <VoteCard key={i} vote={vote} />
-            ))}
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-dim mb-1.5">
+            Agent Votes · {session.votes.length}
           </div>
+          <VoteBlotter votes={session.votes} />
         </div>
       )}
 
-      {/* Messages */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-6">
-        <h3 className="text-lg font-medium text-white mb-4 flex items-center gap-2">
-          <MessageSquare className="w-5 h-5 text-blue-400" />
-          Discussion ({session.messages.length} messages)
-        </h3>
-        <div className="space-y-2 max-h-[600px] overflow-y-auto">
+      {/* Discussion */}
+      <div>
+        <div className="text-[10px] uppercase tracking-wide text-dim mb-1.5">
+          Discussion · {session.messages.length}
+        </div>
+        <div className="space-y-1 max-h-[600px] overflow-y-auto">
           {session.messages.map((message) => (
             <MessageBubble key={message.id} message={message} />
           ))}

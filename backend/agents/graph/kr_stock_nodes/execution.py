@@ -13,6 +13,7 @@ Supported TradeAction types:
 - AVOID: 매수 금지 (미보유 + SELL 시그널) - 거래 미실행
 """
 
+from datetime import date
 from typing import Literal, Optional
 
 import structlog
@@ -26,7 +27,12 @@ from agents.graph.kr_stock_state import (
 )
 from app.config import settings
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
-from services.kiwoom import OrderType
+from services.execution import (
+    KiwoomExecutionAdapter,
+    ExecutionSide,
+    ExecutionOrderType,
+)
+from services.trading.fill_confirm import confirm_kiwoom_fill
 
 logger = structlog.get_logger()
 
@@ -222,28 +228,16 @@ async def kr_stock_execution_node(state: dict) -> dict:
             "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
         }
 
-    # Execute order via Kiwoom API (using shared singleton)
+    # Execute via the broker-agnostic execution path. KiwoomExecutionAdapter wraps
+    # the shared client (mock/live gated inside it by KIWOOM_IS_MOCK).
     try:
         client = await get_shared_kiwoom_client_async()
+        adapter = KiwoomExecutionAdapter(client)
 
-        # BUY or ADD → Execute buy order
         if _is_buy_action(action):
-            order_response = await client.place_buy_order(
-                stk_cd=stk_cd,
-                qty=quantity,
-                price=entry_price,
-                order_type=OrderType.LIMIT,
-            )
-
-        # SELL or REDUCE → Execute sell order
+            exec_side = ExecutionSide.BUY
         elif _is_sell_action(action):
-            order_response = await client.place_sell_order(
-                stk_cd=stk_cd,
-                qty=quantity,
-                price=entry_price,
-                order_type=OrderType.LIMIT,
-            )
-
+            exec_side = ExecutionSide.SELL
         else:
             # Should not reach here due to no-trade check above
             reasoning = f"[실행] 알 수 없는 액션: {action.value}"
@@ -254,6 +248,83 @@ async def kr_stock_execution_node(state: dict) -> dict:
                 "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
             }
 
+        # L2 (decision lineage restoration, spec D1/D5): persist a durable
+        # decision-ledger row (L1's persist_analysis_decision) just before
+        # order placement, so kr_stock_trades.decision_id and
+        # ManagedPosition.analysis_session_id below can carry an id that
+        # survives this SessionManager session's eventual GC (P5) instead of
+        # state.get("session_id") -- a dangling pointer once that session is
+        # cleaned up. Best-effort and entirely exception-boxed on top of
+        # persist_analysis_decision's own never-raise contract: any failure
+        # here (including get_storage_service itself) degrades to
+        # decision_id=None and order placement proceeds exactly as before
+        # this wiring existed -- a lineage gap, never an execution gap.
+        decision_id: Optional[str] = None
+        try:
+            from services.storage_service import get_storage_service
+            from services.trading.decision_ledger import persist_analysis_decision
+
+            synthesis = state.get("synthesis") or {}
+            storage = await get_storage_service()
+            decision_id = await persist_analysis_decision(
+                storage,
+                session_id=state.get("session_id"),
+                ticker=stk_cd,
+                action=action.value,
+                confidence=synthesis.get("average_confidence"),
+                rationale=synthesis.get("decision_rationale") or proposal.get("rationale"),
+                # I3 (final-review fix): stk_nm is already in scope here
+                # (proposal.get("stk_nm", stk_cd) above) -- thread it through
+                # so the durable decision row carries a display name too.
+                stock_name=stk_nm,
+            )
+        except Exception as decision_ledger_err:
+            logger.warning(
+                "kr_stock_decision_ledger_persist_failed",
+                stk_cd=stk_cd,
+                action=action.value,
+                error=str(decision_ledger_err),
+            )
+
+        result = await adapter.place(
+            ticker=stk_cd,
+            side=exec_side,
+            qty=quantity,
+            price=entry_price,
+            order_type=ExecutionOrderType.LIMIT,
+        )
+        order_response = result.raw  # native OrderResponse — ord_no/return_code used below
+
+        # A broker REJECTION is not an exception — KiwoomExecutionAdapter.place
+        # returns success=False (return_code != 0, ord_no likely empty) WITHOUT
+        # raising. Branch on it BEFORE fill confirmation: a rejected order has
+        # no fill to confirm and must never register a phantom TrackedOrder
+        # (an "" ord_no would be polled against real ka10076 every tick and
+        # expire at market close as '미체결 만료' for an order the broker
+        # refused). Same failure vocabulary as the node's other failure paths.
+        if not result.success:
+            error_msg = order_response.return_msg or "Order rejected by broker"
+            logger.error(
+                "kr_stock_order_rejected",
+                stk_cd=stk_cd,
+                action=action.value,
+                return_code=order_response.return_code,
+                error=error_msg,
+            )
+            reasoning = f"[실행] {action_korean} 주문 거부: {error_msg}"
+            return {
+                "execution_status": "failed",
+                "error": error_msg,
+                "order_response": {
+                    "ord_no": order_response.ord_no,
+                    "return_code": order_response.return_code,
+                    "return_msg": order_response.return_msg,
+                },
+                "current_stage": KRStockAnalysisStage.COMPLETE,
+                "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
+                "messages": [AIMessage(content=reasoning)],
+            }
+
         logger.info(
             "kr_stock_order_placed",
             stk_cd=stk_cd,
@@ -262,73 +333,303 @@ async def kr_stock_execution_node(state: dict) -> dict:
             return_code=order_response.return_code,
         )
 
-        # Calculate position quantity change
-        existing_qty = existing_position.get("quantity", 0) if existing_position else 0
-        quantity_change = _calculate_position_quantity_change(action, quantity)
+        # An accepted order is NOT a filled order — confirm the ACTUAL fill via
+        # ka10076 (체결내역) instead of assuming full fill at the limit price.
+        # A limit order may fill partially or not at all; reporting an assumed
+        # full fill fabricated ghost positions for shares the broker never
+        # actually filled (F3 audit; mirrors OrderAgent._confirm_kiwoom_fill).
+        # A query failure inside confirm_kiwoom_fill is reported as 0 fill,
+        # never as an assumed full fill.
+        filled_qty, avg_fill_price = await confirm_kiwoom_fill(
+            client,
+            ticker=stk_cd,
+            order_no=order_response.ord_no,
+            requested_qty=quantity,
+            fallback_price=entry_price,
+        )
+        remaining_qty = max(0, quantity - filled_qty)
 
-        # Create/update position record based on action type
-        if action == TradeAction.ADD:
-            # ADD: Merge with existing position (existing_position is guaranteed non-None here)
-            new_quantity = existing_qty + quantity
-            avg_price = _calculate_average_price(
-                existing_price=existing_position.get("entry_price", 0),
-                existing_qty=existing_qty,
-                new_price=entry_price,
-                new_qty=quantity,
-            )
-            position = KRStockPosition(
-                stk_cd=stk_cd,
-                stk_nm=stk_nm,
-                quantity=new_quantity,
-                entry_price=avg_price,
-                current_price=entry_price,
-                stop_loss=proposal.get("stop_loss") or existing_position.get("stop_loss"),
-                take_profit=proposal.get("take_profit") or existing_position.get("take_profit"),
-            )
-        elif action == TradeAction.REDUCE and existing_position:
-            # Reduce existing position
-            new_quantity = max(0, existing_qty - quantity)
-            position = KRStockPosition(
-                stk_cd=stk_cd,
-                stk_nm=stk_nm,
-                quantity=new_quantity,
-                entry_price=existing_position.get("entry_price", entry_price),
-                current_price=entry_price,
-                stop_loss=existing_position.get("stop_loss") if new_quantity > 0 else None,
-                take_profit=existing_position.get("take_profit") if new_quantity > 0 else None,
-            )
-        else:
-            # BUY (new position) or SELL (position closed)
-            position = KRStockPosition(
-                stk_cd=stk_cd,
-                stk_nm=stk_nm,
-                quantity=quantity_change,
-                entry_price=entry_price,
-                current_price=entry_price,
-                stop_loss=proposal.get("stop_loss"),
-                take_profit=proposal.get("take_profit"),
-            )
+        logger.info(
+            "kr_stock_fill_confirmed",
+            stk_cd=stk_cd,
+            action=action.value,
+            order_no=order_response.ord_no,
+            requested_qty=quantity,
+            filled_qty=filled_qty,
+            remaining_qty=remaining_qty,
+        )
+
+        # Calculate position quantity change — driven by the CONFIRMED fill,
+        # never the requested quantity. A 0 fill produces no position at all
+        # (position stays None → omitted from the returned state so any
+        # existing position is left untouched rather than clobbered).
+        existing_qty = existing_position.get("quantity", 0) if existing_position else 0
+        avg_fill_price_int = round(avg_fill_price)
+
+        position: Optional[KRStockPosition] = None
+        if filled_qty > 0:
+            # Create/update position record based on action type
+            if action == TradeAction.ADD:
+                # ADD: Merge with existing position (existing_position is guaranteed non-None here)
+                new_quantity = existing_qty + filled_qty
+                avg_price = _calculate_average_price(
+                    existing_price=existing_position.get("entry_price", 0),
+                    existing_qty=existing_qty,
+                    new_price=avg_fill_price,
+                    new_qty=filled_qty,
+                )
+                position = KRStockPosition(
+                    stk_cd=stk_cd,
+                    stk_nm=stk_nm,
+                    quantity=new_quantity,
+                    entry_price=avg_price,
+                    current_price=avg_fill_price_int,
+                    stop_loss=proposal.get("stop_loss") or existing_position.get("stop_loss"),
+                    take_profit=proposal.get("take_profit") or existing_position.get("take_profit"),
+                )
+            elif action == TradeAction.REDUCE and existing_position:
+                # Reduce existing position by the CONFIRMED sold quantity
+                new_quantity = max(0, existing_qty - filled_qty)
+                position = KRStockPosition(
+                    stk_cd=stk_cd,
+                    stk_nm=stk_nm,
+                    quantity=new_quantity,
+                    entry_price=existing_position.get("entry_price", avg_fill_price_int),
+                    current_price=avg_fill_price_int,
+                    stop_loss=existing_position.get("stop_loss") if new_quantity > 0 else None,
+                    take_profit=existing_position.get("take_profit") if new_quantity > 0 else None,
+                )
+            else:
+                # BUY (new position) or SELL (position reduced/closed) — the
+                # CONFIRMED fill, not the requested quantity, drives the delta.
+                quantity_change = _calculate_position_quantity_change(action, filled_qty)
+                position = KRStockPosition(
+                    stk_cd=stk_cd,
+                    stk_nm=stk_nm,
+                    quantity=quantity_change,
+                    entry_price=avg_fill_price_int,
+                    current_price=avg_fill_price_int,
+                    stop_loss=proposal.get("stop_loss"),
+                    take_profit=proposal.get("take_profit"),
+                )
+
+            # P1-1: record the confirmed fill for /trades — regardless of
+            # action type (BUY/ADD/SELL/REDUCE), matching the coordinator's
+            # own choke points. Lazy-imported (mirrors this file's existing
+            # convention for coordinator side effects below) so tests can
+            # patch it at its origin module. Best-effort: a recording
+            # failure must never fail the graph run.
+            try:
+                from services.trading.trade_log import record_trade_fill
+
+                record_trade_fill(
+                    stk_cd=stk_cd,
+                    stk_nm=stk_nm,
+                    side="buy" if _is_buy_action(action) else "sell",
+                    order_type="limit",
+                    price=avg_fill_price,
+                    quantity=quantity,
+                    executed_quantity=filled_qty,
+                    status="completed" if filled_qty >= quantity else "partial",
+                    order_id=order_response.ord_no,
+                    session_id=state.get("session_id"),
+                    # L2: durable decision-ledger id (None if the persist
+                    # step above failed or produced no id) + entry/exit
+                    # derived from the same buy/sell split the `side` field
+                    # just above already uses.
+                    decision_id=decision_id,
+                    entry_or_exit="entry" if _is_buy_action(action) else "exit",
+                )
+            except Exception as trade_log_err:
+                logger.warning(
+                    "kr_stock_trade_log_failed",
+                    stk_cd=stk_cd,
+                    action=action.value,
+                    error=str(trade_log_err),
+                )
+
+        # Mirror the confirmed fill into the trading coordinator's own
+        # monitoring (RiskMonitor / agent-chat PositionManager) and, for any
+        # still-unfilled remainder of a BUY-side order, register it with the
+        # coordinator's fill tracker so the scheduler's ka10076 poll can pick
+        # up the post-fill later — otherwise a partial/zero fill at placement
+        # time would go unwatched by every defense engine once this node
+        # returns. E1-3: a SELL/REDUCE order's unfilled remainder is now
+        # registered too (below) — previously out of scope (R5-P4), the same
+        # gap E1-1/E1-2 already closed for coordinator.py's own SELL paths.
+        # Unlike BUY, a SELL fill never flows through register_fill_as_position
+        # (that would wrongly GROW a position from an exit), and stop_loss/
+        # take_profit are always None (an exit carries no defense levels of
+        # its own forward).
+        #
+        # Best-effort: a coordinator failure must never crash the graph run,
+        # so this entire block is exception-boxed and the execution_status
+        # computed below is unaffected by it.
+        if _is_buy_action(action):
+            try:
+                from app.dependencies import get_trading_coordinator
+                from services.trading.pending_order_tracker import TrackedOrder
+                from services.trading.position_registration import (
+                    register_fill_as_position,
+                )
+
+                coordinator = await get_trading_coordinator()
+
+                # Proposal risk_score is float 0-1 (KRStockTradeProposal);
+                # the coordinator layer (TrackedOrder / ManagedPosition) uses
+                # int 1-10 — convert with the file's existing convention
+                # (decision_nodes.py:330, int(proposal.risk_score * 10)).
+                proposal_risk = proposal.get("risk_score")
+                risk_score_int = (
+                    int(float(proposal_risk) * 10) if proposal_risk is not None else None
+                )
+
+                if filled_qty > 0:
+                    await register_fill_as_position(
+                        coordinator,
+                        ticker=stk_cd,
+                        stock_name=stk_nm,
+                        quantity=filled_qty,
+                        avg_price=avg_fill_price,
+                        stop_loss=proposal.get("stop_loss"),
+                        take_profit=proposal.get("take_profit"),
+                        # L2 (spec D1): the durable decision-ledger id, NOT
+                        # state.get("session_id") -- ManagedPosition.
+                        # analysis_session_id is meant to survive the
+                        # originating SessionManager session's GC (P5), so it
+                        # must hold an id that outlives that session, not the
+                        # session's own id. None (persist failed/no id) is
+                        # threaded through as-is -- this is a deliberate spec
+                        # change from the prior state.get("session_id")
+                        # behavior, pinned by test.
+                        session_id=decision_id,
+                        source="kr_graph_execution",
+                        # Parity with the poll path (coordinator.py:1560-1561):
+                        # stop_loss_mode from risk params, risk from the proposal.
+                        stop_loss_mode=coordinator.risk_params.stop_loss_mode,
+                        risk_score=risk_score_int,
+                    )
+
+                if remaining_qty > 0:
+                    coordinator.fill_tracker.register(
+                        TrackedOrder(
+                            ord_no=order_response.ord_no,
+                            ticker=stk_cd,
+                            stock_name=stk_nm,
+                            side="buy",
+                            total_quantity=quantity,
+                            filled_quantity=filled_qty,
+                            filled_amount=filled_qty * avg_fill_price,
+                            limit_price=entry_price,
+                            stop_loss=proposal.get("stop_loss"),
+                            take_profit=proposal.get("take_profit"),
+                            # I2 (final-review fix): the durable decision-
+                            # ledger id, matching register_fill_as_position's
+                            # session_id kwarg just above (L2, spec D1) --
+                            # NOT state.get("session_id") (a dangling
+                            # SessionManager id once that session is GC'd,
+                            # P5). None (persist failed/no id) threads
+                            # through as-is, same as the BUY position path.
+                            source_session_id=decision_id,
+                            risk_score=risk_score_int,
+                            trade_date=date.today().strftime("%Y%m%d"),
+                        )
+                    )
+                    # A memory-only TrackedOrder dies with the process — the
+                    # exact incident class this arc closes. Schedule the
+                    # coordinator's blob persistence (R5-P1 mechanism) so the
+                    # tracked remainder survives a restart.
+                    coordinator._schedule_persist()
+            except Exception as coord_err:
+                logger.warning(
+                    "kr_stock_fill_registration_failed",
+                    stk_cd=stk_cd,
+                    action=action.value,
+                    error=str(coord_err),
+                )
+        elif _is_sell_action(action) and remaining_qty > 0:
+            # E1-3: mirror the BUY-side unfilled-remainder registration above
+            # for SELL/REDUCE — a partial/zero SELL fill at placement time
+            # previously went unwatched by the ka10076 poll entirely. No
+            # register_fill_as_position call here: a SELL fill must never
+            # grow a position. stop_loss/take_profit are None: an exit has no
+            # defense levels of its own to carry forward.
+            try:
+                from app.dependencies import get_trading_coordinator
+                from services.trading.pending_order_tracker import TrackedOrder
+
+                coordinator = await get_trading_coordinator()
+
+                proposal_risk = proposal.get("risk_score")
+                risk_score_int = (
+                    int(float(proposal_risk) * 10) if proposal_risk is not None else None
+                )
+
+                coordinator.fill_tracker.register(
+                    TrackedOrder(
+                        ord_no=order_response.ord_no,
+                        ticker=stk_cd,
+                        stock_name=stk_nm,
+                        side="sell",
+                        total_quantity=quantity,
+                        filled_quantity=filled_qty,
+                        filled_amount=filled_qty * avg_fill_price,
+                        limit_price=entry_price,
+                        # I2 (final-review fix): the durable decision-ledger
+                        # id (this EXIT's own decision_id), NOT
+                        # state.get("session_id") -- mirrors the BUY-side
+                        # fix above. This is what the post-fill poll path
+                        # (_poll_tracked_fills -> _apply_sell_position_delta
+                        # -> record_kr_realized_pnl(exit_decision_id=...))
+                        # later reads as the EXIT decision's lineage anchor.
+                        source_session_id=decision_id,
+                        risk_score=risk_score_int,
+                        trade_date=date.today().strftime("%Y%m%d"),
+                    )
+                )
+                # A memory-only TrackedOrder dies with the process — schedule
+                # the coordinator's blob persistence (R5-P1 mechanism) so the
+                # tracked remainder survives a restart (parity with the BUY
+                # branch above).
+                coordinator._schedule_persist()
+            except Exception as coord_err:
+                logger.warning(
+                    "kr_stock_fill_registration_failed",
+                    stk_cd=stk_cd,
+                    action=action.value,
+                    error=str(coord_err),
+                )
+
+        execution_status = "completed" if filled_qty > 0 else "placed_pending_fill"
 
         # Build reasoning message with action-specific details
         if action == TradeAction.ADD:
+            reported_total = position.quantity if position else existing_qty
             reasoning = (
-                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} +{quantity}주 @ {entry_price:,}원, "
-                f"기존 {existing_qty}주 → 총 {position.quantity}주, 주문번호: {order_response.ord_no}"
+                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} +{filled_qty}/{quantity}주(체결/요청) "
+                f"@ {avg_fill_price_int:,}원, 기존 {existing_qty}주 → 총 {reported_total}주, "
+                f"주문번호: {order_response.ord_no}"
             )
         elif action == TradeAction.REDUCE:
+            reported_remaining = position.quantity if position else existing_qty
             reasoning = (
-                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} -{quantity}주 @ {entry_price:,}원, "
-                f"기존 {existing_qty}주 → 잔여 {position.quantity}주, 주문번호: {order_response.ord_no}"
+                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} -{filled_qty}/{quantity}주(체결/요청) "
+                f"@ {avg_fill_price_int:,}원, 기존 {existing_qty}주 → 잔여 {reported_remaining}주, "
+                f"주문번호: {order_response.ord_no}"
+            )
+        elif filled_qty <= 0:
+            reasoning = (
+                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} {quantity}주 @ {entry_price:,}원, "
+                f"체결 미확인 — 체결 추적 중 (주문번호: {order_response.ord_no})"
             )
         else:
             reasoning = (
-                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} {quantity}주 @ {entry_price:,}원, "
-                f"주문번호: {order_response.ord_no}"
+                f"[실행] ({mode_str}) {action_korean} 접수: {stk_nm} {filled_qty}/{quantity}주(체결/요청) "
+                f"@ {avg_fill_price_int:,}원, 주문번호: {order_response.ord_no}"
             )
 
-        return {
-            "execution_status": "completed",
-            "active_position": position.model_dump(),
+        response_update = {
+            "execution_status": execution_status,
             "order_response": {
                 "ord_no": order_response.ord_no,
                 "return_code": order_response.return_code,
@@ -338,6 +639,9 @@ async def kr_stock_execution_node(state: dict) -> dict:
             "reasoning_log": add_kr_stock_reasoning_log(state, reasoning),
             "messages": [AIMessage(content=reasoning)],
         }
+        if position is not None:
+            response_update["active_position"] = position.model_dump()
+        return response_update
 
     except Exception as e:
         error_msg = str(e)

@@ -82,7 +82,6 @@ class ActivityType(str, Enum):
     MARKET_CLOSED = "market_closed"
     ACCOUNT_REFRESHED = "account_refreshed"
     STRATEGY_CHANGED = "strategy_changed"
-    STRATEGY_EVALUATED = "strategy_evaluated"
     # Watch list activities
     WATCH_ADDED = "watch_added"
     WATCH_REMOVED = "watch_removed"
@@ -193,11 +192,46 @@ class RiskParameters(BaseModel):
         description="Maximum total stock allocation as % of total equity"
     )
 
+    # Autonomy safety rails (R3 — enforced by services/autonomy/gate.py)
+    max_daily_loss_pct: float = Field(
+        default=3.0,
+        ge=0.1, le=20.0,
+        description="Daily realized-loss breaker %, autonomous mode (enforced via the gate seam; inert until a realized-P&L source is wired)"
+    )
+    max_open_positions: int = Field(
+        default=5,
+        ge=1, le=50,
+        description="Maximum concurrent open positions for autonomous BUY/ADD"
+    )
+    max_trade_notional_pct: float = Field(
+        default=15.0,
+        ge=0.5, le=50.0,
+        description="Per-trade notional cap as % of total account equity for autonomous BUY/ADD (전략이 [5,30] 바운드 내 적응)"
+    )
+
     # Risk thresholds
     sudden_move_threshold_pct: float = Field(
         default=10.0,
         ge=1.0, le=30.0,
         description="% change to trigger sudden move alert"
+    )
+
+    # Sudden-move pause is PER-TICKER and auto-recovering (M1, C2 audit
+    # 2026-07-13) — it does NOT use the global pause()/resume() kill-switch,
+    # so one stock's dead-candle can no longer freeze stop-loss defense for
+    # the whole book. See RiskMonitor._handle_sudden_move / _check_position.
+    sudden_move_cooldown_ticks: int = Field(
+        default=5,
+        ge=1, le=100,
+        description="Monitor ticks a ticker's stop-loss/take-profit stays "
+                     "paused after a sudden move, before auto-recovering"
+    )
+    sudden_move_stabilization_pct: float = Field(
+        default=3.0,
+        ge=0.1, le=30.0,
+        description="If a ticker's tick-to-tick price move falls at/under "
+                     "this %% while cooling down, it auto-recovers early "
+                     "(before sudden_move_cooldown_ticks elapses)"
     )
 
     # Trading limits
@@ -207,9 +241,65 @@ class RiskParameters(BaseModel):
         description="Maximum trades per day"
     )
 
-    # Stop-loss/Take-profit modes
-    stop_loss_mode: StopLossMode = StopLossMode.USER_APPROVAL
+    # Stop-loss/Take-profit modes.
+    #
+    # S-2 (survival discipline, spec docs/superpowers/specs/
+    # 2026-07-19-survival-discipline-design.md §2, decision D1): stop-loss
+    # defaults to AGENT_AUTO — a stop-loss is never optional risk reduction,
+    # so an autonomous account must not silently sit at a breached stop
+    # waiting for a human click. take_profit_mode stays USER_APPROVAL
+    # (decision D2 — profit-taking remains discussion-gated, unchanged).
+    # This field is GATE_PROTECTED (strategy_apply.py) — a strategy
+    # consensus can never move it; only a manual PUT /risk-params edit or
+    # this model default can.
+    stop_loss_mode: StopLossMode = StopLossMode.AGENT_AUTO
     take_profit_mode: StopLossMode = StopLossMode.USER_APPROVAL
+
+    # Default stop/take levels applied to a newly tracked order when the
+    # proposal didn't specify its own (F3 — PendingOrderTracker consumers)
+    default_stop_loss_pct: float = Field(
+        default=8.0,
+        ge=0.5, le=30.0,
+        description="Default stop-loss distance from entry, %"
+    )
+    default_take_profit_pct: float = Field(
+        default=8.0,
+        ge=0.5, le=50.0,
+        description="Default take-profit distance from entry, %"
+    )
+
+    # S-4 (생존 규율 — docs/superpowers/specs/2026-07-19-survival-discipline-
+    # design.md §2 S-4, decision D4): per-trade R risk budget as % of total
+    # account equity. Both sizing sites (portfolio_agent
+    # ._calculate_max_position_value, KR graph decision_nodes' quantity
+    # calc) feed this into services.trading.r_sizing.r_cap_value and
+    # min()-combine the result with their existing notional/cash caps — the
+    # smaller of the two always wins, so this can only ever tighten sizing,
+    # never loosen it. Hard Field bounds are deliberately loose (0.1-3.0);
+    # the real ceiling is strategy_apply.STRATEGY_MAPPED_FIELDS' (0.25, 1.5)
+    # EOD-consensus clamp. Not gate-protected (services/autonomy/gate.py
+    # never reads it) — safe for a strategy to adapt.
+    risk_budget_pct: float = Field(
+        default=0.75,
+        ge=0.1, le=3.0,
+        description="Per-trade R risk budget as % of total equity — "
+                     "position-value ceiling = equity*(risk_budget_pct/100)"
+                     "/stop_distance_pct, min()-combined with existing caps"
+    )
+
+    # 변동성 타게팅 노브 (2026-08-07). exposure_target.compute_regime_target의
+    # 모듈 상수(TARGET_VOL_PCT/VOL_MULTIPLIER_MIN)를 전략 소유로 옮겼다 —
+    # strategy_apply가 [10, 40] / [0.2, 0.8] 하드 바운드로 클램프한다.
+    target_vol_pct: float = Field(
+        default=18.0, ge=10.0, le=40.0,
+        description="변동성 타게팅 기준(퍼센트). KOSPI 20일 실현 연변동성 "
+                    "중앙값 20.6%와 맞물리는 값",
+    )
+    vol_multiplier_min: float = Field(
+        default=0.5, ge=0.2, le=0.8,
+        description="변동성 배수 하한(분율). 1.0을 허용하지 않는 이유는 "
+                    "전략이 변동성 방어를 통째로 끄지 못하게 하려는 것",
+    )
 
 
 # -------------------------------------------
@@ -243,6 +333,12 @@ class OrderResult(BaseModel):
 
     status: str  # pending, partial, filled, rejected, cancelled
     message: Optional[str] = None
+
+    # F3: split orders place SEVERAL broker orders, each with its own ord_no —
+    # the aggregate's order_id alone cannot drive per-order fill tracking
+    # (ka10076 matches by ord_no). Set by OrderAgent._aggregate_results so the
+    # fill tracker can register each part individually. None for single orders.
+    parts: Optional[List["OrderResult"]] = None
 
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.now)
@@ -294,6 +390,22 @@ class ManagedPosition(BaseModel):
     analysis_session_id: Optional[str] = None
     risk_score: Optional[int] = None
 
+    # Set once when an AGENT_AUTO defensive sell (RiskMonitor stop-loss /
+    # take-profit) is blocked by the autonomy gate, so the human is notified
+    # ONCE per denied episode instead of on every monitor tick (mirrors
+    # agent_chat.position_manager.MonitoredPosition.close_gate_denied_notified,
+    # A2). Reset when the gate next allows. Defaults False so old persisted
+    # positions restore cleanly.
+    monitor_gate_denied_notified: bool = False
+
+    # 통지 광역화 최종 리뷰 Important 4: 방어적 SELL(_close_position/
+    # _reduce_position/_execute_order_from_monitor)이 브로커에서 거부되면
+    # 예외가 아니라 정상 OrderResult(status="rejected")로 돌아온다 — 위
+    # monitor_gate_denied_notified와 같은 형태로, 거부가 매 감시 틱마다
+    # 반복돼도 사람에게는 거부 에피소드당 한 번만 통지한다(동일 이유로
+    # 기본 False — 구 영속 포지션도 깨끗이 복원).
+    close_order_rejected_notified: bool = False
+
     model_config = ConfigDict(use_enum_values=True)
 
 
@@ -324,6 +436,13 @@ class AllocationPlan(BaseModel):
     # Reason/rationale
     rationale: Optional[str] = None
 
+    # U3 (사이징 계보, 2026-08-05): PortfolioAgent._calculate_max_position_
+    # value's optional `lineage` out-param, threaded through unchanged --
+    # None for every early-return plan computed before sizing runs (e.g.
+    # insufficient cash), populated for every plan computed after it. Purely
+    # additive/optional so no existing AllocationPlan(...) call site breaks.
+    sizing_lineage: Optional[dict] = None
+
     model_config = ConfigDict(use_enum_values=True)
 
 
@@ -349,6 +468,11 @@ class QueuedTrade(BaseModel):
     # Queue status
     status: QueueStatus = QueueStatus.PENDING
     reason: str = ""  # Why it was queued (e.g., "Market closed")
+
+    # R3: True when this trade originated from an autonomous engine — the
+    # queue processor must RE-check the autonomy gate before executing it
+    # (mode flips / breaker trips between queueing and execution must win).
+    autonomous: bool = False
 
     # Timestamps
     queued_at: datetime = Field(default_factory=datetime.now)
@@ -397,6 +521,16 @@ class WatchedStock(BaseModel):
 
     # Metadata
     risk_score: int = 5  # 1-10
+
+    # Provenance (DS-4): 'manual' (user/analysis-flow add, the historical
+    # default) vs 'discovery' (regime-weighted ranking auto-promotion). Drives
+    # the watch-total-cap eviction gate in services/discovery/ranker.py — only
+    # 'discovery' entries are ever auto-evicted, manual entries are always
+    # protected. A field default (not a migration) gives backward
+    # compatibility for free: existing persisted blobs written before this
+    # field existed simply lack the key, and `WatchedStock.model_validate(...)`
+    # falls back to 'manual' for them.
+    source: str = "manual"
 
     model_config = ConfigDict(use_enum_values=True)
 
@@ -502,7 +636,6 @@ class TradingState(BaseModel):
         "portfolio": AgentState(name="Portfolio Agent"),
         "order": AgentState(name="Order Agent"),
         "risk": AgentState(name="Risk Monitor"),
-        "strategy": AgentState(name="Strategy Engine"),
     })
 
     # Timestamps

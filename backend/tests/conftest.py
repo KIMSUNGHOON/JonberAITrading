@@ -5,7 +5,9 @@ Provides shared fixtures for all tests.
 """
 
 import asyncio
-from typing import AsyncGenerator, Generator
+import sqlite3
+from pathlib import Path
+from typing import AsyncGenerator, Generator, Optional
 
 import pytest
 import pytest_asyncio
@@ -13,6 +15,9 @@ from fastapi.testclient import TestClient
 from httpx import AsyncClient
 
 from app.main import app
+
+import services.background_scanner.scanner as scanner_module
+import services.storage_service as storage_service_module
 
 
 # -------------------------------------------
@@ -132,3 +137,437 @@ def set_test_env(monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "development")
     monkeypatch.setenv("DEBUG", "true")
     monkeypatch.setenv("MARKET_DATA_MODE", "mock")
+
+
+# -------------------------------------------
+# FI final-fix review Minor 2: scanner_results.db isolation (autouse)
+# -------------------------------------------
+#
+# app.main's lifespan (FI-1, see BackgroundScanner.reconcile_orphan_scan_
+# sessions) unconditionally runs an UPDATE against
+# services.background_scanner.scanner.DB_PATH on every process startup --
+# including every `with TestClient(app) as ...:` boot anywhere in the
+# suite (module- or function-scoped `client` fixtures across
+# tests/test_api/*.py all trigger FastAPI's lifespan). Left unpatched,
+# this write silently touches the real backend/data/scanner_results.db
+# from ordinary test runs -- the same tripwire-violating pattern the L-6
+# incident below caught for storage.db, just for a different DB file.
+#
+# Session-scoped + autouse so it patches the module attribute once,
+# before ANY test's own fixtures run: pytest instantiates higher-scoped
+# fixtures first within a test request ("higher-scoped fixtures are
+# instantiated first"), so this always wins the race against a
+# module-scoped `client` fixture (e.g. tests/test_api/test_discovery_
+# routes.py's) even on that module's very first test. Plain attribute
+# reassignment rather than the `monkeypatch` fixture -- `monkeypatch` is
+# function-scoped and cannot be requested from a session-scoped fixture.
+# DB_PATH is read fresh off the module global at every call site inside
+# scanner.py (never cached on the BackgroundScanner instance), so
+# reassigning the attribute here is sufficient regardless of when
+# scanner.py was first imported relative to this fixture running.
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_scanner_db_path(tmp_path_factory):
+    """Autouse: redirect scanner.DB_PATH at a throwaway sqlite file for the
+    whole test session so no TestClient(app) boot's FI-1 orphan-reconcile
+    (or any other scanner DB write) ever touches the real
+    backend/data/scanner_results.db."""
+    original = scanner_module.DB_PATH
+    scanner_module.DB_PATH = tmp_path_factory.mktemp("scanner_db_isolation") / "scanner_results.db"
+    yield
+    scanner_module.DB_PATH = original
+
+
+# -------------------------------------------
+# L-6: real-storage.db isolation (opt-in) + session tripwire
+# -------------------------------------------
+#
+# Incident (2026-07-19 05:43~06:12 UTC): an unisolated test file
+# (tests/test_api/test_agent_chat_ws_push.py) ran real
+# ChatCoordinator.start_manual_discussion() completions against the
+# process-wide get_storage_service() singleton, which defaults to the LIVE
+# backend/data/storage.db when nothing has swapped it out. Every completed
+# discussion (DECIDED or CANCELLED) calls
+# services.agent_chat.decision_log.persist_session(), which writes a real
+# row into agent_chat_decisions (+ agent_chat_votes) -- silently
+# contaminating the measurement DB this lineage-restoration arc depends on.
+#
+# `isolated_storage_service` below is the fix: an OPT-IN (NOT autouse)
+# fixture any test file can request explicitly (directly as a fixture arg,
+# or via `pytestmark = pytest.mark.usefixtures("isolated_storage_service")`
+# at module scope) to redirect get_storage_service() at its tmp-path SQLite
+# instance for the duration of that file's tests. It is deliberately NOT
+# autouse here -- making it blanket every test under tests/ would be a much
+# larger blast radius than this task's remit, and would silently change the
+# behavior of tests that intentionally exercise the real singleton (e.g.
+# get_storage_service failure-path tests). Apply it file-by-file, the same
+# way test_r5_p1_execution_reliability.py / test_afterhours_gate.py already
+# hand-roll the identical pattern locally.
+#
+# `pytest_sessionstart`/`pytest_sessionfinish` add a tripwire: the real
+# storage.db's agent_chat_decisions row count is snapshotted at session
+# start and compared at session end. A net increase means some test,
+# somewhere, wrote to the live DB without isolation -- this only WARNS
+# (never fails the run) so it can't break the existing suite, but it makes
+# any future regression impossible to miss in the test output.
+#
+# See .superpowers/sdd/task-L-6-report.md for the full incident writeup,
+# the confirmed culprit, and the cleanup SQL for the rows already landed.
+
+
+@pytest_asyncio.fixture
+async def isolated_storage_service(tmp_path, monkeypatch):
+    """Opt-in: swap services.storage_service's module-level singleton for a
+    tmp-path-backed StorageService so get_storage_service() -- however it
+    was imported by the calling module -- never touches the live
+    backend/data/storage.db for the duration of the requesting test."""
+    storage = storage_service_module.StorageService(
+        db_path=tmp_path / "test_storage_isolated.db"
+    )
+    await storage.initialize()
+    monkeypatch.setattr(storage_service_module, "_storage_service", storage)
+    yield storage
+    monkeypatch.setattr(storage_service_module, "_storage_service", None)
+
+
+# -------------------------------------------
+# 라이브 DB 가드 (2026-08-12) — 탐지가 아니라 **차단**
+#
+# 위 L-6 트립와이어는 `agent_chat_decisions`의 *행 수 증가*만 보고, 그것도
+# 경고만 한다. 그래서 다음을 **구조적으로 놓친다**:
+#
+#   `app_settings` 오염은 UPDATE라 행 수가 변하지 않는다.
+#
+# 2026-08-03과 2026-08-11에 **같은 키가 두 번** 그렇게 덮였다 --
+# `agent_chat:coordinator_state`가 테스트 픽스처 값
+# `{"running": false, "check_interval": 5, "max_concurrent": 3}`으로. 08-11
+# 오염은 **3거래일 뒤** 재기동에서야 발현해, 그동안 자율 토론 엔진이 꺼진
+# 채로 돌았다(손절만 작동해 증상이 "주문이 안 나간다" 하나뿐이었다).
+#
+# 규칙("전체 스위트는 워크트리에서")이 메모리와 문서에만 있고 **명령 자체에
+# 붙어 있지 않은 것**이 근본 원인이었다. 그래서 여기서 강제한다.
+#
+# **왜 실패가 아니라 리다이렉트인가**: 라이브 경로를 열려는 테스트를 즉시
+# 실패시키면 격리가 없는 기존 파일 9개가 한꺼번에 깨진다. 리다이렉트는
+# 메인 체크아웃을 **워크트리와 같은 상태**로 만들 뿐이라(워크트리에는
+# `storage.db`가 없다) 동작 변화가 예측 가능하다. 대신 침묵하지 않는다 --
+# 세션 끝에 리다이렉트된 테스트를 전부 이름으로 보고한다.
+# -------------------------------------------
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_LIVE_DB_FILES = {
+    (_DATA_DIR / "storage.db").resolve(),
+    (_DATA_DIR / "holidays.db").resolve(),
+}
+_live_db_offenders: set = set()
+
+
+def _sandbox_target(original, sandbox: Path) -> Optional[Path]:
+    """`original`이 라이브 DB면 샌드박스 안의 같은 이름 경로, 아니면 None."""
+    if original is None:
+        return None
+    try:
+        resolved = Path(original).resolve()
+    except (OSError, ValueError, TypeError):
+        return None
+    return sandbox / resolved.name if resolved in _LIVE_DB_FILES else None
+
+
+@pytest.fixture(autouse=True)
+def guard_live_databases(request, tmp_path_factory, monkeypatch):
+    """라이브 `storage.db`/`holidays.db`를 여는 시도를 tmp로 돌린다.
+
+    `db_path=None`(기본 경로)까지 잡는 것이 핵심이다 -- 실제 사고 경로인
+    `get_storage_service()` 싱글턴이 바로 그 형태로 만들어진다. 명시적
+    경로만 막으면 정작 막아야 할 것을 놓친다.
+    """
+    import services.krx_holiday.storage as holiday_storage_module
+
+    sandbox = tmp_path_factory.mktemp("live-db-guard")
+    nodeid = request.node.nodeid
+
+    real_storage_init = storage_service_module.StorageService.__init__
+    real_holiday_init = holiday_storage_module.HolidayStorage.__init__
+
+    def _storage_init(self, db_path=None):
+        requested = db_path if db_path is not None else storage_service_module.DEFAULT_DB_PATH
+        target = _sandbox_target(requested, sandbox)
+        if target is not None:
+            _live_db_offenders.add(nodeid)
+            db_path = target
+        real_storage_init(self, db_path)
+
+    def _holiday_init(self, db_path=None):
+        requested = db_path if db_path is not None else _DATA_DIR / "holidays.db"
+        target = _sandbox_target(requested, sandbox)
+        if target is not None:
+            _live_db_offenders.add(nodeid)
+            db_path = str(target)
+        real_holiday_init(self, db_path)
+
+    monkeypatch.setattr(
+        storage_service_module.StorageService, "__init__", _storage_init
+    )
+    monkeypatch.setattr(
+        holiday_storage_module.HolidayStorage, "__init__", _holiday_init
+    )
+    yield
+
+
+# -------------------------------------------
+# 라이브 외부 엔드포인트 가드 (2026-08-12)
+#
+# 위 DB 가드는 **파일만** 막는다. 2026-08-12에 메인 체크아웃에서 스위트를
+# 돌리자 라이브 백엔드 로그에 이것이 18건 쌓였다:
+#
+#   telegram_receiver_polling_error
+#     error='Conflict: terminated by other getUpdates request'
+#
+# **테스트가 라이브 Telegram 봇의 폴링을 빼앗았다.** 장중이었다면 손절·익절
+# 통지가 유실된다. Kiwoom도 같은 레이트리밋을 공유한다.
+#
+# 워크트리가 안전한 진짜 이유는 DB 부재가 아니라 **`.env` 부재 = 자격증명
+# 부재**였다. 여기서는 자격증명을 건드리지 않는다(비우면 설정 관련 테스트가
+# 무더기로 다르게 동작한다) -- **전송 계층에서 호스트만** 막는다.
+# PTB 22.5(`telegram.request.HTTPXRequest`)와 Kiwoom 클라이언트가 둘 다
+# httpx를 쓰므로 한 지점이면 둘 다 커버된다.
+#
+# ⚠️ 명시된 호스트만 막는다. localhost/testserver/mock 서버는 그대로
+# 통과해야 한다 -- 무차별로 막으면 기존 스위트가 통째로 깨진다.
+# `MockTransport`를 쓰는 테스트는 애초에 이 경로를 안 탄다(정상).
+# -------------------------------------------
+
+_LIVE_ENDPOINT_HOSTS = (
+    "api.telegram.org",
+    "api.kiwoom.com",
+    "mockapi.kiwoom.com",  # 모의투자도 막는다 -- KIWOOM_IS_MOCK은 **주문만**
+                           # 모의고 레이트리밋·세션은 실물과 같은 자원이다
+)
+
+
+def _assert_not_live_endpoint(url) -> None:
+    host = (getattr(url, "host", "") or "").lower()
+    for blocked in _LIVE_ENDPOINT_HOSTS:
+        if host == blocked or host.endswith("." + blocked):
+            raise RuntimeError(
+                f"테스트가 라이브 엔드포인트 {host} 에 접속하려 했다 "
+                f"({url}). 라이브 Telegram 폴링을 빼앗거나 Kiwoom "
+                f"레이트리밋을 소모한다 -- 2026-08-12에 실제로 18건 발생했다. "
+                f"httpx.MockTransport나 respx로 대체하거나, 해당 호출을 "
+                f"patch할 것."
+            )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def guard_live_endpoints():
+    """라이브 Telegram/Kiwoom으로 나가는 요청을 막는다.
+
+    **세션 스코프인 이유** (2026-08-12에 function 스코프로 만들었다가 샜다):
+    `updater.start_polling()`은 **백그라운드 태스크**를 만들고 즉시 반환한다
+    (`receiver.py:20` 주석이 그렇게 설명한다). 그 태스크는 픽스처 teardown으로
+    monkeypatch가 되돌려진 **뒤에도 살아서** 라이브 봇을 계속 폴링한다.
+    실측: transport 가드만 넣고 메인에서 API 계층을 돌렸더니 `getMe`는 막혔는데
+    (로그에 RuntimeError 확인) 충돌은 18 → 39건으로 **늘었고** 테스트가 끝난
+    뒤인 05:32까지 이어졌다.
+
+    그래서 두 겹으로 막는다:
+      1. `Updater.start_polling` -- 태스크가 **생기기 전에** 차단
+      2. httpx transport -- 그 외 모든 라이브 호스트 요청
+
+    monkeypatch는 function 스코프 전용이라 여기서는 직접 setattr한다.
+    """
+    import httpx
+    from telegram.ext import Updater
+
+    real_async = httpx.AsyncHTTPTransport.handle_async_request
+    real_sync = httpx.HTTPTransport.handle_request
+    real_polling = Updater.start_polling
+
+    async def _guarded_async(self, request):
+        _assert_not_live_endpoint(request.url)
+        return await real_async(self, request)
+
+    def _guarded_sync(self, request):
+        _assert_not_live_endpoint(request.url)
+        return real_sync(self, request)
+
+    async def _blocked_polling(self, *args, **kwargs):
+        raise RuntimeError(
+            "테스트가 라이브 Telegram 폴링(getUpdates)을 시작하려 했다. "
+            "이 태스크는 테스트가 끝난 뒤에도 살아남아 운영 봇의 폴링을 "
+            "빼앗는다 -- 2026-08-12에 실제로 39건 충돌했다. "
+            "`start_receiver`를 부르는 테스트는 `Application`을 mock하거나 "
+            "`updater.start_polling`을 직접 patch할 것."
+        )
+
+    httpx.AsyncHTTPTransport.handle_async_request = _guarded_async
+    httpx.HTTPTransport.handle_request = _guarded_sync
+    Updater.start_polling = _blocked_polling
+    try:
+        yield
+    finally:
+        httpx.AsyncHTTPTransport.handle_async_request = real_async
+        httpx.HTTPTransport.handle_request = real_sync
+        Updater.start_polling = real_polling
+
+
+# -------------------------------------------
+# 라이브 리포트 디렉터리 가드 (2026-08-13)
+#
+# Task 7 리뷰 Critical 1 실측: `build_and_send_report`(services/reports/
+# __init__.py)는 텔레그램 준비 여부를 보기 **전에** 무조건
+# `delivery.prune_old_reports(delivery.REPORT_ROOT)` +
+# `delivery.save_report(delivery.REPORT_ROOT, ...)`를 호출한다.
+# `REPORT_ROOT`는 `backend/data/reports/`로 하드코딩된 모듈 상수다.
+# `_notify_eod_summary`가 이 함수를 배선(Task 7)하면서, `is_ready=True`로
+# 그 경로를 실호출하는 기존 테스트(예: test_f3_fill_tracking.py::
+# test_notify_eod_summary_refreshes_strategy_section_after_consensus)가
+# 이 부작용을 그대로 물려받아 **실제 `backend/data/reports/
+# postmarket-2026-08-13.html`을 가짜 데이터("보유 0종")로 덮어썼다**
+# (2026-08-13 리뷰에서 실측). `prune_old_reports`는 14일 지난 파일을
+# 지우므로, 고쳐지지 않으면 2주 뒤부터 실제 과거 리포트까지 조용히
+# 삭제하기 시작한다.
+#
+# `guard_live_databases`와 같은 이유로 autouse다 -- 개별 테스트가
+# `monkeypatch.setattr("services.reports.delivery.REPORT_ROOT", tmp_path)`
+# 를 직접 기억해서 넣어야 하는 규칙은 반드시 잊힌다(이 리포는 같은 종류의
+# 방심으로 이미 한 번 자율 토론 엔진을 3거래일 꺼뜨렸다 --
+# gotcha-tests-write-live-storage-db). `REPORT_ROOT`를 읽는 프로덕션
+# 호출부는 `delivery.REPORT_ROOT` 형태(모듈 속성의 지연 조회) 단 한 곳뿐이라
+# (실물 확인: grep -rn "REPORT_ROOT" services/) monkeypatch가 완전히
+# 가로챌 수 있다.
+#
+# 그래도 "조용히 안 걸리는 가드"는 가드 없음보다 나쁘므로, 리다이렉트에만
+# 기대지 않고 실제 `backend/data/reports/`의 *.html 파일 목록을 테스트
+# 전후로 스냅샷 비교한다 -- 하나라도 달라지면(생성이든 prune에 의한
+# 삭제든) 리다이렉트가 뚫렸다는 뜻이라 teardown에서 즉시 예외를 던져
+# 테스트를 실패시킨다(세션 끝 요약이 아니라 해당 테스트 자리에서 바로
+# 드러나야 놓치지 않는다).
+# -------------------------------------------
+
+_LIVE_REPORT_ROOT = Path(__file__).resolve().parent.parent / "data" / "reports"
+
+
+def _report_snapshot(root: Path) -> frozenset:
+    """`root`(디렉터리) 안의 *.html 파일명 집합. 없으면 빈 집합."""
+    if not root.is_dir():
+        return frozenset()
+    return frozenset(f.name for f in root.glob("*.html"))
+
+
+def _assert_no_report_drift(before: frozenset, after: frozenset, *, nodeid: str) -> None:
+    """`guard_live_report_root`의 핵심 판정 -- 별도 함수로 뺀 이유는
+    `test_report_root_guard.py`가 실제 `backend/data/reports/`를 단 한
+    바이트도 건드리지 않고 이 판정 로직 자체를 검증할 수 있게 하기
+    위해서다(가짜 before/after frozenset을 넣어서 검증한다)."""
+    if after == before:
+        return
+    added = sorted(after - before)
+    removed = sorted(before - after)
+    raise AssertionError(
+        "guard_live_report_root가 뚫렸다 -- "
+        f"{nodeid}가 실제 backend/data/reports/를 바꿨다 "
+        f"(추가={added}, 삭제={removed}). "
+        "services.reports.delivery.REPORT_ROOT 리다이렉트를 우회하는 "
+        "경로가 생긴 것이므로 원인을 찾아 고칠 것."
+    )
+
+
+@pytest.fixture(autouse=True)
+def guard_live_report_root(request, tmp_path_factory, monkeypatch):
+    """`services.reports.delivery.REPORT_ROOT`을 매 테스트 tmp로 리다이렉트
+    하고, 그럼에도 실제 `backend/data/reports/`가 바뀌면 즉시 실패시킨다."""
+    import services.reports.delivery as delivery_module
+
+    before = _report_snapshot(_LIVE_REPORT_ROOT)
+    sandbox = tmp_path_factory.mktemp("report-root-guard")
+    monkeypatch.setattr(delivery_module, "REPORT_ROOT", sandbox)
+    yield
+    after = _report_snapshot(_LIVE_REPORT_ROOT)
+    _assert_no_report_drift(before, after, nodeid=request.node.nodeid)
+
+
+_LINEAGE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "storage.db"
+_lineage_decisions_baseline: Optional[int] = None
+
+
+def _count_live_agent_chat_decisions() -> Optional[int]:
+    """Read-only row count of the LIVE agent_chat_decisions table. Never
+    opens the db for write; returns None (tripwire no-ops) if the file or
+    table doesn't exist yet (fresh checkout / CI)."""
+    if not _LINEAGE_DB_PATH.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{_LINEAGE_DB_PATH}?mode=ro", uri=True)
+        try:
+            cur = conn.execute("SELECT COUNT(*) FROM agent_chat_decisions")
+            return cur.fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def pytest_sessionstart(session):  # noqa: D103 - pytest hook, not a fixture
+    global _lineage_decisions_baseline
+    _lineage_decisions_baseline = _count_live_agent_chat_decisions()
+
+
+def _report_live_db_redirects(session) -> None:
+    """가드가 몇 번, 어떤 테스트에서 발동했는지 세션 끝에 알린다.
+
+    리다이렉트는 사고를 **막지만** 원인을 고치지는 않는다. 조용히 넘어가면
+    "격리 없이 라이브 경로를 여는 테스트"가 계속 늘어나고, 워크트리 밖에서
+    돌릴 때만 가드에 의존하게 된다. 이름을 찍어 두면 점진적으로 고칠 수 있다.
+    """
+    if not _live_db_offenders:
+        return
+    terminal = session.config.pluginmanager.get_plugin("terminalreporter")
+    names = sorted(_live_db_offenders)
+    shown = names[:15]
+    lines = [
+        "",
+        "=" * 70,
+        f"LIVE-DB GUARD: {len(names)}개 테스트가 라이브 DB 경로를 열려고 했고,",
+        "모두 tmp 샌드박스로 돌렸다(라이브 파일은 안전하다).",
+        "",
+        "이 테스트들은 `isolated_storage_service` 픽스처를 쓰도록 고치는 것이",
+        "근본 해결이다 -- 가드는 그물이지 설계가 아니다:",
+        "",
+    ]
+    lines += [f"  - {n}" for n in shown]
+    if len(names) > len(shown):
+        lines.append(f"  ... 외 {len(names) - len(shown)}개")
+    lines.append("=" * 70)
+    message = "\n".join(lines)
+    if terminal is not None:
+        terminal.write_line(message, yellow=True, bold=True)
+    else:
+        print(message)
+
+
+def pytest_sessionfinish(session, exitstatus):  # noqa: D103 - pytest hook
+    _report_live_db_redirects(session)
+    if _lineage_decisions_baseline is None:
+        return
+    after = _count_live_agent_chat_decisions()
+    if after is None or after <= _lineage_decisions_baseline:
+        return
+    delta = after - _lineage_decisions_baseline
+    terminal = session.config.pluginmanager.get_plugin("terminalreporter")
+    message = (
+        f"\n{'=' * 70}\n"
+        f"L-6 TRIPWIRE WARNING: backend/data/storage.db agent_chat_decisions "
+        f"grew by {delta} row(s) during this test session "
+        f"({_lineage_decisions_baseline} -> {after}).\n"
+        f"Some test wrote to the LIVE measurement DB instead of an isolated "
+        f"tmp storage -- see .superpowers/sdd/task-L-6-report.md for the "
+        f"isolation pattern (isolated_storage_service in tests/conftest.py) "
+        f"and the cleanup SQL.\n"
+        f"{'=' * 70}"
+    )
+    if terminal is not None:
+        terminal.write_line(message, red=True, bold=True)
+    else:
+        print(message)

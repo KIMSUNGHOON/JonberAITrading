@@ -16,7 +16,8 @@ import structlog
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
-from tenacity import retry, stop_after_attempt, wait_exponential
+
+from agents.llm.router import get_router
 
 logger = structlog.get_logger()
 
@@ -128,175 +129,82 @@ class LLMProvider:
             )
         return self._http_client
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-    )
     async def generate(
         self,
         messages: list[BaseMessage],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        *,
+        task: object = None,
+        response_schema: Optional[dict] = None,
     ) -> str:
         """
-        Generate a response from the LLM.
+        Generate a response via the multi-backend router.
 
-        Args:
-            messages: List of chat messages.
-            temperature: Override default temperature.
-            max_tokens: Override default max tokens.
-
-        Returns:
-            Generated text response.
-
-        Raises:
-            Exception: If generation fails after retries.
+        Positional args are unchanged for backward compatibility. `task` (keyword-
+        only) hints which backend to prefer (None -> GENERAL; unknown -> GENERAL).
+        `response_schema` requests structured JSON output. Returns raw text (or a
+        raw JSON string when a schema is given). Retry/fallback are owned by the
+        router, so there is no blanket retry here.
         """
-        try:
-            # Create client with overrides if provided
-            client = self.client
-            if temperature is not None or max_tokens is not None:
-                client = ChatOpenAI(
-                    base_url=self.config.base_url,
-                    model=self.config.model,
-                    temperature=temperature or self.config.temperature,
-                    max_tokens=max_tokens or self.config.max_tokens,
-                    timeout=self.config.timeout,
-                    api_key=self.config.api_key,
-                )
+        return await get_router().generate(
+            messages,
+            task=task,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_schema=response_schema,
+        )
 
-            response = await client.ainvoke(messages)
-            content = response.content if isinstance(response.content, str) else str(response.content)
-
-            logger.debug(
-                "llm_generation_success",
-                model=self.config.model,
-                input_messages=len(messages),
-                output_length=len(content),
-            )
-
-            return content
-
-        except Exception as e:
-            logger.error(
-                "llm_generation_failed",
-                error=str(e),
-                model=self.config.model,
-                provider=self.config.provider,
-            )
-            raise
-
-    async def stream(
+    def stream(
         self,
         messages: list[BaseMessage],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        *,
+        task: object = None,
     ) -> AsyncIterator[str]:
-        """
-        Stream response tokens from the LLM.
+        """Stream response chunks via the router (HTTP-capable backends only; the
+        router auto-excludes non-streaming CLI backends from the chain)."""
+        return get_router().stream(
+            messages, task=task, temperature=temperature, max_tokens=max_tokens
+        )
 
-        Args:
-            messages: List of chat messages.
-            temperature: Override default temperature.
-            max_tokens: Override default max tokens.
+    async def generate_structured(
+        self,
+        messages: list[BaseMessage],
+        schema: dict,
+        *,
+        task: object = "strategic_decision",
+    ) -> dict:
+        """Generate a structured object, JSON-parsed and checked for the schema's
+        required keys. Raises ValueError on parse failure or missing keys."""
+        import json
 
-        Yields:
-            Text chunks as they are generated.
-
-        Raises:
-            Exception: If streaming fails.
-        """
+        raw = await get_router().generate(messages, task=task, response_schema=schema)
         try:
-            client = self.client
-            if temperature is not None or max_tokens is not None:
-                client = ChatOpenAI(
-                    base_url=self.config.base_url,
-                    model=self.config.model,
-                    temperature=temperature or self.config.temperature,
-                    max_tokens=max_tokens or self.config.max_tokens,
-                    timeout=self.config.timeout,
-                    api_key=self.config.api_key,
-                )
-
-            async for chunk in client.astream(messages):
-                if chunk.content:
-                    yield chunk.content if isinstance(chunk.content, str) else str(chunk.content)
-
-        except Exception as e:
-            logger.error(
-                "llm_stream_failed",
-                error=str(e),
-                model=self.config.model,
-                provider=self.config.provider,
-            )
-            raise
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as e:
+            raise ValueError(f"structured output was not valid JSON: {str(raw)[:200]}") from e
+        missing = [k for k in schema.get("required", []) if k not in obj]
+        if missing:
+            raise ValueError(f"structured output missing required keys {missing}: {str(raw)[:200]}")
+        return obj
 
     async def health_check(self) -> dict:
+        """Report intelligence-layer health as a summary of the router snapshot.
+
+        Kept for backward compatibility with app startup, which reads
+        ``status`` / ``provider`` / ``configured_model``.
         """
-        Check if the LLM server is available and responding.
-
-        Returns:
-            Dict with health status and details.
-        """
-        health_url = f"{self.config.base_url}/models"
-
-        try:
-            response = await self.http_client.get(health_url)
-
-            if response.status_code == 200:
-                data = response.json()
-                models = data.get("data", [])
-                model_names = [m.get("id", "unknown") for m in models]
-
-                logger.info(
-                    "llm_health_check_success",
-                    provider=self.config.provider,
-                    available_models=model_names,
-                )
-
-                return {
-                    "status": "healthy",
-                    "provider": self.config.provider,
-                    "base_url": self.config.base_url,
-                    "configured_model": self.config.model,
-                    "available_models": model_names,
-                }
-
-            logger.warning(
-                "llm_health_check_failed",
-                status_code=response.status_code,
-                provider=self.config.provider,
-            )
-
-            return {
-                "status": "unhealthy",
-                "provider": self.config.provider,
-                "error": f"HTTP {response.status_code}",
-            }
-
-        except httpx.ConnectError:
-            logger.warning(
-                "llm_server_unavailable",
-                base_url=self.config.base_url,
-                provider=self.config.provider,
-            )
-            return {
-                "status": "unavailable",
-                "provider": self.config.provider,
-                "error": "Connection refused - is the LLM server running?",
-            }
-
-        except Exception as e:
-            logger.error(
-                "llm_health_check_error",
-                error=str(e),
-                provider=self.config.provider,
-            )
-            return {
-                "status": "error",
-                "provider": self.config.provider,
-                "error": str(e),
-            }
+        snapshot = get_router().snapshot()
+        constructed = [n for n, b in snapshot["backends"].items() if b["constructed"]]
+        return {
+            "status": "healthy" if constructed else "unavailable",
+            "provider": "router",
+            "configured_model": self.config.model,
+            "available_backends": constructed,
+            "backends": snapshot["backends"],
+        }
 
     async def close(self) -> None:
         """Clean up resources."""

@@ -23,7 +23,6 @@ import {
   CheckCircle2,
   XCircle,
   Clock,
-  Bitcoin,
   Building2,
   Activity,
   DollarSign,
@@ -34,9 +33,13 @@ import {
   Eye,
 } from 'lucide-react';
 import { useStore, selectTickerHistory, type MarketType, type TickerHistoryItem } from '@/store';
+import { useGoTo } from '@/hooks/useNav';
 import { addToTradeQueue } from '@/api/client';
 import { MarkdownRenderer } from '@/components/common/MarkdownRenderer';
+import { ReadingPane } from '@/components/common/ReadingPane';
 import { useTranslations } from '@/utils/translations';
+import { pnlColor } from '@/utils/pnl';
+import { Awaiting } from '@/components/terminal/panels/shared';
 import type {
   DetailedAnalysisResults,
   TechnicalAnalysisResult,
@@ -51,24 +54,18 @@ interface AnalysisDetailPageProps {
   onBack?: () => void;
 }
 
-// Market type icon component
-function MarketIcon({ marketType, size = 20 }: { marketType: MarketType; size?: number }) {
-  switch (marketType) {
-    case 'stock':
-      return <TrendingUp size={size} className="text-green-400" />;
-    case 'coin':
-      return <Bitcoin size={size} className="text-yellow-400" />;
-    case 'kiwoom':
-      return <Building2 size={size} className="text-blue-400" />;
-  }
+// Market type icon component. Colors are market IDENTITY (which market this
+// analysis belongs to), not a P&L/direction value, so they stay raw — same
+// precedent as AnalysisPage's MarketIcon/getMarketColor. MarketType is a
+// single-member 'kiwoom' union post-coin-removal — kept as a component
+// rather than inlined so widening the union later doesn't require touching
+// every call site.
+function MarketIcon({ marketType: _marketType, size = 16 }: { marketType: MarketType; size?: number }) {
+  return <Building2 size={size} className="text-blue-400" />;
 }
 
-function getMarketLabel(marketType: MarketType): string {
-  switch (marketType) {
-    case 'stock': return 'US Stock';
-    case 'coin': return 'Crypto';
-    case 'kiwoom': return 'KR Stock';
-  }
+function getMarketLabel(_marketType: MarketType): string {
+  return 'KR Stock';
 }
 
 function formatDate(date: Date): string {
@@ -84,13 +81,7 @@ function formatDate(date: Date): string {
 
 // Helper to get display name from history item
 function getDisplayName(item: TickerHistoryItem): string {
-  if ('stk_nm' in item && (item as { stk_nm?: string }).stk_nm) {
-    return (item as { stk_nm: string }).stk_nm;
-  }
-  if ('koreanName' in item && (item as { koreanName?: string }).koreanName) {
-    return (item as { koreanName: string }).koreanName;
-  }
-  return item.ticker;
+  return item.stk_nm || item.ticker;
 }
 
 // Helper to get action from history item
@@ -101,19 +92,36 @@ function getAction(item: TickerHistoryItem): string | null {
   return null;
 }
 
-// Signal color helper
-function getSignalColor(signal?: string) {
+// Signal color routes through the shared P&L helper: bullish/buy is up
+// (green), bearish/sell is down (red), anything else (HOLD, or a riskLevel
+// string reused through this same helper) is neutral. Text-only — the badge
+// itself supplies the neutral bg-elevated/border-hairline chip.
+function getSignalColor(signal?: string): string {
   switch (signal?.toUpperCase()) {
     case 'BULLISH':
     case 'BUY':
-      return 'text-green-400 bg-green-500/20';
+      return pnlColor(1);
     case 'BEARISH':
     case 'SELL':
-      return 'text-red-400 bg-red-500/20';
+      return pnlColor(-1);
     default:
-      return 'text-gray-400 bg-gray-500/20';
+      return 'text-muted';
   }
 }
+
+// Trade-action color — mirrors the ACTION_TEXT_COLOR convention from
+// ScannerResultsPage/AnalysisPage: BUY/ADD and SELL/REDUCE are genuinely
+// bullish/bearish and route through the shared P&L helper; WATCH/AVOID/HOLD
+// are non-directional statuses that use direct semantic tokens instead.
+const ACTION_COLOR: Record<string, string> = {
+  BUY: pnlColor(1),
+  ADD: pnlColor(1),
+  SELL: pnlColor(-1),
+  REDUCE: pnlColor(-1),
+  WATCH: 'text-warn',
+  AVOID: 'text-accent',
+  HOLD: 'text-muted',
+};
 
 // Analysis card component
 function AnalysisCard({
@@ -143,25 +151,25 @@ function AnalysisCard({
           <h3 className="font-semibold">{title}</h3>
         </div>
         {signal && (
-          <span className={`px-2 py-1 text-xs font-medium rounded ${getSignalColor(signal)}`}>
+          <span className={`px-2 py-1 text-xs font-medium rounded border border-hairline bg-elevated ${getSignalColor(signal)}`}>
             {signal}
           </span>
         )}
       </div>
 
       {notAvailable ? (
-        <p className="text-sm text-gray-500 italic">데이터 없음</p>
+        <Awaiting label="데이터 없음" />
       ) : (
         <>
           {confidence !== undefined && confidence > 0 && (
             <div className="mb-3">
               <div className="flex items-center justify-between text-sm mb-1">
-                <span className="text-gray-400">신뢰도</span>
-                <span className="font-medium">{confidence.toFixed(0)}%</span>
+                <span className="text-muted">신뢰도</span>
+                <span className="font-medium tabular-nums">{confidence.toFixed(0)}%</span>
               </div>
-              <div className="h-2 bg-surface rounded-full overflow-hidden">
+              <div className="h-2 bg-elevated rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-blue-500 transition-all"
+                  className="h-full bg-accent transition-all"
                   style={{ width: `${Math.min(confidence, 100)}%` }}
                 />
               </div>
@@ -169,8 +177,8 @@ function AnalysisCard({
           )}
 
           {summary && (
-            <div className="text-sm text-gray-300 mb-3 bg-surface/50 rounded-lg p-3 max-h-64 overflow-y-auto">
-              <MarkdownRenderer content={summary} compact />
+            <div className="text-sm text-ink mb-3 bg-elevated/50 rounded-lg p-3 max-h-64 overflow-y-auto">
+              <ReadingPane><MarkdownRenderer content={summary} compact /></ReadingPane>
             </div>
           )}
 
@@ -181,11 +189,11 @@ function AnalysisCard({
           )}
 
           {highlights && highlights.length > 0 && (
-            <div className="text-sm bg-surface rounded-lg p-3 max-h-36 overflow-y-auto">
+            <div className="text-sm bg-elevated rounded-lg p-3 max-h-36 overflow-y-auto">
               <ul className="space-y-1">
                 {highlights.map((h, i) => (
-                  <li key={i} className="text-gray-400 flex items-start gap-2">
-                    <span className="text-blue-400 mt-1">•</span>
+                  <li key={i} className="text-muted flex items-start gap-2">
+                    <span className="text-accent mt-1">•</span>
                     <span>{h}</span>
                   </li>
                 ))}
@@ -207,41 +215,36 @@ function TechnicalIndicators({ data }: { data: TechnicalAnalysisResult }) {
   return (
     <div className="grid grid-cols-2 gap-2 text-xs">
       {indicators.rsi !== null && (
-        <div className="bg-surface rounded p-2">
-          <span className="text-gray-500">RSI</span>
-          <span className={`ml-2 font-medium ${
-            indicators.rsi > 70 ? 'text-red-400' :
-            indicators.rsi < 30 ? 'text-green-400' : 'text-gray-300'
+        <div className="bg-elevated rounded p-2">
+          <span className="text-dim">RSI</span>
+          <span className={`ml-2 font-medium tabular-nums ${
+            indicators.rsi > 70 ? pnlColor(-1) :
+            indicators.rsi < 30 ? pnlColor(1) : 'text-ink'
           }`}>
             {indicators.rsi.toFixed(1)}
           </span>
         </div>
       )}
       {indicators.sma50 !== null && (
-        <div className="bg-surface rounded p-2">
-          <span className="text-gray-500">SMA50</span>
-          <span className="ml-2 font-medium text-gray-300">
+        <div className="bg-elevated rounded p-2">
+          <span className="text-dim">SMA50</span>
+          <span className="ml-2 font-medium text-ink tabular-nums">
             ₩{indicators.sma50.toLocaleString('ko-KR')}
           </span>
         </div>
       )}
       {indicators.macd && (
-        <div className="bg-surface rounded p-2">
-          <span className="text-gray-500">MACD</span>
-          <span className={`ml-2 font-medium ${
-            (indicators.macd.histogram ?? 0) > 0 ? 'text-green-400' : 'text-red-400'
-          }`}>
+        <div className="bg-elevated rounded p-2">
+          <span className="text-dim">MACD</span>
+          <span className={`ml-2 font-medium tabular-nums ${pnlColor(indicators.macd.histogram ?? 0)}`}>
             {(indicators.macd.histogram ?? 0).toFixed(2)}
           </span>
         </div>
       )}
       {priceAction && (
-        <div className="bg-surface rounded p-2">
-          <span className="text-gray-500">{t('price_change')}</span>
-          <span className={`ml-2 font-medium ${
-            priceAction.changePercent24h > 0 ? 'text-green-400' :
-            priceAction.changePercent24h < 0 ? 'text-red-400' : 'text-gray-300'
-          }`}>
+        <div className="bg-elevated rounded p-2">
+          <span className="text-dim">{t('price_change')}</span>
+          <span className={`ml-2 font-medium tabular-nums ${pnlColor(priceAction.changePercent24h)}`}>
             {priceAction.changePercent24h > 0 ? '+' : ''}{priceAction.changePercent24h.toFixed(2)}%
           </span>
         </div>
@@ -257,11 +260,13 @@ function FundamentalMetrics({ data }: { data: FundamentalAnalysisResult }) {
   const language = useStore((state) => state.language);
   const t = useTranslations(language);
 
+  // Financial-health is a non-directional status (not a raw P&L value), so it
+  // maps to direct semantic tokens rather than routing through pnlColor.
   const healthColor: Record<string, string> = {
-    strong: 'text-green-400',
-    moderate: 'text-yellow-400',
-    weak: 'text-red-400',
-    unknown: 'text-gray-400',
+    strong: 'text-up',
+    moderate: 'text-warn',
+    weak: 'text-down',
+    unknown: 'text-muted',
   };
 
   const hasMetrics = metrics && (metrics.per != null || metrics.pbr != null || metrics.roe != null);
@@ -271,27 +276,27 @@ function FundamentalMetrics({ data }: { data: FundamentalAnalysisResult }) {
       {hasMetrics && (
         <div className="grid grid-cols-3 gap-2 text-xs">
           {metrics.per != null && (
-            <div className="bg-surface rounded p-2 text-center">
-              <div className="text-gray-500">PER</div>
-              <div className="font-medium text-gray-300">{metrics.per.toFixed(1)}</div>
+            <div className="bg-elevated rounded p-2 text-center">
+              <div className="text-dim">PER</div>
+              <div className="font-medium text-ink tabular-nums">{metrics.per.toFixed(1)}</div>
             </div>
           )}
           {metrics.pbr != null && (
-            <div className="bg-surface rounded p-2 text-center">
-              <div className="text-gray-500">PBR</div>
-              <div className="font-medium text-gray-300">{metrics.pbr.toFixed(2)}</div>
+            <div className="bg-elevated rounded p-2 text-center">
+              <div className="text-dim">PBR</div>
+              <div className="font-medium text-ink tabular-nums">{metrics.pbr.toFixed(2)}</div>
             </div>
           )}
           {metrics.roe != null && (
-            <div className="bg-surface rounded p-2 text-center">
-              <div className="text-gray-500">ROE</div>
-              <div className="font-medium text-gray-300">{metrics.roe.toFixed(1)}%</div>
+            <div className="bg-elevated rounded p-2 text-center">
+              <div className="text-dim">ROE</div>
+              <div className="font-medium text-ink tabular-nums">{metrics.roe.toFixed(1)}%</div>
             </div>
           )}
         </div>
       )}
       <div className="flex items-center gap-2 text-sm">
-        <span className="text-gray-500">{t('financial_health')}:</span>
+        <span className="text-dim">{t('financial_health')}:</span>
         <span className={`font-medium ${healthColor[financialHealth] || healthColor.unknown}`}>
           {t(financialHealth as 'strong' | 'moderate' | 'weak' | 'unknown')}
         </span>
@@ -305,10 +310,12 @@ function SentimentIndicators({ data }: { data: SentimentAnalysisResult }) {
   const language = useStore((state) => state.language);
   const t = useTranslations(language);
 
+  // Sentiment valence is directional (positive/negative ~ bullish/bearish),
+  // so it routes through the same pnlColor helper as the signal badges.
   const sentimentColor: Record<string, string> = {
-    positive: 'text-green-400',
-    neutral: 'text-gray-400',
-    negative: 'text-red-400',
+    positive: pnlColor(1),
+    neutral: 'text-muted',
+    negative: pnlColor(-1),
   };
 
   const sentiment = data.sentiment || 'neutral';
@@ -317,20 +324,20 @@ function SentimentIndicators({ data }: { data: SentimentAnalysisResult }) {
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between text-sm">
-        <span className="text-gray-500">{t('market_sentiment')}:</span>
-        <span className={`font-medium ${sentimentColor[sentiment] || sentimentColor.neutral}`}>
+        <span className="text-dim">{t('market_sentiment')}:</span>
+        <span className={`font-medium tabular-nums ${sentimentColor[sentiment] || sentimentColor.neutral}`}>
           {t(sentiment as 'positive' | 'neutral' | 'negative')} {score !== 0 && `(${score > 0 ? '+' : ''}${score.toFixed(0)})`}
         </span>
       </div>
       {data.newsCount > 0 && (
-        <div className="text-xs text-gray-500">
+        <div className="text-xs text-dim">
           {language === 'ko' ? `최근 뉴스 ${data.newsCount}건 분석` : `${data.newsCount} news articles analyzed`}
         </div>
       )}
       {data.recentNews && data.recentNews.length > 0 && (
-        <div className="bg-surface rounded p-2 max-h-24 overflow-y-auto">
+        <div className="bg-elevated rounded p-2 max-h-24 overflow-y-auto">
           {data.recentNews.slice(0, 3).map((news, i) => (
-            <div key={i} className="text-xs text-gray-400 truncate py-0.5">
+            <div key={i} className="text-xs text-muted truncate py-0.5">
               <span className={sentimentColor[news.sentiment] || sentimentColor.neutral}>●</span> {news.title}
             </div>
           ))}
@@ -345,11 +352,14 @@ function RiskFactors({ data }: { data: RiskAssessmentResult }) {
   const language = useStore((state) => state.language);
   const t = useTranslations(language);
 
+  // Risk-level severity is a non-directional status (low/medium/high/very_high),
+  // not a raw P&L value, so it maps to direct semantic tokens. The reduced
+  // palette (only up/warn/down) means high and very_high share a token.
   const riskColor: Record<string, string> = {
-    low: 'text-green-400 bg-green-500/20',
-    medium: 'text-yellow-400 bg-yellow-500/20',
-    high: 'text-orange-400 bg-orange-500/20',
-    very_high: 'text-red-400 bg-red-500/20',
+    low: 'text-up',
+    medium: 'text-warn',
+    high: 'text-down',
+    very_high: 'text-down',
   };
 
   const riskLevel = data.riskLevel || 'medium';
@@ -357,37 +367,37 @@ function RiskFactors({ data }: { data: RiskAssessmentResult }) {
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <span className="text-sm text-gray-500">{t('risk_level')}:</span>
-        <span className={`px-2 py-0.5 text-xs font-medium rounded ${riskColor[riskLevel] || riskColor.medium}`}>
+        <span className="text-sm text-dim">{t('risk_level')}:</span>
+        <span className={`px-2 py-0.5 text-xs font-medium rounded border border-hairline bg-elevated ${riskColor[riskLevel] || riskColor.medium}`}>
           {t(riskLevel as 'low' | 'medium' | 'high')}
         </span>
       </div>
       <div className="grid grid-cols-2 gap-2 text-xs">
         {data.suggestedStopLoss != null && (
-          <div className="bg-surface rounded p-2">
-            <span className="text-gray-500">{t('suggested_stop_loss')}</span>
-            <span className="ml-2 font-medium text-red-400">
+          <div className="bg-elevated rounded p-2">
+            <span className="text-dim">{t('suggested_stop_loss')}</span>
+            <span className={`ml-2 font-medium tabular-nums ${pnlColor(-1)}`}>
               ₩{data.suggestedStopLoss.toLocaleString('ko-KR')}
             </span>
           </div>
         )}
         {data.suggestedTakeProfit != null && (
-          <div className="bg-surface rounded p-2">
-            <span className="text-gray-500">{t('suggested_take_profit')}</span>
-            <span className="ml-2 font-medium text-green-400">
+          <div className="bg-elevated rounded p-2">
+            <span className="text-dim">{t('suggested_take_profit')}</span>
+            <span className={`ml-2 font-medium tabular-nums ${pnlColor(1)}`}>
               ₩{data.suggestedTakeProfit.toLocaleString('ko-KR')}
             </span>
           </div>
         )}
       </div>
       {data.factors && data.factors.length > 0 && (
-        <div className="text-xs bg-surface rounded-lg p-2 max-h-24 overflow-y-auto">
+        <div className="text-xs bg-elevated rounded-lg p-2 max-h-24 overflow-y-auto">
           <ul className="space-y-1">
             {data.factors.slice(0, 3).map((f, i) => (
-              <li key={i} className="text-gray-400 flex items-start gap-2">
+              <li key={i} className="text-muted flex items-start gap-2">
                 <span className={
-                  f.impact === 'positive' ? 'text-green-400' :
-                  f.impact === 'negative' ? 'text-red-400' : 'text-gray-400'
+                  f.impact === 'positive' ? pnlColor(1) :
+                  f.impact === 'negative' ? pnlColor(-1) : 'text-muted'
                 }>•</span>
                 <span>{f.description || f.name}</span>
               </li>
@@ -400,7 +410,7 @@ function RiskFactors({ data }: { data: RiskAssessmentResult }) {
 }
 
 export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: AnalysisDetailPageProps) {
-  const setCurrentView = useStore((state) => state.setCurrentView);
+  const goTo = useGoTo();
   const storeSessionId = useStore((state) => state.selectedSessionId);
   const history = useStore(selectTickerHistory);
   const language = useStore((state) => state.language);
@@ -429,7 +439,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
     if (onBack) {
       onBack();
     } else {
-      setCurrentView('analysis');
+      goTo('analysis');
     }
   };
 
@@ -438,7 +448,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
     if (!analysis) return;
 
     // Get required data
-    const ticker = 'stk_cd' in analysis ? (analysis as { stk_cd: string }).stk_cd : analysis.ticker;
+    const ticker = analysis.stk_cd;
     const stockName = getDisplayName(analysis);
     const action = getAction(analysis);
 
@@ -490,15 +500,15 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
   // If no analysis found, show not found state
   if (!analysis) {
     return (
-      <div className="h-full flex flex-col bg-surface">
+      <div className="h-full flex flex-col bg-canvas">
         <div className="flex-1 flex items-center justify-center p-4">
-          <div className="text-center text-gray-500">
+          <div className="text-center text-dim">
             <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
             <p className="text-lg">Analysis not found</p>
             <p className="text-sm mt-2">The analysis may have been removed or expired</p>
             <button
               onClick={handleBack}
-              className="mt-4 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-white text-sm"
+              className="mt-4 px-4 py-2 bg-accent hover:bg-accent/90 rounded-lg text-canvas text-sm transition-colors"
             >
               Back to Analysis
             </button>
@@ -510,7 +520,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
 
   const displayName = getDisplayName(analysis);
   const action = getAction(analysis);
-  const marketType: MarketType = 'market' in analysis ? 'coin' : 'stk_cd' in analysis ? 'kiwoom' : 'stock';
+  const marketType: MarketType = 'kiwoom';
 
   // Get analysis results from the new structure (Phase 9)
   const analysisResults = 'analysisResults' in analysis
@@ -546,93 +556,93 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
     : null;
 
   return (
-    <div className="h-full flex flex-col bg-surface">
+    <div className="h-full flex flex-col bg-canvas">
+      {/* Header */}
+      <div className="flex-none border-b border-hairline bg-card">
+        <div className="max-w-4xl mx-auto px-4 py-2.5 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handleBack}
+              className="p-1.5 rounded hover:bg-elevated transition-colors"
+              title="Back to Analysis"
+            >
+              <ArrowLeft className="w-4 h-4 text-muted" />
+            </button>
+            <MarketIcon marketType={marketType} />
+            <div>
+              <h1 className="text-sm font-semibold text-ink">{displayName}</h1>
+              <div className="flex items-center gap-2 text-[11px] text-dim">
+                {displayName !== analysis.ticker && <span>{analysis.ticker}</span>}
+                <span className="px-1.5 py-0.5 text-[10px] bg-elevated rounded text-muted">{getMarketLabel(marketType)}</span>
+                <span>·</span>
+                <span>{formatDate(analysis.timestamp)}</span>
+              </div>
+            </div>
+          </div>
+          {/* Status & Action Badge + Language Toggle */}
+          <div className="flex items-center gap-2">
+            {/* Language Toggle */}
+            <button
+              onClick={toggleLanguage}
+              className="px-2 py-1 text-xs rounded bg-elevated hover:bg-hairline flex items-center gap-1 text-muted hover:text-ink transition-colors"
+              title={language === 'ko' ? 'Switch to English' : '한국어로 변경'}
+            >
+              <Languages className="w-3 h-3" />
+              {language === 'ko' ? 'EN' : 'KO'}
+            </button>
+            {/* Action badge — a real trade recommendation, so it's a text-only
+                chip on a neutral bg-elevated/border-hairline background,
+                routed through ACTION_COLOR (pnlColor-backed for BUY/SELL). */}
+            {action && (
+              <span className={`px-2 py-1 text-xs font-medium rounded border border-hairline bg-elevated flex items-center gap-1 ${ACTION_COLOR[action] ?? 'text-muted'}`}>
+                {(action === 'BUY' || action === 'ADD') ? <TrendingUp className="w-3 h-3" /> :
+                 (action === 'SELL' || action === 'REDUCE' || action === 'AVOID') ? <TrendingDown className="w-3 h-3" /> :
+                 <Eye className="w-3 h-3" />}
+                {action}
+              </span>
+            )}
+            {/* Session-status badge — non-trading status, direct semantic tokens. */}
+            <span className={`px-2 py-1 text-xs rounded border border-hairline bg-elevated flex items-center gap-1 ${
+              analysis.status === 'completed' ? 'text-up' :
+              analysis.status === 'cancelled' ? 'text-warn' : 'text-down'
+            }`}>
+              {analysis.status === 'completed' ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
+              {analysis.status}
+            </span>
+          </div>
+        </div>
+      </div>
+
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4">
         <div className="max-w-4xl mx-auto space-y-4">
-          {/* Inline Header */}
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <button
-                onClick={handleBack}
-                className="p-1.5 rounded-lg hover:bg-surface-dark transition-colors text-gray-400 hover:text-white"
-                title="Back to Analysis"
-              >
-                <ArrowLeft className="w-4 h-4" />
-              </button>
-              <MarketIcon marketType={marketType} />
-              <div>
-                <h1 className="text-lg font-semibold">{displayName}</h1>
-                <div className="flex items-center gap-2 text-xs text-gray-500">
-                  {displayName !== analysis.ticker && <span>{analysis.ticker}</span>}
-                  <span className="px-1.5 py-0.5 bg-surface rounded">{getMarketLabel(marketType)}</span>
-                  <span>·</span>
-                  <span>{formatDate(analysis.timestamp)}</span>
-                </div>
-              </div>
-            </div>
-            {/* Status & Action Badge + Language Toggle */}
-            <div className="flex items-center gap-2">
-              {/* Language Toggle */}
-              <button
-                onClick={toggleLanguage}
-                className="px-2 py-1 text-xs rounded-lg bg-surface-dark hover:bg-surface flex items-center gap-1 text-gray-400 hover:text-white transition-colors"
-                title={language === 'ko' ? 'Switch to English' : '한국어로 변경'}
-              >
-                <Languages className="w-3 h-3" />
-                {language === 'ko' ? 'EN' : 'KO'}
-              </button>
-              {action && (
-                <span className={`px-2 py-1 text-xs font-medium rounded-lg flex items-center gap-1 ${
-                  action === 'BUY' || action === 'ADD' ? 'bg-green-500/20 text-green-400' :
-                  action === 'SELL' || action === 'REDUCE' ? 'bg-red-500/20 text-red-400' :
-                  action === 'AVOID' ? 'bg-red-500/20 text-red-400' :
-                  action === 'WATCH' ? 'bg-yellow-500/20 text-yellow-400' :
-                  'bg-gray-500/20 text-gray-400'
-                }`}>
-                  {(action === 'BUY' || action === 'ADD') ? <TrendingUp className="w-3 h-3" /> :
-                   (action === 'SELL' || action === 'REDUCE' || action === 'AVOID') ? <TrendingDown className="w-3 h-3" /> :
-                   <Eye className="w-3 h-3" />}
-                  {action}
-                </span>
-              )}
-              <span className={`px-2 py-1 text-xs rounded-lg flex items-center gap-1 ${
-                analysis.status === 'completed' ? 'bg-green-500/20 text-green-400' :
-                analysis.status === 'cancelled' ? 'bg-yellow-500/20 text-yellow-400' : 'bg-red-500/20 text-red-400'
-              }`}>
-                {analysis.status === 'completed' ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
-                {analysis.status}
-              </span>
-            </div>
-          </div>
-
           {/* Summary Card */}
-          <div className="card bg-gradient-to-r from-blue-600/10 to-purple-600/10 border-blue-500/30">
-            <h2 className="text-lg font-semibold mb-4">{t('analysis_summary')}</h2>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div className="card">
+            <h2 className="text-sm font-semibold mb-3 text-ink">{t('analysis_summary')}</h2>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <div className="text-center">
-                <div className="text-2xl font-bold text-blue-400">
+                <div className={`text-lg font-bold tabular-nums ${ACTION_COLOR[action ?? 'HOLD'] ?? 'text-muted'}`}>
                   {action || 'HOLD'}
                 </div>
-                <div className="text-xs text-gray-500 mt-1">{t('recommendation')}</div>
+                <div className="text-[11px] text-dim mt-1">{t('recommendation')}</div>
               </div>
               <div className="text-center">
-                <div className="text-2xl font-bold text-green-400">
+                <div className="text-lg font-bold tabular-nums text-up">
                   {analysis.status === 'completed' ? '100%' : '-'}
                 </div>
-                <div className="text-xs text-gray-500 mt-1">{t('complete')}</div>
+                <div className="text-[11px] text-dim mt-1">{t('complete')}</div>
               </div>
               <div className="text-center">
-                <div className="text-2xl font-bold text-purple-400">
+                <div className="text-lg font-bold text-ink">
                   {getMarketLabel(marketType)}
                 </div>
-                <div className="text-xs text-gray-500 mt-1">{t('market')}</div>
+                <div className="text-[11px] text-dim mt-1">{t('market')}</div>
               </div>
               <div className="text-center">
-                <div className="flex items-center justify-center gap-1 text-2xl font-bold text-gray-400">
-                  <Clock className="w-5 h-5" />
+                <div className="flex items-center justify-center gap-1 text-lg font-bold text-muted">
+                  <Clock className="w-4 h-4" />
                 </div>
-                <div className="text-xs text-gray-500 mt-1">
+                <div className="text-[11px] text-dim mt-1">
                   {formatDate(analysis.timestamp).split(' ').slice(-2).join(' ')}
                 </div>
               </div>
@@ -641,10 +651,10 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
 
           {/* Trade Proposal Card (if available) */}
           {tradeProposal && (
-            <div className="card bg-gradient-to-r from-green-600/10 to-blue-600/10 border-green-500/30">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-semibold flex items-center gap-2">
-                  <Activity className="w-5 h-5 text-green-400" />
+            <div className="card">
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-sm font-semibold flex items-center gap-2 text-ink">
+                  <Activity className="w-4 h-4 text-accent" />
                   {t('trade_proposal')}
                 </h2>
                 {/* Add to Queue Button */}
@@ -652,7 +662,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
                   <button
                     onClick={handleAddToQueue}
                     disabled={addingToQueue}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-accent hover:bg-accent/90 text-canvas rounded disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                   >
                     {addingToQueue ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
@@ -664,47 +674,48 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
                 )}
               </div>
 
-              {/* Queue Message */}
+              {/* Queue Message — a system toast (success/error), not a trading
+                  recommendation badge, so a tinted fill is fine here. */}
               {queueMessage && (
-                <div className={`mb-4 p-3 rounded-lg text-sm ${
+                <div className={`mb-4 p-3 rounded-lg text-sm border ${
                   queueMessage.type === 'success'
-                    ? 'bg-green-500/20 text-green-400 border border-green-500/30'
-                    : 'bg-red-500/20 text-red-400 border border-red-500/30'
+                    ? 'bg-up/10 text-up border-up/30'
+                    : 'bg-down/10 text-down border-down/30'
                 }`}>
                   {queueMessage.text}
                 </div>
               )}
 
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
                 {tradeProposal.entry_price && (
                   <div className="text-center">
-                    <div className="text-lg font-bold text-blue-400">
+                    <div className="text-lg font-bold text-ink tabular-nums">
                       ₩{tradeProposal.entry_price.toLocaleString('ko-KR')}
                     </div>
-                    <div className="text-xs text-gray-500">{t('entry_price')}</div>
+                    <div className="text-[11px] text-dim">{t('entry_price')}</div>
                   </div>
                 )}
                 {tradeProposal.stop_loss && (
                   <div className="text-center">
-                    <div className="text-lg font-bold text-red-400">
+                    <div className={`text-lg font-bold tabular-nums ${pnlColor(-1)}`}>
                       ₩{tradeProposal.stop_loss.toLocaleString('ko-KR')}
                     </div>
-                    <div className="text-xs text-gray-500">{t('stop_loss')}</div>
+                    <div className="text-[11px] text-dim">{t('stop_loss')}</div>
                   </div>
                 )}
                 {tradeProposal.take_profit && (
                   <div className="text-center">
-                    <div className="text-lg font-bold text-green-400">
+                    <div className={`text-lg font-bold tabular-nums ${pnlColor(1)}`}>
                       ₩{tradeProposal.take_profit.toLocaleString('ko-KR')}
                     </div>
-                    <div className="text-xs text-gray-500">{t('take_profit')}</div>
+                    <div className="text-[11px] text-dim">{t('take_profit')}</div>
                   </div>
                 )}
               </div>
               {tradeProposal.rationale && (
-                <div className="text-sm text-gray-300 bg-surface rounded-lg p-3">
-                  <p className="font-medium text-gray-400 mb-2">{t('analysis_rationale')}:</p>
-                  <MarkdownRenderer content={tradeProposal.rationale} compact />
+                <div className="text-sm text-ink bg-elevated rounded-lg p-3">
+                  <p className="font-medium text-muted mb-2">{t('analysis_rationale')}:</p>
+                  <ReadingPane><MarkdownRenderer content={tradeProposal.rationale} compact /></ReadingPane>
                 </div>
               )}
             </div>
@@ -726,7 +737,7 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
 
             {/* Fundamental Analysis */}
             <AnalysisCard
-              icon={<DollarSign className="w-5 h-5 text-green-400" />}
+              icon={<DollarSign className="w-5 h-5 text-green-400" />} // color-ok: analysis-category icon, not directional
               title={t('fundamental_analysis')}
               signal={fundamentalAnalysis?.recommendation}
               confidence={fundamentalAnalysis?.confidence}
@@ -762,11 +773,11 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
           {/* Reasoning Summary */}
           {reasoningSummary && (
             <div className="card">
-              <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                <Brain className="w-5 h-5 text-gray-400" />
+              <h2 className="text-sm font-semibold mb-3 flex items-center gap-2 text-ink">
+                <Brain className="w-4 h-4 text-muted" />
                 {t('reasoning_summary')}
               </h2>
-              <div className="text-sm text-gray-300 bg-surface rounded-lg p-4 whitespace-pre-wrap">
+              <div className="text-sm text-ink bg-elevated rounded-lg p-4 whitespace-pre-wrap">
                 {reasoningSummary}
               </div>
             </div>
@@ -775,11 +786,11 @@ export function AnalysisDetailPage({ sessionId: propSessionId, onBack }: Analysi
           {/* No detail data fallback */}
           {!hasAnalysisData && !reasoningSummary && (
             <div className="card text-center py-8">
-              <AlertTriangle className="w-8 h-8 mx-auto mb-3 text-yellow-400" />
-              <p className="text-gray-400">
+              <AlertTriangle className="w-8 h-8 mx-auto mb-3 text-warn" />
+              <p className="text-muted">
                 {t('no_data_available')}
               </p>
-              <p className="text-sm text-gray-500 mt-1">
+              <p className="text-sm text-dim mt-1">
                 {t('legacy_analysis_note')}
               </p>
             </div>

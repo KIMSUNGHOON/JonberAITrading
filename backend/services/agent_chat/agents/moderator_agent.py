@@ -113,6 +113,7 @@ class ModeratorAgent(BaseDiscussionAgent):
 
 ### 토론 핵심 요약
 {discussion_summary}
+{us_market_context}
 
 ---
 
@@ -157,7 +158,7 @@ class ModeratorAgent(BaseDiscussionAgent):
             current_price=context.current_price,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         return self._create_message(
             message_type=MessageType.SUMMARY,
@@ -188,7 +189,7 @@ class ModeratorAgent(BaseDiscussionAgent):
             chat_history=history_str,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         return self._create_message(
             message_type=MessageType.SUMMARY,
@@ -238,9 +239,10 @@ class ModeratorAgent(BaseDiscussionAgent):
             vote_summary=vote_summary,
             consensus_level=consensus_level,
             discussion_summary=discussion_summary,
+            us_market_context=context.us_market_context or "",
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         # Parse decision from response
         decision = self._parse_decision(response, session, context)
@@ -323,16 +325,29 @@ class ModeratorAgent(BaseDiscussionAgent):
     ) -> TradeDecision:
         """Parse decision from moderator response."""
         # Parse action
-        action = self._parse_action(response, context.has_position)
+        # #1 (audit C-series, live 009150): derive the final action from the
+        # structured weighted vote consensus, NOT a free-text regex scan of the
+        # moderator prose — that scan matched substrings like '진입' inside
+        # '신규진입 시 고위험' and inverted an all-SELL consensus into BUY.
+        # vote_to_action encodes the feasible set: bearish + no position ->
+        # NO_ACTION (never BUY).
+        action = vote_to_action(session.get_majority_direction(), context.has_position)
+
+        # --- Consensus safety gate ---
+        # If agents did not reach the required agreement level, refuse to trade.
+        if session.consensus_level < session.consensus_threshold:
+            action = DecisionAction.HOLD if context.has_position else DecisionAction.NO_ACTION
 
         # Get weighted confidence
-        confidence = calculate_weighted_confidence(session.votes)
+        confidence = calculate_weighted_confidence(session.votes, session.agent_weights)
 
         # Get risk parameters from risk agent's vote
         risk_vote = next(
             (v for v in session.votes if v.agent_type == AgentType.RISK),
             None,
         )
+
+        strategy_knobs = context.strategy_knobs or {}
 
         # Calculate trade parameters
         quantity = None
@@ -343,16 +358,44 @@ class ModeratorAgent(BaseDiscussionAgent):
 
         if risk_vote:
             position_pct = risk_vote.suggested_position_pct
-            stop_loss_pct = risk_vote.suggested_stop_loss_pct or 5.0
-            take_profit_pct = risk_vote.suggested_take_profit_pct or 10.0
+            # Phase4: 폴백 우선순위 — risk 에이전트 제안 > 활성 전략 > 레거시 상수
+            stop_loss_pct = (
+                risk_vote.suggested_stop_loss_pct
+                or strategy_knobs.get("stop_loss_pct")
+                or 5.0
+            )
+            take_profit_pct = (
+                risk_vote.suggested_take_profit_pct
+                or strategy_knobs.get("take_profit_pct")
+                or 10.0
+            )
 
             stop_loss = int(entry_price * (1 - stop_loss_pct / 100))
             take_profit = int(entry_price * (1 + take_profit_pct / 100))
+        elif not context.has_position and (
+            strategy_knobs.get("stop_loss_pct") or strategy_knobs.get("take_profit_pct")
+        ):
+            # Phase4: risk 투표 자체가 없어도 활성 전략이 있으면 스탑을 채운다
+            # (기존엔 None 스탑 결정 → 감시 skip이 잠복 갭이었음) — 단, 신규
+            # 진입(no position)에만. 보유 포지션 재평가(STRATEGIC_REEVAL)에서
+            # 이 분기가 채우면, 합의 미달 시 액션이 HOLD로 강제된 뒤
+            # PositionManager._apply_decision의 HOLD 분기가 그 스탑을 기존
+            # 포지션에 그대로 적용한다 — 가격이 진입가 아래로 내려간 상태라면
+            # 스탑이 아래로 재앵커되어 방어가 완화되는 회귀(final-review 발견).
+            if strategy_knobs.get("stop_loss_pct"):
+                stop_loss = int(entry_price * (1 - strategy_knobs["stop_loss_pct"] / 100))
+            if strategy_knobs.get("take_profit_pct"):
+                take_profit = int(entry_price * (1 + strategy_knobs["take_profit_pct"] / 100))
 
-            # Calculate quantity if we have portfolio info
-            if context.available_cash and position_pct:
-                investment = context.available_cash * (position_pct / 100)
-                quantity = int(investment / entry_price)
+        # Phase4: 전략 사이징 캡 — 자율 경로의 quantity_override가 PortfolioAgent
+        # 캡을 우회하므로, 수량의 원천인 position_pct를 여기서 캡한다.
+        max_position_pct = strategy_knobs.get("max_position_pct")
+        if position_pct and max_position_pct:
+            position_pct = min(position_pct, max_position_pct)
+
+        if risk_vote and context.available_cash and position_pct:
+            investment = context.available_cash * (position_pct / 100)
+            quantity = int(investment / entry_price)
 
         # Collect key factors from all votes
         key_factors = []
@@ -389,26 +432,6 @@ class ModeratorAgent(BaseDiscussionAgent):
             votes=vote_breakdown,
         )
 
-    def _parse_action(self, response: str, has_position: bool) -> DecisionAction:
-        """Parse decision action from response."""
-        response_lower = response.lower()
-
-        # Check for specific actions
-        if "add" in response_lower or "추가 매수" in response_lower:
-            return DecisionAction.ADD
-        elif "reduce" in response_lower or "일부 매도" in response_lower:
-            return DecisionAction.REDUCE
-        elif "buy" in response_lower or "매수" in response_lower or "진입" in response_lower:
-            return DecisionAction.BUY if not has_position else DecisionAction.ADD
-        elif "sell" in response_lower or "매도" in response_lower or "청산" in response_lower:
-            return DecisionAction.SELL if has_position else DecisionAction.NO_ACTION
-        elif "hold" in response_lower or "보유" in response_lower or "유지" in response_lower:
-            return DecisionAction.HOLD
-        elif "watch" in response_lower or "관망" in response_lower or "대기" in response_lower:
-            return DecisionAction.WATCH
-        else:
-            return DecisionAction.NO_ACTION
-
     def _is_opposite_direction(self, vote: VoteType, majority: VoteType) -> bool:
         """Check if a vote is opposite to majority direction."""
         bullish = (VoteType.STRONG_BUY, VoteType.BUY)
@@ -439,7 +462,7 @@ class ModeratorAgent(BaseDiscussionAgent):
 - 이견 사항
 - 다음 라운드에서 논의할 점"""
 
-        response = await self._call_llm(self.system_prompt, summary_prompt)
+        response = await self._call_llm(self._effective_system_prompt(), summary_prompt)
 
         return self._create_message(
             message_type=MessageType.SUMMARY,

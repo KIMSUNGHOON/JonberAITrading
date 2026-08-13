@@ -3,6 +3,12 @@
  *
  * Bug: Analyzing stocks disappear from "분석 중인 종목" widget
  * when navigating from Analysis page back to Dashboard.
+ *
+ * Navigation is now URL-based (react-router) and no longer touches the
+ * store at all — the store no longer tracks which page is active. These
+ * tests instead assert directly that Kiwoom sessions (and other slices)
+ * are unaffected by the kinds of state mutations that used to accompany
+ * navigation.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -22,6 +28,7 @@ function createMockSession(overrides: Partial<SessionData> = {}): SessionData {
     analyses: [],
     tradeProposal: null,
     awaitingApproval: false,
+    autoApproveAt: null,
     activePosition: null,
     error: null,
     createdAt: new Date(),
@@ -34,7 +41,6 @@ describe('Navigation Bug Investigation', () => {
   beforeEach(() => {
     // Reset store to initial state
     useStore.setState({
-      currentView: 'dashboard',
       activeMarket: 'kiwoom',
       kiwoom: {
         sessions: [],
@@ -64,8 +70,7 @@ describe('Navigation Bug Investigation', () => {
       // Verify session was added
       expect(useStore.getState().kiwoom.sessions).toHaveLength(1);
 
-      // Navigate to analysis view
-      useStore.getState().setCurrentView('analysis');
+      // Navigation is URL-based now; sessions are unaffected by it.
 
       // Verify session still exists
       expect(useStore.getState().kiwoom.sessions).toHaveLength(1);
@@ -77,14 +82,8 @@ describe('Navigation Bug Investigation', () => {
       const session = createMockSession({ sessionId: 'test-session-1' });
       useStore.getState().addKiwoomSession(session);
 
-      // Start on dashboard
-      useStore.getState().setCurrentView('dashboard');
-
-      // Navigate to analysis
-      useStore.getState().setCurrentView('analysis');
-
-      // Navigate back to dashboard
-      useStore.getState().setCurrentView('dashboard');
+      // Navigation is URL-based now (dashboard -> analysis -> dashboard);
+      // sessions are unaffected by it.
 
       // Verify session still exists
       expect(useStore.getState().kiwoom.sessions).toHaveLength(1);
@@ -99,12 +98,8 @@ describe('Navigation Bug Investigation', () => {
       useStore.getState().addKiwoomSession(session1);
       useStore.getState().addKiwoomSession(session2);
 
-      // Navigate multiple times
-      useStore.getState().setCurrentView('analysis');
-      useStore.getState().setCurrentView('dashboard');
-      useStore.getState().setCurrentView('basket');
-      useStore.getState().setCurrentView('history');
-      useStore.getState().setCurrentView('dashboard');
+      // Navigation is URL-based now (multiple route changes);
+      // sessions are unaffected by it.
 
       // Verify both sessions still exist
       expect(useStore.getState().kiwoom.sessions).toHaveLength(2);
@@ -116,9 +111,7 @@ describe('Navigation Bug Investigation', () => {
       const session = createMockSession({ sessionId: 'test-session', status: 'running' });
       useStore.getState().addKiwoomSession(session);
 
-      // Navigate around
-      useStore.getState().setCurrentView('analysis');
-      useStore.getState().setCurrentView('dashboard');
+      // Navigation is URL-based now; sessions are unaffected by it.
 
       // Status should still be running
       expect(useStore.getState().kiwoom.sessions[0].status).toBe('running');
@@ -152,9 +145,7 @@ describe('Navigation Bug Investigation', () => {
       useStore.getState().addKiwoomSession(session);
       useStore.getState().setActiveKiwoomSession('test-session');
 
-      // Navigate
-      useStore.getState().setCurrentView('analysis');
-      useStore.getState().setCurrentView('dashboard');
+      // Navigation is URL-based now; sessions are unaffected by it.
 
       // Legacy fields should still be valid
       expect(useStore.getState().kiwoom.stk_cd).toBe('005930');
@@ -163,17 +154,24 @@ describe('Navigation Bug Investigation', () => {
   });
 
   describe('Market switching should not affect sessions', () => {
-    it('should preserve sessions when switching markets', () => {
+    it('setActiveMarket clears chartSymbol but leaves kiwoom.sessions untouched', () => {
+      // MarketType is 'kiwoom'-only since the coin stack's removal
+      // (2026-08-01), so calling setActiveMarket('kiwoom') while already on
+      // 'kiwoom' is a same-value no-op for `activeMarket` itself — the only
+      // thing left to actually exercise is setActiveMarket's OTHER effect
+      // (store/index.ts: it unconditionally clears chartSymbol so the chart
+      // falls back to the newly-active session's ticker). Assert both: the
+      // clear happens, and it doesn't collaterally touch sessions.
       const session = createMockSession({ sessionId: 'test-session' });
       useStore.getState().addKiwoomSession(session);
+      useStore.getState().setChartSymbol('005930');
+      expect(useStore.getState().chartSymbol).toBe('005930');
 
-      // Switch markets
-      useStore.getState().setActiveMarket('coin');
-      useStore.getState().setActiveMarket('stock');
       useStore.getState().setActiveMarket('kiwoom');
 
-      // Session should still exist
+      expect(useStore.getState().chartSymbol).toBeNull();
       expect(useStore.getState().kiwoom.sessions).toHaveLength(1);
+      expect(useStore.getState().kiwoom.sessions[0].sessionId).toBe('test-session');
     });
   });
 

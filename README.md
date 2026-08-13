@@ -126,10 +126,9 @@ JonberAITrading/
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/analysis/start` | POST | Start new analysis |
-| `/api/analysis/status/{id}` | GET | Get session status |
-| `/api/analysis/sessions` | GET | List all sessions |
-| `/api/analysis/cancel/{id}` | POST | Cancel session |
+| `/api/kr_stocks/analysis/start` | POST | Start KR stock analysis |
+| `/api/kr_stocks/analysis/status/{id}` | GET | KR analysis status |
+| `/api/analysis/translate` | POST | KO↔EN translation (LLM) |
 
 ### Approval Endpoints
 

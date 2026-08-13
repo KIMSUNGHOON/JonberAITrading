@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useState, useCallback } from 'react';
-import { X, TrendingUp, TrendingDown, Clock, Eye, AlertTriangle, CheckCircle, Wifi, WifiOff } from 'lucide-react';
+import { X, TrendingUp, TrendingDown, Clock, Eye, AlertTriangle, CheckCircle, Wifi, WifiOff, FileText } from 'lucide-react';
 import {
   useTradeNotifications,
   formatNotificationMessage,
@@ -14,6 +14,7 @@ import {
   type TradeNotification,
   type TradeNotificationType,
 } from '@/hooks/useTradeNotifications';
+import { useStore, selectNotifications } from '@/store';
 
 // -------------------------------------------
 // Types
@@ -43,6 +44,7 @@ const iconMap: Record<TradeNotificationType, typeof TrendingUp> = {
   watch_added: Eye,
   stop_loss_triggered: TrendingDown,
   take_profit_triggered: TrendingUp,
+  eod_summary: FileText,
 };
 
 const severityStyles: Record<'success' | 'warning' | 'error' | 'info', string> = {
@@ -157,7 +159,10 @@ export function TradeNotificationToast({
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
   const handleNotification = useCallback((notification: TradeNotification) => {
-    const id = `${notification.type}-${notification.data.ticker}-${Date.now()}`;
+    // ticker is absent on account-wide types (eod_summary) -- fall back to
+    // trade_date, then '', so the key never embeds a literal "undefined".
+    const idSubject = notification.data.ticker ?? notification.data.trade_date ?? '';
+    const id = `${notification.type}-${idSubject}-${Date.now()}`;
 
     setToasts((prev) => {
       // Add new toast at the beginning
@@ -238,9 +243,13 @@ interface InlineTradeNotificationsProps {
 }
 
 export function InlineTradeNotifications({ maxItems = 10 }: InlineTradeNotificationsProps) {
-  const { notifications, isConnected, clearNotifications } = useTradeNotifications({
-    autoConnect: true,
-  });
+  // Live connection status only — the LIST itself is sourced from the store
+  // (see NotificationBell), which is captured once at the shell level and
+  // persisted, so this panel shows history across refreshes rather than only
+  // whatever has arrived since this component happened to be mounted.
+  const { isConnected } = useTradeNotifications({ autoConnect: true });
+  const notifications = useStore(selectNotifications);
+  const clearAllNotifications = useStore((s) => s.clearAllNotifications);
 
   const displayItems = notifications.slice(0, maxItems);
 
@@ -253,7 +262,7 @@ export function InlineTradeNotifications({ maxItems = 10 }: InlineTradeNotificat
         </div>
         {notifications.length > 0 && (
           <button
-            onClick={clearNotifications}
+            onClick={clearAllNotifications}
             className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
           >
             모두 지우기
@@ -265,7 +274,7 @@ export function InlineTradeNotifications({ maxItems = 10 }: InlineTradeNotificat
         <p className="text-sm text-gray-500 py-4 text-center">알림 없음</p>
       ) : (
         <div className="space-y-1">
-          {displayItems.map((notification, index) => {
+          {displayItems.map((notification) => {
             const severity = getNotificationSeverity(notification.type);
             const Icon = iconMap[notification.type];
             const message = formatNotificationMessage(notification);
@@ -277,7 +286,7 @@ export function InlineTradeNotifications({ maxItems = 10 }: InlineTradeNotificat
 
             return (
               <div
-                key={`${notification.type}-${notification.data.ticker}-${index}`}
+                key={notification.id}
                 className={`
                   flex items-start gap-2 p-2 rounded-lg text-sm
                   ${severity === 'success' ? 'bg-green-500/10 text-green-400' : ''}

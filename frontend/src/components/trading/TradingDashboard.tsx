@@ -1,512 +1,364 @@
 /**
- * TradingDashboard Component
+ * 자율 운용 관제 (Autonomous Operations Control) — /trading
  *
- * Main auto-trading dashboard showing:
- * - Trading system status and controls
- * - Portfolio summary
- * - Managed positions with P&L
- * - Pending alerts
- * - Risk parameters
+ * R5-P2 재편: 이전 버전은 초기 모델의 잔재였다 — 장식용 Agent Workflow 그래프
+ * (갱신 경로가 데드 코드), 어떤 매매 경로도 읽지 않는 전략 프리셋 위젯,
+ * 코디네이터 인메모리 포트폴리오(브로커 계좌와 다른 진실), R3 자율 시스템과의
+ * 완전한 단절. 이 화면은 실제 자율 운용의 세 스위치와 안전장치를 한곳에 모은다:
+ *
+ *   1. 트레이딩 모드 (HITL | AUTONOMOUS, 마켓별) — R3 게이트가 매 결정마다 읽음
+ *   2. 결정 계층 (Agent Coordinator) — 워치리스트 감시 → 토론 → 합의 → 결정
+ *   3. 실행 계층 (Execution Coordinator) — 큐 → 게이트 재확인 → 브로커 주문
+ *
+ * 전략 위젯은 실제 배선(R5-P3) 전까지 UI에서 내렸다 — 통제감 착각 제거.
+ *
+ * R5-P2-UX B1: "결정 계층" 카드는 더 이상 Start/Stop을 직접 호출하지 않는다.
+ * 이 코디네이터 on/off는 /agent-chat Status Card, /trading(여기), 대시보드
+ * DebatePanel 세 곳에서 각각 다른 라벨로 켤 수 있었다 — 사용자가 "같은
+ * 스위치"라는 걸 알 수 없는 3중 컨트롤이었다. SSOT는 /agent-chat으로 고정하고,
+ * 여기서는 읽기전용 상태칩 + 딥링크만 제공한다("실행 계층"은 별개 스위치라
+ * 그대로 유지).
+ *
+ * P2 funnel-consolidation Task 8b: the "3행: 운용 데이터" row (WatchListWidget/
+ * TradeQueueWidget) has been removed — every action those two widgets
+ * offered (convert-to-queue, remove-from-watch, re-analyze, cancel-queued,
+ * manual queue-process) now lives in the dashboard funnel's WATCHLIST/
+ * PIPELINE sections (see OperationsPanel.tsx's WatchingColumn/
+ * PendingBuyColumn + FunnelPanel.tsx), which poll the SAME `/operations`
+ * source instead of running two more independent polls. This screen is now
+ * purely the three control switches + safety gate summary.
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
-  Play,
+  Bot,
+  CircleDollarSign,
   Pause,
-  Square,
+  Play,
   RefreshCw,
-  AlertTriangle,
-  TrendingUp,
-  TrendingDown,
-  DollarSign,
-  Activity,
-  Bell,
-  LayoutGrid,
-  GitBranch,
+  ShieldCheck,
+  Square,
 } from 'lucide-react';
-import { useStore } from '@/store';
-import AgentStatusWidget from './AgentStatusWidget';
-import { AgentWorkflowGraph } from './AgentWorkflowGraph';
-import TradeQueueWidget from './TradeQueueWidget';
-import StrategyConfigWidget from './StrategyConfigWidget';
-import WatchListWidget from './WatchListWidget';
+
 import {
+  getAgentChatStatus,
   getTradingStatus,
   getTradingPortfolio,
-  getTradingAlerts,
   startTrading,
   stopTrading,
   pauseTrading,
   resumeTrading,
+  apiClient,
 } from '@/api/client';
-import { useTranslations } from '@/utils/translations';
-import type {
-  TradingMode,
-  ManagedPosition,
-  TradingAlert,
-} from '@/types';
+import { useStore } from '@/store';
+import { TradingModeSection } from '@/components/settings/TradingModeSection';
+import { RiskParamsPanel } from '@/components/trading/RiskParamsPanel';
+import UsSignalCard from '@/components/terminal/panels/UsSignalCard';
+import type { AgentChatCoordinatorStatus } from '@/types';
 
-// -------------------------------------------
-// Sub-components
-// -------------------------------------------
-
-interface StatusBadgeProps {
-  mode: TradingMode | string;
+/** HH:mm for the last coordinator watch-list tick; DASH when unknown. */
+const DASH = '—';
+function formatLastCheck(iso: string | null | undefined): string {
+  if (!iso) return DASH;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return DASH;
+  return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-function StatusBadge({ mode }: StatusBadgeProps) {
-  const styles: Record<string, string> = {
-    active: 'bg-green-500/20 text-green-400 border-green-500/30',
-    paused: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
-    stopped: 'bg-gray-500/20 text-gray-400 border-gray-500/30',
-  };
+interface ExecutionStatus {
+  mode: string;
+  is_active: boolean;
+  started_at: string | null;
+  daily_trades: number;
+  max_daily_trades: number;
+}
 
-  const labels: Record<string, string> = {
-    active: 'Active',
-    paused: 'Paused',
-    stopped: 'Stopped',
-  };
+interface RiskLimits {
+  max_daily_loss_pct?: number;
+  max_open_positions?: number;
+  max_trade_notional_pct?: number;
+}
 
+function StatusDot({ on }: { on: boolean }) {
   return (
     <span
-      className={`px-3 py-1 rounded-full text-sm font-medium border ${
-        styles[mode] || styles.stopped
-      }`}
-    >
-      {labels[mode] || mode}
-    </span>
+      className={`inline-block w-2 h-2 rounded-full ${on ? 'bg-up' : 'bg-dim'}`}
+      aria-hidden
+    />
   );
 }
 
-interface PositionRowProps {
-  position: ManagedPosition;
-}
-
-function PositionRow({ position }: PositionRowProps) {
-  const pnlColor =
-    position.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400';
-  const pnlIcon =
-    position.unrealized_pnl >= 0 ? (
-      <TrendingUp className="w-4 h-4" />
-    ) : (
-      <TrendingDown className="w-4 h-4" />
-    );
-
+function CardHeader({ icon, title }: { icon: React.ReactNode; title: string }) {
   return (
-    <div className="flex items-center justify-between p-3 bg-gray-800/50 rounded-lg">
-      <div className="flex-1">
-        <div className="font-medium text-white">{position.stock_name}</div>
-        <div className="text-sm text-gray-400">{position.ticker}</div>
-      </div>
-      <div className="text-right">
-        <div className="text-sm text-gray-300">
-          {position.quantity}주 @ ₩{position.avg_price.toLocaleString()}
-        </div>
-        <div className={`flex items-center justify-end gap-1 ${pnlColor}`}>
-          {pnlIcon}
-          <span>
-            ₩{Math.abs(position.unrealized_pnl).toLocaleString()} (
-            {position.unrealized_pnl_pct >= 0 ? '+' : ''}
-            {position.unrealized_pnl_pct.toFixed(2)}%)
-          </span>
-        </div>
-      </div>
+    <div className="flex items-center gap-2 mb-3">
+      <span className="text-muted">{icon}</span>
+      <h3 className="text-sm font-medium text-ink">{title}</h3>
     </div>
   );
 }
 
-interface AlertItemProps {
-  alert: TradingAlert;
-}
-
-function AlertItem({ alert }: AlertItemProps) {
-  const typeColors: Record<string, string> = {
-    stop_loss_triggered: 'border-red-500/50 bg-red-500/10',
-    take_profit_triggered: 'border-green-500/50 bg-green-500/10',
-    sudden_move_up: 'border-yellow-500/50 bg-yellow-500/10',
-    sudden_move_down: 'border-orange-500/50 bg-orange-500/10',
-    news_alert: 'border-blue-500/50 bg-blue-500/10',
-  };
-
+function ActionButton({
+  label,
+  onClick,
+  disabled,
+  tone = 'default',
+  icon,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  tone?: 'default' | 'accent' | 'danger';
+  icon?: React.ReactNode;
+}) {
+  const toneCls =
+    tone === 'accent'
+      ? 'bg-accent text-canvas hover:bg-accent/90'
+      : tone === 'danger'
+        ? 'border border-down/50 text-down hover:bg-down/10'
+        : 'border border-hairline text-muted hover:text-ink hover:bg-elevated';
   return (
-    <div
-      className={`p-3 rounded-lg border ${
-        typeColors[alert.alert_type] || 'border-gray-700 bg-gray-800/50'
-      }`}
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${toneCls}`}
     >
-      <div className="flex items-start gap-2">
-        <AlertTriangle className="w-4 h-4 mt-0.5 text-yellow-400" />
-        <div className="flex-1">
-          <div className="font-medium text-white">{alert.title}</div>
-          <div className="text-sm text-gray-300">{alert.message}</div>
-          {alert.ticker && (
-            <div className="text-xs text-gray-400 mt-1">{alert.ticker}</div>
-          )}
-        </div>
-      </div>
-    </div>
+      {icon}
+      {label}
+    </button>
   );
 }
-
-// -------------------------------------------
-// Main Component
-// -------------------------------------------
 
 export default function TradingDashboard() {
-  const language = useStore((state) => state.language);
-  const t = useTranslations(language);
-  const [loading, setLoading] = useState(true);
+  const navigate = useNavigate();
+  const masterEnabled = useStore((s) => s.autonomyMasterEnabled);
+  const tradingModes = useStore((s) => s.tradingModes);
+
   const [error, setError] = useState<string | null>(null);
-  const [agentViewMode, setAgentViewMode] = useState<'workflow' | 'grid'>('workflow');
+  const [execStatus, setExecStatus] = useState<ExecutionStatus | null>(null);
+  const [brainStatus, setBrainStatus] = useState<AgentChatCoordinatorStatus | null>(null);
+  const [riskLimits, setRiskLimits] = useState<RiskLimits | null>(null);
+  const [totalEquity, setTotalEquity] = useState(0);
+  const [busy, setBusy] = useState<string | null>(null);
 
-  // Trading state
-  const [status, setStatus] = useState<{
-    mode: string;
-    is_active: boolean;
-    started_at: string | null;
-    daily_trades: number;
-    max_daily_trades: number;
-    pending_alerts_count: number;
-  } | null>(null);
-
-  const [portfolio, setPortfolio] = useState<{
-    total_equity: number;
-    cash: number;
-    cash_ratio: number;
-    stock_value: number;
-    stock_ratio: number;
-    positions: ManagedPosition[];
-    total_unrealized_pnl: number;
-    total_unrealized_pnl_pct: number;
-    daily_trades: number;
-    max_daily_trades: number;
-  } | null>(null);
-
-  const [alerts, setAlerts] = useState<TradingAlert[]>([]);
-  const [actionLoading, setActionLoading] = useState(false);
-
-  // Fetch data
-  const fetchData = useCallback(async () => {
-    try {
-      setError(null);
-      const [statusData, portfolioData, alertsData] = await Promise.all([
-        getTradingStatus(),
-        getTradingPortfolio().catch(() => null),
-        getTradingAlerts().catch(() => ({ alerts: [], count: 0 })),
-      ]);
-
-      setStatus(statusData);
-      if (portfolioData) {
-        setPortfolio({
-          ...portfolioData,
-          positions: portfolioData.positions as ManagedPosition[],
-        });
-      } else {
-        setPortfolio(null);
-      }
-      setAlerts((alertsData.alerts as TradingAlert[]) || []);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch trading data');
-    } finally {
-      setLoading(false);
-    }
+  const fetchAll = useCallback(async () => {
+    const [exec, brain, risk, portfolio] = await Promise.allSettled([
+      getTradingStatus(),
+      getAgentChatStatus(),
+      apiClient.getTradingRiskParams(),
+      getTradingPortfolio(),
+    ]);
+    if (exec.status === 'fulfilled') setExecStatus(exec.value as ExecutionStatus);
+    if (brain.status === 'fulfilled') setBrainStatus(brain.value);
+    if (risk.status === 'fulfilled') setRiskLimits(risk.value as RiskLimits);
+    if (portfolio.status === 'fulfilled') setTotalEquity(portfolio.value.total_equity);
   }, []);
 
   useEffect(() => {
-    fetchData();
-    // Poll every 10 seconds
-    const interval = setInterval(fetchData, 10000);
+    fetchAll();
+    const interval = setInterval(fetchAll, 10000);
     return () => clearInterval(interval);
-  }, [fetchData]);
+  }, [fetchAll]);
 
-  // Actions
-  const handleStart = async () => {
-    setActionLoading(true);
+  const act = async (key: string, fn: () => Promise<unknown>) => {
+    setBusy(key);
+    setError(null);
     try {
-      await startTrading();
-      await fetchData();
+      await fn();
+      await fetchAll();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start trading');
+      setError(err instanceof Error ? err.message : '요청에 실패했습니다');
     } finally {
-      setActionLoading(false);
+      setBusy(null);
     }
   };
 
-  const handleStop = async () => {
-    setActionLoading(true);
-    try {
-      await stopTrading();
-      await fetchData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to stop trading');
-    } finally {
-      setActionLoading(false);
-    }
-  };
-
-  const handlePause = async () => {
-    setActionLoading(true);
-    try {
-      await pauseTrading('Manual pause');
-      await fetchData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to pause trading');
-    } finally {
-      setActionLoading(false);
-    }
-  };
-
-  const handleResume = async () => {
-    setActionLoading(true);
-    try {
-      await resumeTrading();
-      await fetchData();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to resume trading');
-    } finally {
-      setActionLoading(false);
-    }
-  };
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <RefreshCw className="w-8 h-8 animate-spin text-blue-500" />
-      </div>
-    );
-  }
+  const autonomousMarkets = tradingModes
+    ? (['kiwoom'] as const).filter((m) => tradingModes[m] === 'autonomous')
+    : [];
+  const fullyArmed =
+    masterEnabled && autonomousMarkets.length > 0 && brainStatus?.is_running && execStatus?.is_active;
 
   return (
-    <div className="p-4 lg:p-6">
+    <div className="h-full flex flex-col bg-canvas">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex-none flex items-center justify-between px-4 py-2.5 border-b border-hairline bg-card">
         <div>
-          <h1 className="text-xl lg:text-2xl font-bold text-white">{t('trading_title')}</h1>
-          <p className="text-sm text-gray-400">{t('trading_subtitle')}</p>
+          <h1 className="text-sm font-semibold text-ink">자율 운용 관제</h1>
+          <p className="text-[11px] text-dim">
+            모드 · 결정 계층 · 실행 계층 · 안전장치를 한곳에서 제어합니다
+          </p>
         </div>
-        <button
-          onClick={fetchData}
-          className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
-        >
-          <RefreshCw className="w-5 h-5" />
-        </button>
+        <div className="flex items-center gap-3">
+          {fullyArmed ? (
+            <span className="px-2 py-0.5 rounded border border-accent/50 text-accent text-[11px] font-medium uppercase tracking-wide">
+              Autonomous · Armed
+            </span>
+          ) : (
+            <span className="px-2 py-0.5 rounded border border-hairline text-dim text-[11px] uppercase tracking-wide">
+              Standby
+            </span>
+          )}
+          <button
+            onClick={fetchAll}
+            className="p-2 text-muted hover:text-ink hover:bg-elevated rounded-lg"
+            title="새로고침"
+          >
+            <RefreshCw className="w-4 h-4" />
+          </button>
+        </div>
       </div>
 
-      {/* Error */}
       {error && (
-        <div className="mb-4 p-3 bg-red-500/20 border border-red-500/30 rounded-lg text-red-400 text-sm">
+        <div className="mx-4 mt-3 px-3 py-2 rounded border border-down/40 bg-down/10 text-down text-sm">
           {error}
         </div>
       )}
 
-      {/* Main Grid Layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Left Column - Controls & Status */}
-        <div className="space-y-4">
-          {/* Status Card - Compact */}
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="font-semibold text-white flex items-center gap-2">
-                <Activity className="w-4 h-4 text-blue-400" />
-                {t('trading_status')}
-              </h2>
-              <StatusBadge mode={status?.mode || 'stopped'} />
-            </div>
+      <div className="flex-1 overflow-y-auto p-4">
+        <div className="max-w-6xl mx-auto space-y-4">
+          <UsSignalCard />
 
-            <div className="space-y-2 text-sm mb-4">
-              <div className="flex justify-between">
-                <span className="text-gray-400">{t('trading_started')}</span>
-                <span className="text-white">
-                  {status?.started_at
-                    ? new Date(status.started_at).toLocaleTimeString()
-                    : '-'}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-400">{t('trading_trades')}</span>
-                <span className="text-white">
-                  {status?.daily_trades || 0}/{status?.max_daily_trades || 10}
-                </span>
-              </div>
-            </div>
+          {/* 1행: 스위치 3개 */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+            {/* 트레이딩 모드 (공용 섹션 재사용) */}
+            <TradingModeSection onError={setError} />
 
-            {/* Control Buttons */}
-            <div className="flex gap-2">
-              {status?.mode === 'stopped' ? (
-                <button
-                  onClick={handleStart}
-                  disabled={actionLoading}
-                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg disabled:opacity-50"
-                >
-                  <Play className="w-4 h-4" />
-                  {t('trading_start_btn')}
-                </button>
-              ) : status?.mode === 'paused' ? (
-                <>
-                  <button
-                    onClick={handleResume}
-                    disabled={actionLoading}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg disabled:opacity-50"
-                  >
-                    <Play className="w-4 h-4" />
-                    {t('trading_resume_btn')}
-                  </button>
-                  <button
-                    onClick={handleStop}
-                    disabled={actionLoading}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg disabled:opacity-50"
-                  >
-                    <Square className="w-4 h-4" />
-                    {t('trading_stop_btn')}
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    onClick={handlePause}
-                    disabled={actionLoading}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-yellow-600 hover:bg-yellow-700 text-white text-sm rounded-lg disabled:opacity-50"
-                  >
-                    <Pause className="w-4 h-4" />
-                    {t('trading_pause_btn')}
-                  </button>
-                  <button
-                    onClick={handleStop}
-                    disabled={actionLoading}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg disabled:opacity-50"
-                  >
-                    <Square className="w-4 h-4" />
-                    {t('trading_stop_btn')}
-                  </button>
-                </>
+            {/* 결정 계층 — 읽기전용 상태칩 + 딥링크 (B1: on/off SSOT=/agent-chat) */}
+            <div className="bg-card border border-hairline rounded p-4">
+              <CardHeader icon={<Bot size={15} />} title="결정 계층 · Agent Coordinator" />
+              <div className="flex items-center gap-2 text-sm text-muted mb-1">
+                <StatusDot on={!!brainStatus?.is_running} />
+                {brainStatus == null
+                  ? '상태 확인 중…'
+                  : brainStatus.is_running
+                    ? `가동 중 — 토론 ${brainStatus.active_discussions}건 · ${brainStatus.check_interval_minutes}분 주기`
+                    : '정지 — 워치리스트 감시 없음'}
+              </div>
+              {brainStatus?.is_running && (
+                <div className="text-[11px] text-dim mb-2">
+                  마지막 점검 {formatLastCheck(brainStatus.last_check_at)}
+                </div>
               )}
-            </div>
-          </div>
-
-          {/* Portfolio Summary - Compact */}
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
-              <DollarSign className="w-4 h-4 text-green-400" />
-              {t('trading_portfolio')}
-            </h2>
-
-            {portfolio ? (
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-gray-400">{t('trading_equity')}</span>
-                  <span className="text-white font-medium">
-                    ₩{portfolio.total_equity.toLocaleString()}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-400">{t('trading_cash')}</span>
-                  <span className="text-white">
-                    {(portfolio.cash_ratio * 100).toFixed(0)}%
-                  </span>
-                </div>
-                <div className="flex justify-between pt-2 border-t border-gray-700">
-                  <span className="text-gray-400">{t('trading_pnl')}</span>
-                  <span className={portfolio.total_unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
-                    {portfolio.total_unrealized_pnl >= 0 ? '+' : ''}
-                    {portfolio.total_unrealized_pnl_pct.toFixed(2)}%
-                  </span>
-                </div>
-              </div>
-            ) : (
-              <div className="text-gray-400 text-center py-4 text-sm">{t('no_data')}</div>
-            )}
-          </div>
-
-          {/* Trade Queue Widget */}
-          <TradeQueueWidget />
-
-          {/* Watch List Widget */}
-          <WatchListWidget />
-        </div>
-
-        {/* Middle Column - Agent Status & Positions */}
-        <div className="space-y-4">
-          {/* Agent Status Section with View Toggle */}
-          <div className="relative">
-            {/* View Toggle Buttons */}
-            <div className="absolute -top-1 right-0 flex bg-gray-800 rounded-lg p-0.5 z-10">
               <button
-                onClick={() => setAgentViewMode('workflow')}
-                className={`p-1.5 rounded-md transition-colors ${
-                  agentViewMode === 'workflow'
-                    ? 'bg-blue-600 text-white'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-                title="워크플로우 뷰"
+                type="button"
+                onClick={() => navigate('/agent-chat')}
+                className="mt-2 text-xs font-medium text-accent hover:underline"
               >
-                <GitBranch className="w-4 h-4" />
+                /agent-chat에서 제어 →
               </button>
-              <button
-                onClick={() => setAgentViewMode('grid')}
-                className={`p-1.5 rounded-md transition-colors ${
-                  agentViewMode === 'grid'
-                    ? 'bg-blue-600 text-white'
-                    : 'text-gray-400 hover:text-white'
-                }`}
-                title="그리드 뷰"
-              >
-                <LayoutGrid className="w-4 h-4" />
-              </button>
+              <p className="mt-3 text-[11px] text-dim leading-relaxed">
+                워치리스트 감시 → 에이전트 토론 → 합의(75%) → 결정. 손절/익절 감시
+                (Position Monitor)도 함께 기동됩니다. 시작/정지는 /agent-chat에서
+                제어합니다.
+              </p>
             </div>
 
-            {/* Agent View */}
-            {agentViewMode === 'workflow' ? (
-              <AgentWorkflowGraph />
-            ) : (
-              <AgentStatusWidget />
-            )}
+            {/* 실행 계층 */}
+            <div className="bg-card border border-hairline rounded p-4">
+              <CardHeader
+                icon={<CircleDollarSign size={15} />}
+                title="실행 계층 · Execution"
+              />
+              <div className="flex items-center gap-2 text-sm text-muted mb-3">
+                <StatusDot on={!!execStatus?.is_active} />
+                {execStatus == null
+                  ? '상태 확인 중…'
+                  : execStatus.is_active
+                    ? `가동 중 (${execStatus.mode}) — 오늘 ${execStatus.daily_trades}/${execStatus.max_daily_trades}건`
+                    : '정지 — 큐 처리 없음'}
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                {execStatus?.is_active ? (
+                  <>
+                    <ActionButton
+                      label="Pause"
+                      icon={<Pause size={12} />}
+                      disabled={busy !== null}
+                      onClick={() => act('exec', () => pauseTrading('Manual pause'))}
+                    />
+                    <ActionButton
+                      label="Stop"
+                      icon={<Square size={12} />}
+                      tone="danger"
+                      disabled={busy !== null}
+                      onClick={() => act('exec', () => stopTrading())}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <ActionButton
+                      label="Start"
+                      icon={<Play size={12} />}
+                      tone="accent"
+                      disabled={busy !== null}
+                      onClick={() => act('exec', () => startTrading())}
+                    />
+                    <ActionButton
+                      label="Resume"
+                      disabled={busy !== null}
+                      onClick={() => act('exec', () => resumeTrading())}
+                    />
+                  </>
+                )}
+              </div>
+              <p className="mt-3 text-[11px] text-dim leading-relaxed">
+                승인된 거래의 큐 처리와 브로커 주문. 자율 거래는 실행 직전 게이트를
+                다시 통과해야 합니다.
+              </p>
+            </div>
           </div>
 
-          {/* Positions */}
-          <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
-              <TrendingUp className="w-4 h-4 text-blue-400" />
-              {t('trading_positions')}
-              {portfolio?.positions && portfolio.positions.length > 0 && (
-                <span className="text-sm text-gray-400">
-                  ({portfolio.positions.length})
-                </span>
-              )}
-            </h2>
-
-            {portfolio?.positions && portfolio.positions.length > 0 ? (
-              <div className="space-y-2 max-h-64 overflow-y-auto">
-                {portfolio.positions.map((position, idx) => (
-                  <PositionRow key={position.ticker || idx} position={position} />
-                ))}
+          {/* 2행: 안전장치 */}
+          <div className="bg-card border border-hairline rounded p-4">
+            <CardHeader icon={<ShieldCheck size={15} />} title="안전장치 · Autonomy Gate" />
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
+              <div>
+                <div className="text-[11px] text-dim uppercase tracking-wide">마스터 게이트</div>
+                <div className={masterEnabled ? 'text-up' : 'text-muted'}>
+                  {masterEnabled ? 'ENABLED' : 'DISABLED (env)'}
+                </div>
               </div>
-            ) : (
-              <div className="text-gray-400 text-center py-6 text-sm">
-                {t('trading_no_positions')}
+              <div>
+                <div className="text-[11px] text-dim uppercase tracking-wide">일일 손실 한도</div>
+                <div className="text-ink tabular-nums">
+                  {riskLimits?.max_daily_loss_pct != null
+                    ? `${riskLimits.max_daily_loss_pct}% (브레이커)`
+                    : '—'}
+                </div>
               </div>
-            )}
-          </div>
-
-          {/* Alerts */}
-          {alerts.length > 0 && (
-            <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
-              <h2 className="font-semibold text-white flex items-center gap-2 mb-3">
-                <Bell className="w-4 h-4 text-yellow-400" />
-                {t('trading_alerts')}
-                <span className="text-sm text-gray-400">({alerts.length})</span>
-              </h2>
-              <div className="space-y-2 max-h-48 overflow-y-auto">
-                {alerts.map((alert) => (
-                  <AlertItem key={alert.id} alert={alert} />
-                ))}
+              <div>
+                <div className="text-[11px] text-dim uppercase tracking-wide">최대 포지션</div>
+                <div className="text-ink tabular-nums">
+                  {riskLimits?.max_open_positions ?? '—'}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-dim uppercase tracking-wide">거래당 상한</div>
+                <div className="text-ink tabular-nums">
+                  {riskLimits?.max_trade_notional_pct != null
+                    ? `${riskLimits.max_trade_notional_pct}%${
+                        totalEquity > 0
+                          ? ` (≈₩${Math.round(
+                              (riskLimits.max_trade_notional_pct / 100) * totalEquity,
+                            ).toLocaleString('ko-KR')})`
+                          : ''
+                      }`
+                    : '—'}
+                </div>
               </div>
             </div>
-          )}
-        </div>
+            <p className="mt-3 text-[11px] text-dim leading-relaxed">
+              모든 자율 승인·실행은 게이트 체인(마스터 → 마켓 모드 → 페이퍼 →
+              브레이커 → 포지션/금액 캡)을 통과해야 하며, 페이퍼 모드는 코드에
+              고정되어 있습니다. 자율 승인 전 60초 유예 동안 홈 ORDER 레일에서
+              거부할 수 있습니다.
+            </p>
+          </div>
 
-        {/* Right Column - Strategy Configuration */}
-        <div>
-          <StrategyConfigWidget />
+          {/* 3행: 리스크 파라미터 편집 */}
+          <RiskParamsPanel totalEquity={totalEquity} />
         </div>
       </div>
     </div>

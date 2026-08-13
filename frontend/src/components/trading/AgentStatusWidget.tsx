@@ -22,6 +22,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { getAgentStates } from '@/api/client';
+import { pnlColor } from '@/utils/pnl';
 
 // -------------------------------------------
 // Types
@@ -85,10 +86,10 @@ const AGENT_ICONS: Record<string, React.ReactNode> = {
 };
 
 const STATUS_CONFIG: Record<AgentState['status'], { label: string; color: string; icon: React.ReactNode }> = {
-  idle: { label: '대기', color: 'text-gray-400', icon: <CheckCircle className="w-3 h-3" /> },
-  working: { label: '작업중', color: 'text-blue-400', icon: <Loader2 className="w-3 h-3 animate-spin" /> },
-  waiting: { label: '대기중', color: 'text-yellow-400', icon: <Clock className="w-3 h-3" /> },
-  error: { label: '오류', color: 'text-red-400', icon: <AlertCircle className="w-3 h-3" /> },
+  idle: { label: '대기', color: 'text-muted', icon: <CheckCircle className="w-3 h-3" /> },
+  working: { label: '작업중', color: 'text-accent', icon: <Loader2 className="w-3 h-3 animate-spin" /> },
+  waiting: { label: '대기중', color: 'text-warn', icon: <Clock className="w-3 h-3" /> },
+  error: { label: '오류', color: 'text-down', icon: <AlertCircle className="w-3 h-3" /> },
 };
 
 // -------------------------------------------
@@ -125,33 +126,47 @@ function AgentCard({ agentKey, agent }: AgentCardProps) {
     return `₩${amount.toLocaleString()}`;
   };
 
+  // Merged app-wide ACTION_COLOR convention (matches ScannerResultsPage /
+  // AnalysisDetailPage): BUY/ADD is bullish -> pnlColor(1) (up/green),
+  // SELL/REDUCE is bearish -> pnlColor(-1) (down/red). This FLIPS the old
+  // Korean red-up convention that used to color BUY red here while
+  // TradeQueueWidget colored BUY green — the safety-relevant unification.
   const getActionColor = (action: string | undefined) => {
-    if (!action) return 'text-gray-400';
+    if (!action) return 'text-muted';
     switch (action.toUpperCase()) {
-      case 'BUY': return 'text-red-400';
-      case 'SELL': return 'text-blue-400';
-      case 'HOLD': return 'text-gray-400';
-      default: return 'text-gray-400';
+      case 'BUY':
+      case 'ADD':
+        return pnlColor(1);
+      case 'SELL':
+      case 'REDUCE':
+        return pnlColor(-1);
+      case 'WATCH':
+        return 'text-warn';
+      case 'AVOID':
+        return 'text-accent';
+      case 'HOLD':
+      default:
+        return 'text-muted';
     }
   };
 
   return (
     <div className={`p-3 rounded-lg border ${
-      agent.status === 'error' ? 'border-red-500/30 bg-red-500/5' :
-      agent.status === 'working' ? 'border-blue-500/30 bg-blue-500/5' :
-      'border-gray-700 bg-gray-800/50'
+      agent.status === 'error' ? 'border-down/30 bg-down/5' :
+      agent.status === 'working' ? 'border-accent/30 bg-accent/5' :
+      'border-hairline bg-elevated/50'
     }`}>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div className={`p-1.5 rounded ${
-            agent.status === 'working' ? 'bg-blue-500/20 text-blue-400' :
-            agent.status === 'error' ? 'bg-red-500/20 text-red-400' :
-            'bg-gray-700 text-gray-400'
+            agent.status === 'working' ? 'bg-accent/20 text-accent' :
+            agent.status === 'error' ? 'bg-down/20 text-down' :
+            'bg-elevated text-muted'
           }`}>
             {icon}
           </div>
           <div>
-            <div className="font-medium text-sm text-white">{agent.name}</div>
+            <div className="font-medium text-sm text-ink">{agent.name}</div>
             <div className={`flex items-center gap-1 text-xs ${statusConfig.color}`}>
               {statusConfig.icon}
               <span>{statusConfig.label}</span>
@@ -159,18 +174,18 @@ function AgentCard({ agentKey, agent }: AgentCardProps) {
           </div>
         </div>
         <div className="text-right text-xs">
-          <div className="text-gray-500">완료: {agent.tasks_completed}</div>
+          <div className="text-dim tabular-nums">완료: {agent.tasks_completed}</div>
           {agent.tasks_failed > 0 && (
-            <div className="text-red-400">실패: {agent.tasks_failed}</div>
+            <div className="text-down tabular-nums">실패: {agent.tasks_failed}</div>
           )}
         </div>
       </div>
 
       {/* Processing Stock */}
       {agent.processing_stock && (
-        <div className="mt-2 px-2 py-1 bg-yellow-500/10 border border-yellow-500/20 rounded text-xs">
-          <span className="text-yellow-400">처리중: </span>
-          <span className="text-white font-medium">
+        <div className="mt-2 px-2 py-1 bg-warn/10 border border-warn/20 rounded text-xs">
+          <span className="text-warn">처리중: </span>
+          <span className="text-ink font-medium">
             {agent.processing_stock_name || agent.processing_stock} ({agent.processing_stock})
           </span>
         </div>
@@ -178,17 +193,17 @@ function AgentCard({ agentKey, agent }: AgentCardProps) {
 
       {/* Current Task */}
       {agent.current_task && (
-        <div className="mt-2 p-2 bg-gray-900/50 rounded text-xs">
-          <div className="text-gray-400">현재 작업:</div>
-          <div className="text-white truncate">{agent.current_task}</div>
+        <div className="mt-2 p-2 bg-elevated/50 rounded text-xs">
+          <div className="text-muted">현재 작업:</div>
+          <div className="text-ink truncate">{agent.current_task}</div>
         </div>
       )}
 
       {/* Trade Details */}
       {agent.trade_details && (
-        <div className="mt-2 p-2 bg-gray-900/50 rounded text-xs space-y-1">
+        <div className="mt-2 p-2 bg-elevated/50 rounded text-xs space-y-1">
           <div className="flex items-center justify-between">
-            <span className="text-gray-400">거래 정보</span>
+            <span className="text-muted">거래 정보</span>
             <span className={`font-medium ${getActionColor(agent.trade_details.action)}`}>
               {agent.trade_details.action}
             </span>
@@ -196,49 +211,49 @@ function AgentCard({ agentKey, agent }: AgentCardProps) {
           <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[10px]">
             {agent.trade_details.quantity && (
               <>
-                <span className="text-gray-500">수량:</span>
-                <span className="text-white text-right">{agent.trade_details.quantity.toLocaleString()}주</span>
+                <span className="text-dim">수량:</span>
+                <span className="text-ink text-right tabular-nums">{agent.trade_details.quantity.toLocaleString()}주</span>
               </>
             )}
             {agent.trade_details.entry_price && (
               <>
-                <span className="text-gray-500">진입가:</span>
-                <span className="text-white text-right">{formatPrice(agent.trade_details.entry_price)}</span>
+                <span className="text-dim">진입가:</span>
+                <span className="text-ink text-right tabular-nums">{formatPrice(agent.trade_details.entry_price)}</span>
               </>
             )}
             {agent.trade_details.stop_loss && (
               <>
-                <span className="text-gray-500">손절가:</span>
-                <span className="text-red-400 text-right">{formatPrice(agent.trade_details.stop_loss)}</span>
+                <span className="text-dim">손절가:</span>
+                <span className="text-down text-right tabular-nums">{formatPrice(agent.trade_details.stop_loss)}</span>
               </>
             )}
             {agent.trade_details.take_profit && (
               <>
-                <span className="text-gray-500">익절가:</span>
-                <span className="text-green-400 text-right">{formatPrice(agent.trade_details.take_profit)}</span>
+                <span className="text-dim">익절가:</span>
+                <span className="text-up text-right tabular-nums">{formatPrice(agent.trade_details.take_profit)}</span>
               </>
             )}
             {(agent.trade_details.estimated_amount || agent.trade_details.total_amount) && (
               <>
-                <span className="text-gray-500">금액:</span>
-                <span className="text-white text-right">
+                <span className="text-dim">금액:</span>
+                <span className="text-ink text-right tabular-nums">
                   {formatAmount(agent.trade_details.total_amount || agent.trade_details.estimated_amount)}
                 </span>
               </>
             )}
             {agent.trade_details.position_pct !== undefined && (
               <>
-                <span className="text-gray-500">비중:</span>
-                <span className="text-white text-right">{agent.trade_details.position_pct.toFixed(1)}%</span>
+                <span className="text-dim">비중:</span>
+                <span className="text-ink text-right tabular-nums">{agent.trade_details.position_pct.toFixed(1)}%</span>
               </>
             )}
             {agent.trade_details.risk_score !== undefined && (
               <>
-                <span className="text-gray-500">위험도:</span>
-                <span className={`text-right ${
-                  agent.trade_details.risk_score >= 7 ? 'text-red-400' :
-                  agent.trade_details.risk_score >= 4 ? 'text-yellow-400' :
-                  'text-green-400'
+                <span className="text-dim">위험도:</span>
+                <span className={`text-right tabular-nums ${
+                  agent.trade_details.risk_score >= 7 ? 'text-down' :
+                  agent.trade_details.risk_score >= 4 ? 'text-warn' :
+                  'text-up'
                 }`}>{agent.trade_details.risk_score}/10</span>
               </>
             )}
@@ -250,25 +265,25 @@ function AgentCard({ agentKey, agent }: AgentCardProps) {
       {agent.last_result && (
         <div className={`mt-2 p-2 rounded text-xs ${
           agent.last_result.success
-            ? 'bg-green-500/10 border border-green-500/20'
-            : 'bg-red-500/10 border border-red-500/20'
+            ? 'bg-up/10 border border-up/20'
+            : 'bg-down/10 border border-down/20'
         }`}>
           <div className="flex items-center gap-1">
             {agent.last_result.success ? (
-              <CheckCircle className="w-3 h-3 text-green-400" />
+              <CheckCircle className="w-3 h-3 text-up" />
             ) : (
-              <AlertCircle className="w-3 h-3 text-red-400" />
+              <AlertCircle className="w-3 h-3 text-down" />
             )}
-            <span className={agent.last_result.success ? 'text-green-400' : 'text-red-400'}>
+            <span className={agent.last_result.success ? 'text-up' : 'text-down'}>
               {agent.last_result.success ? '성공' : '실패'}
             </span>
           </div>
-          <div className="text-gray-300 mt-1 truncate">{agent.last_result.message}</div>
+          <div className="text-muted mt-1 truncate">{agent.last_result.message}</div>
           {agent.last_result.order_id && (
-            <div className="text-gray-500 mt-0.5">주문번호: {agent.last_result.order_id}</div>
+            <div className="text-dim mt-0.5">주문번호: {agent.last_result.order_id}</div>
           )}
           {agent.last_result.filled_quantity && agent.last_result.avg_price && (
-            <div className="text-gray-400 mt-0.5">
+            <div className="text-muted mt-0.5 tabular-nums">
               체결: {agent.last_result.filled_quantity.toLocaleString()}주 @ {formatPrice(agent.last_result.avg_price)}
             </div>
           )}
@@ -277,14 +292,14 @@ function AgentCard({ agentKey, agent }: AgentCardProps) {
 
       {/* Last Action (when no detailed info) */}
       {agent.last_action && !agent.trade_details && !agent.last_result && (
-        <div className="mt-2 text-xs text-gray-500">
+        <div className="mt-2 text-xs text-dim">
           마지막: {agent.last_action} ({formatTime(agent.last_action_time)})
         </div>
       )}
 
       {/* Error Message */}
       {agent.error_message && (
-        <div className="mt-2 p-2 bg-red-500/10 border border-red-500/20 rounded text-xs text-red-400">
+        <div className="mt-2 p-2 bg-down/10 border border-down/20 rounded text-xs text-down">
           {agent.error_message}
         </div>
       )}
@@ -323,15 +338,15 @@ export default function AgentStatusWidget() {
   const hasActiveAgents = Object.values(agents).some(a => a.status === 'working');
 
   return (
-    <div className="bg-gray-900 rounded-xl border border-gray-800">
+    <div className="bg-card rounded border border-hairline">
       {/* Header */}
-      <div className="p-4 border-b border-gray-800">
+      <div className="p-4 border-b border-hairline">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Activity className={`w-5 h-5 ${hasActiveAgents ? 'text-blue-400' : 'text-gray-400'}`} />
-            <h2 className="text-lg font-semibold text-white">Agent Status</h2>
+            <Activity className={`w-5 h-5 ${hasActiveAgents ? 'text-accent' : 'text-muted'}`} />
+            <h2 className="text-lg font-semibold text-ink">Agent Status</h2>
             {hasActiveAgents && (
-              <span className="px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded-full">
+              <span className="px-2 py-0.5 text-xs bg-accent/20 text-accent rounded-full">
                 Active
               </span>
             )}
@@ -339,7 +354,7 @@ export default function AgentStatusWidget() {
           <button
             onClick={fetchAgentStates}
             disabled={loading}
-            className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg"
+            className="p-2 text-muted hover:text-ink hover:bg-elevated rounded-lg"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
@@ -349,12 +364,12 @@ export default function AgentStatusWidget() {
       {/* Content */}
       <div className="p-4">
         {error ? (
-          <div className="text-center text-red-400 py-4">
+          <div className="text-center text-down py-4">
             <AlertCircle className="w-6 h-6 mx-auto mb-2" />
             <p className="text-sm">{error}</p>
           </div>
         ) : loading && Object.keys(agents).length === 0 ? (
-          <div className="text-center text-gray-400 py-4">
+          <div className="text-center text-muted py-4">
             <RefreshCw className="w-6 h-6 mx-auto mb-2 animate-spin" />
             <p className="text-sm">Loading...</p>
           </div>

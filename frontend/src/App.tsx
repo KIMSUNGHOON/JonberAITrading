@@ -5,28 +5,41 @@
  */
 
 import { useEffect } from 'react';
+import { Routes, Route, Navigate } from 'react-router-dom';
 import { useStore, selectError } from '@/store';
-import { Header } from '@/components/layout/Header';
-import { Sidebar } from '@/components/layout/Sidebar';
-import { MainContent } from '@/components/layout/MainContent';
-import { ApprovalDialog } from '@/components/approval/ApprovalDialog';
+import { TerminalShell } from '@/components/terminal/TerminalShell';
+import { TerminalDashboard } from '@/components/terminal/TerminalDashboard';
 import { MobileNav } from '@/components/layout/MobileNav';
 import { SettingsModal } from '@/components/settings/SettingsModal';
 import { ChatToggleButton } from '@/components/chat/ChatToggleButton';
 import { ChatPopup } from '@/components/chat/ChatPopup';
 import { Toast } from '@/components/ui/Toast';
 import { TradeNotificationToast } from '@/components/ui/TradeNotificationToast';
-import { getUpbitApiStatus, getKiwoomApiStatus } from '@/api/client';
+import { getKiwoomApiStatus, getTradingMode } from '@/api/client';
+import { rehydrateKiwoomSessions } from '@/api/kiwoomSessionHandlers';
+import { SessionBridge } from '@/routes/SessionBridge';
+import { PositionsPage } from '@/pages/PositionsPage';
+import { TradesPage } from '@/pages/TradesPage';
+import { AnalysisPage } from '@/pages/AnalysisPage';
+import { WorkflowPage } from '@/pages/WorkflowPage';
+import { AnalysisDetailPage } from '@/pages/AnalysisDetailPage';
+import { ScannerResultsPage } from '@/pages/ScannerResultsPage';
+import { DiscoveryLedgerPanel } from '@/components/terminal/panels/DiscoveryLedgerPanel';
+import { TradingDashboard } from '@/components/trading';
+import { AgentChatDashboard } from '@/components/agent-chat';
 
 function App() {
-  const showApprovalDialog = useStore((state) => state.showApprovalDialog);
   const showSettingsModal = useStore((state) => state.showSettingsModal);
   const setShowSettingsModal = useStore((state) => state.setShowSettingsModal);
-  const setUpbitApiConfigured = useStore((state) => state.setUpbitApiConfigured);
   const setKiwoomApiConfigured = useStore((state) => state.setKiwoomApiConfigured);
-  const sidebarCollapsed = useStore((state) => state.sidebarCollapsed);
+  const setTradingModes = useStore((state) => state.setTradingModes);
   const error = useStore(selectError);
   const setError = useStore((state) => state.setError);
+  // P4 T3: brief informational note (e.g. "이미 보유 중" on a held-position
+  // re-analysis) — deliberately separate from `error`/setError above, which
+  // also flips the active session's status to 'error'.
+  const infoNotice = useStore((state) => state.infoNotice);
+  const setInfoNotice = useStore((state) => state.setInfoNotice);
 
   // Chat Popup state - select individual values to avoid re-renders
   const chatPopupOpen = useStore((state) => state.chatPopupOpen);
@@ -38,27 +51,13 @@ function App() {
   const setChatPopupPosition = useStore((state) => state.setChatPopupPosition);
 
   // Check if there's a notification (awaiting approval or new messages)
-  const awaitingApproval = useStore((state) => {
-    switch (state.activeMarket) {
-      case 'stock': return state.stock.awaitingApproval;
-      case 'coin': return state.coin.awaitingApproval;
-      case 'kiwoom': return state.kiwoom.awaitingApproval;
-    }
-  });
+  const awaitingApproval = useStore((state) => state.kiwoom.awaitingApproval);
   const hasMessages = useStore((state) => state.messages.length > 0);
   const hasNotification = !chatPopupOpen && (awaitingApproval || hasMessages);
 
   // Check API status on mount
   useEffect(() => {
     async function checkApiStatus() {
-      // Check Upbit API
-      try {
-        const upbitStatus = await getUpbitApiStatus();
-        setUpbitApiConfigured(upbitStatus.is_configured);
-      } catch (err) {
-        console.error('Failed to check Upbit API status:', err);
-      }
-
       // Check Kiwoom API
       try {
         const kiwoomStatus = await getKiwoomApiStatus();
@@ -66,16 +65,46 @@ function App() {
       } catch (err) {
         console.error('Failed to check Kiwoom API status:', err);
       }
+
+      // R3: fetch per-market trading modes (Autonomous | HITL). Silent on
+      // failure — modes stay null and the mode badges simply don't render.
+      try {
+        setTradingModes(await getTradingMode());
+      } catch {
+        // modes stay null
+      }
+
+      // Rehydrate running/awaiting sessions after a page refresh — silent on
+      // failure (the operations board surfaces its own error state).
+      try {
+        await rehydrateKiwoomSessions();
+      } catch {
+        // silent
+      }
     }
     checkApiStatus();
-  }, [setUpbitApiConfigured, setKiwoomApiConfigured]);
+  }, [setKiwoomApiConfigured, setTradingModes]);
 
   return (
-    <div className="h-screen bg-surface flex flex-col overflow-hidden">
-      {/* Header - Fixed height */}
-      <Header />
+    <div className="h-screen overflow-hidden">
+      {/* Dense Terminal Shell: command bar + nav rail + status line wrap all views */}
+      <Routes>
+        <Route element={<TerminalShell />}>
+          <Route index element={<TerminalDashboard />} />
+          <Route path="analysis" element={<AnalysisPage />} />
+          <Route path="analysis/:sessionId" element={<SessionBridge><AnalysisDetailPage /></SessionBridge>} />
+          <Route path="workflow/:sessionId" element={<SessionBridge><WorkflowPage /></SessionBridge>} />
+          <Route path="positions" element={<PositionsPage />} />
+          <Route path="scanner" element={<ScannerResultsPage />} />
+          <Route path="discovery" element={<DiscoveryLedgerPanel />} />
+          <Route path="agent-chat" element={<div className="p-3 md:p-4"><AgentChatDashboard /></div>} />
+          <Route path="trading" element={<TradingDashboard />} />
+          <Route path="trades" element={<TradesPage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
 
-      {/* Error Toast - Persistent with dismiss button */}
+      {/* Error Toast - Persistent with dismiss button (overlay) */}
       {error && (
         <Toast
           message={error}
@@ -85,38 +114,25 @@ function App() {
         />
       )}
 
-      {/* Trade Notification Toast - Real-time WebSocket notifications */}
+      {/* Info Toast - brief, auto-dismissing (P4 T3 held-position notice) */}
+      {infoNotice && (
+        <Toast
+          message={infoNotice}
+          type="info"
+          duration={4500}
+          onClose={() => setInfoNotice(null)}
+        />
+      )}
+
+      {/* Trade Notification Toast - Real-time WebSocket notifications (overlay) */}
       <TradeNotificationToast
         maxToasts={5}
         duration={5000}
         position="top-right"
       />
 
-      {/* Main Layout - Takes remaining height */}
-      <div className="flex-1 flex min-h-0">
-        {/* Sidebar - Hidden on mobile, collapsible */}
-        <aside
-          className={`hidden lg:flex lg:flex-col h-full border-r border-border bg-surface-dark flex-shrink-0 transition-all duration-300 overflow-hidden ${
-            sidebarCollapsed ? 'w-16' : 'w-60'
-          }`}
-        >
-          <Sidebar collapsed={sidebarCollapsed} />
-        </aside>
-
-        {/* Main Content Area */}
-        <main className="flex-1 flex flex-col lg:flex-row min-h-0 min-w-0 bg-surface">
-          {/* Dashboard Panel - Scrollable */}
-          <div className="flex-1 overflow-y-auto min-h-0 bg-surface">
-            <MainContent />
-          </div>
-        </main>
-      </div>
-
       {/* Mobile Navigation */}
       <MobileNav />
-
-      {/* Approval Dialog */}
-      {showApprovalDialog && <ApprovalDialog />}
 
       {/* Settings Modal */}
       <SettingsModal

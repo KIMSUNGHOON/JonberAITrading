@@ -72,8 +72,8 @@ class KiwoomCache:
         "daily_chart": 3600.0,  # 일봉 차트: 1시간
         "cash_balance": 30.0,   # 예수금: 30초
         "account_balance": 30.0, # 계좌 잔고: 30초
-        "pending_orders": 5.0,  # 미체결: 5초
-        "filled_orders": 5.0,   # 체결 내역: 5초
+        "pending_orders": 10.0,  # 미체결: 10초 (FE Ops 폴 10s와 정합 — 감시튜닝)
+        "filled_orders": 10.0,   # 체결 내역: 10초 (FE Ops 폴 10s와 정합 — 감시튜닝)
         "stock_list": 86400.0,  # 종목 리스트: 24시간
     }
 

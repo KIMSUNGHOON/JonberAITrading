@@ -12,6 +12,12 @@ const localStorageMock = {
 };
 Object.defineProperty(window, 'localStorage', { value: localStorageMock });
 
+// jsdom does not implement scrollIntoView; stub it so components that
+// auto-scroll a ref (e.g. ReasoningWire) don't throw during render.
+if (!window.HTMLElement.prototype.scrollIntoView) {
+  window.HTMLElement.prototype.scrollIntoView = vi.fn();
+}
+
 // Reset all mocks before each test
 beforeEach(() => {
   vi.clearAllMocks();

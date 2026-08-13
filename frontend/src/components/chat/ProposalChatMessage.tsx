@@ -20,8 +20,8 @@ import {
 import { format } from 'date-fns';
 import ReactMarkdown from 'react-markdown';
 import { useStore } from '@/store';
-import { cancelSession, cancelCoinSession, cancelKRStockSession, translateText } from '@/api/client';
-import type { TradeProposal, CoinTradeProposal, KRStockTradeProposal } from '@/types';
+import { cancelKRStockSession, translateText } from '@/api/client';
+import type { AnyTradeProposal, KRStockTradeProposal } from '@/types';
 
 type Language = 'original' | 'en' | 'ko';
 
@@ -31,8 +31,6 @@ interface TranslatedContent {
   bear_case?: string;
 }
 
-type AnyTradeProposal = TradeProposal | CoinTradeProposal | KRStockTradeProposal;
-
 interface ProposalChatMessageProps {
   proposal: AnyTradeProposal;
   timestamp: Date;
@@ -40,41 +38,18 @@ interface ProposalChatMessageProps {
 
 // Helper to get display name
 function getProposalDisplayName(proposal: AnyTradeProposal): string {
-  if ('ticker' in proposal) return proposal.ticker;
-  if ('market' in proposal) {
-    const coinProposal = proposal as CoinTradeProposal;
-    return coinProposal.korean_name || proposal.market.replace('KRW-', '');
-  }
-  if ('stk_cd' in proposal) {
-    const stockProposal = proposal as KRStockTradeProposal;
-    return stockProposal.stk_nm || proposal.stk_cd;
-  }
-  return 'UNKNOWN';
-}
-
-// Helper to check proposal type
-function isCoinProposal(proposal: AnyTradeProposal): proposal is CoinTradeProposal {
-  return 'market' in proposal;
-}
-
-function isKiwoomProposal(proposal: AnyTradeProposal): proposal is KRStockTradeProposal {
-  return 'stk_cd' in proposal;
+  return proposal.stk_nm || proposal.stk_cd;
 }
 
 // Helper to format currency
-function formatCurrency(value: number | null, isCoin: boolean, isKiwoom: boolean): string {
+function formatCurrency(value: number | null): string {
   if (value === null) return 'N/A';
-  if (isCoin || isKiwoom) {
-    return `₩${value.toLocaleString('ko-KR')}`;
-  }
-  return `$${value.toFixed(2)}`;
+  return `₩${value.toLocaleString('ko-KR')}`;
 }
 
 // Helper to format quantity
-function formatQuantity(quantity: number, isCoin: boolean, isKiwoom: boolean): string {
-  if (isCoin) return `₩${quantity.toLocaleString('ko-KR')}`;
-  if (isKiwoom) return `${quantity.toLocaleString('ko-KR')}주`;
-  return `${quantity} shares`;
+function formatQuantity(quantity: number): string {
+  return `${quantity.toLocaleString('ko-KR')}주`;
 }
 
 export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessageProps) {
@@ -87,7 +62,7 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
     en: {},
     ko: {},
   });
-  const setShowApprovalDialog = useStore((state) => state.setShowApprovalDialog);
+  const setAwaitingApproval = useStore((state) => state.setAwaitingApproval);
 
   // Detect original language (heuristic: check if rationale contains Korean characters)
   const hasKorean = /[\u3131-\u314e|\u314f-\u3163|\uac00-\ud7a3]/g.test(proposal.rationale || '');
@@ -143,33 +118,21 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
     return translations[language][field] || proposal[field] || '';
   };
 
-  // Get cancel actions for different market types
-  const setStockProposal = useStore((state) => state.setStockProposal);
-  const setCoinProposal = useStore((state) => state.setCoinProposal);
+  // Get cancel actions
   const setKiwoomProposal = useStore((state) => state.setKiwoomProposal);
-  const stockSessionId = useStore((state) => state.stock.activeSessionId);
-  const coinSessionId = useStore((state) => state.coin.activeSessionId);
   const kiwoomSessionId = useStore((state) => state.kiwoom.activeSessionId);
   const setActiveMarket = useStore((state) => state.setActiveMarket);
 
   const isBuy = proposal.action === 'BUY';
-  const isCoin = isCoinProposal(proposal);
-  const isKiwoom = isKiwoomProposal(proposal);
   const displayName = getProposalDisplayName(proposal);
 
   // Handle cancel/reject
   const handleCancel = async () => {
     setIsCancelling(true);
     try {
-      if (isKiwoom && kiwoomSessionId) {
+      if (kiwoomSessionId) {
         await cancelKRStockSession(kiwoomSessionId);
         setKiwoomProposal(null);
-      } else if (isCoin && coinSessionId) {
-        await cancelCoinSession(coinSessionId);
-        setCoinProposal(null);
-      } else if (stockSessionId) {
-        await cancelSession(stockSessionId);
-        setStockProposal(null);
       }
     } catch (error) {
       console.error('Failed to cancel analysis:', error);
@@ -224,24 +187,24 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div>
                 <span className="text-gray-500 block text-xs">Quantity</span>
-                <span className="font-medium">{formatQuantity(proposal.quantity, isCoin, isKiwoom)}</span>
+                <span className="font-medium">{formatQuantity(proposal.quantity)}</span>
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Entry Price</span>
                 <span className="font-medium">
-                  {formatCurrency(proposal.entry_price, isCoin, isKiwoom)}
+                  {formatCurrency(proposal.entry_price)}
                 </span>
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Stop Loss</span>
                 <span className="font-medium text-red-400">
-                  {formatCurrency(proposal.stop_loss, isCoin, isKiwoom)}
+                  {formatCurrency(proposal.stop_loss)}
                 </span>
               </div>
               <div>
                 <span className="text-gray-500 block text-xs">Take Profit</span>
                 <span className="font-medium text-green-400">
-                  {formatCurrency(proposal.take_profit, isCoin, isKiwoom)}
+                  {formatCurrency(proposal.take_profit)}
                 </span>
               </div>
             </div>
@@ -341,17 +304,9 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
             <button
               onClick={() => {
                 // Set correct active market and proposal, then open dialog for re-analysis
-                if (isKiwoom) {
-                  setActiveMarket('kiwoom');
-                  setKiwoomProposal(proposal as KRStockTradeProposal);
-                } else if (isCoin) {
-                  setActiveMarket('coin');
-                  setCoinProposal(proposal as CoinTradeProposal);
-                } else {
-                  setActiveMarket('stock');
-                  setStockProposal(proposal as TradeProposal);
-                }
-                setShowApprovalDialog(true);
+                setActiveMarket('kiwoom');
+                setKiwoomProposal(proposal as KRStockTradeProposal);
+                setAwaitingApproval(true);
               }}
               className="flex items-center gap-1 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-300 hover:bg-surface rounded transition-colors"
             >
@@ -362,22 +317,14 @@ export function ProposalChatMessage({ proposal, timestamp }: ProposalChatMessage
               <button
                 onClick={() => {
                   // Set the correct active market and ensure proposal is in store
-                  if (isKiwoom) {
-                    setActiveMarket('kiwoom');
-                    setKiwoomProposal(proposal as KRStockTradeProposal);
-                  } else if (isCoin) {
-                    setActiveMarket('coin');
-                    setCoinProposal(proposal as CoinTradeProposal);
-                  } else {
-                    setActiveMarket('stock');
-                    setStockProposal(proposal as TradeProposal);
-                  }
-                  setShowApprovalDialog(true);
+                  setActiveMarket('kiwoom');
+                  setKiwoomProposal(proposal as KRStockTradeProposal);
+                  setAwaitingApproval(true);
                 }}
                 className="flex items-center gap-1 px-4 py-1.5 text-xs font-medium bg-green-600 hover:bg-green-500 text-white rounded transition-colors"
               >
                 <Check className="w-3 h-3" />
-                Approve
+                Review
               </button>
               <button
                 onClick={handleCancel}

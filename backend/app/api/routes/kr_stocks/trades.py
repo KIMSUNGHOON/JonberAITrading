@@ -42,16 +42,12 @@ async def get_trades(
     storage = await get_storage_service()
     offset = (page - 1) * limit
 
-    try:
-        trades_data = await storage.get_kr_stock_trades(
-            stk_cd=stk_cd,
-            limit=limit,
-            offset=offset,
-        )
-        total = await storage.get_kr_stock_trades_count(stk_cd=stk_cd)
-    except AttributeError:
-        trades_data = []
-        total = 0
+    trades_data = await storage.get_kr_stock_trades(
+        stk_cd=stk_cd,
+        limit=limit,
+        offset=offset,
+    )
+    total = await storage.get_kr_stock_trades_count(stk_cd=stk_cd)
 
     trades = [
         KRStockTradeRecord(
@@ -96,10 +92,7 @@ async def get_trade(trade_id: str):
 
     storage = await get_storage_service()
 
-    try:
-        trade = await storage.get_kr_stock_trade(trade_id)
-    except AttributeError:
-        trade = None
+    trade = await storage.get_kr_stock_trade(trade_id)
 
     if not trade:
         raise HTTPException(

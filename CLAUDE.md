@@ -28,7 +28,11 @@ The system provides autonomous market analysis with human-in-the-loop (HITL) app
 
 - **Real-time Updates**: WebSocket connections stream reasoning logs and position updates
 
-- **Data Fallback**: Always use yfinance with graceful fallback to mock data in `data/mock/`
+- **Markets**: KR stocks (Kiwoom) only — the US/yfinance stack was removed (R2, 2026-07-11) and the Upbit crypto stack was removed (2026-08-01)
+  - ⚠️ `KIWOOM_IS_MOCK=true`는 **주문만** 모의다. 시세는 실물이다 — 2026-08-07에
+    이것을 "합성 시장"으로 오판해 변동성 방어가 꺼진 채 배포된 적이 있다.
+    데이터 진위가 의심되면 `yfinance`(설치돼 있음)로 `005930.KS`·`^KS11`을
+    대조하라. 비용 0이다.
 
 ## Development Commands
 
@@ -43,14 +47,16 @@ conda activate agentic-trading
 ```bash
 conda activate agentic-trading
 cd backend
-uvicorn app.main:app --reload --port 8000
+python run_dev.py --reload   # 8000부터 빈 포트 자동 선택 (타 앱이 8000 점유 시 8001+로 비켜 뜸)
+# 고정 포트가 필요하면: uvicorn app.main:app --reload --port 8001
 ```
 
 ### Frontend
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev   # dev 프록시가 백엔드 포트(8000~8005)를 자동 탐지해 연결
+# 수동 지정: BACKEND_ORIGIN=http://127.0.0.1:8001 npm run dev (또는 frontend/.env.local)
 ```
 
 ### LLM Server
@@ -99,11 +105,14 @@ cd backend && pytest -v
 | `LLM_PROVIDER` | Provider type | `ollama` (Win/macOS) or `vllm` (Linux) |
 | `LLM_BASE_URL` | OpenAI-compatible endpoint | `http://localhost:11434/v1` |
 | `LLM_MODEL` | Model name | `deepseek-r1:14b` |
-| `MARKET_DATA_MODE` | Data source | `live` or `mock` |
 | `REDIS_URL` | Redis connection | `redis://localhost:6379` |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot Token | (required for notifications) |
 | `TELEGRAM_CHAT_ID` | Telegram Chat ID | (required for notifications) |
 | `TELEGRAM_ENABLED` | Enable Telegram | `false` |
+| `AUTONOMY_ENABLED` | 자율 매매 마스터 게이트 (R3) — off면 모든 자율 실행 거부 | `false` |
+| `REGIME_EXPOSURE_ENABLED` | 레짐 인지 노출도 제어 — off면 게이트 검사 8과 슬롯 상향, 토론 프롬프트 주입을 모두 건너뜀 | `false` |
+| `KIWOOM_IS_MOCK` | **주문 실행만** 모의투자 서버로 보낸다 — 시세·지수·재무는 **실제 시장**이다 | `true` |
+| `FINNHUB_API_KEY` | 미국 매크로 (레짐 판정 LLM 입력) | (없으면 매크로 수집 스킵) |
 
 ## Project Structure
 

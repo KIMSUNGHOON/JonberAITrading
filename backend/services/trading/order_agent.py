@@ -23,6 +23,12 @@ from .market_hours import (
     is_valid_tick_price,
     get_krx_tick_size,
 )
+from services.execution import (
+    KiwoomExecutionAdapter,
+    ExecutionSide,
+    ExecutionOrderType,
+)
+from .fill_confirm import confirm_kiwoom_fill
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +193,8 @@ class OrderAgent:
         self,
         kiwoom_client=None,
         rate_limiter: Optional[KiwoomRateLimiter] = None,
+        fill_confirm_attempts: int = 3,
+        fill_confirm_interval: float = 0.5,
     ):
         """
         Initialize Order Agent.
@@ -194,9 +202,14 @@ class OrderAgent:
         Args:
             kiwoom_client: Kiwoom API client
             rate_limiter: Rate limiter instance
+            fill_confirm_attempts: how many times to poll ka10076 for the fill
+                before reporting the confirmed (possibly partial/zero) quantity
+            fill_confirm_interval: seconds between fill-confirmation polls
         """
         self.kiwoom = kiwoom_client
         self.limiter = rate_limiter or KiwoomRateLimiter()
+        self._fill_confirm_attempts = max(1, fill_confirm_attempts)
+        self._fill_confirm_interval = fill_confirm_interval
 
         # Order tracking
         self._pending_orders: dict = {}
@@ -218,7 +231,7 @@ class OrderAgent:
             OrderResult with execution details
         """
         logger.info(
-            f"[OrderAgent] Executing order: {order.side.value} "
+            f"[OrderAgent] Executing order: {order.side} "
             f"{order.quantity} {order.ticker} @ {order.price or 'market'}"
         )
 
@@ -337,11 +350,11 @@ class OrderAgent:
         order_id: str,
         order: OrderRequest,
     ) -> OrderResult:
-        """Execute order via Kiwoom API."""
-        # Map to Kiwoom order type
-        order_type_code = "00" if order.order_type == OrderType.LIMIT else "03"
-        side_code = "01" if order.side == OrderSide.BUY else "02"
+        """Execute order via the Kiwoom client (place_buy_order / place_sell_order).
 
+        Dispatches by side and passes the Kiwoom OrderType enum; the client returns
+        an OrderResponse (is_success == return_code == 0), not a raw dict.
+        """
         # Apply tick size rounding for limit orders
         price_to_use = 0
         if order.price and order.order_type == OrderType.LIMIT:
@@ -356,26 +369,54 @@ class OrderAgent:
                     f"(tick size: {get_krx_tick_size(order.price)})"
                 )
 
+        exec_order_type = (
+            ExecutionOrderType.LIMIT
+            if order.order_type == OrderType.LIMIT
+            else ExecutionOrderType.MARKET
+        )
+        exec_side = (
+            ExecutionSide.BUY if order.side == OrderSide.BUY else ExecutionSide.SELL
+        )
+
         try:
-            response = await self.kiwoom.place_order(
-                order_type=side_code,
-                stock_code=order.ticker,
-                quantity=order.quantity,
+            # Route through the single broker-agnostic execution path. The adapter
+            # sends the tick-rounded price for LIMIT and no price for MARKET.
+            result = await KiwoomExecutionAdapter(self.kiwoom).place(
+                ticker=order.ticker,
+                side=exec_side,
+                qty=order.quantity,
                 price=price_to_use,
-                price_type=order_type_code,
+                order_type=exec_order_type,
             )
 
-            # Parse response
-            if response.get("rt_cd") == "0":
+            if result.success:
+                # An accepted order is NOT a filled order — confirm the ACTUAL
+                # fill via ka10076 (체결내역) instead of assuming full fill at the
+                # limit price (audit A3). A limit order may fill partially or not
+                # at all; reporting an assumed full fill made the coordinator
+                # track phantom positions and drop unsold ones.
+                broker_ord_no = result.order_id or order_id
+                filled_qty, avg_price = await self._confirm_kiwoom_fill(
+                    ticker=order.ticker,
+                    order_no=broker_ord_no,
+                    requested_qty=order.quantity,
+                    fallback_price=order.price or 0,
+                )
+                if filled_qty >= order.quantity:
+                    status = "filled"
+                elif filled_qty > 0:
+                    status = "partial"
+                else:
+                    status = "pending"
                 return OrderResult(
-                    order_id=response.get("order_no", order_id),
+                    order_id=broker_ord_no,
                     ticker=order.ticker,
                     side=order.side,
                     requested_quantity=order.quantity,
-                    filled_quantity=order.quantity,  # Assume filled
-                    avg_price=order.price or 0,
-                    status="filled",
-                    filled_at=datetime.now(),
+                    filled_quantity=filled_qty,
+                    avg_price=avg_price,
+                    status=status,
+                    filled_at=datetime.now() if filled_qty > 0 else None,
                 )
             else:
                 return OrderResult(
@@ -385,11 +426,34 @@ class OrderAgent:
                     requested_quantity=order.quantity,
                     filled_quantity=0,
                     status="rejected",
-                    message=response.get("msg1", "Unknown error"),
+                    message=result.message or "Unknown error",
                 )
 
         except Exception as e:
             raise OrderExecutionError(f"Kiwoom API error: {e}")
+
+    async def _confirm_kiwoom_fill(
+        self,
+        ticker: str,
+        order_no: str,
+        requested_qty: int,
+        fallback_price: float,
+    ) -> tuple[int, float]:
+        """Confirm the actual fill of an accepted Kiwoom order via ka10076.
+
+        Thin delegation to the shared `fill_confirm.confirm_kiwoom_fill` helper
+        (also used by the LangGraph execution node), passing this agent's
+        configured attempts/interval.
+        """
+        return await confirm_kiwoom_fill(
+            self.kiwoom,
+            ticker=ticker,
+            order_no=order_no,
+            requested_qty=requested_qty,
+            fallback_price=fallback_price,
+            attempts=self._fill_confirm_attempts,
+            interval=self._fill_confirm_interval,
+        )
 
     async def _simulate_order(
         self,
@@ -429,7 +493,20 @@ class OrderAgent:
         original_order: OrderRequest,
         results: List[OrderResult],
     ) -> OrderResult:
-        """Aggregate multiple split order results."""
+        """Aggregate multiple split order results.
+
+        F3 CRITICAL fix: 0 total fill is NOT "rejected" when at least one part
+        was ACCEPTED by the broker — an accepted-but-unfilled split is
+        "pending", exactly like a single order, so the coordinator registers
+        the remainder with the fill tracker. (The motivating incident was a
+        3-way split BUY, 0-fill at placement, fully filled hours later —
+        mapping it to "rejected" made it invisible to every defense engine.)
+        "rejected" only when EVERY part failed placement.
+
+        The per-part results (each with its own broker ord_no) are exposed via
+        `parts` — ka10076 fill tracking matches by ord_no, so consumers must
+        track each broker order individually, not the aggregate.
+        """
         total_filled = sum(r.filled_quantity for r in results)
         total_value = sum(r.filled_quantity * r.avg_price for r in results)
         avg_price = total_value / total_filled if total_filled > 0 else 0
@@ -439,6 +516,8 @@ class OrderAgent:
             status = "filled"
         elif total_filled > 0:
             status = "partial"
+        elif any(r.status != "rejected" for r in results):
+            status = "pending"
         else:
             status = "rejected"
 
@@ -452,6 +531,7 @@ class OrderAgent:
             status=status,
             filled_at=datetime.now() if total_filled > 0 else None,
             message=f"Split order: {len(results)} parts",
+            parts=list(results) if results else None,
         )
 
     async def cancel_order(self, order_id: str) -> bool:
@@ -465,10 +545,17 @@ class OrderAgent:
             logger.warning(f"[OrderAgent] Order {order_id} not found in pending")
             return False
 
+        order = self._pending_orders[order_id]
         if self.kiwoom:
             try:
                 await self.limiter.wait_for_slot()
-                await self.kiwoom.cancel_order(order_id)
+                # kt10003 계약: 원주문번호 + 종목코드 필수 (qty 생략=잔량 전부 취소).
+                # 주의: order_id는 내부 UUID라 브로커 주문번호와 다름 — 이 경로는
+                # 현재 호출자가 없으며, 브로커 취소가 필요해지면 실행 시점의
+                # 브로커 ord_no 추적이 선행돼야 한다.
+                await self.kiwoom.cancel_order(
+                    org_ord_no=order_id, stk_cd=order.ticker
+                )
             except Exception as e:
                 logger.error(f"[OrderAgent] Cancel failed: {e}")
                 return False

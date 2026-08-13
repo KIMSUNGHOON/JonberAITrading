@@ -2,7 +2,8 @@
 Korean Stock (Kiwoom) Analysis API Schemas
 
 Pydantic models for Kiwoom REST API request/response validation.
-Follows the same patterns as coin.py for consistency.
+Followed the same patterns as coin.py (removed 2026-08-01 Upbit 제거) for
+consistency.
 """
 
 from datetime import datetime
@@ -53,6 +54,28 @@ class KRStockTickerResponse(BaseModel):
     eps: Optional[int] = Field(default=None, description="EPS (Earnings Per Share)")
     bps: Optional[int] = Field(default=None, description="BPS (Book-value Per Share)")
     timestamp: datetime = Field(description="Data timestamp")
+
+
+class KRStockTickerBatchRequest(BaseModel):
+    """Batch ticker request for multiple Korean stock codes (P1-7)."""
+
+    codes: list[str] = Field(description="Stock codes (6-digit each), max 50 per request")
+
+
+class KRStockTickerBatchResponse(BaseModel):
+    """
+    Batch ticker snapshots keyed by stock code (P1-7).
+
+    A code that could not be fetched (unknown code, transient API/rate-limit
+    error) maps to `None` rather than being fabricated — callers must treat
+    a null entry as "keep the last known price", same contract as the
+    per-symbol endpoint's failure mode.
+    """
+
+    tickers: dict[str, Optional[KRStockTickerResponse]] = Field(
+        description="Stock code -> ticker snapshot, or null on per-code failure"
+    )
+    total: int = Field(description="Count of codes successfully fetched (non-null)")
 
 
 class KRStockCandleData(BaseModel):
@@ -128,6 +151,25 @@ class KRStockAnalysisResponse(BaseModel):
     stk_nm: Optional[str] = Field(default=None, description="Stock name")
     status: str = Field(description="Current status")
     message: str = Field(description="Status message")
+    duplicate: bool = Field(
+        default=False,
+        description=(
+            "True when this response reuses an already in-progress "
+            "(running/awaiting_approval) session for the same stk_cd "
+            "instead of starting a new analysis (P4 dedup)."
+        ),
+    )
+    position_exists: bool = Field(
+        default=False,
+        description=(
+            "True when stk_cd is already held in the broker account balance "
+            "(kt00004, the same source /positions and Operations '보유' read) "
+            "at the time this analysis started — lets the FE label this run "
+            "'이미 보유 중 · 관리 분석' instead of a fresh-entry analysis (P4). "
+            "Best-effort: a broker-fetch failure degrades this to False rather "
+            "than failing the analysis-start request."
+        ),
+    )
 
 
 class KRStockAnalysisSummary(BaseModel):
@@ -146,7 +188,11 @@ class KRStockTradeProposalResponse(BaseModel):
     id: str = Field(description="Proposal ID")
     stk_cd: str = Field(description="Stock code")
     stk_nm: Optional[str] = Field(default=None, description="Stock name")
-    action: Literal["BUY", "SELL", "HOLD"] = Field(description="Recommended action")
+    # All 7 KR TradeActions (agents.graph.kr_stock_state.TradeAction) — the
+    # graph proposes WATCH/AVOID/ADD/REDUCE too, not just order-shaped actions.
+    action: Literal["BUY", "SELL", "HOLD", "ADD", "REDUCE", "WATCH", "AVOID"] = Field(
+        description="Recommended action"
+    )
     quantity: int = Field(description="Recommended quantity (shares)")
     entry_price: Optional[int] = Field(default=None, description="Entry price (KRW)")
     stop_loss: Optional[int] = Field(default=None, description="Stop-loss price (KRW)")
@@ -170,6 +216,13 @@ class KRStockAnalysisStatusResponse(BaseModel):
     )
     current_stage: Optional[str] = Field(default=None, description="Current analysis stage")
     awaiting_approval: bool = Field(default=False, description="Whether awaiting HITL approval")
+    position_exists: bool = Field(
+        default=False,
+        description=(
+            "True when stk_cd was already held in the broker account balance "
+            "at analysis-start time (P4). See KRStockAnalysisResponse.position_exists."
+        ),
+    )
     trade_proposal: Optional[KRStockTradeProposalResponse] = Field(
         default=None, description="Trade proposal if available"
     )

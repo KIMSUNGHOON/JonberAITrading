@@ -12,6 +12,7 @@ Features:
 """
 
 import asyncio
+import json
 import aiosqlite
 from datetime import datetime, timedelta
 from enum import Enum
@@ -21,6 +22,13 @@ from typing import Optional, List, Callable, Awaitable
 from pydantic import BaseModel, Field
 
 import structlog
+
+from services.discovery.factors import (
+    FlowRank,
+    StockSnapshot,
+    compute_strategy_scores,
+    passes_quality_filter,
+)
 
 logger = structlog.get_logger()
 
@@ -104,6 +112,15 @@ class BackgroundScanner:
     MAX_CONCURRENT_SCANS = 8  # Optimized for RTX 3090 24GB
     DEFAULT_CONCURRENT_SCANS = 3
 
+    # Watch-list auto-promotion defaults. Auto-promote is OFF by default —
+    # the scan pipeline previously dead-ended (results reached nowhere), but
+    # turning promotion on unconditionally would silently start feeding the
+    # autonomous watch monitor/queue-conversion path, so it stays an explicit
+    # opt-in (mirrors the AUTONOMY_ENABLED fail-closed default elsewhere).
+    DEFAULT_AUTO_PROMOTE_ENABLED = False
+    DEFAULT_PROMOTE_CONFIDENCE_THRESHOLD = 0.7
+    DEFAULT_PROMOTE_MAX_COUNT = 10
+
     def __init__(self):
         self._progress = ScanProgress()
         self._current_concurrency = self.DEFAULT_CONCURRENT_SCANS
@@ -116,6 +133,53 @@ class BackgroundScanner:
         self._db_initialized = False
         self._use_llm = False  # Whether to use LLM for analysis
         self._gpu_monitor = None
+
+        # FI-1: the notify_progress preference THIS scan was started with,
+        # stashed off the start_scan() local so stop_scan() -- called much
+        # later, often by a completely different caller (the coordinator's
+        # timeout watchdog) that has no notify_progress argument of its own
+        # -- can gate its own partial-completion Telegram notification on
+        # it, same as every other notification point in this class already
+        # does. Default True mirrors start_scan's own default; only ever
+        # meaningfully read after start_scan has run (stop_scan's real work
+        # is itself gated on self._running, which start_scan sets).
+        self._notify_progress = True
+
+        # Watch-list auto-promotion config (see start_scan args).
+        self._auto_promote_enabled = self.DEFAULT_AUTO_PROMOTE_ENABLED
+        self._promote_confidence_threshold = self.DEFAULT_PROMOTE_CONFIDENCE_THRESHOLD
+        self._promote_max_count = self.DEFAULT_PROMOTE_MAX_COUNT
+
+        # Scan mode (DS-2): "quick"/"llm" legacy behavior is unchanged and
+        # keyed off `_use_llm` as before; "discovery" is a new collection
+        # mode consumed by _scan_all_stocks' branch below. Defaults to
+        # "quick" so any code that constructs BackgroundScanner() directly
+        # (e.g. existing promotion tests) without going through start_scan
+        # never accidentally trips the discovery-only promotion guard.
+        self._mode = "quick"
+        # True only when the most recent _load_stock_list() call fell back
+        # to _get_fallback_stock_list() (get_all_stocks failure) — recorded
+        # into scan_sessions.universe_fallback (DS-2).
+        self._universe_fallback_used = False
+        # T2: comma-joined market names (e.g. "KOSDAQ") that failed to load
+        # on the most recent _load_stock_list() call while at least one
+        # OTHER market succeeded — a real, partial universe that is still
+        # promotion-eligible (unlike _universe_fallback_used's 15-name
+        # hardcoded list). Recorded into scan_sessions.universe_partial.
+        # Empty string means "no partial universe this run".
+        self._universe_partial_markets = ""
+
+        # SC-1: the scan_sessions.id of the currently in-flight scan (set by
+        # start_scan, read by stop_scan so it can record a 'partial'
+        # completion row for the session actually running — start_scan only
+        # ever kept `session_id` as a local variable before this, so
+        # stop_scan had no way to identify which row to update).
+        self._current_session_id: Optional[str] = None
+
+        # A1: 발굴 스캔 1회 동안 고정되는 유동성 임계값(원, ADTV 중앙값의
+        # 최소 요구치). _scan_all_stocks_discovery 진입 시 1회만 산출된다 —
+        # 종목마다 계좌를 조회하면 2,650회 API 호출이 되어버린다.
+        self._discovery_min_adtv: Optional[float] = None
 
     async def _init_db(self):
         """Initialize SQLite database for storing scan results."""
@@ -205,14 +269,66 @@ class BackgroundScanner:
                 ON scan_sessions(status)
             """)
 
+            # Discovery 수집 모드 스키마 확장 (DS-2): 이 DB 파일은 scanner.py
+            # 자체 소유(storage.db와 분리)라 storage_service._ensure_columns와
+            # 동일한 PRAGMA table_info 확인 후 ALTER 관례를 이 파일 안에서
+            # 그대로 반복한다 — 전부 nullable, 기존 행은 NULL로 남는다.
+            await self._ensure_columns(db, "scan_results", {"factor_json": "TEXT"})
+            await self._ensure_columns(
+                db,
+                "scan_sessions",
+                {
+                    "universe_fallback": "INTEGER",
+                    "scan_mode": "TEXT",
+                    # T2: comma-joined market names that were missing from an
+                    # otherwise-usable partial universe (NULL/'' when the
+                    # session's universe was complete or a full fallback).
+                    "universe_partial": "TEXT",
+                },
+            )
+
             await db.commit()
 
         self._db_initialized = True
         logger.info("scanner_db_initialized", path=str(DB_PATH))
 
+    @staticmethod
+    async def _ensure_columns(
+        conn: "aiosqlite.Connection", table: str, cols: dict[str, str]
+    ) -> None:
+        """Add any of `cols` missing from `table` via ALTER TABLE ADD COLUMN.
+
+        Ported from services/storage_service.py's `_ensure_columns` (same
+        no-migration-mechanism situation — CREATE TABLE IF NOT EXISTS is a
+        no-op against a table that already exists on disk, so a column added
+        after the DB file was first created needs an explicit ALTER path).
+        Every column added this way must be nullable.
+        """
+        cursor = await conn.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cursor.fetchall()}
+        for name, col_type in cols.items():
+            if name not in existing:
+                await conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {col_type}"
+                )
+
     async def _load_stock_list(self) -> List[tuple]:
         """
         Load full KOSPI/KOSDAQ stock list from Kiwoom API.
+
+        T2 (발굴 유니버스 rate-limit 회복): `get_all_stocks` now returns
+        (stocks, missing_markets) — one market failing (e.g. KOSDAQ still
+        rate-limited after retries) no longer discards the market(s) that
+        DID succeed. Three outcomes:
+          - both markets fail (stocks empty) -> hardcoded 15-name fallback,
+            `_universe_fallback_used = True` (promotion-suppressed, same as
+            pre-T2 behavior).
+          - one market missing but the other succeeded -> the real partial
+            universe is used as-is, `_universe_fallback_used` stays False,
+            and `_universe_partial_markets` records which market(s) were
+            missing (promotion IS allowed — a partial real universe is not
+            the same as the hardcoded fallback).
+          - both markets succeed -> full universe, neither flag set.
 
         Returns:
             List of (stock_code, stock_name, market_type) tuples
@@ -221,28 +337,48 @@ class BackgroundScanner:
 
         try:
             client = await get_shared_kiwoom_client_async()
-            all_stocks = await client.get_all_stocks(
+            all_stocks, missing_markets = await client.get_all_stocks(
                 include_kospi=True,
                 include_kosdaq=True,
                 exclude_warnings=True,
+                exclude_etf_etn=True,  # DQ-1: ETN/스팩 유니버스 혼입 제외
             )
-
-            stock_list = [
-                (stock.code, stock.name, stock.market_name)
-                for stock in all_stocks
-            ]
-
-            logger.info(
-                "stock_list_loaded",
-                total=len(stock_list),
-            )
-
-            return stock_list
-
         except Exception as e:
             logger.error("stock_list_load_failed", error=str(e))
             # Fallback to hardcoded list if API fails
+            self._universe_fallback_used = True
             return self._get_fallback_stock_list()
+
+        if not all_stocks:
+            # Both markets failed -- nothing real to work with.
+            logger.error(
+                "stock_list_load_failed",
+                error="all_markets_failed",
+                missing=missing_markets,
+            )
+            self._universe_fallback_used = True
+            return self._get_fallback_stock_list()
+
+        if missing_markets:
+            # Partial but real universe -- promotion stays allowed.
+            self._universe_partial_markets = ",".join(missing_markets)
+            logger.warning(
+                "universe_partial",
+                missing=missing_markets,
+                count=len(all_stocks),
+            )
+
+        stock_list = [
+            (stock.code, stock.name, stock.market_name)
+            for stock in all_stocks
+        ]
+
+        logger.info(
+            "stock_list_loaded",
+            total=len(stock_list),
+        )
+
+        return stock_list
 
     def _get_fallback_stock_list(self) -> List[tuple]:
         """Fallback stock list if API fails."""
@@ -271,6 +407,10 @@ class BackgroundScanner:
         notify_progress: bool = True,
         use_llm: bool = False,
         auto_gpu_scaling: bool = True,
+        auto_promote_enabled: bool = DEFAULT_AUTO_PROMOTE_ENABLED,
+        promote_confidence_threshold: float = DEFAULT_PROMOTE_CONFIDENCE_THRESHOLD,
+        promote_max_count: int = DEFAULT_PROMOTE_MAX_COUNT,
+        mode: str = "quick",
     ):
         """
         Start background scanning of all stocks.
@@ -278,8 +418,25 @@ class BackgroundScanner:
         Args:
             stock_list: Optional custom list of (stk_cd, stk_nm, market_type) tuples
             notify_progress: Whether to send Telegram notifications
-            use_llm: Use LLM for analysis (slower but more accurate)
+            use_llm: Use LLM for analysis (slower but more accurate). Ignored
+                (forced False) when mode="discovery" — discovery collection
+                is rule-only, never calls the LLM.
             auto_gpu_scaling: Automatically adjust concurrency based on GPU memory
+            auto_promote_enabled: Auto-promote high-conviction BUY/WATCH results
+                into the server watch-list on scan completion. OFF by default —
+                must be explicitly enabled (see _promote_results_to_watch_list).
+                Ignored when mode="discovery" — that pipeline's promotion is
+                DS-4's job, never this legacy confidence-threshold path (see
+                _promote_results_to_watch_list's mode guard).
+            promote_confidence_threshold: Minimum confidence (0.0-1.0) a
+                BUY/WATCH result must clear to be promoted.
+            promote_max_count: Maximum number of results promoted per scan.
+            mode: "quick" (default, legacy technical-indicator scan) /
+                "llm" behavior is still selected via `use_llm` for backward
+                compatibility — pass mode="discovery" to run the DS-2
+                factor-collection pipeline (ka10001+ka10081 -> StockSnapshot
+                -> quality filter -> compute_strategy_scores -> factor_json)
+                instead of the legacy quick/llm analysis.
         """
         if self._running:
             logger.warning("scanner_already_running")
@@ -288,8 +445,23 @@ class BackgroundScanner:
         # Initialize database
         await self._init_db()
 
-        # Store LLM preference
-        self._use_llm = use_llm
+        # Track scan mode (DS-2) and LLM preference. Discovery never calls
+        # the LLM regardless of what the caller passed for use_llm.
+        self._mode = mode
+        self._use_llm = False if mode == "discovery" else use_llm
+
+        # FI-1: stop_scan() (called well after this method returns, often by
+        # a caller -- e.g. the coordinator's timeout watchdog -- with no
+        # notify_progress argument of its own) must know THIS scan's own
+        # notify_progress preference to gate its own notification.
+        self._notify_progress = notify_progress
+
+        # Store watch-list auto-promotion preferences. For mode="discovery"
+        # these are stored but never consulted — see
+        # _promote_results_to_watch_list's unconditional mode guard.
+        self._auto_promote_enabled = auto_promote_enabled
+        self._promote_confidence_threshold = promote_confidence_threshold
+        self._promote_max_count = promote_max_count
 
         # Initialize GPU monitor if using LLM with auto scaling
         if use_llm and auto_gpu_scaling:
@@ -309,12 +481,19 @@ class BackgroundScanner:
         else:
             self._gpu_monitor = None
 
-        # Load stock list if not provided
+        # Load stock list if not provided (only _load_stock_list() calls can
+        # set the fallback/partial flags — an explicitly supplied stock_list
+        # never counts as a fallback or partial universe).
+        self._universe_fallback_used = False
+        self._universe_partial_markets = ""
         if stock_list is None:
             stock_list = await self._load_stock_list()
 
         # Generate session ID
         session_id = datetime.now().strftime("%Y%m%d%H%M%S")
+        # SC-1: stop_scan needs this to record a 'partial' row for the
+        # session it's actually stopping.
+        self._current_session_id = session_id
 
         self._progress = ScanProgress(
             status=ScanStatus.RUNNING,
@@ -334,8 +513,14 @@ class BackgroundScanner:
             concurrency=self._current_concurrency,
         )
 
-        # Save session start
-        await self._save_session_start(session_id)
+        # Save session start (DS-2: scan_mode/universe_fallback metadata)
+        scan_mode_label = "discovery" if mode == "discovery" else ("llm" if use_llm else "quick")
+        await self._save_session_start(
+            session_id,
+            scan_mode=scan_mode_label,
+            universe_fallback=self._universe_fallback_used,
+            universe_partial=self._universe_partial_markets,
+        )
 
         # Send Telegram notification
         analysis_mode = "LLM 기반 상세 분석" if use_llm else "기술적 지표 분석"
@@ -354,14 +539,28 @@ class BackgroundScanner:
             self._scan_all_stocks(stock_list, session_id, notify_progress)
         )
 
-    async def _save_session_start(self, session_id: str):
+    async def _save_session_start(
+        self,
+        session_id: str,
+        scan_mode: str = "quick",
+        universe_fallback: bool = False,
+        universe_partial: str = "",
+    ):
         """Save scan session start to database."""
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
                 INSERT INTO scan_sessions
-                (id, started_at, total_stocks, status)
-                VALUES (?, ?, ?, ?)
-            """, (session_id, datetime.now(), self._progress.total_stocks, "running"))
+                (id, started_at, total_stocks, status, scan_mode, universe_fallback, universe_partial)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                session_id,
+                datetime.now(),
+                self._progress.total_stocks,
+                "running",
+                scan_mode,
+                1 if universe_fallback else 0,
+                universe_partial or None,
+            ))
             await db.commit()
 
     async def _save_session_complete(self, session_id: str):
@@ -389,6 +588,52 @@ class BackgroundScanner:
                 self._progress.watch_count,
                 self._progress.avoid_count,
                 "completed",
+                session_id,
+            ))
+            await db.commit()
+
+    async def _save_session_partial(self, session_id: str):
+        """SC-1: record a partial-completion scan session row.
+
+        `stop_scan()` cancels `self._task` to interrupt an in-flight scan,
+        which means `_scan_all_stocks` never reaches its own
+        `_save_session_complete` call — the scan_sessions row was
+        previously left stuck at status='running' forever (a permanent
+        orphan once the process moved on), which made regime.py's and
+        ranker.py's `status = 'completed'` gates silently return zero rows
+        for a scan that may have gotten most of the way through the
+        universe (real incident: 3700/4276 stocks saved, entirely
+        unconsumed).
+
+        Mirrors `_save_session_complete`'s exact UPDATE shape/value source
+        (`self._progress.*` — the same counters the stop notification right
+        below already surfaces as "완료: N/M") with status='partial'
+        instead of 'completed'. `_save_session_complete` itself is
+        untouched — a normal completion's row stays byte-identical.
+        """
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE scan_sessions SET
+                    completed_at = ?,
+                    completed = ?,
+                    failed = ?,
+                    buy_count = ?,
+                    sell_count = ?,
+                    hold_count = ?,
+                    watch_count = ?,
+                    avoid_count = ?,
+                    status = ?
+                WHERE id = ?
+            """, (
+                datetime.now(),
+                self._progress.completed,
+                self._progress.failed,
+                self._progress.buy_count,
+                self._progress.sell_count,
+                self._progress.hold_count,
+                self._progress.watch_count,
+                self._progress.avoid_count,
+                "partial",
                 session_id,
             ))
             await db.commit()
@@ -479,7 +724,9 @@ class BackgroundScanner:
         LLM_BATCH_SIZE = 10  # Number of stocks per LLM batch request
         QUICK_BATCH_SIZE = 50  # Process in smaller batches for memory management
 
-        if self._use_llm:
+        if self._mode == "discovery":
+            await self._scan_all_stocks_discovery(stocks, session_id, notify_progress, QUICK_BATCH_SIZE)
+        elif self._use_llm:
             await self._scan_all_stocks_llm_batch(stocks, session_id, notify_progress, LLM_BATCH_SIZE)
         else:
             await self._scan_all_stocks_quick(stocks, session_id, notify_progress, QUICK_BATCH_SIZE)
@@ -501,9 +748,108 @@ class BackgroundScanner:
             session_id=session_id,
         )
 
+        # Auto-promote high-conviction results into the server watch-list so
+        # the discovery pipeline doesn't dead-end (opt-in; see docstring).
+        await self._promote_results_to_watch_list(session_id)
+
         # Send completion notification
         if notify_progress:
             await self._send_scan_summary()
+
+    async def _promote_results_to_watch_list(self, session_id: str) -> int:
+        """Promote high-conviction scan results into the server watch-list.
+
+        ROOT: scan results previously flowed nowhere — a completed scan sat in
+        `self._results`/SQLite with no consumer, so agent-chat's 5-minute
+        watch monitor and queue-conversion never picked up discovered names.
+        This closes that dead-end by pushing the top BUY/WATCH results (by
+        confidence) into `ExecutionCoordinator.add_to_watch_list`, the same
+        sink the WATCH-decision graph node and the `/trading/watch-list/add`
+        route use.
+
+        Gated by `_auto_promote_enabled` (default False, set via
+        `start_scan`) — auto-promotion must be explicitly turned on so a scan
+        never silently starts feeding the autonomous pipeline.
+
+        Only BUY/WATCH actions clearing `_promote_confidence_threshold` are
+        candidates; AVOID/SELL/HOLD are never promoted. Candidates already
+        present in the watch list (by ticker) are skipped so they don't
+        consume a promotion slot or get duplicated; the remaining candidates
+        are ranked by confidence and capped at `_promote_max_count`.
+
+        Returns the number of results promoted (0 if disabled/none qualify).
+        """
+        if self._mode == "discovery":
+            # Discovery-collected rows are action='WATCH' fixed with a
+            # non-ranking placeholder confidence (real ranking/promotion is
+            # DS-4's job: regime-weighted composite + LLM suitability gate).
+            # This legacy confidence-threshold promotion must never fire for
+            # them, regardless of _auto_promote_enabled.
+            return 0
+
+        if not self._auto_promote_enabled:
+            return 0
+
+        candidates = [
+            r for r in self._results
+            if r.action in ("BUY", "WATCH")
+            and r.confidence >= self._promote_confidence_threshold
+        ]
+        if not candidates:
+            return 0
+
+        # Highest-confidence first so max_count keeps the strongest names
+        # when there are more qualifying candidates than promotion slots.
+        candidates.sort(key=lambda r: r.confidence, reverse=True)
+
+        try:
+            from app.dependencies import get_trading_coordinator
+
+            coordinator = await get_trading_coordinator()
+        except Exception as e:
+            logger.warning("watch_list_promotion_coordinator_unavailable", error=str(e))
+            return 0
+
+        existing_tickers = {w.ticker for w in coordinator.get_watch_list()}
+
+        promoted = 0
+        for result in candidates:
+            if promoted >= self._promote_max_count:
+                break
+            if result.stk_cd in existing_tickers:
+                continue  # already watched — dedup, don't double-add
+
+            try:
+                coordinator.add_to_watch_list(
+                    session_id=session_id,
+                    ticker=result.stk_cd,
+                    stock_name=result.stk_nm,
+                    signal=result.signal,
+                    confidence=result.confidence,
+                    current_price=result.current_price,
+                    analysis_summary=result.summary,
+                    key_factors=result.key_factors,
+                )
+            except Exception as e:
+                logger.warning(
+                    "watch_list_promotion_failed",
+                    stk_cd=result.stk_cd,
+                    error=str(e),
+                )
+                continue
+
+            existing_tickers.add(result.stk_cd)
+            promoted += 1
+
+        logger.info(
+            "scan_results_promoted_to_watch_list",
+            promoted=promoted,
+            candidates=len(candidates),
+            session_id=session_id,
+            threshold=self._promote_confidence_threshold,
+            max_count=self._promote_max_count,
+        )
+        return promoted
 
     async def _scan_all_stocks_quick(
         self,
@@ -564,6 +910,474 @@ class BackgroundScanner:
 
             logger.debug(
                 "batch_completed",
+                batch_start=batch_start,
+                batch_size=len(batch),
+                total_completed=self._progress.completed,
+            )
+
+    async def _build_flow_map(self, client) -> dict:
+        """ka10131(기관/외인 순매수 랭킹)을 시장별(KOSPI="001"/KOSDAQ="101")
+        딱 1콜씩 선조회해 스캔 전체가 공유하는 FlowRank dict[ticker]를 만든다.
+
+        스펙 요구: "스캔당 시장별 1콜, 종목별 재호출 절대 금지" — 이 메서드는
+        `_scan_all_stocks_discovery` 시작 시 정확히 한 번만 호출되고, 결과
+        dict는 모든 종목의 `compute_strategy_scores` 호출에 재사용된다.
+        get_inst_foreign_flow 자체가 실패-무해(예외/빈 응답 시 None) 계약이라
+        여기서도 방어적으로만 감싼다 — 조회 실패는 해당 시장 종목들의 flow
+        성분이 0으로 수렴할 뿐, 스캔 자체를 절대 막지 않는다.
+        """
+        flow_map: dict = {}
+        for mrkt_tp in ("001", "101"):
+            try:
+                rows = await client.get_inst_foreign_flow(mrkt_tp=mrkt_tp)
+            except Exception as e:
+                logger.warning("discovery_flow_fetch_failed", mrkt_tp=mrkt_tp, error=str(e))
+                rows = None
+            if not rows:
+                continue
+            for idx, row in enumerate(rows, start=1):
+                ticker = row.get("stk_cd", "")
+                if not ticker:
+                    continue
+                flow_map[ticker] = FlowRank(
+                    ticker=ticker,
+                    orgn_net_amt=row.get("orgn_net_amt", 0.0),
+                    frgnr_net_amt=row.get("frgnr_net_amt", 0.0),
+                    orgn_cont_days=row.get("orgn_cont_days", 0),
+                    frgnr_cont_days=row.get("frgnr_cont_days", 0),
+                    rank=idx,
+                )
+        return flow_map
+
+    async def _fetch_discovery_snapshot(
+        self,
+        stk_cd: str,
+        stk_nm: str,
+        client,
+    ) -> StockSnapshot:
+        """ka10001+ka10081을 병렬 수집해 StockSnapshot을 만든다.
+
+        둘 중 하나라도 예외를 던지거나 현재가를 숫자로 파싱할 수 없으면 그
+        예외를 그대로 전파한다 — 호출자(`_scan_stock_discovery`)가 이를
+        "수집 실패=행 드롭"으로 취급한다(가짜 HOLD 저장 금지, discovery
+        모드 한정 — quick/llm 경로는 무변경).
+        """
+        stock_info_task = client.get_stock_info(stk_cd)
+        chart_df_task = client.get_daily_chart_df(stk_cd)
+
+        stock_info, chart_df = await asyncio.gather(
+            stock_info_task, chart_df_task, return_exceptions=True
+        )
+
+        if isinstance(stock_info, Exception):
+            raise stock_info
+        if isinstance(chart_df, Exception):
+            raise chart_df
+
+        # 가격 파싱 불가(예: 예상 밖 타입)도 수집 실패로 취급 — 아래
+        # float() 캐스팅이 실패하면 ValueError/TypeError가 호출자까지
+        # 그대로 전파돼 드롭된다.
+        price = float(stock_info.cur_prc)
+        # ka10001 mrkt_tot_amt 단위=억원 (라이브 실측 2026-07-18: 005930
+        # -> 14,908,010억 ≈ 1,490조). 팩터 엔진 필터는 원 단위 비교라 환산.
+        market_cap = (
+            float(stock_info.mrkt_tot_amt) * 100_000_000
+            if stock_info.mrkt_tot_amt is not None
+            else 0.0
+        )
+        # 0.0 폴백 금지 — 결측을 0.0으로 붕괴시키면 밸류 축 도입 시 "결측 =
+        # 무한히 싸다"가 되어 랭킹 최상위를 싹쓸이한다. PER 0·PBR 0은 실재하지
+        # 않으므로 0.0은 곧 결측의 다른 표현이었다.
+        per = float(stock_info.per) if stock_info.per is not None else None
+        pbr = float(stock_info.pbr) if stock_info.pbr is not None else None
+        # 적자 배제 게이트용. per/pbr과 달리 0.0 폴백을 쓰지 않는다 — EPS 0은
+        # "이익 없음"이라 게이트가 배제해야 하는 실제 값이고, 결측(None)은
+        # "모름"이라 통과시켜야 하므로 둘을 구분해야 한다.
+        eps = float(stock_info.eps) if stock_info.eps is not None else None
+        bps = float(stock_info.bps) if stock_info.bps is not None else None
+        volume = float(stock_info.acml_vol) if stock_info.acml_vol is not None else 0.0
+
+        return StockSnapshot(
+            ticker=stk_cd,
+            name=stk_nm,
+            price=price,
+            market_cap=market_cap,
+            per=per,
+            pbr=pbr,
+            volume=volume,
+            chart_df=chart_df,
+            eps=eps,
+            bps=bps,
+        )
+
+    @staticmethod
+    def _classify_breadth_direction(chart_df) -> str:
+        """discovery breadth 판정: chart_df 마지막 2개 종가를 비교해
+        advance(마지막 close > 직전 close)/decline(<)/flat(==거나 판정
+        불가·데이터 부족)을 반환한다. 호출자가 이를 세션 buy/sell/hold_count
+        에 매핑 — regime.py가 소비하는 breadth_ratio가 이제 처음으로
+        유의미해진다(DS-2 리뷰픽스, 스펙 §3).
+        """
+        try:
+            closes = chart_df["close"]
+            if len(closes) < 2:
+                return "flat"
+            last = float(closes.iloc[-1])
+            prev = float(closes.iloc[-2])
+        except Exception:
+            return "flat"
+        if last != last or prev != prev:  # NaN 체크 (pandas import 없이)
+            return "flat"
+        if last > prev:
+            return "advance"
+        if last < prev:
+            return "decline"
+        return "flat"
+
+    async def _scan_stock_discovery(
+        self,
+        stk_cd: str,
+        stk_nm: str,
+        market_type: str,
+        flow_map: dict,
+        client,
+    ) -> Optional[tuple]:
+        """단일 종목 discovery 수집 (semaphore-controlled concurrency, quick
+        모드의 `_scan_stock`과 동일한 동시성 정책 재사용 — rate limiter
+        무변경 요구).
+
+        수집 자체가 실패(예외/가격 파싱 불가)하면 None을 반환해 호출자가
+        행을 드롭하게 한다. 수집은 성공했지만 품질 필터를 통과하지 못한
+        종목은 (ScanResult, factor_json, breadth_direction) 3튜플을
+        반환하되 factor_json에 skip_reason만 담는다(스코어 계산은 필터
+        통과 종목에 한정 — DS-1 리뷰 이월: 필터→스코어 순서 엄수, len<60
+        ma_alignment 가변 분모 함정 방어선).
+
+        breadth_direction(advance/decline/flat, chart_df 마지막 2개 종가로
+        판정)은 품질 필터 통과 여부와 무관하게(차트만 수집됐으면) 계산돼
+        호출자가 세션 buy/sell/hold_count(=regime.py가 소비하는 breadth)에
+        반영한다 — DS-2 리뷰픽스: scan_results 행의 action='WATCH' 고정은
+        무변경(행 수준 의미 무변경, 세션 집계만 유의미화).
+        """
+        async with self._semaphore:
+            self._progress.in_progress += 1
+            self._progress.current_stocks.append(stk_cd)
+
+            try:
+                snap = await self._fetch_discovery_snapshot(stk_cd, stk_nm, client)
+                breadth_direction = self._classify_breadth_direction(snap.chart_df)
+                from app.config import settings as _s
+
+                passed, reason = passes_quality_filter(
+                    snap,
+                    min_adtv=self._discovery_min_adtv,
+                    exclude_negative_eps=getattr(
+                        _s, "DISCOVERY_EXCLUDE_NEGATIVE_EPS", True
+                    ),
+                )
+
+                # 통과/탈락 두 분기가 공유하는 멀티플 적재분. per/pbr이 이제
+                # Optional이라 스냅샷 값을 그대로 넘긴다 — 0.0→None 되돌림이
+                # 필요했던 것은 스냅샷이 결측을 0.0으로 붕괴시키던 시절 얘기다.
+                _multiples = {
+                    "per": snap.per,
+                    "pbr": snap.pbr,
+                    "eps": snap.eps,
+                    "bps": snap.bps,
+                }
+
+                if passed:
+                    flow = flow_map.get(stk_cd)
+                    scores = compute_strategy_scores(snap, flow)
+                    atoms = scores["_atoms"]
+                    strategy_scores = {k: v for k, v in scores.items() if k != "_atoms"}
+
+                    # US 신호 T5: AI밸류체인 종목 + 당일 캐시 신호 존재 시만
+                    # 소량 넛지(≤0.05). off/결측/비-AI밸류체인 -> 0.0.
+                    # never-raise: 실패는 로그만 남기고 0.0 유지.
+                    _us_bonus = 0.0
+                    try:
+                        from services.discovery.ai_valuechain import is_ai_valuechain, valuechain_signal_type
+                        from services.trading.us_market_data import get_cached_us_ai_signal, get_subsignal
+                        if is_ai_valuechain(stk_cd):
+                            _us = await get_cached_us_ai_signal()
+                            _sub = get_subsignal(_us, valuechain_signal_type(stk_cd))
+                            if _sub is not None and _sub.get("signal") is not None:
+                                _us_bonus = max(0.0, float(_sub.get("signal") or 0.0)) * 0.05
+                    except Exception as e:
+                        logger.warning("us_crossmarket_bonus_failed", stk_cd=stk_cd, error=str(e))
+
+                    from services.discovery.liquidity import adtv_median
+
+                    _adtv = adtv_median(snap.chart_df)
+
+                    factor_json = {
+                        "quality_filter_passed": True,
+                        "skip_reason": None,
+                        # flow_present 발원지 -- ka10131 수급 랭킹에 이
+                        # 종목이 존재했는지(flow_map.get(stk_cd) is not
+                        # None) 그대로. ranker._effective_weights가 이
+                        # 플래그로 flow_present=False일 때 flow 가중을 0으로
+                        # 세팅한다(재분배 없음 -- 구 DQ-2 재정규화는
+                        # 2026-07-27 유동성 인지 아크에서 폐기됨, 경위는
+                        # ranker._effective_weights docstring 참조. 없는 구
+                        # 스캔은 raw flow==0.0 프록시로 폴백 -- ranker.py 쪽
+                        # 하위호환).
+                        "flow_present": flow is not None,
+                        "scores": strategy_scores,
+                        "atoms": atoms,
+                        "close_price": snap.price,
+                        "market_cap": snap.market_cap,
+                        # US 신호 T5: AI밸류체인 종목 + 당일 캐시 신호 존재 시만
+                        # ranker.rank_candidates가 composite에 소량 가산.
+                        "us_crossmarket_bonus": _us_bonus,
+                        # 유동성 인지 아크: 사이징 캡(C1)과 토론 프롬프트(C2)가
+                        # 이 값을 소비한다. None이면 소비자가 캡/문구를 생략한다.
+                        "adtv20_med": _adtv,
+                        # 멀티플 시계열 축적(2026-07-29). 지금은 아무도 소비하지
+                        # 않는다 — 순수 적재다. 밸류에이션 rerating("멀티플이
+                        # 어디에서 어디로 움직였나")은 당일 스냅샷으로는 판정할
+                        # 수 없고 시계열이 필요한데, 지금까지 ka10001에서 받아
+                        # 계산에만 쓰고 버려왔다.
+                        #
+                        # EPS/BPS를 함께 남기는 이유: 일봉 60개와 결합하면
+                        # 밴드를 재구성할 수 있다(PER_t ≈ price_t/EPS,
+                        # PBR_t ≈ price_t/BPS). PER/PBR만 저장하면 관측일의
+                        # 점 하나씩만 남는다.
+                        **_multiples,
+                    }
+                    summary = f"{stk_nm}: 발굴 수집 완료(품질필터 통과)"
+                else:
+                    factor_json = {
+                        "quality_filter_passed": False,
+                        "skip_reason": reason,
+                        # 탈락 종목도 멀티플을 남긴다 — 통과분만 쌓으면 게이트에
+                        # 편향된 시계열이 되고, "적자였다가 흑자 전환"이나
+                        # "유동성이 개선된 종목" 같은 상태 변화를 추적할 수 없다.
+                        **_multiples,
+                    }
+                    summary = f"{stk_nm}: 발굴 수집 완료(품질필터 탈락: {reason})"
+
+                # action='WATCH' 고정 + confidence는 composite가 아니다 —
+                # 레짐 가중 랭킹·판정은 DS-4 전용(스펙 §5).
+                result = ScanResult(
+                    stk_cd=stk_cd,
+                    stk_nm=stk_nm,
+                    action="WATCH",
+                    signal="discovery",
+                    confidence=0.0,
+                    summary=summary,
+                    key_factors=[],
+                    current_price=int(snap.price),
+                    market_type=market_type,
+                )
+
+                self._progress.completed += 1
+                self._update_eta()
+
+                return result, factor_json, breadth_direction
+
+            except Exception as e:
+                logger.warning("discovery_stock_collection_failed", stk_cd=stk_cd, error=str(e))
+                self._progress.last_error = f"{stk_cd}: {str(e)}"
+                return None
+
+            finally:
+                self._progress.in_progress -= 1
+                if stk_cd in self._progress.current_stocks:
+                    self._progress.current_stocks.remove(stk_cd)
+
+    async def _save_discovery_results_batch(
+        self,
+        pairs: List[tuple],
+        session_id: str,
+    ):
+        """discovery 모드 결과를 factor_json과 함께 배치 저장한다.
+
+        기존 `_save_results_batch`/`_save_result_to_db`(quick/llm 공용)는
+        건드리지 않는다 — 그 INSERT문은 factor_json 컬럼을 아예 언급하지
+        않으므로 스키마에 컬럼이 추가돼도 그 두 메서드의 동작은
+        byte-무변경이다.
+        """
+        if not pairs:
+            return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            data = [
+                (
+                    result.stk_cd,
+                    result.stk_nm,
+                    result.action,
+                    result.signal,
+                    result.confidence,
+                    result.summary,
+                    ",".join(result.key_factors),
+                    result.current_price,
+                    result.market_type,
+                    result.scanned_at,
+                    session_id,
+                    json.dumps(factor_json, ensure_ascii=False),
+                )
+                for result, factor_json in pairs
+            ]
+
+            await db.executemany("""
+                INSERT INTO scan_results
+                (stk_cd, stk_nm, action, signal, confidence, summary,
+                 key_factors, current_price, market_type, scanned_at, scan_session_id,
+                 factor_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, data)
+            await db.commit()
+
+            logger.debug(
+                "discovery_batch_results_saved",
+                count=len(pairs),
+                session_id=session_id,
+            )
+
+    async def _resolve_min_adtv(self) -> float:
+        """A1: 계좌 평가액 기반 유동성 임계값(원). 조회 실패 시 설정 폴백
+        (fail-closed — 게이트를 끄는 대신 보수적 상수로 대체한다).
+
+        min_adtv = max(equity * 0.04 / 1%, 10억) — 포지션(계좌의 4%)이 일평균
+        거래대금의 1%를 넘지 않게 하는 최소 ADTV(required_min_adtv가 하드플로어
+        10억과의 max를 처리). 계좌가 커지면 임계값도 자동으로 올라간다.
+
+        0.04는 현재 포지션 배분 정책(계좌 대비 %) 하드코딩 — 별도 설정 항목이
+        아직 없어 상수로 둔다.
+
+        **상한 클램프(최종 리뷰 Blocking2)**: 계좌 평가액은 상류 파싱 사고에
+        취약하다 — 이 저장소에 `mrkt_tot_amt` 억원 단위 오분류, `ka10131
+        _parse_float` 이중부호 크래시 전례가 있다. equity가 100배로 잘못
+        들어오면 min_adtv가 100배가 되어 2,650종 전량이 배제되는 폭주가
+        일어난다(그리고 EOD 창에서만 드러난다). 폴백의 5배(기본 100억)를
+        상한으로 둔다 — 정상 계좌 성장은 이 안에 들어오고, 자릿수 사고만
+        잘린다. 폴백 자체도 하드플로어(10억) 미만으로는 못 내려간다.
+        """
+        from app.config import settings
+        from app.dependencies import get_trading_coordinator
+        from services.discovery.liquidity import HARD_FLOOR_ADTV, required_min_adtv
+
+        # 폴백 하한 보호: 설정이 하드플로어보다 낮게 잡혀도 게이트가 그
+        # 아래로는 내려가지 않는다(HARD_FLOOR_ADTV 계약).
+        fallback = max(
+            float(getattr(settings, "DISCOVERY_MIN_ADTV_FALLBACK", 2_000_000_000.0)),
+            HARD_FLOOR_ADTV,
+        )
+        ceiling = fallback * 5.0
+        try:
+            coordinator = await get_trading_coordinator()
+            equity = float(coordinator._state.account.total_equity)
+            if equity <= 0:
+                raise ValueError("equity<=0")
+            resolved = required_min_adtv(equity * 0.04)
+            if resolved > ceiling:
+                logger.warning(
+                    "discovery_min_adtv_clamped",
+                    equity=equity, resolved=resolved, ceiling=ceiling,
+                )
+                return ceiling
+            return resolved
+        except Exception as e:
+            logger.warning(
+                "discovery_min_adtv_fallback", error=str(e), fallback=fallback
+            )
+            return fallback
+
+    async def _scan_all_stocks_discovery(
+        self,
+        stocks: List[tuple],
+        session_id: str,
+        notify_progress: bool,
+        batch_size: int,
+    ):
+        """Discovery 수집 모드 (DS-2): 종목당 ka10001+ka10081 -> StockSnapshot
+        -> 품질 필터 -> compute_strategy_scores -> factor_json 저장.
+
+        ka10131(기관/외인 순매수)은 이 메서드 진입 시 시장별 1콜씩만
+        선조회해(`_build_flow_map`) 전체 스캔이 재사용한다. LLM 호출 없음
+        (룰 전용). 기존 자동 승격 배관은 `_promote_results_to_watch_list`
+        자체의 mode 가드로 비활성 — 이 메서드는 그 호출부를 건드리지 않는다.
+
+        세션 buy/sell/hold_count는 종목별 advance/decline/flat breadth
+        판정(`_classify_breadth_direction`)으로 집계된다 — action='WATCH'
+        고정인 행 자체의 의미는 무변경(DS-2 리뷰픽스: 세션 집계만 유의미화).
+
+        A1: 유동성 임계값(`_discovery_min_adtv`)은 이 메서드 진입 시 계좌
+        평가액 기준으로 정확히 한 번만 산출돼 스캔 전체(종목 수천 개)가
+        재사용한다 — 종목마다 계좌를 조회하지 않는다.
+
+        킬스위치(`DISCOVERY_LIQUIDITY_GATE_ENABLED`, 설계 §6): off면
+        `_discovery_min_adtv=None` — `factors.passes_quality_filter`의 기존
+        하위호환 스킵 분기(`min_adtv is None`)로 수렴해 A1 게이트만 무효화된다.
+        A2/A3 스코어 수식과 B(가중 재정규화 폐기)는 그대로 유지된다.
+        """
+        from app.config import settings as _settings
+
+        if not getattr(_settings, "DISCOVERY_LIQUIDITY_GATE_ENABLED", True):
+            self._discovery_min_adtv = None
+            # 게이트가 꺼진 채 도는 스캔은 조용히 지나가면 안 된다 — 승격
+            # 분포가 이전과 달라지는 이유가 로그에 남아야 한다.
+            logger.warning("discovery_liquidity_gate_disabled")
+        else:
+            self._discovery_min_adtv = await self._resolve_min_adtv()
+            logger.info(
+                "discovery_min_adtv_resolved", min_adtv=self._discovery_min_adtv
+            )
+
+        from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+
+        client = await get_shared_kiwoom_client_async()
+        flow_map = await self._build_flow_map(client)
+
+        for batch_start in range(0, len(stocks), batch_size):
+            if self._cancel_event.is_set():
+                logger.info("scan_cancelled_at_batch", batch_start=batch_start)
+                break
+
+            while self._paused:
+                await asyncio.sleep(1)
+                if self._cancel_event.is_set():
+                    break
+
+            if self._cancel_event.is_set():
+                break
+
+            batch = stocks[batch_start:batch_start + batch_size]
+            tasks = []
+
+            for stock_data in batch:
+                if len(stock_data) >= 3:
+                    stk_cd, stk_nm, market_type = stock_data[0], stock_data[1], stock_data[2]
+                else:
+                    stk_cd, stk_nm = stock_data[0], stock_data[1]
+                    market_type = ""
+
+                tasks.append(asyncio.create_task(
+                    self._scan_stock_discovery(stk_cd, stk_nm, market_type, flow_map, client)
+                ))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            valid_pairs: List[tuple] = []
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("discovery_scan_task_failed", error=str(result))
+                    self._progress.failed += 1
+                elif result is None:
+                    self._progress.failed += 1
+                else:
+                    scan_result, factor_json, breadth_direction = result
+                    valid_pairs.append((scan_result, factor_json))
+                    self._results.append(scan_result)
+                    self._update_breadth_count(breadth_direction)
+
+            if valid_pairs:
+                await self._save_discovery_results_batch(valid_pairs, session_id)
+
+            logger.debug(
+                "discovery_batch_completed",
                 batch_start=batch_start,
                 batch_size=len(batch),
                 total_completed=self._progress.completed,
@@ -710,7 +1524,10 @@ class BackgroundScanner:
 
                     current_price = stock_info.cur_prc
                     prdy_ctrt = stock_info.prdy_ctrt if hasattr(stock_info, "prdy_ctrt") else 0
-                    trd_qty = stock_info.trd_qty if hasattr(stock_info, "trd_qty") else 0
+                    # StockBasicInfo has no `trd_qty` attribute — that name
+                    # was always dead (hasattr always False -> always 0).
+                    # The real accumulated-volume field is `acml_vol`.
+                    trd_qty = stock_info.acml_vol if hasattr(stock_info, "acml_vol") else 0
 
                     # Calculate technical indicators
                     tech_summary = "데이터 부족"
@@ -928,7 +1745,7 @@ KEY_FACTORS: [주요 판단 근거 3가지, 쉼표로 구분]
                 SystemMessage(content="당신은 한국 주식 시장 전문 분석가입니다."),
                 HumanMessage(content=prompt),
             ]
-            response = await llm.generate(messages)
+            response = await llm.generate(messages, task="scanner")
 
             # Parse LLM response
             action, confidence, summary, key_factors = self._parse_llm_response(
@@ -1006,7 +1823,7 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
                 SystemMessage(content="당신은 한국 주식 시장 전문 분석가입니다. 주어진 기술적 지표와 시장 데이터를 기반으로 종목을 분석합니다."),
                 HumanMessage(content=batch_prompt),
             ]
-            response = await llm.generate(messages)
+            response = await llm.generate(messages, task="scanner")
 
             # Parse batch response
             results = self._parse_batch_llm_response(response, stocks_data)
@@ -1181,6 +1998,21 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
         attr = action_map.get(action, "hold_count")
         setattr(self._progress, attr, getattr(self._progress, attr) + 1)
 
+    def _update_breadth_count(self, direction: str):
+        """Discovery 모드 전용 세션 카운트 (DS-2 리뷰픽스): chart_df 마지막
+        2개 종가로 판정한 일간 등락 방향(advance/decline/flat)을
+        buy/sell/hold_count에 매핑한다. scan_results 행의 action='WATCH'
+        고정(행 수준 의미 무변경)과는 별개로, regime.py가 소비하는 세션
+        집계(breadth)만 advance/decline로 유의미화한다 — quick/llm 모드의
+        `_update_action_count`는 무변경."""
+        direction_map = {
+            "advance": "buy_count",
+            "decline": "sell_count",
+            "flat": "hold_count",
+        }
+        attr = direction_map.get(direction, "hold_count")
+        setattr(self._progress, attr, getattr(self._progress, attr) + 1)
+
     def _update_eta(self):
         """Update estimated completion time."""
         if self._progress.completed > 0:
@@ -1214,27 +2046,163 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
                 f"남은 종목: {self._progress.total_stocks - self._progress.completed}개"
             )
 
-    async def stop_scan(self):
-        """Stop the background scan."""
+    async def stop_scan(self, reason: str = "manual"):
+        """Stop the background scan.
+
+        Args:
+            reason: "manual" (default) -- an FE-initiated stop (POST
+                /scanner/stop) -- suppresses the partial-completion Telegram
+                notification below unconditionally; a user who just clicked
+                Stop doesn't need a message telling them a scan they just
+                stopped, stopped. "timeout" -- the coordinator's
+                `_run_discovery_scan` watchdog cleanup -- instead follows the
+                same `self._notify_progress` gate every other notification
+                point in this class already uses (start_scan's own start
+                notification, `_scan_all_stocks`' completion notification),
+                so an EOD discovery scan started with `notify_progress=False`
+                never fires a stop notification the caller explicitly opted
+                out of.
+
+                FI-1: prior to this, the partial notification below fired
+                unconditionally regardless of `notify_progress` or which
+                caller triggered the stop -- a 4276-stock EOD scan
+                (notify_progress=False) that hit its watchdog timeout still
+                sent a Telegram "분석 중지" message every time, and the FE's
+                own manual Stop button re-notified the user of an action
+                they had just taken themselves.
+
+        `_save_session_partial` below (the SC-1 DB persistence fix) is NOT
+        gated by `reason` or `notify_progress` -- it must always run so
+        regime.py/ranker.py's breadth accounting reflects reality regardless
+        of how or why the scan was stopped.
+        """
         if self._running:
             self._cancel_event.set()
             self._progress.status = ScanStatus.IDLE
             self._running = False
             self._paused = False
 
+            # SC-1: record the partial-completion row BEFORE cancelling the
+            # task -- _task.cancel() interrupts _scan_all_stocks before it
+            # can ever reach its own _save_session_complete, which used to
+            # leave the DB row orphaned at status='running' forever (see
+            # _save_session_partial's docstring). No-op if no scan session
+            # was ever started (self._current_session_id unset). Best-effort
+            # -- a failure here must not block the cancel/notify below.
+            if self._current_session_id:
+                try:
+                    await self._save_session_partial(self._current_session_id)
+                except Exception as e:
+                    logger.warning(
+                        "scan_partial_session_save_failed",
+                        session_id=self._current_session_id,
+                        error=str(e),
+                    )
+
             if self._task:
                 self._task.cancel()
 
-            logger.info("background_scan_stopped")
+            logger.info("background_scan_stopped", reason=reason)
 
-            await self._send_telegram_notification(
-                f"⏹ *백그라운드 분석 중지*\n\n"
-                f"분석 완료: {self._progress.completed}/{self._progress.total_stocks}"
+            # SC-3: the stop above always corresponds to a partial-completion
+            # session (a normal completion clears self._running BEFORE
+            # reaching _save_session_complete -- see _scan_all_stocks -- so
+            # stop_scan() is a guaranteed no-op via the `if self._running:`
+            # guard once a scan has already finished on its own). Today's
+            # incident: this Telegram message showed only "분석 중지" +
+            # "완료: 3700/4276" with no indication that breadth was still
+            # reflected and only promotion was withheld, which read as a
+            # total abandonment rather than a partial-completion. Surface
+            # the same N/M/percent explicitly in both the log and (if the
+            # notification isn't gated off below) the notification text.
+            completed = self._progress.completed
+            total = self._progress.total_stocks
+            coverage_pct = (completed / total * 100) if total else 0.0
+            partial_note = (
+                f"부분 완주 {completed}/{total}({coverage_pct:.1f}%) — "
+                f"breadth 반영, 승격 보류"
             )
+
+            logger.info(
+                partial_note,
+                session_id=self._current_session_id,
+                completed=completed,
+                total=total,
+                coverage_pct=round(coverage_pct, 1),
+            )
+
+            # FI-1: a manual stop never notifies (the caller already knows);
+            # any other reason (currently just "timeout") still follows this
+            # scan's own notify_progress preference.
+            if reason != "manual" and self._notify_progress:
+                await self._send_telegram_notification(
+                    f"⏹ *백그라운드 분석 중지*\n\n"
+                    f"분석 완료: {completed}/{total}\n"
+                    f"{partial_note}"
+                )
+
+    async def reconcile_orphan_scan_sessions(self) -> int:
+        """FI-1: mark leftover status='running' scan_sessions rows 'aborted'.
+
+        A process that dies (crash, forced kill) while a scan is in flight
+        never reaches stop_scan()/_save_session_partial, nor
+        _scan_all_stocks'/_save_session_complete -- its scan_sessions row is
+        left at status='running' forever once the process is gone (the same
+        underlying orphan failure mode `_save_session_partial`'s docstring
+        describes for stop_scan, but for a process that never got to call
+        stop_scan at all -- e.g. today's 20260720153027 incident). 'aborted'
+        is deliberately its own status, distinct from 'partial' (a
+        stop_scan-recorded partial completion -- real breadth was saved)
+        and 'completed'/'failed' -- and outside the
+        `status IN ('completed', 'partial')` gates regime.py/ranker.py use
+        to consume scan results (SC-1), so an aborted row is never mistaken
+        for consumable breadth.
+
+        MUST be called at process startup BEFORE any scan starts in THIS
+        process (see app.main's lifespan) -- at that point this process can
+        never have a genuinely in-flight 'running' row of its own, so every
+        'running' row found here is guaranteed to be a leftover from a
+        previous process.
+
+        Best-effort / never-raises -- e.g. the DB file may not exist yet if
+        no scan has ever run. The caller also wraps this in its own
+        try/except for startup-safety logging, but this method swallows its
+        own errors too and reports 0 reconciled rather than propagating.
+
+        Returns:
+            Number of rows reconciled (0 if none were orphaned, or on any
+            internal failure).
+        """
+        try:
+            await self._init_db()
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "UPDATE scan_sessions SET status = 'aborted' WHERE status = 'running'"
+                )
+                await db.commit()
+                return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        except Exception as e:
+            logger.warning("scan_orphan_reconcile_failed", error=str(e))
+            return 0
 
     def get_progress(self) -> ScanProgress:
         """Get current scan progress."""
         return self._progress
+
+    @property
+    def is_running(self) -> bool:
+        """DS-5 review fix: public mirror of the internal `_running` flag.
+
+        `start_scan()` itself gates on this flag and silently no-ops when a
+        scan (of ANY mode -- manual or discovery) is already in flight
+        (`if self._running: ... return`, above). Callers that need to know
+        BEFORE calling `start_scan()` whether it would actually start a new
+        scan -- as opposed to `get_progress().status == RUNNING`, which stays
+        RUNNING for the no-op'd caller's own already-running scan too and so
+        cannot distinguish "my scan is running" from "someone else's scan is
+        running and mine never started" -- should check this property first.
+        """
+        return self._running
 
     def get_results(self, action_filter: Optional[str] = None) -> List[ScanResult]:
         """
@@ -1262,6 +2230,50 @@ KEY_FACTORS: [주요 판단 근거, 쉼표 구분]
             ) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else None
+
+    async def get_latest_adtv(self, stk_cd: str) -> Optional[float]:
+        """T6(유동성 인지 사이징 캡) 폴백: 이 종목의 가장 최근 scan_results.
+        factor_json에 저장된 adtv20_med(원, T3가 씀 — scanner.py의 발굴 수집
+        루프 참조).
+
+        `portfolio_agent._resolve_adtv`가 진입 직전 라이브 재계산에 실패했을
+        때만 쓰인다. 승격(EOD) 당시 값이라 며칠 지난 값일 수 있지만, 캡이
+        완전히 꺼지는(fail-open) 것보다는 낫다 — 리뷰 Important2(a): 애초
+        `discovery_candidates`/`WatchedStock`에는 factor_json 저장 경로가
+        없어(Task 6 조사) 폴백이 불가능하다고 판단했었으나, 실제로는
+        `scan_results`(이 테이블, stk_cd 인덱스 idx_scan_results_stk_cd 有)에
+        T3가 이미 저장하고 있었다.
+
+        `AND factor_json IS NOT NULL` 필수(T8 재리뷰 봉합): `scan_results`에는
+        discovery 외에 quick/LLM 스캔 writer(`_save_result_to_db`/
+        `_save_results_batch`)도 있는데, 이쪽은 factor_json을 아예 채우지
+        않아 NULL로 남는다. 필터 없이 `ORDER BY scanned_at DESC LIMIT 1`만
+        쓰면, EOD discovery 스캔 다음날 아침 일반 스윕이 같은 종목에 NULL
+        factor_json 행을 더 최신으로 얹는 순간 이 폴백이 조용히 무력화된다.
+
+        never-raise: 조회/파싱 실패는 전부 None(호출자가 fail-open으로
+        처리)."""
+        try:
+            await self._init_db()
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT factor_json FROM scan_results WHERE stk_cd = ? "
+                    "AND factor_json IS NOT NULL ORDER BY scanned_at DESC LIMIT 1",
+                    (stk_cd,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+        except Exception as e:
+            logger.warning("scan_results_adtv_lookup_failed", stk_cd=stk_cd, error=str(e))
+            return None
+
+        if not row or not row[0]:
+            return None
+        try:
+            factor_json = json.loads(row[0])
+            adtv = factor_json.get("adtv20_med")
+            return float(adtv) if adtv is not None else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
 
     async def get_results_from_db(
         self,

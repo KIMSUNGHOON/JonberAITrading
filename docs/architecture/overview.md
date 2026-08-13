@@ -31,11 +31,11 @@ JonberAI Trading 시스템 아키텍처 개요
                          │ API Calls
 ┌────────────────────────▼────────────────────────────────────┐
 │                    External Services                         │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐ │
-│  │  LLM Server  │ │ Kiwoom API   │ │  Upbit API           │ │
-│  │  (Ollama/    │ │ (한국 주식)  │ │  (암호화폐)          │ │
-│  │   vLLM)      │ │              │ │                      │ │
-│  └──────────────┘ └──────────────┘ └──────────────────────┘ │
+│  ┌──────────────┐ ┌──────────────┐                          │
+│  │  LLM Server  │ │ Kiwoom API   │                          │
+│  │  (Ollama/    │ │ (한국 주식)  │                          │
+│  │   vLLM)      │ │              │                          │
+│  └──────────────┘ └──────────────┘                          │
 │  ┌──────────────┐ ┌──────────────┐                          │
 │  │  Telegram    │ │  Naver News  │                          │
 │  │  Bot API     │ │  API         │                          │
@@ -57,7 +57,6 @@ backend/
 │       ├── routes/
 │       │   ├── analysis.py      # 미국 주식 분석
 │       │   ├── kr_stocks.py     # 한국 주식 분석
-│       │   ├── coin.py          # 암호화폐 분석
 │       │   ├── trading.py       # 자동매매 API
 │       │   ├── approval.py      # HITL 승인
 │       │   ├── agent_chat.py    # Agent Group Chat
@@ -67,8 +66,7 @@ backend/
 ├── agents/
 │   ├── graph/
 │   │   ├── trading_graph.py     # 미국 주식 워크플로우
-│   │   ├── kr_stock_graph.py    # 한국 주식 워크플로우
-│   │   └── coin_trading_graph.py # 코인 워크플로우
+│   │   └── kr_stock_graph.py    # 한국 주식 워크플로우
 │   ├── subagents/
 │   │   ├── technical_analyst.py
 │   │   ├── fundamental_analyst.py

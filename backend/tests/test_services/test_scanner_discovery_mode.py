@@ -1,0 +1,1647 @@
+"""
+DS-2: BackgroundScanner discovery 수집 모드 테스트.
+
+기존 quick/llm 스캔 모드는 여전히 죽은 시그널 타입 매칭 위에서 동작하는
+레거시 경로라 손대지 않는다 — 이 파일은 신설 `start_scan(mode='discovery')`
+경로만 겨냥한다. DS-1(services/discovery/factors.py)이 이미 순수 함수로
+검증됐으므로 여기서는 "스캐너가 그 인터페이스를 올바르게 소비하는가"만 본다.
+
+실 네트워크·실 Kiwoom·실 DB 절대 금지 — Kiwoom 클라이언트는 전부 목, DB는
+tmp_path 픽스처로 scanner.py의 모듈 전역 DB_PATH를 monkeypatch한다(실
+scanner_results.db 오염 금지, ds-global-constraints.md 준수).
+"""
+
+import asyncio
+import contextlib
+import json
+from datetime import datetime
+from typing import Optional
+
+import aiosqlite
+import pandas as pd
+import pytest
+from unittest.mock import AsyncMock
+
+from services.background_scanner import scanner as scanner_module
+from services.background_scanner.scanner import BackgroundScanner
+from services.kiwoom.models import StockBasicInfo, StockListItem
+from services.trading.coordinator import ExecutionCoordinator
+
+# Note: no module-level `pytestmark` marker — pytest.ini sets asyncio_mode =
+# auto, so `async def test_*` is picked up automatically (mirrors
+# test_watch_list_promotion.py's convention).
+
+
+# ---------------------------------------------------------------------------
+# 결정적 합성 OHLCV + 목 Kiwoom 클라이언트
+# ---------------------------------------------------------------------------
+
+
+def _make_chart_df(n: int, start: float = 50_000.0) -> pd.DataFrame:
+    """get_daily_chart_df와 동일 스키마(date/open/high/low/close/volume/value,
+    오름차순)의 완만한 상승 합성 OHLCV. 결정적(랜덤 없음).
+
+    A1: value(거래대금)는 close*volume로 근사 — close~50,000·volume~500,000
+    라 값이 약 250억원대로, 발굴 스캐너의 유동성 게이트 폴백 임계값(계좌
+    조회 실패 시 20억원, DISCOVERY_MIN_ADTV_FALLBACK)을 넉넉히 넘는다. 이
+    파일의 기존 테스트들은 유동성이 아니라 factor_json 배선/breadth/승격을
+    검증하므로, 유동성 게이트가 그 검증들을 가리지 않도록 항상 통과시킨다."""
+    dates = pd.date_range("2026-01-01", periods=n, freq="B")
+    closes = [start * (1 + 0.001) ** i for i in range(n)]
+    opens = [closes[0]] + closes[:-1]
+    highs = [c * 1.004 for c in closes]
+    lows = [c * 0.996 for c in closes]
+    volumes = [500_000 + i * 100 for i in range(n)]
+    values = [c * v for c, v in zip(closes, volumes)]
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+            "value": values,
+        }
+    )
+
+
+def _chart_df_with_last_move(direction: str, n: int = 65, start: float = 50_000.0) -> pd.DataFrame:
+    """`_make_chart_df` 기반이되 마지막 종가만 원하는 등락 방향으로
+    오버라이드한다 — breadth 판정(마지막 2개 종가 비교)의 advance/decline/
+    flat 픽스처. `_make_chart_df`는 기본적으로 계속 상승(advance)하므로
+    decline/flat만 실제로 값을 바꾼다."""
+    df = _make_chart_df(n, start=start)
+    prev_close = df["close"].iloc[-2]
+    if direction == "advance":
+        pass  # 기본 상승 계열 그대로 사용
+    elif direction == "decline":
+        df.loc[df.index[-1], "close"] = prev_close * 0.99
+    elif direction == "flat":
+        df.loc[df.index[-1], "close"] = prev_close
+    else:
+        raise ValueError(f"unknown direction: {direction}")
+    return df
+
+
+def _stock_info(
+    stk_cd: str,
+    stk_nm: str = "테스트종목",
+    cur_prc: int = 70_000,
+    mrkt_tot_amt: Optional[int] = 1_000,  # ka10001 단위=억원 → 1,000억 — 500억 하한 통과
+    per: Optional[float] = 10.0,
+    pbr: Optional[float] = 1.2,
+    acml_vol: int = 500_000,
+    eps: Optional[int] = 7_000,   # 기본 흑자 — 적자 배제 게이트 통과
+    bps: Optional[int] = 58_000,
+) -> StockBasicInfo:
+    return StockBasicInfo(
+        stk_cd=stk_cd,
+        stk_nm=stk_nm,
+        cur_prc=cur_prc,
+        mrkt_tot_amt=mrkt_tot_amt,
+        per=per,
+        pbr=pbr,
+        acml_vol=acml_vol,
+        eps=eps,
+        bps=bps,
+    )
+
+
+class _FakeStockInfoUnparsablePrice:
+    """StockBasicInfo가 아닌 duck-typed 페이크 — cur_prc가 숫자로 파싱 불가한
+    경우(가격 파싱 실패 드롭 경로)를 재현하려면 pydantic 검증을 우회해야
+    한다(진짜 StockBasicInfo는 cur_prc: int라 애초에 생성이 막힘)."""
+
+    def __init__(self, stk_cd: str):
+        self.stk_cd = stk_cd
+        self.stk_nm = "파싱불가"
+        self.cur_prc = "N/A"  # float() 캐스팅이 ValueError를 던짐
+        self.mrkt_tot_amt = 1_000  # 억원 단위
+        self.per = 10.0
+        self.pbr = 1.0
+        self.acml_vol = 100_000
+
+
+class FakeKiwoomClient:
+    """discovery 스캔이 소비하는 4개 메서드만 구현한 목 클라이언트.
+
+    stock_infos/chart_dfs 값이 Exception 인스턴스면 그 메서드가 그 예외를
+    던진다(수집 실패 시뮬레이션). 기본값(딕셔너리에 없는 종목코드)은
+    RuntimeError를 던진다 — 폴백 유니버스 테스트처럼 전종목을 굳이 목킹하지
+    않고도 "수집 실패=드롭"이 세션 메타데이터 기록을 막지 않음을 확인할 수
+    있게 한다.
+    """
+
+    def __init__(
+        self,
+        stock_infos=None,
+        chart_dfs=None,
+        flow_responses=None,
+        all_stocks_error=None,
+        all_stocks_result=None,
+    ):
+        self._stock_infos = stock_infos or {}
+        self._chart_dfs = chart_dfs or {}
+        self._flow_responses = flow_responses or {}
+        self._all_stocks_error = all_stocks_error
+        # T2: get_all_stocks now returns (stocks, missing_markets). Default
+        # mirrors the pre-T2 "no stub configured" behavior (empty universe,
+        # no missing markets) but shaped as the new tuple contract.
+        self._all_stocks_result = (
+            all_stocks_result if all_stocks_result is not None else ([], [])
+        )
+        self.flow_calls: list[str] = []
+        self.stock_info_calls: list[str] = []
+        self.chart_df_calls: list[str] = []
+        self.get_all_stocks_calls: list[dict] = []
+
+    async def get_stock_info(self, stk_cd: str, ttl=None):
+        self.stock_info_calls.append(stk_cd)
+        val = self._stock_infos.get(stk_cd)
+        if isinstance(val, Exception):
+            raise val
+        if val is None:
+            raise RuntimeError(f"no stub for {stk_cd}")
+        return val
+
+    async def get_daily_chart_df(self, stk_cd: str, base_dt=None, upd_stkpc_tp="1"):
+        self.chart_df_calls.append(stk_cd)
+        val = self._chart_dfs.get(stk_cd)
+        if isinstance(val, Exception):
+            raise val
+        if val is None:
+            raise RuntimeError(f"no chart stub for {stk_cd}")
+        return val
+
+    async def get_inst_foreign_flow(self, mrkt_tp: str = "001"):
+        self.flow_calls.append(mrkt_tp)
+        return self._flow_responses.get(mrkt_tp)
+
+    async def get_all_stocks(
+        self,
+        include_kospi=True,
+        include_kosdaq=True,
+        exclude_warnings=True,
+        exclude_etf_etn=False,  # 목 기본값=False — 스캐너가 명시 전달하는지 검증하기 위함
+    ):
+        self.get_all_stocks_calls.append(
+            {
+                "include_kospi": include_kospi,
+                "include_kosdaq": include_kosdaq,
+                "exclude_warnings": exclude_warnings,
+                "exclude_etf_etn": exclude_etf_etn,
+            }
+        )
+        if self._all_stocks_error is not None:
+            raise self._all_stocks_error
+        return self._all_stocks_result
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    return tmp_path / "scanner_discovery_test.db"
+
+
+@pytest.fixture(autouse=True)
+def patched_db(monkeypatch, db_path):
+    """실 scanner_results.db를 절대 건드리지 않도록 모듈 전역 DB_PATH를
+    tmp 경로로 교체(ds-global-constraints.md: 실 DB 금지)."""
+    monkeypatch.setattr(scanner_module, "DB_PATH", db_path)
+
+
+def _patch_client(monkeypatch, client: FakeKiwoomClient):
+    """scanner.py는 각 메서드 안에서 `from app.core.kiwoom_singleton import
+    get_shared_kiwoom_client_async`를 지역 import하므로, patch 대상은 그
+    지역 import가 attribute lookup 시점에 참조하는 소스 모듈이어야 한다."""
+    monkeypatch.setattr(
+        "app.core.kiwoom_singleton.get_shared_kiwoom_client_async",
+        AsyncMock(return_value=client),
+    )
+
+
+async def _run_scan(scanner: BackgroundScanner, **kwargs):
+    kwargs.setdefault("notify_progress", False)
+    await scanner.start_scan(**kwargs)
+    await scanner._task
+
+
+async def _fetch_rows(db_path, session_id: Optional[str] = None):
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        if session_id:
+            cursor = await db.execute(
+                "SELECT * FROM scan_results WHERE scan_session_id = ?", (session_id,)
+            )
+        else:
+            cursor = await db.execute("SELECT * FROM scan_results")
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# ① discovery 스캔 → factor_json(스코어 4종+atoms) 저장 + 필터→스코어 순서
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_scan_saves_factor_json_with_scores_and_atoms(monkeypatch):
+    """품질 필터를 통과한 종목은 4전략 스코어+_atoms+종가+시총을 factor_json에
+    저장한다. 필터 탈락 종목(사유=insufficient_history)은 스코어 없이
+    skip_reason만 저장돼야 한다 — DS-1 리뷰 이월: 필터가 스코어 계산보다
+    먼저 실행돼야 한다(len<60 ma_alignment 가변 분모 함정 방어선)."""
+    passing_df = _make_chart_df(65)
+    failing_df = _make_chart_df(10)  # len<60 → insufficient_history
+
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "삼성전자"),
+            "000660": _stock_info("000660", "SK하이닉스"),
+        },
+        chart_dfs={
+            "005930": passing_df,
+            "000660": failing_df,
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "삼성전자", "코스피"), ("000660", "SK하이닉스", "코스피")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session_id = sessions[0]["id"]
+    rows = await _fetch_rows(scanner_module.DB_PATH, session_id)
+    by_ticker = {r["stk_cd"]: r for r in rows}
+
+    assert set(by_ticker) == {"005930", "000660"}
+
+    passed_row = by_ticker["005930"]
+    assert passed_row["action"] == "WATCH"
+    fj_passed = json.loads(passed_row["factor_json"])
+    assert fj_passed["quality_filter_passed"] is True
+    assert set(fj_passed["scores"]) == {"momentum", "pullback", "flow", "meanrev"}
+    for v in fj_passed["scores"].values():
+        assert 0.0 <= v <= 1.0
+    assert "atoms" in fj_passed and isinstance(fj_passed["atoms"], dict)
+    # snap.price는 일봉의 마지막 종가가 아니라 ka10001(get_stock_info)의
+    # 현재가(cur_prc)에서 온다 - 실시간 현재가가 일봉의 전일 종가보다 우선.
+    assert fj_passed["close_price"] == pytest.approx(70_000.0)
+    assert fj_passed["market_cap"] == pytest.approx(100_000_000_000.0)
+
+    failed_row = by_ticker["000660"]
+    assert failed_row["action"] == "WATCH"
+    fj_failed = json.loads(failed_row["factor_json"])
+    assert fj_failed["quality_filter_passed"] is False
+    assert fj_failed["skip_reason"] == "insufficient_history"
+    # 필터 탈락 종목은 스코어를 계산하지 않는다(스코어 없음).
+    assert "scores" not in fj_failed
+    assert "atoms" not in fj_failed
+
+
+# ---------------------------------------------------------------------------
+# ② 수집 실패 종목 = 행 미저장(드롭), 가짜 HOLD 절대 금지
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_scan_drops_collection_failures_no_fake_hold(monkeypatch):
+    """예외로 실패한 종목(ka10001/ka10081 둘 중 하나)과 가격 파싱 불가 종목은
+    scan_results에 행 자체가 남지 않아야 한다 — quick 모드의 action=HOLD/
+    confidence=0.5/price=0 폴백을 discovery 모드에 재현하면 안 된다."""
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": Exception("kiwoom timeout (ka10001)"),  # 예외
+            "000660": _FakeStockInfoUnparsablePrice("000660"),  # 가격 파싱 불가
+            "035420": _stock_info("035420", "NAVER"),
+        },
+        chart_dfs={
+            "005930": _make_chart_df(65),
+            "000660": _make_chart_df(65),
+            "035420": Exception("kiwoom timeout (ka10081)"),  # 예외
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "삼성전자", "코스피"),
+            ("000660", "SK하이닉스", "코스피"),
+            ("035420", "NAVER", "코스피"),
+        ],
+        mode="discovery",
+    )
+
+    rows = await _fetch_rows(scanner_module.DB_PATH)
+    assert rows == [], "수집 실패 종목은 행 자체가 저장되면 안 된다(가짜 HOLD 금지)"
+
+    # 메모리상 결과에도 남지 않아야 하고, 실패로 집계돼야 한다.
+    assert scanner.get_results() == []
+    progress = scanner.get_progress()
+    assert progress.failed == 3
+    assert progress.completed == 0
+
+
+# ---------------------------------------------------------------------------
+# ③ 유니버스 폴백 시 universe_fallback=1 + scan_mode 기록
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_scan_records_universe_fallback_and_scan_mode(monkeypatch):
+    """get_all_stocks 실패 → _get_fallback_stock_list 사용 → scan_sessions에
+    universe_fallback=1과 scan_mode='discovery'가 기록돼야 한다. 폴백
+    유니버스 종목들의 개별 수집 성패는 이 테스트의 관심사가 아니다(전부
+    실패해도 세션 메타데이터는 기록되어야 함)."""
+    client = FakeKiwoomClient(all_stocks_error=RuntimeError("kiwoom list unavailable"))
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=None, mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session["universe_fallback"] == 1
+    assert session["scan_mode"] == "discovery"
+    # 폴백 유니버스(_get_fallback_stock_list)의 고정 15종목이 그대로 총량.
+    assert session["total_stocks"] == 15
+
+
+async def test_non_discovery_scan_records_no_universe_fallback(monkeypatch):
+    """폴백이 발생하지 않은 정상 세션은 universe_fallback=0으로 기록돼야
+    한다(양성 대조)."""
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자")},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert sessions[0]["universe_fallback"] == 0
+    assert sessions[0]["scan_mode"] == "discovery"
+
+
+# ---------------------------------------------------------------------------
+# T2 (발굴 유니버스 rate-limit 회복): KOSDAQ만 실패해도 KOSPI 실 유니버스는
+# 그대로 쓰고 universe_partial에 기록 -- universe_fallback(15개 하드코딩)과는
+# 구분되는, 승격 허용 대상.
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_scan_records_universe_partial_when_one_market_missing(monkeypatch):
+    """get_all_stocks가 (KOSPI 2종목, missing=["KOSDAQ"])를 반환하면
+    _load_stock_list은 그 실 데이터를 그대로 쓴다 -- 15개 하드코딩 폴백으로
+    떨어지지 않는다. universe_fallback=0(승격 억제 아님) +
+    universe_partial='KOSDAQ'로 기록돼야 한다."""
+    kospi_items = [
+        StockListItem(code="005930", name="삼성전자", market_name="코스피"),
+        StockListItem(code="000660", name="SK하이닉스", market_name="코스피"),
+    ]
+    client = FakeKiwoomClient(all_stocks_result=(kospi_items, ["KOSDAQ"]))
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=None, mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["universe_fallback"] == 0
+    assert session["universe_partial"] == "KOSDAQ"
+    # 15개 하드코딩 폴백이 아니라 실 KOSPI 유니버스(2종목) 그대로.
+    assert session["total_stocks"] == 2
+
+
+async def test_discovery_scan_no_universe_partial_when_both_markets_succeed(monkeypatch):
+    """양 시장 모두 성공하면 universe_partial이 기록되지 않아야 한다(양성
+    대조 -- NULL/falsy)."""
+    kospi_items = [StockListItem(code="005930", name="삼성전자", market_name="코스피")]
+    client = FakeKiwoomClient(all_stocks_result=(kospi_items, []))
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=None, mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["universe_fallback"] == 0
+    assert not session["universe_partial"]
+
+
+# ---------------------------------------------------------------------------
+# DQ-1: _load_stock_list이 get_all_stocks에 exclude_etf_etn=True를 전달
+# ---------------------------------------------------------------------------
+
+
+async def test_load_stock_list_requests_etf_etn_exclusion(monkeypatch):
+    """discovery 스캔이 stock_list=None(자동 유니버스 로드)이면
+    _load_stock_list가 client.get_all_stocks를 exclude_etf_etn=True로
+    호출해야 한다 — ETN/스팩 혼입 방지(DQ-1)."""
+    client = FakeKiwoomClient()
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=None, mode="discovery")
+
+    assert len(client.get_all_stocks_calls) == 1
+    assert client.get_all_stocks_calls[0]["exclude_etf_etn"] is True
+
+
+# ---------------------------------------------------------------------------
+# ④ quick 모드 기존 거동 불변(동일 목으로 병행 대조)
+# ---------------------------------------------------------------------------
+
+
+async def test_quick_mode_unchanged_with_same_failing_mock(monkeypatch, tmp_path):
+    """discovery 모드가 드롭하는 바로 그 실패 종목이라도, quick 모드는 기존
+    그대로 action=HOLD/confidence=0.5/current_price=0의 폴백 ScanResult를
+    저장해야 한다(byte-무변경 불변식 회귀 고정) — factor_json은 NULL.
+
+    두 서브 스캔은 별도 tmp DB를 쓴다 — session_id가 초 단위 타임스탬프라
+    같은 DB에 몰아넣으면 같은 초 안에 시작된 두 세션이 PK 충돌을 일으킬 수
+    있다(스캐너 자체의 기존 한계이지 이 테스트가 검증할 대상이 아님)."""
+    failing_client = FakeKiwoomClient(
+        stock_infos={"005930": Exception("kiwoom timeout (ka10001)")},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, failing_client)
+
+    # -- quick 모드 (mode 인자 생략 = 레거시 기본) --
+    quick_db = tmp_path / "quick.db"
+    monkeypatch.setattr(scanner_module, "DB_PATH", quick_db)
+    quick_scanner = BackgroundScanner()
+    await _run_scan(
+        quick_scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+    )
+
+    quick_results = quick_scanner.get_results()
+    assert len(quick_results) == 1
+    r = quick_results[0]
+    assert r.action == "HOLD"
+    assert r.confidence == 0.5
+    assert r.current_price == 0
+    assert r.summary.startswith("분석 실패:")
+
+    rows = await _fetch_rows(quick_db)
+    assert len(rows) == 1
+    assert rows[0]["action"] == "HOLD"
+    assert rows[0]["factor_json"] is None
+
+    # -- 같은 목으로 discovery 모드를 병행 실행 → 대조적으로 드롭돼야 함 --
+    discovery_db = tmp_path / "discovery.db"
+    monkeypatch.setattr(scanner_module, "DB_PATH", discovery_db)
+    discovery_scanner = BackgroundScanner()
+    await _run_scan(
+        discovery_scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+        mode="discovery",
+    )
+    assert discovery_scanner.get_results() == []
+
+
+# ---------------------------------------------------------------------------
+# ⑤ ka10131은 스캔당 시장별(KOSPI/KOSDAQ) 정확히 1콜 — 종목별 재호출 금지
+# ---------------------------------------------------------------------------
+
+
+async def test_flow_fetched_exactly_once_per_market(monkeypatch):
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "삼성전자"),
+            "000660": _stock_info("000660", "SK하이닉스"),
+            "035420": _stock_info("035420", "NAVER"),
+        },
+        chart_dfs={
+            "005930": _make_chart_df(65),
+            "000660": _make_chart_df(65),
+            "035420": _make_chart_df(65),
+        },
+        flow_responses={
+            "001": [{"stk_cd": "005930", "orgn_net_amt": 1e9, "frgnr_net_amt": 2e9,
+                      "orgn_cont_days": 3, "frgnr_cont_days": 4}],
+            "101": [{"stk_cd": "035420", "orgn_net_amt": 5e8, "frgnr_net_amt": 1e8,
+                      "orgn_cont_days": 1, "frgnr_cont_days": 0}],
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "삼성전자", "코스피"),
+            ("000660", "SK하이닉스", "코스피"),
+            ("035420", "NAVER", "코스닥"),
+        ],
+        mode="discovery",
+    )
+
+    # 종목 수(3)와 무관하게 시장별 정확히 1콜(KOSPI+KOSDAQ)=총 2콜.
+    assert client.flow_calls == ["001", "101"]
+
+    # 랭킹에 존재하는 005930의 factor_json에 flow 성분이 반영됐는지도 확인
+    # (재사용이 실제로 스코어 계산에 도달했다는 방증).
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    by_ticker = {r["stk_cd"]: json.loads(r["factor_json"]) for r in rows}
+    assert by_ticker["005930"]["atoms"]["flow_rank"] == 1
+    assert by_ticker["000660"]["scores"]["flow"] == 0.0  # 랭킹 밖
+
+
+# ---------------------------------------------------------------------------
+# DQ-2: factor_json에 flow_present bool 저장(왕복) -- ranker._effective_
+# weights 재정규화의 1차 소스.
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_scan_records_flow_present_flag_in_factor_json(monkeypatch):
+    """flow_map(ka10131 랭킹)에 존재하는 종목은 factor_json 최상위에
+    flow_present=True, 없는 종목은 flow_present=False가 저장돼야 한다 --
+    DB round-trip(json.dumps -> sqlite -> json.loads) 후에도 bool 그대로
+    보존."""
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "삼성전자"),
+            "000660": _stock_info("000660", "SK하이닉스"),
+        },
+        chart_dfs={
+            "005930": _make_chart_df(65),
+            "000660": _make_chart_df(65),
+        },
+        flow_responses={
+            "001": [{"stk_cd": "005930", "orgn_net_amt": 1e9, "frgnr_net_amt": 2e9,
+                      "orgn_cont_days": 3, "frgnr_cont_days": 4}],
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "삼성전자", "코스피"),
+            ("000660", "SK하이닉스", "코스피"),
+        ],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    by_ticker = {r["stk_cd"]: json.loads(r["factor_json"]) for r in rows}
+
+    assert by_ticker["005930"]["flow_present"] is True
+    assert by_ticker["000660"]["flow_present"] is False
+
+
+# ---------------------------------------------------------------------------
+# ⑥ discovery 모드에서 기존 자동 승격 비발화(auto_promote_enabled와 무관)
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_mode_never_auto_promotes(monkeypatch):
+    """auto_promote_enabled=True + confidence 임계 0.0(그냥 통과 조건)로
+    일부러 레거시 프로모션 조건을 만족시켜도, discovery 모드에서는 절대
+    watch-list에 아무 것도 승격되면 안 된다(랭킹·판정은 DS-4 전용)."""
+    import app.dependencies as deps
+
+    coordinator = ExecutionCoordinator(kiwoom_client=None)
+    monkeypatch.setattr(deps, "get_trading_coordinator", AsyncMock(return_value=coordinator))
+
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자")},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+        mode="discovery",
+        auto_promote_enabled=True,
+        promote_confidence_threshold=0.0,
+        promote_max_count=10,
+    )
+
+    # discovery 결과는 action='WATCH' 고정이라, 가드가 없다면 confidence 0.0
+    # >= 임계 0.0 조건에 걸려 레거시 프로모션이 발화했을 것이다.
+    result = scanner.get_results()[0]
+    assert result.action == "WATCH"
+    assert coordinator.get_watch_list() == [], "discovery 모드는 승격을 절대 발화시키면 안 된다"
+
+
+# ---------------------------------------------------------------------------
+# ⑦ discovery 세션 buy/sell/hold_count = advance/decline/flat breadth
+#    (DS-2 리뷰픽스: action='WATCH' 고정이라 세션 카운트가 전부 watch_count로
+#    몰려 regime.py의 breadth가 항상 0.0/neutral로 오염되던 결함 봉합)
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_session_counts_reflect_advance_decline_flat_breadth(monkeypatch):
+    """세션 buy/sell/hold_count는 discovery 종목의 등락 방향(advance/decline/
+    flat, chart_df 마지막 2개 종가 비교)을 반영해야 한다 — 종전처럼
+    action='WATCH' 고정 매핑(watch_count에만 집계)이면 buy/sell/hold가 전부
+    0이 돼 regime.py의 breadth가 오염된다. 행 수준 action='WATCH'는
+    유지되어야 한다(행 수준 의미 무변경 — 세션 집계만 유의미화)."""
+    advancing_1 = _make_chart_df(65)
+    advancing_2 = _make_chart_df(65, start=30_000.0)
+    declining = _chart_df_with_last_move("decline")
+    flat = _chart_df_with_last_move("flat")
+
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "AdvA"),
+            "000660": _stock_info("000660", "AdvB"),
+            "035420": _stock_info("035420", "Decl"),
+            "005380": _stock_info("005380", "Flat"),
+        },
+        chart_dfs={
+            "005930": advancing_1,
+            "000660": advancing_2,
+            "035420": declining,
+            "005380": flat,
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "AdvA", "코스피"),
+            ("000660", "AdvB", "코스피"),
+            ("035420", "Decl", "코스피"),
+            ("005380", "Flat", "코스피"),
+        ],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["buy_count"] == 2
+    assert session["sell_count"] == 1
+    assert session["hold_count"] == 1
+
+    # 행 수준 action은 여전히 WATCH 고정(회귀 고정 — 세션 집계만 유의미화).
+    rows = await _fetch_rows(scanner_module.DB_PATH, session["id"])
+    assert len(rows) == 4
+    assert all(r["action"] == "WATCH" for r in rows)
+
+
+async def test_discovery_session_counts_include_quality_filter_rejects(monkeypatch):
+    """품질 필터에서 탈락(예: 시총 미달)해도 차트 수집에 성공했다면 breadth
+    카운트에는 포함돼야 한다 — breadth는 시장 전체 내부 지표이지 필터 통과
+    종목만의 지표가 아니다."""
+    client = FakeKiwoomClient(
+        stock_infos={
+            # 시총 10억 — DEFAULT_MIN_MARKET_CAP(500억) 미달 -> 품질 필터 탈락
+            "005930": _stock_info("005930", "SmallCap", mrkt_tot_amt=100),
+        },
+        chart_dfs={"005930": _make_chart_df(65)},  # 상승 계열
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "SmallCap", "코스피")],
+        mode="discovery",
+    )
+
+    # 사전조건: 실제로 품질 필터에서 탈락했는지 확인.
+    rows = await _fetch_rows(scanner_module.DB_PATH)
+    assert len(rows) == 1
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is False
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    # 상승(advance) 종목이므로 필터 탈락과 무관하게 buy_count에 집계된다.
+    assert sessions[0]["buy_count"] == 1
+    assert sessions[0]["sell_count"] == 0
+    assert sessions[0]["hold_count"] == 0
+
+
+async def test_discovery_session_counts_exclude_collection_failures(monkeypatch):
+    """수집 자체가 실패(예외/가격 파싱 불가)한 종목은 breadth 카운트에도
+    포함되면 안 된다 — 성공 2종목(상승1·하락1) + 실패 1종목 혼합 시
+    buy=1, sell=1, hold=0이어야 하고 실패 종목의 흔적이 카운트에 없어야
+    한다."""
+    declining = _chart_df_with_last_move("decline")
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "Adv"),
+            "035420": _stock_info("035420", "Decl"),
+            "000660": Exception("kiwoom timeout (ka10001)"),  # 수집 실패
+        },
+        chart_dfs={
+            "005930": _make_chart_df(65),
+            "035420": declining,
+            "000660": _make_chart_df(65),
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "Adv", "코스피"),
+            ("035420", "Decl", "코스피"),
+            ("000660", "Fail", "코스피"),
+        ],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["buy_count"] == 1
+    assert session["sell_count"] == 1
+    assert session["hold_count"] == 0
+    assert session["failed"] == 1
+
+    rows = await _fetch_rows(scanner_module.DB_PATH, session["id"])
+    assert len(rows) == 2  # 실패 종목 행 없음(가짜 HOLD 금지, 기존 불변식)
+
+
+async def test_regime_snapshot_consumes_discovery_breadth_end_to_end(monkeypatch):
+    """통합-lite: discovery 세션이 tmp scanner DB에 저장된 뒤
+    regime.compute_regime_snapshot이 그 buy/sell/hold_count를 읽어
+    breadth_ratio를 유의미하게 산출해야 한다 — 수정 전에는 discovery
+    세션의 action이 전부 'WATCH'라 buy/sell/hold=0 고정 -> breadth_ratio는
+    항상 0.0/regime_label은 항상 'neutral'로 강제됐다."""
+    from services.trading.regime import compute_regime_snapshot
+
+    advancing_1 = _make_chart_df(65)
+    advancing_2 = _make_chart_df(65, start=30_000.0)
+    declining = _chart_df_with_last_move("decline")
+    flat = _chart_df_with_last_move("flat")
+
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "AdvA"),
+            "000660": _stock_info("000660", "AdvB"),
+            "035420": _stock_info("035420", "Decl"),
+            "005380": _stock_info("005380", "Flat"),
+        },
+        chart_dfs={
+            "005930": advancing_1,
+            "000660": advancing_2,
+            "035420": declining,
+            "005380": flat,
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "AdvA", "코스피"),
+            ("000660", "AdvB", "코스피"),
+            ("035420", "Decl", "코스피"),
+            ("005380", "Flat", "코스피"),
+        ],
+        mode="discovery",
+    )
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    record = compute_regime_snapshot(str(scanner_module.DB_PATH), today)
+
+    assert record is not None
+    assert record["breadth_buy"] == 2
+    assert record["breadth_sell"] == 1
+    assert record["breadth_hold"] == 1
+    # (buy - sell) / (buy + sell + hold) = (2 - 1) / 4 = 0.25
+    assert record["breadth_ratio"] == pytest.approx(0.25)
+
+    # 실코드 임계값(EOD_REGIME_BREADTH_THRESHOLD, 기본 0.15)을 직접 읽어
+    # 레이블 경계를 하드코딩하지 않고 단언한다.
+    from app.config import get_settings
+
+    threshold = get_settings().EOD_REGIME_BREADTH_THRESHOLD
+    assert record["breadth_ratio"] > threshold, (
+        "테스트 픽스처(0.25)가 임계값보다 커야 non-neutral 레이블을 검증할 수 있다"
+    )
+    assert record["regime_label"] == "risk_on"
+
+
+# ---------------------------------------------------------------------------
+# SC-1: stop_scan orphan-fix — status='partial' 종결 + 부분 breadth 반영
+#
+# 실측 사고: discovery EOD 스캔이 90분 타임아웃으로 stop_scan 호출 시
+# scan_sessions row가 status='running'인 채 영구 고아로 남아, regime.py·
+# ranker.py의 `WHERE status = 'completed'` 게이트가 0건을 반환 → 84%
+# 스캔(3700/4276)이 breadth·랭킹에 통째로 미반영됐다.
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_scan_marks_running_session_partial_with_saved_count(monkeypatch):
+    """타임아웃/수동 stop처럼 스캔 도중 stop_scan()이 호출되면, 세션 row는
+    status='partial'로 명시 종결되어야 하고(수정 전 RED=영구 'running' 고아),
+    completed는 그 시점까지 실제로 scan_results에 저장된 행 수와 일치해야
+    한다. 배치 2(10종목)는 release Event로 블록해 배치 1(50종목=discovery
+    QUICK_BATCH_SIZE)만 저장된 상태에서 stop_scan을 호출하도록 결정적으로
+    구성한다."""
+    batch1 = [(f"{100000 + i:06d}", f"S1-{i}", "코스피") for i in range(50)]
+    batch2 = [(f"{200000 + i:06d}", f"S2-{i}", "코스피") for i in range(10)]
+    stock_list = batch1 + batch2
+
+    stock_infos = {code: _stock_info(code, name) for code, name, _ in stock_list}
+    chart_dfs = {code: _make_chart_df(65) for code, _, _ in stock_list}
+
+    blocked_codes = {code for code, _, _ in batch2}
+    release = asyncio.Event()
+
+    class _SlowClient(FakeKiwoomClient):
+        async def get_daily_chart_df(self, stk_cd: str, base_dt=None, upd_stkpc_tp="1"):
+            if stk_cd in blocked_codes:
+                await release.wait()
+            return await super().get_daily_chart_df(
+                stk_cd, base_dt=base_dt, upd_stkpc_tp=upd_stkpc_tp
+            )
+
+    client = _SlowClient(stock_infos=stock_infos, chart_dfs=chart_dfs)
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+
+    # 배치 1 저장 완료를 결정적으로 대기하기 위한 훅 — 배치 2(블록됨)가
+    # 저장되기 전에 정확히 stop_scan()을 호출할 수 있게 한다.
+    batch1_saved = asyncio.Event()
+    original_save = BackgroundScanner._save_discovery_results_batch
+
+    async def _tracking_save(self, pairs, session_id):
+        await original_save(self, pairs, session_id)
+        batch1_saved.set()
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_save_discovery_results_batch", _tracking_save
+    )
+
+    await scanner.start_scan(
+        stock_list=stock_list, mode="discovery", notify_progress=False
+    )
+
+    await asyncio.wait_for(batch1_saved.wait(), timeout=5)
+
+    # 사전조건: 배치 1만 저장된 상태(배치 2는 아직 release 대기 중).
+    rows_before_stop = await _fetch_rows(scanner_module.DB_PATH)
+    assert len(rows_before_stop) == 50
+
+    await scanner.stop_scan()
+
+    # stop_scan이 취소한 태스크가 실제로 풀릴 때까지 대기(CancelledError는
+    # 정상 종료 신호 — 여기서 흡수).
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(scanner._task, timeout=5)
+
+    release.set()  # 방어적 정리(배치 2가 취소로 이미 풀렸어야 함)
+
+    rows = await _fetch_rows(scanner_module.DB_PATH)
+    assert len(rows) == 50, "배치 2는 취소돼 저장되면 안 된다"
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    session = sessions[0]
+    assert session["status"] == "partial", (
+        "수정 전에는 stop_scan이 세션을 'running'으로 영구 고아 상태로 "
+        "남겼다(RED)"
+    )
+    assert session["completed"] == 50, "completed는 실제 저장된 행 수와 일치해야 한다"
+
+
+async def test_stop_scan_noop_when_no_scan_running():
+    """스캔이 실행 중이 아닐 때 stop_scan()은 아무 것도 하지 않아야 한다
+    (세션도 없고 예외도 없어야 함)."""
+    scanner = BackgroundScanner()
+    await scanner.stop_scan()  # 예외 없이 조용히 반환
+
+    sessions = await scanner.get_scan_sessions(limit=10)
+    assert sessions == []
+
+
+async def test_normal_completion_session_status_still_completed(monkeypatch):
+    """정상 완주 세션은 여전히 status='completed'여야 한다(SC-1의
+    `_save_session_complete` 무변경 불변식 회귀 고정)."""
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자")},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert sessions[0]["status"] == "completed"
+    assert sessions[0]["completed"] == 1
+
+
+
+# ---------------------------------------------------------------------------
+# SC-3: 관측성/정합 -- partial 종결이 로그+Telegram 통지에 "부분 완주
+# N/M(X%) -- breadth 반영, 승격 보류"로 명시돼야 한다(오늘 사건: "분석 중지"
+# 문구만 보여 84% 완주가 전면 폐기된 것으로 오인됨). 정상 완료 통지
+# (_send_scan_summary)는 이 태스크로 완전 무접촉이어야 한다(byte-불변).
+# ---------------------------------------------------------------------------
+
+
+async def _start_scan_then_stop_partial(monkeypatch, *, notify_progress: bool, reason: str):
+    """FI-1 테스트 헬퍼: 배치1(50종목)만 저장된 상태에서
+    `stop_scan(reason=reason)`을 호출한다(배치2=10종목은 release Event로
+    블록해 부분 완주 50/60을 결정적으로 재현). `(scanner, sent_messages)`를
+    반환 -- 호출부가 발신 Telegram 메시지와 DB 세션 행 양쪽을 검사할 수
+    있게 한다. 호출부는 매번 새 db_path(pytest tmp_path, 함수 스코프)에서
+    실행돼야 세션 id(초 단위 타임스탬프) 충돌이 없다 -- 이 헬퍼를 같은
+    테스트 함수 안에서 반복 호출하지 말 것(파라미터화된 별도 테스트로
+    분리)."""
+    batch1 = [(f"{100000 + i:06d}", f"S1-{i}", "코스피") for i in range(50)]
+    batch2 = [(f"{200000 + i:06d}", f"S2-{i}", "코스피") for i in range(10)]
+    stock_list = batch1 + batch2
+
+    stock_infos = {code: _stock_info(code, name) for code, name, _ in stock_list}
+    chart_dfs = {code: _make_chart_df(65) for code, _, _ in stock_list}
+
+    blocked_codes = {code for code, _, _ in batch2}
+    release = asyncio.Event()
+
+    class _SlowClient(FakeKiwoomClient):
+        async def get_daily_chart_df(self, stk_cd: str, base_dt=None, upd_stkpc_tp="1"):
+            if stk_cd in blocked_codes:
+                await release.wait()
+            return await super().get_daily_chart_df(
+                stk_cd, base_dt=base_dt, upd_stkpc_tp=upd_stkpc_tp
+            )
+
+    client = _SlowClient(stock_infos=stock_infos, chart_dfs=chart_dfs)
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+
+    batch1_saved = asyncio.Event()
+    original_save = BackgroundScanner._save_discovery_results_batch
+
+    async def _tracking_save(self, pairs, session_id):
+        await original_save(self, pairs, session_id)
+        batch1_saved.set()
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_save_discovery_results_batch", _tracking_save
+    )
+
+    sent_messages = []
+
+    async def _capture_telegram(self, message):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_send_telegram_notification", _capture_telegram
+    )
+
+    await scanner.start_scan(
+        stock_list=stock_list, mode="discovery", notify_progress=notify_progress
+    )
+    await asyncio.wait_for(batch1_saved.wait(), timeout=5)
+
+    await scanner.stop_scan(reason=reason)
+    with contextlib.suppress(asyncio.CancelledError):
+        await asyncio.wait_for(scanner._task, timeout=5)
+
+    release.set()  # 방어적 정리(배치 2가 취소로 이미 풀렸어야 함)
+
+    return scanner, sent_messages
+
+
+async def test_stop_scan_partial_notification_shows_n_of_m_percent(monkeypatch, caplog):
+    """FI-1 게이트가 열린 경로(notify_progress=True + reason="timeout")에서
+    stop_scan()이 partial 종결하면, Telegram 통지 문구와 로그 양쪽에
+    "부분 완주 50/60(83.3%) -- breadth 반영, 승격 보류"가 그대로 노출돼야
+    한다. 배치1(50종목)만 저장된 상태에서 stop -- completed=50/total=60."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger=scanner_module.__name__):
+        scanner, sent_messages = await _start_scan_then_stop_partial(
+            monkeypatch, notify_progress=True, reason="timeout"
+        )
+
+    expected_note = "부분 완주 50/60(83.3%) — breadth 반영, 승격 보류"
+
+    # notify_progress=True는 start_scan() 자신의 "시작" 통지(:458, FI-1과
+    # 무관하게 이미 게이트돼 있던 별개 지점)도 함께 내보낸다 -- stop 통지만
+    # 골라 검사한다.
+    stop_messages = [m for m in sent_messages if m.startswith("⏹")]
+    assert len(stop_messages) == 1
+    assert "⏹ *백그라운드 분석 중지*" in stop_messages[0]
+    assert "분석 완료: 50/60" in stop_messages[0]
+    assert expected_note in stop_messages[0]
+
+    matching = [r for r in caplog.records if expected_note in r.getMessage()]
+    assert len(matching) == 1, (
+        "partial 종결 로그에 '부분 완주 N/M(X%) -- breadth 반영, 승격 보류' "
+        "문구가 명시돼야 한다(게이트는 Telegram 발신에만 걸리고 로그는 "
+        "reason/notify_progress 무관하게 항상 남는다)"
+    )
+
+
+async def test_stop_scan_noop_leaves_no_partial_notification(monkeypatch):
+    """스캔이 실행 중이 아닐 때 stop_scan()은 partial 통지도 전혀 보내지
+    않아야 한다(SC-1의 no-op 가드가 SC-3 문구 추가로도 깨지지 않음)."""
+    sent_messages = []
+
+    async def _capture_telegram(self, message):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_send_telegram_notification", _capture_telegram
+    )
+
+    scanner = BackgroundScanner()
+    await scanner.stop_scan()
+
+    assert sent_messages == []
+
+
+async def test_stop_scan_notify_progress_false_suppresses_timeout_notification(monkeypatch):
+    """FI-1 ① (현행 RED=무조건 발송): notify_progress=False로 시작된 스캔이
+    reason="timeout"(coordinator의 watchdog 정리 경로)으로 stop되면, partial
+    Telegram 통지가 전혀 발송되면 안 된다 -- 오늘 4276종목 EOD 스캔
+    (notify_progress=False)이 타임아웃 시에도 통지를 보낸 실사고의 재현."""
+    scanner, sent_messages = await _start_scan_then_stop_partial(
+        monkeypatch, notify_progress=False, reason="timeout"
+    )
+
+    assert sent_messages == []
+
+    # DB에는 여전히 partial로 기록돼야 한다(통지 억제가 SC-1 영속을 깨면
+    # 안 된다 -- ⑤ 항목과 상보).
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert sessions[0]["status"] == "partial"
+    assert sessions[0]["completed"] == 50
+
+
+async def test_stop_scan_reason_manual_suppresses_notification_unconditionally(monkeypatch):
+    """FI-1 ②: reason="manual"(FE의 POST /scanner/stop)은 notify_progress가
+    True(즉 게이트가 원래 열려 있었을) 스캔이라도 통지를 무조건 억제한다 --
+    방금 Stop을 누른 사용자에게 그 사실을 다시 알릴 필요가 없다."""
+    scanner, sent_messages = await _start_scan_then_stop_partial(
+        monkeypatch, notify_progress=True, reason="manual"
+    )
+
+    # notify_progress=True는 start_scan() 자신의 "시작" 통지를 여전히
+    # 내보낸다(FI-1과 무관, 이미 게이트돼 있던 별개 지점) -- reason="manual"이
+    # 억제하는 건 stop_scan()의 partial 통지뿐이다.
+    assert not any(m.startswith("⏹") for m in sent_messages), (
+        "reason='manual'은 partial 중지 통지를 무조건 억제해야 한다"
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert sessions[0]["status"] == "partial"
+    assert sessions[0]["completed"] == 50
+
+
+@pytest.mark.parametrize("reason", ["manual", "timeout"])
+@pytest.mark.parametrize("notify_progress", [True, False])
+async def test_stop_scan_partial_db_write_unconditional_across_all_reason_combos(
+    monkeypatch, notify_progress, reason
+):
+    """FI-1 ⑤: _save_session_partial의 DB 영속은 reason/notify_progress
+    조합과 무관하게 항상 일어나야 한다(통지 게이트가 실수로 DB 기록까지
+    감싸면 SC-1이 재발한다). manual/timeout x notify_progress True/False
+    네 조합 전부(파라미터화, 각자 독립 tmp DB) 전부에서 partial +
+    completed=50이 기록되는지 확인한다."""
+    scanner, _ = await _start_scan_then_stop_partial(
+        monkeypatch, notify_progress=notify_progress, reason=reason
+    )
+    sessions = await scanner.get_scan_sessions(limit=1)
+    assert sessions[0]["status"] == "partial"
+    assert sessions[0]["completed"] == 50
+
+
+async def test_normal_completion_telegram_message_byte_invariant(monkeypatch):
+    """SC-3: 정상 완료 Telegram 통지(_send_scan_summary)는 이번 태스크로
+    한 바이트도 바뀌면 안 된다 -- SC-3의 partial 문구는 stop_scan() 경로
+    (_save_session_partial이 관여하는 경로)에만 추가되고, 정상 완주 경로의
+    _send_scan_summary는 완전 무접촉이어야 한다."""
+    scanner = BackgroundScanner()
+    scanner._progress.total_stocks = 100
+    scanner._progress.completed = 100
+    scanner._progress.failed = 0
+    scanner._progress.buy_count = 40
+    scanner._progress.sell_count = 10
+    scanner._progress.hold_count = 30
+    scanner._progress.watch_count = 15
+    scanner._progress.avoid_count = 5
+    scanner._progress.started_at = datetime(2026, 7, 20, 9, 0, 0)
+    scanner._progress.completed_at = datetime(2026, 7, 20, 9, 30, 0)
+
+    sent_messages = []
+
+    async def _capture_telegram(self, message):
+        sent_messages.append(message)
+
+    monkeypatch.setattr(
+        BackgroundScanner, "_send_telegram_notification", _capture_telegram
+    )
+
+    await scanner._send_scan_summary()
+
+    assert len(sent_messages) == 1
+    expected = (
+        "✅ *백그라운드 분석 완료*\n\n"
+        "📊 *분석 결과*\n"
+        "• 총 분석: 100개\n"
+        "• 완료: 100개\n"
+        "• 실패: 0개\n\n"
+        "📈 *추천 분포*\n"
+        "• 매수(BUY): 40개\n"
+        "• 매도(SELL): 10개\n"
+        "• 보유(HOLD): 30개\n"
+        "• 관망(WATCH): 15개\n"
+        "• 회피(AVOID): 5개\n\n"
+        "⏱ 소요 시간: 30.0분\n\n"
+        "_결과는 Scanner Results 탭에서 확인하세요_"
+    )
+    assert sent_messages[0] == expected
+    assert "부분 완주" not in sent_messages[0]
+
+
+# ---------------------------------------------------------------------------
+# FI-D3: 고아 세션 리컨실 -- 기동 시 status='running' 잔재 -> 'aborted'
+#
+# 실측 사고: 오늘(20260720153027) 프로세스가 재시작되며 status='running'
+# 세션이 영구 고아로 남았다(stop_scan을 거치지 않고 프로세스가 죽은 경우라
+# _save_session_partial도 결코 호출되지 못한다 -- FI-1의 게이트/reason
+# 수정으로는 못 잡는 별개의 실패 모드).
+# ---------------------------------------------------------------------------
+
+
+async def test_reconcile_orphan_scan_sessions_marks_running_aborted():
+    """기동 시 리컨실은 status='running'인 행을 전부 'aborted'로 바꾸고,
+    반환값으로 몇 건을 고쳤는지 보고해야 한다."""
+    scanner = BackgroundScanner()
+    await scanner._init_db()
+
+    async with aiosqlite.connect(scanner_module.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260720153027", datetime(2026, 7, 20, 15, 30, 27), 4276, "running"),
+        )
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260719090000", datetime(2026, 7, 19, 9, 0, 0), 100, "running"),
+        )
+        await db.commit()
+
+    reconciled = await scanner.reconcile_orphan_scan_sessions()
+    assert reconciled == 2
+
+    sessions = {
+        s["id"]: s["status"] for s in await scanner.get_scan_sessions(limit=10)
+    }
+    assert sessions["20260720153027"] == "aborted"
+    assert sessions["20260719090000"] == "aborted"
+
+
+async def test_reconcile_orphan_scan_sessions_leaves_completed_and_partial_untouched():
+    """리컨실은 status='completed'/'partial' 행은 절대 건드리면 안 된다 --
+    regime.py/ranker.py의 `status IN ('completed', 'partial')` 게이트가
+    소비하는 정상 breadth 데이터이므로 SC-1이 재발하면 안 된다."""
+    scanner = BackgroundScanner()
+    await scanner._init_db()
+
+    async with aiosqlite.connect(scanner_module.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260718090000", datetime(2026, 7, 18, 9, 0, 0), 100, "completed"),
+        )
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260717090000", datetime(2026, 7, 17, 9, 0, 0), 100, "partial"),
+        )
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260720153027", datetime(2026, 7, 20, 15, 30, 27), 4276, "running"),
+        )
+        await db.commit()
+
+    reconciled = await scanner.reconcile_orphan_scan_sessions()
+    assert reconciled == 1
+
+    sessions = {
+        s["id"]: s["status"] for s in await scanner.get_scan_sessions(limit=10)
+    }
+    assert sessions["20260718090000"] == "completed"
+    assert sessions["20260717090000"] == "partial"
+    assert sessions["20260720153027"] == "aborted"
+
+
+async def test_reconcile_orphan_scan_sessions_no_running_rows_is_noop():
+    """running 행이 하나도 없으면(정상 재시작 직후 등) 0을 반환하고 아무
+    행도 바뀌지 않는다."""
+    scanner = BackgroundScanner()
+    await scanner._init_db()
+
+    async with aiosqlite.connect(scanner_module.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO scan_sessions (id, started_at, total_stocks, status) "
+            "VALUES (?, ?, ?, ?)",
+            ("20260718090000", datetime(2026, 7, 18, 9, 0, 0), 100, "completed"),
+        )
+        await db.commit()
+
+    reconciled = await scanner.reconcile_orphan_scan_sessions()
+    assert reconciled == 0
+
+    sessions = await scanner.get_scan_sessions(limit=10)
+    assert sessions[0]["status"] == "completed"
+
+
+async def test_reconcile_orphan_scan_sessions_never_raises_on_missing_db():
+    """DB 파일이 아직 없는 상태(어떤 스캔도 실행된 적 없는 새 배포)에서도
+    리컨실은 예외 없이 0을 반환해야 한다(best-effort never-raise)."""
+    scanner = BackgroundScanner()
+    # _init_db()를 의도적으로 호출하지 않는다 -- reconcile 스스로가
+    # _init_db()를 호출해 테이블을 만들어야 한다(메서드 계약).
+    reconciled = await scanner.reconcile_orphan_scan_sessions()
+    assert reconciled == 0
+
+
+# ---------------------------------------------------------------------------
+# ⑨ A1: 유동성 게이트 scanner 배선 -- once-per-scan 계좌 조회 / 저ADTV 배제 /
+#    adtv20_med 저장. factors.py 순수 함수 단위 테스트(test_discovery_factors.py)
+#    만으로는 "스캐너가 실제로 이 인터페이스를 올바르게 소비하는가"를 증명하지
+#    못하므로, 여기서는 실 스캐너 경로(_scan_all_stocks_discovery 전체)를
+#    태운다 -- passes_quality_filter를 직접 부르지 않는다.
+# ---------------------------------------------------------------------------
+
+
+def _low_liquidity_chart_df(
+    n: int = 65, daily_value: float = 120_000_000.0, price: float = 10_000.0
+) -> pd.DataFrame:
+    """저ADTV 픽스처 -- 빅솔론(093190) 실측 대역(일평균 거래대금 1.2억원)을
+    재현한다. 종가는 2,000원 저가주 하한을 넘고 거래량은 0인 날이 없도록
+    거래대금(value)을 역산해 매일 동일하게 고정한다 -- 이 픽스처가 걸려야
+    하는 검사는 ADTV 중앙값 하나뿐이어야 하므로(다른 사유로 우연히 배제되면
+    안 됨), 저가주/거래량0/하방일관성 검사는 전부 여유 있게 통과한다."""
+    dates = pd.date_range("2026-01-01", periods=n, freq="B")
+    closes = [price] * n
+    opens = list(closes)
+    highs = [c * 1.004 for c in closes]
+    lows = [c * 0.996 for c in closes]
+    volume = daily_value / price
+    volumes = [volume] * n
+    values = [daily_value] * n
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+            "value": values,
+        }
+    )
+
+
+async def test_discovery_min_adtv_resolved_exactly_once_per_scan(monkeypatch):
+    """A1 핵심 우려(브리프 명시): 계좌 평가액 조회(get_trading_coordinator)는
+    스캔 1회당 정확히 1번만 일어나야 한다 -- 종목마다 조회하면(N=3이지만
+    실제 유니버스는 ~2,650종목) API 호출이 폭증한다. `client.flow_calls`를
+    세는 `test_flow_fetched_exactly_once_per_market`과 동일 패턴으로,
+    get_trading_coordinator 자체를 호출 횟수 추적 mock으로 교체한다."""
+    import app.dependencies as deps
+
+    coordinator = ExecutionCoordinator(kiwoom_client=None)  # total_equity=0 -> 폴백 경로
+    get_coordinator_mock = AsyncMock(return_value=coordinator)
+    monkeypatch.setattr(deps, "get_trading_coordinator", get_coordinator_mock)
+
+    client = FakeKiwoomClient(
+        stock_infos={
+            "005930": _stock_info("005930", "삼성전자"),
+            "000660": _stock_info("000660", "SK하이닉스"),
+            "035420": _stock_info("035420", "NAVER"),
+        },
+        chart_dfs={
+            "005930": _make_chart_df(65),
+            "000660": _make_chart_df(65),
+            "035420": _make_chart_df(65),
+        },
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[
+            ("005930", "삼성전자", "코스피"),
+            ("000660", "SK하이닉스", "코스피"),
+            ("035420", "NAVER", "코스닥"),
+        ],
+        mode="discovery",
+    )
+
+    assert get_coordinator_mock.call_count == 1, (
+        "종목 3개 스캔에서 계좌 조회가 1회를 넘으면 종목별 조회로 회귀한 것"
+    )
+
+
+async def test_discovery_scan_excludes_low_liquidity_stock_via_scanner_path(monkeypatch):
+    """A1 종단: 실 스캐너 경로를 통해 저ADTV 종목(빅솔론 대역 1.2억원/일,
+    설정 폴백 20억원 미만)이 quality_filter_passed=False +
+    skip_reason='liquidity_low'로 배제되는지 확인한다. `_make_chart_df`
+    (고유동성)를 쓰는 다른 테스트들은 오탐 배제가 없음만 증명했으므로,
+    여기서는 반대 방향(진짜 저유동성이 실제로 걸러지는지)을 채운다."""
+    client = FakeKiwoomClient(
+        stock_infos={"093190": _stock_info("093190", "저유동성종목")},
+        chart_dfs={"093190": _low_liquidity_chart_df()},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("093190", "저유동성종목", "코스닥")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is False
+    assert fj["skip_reason"] == "liquidity_low"
+
+
+async def test_discovery_scan_saves_adtv20_med_in_factor_json(monkeypatch):
+    """T6(사이징 캡)/T7(토론 프롬프트)가 소비할 adtv20_med가 실제로 저장되는
+    factor_json에 들어가고, 값이 픽스처의 실제 20일 중앙값(liquidity.py의
+    adtv_median -- 이미 test_discovery_factors.py에서 독립 검증됨)과
+    일치하는지 확인한다."""
+    from services.discovery.liquidity import adtv_median
+
+    passing_df = _make_chart_df(65)
+    expected_adtv = adtv_median(passing_df)
+    assert expected_adtv is not None  # 픽스처 스스로 유동성 통과 전제
+
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자")},
+        chart_dfs={"005930": passing_df},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is True
+    assert "adtv20_med" in fj
+    assert fj["adtv20_med"] == pytest.approx(expected_adtv)
+
+
+# ---------------------------------------------------------------------------
+# 최종 리뷰 Blocking2: A1 게이트 킬스위치 + min_adtv 상한 클램프
+#
+# 설계 §6이 약속한 `DISCOVERY_LIQUIDITY_GATE_ENABLED`가 저장소 전체에 설계
+# 문서에만 존재했다(코드·설정·테스트 0건). 운용 제약(실 포지션 보유 중 장중
+# 재시작 금지, 배포는 장 마감 후 1회, 15:30~16:35 발굴창 회피)이 이것을
+# blocking으로 만든다 — 배포 후 첫 EOD에서 게이트가 과잉으로 걸려 승격 0건이
+# 되면 운영자에게 부분 롤백 수단이 전혀 없다.
+# ---------------------------------------------------------------------------
+
+
+async def test_liquidity_gate_killswitch_off_admits_low_liquidity_stock(monkeypatch):
+    """킬스위치 off면 A1 게이트만 무효화된다 — 위 배제 테스트와 완전히 같은
+    저ADTV 픽스처가 이번엔 통과해야 한다(A2/A3 스코어 수식은 그대로 계산됨)."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISCOVERY_LIQUIDITY_GATE_ENABLED", False)
+
+    client = FakeKiwoomClient(
+        stock_infos={"093190": _stock_info("093190", "저유동성종목")},
+        chart_dfs={"093190": _low_liquidity_chart_df()},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("093190", "저유동성종목", "코스닥")],
+        mode="discovery",
+    )
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is True, (
+        "킬스위치 off인데 A1 게이트가 여전히 배제했다 — 부분 롤백 수단 무효"
+    )
+    assert fj["skip_reason"] is None
+    # A2/A3는 롤백 단위가 다르다 — 스코어는 계속 계산돼야 한다.
+    assert fj["scores"]
+
+
+async def test_liquidity_gate_killswitch_off_skips_account_lookup(monkeypatch):
+    """게이트가 꺼졌으면 임계값 산출용 계좌 조회 자체가 불필요하다."""
+    import app.dependencies as deps
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DISCOVERY_LIQUIDITY_GATE_ENABLED", False)
+
+    get_coordinator_mock = AsyncMock(
+        return_value=ExecutionCoordinator(kiwoom_client=None)
+    )
+    monkeypatch.setattr(deps, "get_trading_coordinator", get_coordinator_mock)
+
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자")},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("005930", "삼성전자", "코스피")],
+        mode="discovery",
+    )
+
+    assert scanner._discovery_min_adtv is None
+    assert get_coordinator_mock.call_count == 0
+
+
+async def test_liquidity_gate_killswitch_defaults_on(monkeypatch):
+    """기본값은 on(설계 §6) — 스위치를 건드리지 않은 스캔은 게이트가 산다."""
+    from app.config import settings
+
+    assert settings.DISCOVERY_LIQUIDITY_GATE_ENABLED is True
+
+    client = FakeKiwoomClient(
+        stock_infos={"093190": _stock_info("093190", "저유동성종목")},
+        chart_dfs={"093190": _low_liquidity_chart_df()},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(
+        scanner,
+        stock_list=[("093190", "저유동성종목", "코스닥")],
+        mode="discovery",
+    )
+
+    assert scanner._discovery_min_adtv is not None
+
+
+async def test_resolve_min_adtv_clamps_absurd_equity(monkeypatch):
+    """상류 파싱 사고 방어: 계좌 평가액이 자릿수로 잘못 들어와도 min_adtv가
+    폭주해 2,650종 전량을 배제하지 않는다. 이 저장소에 `mrkt_tot_amt` 억원
+    오분류, `ka10131 _parse_float` 이중부호 크래시 전례가 있다."""
+    import app.dependencies as deps
+    from app.config import settings
+
+    coordinator = ExecutionCoordinator(kiwoom_client=None)
+    coordinator._state.account.total_equity = 500_000_000 * 100  # 100배 사고
+    monkeypatch.setattr(
+        deps, "get_trading_coordinator", AsyncMock(return_value=coordinator)
+    )
+
+    scanner = BackgroundScanner()
+    resolved = await scanner._resolve_min_adtv()
+
+    ceiling = max(settings.DISCOVERY_MIN_ADTV_FALLBACK, 1_000_000_000.0) * 5
+    assert resolved == pytest.approx(ceiling)
+
+
+async def test_resolve_min_adtv_normal_equity_not_clamped(monkeypatch):
+    """정상 계좌(5억)는 클램프에 걸리지 않는다 — 상한이 실제 정책을 자르면 안 된다."""
+    import app.dependencies as deps
+
+    coordinator = ExecutionCoordinator(kiwoom_client=None)
+    coordinator._state.account.total_equity = 500_000_000
+    monkeypatch.setattr(
+        deps, "get_trading_coordinator", AsyncMock(return_value=coordinator)
+    )
+
+    scanner = BackgroundScanner()
+    resolved = await scanner._resolve_min_adtv()
+
+    assert resolved == pytest.approx(500_000_000 * 0.04 / 0.01)  # 20억
+
+
+async def test_resolve_min_adtv_fallback_never_below_hard_floor(monkeypatch):
+    """폴백 하한 보호: 설정이 하드플로어(10억)보다 낮아도 게이트는 그 아래로
+    내려가지 않는다."""
+    import app.dependencies as deps
+    from app.config import settings
+    from services.discovery.liquidity import HARD_FLOOR_ADTV
+
+    monkeypatch.setattr(settings, "DISCOVERY_MIN_ADTV_FALLBACK", 1_000_000.0)  # 100만원
+    monkeypatch.setattr(
+        deps, "get_trading_coordinator", AsyncMock(side_effect=RuntimeError("down"))
+    )
+
+    scanner = BackgroundScanner()
+    resolved = await scanner._resolve_min_adtv()
+
+    assert resolved == pytest.approx(HARD_FLOOR_ADTV)
+
+
+# ---------------------------------------------------------------------------
+# 멀티플 시계열 축적 (2026-07-29)
+#
+# rerating("멀티플이 어디에서 어디로 움직였나")은 당일 스냅샷으로 판정할 수
+# 없고 시계열이 필요하다. 지금까지 ka10001에서 per/pbr/eps를 받아 계산에만
+# 쓰고 버려왔다. 순수 적재이며 아직 아무도 소비하지 않는다.
+# ---------------------------------------------------------------------------
+
+
+async def test_multiples_saved_for_passing_stock(monkeypatch):
+    """품질필터 통과 종목의 factor_json에 per/pbr/eps/bps가 적재된다."""
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자", per=12.5, pbr=1.8,
+                                           eps=6_564, bps=63_976)},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=[("005930", "삼성전자", "코스피")], mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is True
+    assert fj["per"] == pytest.approx(12.5)
+    assert fj["pbr"] == pytest.approx(1.8)
+    assert fj["eps"] == pytest.approx(6_564)
+    assert fj["bps"] == pytest.approx(63_976)
+
+
+async def test_multiples_saved_for_rejected_stock(monkeypatch):
+    """탈락 종목도 멀티플을 남긴다.
+
+    통과분만 쌓으면 게이트에 편향된 시계열이 되어 "적자였다가 흑자 전환"이나
+    "유동성이 개선된 종목" 같은 상태 변화를 추적할 수 없다. 여기서는 적자
+    배제 게이트에 걸린 종목이 대상이다."""
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "적자기업", per=None, pbr=17.0,
+                                           eps=-2_317, bps=770)},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=[("005930", "적자기업", "코스피")], mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["quality_filter_passed"] is False
+    assert fj["skip_reason"] == "negative_eps"
+    assert fj["eps"] == pytest.approx(-2_317)   # 탈락해도 적재됨
+    assert fj["bps"] == pytest.approx(770)
+    assert fj["pbr"] == pytest.approx(17.0)
+
+
+async def test_zero_multiples_stored_as_null(monkeypatch):
+    """per/pbr의 0.0 폴백은 None으로 되돌려 적재한다.
+
+    스냅샷은 결측을 0.0으로 채우는데, 시계열에서는 "PER 0"과 "PER 모름"을
+    구분해야 한다(PER 0·PBR 0은 실재하지 않는 값이다)."""
+    client = FakeKiwoomClient(
+        stock_infos={"005930": _stock_info("005930", "삼성전자", per=None, pbr=None)},
+        chart_dfs={"005930": _make_chart_df(65)},
+    )
+    _patch_client(monkeypatch, client)
+
+    scanner = BackgroundScanner()
+    await _run_scan(scanner, stock_list=[("005930", "삼성전자", "코스피")], mode="discovery")
+
+    sessions = await scanner.get_scan_sessions(limit=1)
+    rows = await _fetch_rows(scanner_module.DB_PATH, sessions[0]["id"])
+    fj = json.loads(rows[0]["factor_json"])
+    assert fj["per"] is None
+    assert fj["pbr"] is None

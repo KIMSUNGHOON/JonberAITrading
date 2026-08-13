@@ -72,6 +72,29 @@ class DecisionAction(str, Enum):
     NO_ACTION = "NO_ACTION"
 
 
+# Phase4: 합의 가중의 유일한 소스 — 이전엔 calculate_consensus/
+# get_majority_direction/calculate_weighted_confidence 3곳 + routes FE 미러
+# 1곳에 같은 dict가 4벌 하드코딩돼 있었다. ChatSession.agent_weights(캘리브
+# 레이션 틸트, 키=AgentType.value)가 있으면 그것이 우선. moderator는 투표하지
+# 않으므로 절대 키를 넣지 않는다.
+DEFAULT_AGENT_WEIGHTS: Dict[AgentType, float] = {
+    AgentType.TECHNICAL: 0.25,
+    AgentType.FUNDAMENTAL: 0.25,
+    AgentType.SENTIMENT: 0.20,
+    AgentType.RISK: 0.30,
+}
+
+
+def resolve_agent_weight(
+    agent_type: AgentType, weights: Optional[Dict[str, float]] = None
+) -> float:
+    """세션 가중(있으면) → 기본 가중 → 0.25 폴백."""
+    if weights:
+        base = DEFAULT_AGENT_WEIGHTS.get(agent_type, 0.25)
+        return weights.get(agent_type.value, base)
+    return DEFAULT_AGENT_WEIGHTS.get(agent_type, 0.25)
+
+
 # -------------------------------------------
 # Core Models
 # -------------------------------------------
@@ -156,6 +179,14 @@ class MarketContext(BaseModel):
     current_price: float
     price_change_pct: float
 
+    # Data quality marker (CRITICAL safety fix, 2026-07-14): True when the
+    # underlying Kiwoom quote fetch failed and this context was built from
+    # safe defaults instead of a real quote (never a fabricated random-mock
+    # price). Callers (ChatCoordinator) MUST NOT start a discussion/vote on
+    # a stale context — agents would be debating and voting on invented
+    # numbers.
+    is_stale: bool = False
+
     # Technical data
     chart_data: Optional[List[Dict[str, Any]]] = None
     indicators: Optional[Dict[str, Any]] = None
@@ -180,6 +211,27 @@ class MarketContext(BaseModel):
     available_cash: Optional[float] = None
     total_portfolio_value: Optional[float] = None
     current_sector_exposure: Optional[float] = None
+
+    # Phase4: 활성 TradingStrategy 주입 (best-effort — None이면 전략 없음/조회 실패.
+    # directive=LLM 프롬프트용 한국어 요약, knobs=퍼센트 단위 수치(모더레이터 소비:
+    # AgentVote.suggested_*와 동일 단위 — 전략 원본은 소수분율이라 ×100 변환됨)).
+    strategy_directive: Optional[str] = Field(default=None)
+    strategy_knobs: Optional[Dict[str, float]] = Field(default=None)
+
+    # US 신호 T4: US AI 크로스마켓 신호 한 줄 요약(AI밸류체인 종목 + 당일 캐시
+    # 신호 존재 시에만 coordinator._fetch_market_context가 채움 — 프롬프트
+    # 넛지 전용, 투표/confidence 로직에는 관여하지 않는다).
+    us_market_context: Optional[str] = Field(default=None)
+
+    # C2(유동성 인지): 리스크 에이전트 프롬프트에 주입할 유동성 한 줄.
+    # None/빈 문자열이면 프롬프트에서 해당 섹션이 사라진다(us_market_context 패턴).
+    liquidity_context: Optional[str] = Field(default=None)
+
+    # E-3: 활성 전략의 entry_conditions.consensus_threshold (best-effort —
+    # coordinator._build_strategy_context가 채움. 조회 실패/전략 없음=0.75
+    # 기본값 그대로 — 배포 직후 거동 불변). ChatRoom 생성 시 이 값을 그대로
+    # ChatSession.consensus_threshold에 전달한다(단일 소스화).
+    consensus_threshold: float = Field(default=0.75)
 
 
 class ChatRound(BaseModel):
@@ -234,6 +286,10 @@ class ChatSession(BaseModel):
     max_discussion_rounds: int = 3
     consensus_threshold: float = 0.75  # 75% agreement required
 
+    # Phase4: 캘리브레이션 틸트 가중(키=AgentType.value). None=레거시
+    # DEFAULT_AGENT_WEIGHTS와 완전 동일 거동(옵트인).
+    agent_weights: Optional[Dict[str, float]] = Field(default=None)
+
     model_config = ConfigDict(
         json_encoders={datetime: lambda v: v.isoformat()}
     )
@@ -281,42 +337,103 @@ class ChatSession(BaseModel):
         if not self.votes:
             return 0.0
 
-        # Agent weights
-        weights = {
-            AgentType.TECHNICAL: 0.25,
-            AgentType.FUNDAMENTAL: 0.25,
-            AgentType.SENTIMENT: 0.20,
-            AgentType.RISK: 0.30,
-        }
+        # 감사 2026-07-22 Finding 1/4 (2차): 실제 계산은 전부
+        # _consensus_from_votes에 있다 — 이 함수와 그 함수가 서로 다른
+        # 커버리지 처리를 하면 tilt_changed_gate_verdict의 가중/기본 비교가
+        # 갈라져 허위 경고를 낸다.
+        self.consensus_level = self._consensus_from_votes(self.agent_weights)
+        return self.consensus_level
 
-        # Count weighted votes by direction
+    def _consensus_from_votes(self, weights: Optional[Dict[str, float]]) -> float:
+        """Pure consensus computation for an arbitrary weights mapping (None =
+        base DEFAULT_AGENT_WEIGHTS). Does NOT read or write self.consensus_level
+        — mirrors calculate_consensus's math (incl. the <2-scoring-votes
+        single-vote guard) exactly, but as a side-effect-free helper so
+        tilt_changed_gate_verdict can compute the base-weight counterfactual
+        without disturbing the live (already-computed, possibly tilted)
+        consensus_level field or calling calculate_consensus with a
+        temporary weight swap.
+
+        감사 2026-07-22 Finding 1/4 (2차, 2026-08-04): 원래 식은
+        max_direction / total_weight였는데, total_weight는 "실제로 투표한
+        에이전트"의 가중합일 뿐 패널 전체가 아니다. LLM 장애로 에이전트가
+        누락되면(어제 아크가 이 누락을 ABSTAIN 조작 대신 진짜 결측으로
+        바꿨다 — 인플레이션 메커니즘 자체는 그대로) 살아남은 둘이 합의하는
+        것만으로 반쪽짜리 패널이 100% 확신을 만들어낼 수 있었다.
+        panel-coverage factor(참여가중/패널가중)를 곱해 이를 봉합한다:
+        패널이 4석 다 응답하면 coverage==1(무변화, 아래
+        test_consensus_without_weights_matches_legacy가 그 증거), 절반만
+        응답하면 raw 비율이 그만큼 깎인다.
+
+        moderator는 반드시 `continue` **이후**에만 participating_weight에
+        누적한다 — resolve_agent_weight가 패널 밖 타입(moderator)엔 0.25
+        폴백을 주므로, continue보다 먼저 누적하면 참여가중이 패널가중을
+        넘어 coverage가 1.0을 초과하고 합의가 오히려 **상승**할 수 있다
+        (이 봉합의 목적을 정확히 뒤집는다). add_vote가 agent_type당 표를
+        하나로 중복 제거하고 AgentType엔 패널 4종+MODERATOR 외 값이 없으므로,
+        moderator를 제외하는 한 participating_weight는 항상 panel_weight의
+        부분합이다 — 즉 coverage <= 1이 구조적으로 보장되어 이 인수는
+        합의를 낮추기만 하고 절대 올리지 않는다."""
         bullish_weight = 0.0
         bearish_weight = 0.0
         neutral_weight = 0.0
+        scoring_votes = 0
+        participating_weight = 0.0
 
         for vote in self.votes:
             if vote.agent_type == AgentType.MODERATOR:
-                continue  # Moderator doesn't vote
+                continue  # Moderator doesn't vote — must stay before any
+                # weight accumulation below (see docstring: counting it here
+                # would let coverage exceed 1.0).
 
-            weight = weights.get(vote.agent_type, 0.25)
+            weight = resolve_agent_weight(vote.agent_type, weights)
+            participating_weight += weight
             weighted_confidence = weight * vote.confidence
 
             if vote.vote in (VoteType.STRONG_BUY, VoteType.BUY):
                 bullish_weight += weighted_confidence
+                scoring_votes += 1
             elif vote.vote in (VoteType.STRONG_SELL, VoteType.SELL):
                 bearish_weight += weighted_confidence
+                scoring_votes += 1
             elif vote.vote == VoteType.HOLD:
                 neutral_weight += weighted_confidence
+                scoring_votes += 1
+
+        if scoring_votes < 2:
+            return 0.0
 
         total_weight = bullish_weight + bearish_weight + neutral_weight
         if total_weight == 0:
             return 0.0
 
-        # Consensus is the proportion of the dominant direction
-        max_direction = max(bullish_weight, bearish_weight, neutral_weight)
-        self.consensus_level = max_direction / total_weight
+        raw_consensus = max(bullish_weight, bearish_weight, neutral_weight) / total_weight
 
-        return self.consensus_level
+        panel_weight = sum(
+            resolve_agent_weight(agent_type, weights) for agent_type in DEFAULT_AGENT_WEIGHTS
+        )
+        if panel_weight <= 0:
+            return raw_consensus
+
+        coverage = participating_weight / panel_weight
+        return raw_consensus * coverage
+
+    def tilt_changed_gate_verdict(self) -> Optional[bool]:
+        """동적 가중(캘리브레이션 틸트)이 합의 게이트(consensus_threshold) 통과
+        여부를 기본 가중 대비 뒤집었는지 판정.
+
+        agent_weights가 없으면(옵트인 안 함) None — 비교 자체가 무의미.
+        있으면 현재 self.consensus_level(이미 가중 계산된 라이브 값, 보통
+        calculate_consensus 직후 호출됨) >= threshold와, 같은 votes를 기본
+        가중으로 재계산한 값 >= threshold를 비교해 다르면 True, 같으면
+        False. 판정만 계산하며 consensus_level 필드는 절대 건드리지 않는다.
+        """
+        if not self.agent_weights:
+            return None
+
+        weighted_pass = self.consensus_level >= self.consensus_threshold
+        base_pass = self._consensus_from_votes(None) >= self.consensus_threshold
+        return weighted_pass != base_pass
 
     def get_majority_direction(self) -> VoteType:
         """Get the majority vote direction."""
@@ -324,13 +441,6 @@ class ChatSession(BaseModel):
             return VoteType.HOLD
 
         # Weighted vote counting
-        weights = {
-            AgentType.TECHNICAL: 0.25,
-            AgentType.FUNDAMENTAL: 0.25,
-            AgentType.SENTIMENT: 0.20,
-            AgentType.RISK: 0.30,
-        }
-
         direction_weights = {
             "bullish": 0.0,
             "bearish": 0.0,
@@ -341,7 +451,7 @@ class ChatSession(BaseModel):
             if vote.agent_type == AgentType.MODERATOR:
                 continue
 
-            weight = weights.get(vote.agent_type, 0.25) * vote.confidence
+            weight = resolve_agent_weight(vote.agent_type, self.agent_weights) * vote.confidence
 
             if vote.vote in (VoteType.STRONG_BUY, VoteType.BUY):
                 direction_weights["bullish"] += weight
@@ -400,17 +510,12 @@ def vote_to_action(vote: VoteType, has_position: bool) -> DecisionAction:
             return DecisionAction.WATCH
 
 
-def calculate_weighted_confidence(votes: List[AgentVote]) -> float:
+def calculate_weighted_confidence(
+    votes: List[AgentVote], weights: Optional[Dict[str, float]] = None
+) -> float:
     """Calculate weighted average confidence from votes."""
     if not votes:
         return 0.0
-
-    weights = {
-        AgentType.TECHNICAL: 0.25,
-        AgentType.FUNDAMENTAL: 0.25,
-        AgentType.SENTIMENT: 0.20,
-        AgentType.RISK: 0.30,
-    }
 
     total_weight = 0.0
     weighted_sum = 0.0
@@ -419,7 +524,7 @@ def calculate_weighted_confidence(votes: List[AgentVote]) -> float:
         if vote.agent_type == AgentType.MODERATOR:
             continue
 
-        weight = weights.get(vote.agent_type, 0.25)
+        weight = resolve_agent_weight(vote.agent_type, weights)
         total_weight += weight
         weighted_sum += weight * vote.confidence
 

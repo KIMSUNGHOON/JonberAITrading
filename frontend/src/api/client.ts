@@ -6,27 +6,12 @@
 
 import axios, { type AxiosInstance, type AxiosError } from 'axios';
 import type {
-  AnalysisRequest,
-  AnalysisResponse,
   ApprovalRequest,
   ApprovalResponse,
-  SessionStatus,
-  CoinAnalysisRequest,
-  CoinAnalysisResponse,
-  CoinMarketInfo,
-  CoinAccountListResponse,
-  CoinPositionListResponse,
-  CoinPosition,
-  CoinOrderListResponse,
-  CoinOrder,
-  CoinOrderRequest,
-  CoinTradeListResponse,
-  CoinTradeRecord,
   SettingsStatus,
-  UpbitApiKeyRequest,
-  UpbitApiKeyResponse,
-  UpbitApiKeyStatus,
-  UpbitValidateResponse,
+  TradingMode,
+  TradingModeResponse,
+  MarketType,
   // Korean Stock (Kiwoom) Types
   KRStockListResponse,
   KRStockTickerResponse,
@@ -55,6 +40,19 @@ import type {
   AddToWatchListResponse,
   ConvertWatchToQueueRequest,
   ConvertWatchToQueueResponse,
+  // Operations Types
+  OperationsResponse,
+  // Performance Types
+  PerformanceResponse,
+  // Pnl Summary Types
+  PnlSummaryResponse,
+  // EOD Report Types (E3-5)
+  EodReportResponse,
+  // Discovery Ledger Types (FI-4)
+  DiscoveryCandidatesResponse,
+  DiscoveryPerformanceResponse,
+  // US AI Cross-Market Signal (observability T2)
+  UsSignalResponse,
   // Scanner Types
   ScanProgressResponse,
   ScanResultsResponse,
@@ -193,72 +191,6 @@ class ApiClient {
   }
 
   // -------------------------------------------
-  // Analysis Endpoints
-  // -------------------------------------------
-
-  /**
-   * Start a new analysis session.
-   */
-  async startAnalysis(request: AnalysisRequest): Promise<AnalysisResponse> {
-    const response = await this.client.post<AnalysisResponse>(
-      '/analysis/start',
-      request
-    );
-    return response.data;
-  }
-
-  /**
-   * Get current status of an analysis session.
-   */
-  async getSessionStatus(sessionId: string): Promise<{
-    session_id: string;
-    ticker: string;
-    status: SessionStatus;
-    current_stage: string | null;
-    analyses_count: number;
-    awaiting_approval: boolean;
-    error: string | null;
-  }> {
-    const response = await this.client.get(`/analysis/status/${sessionId}`);
-    return response.data;
-  }
-
-  /**
-   * Get full analysis state.
-   */
-  async getSessionState(sessionId: string): Promise<{
-    session_id: string;
-    state: Record<string, unknown>;
-    status: SessionStatus;
-  }> {
-    const response = await this.client.get(`/analysis/state/${sessionId}`);
-    return response.data;
-  }
-
-  /**
-   * Cancel an analysis session.
-   */
-  async cancelSession(sessionId: string): Promise<{ success: boolean }> {
-    const response = await this.client.post(`/analysis/cancel/${sessionId}`);
-    return response.data;
-  }
-
-  /**
-   * List all active sessions.
-   */
-  async listSessions(): Promise<
-    Array<{
-      session_id: string;
-      ticker: string;
-      status: SessionStatus;
-      created_at: string;
-    }>
-  > {
-    const response = await this.client.get('/analysis/sessions');
-    return response.data;
-  }
-
-  // -------------------------------------------
   // Approval Endpoints
   // -------------------------------------------
 
@@ -295,252 +227,6 @@ class ApiClient {
   }
 
   // -------------------------------------------
-  // Coin Analysis Endpoints
-  // -------------------------------------------
-
-  /**
-   * Get available coin markets.
-   */
-  async getCoinMarkets(quoteCurrency?: string): Promise<{
-    markets: CoinMarketInfo[];
-    total: number;
-  }> {
-    const params = quoteCurrency ? { quote_currency: quoteCurrency } : {};
-    const response = await this.client.get('/coin/markets', { params });
-    return response.data;
-  }
-
-  /**
-   * Search coin markets by name or code.
-   */
-  async searchCoinMarkets(query: string, limit = 10): Promise<{
-    markets: CoinMarketInfo[];
-    total: number;
-  }> {
-    const response = await this.client.post('/coin/markets/search', {
-      query,
-      limit,
-    });
-    return response.data;
-  }
-
-  /**
-   * Start a new coin analysis session.
-   */
-  async startCoinAnalysis(request: CoinAnalysisRequest): Promise<CoinAnalysisResponse> {
-    const response = await this.client.post<CoinAnalysisResponse>(
-      '/coin/analysis/start',
-      request
-    );
-    return response.data;
-  }
-
-  /**
-   * Get coin analysis session status.
-   */
-  async getCoinSessionStatus(sessionId: string): Promise<{
-    session_id: string;
-    market: string;
-    korean_name: string | null;
-    status: SessionStatus;
-    current_stage: string | null;
-    awaiting_approval: boolean;
-    error: string | null;
-  }> {
-    const response = await this.client.get(`/coin/analysis/status/${sessionId}`);
-    return response.data;
-  }
-
-  /**
-   * Cancel a coin analysis session.
-   */
-  async cancelCoinSession(sessionId: string): Promise<{ message: string }> {
-    const response = await this.client.post(`/coin/analysis/cancel/${sessionId}`);
-    return response.data;
-  }
-
-  // -------------------------------------------
-  // Coin Market Data Endpoints
-  // -------------------------------------------
-
-  /**
-   * Get candle (OHLCV) data for a coin market.
-   */
-  async getCoinCandles(
-    market: string,
-    interval: string = '1d',
-    count: number = 200
-  ): Promise<{
-    market: string;
-    interval: string;
-    candles: Array<{
-      datetime: string;
-      open: number;
-      high: number;
-      low: number;
-      close: number;
-      volume: number;
-    }>;
-  }> {
-    const response = await this.client.get(`/coin/candles/${market}`, {
-      params: { interval, count },
-    });
-    return response.data;
-  }
-
-  /**
-   * Get current ticker for a coin market.
-   */
-  async getCoinTicker(market: string): Promise<{
-    market: string;
-    trade_price: number;
-    change: string;
-    change_rate: number;
-    change_price: number;
-    high_price: number;
-    low_price: number;
-    trade_volume: number;
-    acc_trade_price_24h: number;
-    timestamp: string;
-  }> {
-    const response = await this.client.get(`/coin/ticker/${market}`);
-    return response.data;
-  }
-
-  /**
-   * Get current tickers for multiple coin markets in a single request.
-   * This batch endpoint avoids rate limiting by reducing API calls.
-   */
-  async getCoinTickers(markets: string[]): Promise<{
-    tickers: Array<{
-      market: string;
-      trade_price: number;
-      change: string;
-      change_rate: number;
-      change_price: number;
-      high_price: number;
-      low_price: number;
-      trade_volume: number;
-      acc_trade_price_24h: number;
-      timestamp: string;
-    }>;
-    total: number;
-  }> {
-    const response = await this.client.get('/coin/tickers', {
-      params: { markets: markets.join(',') },
-    });
-    return response.data;
-  }
-
-  /**
-   * Get orderbook for a coin market.
-   */
-  async getCoinOrderbook(market: string): Promise<{
-    market: string;
-    total_ask_size: number;
-    total_bid_size: number;
-    bid_ask_ratio: number;
-    asks: Array<{ price: number; size: number }>;
-    bids: Array<{ price: number; size: number }>;
-    timestamp: string;
-  }> {
-    const response = await this.client.get(`/coin/orderbook/${market}`);
-    return response.data;
-  }
-
-  // -------------------------------------------
-  // Coin Trading Endpoints
-  // -------------------------------------------
-
-  /**
-   * Get account balances.
-   */
-  async getCoinAccounts(): Promise<CoinAccountListResponse> {
-    const response = await this.client.get<CoinAccountListResponse>('/coin/accounts');
-    return response.data;
-  }
-
-  /**
-   * Get all open positions with real-time P&L.
-   */
-  async getCoinPositions(): Promise<CoinPositionListResponse> {
-    const response = await this.client.get<CoinPositionListResponse>('/coin/positions');
-    return response.data;
-  }
-
-  /**
-   * Get a single position by market.
-   */
-  async getCoinPosition(market: string): Promise<CoinPosition> {
-    const response = await this.client.get<CoinPosition>(`/coin/positions/${market}`);
-    return response.data;
-  }
-
-  /**
-   * Close a position by selling all holdings at market price.
-   */
-  async closeCoinPosition(market: string): Promise<CoinOrder> {
-    const response = await this.client.post<CoinOrder>(`/coin/positions/${market}/close`);
-    return response.data;
-  }
-
-  /**
-   * Get list of orders.
-   */
-  async getCoinOrders(params?: {
-    market?: string;
-    state?: string;
-    limit?: number;
-  }): Promise<CoinOrderListResponse> {
-    const response = await this.client.get<CoinOrderListResponse>('/coin/orders', { params });
-    return response.data;
-  }
-
-  /**
-   * Get a single order by UUID.
-   */
-  async getCoinOrder(orderId: string): Promise<CoinOrder> {
-    const response = await this.client.get<CoinOrder>(`/coin/orders/${orderId}`);
-    return response.data;
-  }
-
-  /**
-   * Create a new order.
-   */
-  async createCoinOrder(request: CoinOrderRequest): Promise<CoinOrder> {
-    const response = await this.client.post<CoinOrder>('/coin/orders', request);
-    return response.data;
-  }
-
-  /**
-   * Cancel an order.
-   */
-  async cancelCoinOrder(orderId: string): Promise<CoinOrder> {
-    const response = await this.client.delete<CoinOrder>(`/coin/orders/${orderId}`);
-    return response.data;
-  }
-
-  /**
-   * Get trade history with pagination.
-   */
-  async getCoinTrades(params?: {
-    market?: string;
-    page?: number;
-    limit?: number;
-  }): Promise<CoinTradeListResponse> {
-    const response = await this.client.get<CoinTradeListResponse>('/coin/trades', { params });
-    return response.data;
-  }
-
-  /**
-   * Get a single trade by ID.
-   */
-  async getCoinTrade(tradeId: string): Promise<CoinTradeRecord> {
-    const response = await this.client.get<CoinTradeRecord>(`/coin/trades/${tradeId}`);
-    return response.data;
-  }
-
-  // -------------------------------------------
   // Health Check
   // -------------------------------------------
 
@@ -569,39 +255,24 @@ class ApiClient {
   }
 
   /**
-   * Get Upbit API key status.
+   * Get per-market trading mode (R3 Autonomous | HITL) + master gate.
    */
-  async getUpbitApiStatus(): Promise<UpbitApiKeyStatus> {
-    const response = await this.client.get<UpbitApiKeyStatus>('/settings/upbit');
+  async getTradingMode(): Promise<TradingModeResponse> {
+    const response = await this.client.get<TradingModeResponse>('/settings/trading-mode');
     return response.data;
   }
 
   /**
-   * Update Upbit API keys.
+   * Set the trading mode for one market. Returns the full updated state.
    */
-  async updateUpbitApiKeys(request: UpbitApiKeyRequest): Promise<UpbitApiKeyResponse> {
-    const response = await this.client.post<UpbitApiKeyResponse>(
-      '/settings/upbit',
-      request
+  async setTradingMode(
+    market: MarketType,
+    mode: TradingMode
+  ): Promise<TradingModeResponse> {
+    const response = await this.client.put<TradingModeResponse>(
+      '/settings/trading-mode',
+      { market, mode }
     );
-    return response.data;
-  }
-
-  /**
-   * Validate Upbit API keys.
-   */
-  async validateUpbitApiKeys(): Promise<UpbitValidateResponse> {
-    const response = await this.client.post<UpbitValidateResponse>(
-      '/settings/upbit/validate'
-    );
-    return response.data;
-  }
-
-  /**
-   * Clear Upbit API keys.
-   */
-  async clearUpbitApiKeys(): Promise<{ message: string }> {
-    const response = await this.client.delete('/settings/upbit');
     return response.data;
   }
 
@@ -638,6 +309,26 @@ class ApiClient {
     // Queue the request to prevent overwhelming the Kiwoom API
     return kiwoomRequestQueue.enqueue(async () => {
       const response = await this.client.get<KRStockTickerResponse>(`/kr_stocks/ticker/${stk_cd}`);
+      return response.data;
+    });
+  }
+
+  /**
+   * Get current ticker snapshots for multiple Korean stock codes in a single
+   * request (P1-7). Replaces per-symbol getKRStockTicker fan-out — one call
+   * per poll instead of N, still queued behind the shared Kiwoom throttle.
+   * A code that failed to fetch (unknown code, transient API error) maps to
+   * `null` — callers must keep the last known price, never fabricate.
+   */
+  async getKRStockTickers(codes: string[]): Promise<{
+    tickers: Record<string, KRStockTickerResponse | null>;
+    total: number;
+  }> {
+    return kiwoomRequestQueue.enqueue(async () => {
+      const response = await this.client.post<{
+        tickers: Record<string, KRStockTickerResponse | null>;
+        total: number;
+      }>('/kr_stocks/tickers', { codes });
       return response.data;
     });
   }
@@ -1188,6 +879,11 @@ class ApiClient {
 
   /**
    * Get market hours status.
+   *
+   * (2026-08-01 Upbit 제거: 응답의 `crypto` 키를 제거했다 — 백엔드
+   * GET /trading/market-hours는 이미 `krx`만 반환하고 있었고[services/
+   * trading/market_hours.py의 `_get_crypto_session` 제거는 그보다 앞선
+   * 백엔드 제거 단계에서 끝났다], 이 타입만 실물과 어긋난 채 남아 있었다.)
    */
   async getMarketHours(): Promise<{
     krx: {
@@ -1197,13 +893,6 @@ class ApiClient {
       current_time: string;
       next_open: string | null;
       next_close: string | null;
-      message: string;
-    };
-    crypto: {
-      market: string;
-      name: string;
-      is_open: boolean;
-      current_time: string;
       message: string;
     };
   }> {
@@ -1474,6 +1163,122 @@ class ApiClient {
    */
   async getWatchedStock(ticker: string): Promise<WatchedStock> {
     const response = await this.client.get<WatchedStock>(`/trading/watch-list/${ticker}`);
+    return response.data;
+  }
+
+  /**
+   * Get operations pipeline snapshot for a market.
+   */
+  async getOperations(market: MarketType = 'kiwoom'): Promise<OperationsResponse> {
+    const response = await this.client.get<OperationsResponse>('/trading/operations', {
+      params: { market },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get paper-trading performance snapshot (realized P&L, cumulative return,
+   * win rate, daily series). `base`/`start`/`end` are optional overrides —
+   * the backend defaults base to the C1 operating baseline and the window to
+   * the last 30 days.
+   */
+  async getPerformance(params?: { base?: number; start?: string; end?: string }): Promise<PerformanceResponse> {
+    const response = await this.client.get<PerformanceResponse>('/trading/performance', {
+      params,
+    });
+    return response.data;
+  }
+
+  /**
+   * 기간 손익 요약 — 일/주/월/누적 실현손익과 평가금 기준 수익률.
+   * `base`는 누적 수익률 분모 override (기본: 운용 개시 기준 자산).
+   */
+  async getPnlSummary(params?: { base?: number }): Promise<PnlSummaryResponse> {
+    const response = await this.client.get<PnlSummaryResponse>('/trading/pnl-summary', {
+      params,
+    });
+    return response.data;
+  }
+
+  /**
+   * Get the latest (or a specific date's) EOD report -- digest + optional
+   * LLM narrative (E3-4's GET /trading/eod-report). `date` omitted means
+   * "the newest row in the table" (backend default).
+   *
+   * A 404 ("no report for this date / empty table yet") is an expected,
+   * quiet empty state -- NOT a load failure -- so it resolves to `null`
+   * instead of throwing. This mirrors the exact `detail` text the backend
+   * always sends for this route (get_eod_report in
+   * app/api/routes/trading.py: `"eod_review not found for date=..."` or
+   * `"eod_review not found"`), which is all that's left to inspect here:
+   * the shared response interceptor above already collapses every
+   * AxiosError into a plain `Error(message)` before it reaches this
+   * method, so `error.response.status` is no longer available -- matching
+   * on the known message text is the only way left to distinguish
+   * "not found" from a genuine failure (network/500), which still throws.
+   */
+  async getEodReport(date?: string): Promise<EodReportResponse | null> {
+    try {
+      const response = await this.client.get<EodReportResponse>('/trading/eod-report', {
+        params: date ? { date } : undefined,
+      });
+      return response.data;
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('eod_review not found')) {
+        return null;
+      }
+      throw e;
+    }
+  }
+
+  // -------------------------------------------
+  // Discovery Ledger Endpoints (FI-4)
+  // -------------------------------------------
+
+  /**
+   * Get discovery_candidates ledger rows (FI-2's GET
+   * /trading/discovery/candidates) -- the raw per-day scan output the
+   * discovery/regime ranker leaves behind, promoted or not, with the
+   * post-hoc fwd_1d/5d/20d forward returns once backfilled. All filters are
+   * optional; omitting them all returns the newest rows across every date.
+   * An empty ledger is a normal 200 + `{candidates: [], count: 0}`, not an
+   * error -- the dedicated ledger page (DiscoveryLedgerPanel) renders that
+   * as an honest "발굴 이력 없음" rather than surfacing it as a fetch failure.
+   */
+  async getDiscoveryCandidates(params?: {
+    trade_date?: string;
+    promoted?: boolean;
+    limit?: number;
+    offset?: number;
+  }): Promise<DiscoveryCandidatesResponse> {
+    const response = await this.client.get<DiscoveryCandidatesResponse>(
+      '/trading/discovery/candidates',
+      { params }
+    );
+    return response.data;
+  }
+
+  /**
+   * Get discovery performance summary grouped by strategy tag (FI-2's GET
+   * /trading/discovery/performance) -- candidate/promoted counts and
+   * avg fwd_1d/fwd_5d/hit_rate_5d over a trailing window. `days` omitted
+   * lets the backend apply its own default (14).
+   */
+  async getDiscoveryPerformance(days?: number): Promise<DiscoveryPerformanceResponse> {
+    const response = await this.client.get<DiscoveryPerformanceResponse>(
+      '/trading/discovery/performance',
+      { params: days !== undefined ? { days } : undefined }
+    );
+    return response.data;
+  }
+
+  /**
+   * Get the current US AI cross-market signal (GET /trading/discovery/us-signal)
+   * -- overnight US AI value-chain performance + curated ticker list used to
+   * nudge KR AI value-chain discovery/discussion.
+   */
+  async getUsSignal(): Promise<UsSignalResponse> {
+    const response = await this.client.get<UsSignalResponse>('/trading/discovery/us-signal');
     return response.data;
   }
 
@@ -1840,20 +1645,6 @@ export const apiClient = new ApiClient();
 // Convenience Functions
 // -------------------------------------------
 
-export const startAnalysis = (request: AnalysisRequest) =>
-  apiClient.startAnalysis(request);
-
-export const getSessionStatus = (sessionId: string) =>
-  apiClient.getSessionStatus(sessionId);
-
-export const getSessionState = (sessionId: string) =>
-  apiClient.getSessionState(sessionId);
-
-export const cancelSession = (sessionId: string) =>
-  apiClient.cancelSession(sessionId);
-
-export const listSessions = () => apiClient.listSessions();
-
 export const getPendingProposal = (sessionId: string) =>
   apiClient.getPendingProposal(sessionId);
 
@@ -1862,67 +1653,13 @@ export const submitApproval = (request: ApprovalRequest) =>
 
 export const healthCheck = () => apiClient.healthCheck();
 
-// Coin API
-export const getCoinMarkets = (quoteCurrency?: string) =>
-  apiClient.getCoinMarkets(quoteCurrency);
-
-export const searchCoinMarkets = (query: string, limit?: number) =>
-  apiClient.searchCoinMarkets(query, limit);
-
-export const startCoinAnalysis = (request: CoinAnalysisRequest) =>
-  apiClient.startCoinAnalysis(request);
-
-export const getCoinSessionStatus = (sessionId: string) =>
-  apiClient.getCoinSessionStatus(sessionId);
-
-export const cancelCoinSession = (sessionId: string) =>
-  apiClient.cancelCoinSession(sessionId);
-
-// Coin Market Data API
-export const getCoinCandles = (market: string, interval?: string, count?: number) =>
-  apiClient.getCoinCandles(market, interval, count);
-
-export const getCoinTicker = (market: string) => apiClient.getCoinTicker(market);
-
-export const getCoinTickers = (markets: string[]) => apiClient.getCoinTickers(markets);
-
-export const getCoinOrderbook = (market: string) => apiClient.getCoinOrderbook(market);
-
 // Settings API
 export const getSettings = () => apiClient.getSettings();
 
-export const getUpbitApiStatus = () => apiClient.getUpbitApiStatus();
+export const getTradingMode = () => apiClient.getTradingMode();
 
-export const updateUpbitApiKeys = (request: UpbitApiKeyRequest) =>
-  apiClient.updateUpbitApiKeys(request);
-
-export const validateUpbitApiKeys = () => apiClient.validateUpbitApiKeys();
-
-export const clearUpbitApiKeys = () => apiClient.clearUpbitApiKeys();
-
-// Coin Trading API
-export const getCoinAccounts = () => apiClient.getCoinAccounts();
-
-export const getCoinPositions = () => apiClient.getCoinPositions();
-
-export const getCoinPosition = (market: string) => apiClient.getCoinPosition(market);
-
-export const closeCoinPosition = (market: string) => apiClient.closeCoinPosition(market);
-
-export const getCoinOrders = (params?: { market?: string; state?: string; limit?: number }) =>
-  apiClient.getCoinOrders(params);
-
-export const getCoinOrder = (orderId: string) => apiClient.getCoinOrder(orderId);
-
-export const createCoinOrder = (request: CoinOrderRequest) =>
-  apiClient.createCoinOrder(request);
-
-export const cancelCoinOrder = (orderId: string) => apiClient.cancelCoinOrder(orderId);
-
-export const getCoinTrades = (params?: { market?: string; page?: number; limit?: number }) =>
-  apiClient.getCoinTrades(params);
-
-export const getCoinTrade = (tradeId: string) => apiClient.getCoinTrade(tradeId);
+export const setTradingMode = (market: MarketType, mode: TradingMode) =>
+  apiClient.setTradingMode(market, mode);
 
 // Korean Stock (Kiwoom) API
 export const getKRStocks = (limit?: number) => apiClient.getKRStocks(limit);
@@ -1931,6 +1668,8 @@ export const searchKRStocks = (query: string, limit?: number) =>
   apiClient.searchKRStocks(query, limit);
 
 export const getKRStockTicker = (stk_cd: string) => apiClient.getKRStockTicker(stk_cd);
+
+export const getKRStockTickers = (codes: string[]) => apiClient.getKRStockTickers(codes);
 
 export const getKRStockCandles = (stk_cd: string, period?: string, count?: number) =>
   apiClient.getKRStockCandles(stk_cd, period, count);
@@ -2097,6 +1836,35 @@ export const removeFromWatchList = (watchId: string) =>
 
 export const convertWatchToQueue = (request: ConvertWatchToQueueRequest) =>
   apiClient.convertWatchToQueue(request);
+
+// Operations API
+export const getOperations = (market: MarketType = 'kiwoom') =>
+  apiClient.getOperations(market);
+
+// Performance API
+export const getPerformance = (params?: { base?: number; start?: string; end?: string }) =>
+  apiClient.getPerformance(params);
+
+// Pnl Summary API
+export const getPnlSummary = (params?: { base?: number }) =>
+  apiClient.getPnlSummary(params);
+
+// EOD Report API (E3-5)
+export const getEodReport = (date?: string) => apiClient.getEodReport(date);
+
+// Discovery Ledger API (FI-4)
+export const getDiscoveryCandidates = (params?: {
+  trade_date?: string;
+  promoted?: boolean;
+  limit?: number;
+  offset?: number;
+}) => apiClient.getDiscoveryCandidates(params);
+
+export const getDiscoveryPerformance = (days?: number) =>
+  apiClient.getDiscoveryPerformance(days);
+
+// US AI Cross-Market Signal API (observability T2)
+export const getUsSignal = () => apiClient.getUsSignal();
 
 // Background Scanner API
 export const startScan = (request?: StartScanRequest) =>

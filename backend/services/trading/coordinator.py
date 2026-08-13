@@ -6,8 +6,12 @@ Analysis → Approval → Portfolio → Order → Monitor
 """
 
 import asyncio
+import json
 import logging
-from datetime import datetime
+import math
+import time
+import uuid
+from datetime import datetime, date
 from typing import Optional, List, Callable, Awaitable
 
 from .models import (
@@ -17,8 +21,10 @@ from .models import (
     ManagedPosition,
     OrderRequest,
     OrderResult,
+    OrderType,
     AllocationPlan,
     TradingAlert,
+    AlertType,
     RiskParameters,
     PositionStatus,
     OrderSide,
@@ -34,11 +40,192 @@ from .models import (
 from .portfolio_agent import PortfolioAgent
 from .order_agent import OrderAgent, KiwoomRateLimiter
 from .risk_monitor import RiskMonitor
-from .market_hours import MarketType, get_market_hours_service
+from .market_hours import MarketType, get_market_hours_service, is_krx_open_cached
 from .strategy import TradingStrategy
-from .strategy_engine import StrategyEngine
+from .strategy_apply import apply_strategy_to_risk_params
+from .pending_order_tracker import PendingOrderTracker, TrackedOrder
+from .position_registration import register_fill_as_position, mirror_sell_to_position_manager
+from .reconciler import reconcile
+from .trade_log import record_trade_fill, record_kr_realized_pnl, wait_for_pending_trade_fill_writes
+from .cadence import compute_watch_ttl
+from .eod_snapshot import write_daily_snapshot
+from .eod_orchestrator import run_eod_review
+from .strategy_orchestrator import run_strategy_consensus
+from .ledger_reconcile import reconcile_trade_ledger
+from .eod_digest import (
+    _build_strategy_section,
+    _build_discovery_section,
+    _build_postmarket_fills,
+    _build_postmarket_realized,
+    _build_postmarket_revisions,
+)
+from services.storage_service import get_storage_service
+from app.config import get_settings
+from services.background_scanner.scanner import ScanStatus, get_background_scanner
+from services.discovery.orchestrator import run_discovery_pipeline
 
 logger = logging.getLogger(__name__)
+
+
+# G3 (방어 매도 재제출 가드): 같은 종목의 두 방어 매도 **제출** 사이의 최소
+# 간격(초). 30초인 근거 — 이 값보다 짧게 잡아도 새로 알 수 있는 것이 없다:
+#   * RiskMonitor는 1초 틱(`risk_monitor.py` `asyncio.sleep(1)`)이라 트리거
+#     자체는 초당 재발동하지만,
+#   * 브로커 진실이 앱으로 들어오는 유일한 창구인 ka10076 폴
+#     (`_poll_tracked_fills`)은 30초 스케줄러 틱(`_queue_scheduler_interval`)에
+#     묶여 있고,
+#   * 두 번째 방어 엔진 PositionManager의 감시 주기도 30초다.
+# 즉 30초는 "직전 제출의 결과를 아직 모르는 구간"의 길이다. 그 구간 안의
+# 재제출은 정보 없이 같은 주문을 다시 내는 것이고, 브로커는 그것을 800033
+# (매도가능수량 부족)으로 거부하면서 Kiwoom 레이트리밋만 갉아먹는다.
+DEFENSIVE_SELL_COOLDOWN_SEC = 30.0
+
+# G2 나이 상한: 미체결 SELL을 **억제 근거로 신뢰하는** 최대 시간(초).
+# 이 값을 넘긴 `TRACKING` 주문은 브로커 예약이 이미 풀렸는데 앱만 모르는
+# 상태일 수 있으므로 억제에 쓰지 않는다(사유·안전성 논증은
+# `_defensive_sell_suppression_reason`의 G2 항목 참고).
+#
+# 180초인 근거:
+#   * 하한 — 2026-08-10 라이브(089860)에서 부분체결된 시장가 매도의 잔량이
+#     **약 90초 뒤에** 사후 체결됐다(로그 2445 → 2537). 상한이 그보다 낮으면
+#     정상적으로 "작동 중"인 주문에 대고 무의미한 재제출을 시작한다. 관측된
+#     정착 시간의 2배를 잡는다.
+#   * 상한 — ka10076 폴이 30초 주기이므로 180초 = 연속 **6폴**. 여섯 번의
+#     브로커 스냅샷에서 한 번도 대사되지 않은 매도는 앱이 관측할 수 있는
+#     어떤 의미로도 "작동 중"이 아니다.
+#   * `fill_tracker`에는 재량 **지정가** 매도도 들어가고 그건 정당하게 오래
+#     걸릴 수 있다 — 그래도 논리는 그대로다: 그 주문을 무시하고 방어 매도를
+#     내면 최악이 거부 1회(G3가 30초에 한 번으로 묶는다)인 반면, 신뢰하면
+#     최악이 마감까지 무방비다.
+DEFENSIVE_SELL_PENDING_MAX_AGE_SEC = 180.0
+
+# 방어 매도가 재제출 가드(G1/G2/G3)에 막혔을 때의 OrderResult.status.
+# `None`(= 코디네이터 원장에 포지션 없음)과 반드시 구별돼야 한다 —
+# `ORDER_STATUS_REJECTED_LIQUIDITY_CAP`(2026-07-28)와 정확히 같은 선례다:
+# 호출자(`PositionManager._execute_reduce_position`)의 `None` 분기는 오직
+# "원장 불일치"를 뜻해 🚨 desync 통지를 발사하는데, 억제 시엔 포지션이 멀쩡히
+# 있으므로 그 통지는 사실과 다르다. 억제는 정상 동작이지 원장 문제가 아니다.
+ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT = "suppressed_defensive_resubmit"
+
+
+# DS-5: discovery EOD-chain scan-trigger wait, behind the DISCOVERY_ENABLED
+# kill switch (app/config.py). SC-2 (docs/superpowers/specs/
+# 2026-07-20-scan-reliability-design.md §2) made the wait dynamic — the old
+# static 90-minute cap was a structural undercount (4276 stocks x 2 calls x
+# 0.7s rate-limiter interval = ~99.8 theoretical minutes, before any safety
+# margin, so a full-universe scan could exceed it on the API-call count
+# alone). `_DISCOVERY_SCAN_TIMEOUT_SECONDS` below is now the FLOOR (never
+# time out faster than the old cap, even for a tiny universe) and also the
+# FALLBACK used when the universe size can't be read (see
+# `_compute_discovery_scan_timeout_seconds`). Poll interval mirrors the
+# brief's "실코드 수단이 폴링이면 5s 간격" instruction — BackgroundScanner
+# exposes no completion event/future to await directly, only ScanStatus via
+# the existing get_progress() (the same public surface
+# app/api/routes/scanner.py's own status polling already uses).
+# 자율 ADD가 유동성 천장에 막혀 0주가 됐을 때의 OrderResult.status.
+# `None`(= 코디네이터 원장에 포지션 없음)과 반드시 구별돼야 한다 — 호출자
+# (PositionManager._execute_add_position)가 None을 원장 불일치로 해석해
+# 🚨 desync 통지를 보내기 때문이다. 유동성 차단은 원장 문제가 아니다.
+ORDER_STATUS_REJECTED_LIQUIDITY_CAP = "rejected_liquidity_cap"
+# 단일 종목 상한(max_single_position_pct 등)에 이미 도달해 추가매수 여유가
+# 0인 경우. 유동성 차단과 **구별**한다 — 둘 다 정상 억제이지 원장 문제가
+# 아니지만(호출자가 None을 desync로 오진하면 안 된다), 어느 천장에 막혔는지가
+# 운영 판단에서 다르다.
+ORDER_STATUS_REJECTED_POSITION_CAP = "rejected_position_cap"
+# 일일 거래 상한을 이미 소진한 경우. 이 역시 원장 문제가 아닌 정상 억제라
+# `None`과 구별해야 한다. 다른 두 거절과 달리 이것은 **포트폴리오 전역** 조건이라
+# 종목마다 통지하면 같은 사실이 N번 간다 — 호출자는 로그만 남기고 통지하지 않는다.
+ORDER_STATUS_REJECTED_DAILY_LIMIT = "rejected_daily_limit"
+
+# 목표 노출도 섀도 기록 주기(초). 장중 390분 ÷ 5분 = 하루 약 78행 —
+# 슬롯 거절 시점과 최대 5분 차이라 대조에 충분하고, 연 2만 행이라 무시할 양이다.
+EXPOSURE_SHADOW_INTERVAL_SECONDS: int = 300
+
+_DISCOVERY_SCAN_TIMEOUT_SECONDS = 5400.0
+_DISCOVERY_SCAN_POLL_INTERVAL_SECONDS = 5.0
+
+# SC-2 dynamic-timeout tuning constants — all from spec §2 SC-2, kept
+# separate (not folded into one magic expression) so each has its own
+# rationale on record:
+#   - PER_STOCK: theoretical per-ticker API cost. Discovery collection makes
+#     2 calls/stock (ka10001 + ka10081), both funneled through
+#     rate_limiter.py's single shared 0.7s-interval query bucket -> 1.4s/
+#     stock theoretical (measured ~1.46s live, ~4% overhead). Rounded up to
+#     1.5s as the baseline the spec anchors the formula on.
+#   - SAFETY_FACTOR: +30% margin over the theoretical estimate for network
+#     jitter/retries so the timeout isn't shaving the estimate too close.
+#   - BUFFER: fixed +600s (10 min) added after the per-stock estimate for
+#     scan startup overhead and tail latency on the last few stocks.
+#   - CAP: 4h hard ceiling — the close-to-open window is ~17.5h, so even the
+#     largest plausible universe can't stall the EOD chain behind this call
+#     indefinitely (spec §4 risk table).
+_DISCOVERY_SCAN_TIMEOUT_PER_STOCK_SECONDS = 1.5
+_DISCOVERY_SCAN_TIMEOUT_SAFETY_FACTOR = 1.3
+_DISCOVERY_SCAN_TIMEOUT_BUFFER_SECONDS = 600.0
+_DISCOVERY_SCAN_TIMEOUT_CAP_SECONDS = 14400.0
+
+
+def _compute_discovery_scan_timeout_seconds(universe: Optional[int]) -> float:
+    """SC-2: universe-proportional discovery scan timeout.
+
+    ``timeout = clamp(universe * 1.5 * 1.3 + 600, floor=_DISCOVERY_SCAN_
+    TIMEOUT_SECONDS(5400), cap=_DISCOVERY_SCAN_TIMEOUT_CAP_SECONDS(14400))``
+    (spec §2 SC-2, verbatim). `universe` is expected to be the scanner's own
+    `get_progress().total_stocks`, read right after the post-start_scan
+    RUNNING confirmation (see `_run_discovery_scan`) — by that point
+    `BackgroundScanner.start_scan()` has already synchronously populated
+    `total_stocks = len(stock_list)` on `self._progress` before returning
+    (scanner.py — set well before the scan task itself is created), so no
+    extra poll/wait for it is needed.
+
+    Falls back to the static floor/cap-independent `_DISCOVERY_SCAN_
+    TIMEOUT_SECONDS` when `universe` couldn't be read (None or <= 0) — same
+    behavior as the pre-SC-2 fixed timeout for that case.
+    """
+    if not universe or universe <= 0:
+        fallback = _DISCOVERY_SCAN_TIMEOUT_SECONDS
+        logger.info(
+            "[Coordinator] discovery_scan_timeout_computed universe=%r "
+            "raw_seconds=None clamped_seconds=%s (fallback: universe "
+            "unavailable)",
+            universe,
+            fallback,
+        )
+        return fallback
+
+    raw_seconds = (
+        universe
+        * _DISCOVERY_SCAN_TIMEOUT_PER_STOCK_SECONDS
+        * _DISCOVERY_SCAN_TIMEOUT_SAFETY_FACTOR
+        + _DISCOVERY_SCAN_TIMEOUT_BUFFER_SECONDS
+    )
+    clamped_seconds = max(
+        _DISCOVERY_SCAN_TIMEOUT_SECONDS,
+        min(_DISCOVERY_SCAN_TIMEOUT_CAP_SECONDS, int(raw_seconds)),
+    )
+    logger.info(
+        "[Coordinator] discovery_scan_timeout_computed universe=%s "
+        "raw_seconds=%.1f clamped_seconds=%s",
+        universe,
+        raw_seconds,
+        clamped_seconds,
+    )
+    return float(clamped_seconds)
+
+
+# Actions that grow exposure map to a BUY order; everything else reduces it and
+# maps to SELL. An ADD mis-mapped to SELL reverses an autonomous add-to-position
+# into a liquidation — audit finding A1 (2026-07-12). Mirrors the gate's
+# POSITION_INCREASING_ACTIONS so side and cap logic stay in agreement.
+_BUY_SIDE_ACTIONS = {"BUY", "ADD"}
+
+
+def _order_side_for_action(action: str) -> OrderSide:
+    """Resolve the order side for a trade action.
+
+    BUY/ADD increase exposure → BUY side. SELL/REDUCE decrease it → SELL side.
+    """
+    return OrderSide.BUY if action in _BUY_SIDE_ACTIONS else OrderSide.SELL
 
 
 class ExecutionCoordinator:
@@ -83,6 +270,7 @@ class ExecutionCoordinator:
             price_fetcher=self._get_current_price,
             alert_sender=self._on_alert,
             order_executor=self._execute_order_from_monitor,
+            price_sink=self._on_price_update,
         )
 
         # State
@@ -98,7 +286,357 @@ class ExecutionCoordinator:
 
         # Strategy
         self._strategy: Optional[TradingStrategy] = None
-        self._strategy_engine: Optional[StrategyEngine] = None
+
+        # Open-queue scheduler (R5-P1): auto-process the queue on the KRX
+        # closed→open transition while the system is already running.
+        self._market_was_open = False
+        self._queue_scheduler_task: Optional[asyncio.Task] = None
+        self._queue_scheduler_interval = 30.0
+
+        # Watch-list price refresh loop (monitoring-cadence-tuning arc, MAIN
+        # BODY): WatchedStock.current_price for ACTIVE entries was only ever
+        # refreshed at start() and on each trade approval (via
+        # _refresh_account_info -> _reprice_positions), never periodically —
+        # entry-candidate prices went stale for the whole session. Same
+        # lifecycle shape as _queue_scheduler_task above.
+        self._watch_refresh_task: Optional[asyncio.Task] = None
+
+        # Portfolio-exposure shadow recording loop (관측 전용, 2026-08-06):
+        # same idempotent-guard lifecycle shape as the two tasks above.
+        self._exposure_shadow_task: Optional[asyncio.Task] = None
+
+        # E2-2: market-gate last-known state for _refresh_watch_prices, for
+        # the transition-only log helper below (None = not yet observed
+        # this process). Same no-op-cycle pattern as E2-1 (agent_chat
+        # coordinator/position_manager) and RiskMonitor's E2-2 gate. Does
+        # NOT touch the queue scheduler / close-edge / fill-polling /
+        # reconciler loops below (out of scope for this gate).
+        self._market_gate_closed: Optional[bool] = None
+        # Re-entrancy guard: process_trade_queue is now reachable from start(),
+        # the scheduler, and manual API calls — concurrent runs would double-
+        # execute PENDING/PROCESSING trades (review #6).
+        self._processing_queue = False
+
+        # Automatic persistence is only active within a session (start→stop), so
+        # a coordinator built in a unit test does not write to the shared DB. The
+        # explicit _persist_state/_restore_state helpers ignore this flag.
+        self._persistence_active = False
+
+        # Daily trade count — 이 카운트가 속한 달력일(in-memory). 자정을 넘겨
+        # 계속 도는 프로세스는 `_state.daily_trades_count` 하나만으로는 그게
+        # 어제 몫인지 알 길이 없어 상한이 나날이 좁아지다 결국 매매가 전부
+        # 막힌다(2026-08-04 라이브 사고). `_maybe_reset_daily_trades()`가 읽기/
+        # 증가/영속 앞에서 이 값과 오늘을 매번 비교해 lazily 되돌린다 —
+        # `agents/llm/router.py`의 `_maybe_reset_day()`(OpenRouter 일일 예산)와
+        # 동일 패턴.
+        self._daily_count_day: date = date.today()
+
+        # 체결 통지 태스크 강참조. create_task 결과를 붙들지 않으면 GC가
+        # 태스크를 수거해 통지가 조용히 사라진다.
+        self._notify_tasks: set = set()
+
+        # F3 (audit 2026-07-13): a BUY that didn't (fully) fill at placement
+        # time previously vanished from tracking — the coordinator only
+        # registered a position on the filled portion, so any broker-side
+        # post-fill went unwatched by every defense engine. Tracks the
+        # remainder and reconciles it against ka10076 on the scheduler tick.
+        self.fill_tracker = PendingOrderTracker()
+
+        # F3 t6: counts scheduler ticks so the broker-local reconciler runs
+        # every 2nd tick (60s at the default 30s interval) instead of every
+        # tick — it does a full get_account_balance() call plus per-ticker
+        # PositionManager lookups, heavier than the fill-tracker poll.
+        self._reconcile_tick_count = 0
+
+        # S-2 review fix (dual-engine concurrent defensive-exit race): two
+        # independent monitoring engines — RiskMonitor (1s tick, via
+        # `_execute_order_from_monitor`) and PositionManager (30s tick, via
+        # `_execute_close_position` -> `_close_position`) — can each detect
+        # the SAME breached stop and race to close the SAME position. Both
+        # read `_state.positions` for the CURRENT quantity, then `await` an
+        # order submission; if the second engine's read happens before the
+        # first engine's fill has been reconciled back into `_state.positions`
+        # (`_apply_sell_fill`), it still sees the pre-fill quantity and
+        # submits a SECOND full-size SELL — a real double-liquidation (the
+        # paper broker fills unconditionally, with no holdings check).
+        #
+        # Ticker-scoped in-flight guard, not an asyncio.Lock: a Lock would
+        # deadlock the moment `_reduce_position` delegates to
+        # `_close_position` for the SAME ticker within the SAME call stack
+        # (re-entrant acquire), and "lock across an await" invites exactly
+        # the kind of subtle cross-coroutine ordering bugs this fix exists to
+        # eliminate. A plain `set` needs none of that: on a single-threaded
+        # asyncio event loop, a membership check followed immediately by an
+        # add — with NO `await` in between — cannot be interleaved by any
+        # other coroutine, so `_acquire_defensive_exit_guard` is atomic by
+        # construction without any explicit synchronization primitive.
+        self._defensive_exit_inflight: set = set()
+
+        # 방어 매도 재제출 가드 G3 (2026-08-10 라이브 사고, 089860): 종목별
+        # 마지막 방어 매도 **제출 시각**(time.monotonic()). 벽시계가 아니라
+        # 단조시계여야 한다 — NTP 보정/서머타임이 쿨다운을 음수로 만들거나
+        # 영원히 만료되지 않게 하면 안 된다.
+        #
+        # ⚠️ `_defensive_exit_inflight`(동시성 가드)와 목적이 다르다. 저것은
+        # 같은 순간 두 코루틴이 겹치는 것을 막고 `finally`에서 즉시 풀린다 —
+        # **순차** 재발동(RiskMonitor가 1초 뒤 같은 트리거를 다시 쏘는 것)은
+        # 그대로 통과했고, 그것이 이 사고의 기전이었다. 이 dict는 그 시간축
+        # 구멍을 메운다.
+        self._last_defensive_sell_at: dict[str, float] = {}
+        self._defensive_sell_cooldown_sec: float = DEFENSIVE_SELL_COOLDOWN_SEC
+        self._defensive_sell_pending_max_age_sec: float = (
+            DEFENSIVE_SELL_PENDING_MAX_AGE_SEC
+        )
+        # M4: 억제 로그의 에피소드 래치 — **(종목, 호출 경로)별**로 마지막에
+        # WARNING으로 남긴 사유. RiskMonitor는 1초 틱이라 래치가 없으면 G2
+        # 에피소드 하나가 초당 WARNING을 낸다(이 리포에는 회전 없는
+        # FileHandler로 35GB 단일 로그를 만든 이력이 있다).
+        # `monitor_gate_denied_notified`와 같은 형태로 에피소드당 1회만 WARNING,
+        # 반복은 DEBUG로 떨어뜨리고, 억제가 풀리거나 **사유가 바뀌면** 다시
+        # WARNING이 나가게 재무장한다(pending_sell → no_position 전이는 그 자체가
+        # 정보다).
+        #
+        # M5(리뷰 2라운드): 키에 `source`가 들어간다. ticker만 키로 쓰면 두
+        # 방어 엔진(risk_monitor 1초 / position_manager_* 30초)이 같은 사유로
+        # 억제될 때 **먼저 온 쪽만** WARNING이고 다른 엔진은 DEBUG로만 남아,
+        # "한쪽 엔진만 보고 다른 쪽을 놓치는" 이 리포의 반복 실패 양식이 로그
+        # 층에서 재현된다. 경로가 3개뿐이라 최대 3배(에피소드당 3줄)로 여전히
+        # 유계다.
+        self._defensive_sell_suppress_logged: dict[tuple[str, str], str] = {}
+        # 리뷰 2라운드 Important 2: `defensive_sell_stale_pending_ignored`의
+        # **ord_no 단위** 래치. WARNING을 이미 낸 미체결 주문번호 집합이며,
+        # 그 주문이 `tracking()`에서 빠지면 자동으로 정리된다(아래 G2 루프 앞).
+        self._stale_pending_logged: set[str] = set()
+
+    def _defensive_sell_suppression_reason(
+        self, ticker: str, position: Optional[ManagedPosition]
+    ) -> Optional[str]:
+        """방어 매도(손절·익절·자율 청산)를 제출하면 안 되는 사유를 돌려준다
+        (제출해도 되면 None).
+
+        2026-08-10 09:00 라이브 사고(089860)에서 나온 세 관문이다. 익절 361주가
+        245주만 부분체결되자 포지션이 116주로 축소돼 RiskMonitor에 재등록됐고,
+        가격이 여전히 익절선 위라 즉시 재발동했다. 그런데 그 116주는 **미체결
+        주문이 브로커에서 이미 잡고 있어** 매도가능수량이 0이었다 → 800033
+        "모의투자 매도가능수량이 부족합니다". 세 번째 발동은 포지션이 제거된
+        뒤(보유 0주)에 일어났다.
+
+        G1 `no_position` — 보유하지 않은 것을 팔지 않는다. 하류의
+            `_apply_sell_position_delta`가 이미 "SELL fill has no local
+            position to reconcile — skipping"을 경고한다: 포지션 없이 진행하는
+            것은 이미 깨진 경로다.
+
+        G2 `pending_sell` — 같은 종목의 미체결 SELL이 있으면 제출하지 않는다.
+            ⚠️ **이 관문이 방어를 약화시키지 않는 이유**: 브로커에 걸려 있는
+            미체결 SELL은 그 수량을 **이미 예약**하고 있다. 매도가능수량 =
+            보유 − 예약이므로, 재제출해도 그 수량은 팔리지 않는다(그것이
+            800033이다). 즉 G2는 방어를 취소하는 것이 아니라 **불가능한 요청을
+            걸러내는 것**이고, 실제 방어는 이미 브로커에서 작동 중이다 —
+            미체결 주문 그 자체가 나가 있는 손절/익절이다.
+            전량 방어 청산에서는 요청 수량 = 보유 ≥ 매도가능수량이므로 G2가
+            막는 주문은 **브로커가 어차피 거부할 주문**과 정확히 같은 집합이다
+            (현상 유지보다 나쁠 수 없다). 유일한 손해는 예약분보다 작은
+            **부분 축소**를 통째로 미루는 것인데, 그 경로(`_reduce_position`)의
+            호출자는 재량적 트림이지 손절이 아니다.
+            해제는 자동이다 — `apply_fills`가 전량 체결 시 FILLED로,
+            `expire_stale`이 만료 시 EXPIRED로 상태를 바꾸면 그 주문은
+            `tracking()`에서 빠진다. 영구 래치가 아니다.
+            🔴 **나이 상한**(`DEFENSIVE_SELL_PENDING_MAX_AGE_SEC`): 위 두 해제
+            경로가 전부다 — `TrackedOrderStatus.CANCELLED`는 enum에만 있고
+            프로덕션 어디서도 대입되지 않으며, 미체결 조회(ka10075)는
+            읽기 전용 REST 라우트에서만 쓰이고 추적기에 배선돼 있지 않다
+            (`pending_order_tracker.py`의 CANCELLED 주석 참고). 그래서 접수는
+            됐는데 체결로 대사되지 않는 매도 — ①시장가 잔량이 브로커에서 자동
+            취소된 경우(실 KRX 시장가는 잔량 자동 취소가 원칙) ②placement의
+            `order_id`와 ka10076의 `ord_no`가 어긋난 경우 ③`pending`으로
+            등록됐다가 사후 거부된 경우 — 는 **마감까지 TRACKING으로 남고**
+            그동안 그 종목의 모든 방어 매도가 억제된다.
+            억제의 정당화("브로커가 그 수량을 이미 예약 중")는 추적기의 믿음이
+            사실일 때만 성립하는데, 위 셋은 예약이 이미 풀렸는데 앱만 모르는
+            상태다. 그래서 나이가 상한을 넘긴 미체결 SELL은 **억제 근거로
+            쓰지 않는다**.
+            ⚠️ 나이 상한을 넘겨 제출한 결과의 최악은 `800033` 거부 **한 번**
+            — 즉 수정 전과 정확히 같은 동작이다. 반면 상한이 없으면 결과는
+            **마감까지 무방비**다. 거부는 API 호출 하나를 쓰고, 막힌 손절은
+            돈을 잃는다. 게다가 G3 쿨다운이 재시도를 30초에 한 번으로 묶으므로
+            폭주하지 않는다.
+
+        G3 `cooldown` — G1·G2가 못 잡는 백스톱. 주문이 **미체결 등록도 없이**
+            즉시 거부되면(브로커가 접수 자체를 거절) 추적기에 아무것도 남지
+            않고 포지션은 그대로라, 트리거가 매 틱 재발동한다. 반드시 시간으로
+            한정된다(`DEFENSIVE_SELL_COOLDOWN_SEC`, 기본 30초) — 영구 래치가
+            되면 억제된 손절 = 무방비 포지션이 된다.
+
+        판정 순서는 G1 → G2 → G3이다. 위 라이브 로그의 2차 발동은
+        `pending_sell`, 3차 발동은 `no_position`으로 각각 구별돼야 하는데,
+        1차 제출이 세워둔 쿨다운이 먼저 걸리면 둘 다 `cooldown`으로 뭉개져
+        사후 규명이 불가능해진다.
+        """
+        # G1
+        if position is None or position.quantity <= 0:
+            return "no_position"
+
+        # G2
+        now = datetime.now()
+        tracking = self.fill_tracker.tracking()
+        # stale 로그 래치 정리 — 추적기에서 사라진 ord_no는 래치도 푼다(같은
+        # 주문번호가 재사용되면 다시 WARNING이 나가야 한다). `tracking()`은
+        # 수십 건 규모라 매 호출 O(n) 교집합이 무해하다.
+        if self._stale_pending_logged:
+            self._stale_pending_logged &= {o.ord_no for o in tracking}
+
+        for tracked in tracking:
+            if tracked.ticker != ticker or tracked.side != "sell":
+                continue
+            if (tracked.total_quantity - tracked.filled_quantity) <= 0:
+                continue
+
+            # 나이 상한 — 위 docstring의 "🔴 나이 상한" 참고. `placed_at`은
+            # 벽시계(datetime)다: 단조시계는 재시작을 못 넘는데 이 값은
+            # `to_payload`로 영속돼 재시작 뒤에도 살아 있어야 하므로 선택지가
+            # 없다.
+            #
+            # ⚠️ 시계 이상은 **stale 쪽으로** 해석한다(음수 age 포함). 이
+            # 브랜치의 비대칭 논증이 그대로 적용된다 — 신뢰할 수 없는 나이를
+            # "신선함"으로 읽으면 결과가 무방비인데, stale로 읽으면 최악이
+            # 거부 1회다. (이전 주석은 "G3 쿨다운이 상한을 걸고 다음 폴에서
+            # 복귀한다"고 적었는데 **틀렸다**: G3는 억제기이지 해제기가 아니라
+            # G2 억제를 풀어줄 수 없고, 복귀도 "다음 폴"이 아니라 되감긴
+            # 시간만큼 걸린다.)
+            #
+            # M6: tz-aware `placed_at`이 섞여 들어오면 naive `now`와의 뺄셈이
+            # `TypeError`를 던지는데, `_execute_order_from_monitor`에는 이걸
+            # 잡는 except가 없어 **매 틱 손절이 통째로 실패**한다. 오늘의
+            # 왕복 경로(`model_dump(mode="json")` ↔ `model_validate`)는 naive
+            # 전용이라 도달 경로가 없지만, 비용이 2줄이고 실패 양식이
+            # "방어가 영영 안 나감"이라 방어적으로 정규화한다.
+            placed_at = tracked.placed_at
+            if placed_at.tzinfo is not None:
+                placed_at = placed_at.astimezone().replace(tzinfo=None)
+            age_seconds = (now - placed_at).total_seconds()
+
+            if age_seconds < 0 or age_seconds >= self._defensive_sell_pending_max_age_sec:
+                # 리뷰 2라운드 Important 2: 이 WARNING은 M4 래치 **밖**이라
+                # RiskMonitor 1초 틱에서 초당 1줄이 나갔다(낡은 TRACKING이 남아
+                # 있는 한 계속, G3가 억제 중인 29초 구간에도 — G2 루프가 G3보다
+                # 먼저 돌기 때문). 약 0.9MB/시간·종목. M4로 막으려던 바로 그
+                # 양식이라 같은 처방을 쓴다: **ord_no 단위** 래치.
+                # ticker가 아니라 ord_no가 키인 이유 — stale은 특정 **주문**의
+                # 속성이고, `_reduce_position`이 전량 클램프로 `_close_position`에
+                # 위임할 때 같은 제출에 두 줄이 남던 것도 이걸로 함께 사라진다.
+                message = (
+                    f"[Coordinator] defensive_sell_stale_pending_ignored: "
+                    f"{ticker} ord_no={tracked.ord_no} "
+                    f"age_seconds={age_seconds:.0f} "
+                    f"remaining={tracked.total_quantity - tracked.filled_quantity} "
+                    f"— 추적기는 아직 TRACKING이지만 브로커 예약이 이미 풀렸을 "
+                    f"수 있다. 억제 근거로 쓰지 않고 제출을 허용한다"
+                    f"(최악 = 800033 거부 1회, 대안 = 마감까지 무방비)"
+                )
+                if tracked.ord_no in self._stale_pending_logged:
+                    logger.debug(message)
+                else:
+                    self._stale_pending_logged.add(tracked.ord_no)
+                    logger.warning(message)
+                continue
+
+            return "pending_sell"
+
+        # G3
+        last_at = self._last_defensive_sell_at.get(ticker)
+        if (
+            last_at is not None
+            and (time.monotonic() - last_at) < self._defensive_sell_cooldown_sec
+        ):
+            return "cooldown"
+
+        return None
+
+    def _defensive_sell_suppressed(
+        self,
+        ticker: str,
+        position: Optional[ManagedPosition],
+        *,
+        source: str,
+    ) -> Optional[str]:
+        """`_defensive_sell_suppression_reason`의 로깅 래퍼. 억제 사유를
+        그대로 돌려준다(제출해도 되면 None) — 호출자가 사유를 하류 계약에
+        실어야 하기 때문이다(`_reduce_position`의
+        `ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT` 메시지 참고).
+
+        **모든 억제는 로그로 남는다** — 침묵이 성공으로 오인되면 안 된다.
+        관문마다 구별되는 `reason=`을 남겨 사후에 "왜 안 나갔나"를 로그만으로
+        판별할 수 있게 한다(`no_position`/`pending_sell`/`cooldown`).
+
+        M4 에피소드 래치: 같은 (종목, 호출 경로)가 같은 사유로 연속 억제되는
+        동안에는 첫 번째만 WARNING이고 나머지는 DEBUG다. RiskMonitor가 1초
+        틱이라 래치가 없으면 3분짜리 G2 에피소드 하나가 WARNING 180줄을 만든다.
+        억제가 풀리거나 사유가 바뀌면 래치가 재무장돼 다음 WARNING이 반드시
+        나간다 — 즉 **어떤 억제 에피소드도 WARNING 없이 지나가지 않는다**.
+        M5(리뷰 2라운드): 키가 (ticker, source)라 두 방어 엔진이 같은 사유로
+        억제될 때 **양쪽 다** 한 줄씩 남는다(한쪽만 보고 다른 쪽을 놓치지
+        않도록).
+        """
+        reason = self._defensive_sell_suppression_reason(ticker, position)
+        latch_key = (ticker, source)
+        if reason is None:
+            # 억제가 풀렸다 — 래치 재무장(다음 에피소드는 다시 WARNING).
+            self._defensive_sell_suppress_logged.pop(latch_key, None)
+            return None
+
+        held = position.quantity if position is not None else 0
+        message = (
+            f"[Coordinator] defensive_sell_suppressed: {ticker} "
+            f"reason={reason} source={source} held={held} "
+            f"pending_sells="
+            f"{[o.ord_no for o in self.fill_tracker.tracking() if o.ticker == ticker and o.side == 'sell']} "
+            f"— 방어는 취소되지 않는다(미체결 주문/다음 틱이 이어받는다)"
+        )
+        if self._defensive_sell_suppress_logged.get(latch_key) == reason:
+            logger.debug(message)
+        else:
+            self._defensive_sell_suppress_logged[latch_key] = reason
+            logger.warning(message)
+        return reason
+
+    def _note_defensive_sell_submitted(self, ticker: str) -> None:
+        """G3 쿨다운의 기준 시각을 찍는다. **실제 제출 직전**에만 부른다 —
+        게이트 거부/억제는 제출이 아니므로 쿨다운을 시작시키면 안 된다(그러면
+        게이트가 풀린 직후 30초를 공짜로 더 무방비로 만든다)."""
+        self._last_defensive_sell_at[ticker] = time.monotonic()
+
+    def _acquire_defensive_exit_guard(self, ticker: str) -> bool:
+        """Atomically claim `ticker` for an in-flight defensive SELL exit.
+
+        MUST be called with no `await` between the membership check and the
+        `.add()` below — that adjacency (not a lock) is what makes this
+        atomic on the single-threaded event loop. Returns True (guard
+        acquired, caller may proceed to place the order) if `ticker` was not
+        already in flight, or False (caller must skip as a no-op) if another
+        SELL execution already owns this ticker's exit right now.
+
+        Pure `set` membership/insert — no I/O, no exception vector — so a
+        SELL order can never be blocked by a failure IN the guard itself,
+        only by a genuine concurrent in-flight exit for the same ticker.
+        """
+        if ticker in self._defensive_exit_inflight:
+            logger.warning(
+                f"[Coordinator] defensive_exit_skipped_inflight: {ticker} "
+                f"already has a SELL exit in flight — skipping duplicate "
+                f"(first execution owns this exit; a failed first attempt "
+                f"is naturally retried on the next monitor tick)"
+            )
+            return False
+        self._defensive_exit_inflight.add(ticker)
+        return True
+
+    def _release_defensive_exit_guard(self, ticker: str) -> None:
+        """Release `ticker`'s in-flight defensive-exit claim. Always called
+        from a `finally` block by the acquiring call site so a raised
+        exception during order placement can never leave a ticker
+        permanently stuck as "in flight" (a `.discard()` on a missing key is
+        a no-op, so this is also safe to call defensively)."""
+        self._defensive_exit_inflight.discard(ticker)
 
     # -------------------------------------------
     # Activity Logging
@@ -135,33 +673,193 @@ class ExecutionCoordinator:
     # Lifecycle
     # -------------------------------------------
 
-    async def start(self):
-        """Start the auto-trading system."""
+    async def start(self, drain_queue: bool = True, boot_resume: bool = False):
+        """Start the auto-trading system.
+
+        Args:
+            drain_queue: 장이 열려 있고 큐가 비어 있지 않을 때 즉시
+                process_trade_queue()를 돌릴지. 수동 /trading/start는
+                True(기존 동작)이고, **부팅 자동 재개만 False**를 넘긴다 —
+                QueuedTrade에 만료가 없고 process_trade_queue에 신선도
+                검사가 없어서, 사람이 앞에 없는 장중 재시작이 몇 시간 묵은
+                가격으로 주문을 낼 수 있다. 방어(손절/익절)는 이 값과
+                무관하게 즉시 살아난다.
+            boot_resume: 이 시작이 부팅 자동 재개인지. 활동 로그를 수동
+                시작과 구별하기 위한 표식일 뿐 동작을 바꾸지 않는다.
+        """
         logger.info("[Coordinator] Starting auto-trading system")
 
         # Fetch initial account info
         await self._refresh_account_info()
 
-        # Start risk monitor
-        await self.risk_monitor.start()
+        # Restore restart-critical state (positions+stops, queue, daily count)
+        # BEFORE the monitor starts so recovered stops are watched immediately.
+        await self._restore_state()
 
-        # Update state
+        # Phase3: restore the active strategy from its revision pointer.
+        # Independent of _restore_state (its own try/except) — a strategy
+        # restore failure must never block the state restore above.
+        await self._restore_strategy()
+
+        # Update state — persist 활성화보다 **앞**이어야 한다. 순서가
+        # 반대면 그 사이에 트리거된 persist가 직전 mode(보통 STOPPED)를
+        # 저장하고, 다음 부팅의 자동 방어 복원이 그 값을 보고 재개를
+        # 건너뛴다(2026-07-29 재시작 안전).
         self._state.mode = TradingMode.ACTIVE
         self._state.started_at = datetime.now()
 
+        # Activate persistence BEFORE the startup queue drain below, so trades
+        # executed at open are persisted — otherwise a crash before the next
+        # persist re-executes them and loses their stop defense (review #3).
+        self._persistence_active = True
+
+        # Start risk monitor
+        await self.risk_monitor.start()
+
+        # 재시작 안전(2026-07-30): 방어(risk_monitor)가 실제로 켜진 뒤에야
+        # mode=active를 디스크에 남긴다 -- 그 전에 두면 risk_monitor.start()
+        # 실패 시 "방어는 안 켜졌는데 블롭은 active"인 거짓 기록이 남는다.
+        # 이 persist가 없으면(REGRESSION, 라이브에서 실측: 장 마감 중
+        # POST /trading/start 후 블롭 mode가 계속 null) mutation 훅
+        # (_schedule_persist)이나 stop/pause/resume의 persist만으로는 부족하다
+        # -- 장중 뮤테이션이 하나도 없으면 이 시작을 기록할 다른 경로가 없어서,
+        # 다음 재시작의 resume_if_persisted()가 영원히 건너뛴다.
+        # _persistence_active는 이미 True, _restore_state()도 이미 끝난
+        # 뒤라 메모리 스냅샷이 실제 내용이다 -- 부분 쓰기(_persist_fields)가
+        # 아니라 전체 _persist_state()가 맞다. never-raise라 start()를 깰
+        # 수 없다.
+        await self._persist_state()
+
+        # C-2 (2026-08-07): 레짐 슬롯 상향은 게이트 검사 8과 생사를 같이해야
+        # 한다. 킬스위치가 off면 08:05 스케줄러가 **아예 안 뜨므로**
+        # (`start_regime_scheduler`가 플래그를 보고 None을 반환한다) 되돌리기
+        # 로직이 그 안에만 있으면 영원히 실행되지 않는다. 코디네이터 기동은
+        # 킬스위치와 무관하게 돌기 때문에 여기가 유일하게 확실한 지점이다.
+        #
+        # 위치가 중요하다: `_restore_state()`가 블롭의 (상향된) risk_params를
+        # 메모리로 되살린 **뒤**, 그리고 시작 큐 드레인(아래 process_trade_queue)
+        # **앞**이어야 한다 -- 안 그러면 개장 직후 큐가 낡은 상향 천장으로
+        # 매수한다. `_persist_state()` 뒤에 두는 것도 의도다(그 persist는
+        # risk_monitor가 실제로 켜진 뒤 mode=active를 남기는 2026-07-29의
+        # 순서 계약이고, 그 앞에 다른 persist를 끼우면 계약이 깨진다).
+        await self.apply_regime_slots()
+
         self._log_activity(
             ActivityType.SYSTEM_START,
-            f"Auto-trading system started. Account: ₩{self._state.account.total_equity:,.0f}",
-            details={"account": self._state.account.model_dump()},
+            (
+                f"Auto-trading system {'auto-resumed after restart' if boot_resume else 'started'}. "
+                f"Account: ₩{self._state.account.total_equity:,.0f}"
+            ),
+            details={
+                "account": self._state.account.model_dump(),
+                "boot_resume": boot_resume,
+            },
         )
 
         await self._notify_state_change()
 
         # Process any pending trades in queue (if market is open)
         market_session = self._market_hours.get_market_session(MarketType.KRX)
-        if market_session.is_open and self.get_trade_queue():
+        if drain_queue and market_session.is_open and self.get_trade_queue():
             logger.info("[Coordinator] Processing pending trade queue after start")
             await self.process_trade_queue()
+        elif not drain_queue:
+            logger.info(
+                "[Coordinator] Boot resume — skipping startup queue drain "
+                "(stale-price guard)"
+            )
+
+        # Seed the scheduler's edge state and start watching for the KRX
+        # closed→open transition so a queue built overnight processes at open.
+        self._market_was_open = market_session.is_open
+        if self._queue_scheduler_task is None or self._queue_scheduler_task.done():
+            self._queue_scheduler_task = asyncio.create_task(
+                self._queue_scheduler_loop()
+            )
+
+        # Start the periodic watch-list price refresh loop (same idempotent
+        # guard shape as the queue scheduler above).
+        if self._watch_refresh_task is None or self._watch_refresh_task.done():
+            self._watch_refresh_task = asyncio.create_task(
+                self._watch_refresh_loop()
+            )
+
+        # 목표 노출도 섀도 기록 (관측 전용, 같은 idempotent 가드 형태).
+        if self._exposure_shadow_task is None or self._exposure_shadow_task.done():
+            self._exposure_shadow_task = asyncio.create_task(
+                self._exposure_shadow_loop()
+            )
+
+    async def resume_if_persisted(self) -> bool:
+        """부팅 시 호출 — 마지막으로 저장된 mode가 active/paused면 방어를
+        되살린다. 실제로 재개했으면 True, no-op이면 False.
+
+        복원 기계 자체는 start() 안의 _restore_state()가 이미 갖고 있다.
+        이 메서드가 하는 일은 "되살려도 되는가"의 판단뿐이다.
+
+        규칙:
+          active → start(drain_queue=False)
+          paused → start(drain_queue=False) 후 pause() — pause는 감시를
+                   유지하므로 손절은 살고 신규 진입만 잠긴다
+          stopped / mode 필드 없음 / 블롭 없음 → 아무것도 안 함
+
+        mode 필드가 없는 블롭(이 기능 이전에 저장된 것)에서 재개하지 않는
+        것은 의도다 — 추측해서 되살리는 것보다 안전하다. 배포 후 첫 수동
+        start()가 mode를 기록하고, 그 다음 재시작부터 자동으로 동작한다.
+
+        예외는 삼키지 않는다. 호출자(app.main._boot_auto_resume)가 잡아서
+        로그와 Telegram에 남긴다 — 방어를 못 켠 것은 조용히 넘어갈 일이
+        아니다.
+        """
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
+        blob = await storage.get_app_setting(self._STATE_KEY)
+        if not blob:
+            logger.info("[Coordinator] Boot resume: no persisted state")
+            return False
+
+        data = json.loads(blob) or {}
+        mode = data.get("mode")
+        if mode not in (TradingMode.ACTIVE.value, TradingMode.PAUSED.value):
+            logger.info(f"[Coordinator] Boot resume skipped (mode={mode!r})")
+            # RECOMMENDATION 8 (2026-07-29): this no-op is correct and stays
+            # correct -- a blob without a valid mode should never guess its
+            # way into resuming. But it lands the operator in exactly the
+            # pre-branch hole (positions with no defense) with only an info
+            # log, and it fires on THIS branch's very first deploy (no blob
+            # has a "mode" field yet). If positions are sitting in the same
+            # blob we just parsed, say so on the phone.
+            await self._alert_defense_not_armed(data)
+            return False
+
+        logger.info(f"[Coordinator] Boot resume: restoring mode={mode}")
+        await self.start(drain_queue=False, boot_resume=True)
+        if mode == TradingMode.PAUSED.value:
+            await self.pause("restart resume")
+        return True
+
+    async def _alert_defense_not_armed(self, data: dict) -> None:
+        """RECOMMENDATION 8 (2026-07-29): resume_if_persisted()이 재개를
+        건너뛰었는데 같은 블롭에 보유 포지션이 남아 있으면, 방어가 꺼진 채
+        부팅됐다는 사실을 알린다. Best-effort — 알림 실패가 부팅을 막지
+        않는다."""
+        positions = data.get("positions") or []
+        if not positions:
+            return
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_system_status(
+                    "error",
+                    f"부팅 자동 방어 복원 건너뜀 — 보유 포지션 {len(positions)}건이 "
+                    f"무방비 상태입니다. 수동으로 POST /api/trading/start 를 "
+                    f"실행하세요.",
+                )
+        except Exception as e:
+            logger.error(f"[Coordinator] Failed to alert unarmed defense: {e}")
 
     async def stop(self):
         """Stop the auto-trading system."""
@@ -169,6 +867,42 @@ class ExecutionCoordinator:
 
         await self.risk_monitor.stop()
         self._state.mode = TradingMode.STOPPED
+
+        # Stop the open-queue scheduler.
+        if self._queue_scheduler_task is not None:
+            self._queue_scheduler_task.cancel()
+            self._queue_scheduler_task = None
+
+        # Stop the watch-list price refresh loop.
+        if self._watch_refresh_task is not None:
+            self._watch_refresh_task.cancel()
+            self._watch_refresh_task = None
+
+        # Stop the exposure-shadow recording loop.
+        if self._exposure_shadow_task is not None:
+            self._exposure_shadow_task.cancel()
+            self._exposure_shadow_task = None
+
+        # Persist mode on shutdown -- unconditional (IMPORTANT 3, 2026-07-29).
+        # A stop() on a coordinator that never start()ed in THIS process
+        # (e.g. the very first API call after a fresh boot being
+        # /trading/stop) must still write mode=stopped, or a stale
+        # mode=active left over from a previous session survives in the
+        # blob and the next boot's resume_if_persisted() arms trading the
+        # operator explicitly switched off.
+        #
+        # 단, 전체 스냅샷(_persist_state)은 _persistence_active가 True일
+        # 때만 부른다 -- False면 이 프로세스는 _restore_state()를 돈 적이
+        # 없어서 메모리 상 positions/trade_queue/watch_list가 블롭의 실제
+        # 내용이 아니라 전부 빈 기본값이고, 그대로 직렬화하면 진짜 데이터를
+        # 지워 버린다(REGRESSION, 2026-07-29 리뷰). mode만은 여전히
+        # 영속돼야 하므로 그 경우엔 `_persist_fields()`로 mode 키만
+        # read-modify-write한다. 둘 다 never-raise라 셧다운을 깨지 않는다.
+        if self._persistence_active:
+            await self._persist_state()
+        else:
+            await self._persist_fields(mode=self._mode_value())
+        self._persistence_active = False
 
         self._log_activity(
             ActivityType.SYSTEM_STOP,
@@ -190,6 +924,23 @@ class ExecutionCoordinator:
 
         await self._notify_state_change()
 
+        # IMPORTANT 3 (2026-07-29): persist mode immediately, don't wait for
+        # some unrelated mutator to happen to fire a persist. Otherwise:
+        # operator pauses at 10:00 to stop new entries -> process dies at
+        # 10:05 with no intervening persist -> blob still says "active" ->
+        # boot resume calls start(drain_queue=False), NOT pause() ->
+        # autonomous new entries unlock against the operator's explicit
+        # intent on a live account.
+        #
+        # `_persistence_active`가 False(이 프로세스에서 start()를 거친 적
+        # 없음)면 전체 `_persist_state()` 대신 mode 키만 갱신한다 -- 이유는
+        # stop()의 동일 분기 주석 참고(REGRESSION, 2026-07-29 리뷰). 둘 다
+        # never-raise.
+        if self._persistence_active:
+            await self._persist_state()
+        else:
+            await self._persist_fields(mode=self._mode_value())
+
     async def resume(self):
         """Resume auto-trading."""
         await self.risk_monitor.resume()
@@ -201,6 +952,18 @@ class ExecutionCoordinator:
         )
 
         await self._notify_state_change()
+
+        # IMPORTANT 3 (2026-07-29): same reasoning as pause() above -- mode
+        # must be durable the moment it changes, not only when some other
+        # mutator happens to persist. Placed before the queue drain below so
+        # the mode is on disk even if process_trade_queue hangs or fails.
+        #
+        # `_persistence_active`가 False면 mode 키만 갱신한다 -- stop()의
+        # 동일 분기 주석 참고(REGRESSION, 2026-07-29 리뷰). 둘 다 never-raise.
+        if self._persistence_active:
+            await self._persist_state()
+        else:
+            await self._persist_fields(mode=self._mode_value())
 
         # Process any pending trades in queue (if market is open)
         market_session = self._market_hours.get_market_session(MarketType.KRX)
@@ -223,9 +986,16 @@ class ExecutionCoordinator:
         take_profit: Optional[float],
         risk_score: int,
         quantity_override: Optional[int] = None,
+        autonomous: bool = False,
+        queue_id: Optional[str] = None,
     ) -> AllocationPlan:
         """
         Handle an approved trade from the analysis system.
+
+        autonomous=True marks trades originated by an autonomy engine (R3):
+        if such a trade gets QUEUED, the queue processor re-checks the shared
+        autonomy gate before executing it — a mode flip to HITL or a tripped
+        limit between queueing and execution must win.
 
         Args:
             session_id: Analysis session ID
@@ -237,6 +1007,10 @@ class ExecutionCoordinator:
             take_profit: Take-profit price
             risk_score: Risk score from analysis (1-10)
             quantity_override: Optional manual quantity override
+            queue_id: The originating QueuedTrade.id, when this call comes
+                from `_process_trade_queue_inner` (F3) — threaded onto any
+                fill-tracker registration below so a later post-fill can
+                annotate the queue entry it came from.
 
         Returns:
             AllocationPlan with execution details
@@ -301,12 +1075,14 @@ class ExecutionCoordinator:
                 take_profit=take_profit,
                 risk_score=risk_score,
                 reason=queue_reason,
+                autonomous=autonomous,
+                quantity=quantity_override,
             )
 
             return AllocationPlan(
                 ticker=ticker,
                 stock_name=stock_name,
-                side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
+                side=_order_side_for_action(action),
                 quantity=0,
                 entry_price=entry_price,
                 estimated_amount=0,
@@ -315,6 +1091,7 @@ class ExecutionCoordinator:
             )
 
         # Check daily trade limit
+        self._maybe_reset_daily_trades()
         if self._state.daily_trades_count >= self.risk_params.max_daily_trades:
             rationale = f"Daily trade limit reached ({self._state.daily_trades_count}/{self.risk_params.max_daily_trades})"
             self._log_activity(
@@ -326,7 +1103,7 @@ class ExecutionCoordinator:
             return AllocationPlan(
                 ticker=ticker,
                 stock_name=stock_name,
-                side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
+                side=_order_side_for_action(action),
                 quantity=0,
                 entry_price=entry_price,
                 estimated_amount=0,
@@ -338,7 +1115,17 @@ class ExecutionCoordinator:
         await self._refresh_account_info()
 
         # Calculate allocation
-        side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
+        side = _order_side_for_action(action)
+
+        # C1(유동성 인지): 주문 직전 ADTV 재계산 — 발굴(EOD)~진입(수일 후) 사이
+        # 유동성이 바뀔 수 있어 최신 일봉으로 다시 구한다. BUY에서만 의미
+        # 있다(SELL은 _calculate_max_position_value를 타지 않는다).
+        # never-raise: 실패하면 None -> apply_liquidity_cap이 캡
+        # 미적용(fail-open)으로 처리한다.
+        adtv = None
+        if side == OrderSide.BUY:
+            adtv = await self.portfolio_agent._resolve_adtv(ticker)
+
         allocation = self.portfolio_agent.calculate_allocation(
             account=self._state.account,
             ticker=ticker,
@@ -349,13 +1136,21 @@ class ExecutionCoordinator:
             stop_loss=stop_loss,
             take_profit=take_profit,
             current_positions=self._state.positions,
+            adtv=adtv,
         )
 
-        # Override quantity if provided
+        # H2: quantity_override를 allocation 캡(calculate_allocation이 산정한 R-사이징/
+        # min_cash/max_stock 상한 = allocation.quantity)으로 클램프한다. override가
+        # 캡을 통째 덮어써 캡을 우회하지 못하게 — override≤캡이면 그대로, 초과면 캡.
         if quantity_override and quantity_override > 0:
-            allocation.quantity = quantity_override
-            allocation.estimated_amount = quantity_override * entry_price
-            allocation.rationale += f" (quantity override: {quantity_override})"
+            capped = min(quantity_override, allocation.quantity)
+            allocation.quantity = capped
+            allocation.estimated_amount = capped * entry_price
+            allocation.rationale += (
+                f" (quantity override {quantity_override} clamped to {capped})"
+                if capped < quantity_override
+                else f" (quantity override: {quantity_override})"
+            )
 
         # Log allocation decision
         self._log_activity(
@@ -408,14 +1203,115 @@ class ExecutionCoordinator:
             return allocation
 
         # Execute rebalancing orders first
+        #
+        # E1-4: a rebalance order is a SYSTEM-computed SELL of an UNRELATED
+        # position (`portfolio_agent._check_rebalancing_needed` decided it, to
+        # free up room for the trade that WAS approved) — the human approved
+        # the PRIMARY trade, not trimming a different position. That makes it
+        # the same category as a defensive stop-loss/take-profit trigger
+        # (`_execute_order_from_monitor`) or an autonomous full close
+        # (PositionManager._execute_close_position, R5-P0 A2): it must pass
+        # the shared autonomy gate UNCONDITIONALLY, regardless of whether
+        # THIS trade's own `autonomous` flag is set. A denial skips only that
+        # one rebalance item and logs it — the primary order below still
+        # proceeds (mirrors A2's "skip, don't abort" shape), and the fill is
+        # then reconciled through the same `_apply_sell_fill`/
+        # `_register_unfilled_sell` choke points every other SELL site uses
+        # (previously this loop only placed the order and never recorded the
+        # ledger row or decremented the local position for it at all).
+        from services.autonomy import check_autonomy
+
         for rebalance_order in allocation.rebalance_orders:
-            self._log_activity(
-                ActivityType.ORDER_PLACED,
-                f"Rebalance order: {rebalance_order.side.value} {rebalance_order.quantity} shares",
-                agent="order",
-                ticker=rebalance_order.ticker,
-            )
-            await self._execute_order(rebalance_order)
+            # N1 review fix (survival discipline, 6th SELL entry point): this
+            # rebalance-sell loop is a SIXTH source of SELL orders for a
+            # ticker — an UNRELATED position trimmed to free room for the
+            # trade actually approved — and can race a defensive exit
+            # (RiskMonitor/PositionManager) for the SAME ticker exactly like
+            # the other 5 guarded SELL sites (`_execute_order_from_monitor`/
+            # `_close_position`/`_reduce_position`/`on_trade_approved`'s own
+            # SELL/REDUCE main path below/`handle_alert_action`'s
+            # EXECUTE_STOP_LOSS/EXECUTE_TAKE_PROFIT) — see `_close_position`'s
+            # docstring for the full dual-engine race rationale. Acquired
+            # BEFORE the `await check_autonomy` below (not after) so the
+            # in-flight claim closes the race window from the earliest
+            # possible point, same as `_execute_order_from_monitor`'s
+            # acquire-then-gate-check ordering. Guard-denied: skip ONLY this
+            # rebalance item (the loop continues to the next rebalance order,
+            # and the primary approved order below still proceeds untouched)
+            # — the other engine's exit already owns this ticker's exit.
+            if not self._acquire_defensive_exit_guard(rebalance_order.ticker):
+                logger.warning(
+                    f"[Coordinator] rebalance_sell_skipped_inflight: "
+                    f"{rebalance_order.ticker} already has a SELL exit in "
+                    f"flight — skipping this rebalance order (primary trade "
+                    f"unaffected)"
+                )
+                self._log_activity(
+                    ActivityType.TRADE_REJECTED,
+                    f"Rebalance order skipped — defensive exit already in "
+                    f"flight for {rebalance_order.ticker}",
+                    agent="system",
+                    ticker=rebalance_order.ticker,
+                )
+                continue
+
+            try:
+                gate = await check_autonomy(
+                    "kiwoom",
+                    action="SELL",
+                    quantity=rebalance_order.quantity,
+                    entry_price=rebalance_order.price,
+                )
+                if not gate.allowed:
+                    logger.warning(
+                        f"[Coordinator] Rebalance sell blocked by gate: "
+                        f"{rebalance_order.ticker} check={gate.check} reason={gate.reason}"
+                    )
+                    self._log_activity(
+                        ActivityType.TRADE_REJECTED,
+                        f"Rebalance order blocked by autonomy gate: {rebalance_order.ticker} "
+                        f"({gate.reason})",
+                        agent="system",
+                        ticker=rebalance_order.ticker,
+                    )
+                    continue
+
+                # NOTE (pre-existing bug, fixed in passing): OrderRequest has
+                # `use_enum_values=True`, so `.side` is already a plain str
+                # ("sell") by validation time, not an OrderSide member — the old
+                # `.side.value` here raised AttributeError the moment this line
+                # actually ran (every other `.side` use in this file already
+                # compares against the plain string, e.g. line ~2411
+                # `order.side == "sell"`).
+                self._log_activity(
+                    ActivityType.ORDER_PLACED,
+                    f"Rebalance order: {rebalance_order.side} {rebalance_order.quantity} shares",
+                    agent="order",
+                    ticker=rebalance_order.ticker,
+                )
+                # Capture the position BEFORE the fill reconciles it (matches
+                # _execute_order_from_monitor's pattern) — _apply_sell_fill may
+                # reduce/remove it from _state.positions, but
+                # _register_unfilled_sell only needs stock_name/
+                # analysis_session_id/risk_score off the (still-valid) reference.
+                rebalance_position = next(
+                    (p for p in self._state.positions if p.ticker == rebalance_order.ticker),
+                    None,
+                )
+                rebalance_result = await self._execute_order(rebalance_order)
+                self._apply_sell_fill(
+                    rebalance_order.ticker,
+                    rebalance_result.filled_quantity,
+                    order=rebalance_order,
+                    result=rebalance_result,
+                )
+                # A partial/unfilled remainder still has broker-side exposure —
+                # track it the same way every other SELL site does (E1-1/E1-3).
+                self._register_unfilled_sell(
+                    rebalance_order.ticker, rebalance_position, rebalance_order, rebalance_result
+                )
+            finally:
+                self._release_defensive_exit_guard(rebalance_order.ticker)
 
         # Execute main order
         order = OrderRequest(
@@ -424,9 +1320,38 @@ class ExecutionCoordinator:
             side=side,
             quantity=allocation.quantity,
             price=entry_price,
+            # S-3 (survival discipline): a SELL/REDUCE decision reaching this
+            # entry point (e.g. an agent-chat discussion outcome) is a
+            # liquidation, same category as the other defensive-exit sites
+            # (_close_position/_reduce_position/_execute_order_from_monitor)
+            # — submit MARKET so it reports the true fill in a gap/crash.
+            # BUY/ADD stays LIMIT (global invariant, unaffected by `side`
+            # since it's only SELL here).
+            order_type=OrderType.MARKET if side == OrderSide.SELL else OrderType.LIMIT,
             session_id=session_id,
             reason=f"Trade approval (risk: {risk_score})",
         )
+
+        # U3 (사이징 계보, 2026-08-05): 이 지점이 계보(allocation.sizing_
+        # lineage)와 그 계보가 귀속될 decision_id(order.session_id ==
+        # agent-chat 경로에서 agent_chat_decisions.id)가 함께 갖춰지는
+        # 유일한 자리다. 주문이 실제로 체결되는지와 무관하게(사이징 계산
+        # 자체는 체결 전에 이미 끝났다) 여기서 즉시 기록한다. 매칭되는
+        # 행이 없으면(수동 승인 등 agent-chat 기원이 아닌 경로) 조용히
+        # no-op — update_decision_label과 같은 관례. 저장 실패가 주문
+        # 경로를 절대 끊지 않도록 이 호출 자체도 try/except로 감싼다
+        # (StorageService 메서드 내부 가드와 별개의 방어선).
+        if allocation.sizing_lineage:
+            try:
+                storage = await get_storage_service()
+                await storage.update_decision_sizing_lineage(
+                    order.session_id, allocation.sizing_lineage
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Coordinator] sizing lineage 저장 실패 "
+                    f"(주문 경로에는 영향 없음): {e}"
+                )
 
         self._log_activity(
             ActivityType.ORDER_PLACED,
@@ -457,83 +1382,152 @@ class ExecutionCoordinator:
             },
         )
 
-        result = await self._execute_order(order)
+        # S-2 review fix: on_trade_approved is a THIRD source of SELL orders
+        # for `ticker` (e.g. a watch-list agent-chat SELL/REDUCE decision) —
+        # it can race a RiskMonitor/PositionManager defensive exit on the
+        # SAME ticker exactly like the dual-engine race `_close_position`/
+        # `_reduce_position`/`_execute_order_from_monitor` guard against (see
+        # `_close_position`'s docstring). Guard just the order-placement +
+        # fill-reconciliation window below — BUY orders never touch this
+        # guard (`is_sell_main` gates it), matching every other site's
+        # "BUY/ADD paths stay untouched" contract.
+        is_sell_main = side == OrderSide.SELL
+        if is_sell_main and not self._acquire_defensive_exit_guard(ticker):
+            rationale = (
+                f"Defensive exit already in flight for {ticker} — skipped to "
+                f"avoid a duplicate SELL"
+            )
+            self._log_activity(
+                ActivityType.TRADE_REJECTED,
+                rationale,
+                agent="system",
+                ticker=ticker,
+            )
+            return AllocationPlan(
+                ticker=ticker,
+                stock_name=stock_name,
+                side=side,
+                quantity=0,
+                entry_price=entry_price,
+                estimated_amount=0,
+                position_pct=0,
+                rationale=rationale,
+            )
 
-        # Log execution result
-        if result.filled_quantity > 0:
-            self._log_activity(
-                ActivityType.ORDER_EXECUTED,
-                f"Order filled: {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
-                agent="order",
-                ticker=ticker,
-                details={
-                    "filled_quantity": result.filled_quantity,
-                    "avg_price": result.avg_price,
-                    "order_id": result.order_id,
-                },
-            )
-            # Update order agent with success result
-            self._update_agent_status(
-                "order",
-                AgentStatus.IDLE,
-                action=f"Filled {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
-                processing_stock=ticker,
-                processing_stock_name=stock_name,
-                trade_details={
-                    "action": action,
-                    "quantity": result.filled_quantity,
-                    "entry_price": result.avg_price,
-                    "total_amount": result.filled_quantity * result.avg_price,
-                    "stop_loss": stop_loss,
-                    "take_profit": take_profit,
-                },
-                last_result={
-                    "success": True,
-                    "message": f"Order filled: {result.filled_quantity} shares",
-                    "order_id": result.order_id,
-                    "filled_quantity": result.filled_quantity,
-                    "avg_price": result.avg_price,
-                },
-            )
-            self._complete_agent_task("order", success=True)
-        else:
-            self._log_activity(
-                ActivityType.ORDER_FAILED,
-                f"Order failed: {result.message or 'Unknown error'}",
-                agent="order",
-                ticker=ticker,
-            )
-            # Update order agent with failure result
-            self._update_agent_status(
-                "order",
-                AgentStatus.IDLE,
-                action=f"Order failed: {result.message or 'Unknown error'}",
-                error=result.message,
-                processing_stock=ticker,
-                processing_stock_name=stock_name,
-                last_result={
-                    "success": False,
-                    "message": result.message or "Unknown error",
-                },
-            )
-            self._complete_agent_task("order", success=False)
+        try:
+            result = await self._execute_order(order)
+
+            # Log execution result
+            if result.filled_quantity > 0:
+                self._log_activity(
+                    ActivityType.ORDER_EXECUTED,
+                    f"Order filled: {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
+                    agent="order",
+                    ticker=ticker,
+                    details={
+                        "filled_quantity": result.filled_quantity,
+                        "avg_price": result.avg_price,
+                        "order_id": result.order_id,
+                    },
+                )
+                # Update order agent with success result
+                self._update_agent_status(
+                    "order",
+                    AgentStatus.IDLE,
+                    action=f"Filled {result.filled_quantity} shares @ ₩{result.avg_price:,.0f}",
+                    processing_stock=ticker,
+                    processing_stock_name=stock_name,
+                    trade_details={
+                        "action": action,
+                        "quantity": result.filled_quantity,
+                        "entry_price": result.avg_price,
+                        "total_amount": result.filled_quantity * result.avg_price,
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit,
+                    },
+                    last_result={
+                        "success": True,
+                        "message": f"Order filled: {result.filled_quantity} shares",
+                        "order_id": result.order_id,
+                        "filled_quantity": result.filled_quantity,
+                        "avg_price": result.avg_price,
+                    },
+                )
+                self._complete_agent_task("order", success=True)
+
+                # E1-4 (scope 2, PART 2 gap follow-up): this branch used to ONLY
+                # write the ledger row (see the now-superseded comment this
+                # replaces) — it never decremented `_state.positions`, so a fill
+                # placed through THIS entry point (agent-chat direct decisions +
+                # queue replays) left a phantom leftover position exactly the
+                # size of the fill; only a LATER poll delta (E1-2) would shave
+                # anything off, never the placement-time fill itself.
+                # `_apply_sell_fill` is the shared choke point every OTHER SELL
+                # caller (RiskMonitor triggers, _execute_order_from_monitor,
+                # rebalance orders above) already uses — it performs the SAME
+                # ledger write this block used to do directly (record_trade_fill,
+                # still gated on `_persistence_active` internally) AND reconciles
+                # the local position (decrement/remove + realized P&L), so
+                # routing through it here REPLACES the direct call rather than
+                # adding a second one (which would double-record the same fill).
+                if side == OrderSide.SELL:
+                    self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+            else:
+                self._log_activity(
+                    ActivityType.ORDER_FAILED,
+                    f"Order failed: {result.message or 'Unknown error'}",
+                    agent="order",
+                    ticker=ticker,
+                )
+                # Update order agent with failure result
+                self._update_agent_status(
+                    "order",
+                    AgentStatus.IDLE,
+                    action=f"Order failed: {result.message or 'Unknown error'}",
+                    error=result.message,
+                    processing_stock=ticker,
+                    processing_stock_name=stock_name,
+                    last_result={
+                        "success": False,
+                        "message": result.message or "Unknown error",
+                    },
+                )
+                self._complete_agent_task("order", success=False)
+                # Critical 1 (최종 전체 브랜치 리뷰): 이 else 분기는 "브로커 거부"가
+                # 아니라 status in {pending, rejected} 전체다 — 자율 BUY는 LIMIT
+                # 주문이고 order_agent가 3폴×0.5초만 기다린 뒤 미체결이면
+                # status="pending", filled_quantity=0으로 "정상" 반환한다(주문은
+                # 브로커에 살아있고, 9줄 아래 _track_unfilled가 바로 그 살아있는
+                # 주문을 ka10076 추적에 등록한다). pending을 "주문 실패, 수동
+                # 확인하세요" 알림으로 보내면 운영자가 이미 작동 중인 지정가
+                # 주문에 중복 매수를 시도할 위험이 생긴다. 실제 거부(status ==
+                # "rejected")만 알린다 — pending은 의도적으로 무통지다(체결이
+                # 나중에 잡히면 _poll_tracked_fills의 사후 체결 통지가 알린다).
+                if result.status == "rejected":
+                    self._schedule_order_failure_alert(order, result.message or "브로커 거부")
+        finally:
+            if is_sell_main:
+                self._release_defensive_exit_guard(ticker)
 
         # If successful, add to monitoring
         if result.filled_quantity > 0 and side == OrderSide.BUY:
-            position = ManagedPosition(
+            # H3: 즉시체결도 pending체결(:3240)과 동일하게 register_fill_as_position로
+            # 등록 → RiskMonitor(via _add_position, 기존과 동일) + PositionManager
+            # 양쪽 감시엔진에 등록(이중엔진 실현). 이전엔 수동 _add_position만 호출해
+            # PM 미등록이라 PM의 30s 손절/트레일링/재평가가 이 포지션엔 안 돌았다.
+            await register_fill_as_position(
+                self,
                 ticker=ticker,
                 stock_name=stock_name or ticker,
                 quantity=result.filled_quantity,
                 avg_price=result.avg_price,
-                current_price=result.avg_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
+                session_id=session_id,
+                source="placement_fill",
                 stop_loss_mode=self.risk_params.stop_loss_mode,
-                status=PositionStatus.FILLED,
-                analysis_session_id=session_id,
                 risk_score=risk_score,
             )
-            self._add_position(position)
 
             self._log_activity(
                 ActivityType.POSITION_OPENED,
@@ -548,7 +1542,348 @@ class ExecutionCoordinator:
                 },
             )
 
+        # F3/E1-1: an unfilled/partial order (either side) still has (or may
+        # soon have) broker-side exposure that nothing is watching yet —
+        # track the remainder so the scheduler's ka10076 poll can pick up
+        # the post-fill later. `_track_unfilled` is side-agnostic (E1-1
+        # generalized the original BUY-only F3 block, since a SELL/REDUCE
+        # remainder going untracked is exactly how a real ledger under-
+        # recorded a 155-share broker sell as 41 shares).
+        registered = self._track_unfilled(
+            side.value,
+            ticker,
+            stock_name or ticker,
+            result,
+            limit_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            source_queue_id=queue_id,
+            source_session_id=session_id,
+            risk_score=risk_score,
+        )
+        if registered:
+            self._schedule_persist()
+            self._log_activity(
+                ActivityType.ORDER_PLACED,
+                f"미체결 잔량 추적 등록: {stock_name or ticker} "
+                f"({', '.join(registered)})",
+                agent="order",
+                ticker=ticker,
+                details={"tracked": registered},
+            )
+
         return allocation
+
+    def _track_unfilled(
+        self,
+        order_side: str,
+        ticker: str,
+        stock_name: str,
+        result: OrderResult,
+        *,
+        limit_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        source_queue_id: Optional[str] = None,
+        source_session_id: Optional[str] = None,
+        risk_score: Optional[int] = None,
+    ) -> List[str]:
+        """Register every pending/partial part of an order result with the
+        fill tracker, so the 30s ka10076 poll (`_poll_tracked_fills`) can
+        pick up its post-fill later.
+
+        Extracted from the original F3 BUY-only block (E1-1) — `order_side`
+        is now threaded through instead of the block being gated on
+        `OrderSide.BUY`, so the exact same registration applies to a SELL or
+        REDUCE order's unfilled remainder. Returns [] (no registration) when
+        the aggregate result itself is not pending/partial (e.g. fully
+        filled or rejected) — same short-circuit as the original gate.
+
+        Split orders (F3 review CRITICAL): the aggregate carries per-part
+        results in `result.parts`, each with its OWN broker ord_no. ka10076
+        matches by ord_no, so every unfilled/partial part is tracked as its
+        own TrackedOrder — one aggregate entry would poison the diff
+        arithmetic (several broker orders summed against one total).
+        """
+        if result.status not in ("pending", "partial"):
+            return []
+
+        registered: List[str] = []
+        for part in (result.parts or [result]):
+            if part.status not in ("pending", "partial"):
+                continue
+            remaining = part.requested_quantity - part.filled_quantity
+            if remaining <= 0:
+                continue
+            self.fill_tracker.register(
+                TrackedOrder(
+                    ord_no=part.order_id,
+                    ticker=ticker,
+                    stock_name=stock_name or ticker,
+                    side=order_side,
+                    total_quantity=part.requested_quantity,
+                    filled_quantity=part.filled_quantity,
+                    filled_amount=part.filled_quantity * part.avg_price,
+                    limit_price=limit_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    source_queue_id=source_queue_id,
+                    source_session_id=source_session_id,
+                    risk_score=risk_score,
+                    trade_date=date.today().strftime("%Y%m%d"),
+                )
+            )
+            registered.append(f"{part.order_id}:{remaining}주")
+        return registered
+
+    def _register_unfilled_sell(
+        self,
+        ticker: str,
+        position: Optional[ManagedPosition],
+        order: OrderRequest,
+        result: OrderResult,
+    ) -> List[str]:
+        """Register the unfilled/partial remainder of a defensive/monitor SELL
+        (`_close_position`/`_reduce_position`/`_execute_order_from_monitor`)
+        with the fill tracker — the SAME registration `on_trade_approved`'s
+        SELL/REDUCE path already gets via `_track_unfilled` (E1-1/E1-2), just
+        reached from a different call shape here (an already-placed
+        `OrderRequest`/`OrderResult` plus the coordinator's OWN
+        `ManagedPosition`, not the entry-side session context
+        `on_trade_approved` builds from). `position` may be None —
+        `_execute_order_from_monitor` looks it up defensively and can find
+        nothing if the local ledger no longer tracks the ticker — in which
+        case `risk_score` is simply omitted, same as `_track_unfilled`
+        already accepts `None` for it.
+
+        `source_session_id` (I1, final-review fix, spec D2): the PLACED
+        ORDER's own `session_id`, not `position.analysis_session_id` (the
+        position's ENTRY-side decision). The pre-fix code read the entry id
+        here, so a post-fill exit tranche (`_poll_tracked_fills` ->
+        `_apply_sell_position_delta` -> `record_kr_realized_pnl`) mis-
+        attributed `exit_decision_id` to the entry decision for every
+        partially-filled exit, discussion-driven or mechanical alike. Every
+        caller already threads (or deliberately omits) `order.session_id`
+        correctly per spec D2: `_close_position`/`_reduce_position` forward
+        an optional `decision_id` into it (a discussion-driven exit's own
+        decision id, correctly distinct from the position's entry id), while
+        a mechanical stop-loss/take-profit (`_execute_order_from_monitor`)
+        and a system rebalance sell never set it at all — both naturally
+        land None here, which is correct (no upstream decision to cite), not
+        a gap.
+
+        stop_loss/take_profit are always None here: every caller is an EXIT,
+        which has no defense levels of its own to carry forward (unlike an
+        entry BUY's stop/take).
+        """
+        stock_name = (position.stock_name if position else None) or order.stock_name or ticker
+        registered = self._track_unfilled(
+            "sell",
+            ticker,
+            stock_name,
+            result,
+            limit_price=order.price,
+            source_session_id=order.session_id,
+            risk_score=position.risk_score if position else None,
+        )
+        if registered:
+            self._schedule_persist()
+            self._log_activity(
+                ActivityType.ORDER_PLACED,
+                f"미체결 잔량 추적 등록: {stock_name} ({', '.join(registered)})",
+                agent="order",
+                ticker=ticker,
+                details={"tracked": registered},
+            )
+        return registered
+
+    def _record_fill_ledger(
+        self,
+        order: OrderRequest,
+        result: OrderResult,
+        *,
+        side: str,
+        entry_or_exit: str,
+        realized_pnl: Optional[float] = None,
+        realized_pnl_pct: Optional[float] = None,
+    ) -> None:
+        """Shared ledger-write half of both fill choke points (BUY in
+        `_execute_order`, SELL in `_apply_sell_fill`) — split-order aware
+        (Critical 1, final whole-branch review).
+
+        A split order places SEVERAL broker orders, each with its own
+        ord_no, surfaced as `result.parts`. Recording the AGGREGATE as one
+        row (part0's order_id + the summed filled_quantity, the pre-fix
+        behavior) made `reconcile_trade_ledger`'s per-(order_id, stk_cd) EOD
+        diff see every OTHER part's ord_no as entirely absent from the
+        ledger — it re-appended them at EOD as "missing", double-counting
+        both the ledger row and its realized P&L (reviewer repro: a split
+        SELL's placement-time fill recorded as one aggregate row, then the
+        EOD reconciler re-appending the other parts' broker fills as if
+        they were never recorded, inflating both the ledger and realized
+        P&L on every EOD run instead of settling at diff 0).
+
+        Recording one row PER PART (its own order_id/quantity=
+        requested_quantity/executed_quantity=filled_quantity/avg_price)
+        makes each part's ledger key match its broker (ord_no, stk_cd) key
+        exactly, so the EOD diff lands at 0 — the same per-part contract
+        `_track_unfilled` (above) already uses for the fill TRACKER side of
+        the same split. `result.parts is None` (single/non-split order)
+        degrades to `[result]`, keeping the previous single-row behavior
+        byte-for-byte.
+
+        Only the ledger WRITE is split here — position decrement and
+        realized P&L stay total-based in `_apply_sell_position_delta` (the
+        existing semantics: one matched exit against the position's
+        blended average, not a per-part breakdown).
+
+        통지(2026-07-30): 체결 통지를 여기서 던진다. 이 함수가 BUY/SELL 두
+        초크포인트가 공유하는 지점이라 자율·HITL·PM 방어청산이 전부 덮인다.
+        `_persistence_active` 게이트 **앞**에서 던지는 것은 의도다 — 체결
+        사실이 원장 기록 여부에 종속되면 안 된다.
+        """
+        self._schedule_fill_notification(
+            order, result, side=side,
+            realized_pnl=realized_pnl, realized_pnl_pct=realized_pnl_pct,
+        )
+
+        if not self._persistence_active:
+            return
+        for part in (result.parts or [result]):
+            if part.filled_quantity <= 0:
+                continue
+            record_trade_fill(
+                stk_cd=order.ticker,
+                stk_nm=order.stock_name,
+                side=side,
+                order_type=getattr(order.order_type, "value", order.order_type),
+                price=part.avg_price or order.price or 0,
+                quantity=part.requested_quantity,
+                executed_quantity=part.filled_quantity,
+                status=(
+                    "completed"
+                    if part.filled_quantity >= part.requested_quantity
+                    else "partial"
+                ),
+                order_id=part.order_id,
+                session_id=order.session_id,
+                decision_id=order.session_id,
+                entry_or_exit=entry_or_exit,
+            )
+
+    def _schedule_fill_notification(
+        self,
+        order: OrderRequest,
+        result: OrderResult,
+        *,
+        side: str,
+        realized_pnl: Optional[float] = None,
+        realized_pnl_pct: Optional[float] = None,
+    ) -> None:
+        """동기 문맥에서 체결 통지를 던진다(never-raise).
+
+        `_record_fill_ledger`가 `def`라 await를 쓸 수 없다. 레포 기존 패턴과
+        같이 create_task로 던지되 강참조를 보관한다.
+        """
+        try:
+            from services.telegram.config import get_telegram_config
+
+            if not getattr(get_telegram_config(), "TELEGRAM_NOTIFY_FILL_ENABLED", True):
+                return
+        except Exception:
+            pass  # 설정을 못 읽으면 통지를 막지 않는다 — 체결은 알려야 한다
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(
+            self._notify_fill(
+                order, result, side=side,
+                realized_pnl=realized_pnl, realized_pnl_pct=realized_pnl_pct,
+            )
+        )
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
+
+    async def _notify_fill(
+        self,
+        order: OrderRequest,
+        result: OrderResult,
+        *,
+        side: str,
+        realized_pnl: Optional[float] = None,
+        realized_pnl_pct: Optional[float] = None,
+    ) -> None:
+        """체결 통지 본체. 실패해도 절대 밖으로 새지 않는다."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                return
+            filled = int(getattr(result, "filled_quantity", 0) or 0)
+            if filled <= 0:
+                return
+            requested = int(getattr(result, "requested_quantity", 0) or 0)
+            avg = getattr(result, "avg_price", None) or order.price or 0
+            await notifier.send_trade_executed(
+                ticker=order.ticker,
+                stock_name=order.stock_name or order.ticker,
+                action="BUY" if side in ("buy", OrderSide.BUY) else "SELL",
+                quantity=filled,
+                price=int(round(float(avg))),
+                total_amount=int(round(float(avg) * filled)),
+                realized_pnl=realized_pnl,
+                realized_pnl_pct=realized_pnl_pct,
+                source=getattr(order, "reason", None),
+                partial=bool(requested and filled < requested),
+            )
+        except Exception as e:
+            # structlog 스타일 kwargs가 아니라 f-string을 쓴다 — 이 모듈은
+            # stdlib logging.getLogger라 logger.error(msg, ticker=...) 같은
+            # 임의 kwargs는 TypeError로 죽는다(never-raise 위반이 되어버림).
+            logger.error(f"[Coordinator] fill_notification_failed ticker={order.ticker} error={e}")
+
+    def _schedule_order_failure_alert(self, order: OrderRequest, reason: str) -> None:
+        """자율 주문이 브로커 단계에서 실패했음을 알린다(never-raise)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._notify_order_failed(order, reason))
+        self._notify_tasks.add(task)
+        task.add_done_callback(self._notify_tasks.discard)
+
+    async def _notify_order_failed(self, order: OrderRequest, reason: str) -> None:
+        try:
+            from services.telegram import get_telegram_notifier
+            from services.telegram.formatting import stock_label
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                return
+            side = getattr(order.side, "value", order.side)
+            await notifier.send_message(
+                f"⛔ 주문 실패 ({side})\n"
+                f"{stock_label(order.stock_name, order.ticker)}\n"
+                f"사유: {reason}\n"
+                f"→ 체결되지 않았습니다. 수동으로 확인하세요.",
+                parse_mode=None,
+            )
+        except Exception as e:
+            # 이 모듈은 stdlib logging이라 structlog 스타일 kwargs는
+            # TypeError로 죽는다 — never-raise 핸들러 안에서 로거가 죽으면
+            # 안 되므로 f-string을 쓴다(위 _notify_fill과 동일 패턴).
+            logger.error(f"[Coordinator] order_failure_alert_failed ticker={order.ticker} error={e}")
+
+    async def _drain_notify_tasks(self) -> None:
+        """테스트용 — 던져둔 통지 태스크가 끝날 때까지 기다린다."""
+        pending = list(self._notify_tasks)
+        for task in pending:
+            try:
+                await task
+            except Exception:
+                pass
 
     async def _execute_order(self, order: OrderRequest) -> OrderResult:
         """Execute an order and update state."""
@@ -567,19 +1902,177 @@ class ExecutionCoordinator:
 
         # Update trade count
         if result.filled_quantity > 0:
+            self._maybe_reset_daily_trades()
             self._state.daily_trades_count += 1
+            self._schedule_persist()
+
+            # P1-1: record the fill for /trades — BUY only here. Every SELL
+            # caller of _execute_order also calls _apply_sell_fill right
+            # after, which is the single choke point for SELL fills; a
+            # side-agnostic record here would double-count those. Gated by
+            # _persistence_active (same rule as _schedule_persist) so a
+            # coordinator built in a unit test never writes to real storage.
+            if order.side in (OrderSide.BUY, "buy"):
+                # Critical 1 (final review): per-part ledger rows for split
+                # orders — see `_record_fill_ledger` docstring.
+                self._record_fill_ledger(
+                    order, result, side="buy", entry_or_exit="entry"
+                )
 
         await self._notify_state_change()
 
         return result
 
-    async def _execute_order_from_monitor(self, order: OrderRequest):
-        """Execute order from risk monitor (stop-loss/take-profit)."""
-        result = await self._execute_order(order)
+    async def _execute_order_from_monitor(self, order: OrderRequest) -> bool:
+        """Execute order from risk monitor (stop-loss/take-profit).
 
-        if result.filled_quantity > 0:
-            # Remove position
-            self._remove_position(order.ticker)
+        This is the choke point for every AGENT_AUTO defensive sell — it MUST
+        pass the shared autonomy gate, the same one PositionManager's
+        `_execute_close_position` (A2) and the queue re-gate (R5-P0) already
+        enforce. Before this fix a stop-loss/take-profit fired straight to the
+        broker with no gate check at all (audit I1, 2026-07-13). A denied sell
+        places nothing and leaves the position tracked/watched — the
+        USER_APPROVAL alert path (RiskMonitor's non-AGENT_AUTO branch) is
+        untouched by this change.
+
+        S-2 review fix: guarded by the coordinator-wide in-flight defensive-
+        exit set (`_acquire_defensive_exit_guard`) — RiskMonitor's 1s tick
+        and PositionManager's 30s tick can otherwise both detect the same
+        breached stop and race to close the same position. RiskMonitor only
+        ever triggers a defensive SELL through this method (never BUY), but
+        the `is_sell` check is explicit rather than assumed, matching the
+        "BUY/ADD paths stay untouched" contract shared with the other 5
+        guarded SELL sites (`_close_position`/`_reduce_position`/
+        `on_trade_approved`'s SELL/REDUCE main path AND its rebalance-orders
+        loop, N1/`handle_alert_action`'s EXECUTE_STOP_LOSS/
+        EXECUTE_TAKE_PROFIT) — 6 guarded SELL sites total.
+
+        G-2 (gap discipline, spec docs/superpowers/specs/
+        2026-07-20-gap-discipline-design.md §N2): returns `bool` — True only
+        when the order actually reached `_execute_order` (submitted to the
+        broker); False when the in-flight guard or the autonomy gate skipped
+        it. Before this fix the method returned nothing, so RiskMonitor's
+        `_execute_stop_loss`/`_execute_take_profit` could not tell a denied
+        or in-flight-skipped call apart from a real submission and generated
+        a false "Executed" alert unconditionally on every 1s tick. Existing
+        callers that ignore the return value are unaffected by adding it.
+        """
+        from services.autonomy import check_autonomy
+
+        is_sell = order.side == "sell"
+        if is_sell and not self._acquire_defensive_exit_guard(order.ticker):
+            return False
+
+        try:
+            position = next(
+                (p for p in self._state.positions if p.ticker == order.ticker), None
+            )
+
+            # 재제출 가드 G1/G2/G3 (2026-08-10 라이브 사고, 089860) — 위
+            # `_acquire_defensive_exit_guard`는 **동시성** 가드라 `finally`에서
+            # 즉시 풀리고, RiskMonitor가 1초 뒤 같은 트리거를 다시 쏘는
+            # **순차** 재발동은 그대로 통과했다. 사유별 판정/근거는
+            # `_defensive_sell_suppression_reason` 참고. 게이트 검사보다
+            # 앞에 둔다: 애초에 낼 수 없는 주문으로 게이트 판정(그리고 그
+            # 거부 통지 래치)을 오염시킬 이유가 없다.
+            if is_sell and self._defensive_sell_suppressed(
+                order.ticker, position, source="risk_monitor"
+            ) is not None:
+                return False
+
+            gate = await check_autonomy(
+                "kiwoom",
+                action="SELL",
+                quantity=order.quantity,
+                entry_price=order.price,
+            )
+            if not gate.allowed:
+                logger.warning(
+                    f"[Coordinator] AGENT_AUTO defensive sell blocked by gate: "
+                    f"{order.ticker} check={gate.check} reason={gate.reason}"
+                )
+                # Notify once per denied episode, not on every RiskMonitor tick —
+                # mirrors the PositionManager A2 latch (close_gate_denied_notified).
+                if position is not None and not position.monitor_gate_denied_notified:
+                    position.monitor_gate_denied_notified = True
+                    await self._notify_monitor_gate_denied(order, gate.reason)
+                return False
+
+            if position is not None and position.monitor_gate_denied_notified:
+                # Gate allowed again: clear the latch so a future denial notifies.
+                position.monitor_gate_denied_notified = False
+
+            if is_sell:
+                self._note_defensive_sell_submitted(order.ticker)
+            result = await self._execute_order(order)
+            # Important 4: 브로커 거부는 예외가 아니라 정상 결과로 온다 —
+            # _apply_sell_fill의 filled_quantity<=0 가드는 무통지이므로
+            # 여기서 명시적으로 실패를 알린다(_close_position/_reduce_position과
+            # 동일 처리).
+            self._handle_defensive_sell_rejection(position, order, result)
+            # Track the ACTUAL fill: full → remove, partial → reduce, none → retain.
+            self._apply_sell_fill(order.ticker, result.filled_quantity, order=order, result=result)
+            # E1-3: register any unfilled remainder of this AGENT_AUTO defensive
+            # sell (see _close_position's same call for the full rationale) — a
+            # stop-loss/take-profit trigger that only partially filled at the
+            # broker previously went unwatched by the ka10076 poll entirely.
+            self._register_unfilled_sell(order.ticker, position, order, result)
+            return True
+        finally:
+            if is_sell:
+                self._release_defensive_exit_guard(order.ticker)
+
+    async def _notify_monitor_gate_denied(self, order: OrderRequest, gate_reason: str) -> None:
+        """Best-effort Telegram notice when the autonomy gate blocks an
+        AGENT_AUTO defensive sell — the human must know a stop-loss/take-profit
+        did NOT execute and the position is still open."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚫 자율 방어매도 게이트 거부 ({order.ticker}, "
+                    f"{order.reason or 'stop-loss/take-profit'}): {gate_reason}. "
+                    f"포지션은 유지되며 수동 조치가 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(f"[Coordinator] Failed to notify gate denial: {e}")
+
+    def _handle_defensive_sell_rejection(
+        self,
+        position: Optional[ManagedPosition],
+        order: OrderRequest,
+        result: OrderResult,
+    ) -> None:
+        """Important 4 (최종 전체 브랜치 리뷰): 방어적 SELL(_close_position/
+        _reduce_position/_execute_order_from_monitor)이 브로커에서 거부되면
+        예외가 아니라 정상 OrderResult(status="rejected")로 돌아온다 —
+        on_trade_approved의 else 분기(Critical 1)와 달리 이 세 진입점은
+        `_execute_order` 뒤 곧장 `_apply_sell_fill`로 가고, 그 함수는
+        filled_quantity<=0이면 경고 로그만 남기고 반환한다. 그 결과 손절/
+        익절/청산/축소가 브로커 단에서 거부돼도 통지가 전혀 나가지 않았다
+        (on_trade_approved가 이미 갖고 있던 `_schedule_order_failure_alert`를
+        여기서도 재사용한다 — "실패 통지가 없다"는 같은 결함의 다른 얼굴).
+
+        이 세 진입점은 PositionManager의 30초 감시 틱에서 반복 호출될 수
+        있어 브로커가 계속 거부하면(예: 거래정지 종목) 매 틱마다 재통지할
+        위험이 있다 — `monitor_gate_denied_notified`와 같은 형태의 래치
+        (`close_order_rejected_notified`)로 거부 에피소드당 한 번만 알리고,
+        거부가 아닌 상태로 돌아오면 래치를 풀어 다음 거부가 다시 통지되게
+        한다.
+        """
+        if result.status != "rejected":
+            if position is not None and position.close_order_rejected_notified:
+                position.close_order_rejected_notified = False
+            return
+
+        if position is not None:
+            if position.close_order_rejected_notified:
+                return
+            position.close_order_rejected_notified = True
+
+        self._schedule_order_failure_alert(order, result.message or "브로커 거부")
 
     # -------------------------------------------
     # Position Management
@@ -601,11 +2094,25 @@ class ExecutionCoordinator:
             existing.quantity = total_qty
             existing.avg_price = total_cost / total_qty
             existing.last_updated = datetime.now()
+            # I1 (final-review): coalesce stops onto the merged position —
+            # keep existing's non-None stops, only fill gaps from the
+            # incoming tranche.
+            if existing.stop_loss is None and position.stop_loss is not None:
+                existing.stop_loss = position.stop_loss
+            if existing.take_profit is None and position.take_profit is not None:
+                existing.take_profit = position.take_profit
+            watched = existing
         else:
             self._state.positions.append(position)
+            watched = position
 
-        # Add to risk monitor
-        self.risk_monitor.add_position(position)
+        # Add to risk monitor — MUST watch the merged position (`watched`),
+        # not the incoming delta `position`: add_position replaces
+        # WatchConfig wholesale, so after a merge the monitor would otherwise
+        # watch only the last tranche's quantity while the real position is
+        # the merged total — a stop trigger would then sell only that
+        # tranche (I1, final-review).
+        self.risk_monitor.add_position(watched)
 
         # Update risk agent status
         self._update_agent_status(
@@ -624,6 +2131,7 @@ class ExecutionCoordinator:
         )
 
         logger.info(f"[Coordinator] Position added/updated: {position.ticker}")
+        self._schedule_persist()
 
     def _remove_position(self, ticker: str):
         """Remove a position from tracking."""
@@ -659,6 +2167,424 @@ class ExecutionCoordinator:
             )
 
         logger.info(f"[Coordinator] Position removed: {ticker}")
+        self._schedule_persist()
+
+    def _apply_sell_fill(
+        self,
+        ticker: str,
+        filled_quantity: int,
+        *,
+        order: Optional[OrderRequest] = None,
+        result: Optional[OrderResult] = None,
+    ) -> None:
+        """Reconcile position tracking with the ACTUAL fill of a SELL/close (A3).
+
+        Full fill → remove; partial → reduce and keep monitoring the remainder;
+        none → keep the position. A sell that did not fill must NOT orphan the
+        exposure — previously the close removed the position unconditionally, so a
+        rejected/unfilled sell dropped a still-open position from all defense.
+
+        `order`/`result` are optional so existing bare callers keep working,
+        but every current call site passes both — this is the single choke
+        point for recording a SELL fill (/trades, P1-1), independent of
+        whether we still have a locally tracked position for `ticker`.
+
+        Composition (E1-2): the ledger write (record_trade_fill, above) stays
+        here — its fields (order_type/status/etc.) come from `order`/`result`,
+        which this method has but the shared delta helper below does not. The
+        position reconciliation (decrement/remove + realized P&L) is extracted
+        into `_apply_sell_position_delta` so `_poll_tracked_fills`'s post-fill
+        SELL delta branch — which only has a `TrackedOrder`/`FillDelta`, never
+        an `OrderRequest`/`OrderResult` — can reuse the exact same logic.
+        """
+        if filled_quantity <= 0:
+            logger.warning(
+                f"[Coordinator] SELL for {ticker} did not fill — position retained"
+            )
+            return
+
+        if order is not None and result is not None:
+            # Critical 1 (final review): per-part ledger rows for split
+            # orders — see `_record_fill_ledger` docstring. The per-part loop
+            # derives each row's executed_quantity from `result.parts`
+            # directly; `filled_quantity` (the caller-supplied aggregate) IS
+            # used below, for the notification's realized-P&L estimate.
+            #
+            # 실현손익은 포지션 감소 **전에** 계산해야 한다 —
+            # _apply_sell_position_delta가 포지션을 줄이거나 지우고 나면
+            # 진입가를 읽을 수 없다.
+            #
+            # 리뷰 Important 1: _apply_sell_position_delta(아래)는
+            # `_matched = min(quantity, position.quantity)`로 클램프한 뒤
+            # realized_amount를 계산한다(원장의 정답). 여기서 클램프 없이
+            # filled_quantity 그대로 곱하면 오버셀/부분 리컨실 상황에서
+            # 통지 금액이 원장 금액보다 커진다 — 같은 클램프를 그대로
+            # 맞춘다.
+            _pos = next((p for p in self._state.positions if p.ticker == ticker), None)
+            _entry = getattr(_pos, "avg_price", None) if _pos else None
+            _exit = getattr(result, "avg_price", None) if result is not None else None
+            _pnl = None
+            _pnl_pct = None
+            if _entry and _exit and filled_quantity and _pos is not None:
+                _matched_qty = min(int(filled_quantity), int(_pos.quantity))
+                _pnl = (float(_exit) - float(_entry)) * _matched_qty
+                _pnl_pct = (float(_exit) / float(_entry) - 1.0) * 100.0
+
+            self._record_fill_ledger(
+                order, result, side="sell", entry_or_exit="exit",
+                realized_pnl=_pnl, realized_pnl_pct=_pnl_pct,
+            )
+
+        # `avg_price=None` (order/result missing) tells the delta helper below
+        # there is no known exit price for this fill, so it must skip realized
+        # P&L (matching the pre-extraction behavior: that block was gated on
+        # `order is not None and result is not None` too) while STILL
+        # reconciling the local position quantity, which was unconditional.
+        _exit_price: Optional[float] = None
+        _session_id: Optional[str] = None
+        if order is not None and result is not None:
+            _exit_price = result.avg_price or order.price or 0
+            _session_id = order.session_id
+
+        self._apply_sell_position_delta(ticker, filled_quantity, _exit_price, _session_id)
+
+    def _apply_sell_position_delta(
+        self,
+        ticker: str,
+        quantity: int,
+        avg_price: Optional[float],
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Decrement/remove the LOCAL position for a SELL fill and record
+        realized P&L — no ledger write here (callers own `record_trade_fill`
+        separately, since its fields differ per call site).
+
+        Full fill → remove; partial → reduce and keep monitoring the
+        remainder (unchanged from `_apply_sell_fill`'s pre-extraction
+        behavior). No local position found for `ticker` (e.g. the reconciler
+        already cleared it, or — for a fill-tracker SELL delta — the order's
+        earlier partial fill was recorded through a path that never touched
+        `_state.positions`) → warn and no-op; decrement is meaningless
+        without a position to decrement.
+
+        `avg_price=None` means the caller has no known exit price for this
+        fill (only `_apply_sell_fill`'s bare-caller fallback does this) —
+        realized P&L needs an exit price to match against the position's
+        entry price, so it is skipped in that case (mirrors
+        `_apply_sell_fill`'s pre-extraction behavior of skipping
+        `record_kr_realized_pnl` whenever `order`/`result` were absent).
+        """
+        position = next(
+            (p for p in self._state.positions if p.ticker == ticker), None
+        )
+        if position is None:
+            logger.warning(
+                f"[Coordinator] SELL fill for {ticker} ({quantity}주) has no "
+                "local position to reconcile — skipping decrement/realized P&L"
+            )
+            return
+
+        # T4: matched realized P&L — entry avg_price+analysis_session_id and exit fill both in scope here
+        if self._persistence_active and avg_price is not None:
+            _matched = min(quantity, position.quantity)
+            _now = datetime.now()
+            record_kr_realized_pnl(
+                stk_cd=ticker, entry_price=position.avg_price, exit_price=avg_price,
+                quantity=_matched, realized_amount=(avg_price - position.avg_price) * _matched,
+                entry_decision_id=position.analysis_session_id, exit_decision_id=session_id,
+                entry_at=position.entry_time,
+                exit_at=_now,
+                holding_period_seconds=(
+                    int((_now - position.entry_time).total_seconds())
+                    if position.entry_time else None
+                ),
+            )
+
+        if quantity >= position.quantity:
+            self._remove_position(ticker)
+            mirror_sell_to_position_manager(ticker, 0)
+        else:
+            position.quantity -= quantity
+            position.last_updated = datetime.now()
+            # Re-register so the monitor watches the reduced size (keeps stops).
+            self.risk_monitor.remove_position(ticker)
+            self.risk_monitor.add_position(position)
+            self._schedule_persist()
+            logger.info(
+                f"[Coordinator] Position {ticker} reduced by {quantity}; "
+                f"{position.quantity} remaining"
+            )
+            mirror_sell_to_position_manager(ticker, position.quantity)
+
+    # -------------------------------------------
+    # State Persistence (R5-P1 A4)
+    # -------------------------------------------
+    #
+    # Positions (with stop levels), the trade queue, and the daily trade count
+    # lived only in memory, so a restart left the risk monitor watching nothing —
+    # stop-losses became a silent no-op. Persist them to SQLite (app_settings
+    # blob) and reload on start so defense and queued autonomous trades survive a
+    # restart. Stops are the coordinator's own data — the broker does not know
+    # them — so the local state IS the source of truth to persist.
+
+    _STATE_KEY = "trading:coordinator_state"
+
+    def _mode_value(self) -> str:
+        """`_state.mode`를 블롭에 쓸 문자열로 정규화한다. `_persist_state`와
+        `_persist_fields(mode=...)` 호출부(stop/pause/resume) 양쪽에서
+        같은 규칙을 쓰도록 공유한다."""
+        return (
+            self._state.mode.value
+            if hasattr(self._state.mode, "value")
+            else str(self._state.mode)
+        )
+
+    def _maybe_reset_daily_trades(self) -> None:
+        """`daily_trades_count`를 새 달력일로 lazy 롤오버한다.
+
+        `daily_trades_count`를 읽거나 쓰는 모든 지점(게이트 판정·증가·영속·
+        외부 상태 조회) **앞**에서 호출해야 한다. 특히 영속 호출이 빠지면:
+        카운트가 어제 몫인 채로 `_persist_state`가 오늘 날짜를 찍어버리고,
+        다음 재시작에서 `_restore_state`가 "날짜가 맞다"며 그 낡은 카운트를
+        그대로 복원한다 — 재시작으로도 못 고치는 자기영속 결함이 된다
+        (2026-08-04 실 라이브 사고: daily_trades_count=4 / daily_count_date=
+        오늘로 영속돼 있었는데 그중 3건은 전날 거래였다).
+
+        `agents/llm/router.py`의 `_maybe_reset_day()`(OpenRouter 일일 예산)와
+        동일 패턴 — 스케줄된 잡 없이, 쓰는 시점마다 스스로 확인한다.
+        """
+        today = date.today()
+        if today != self._daily_count_day:
+            self._daily_count_day = today
+            self._state.daily_trades_count = 0
+
+    async def _persist_state(self) -> None:
+        """Best-effort persist of restart-critical state. Never raises — a storage
+        failure must not break trading."""
+        try:
+            from services.storage_service import get_storage_service
+
+            # 아래 blob이 "오늘" 날짜를 daily_trades_count에 찍는다 — 롤오버가
+            # 안 돌았으면 어제 몫 카운트에 오늘 도장을 찍는 셈이라, 다음 restore가
+            # "날짜 일치"로 보고 그대로 복원해버린다(자기영속 결함, 위 docstring).
+            self._maybe_reset_daily_trades()
+
+            blob = json.dumps(
+                {
+                    "positions": [
+                        p.model_dump(mode="json") for p in self._state.positions
+                    ],
+                    "trade_queue": [
+                        t.model_dump(mode="json") for t in self._state.trade_queue
+                    ],
+                    # P2 SSOT prep (2026-07-14): the watch list lived only in
+                    # memory alongside positions/queue, so a restart silently
+                    # dropped every watched stock — the funnel's single source
+                    # of truth must survive a restart the same way positions
+                    # and the trade queue already do.
+                    "watch_list": [
+                        w.model_dump(mode="json") for w in self._state.watch_list
+                    ],
+                    "daily_trades_count": self._state.daily_trades_count,
+                    "daily_count_date": date.today().isoformat(),
+                    "tracked_orders": self.fill_tracker.to_payload(),
+                    "risk_params": self.risk_params.model_dump(),
+                    # 재시작 안전(2026-07-29): 부팅 시 "꺼져 있었나 켜져
+                    # 있었나"를 알 유일한 근거다. resume_if_persisted()가
+                    # 이 값만 보고 방어를 되살릴지 정한다. _restore_state는
+                    # 이 필드를 읽지 않는다 — 수동 start()는 기존대로
+                    # 무조건 ACTIVE로 간다.
+                    "mode": self._mode_value(),
+                }
+            )
+            storage = await get_storage_service()
+            await storage.set_app_setting(self._STATE_KEY, blob)
+        except Exception as e:
+            logger.error(f"[Coordinator] Failed to persist state: {e}")
+
+    async def _persist_fields(self, **kv) -> None:
+        """임의 key/value 묶음만 read-modify-write로 갱신한다. Never-raise —
+        `_persist_state`와 동일 계약.
+
+        `_persist_mode_only()`의 일반화(2026-07-29 리뷰: `PUT
+        /api/trading/risk-params` 라우트도 `_persist_state()`를 무조건
+        호출해 미시작 코디네이터의 빈 상태로 블롭을 덮어쓰는 동일한
+        REGRESSION을 갖고 있었다 — mode 하나에 특화된 헬퍼를 또 복제하는
+        대신 임의 필드를 다루도록 일반화한다).
+
+        `_persistence_active`가 False인 코디네이터(이 프로세스에서
+        `_restore_state()`가 한 번도 안 돈, 즉 `start()`를 거치지 않은
+        인스턴스)의 메모리 상 `_state`는 positions/trade_queue/watch_list/
+        tracked_orders가 전부 기본값(빈 값)이다 — 블롭의 실제 내용을 반영하지
+        않는다. 이 상태에서 `_persist_state()`(전체 스냅샷 직렬화)를 부르면
+        진짜 데이터를 빈 값으로 덮어써 버린다(REGRESSION, 2026-07-29 리뷰:
+        재시작 안전 브랜치 자신의 첫 배포 창에서 stop/pause/resume 중 아무거나
+        한 번만 호출돼도 보유 포지션의 손절가가 통째로 사라짐).
+
+        그래도 넘겨받은 필드는 여전히 즉시 영속돼야 한다. 그래서 전체
+        persist를 건너뛰는 대신, 기존 블롭을 읽어 넘겨받은 키만 바꿔 쓴다.
+
+        - `json.loads`는 try 안에 있다 — 기존 블롭이 깨져 있으면(파싱 실패)
+          아무것도 쓰지 않는다. 부분 블롭으로 원본을 덮어쓰는 것보다, 손상된
+          원본이라도 그대로 남는 편이 낫다.
+        - 파싱 결과가 dict가 아니면(예: `"null"`, JSON 배열) 마찬가지로
+          아무것도 쓰지 않는다 — 원본을 dict가 아닌 값으로 오염시킬 수 없다.
+        - 블롭이 없거나 비어 있으면 넘겨받은 필드만 담은 새 블롭을 쓴다.
+          이후 진짜 `_persist_state()`가 나머지 필드를 채운다.
+        """
+        try:
+            from services.storage_service import get_storage_service
+
+            storage = await get_storage_service()
+            blob = await storage.get_app_setting(self._STATE_KEY)
+            data = json.loads(blob) if blob else {}
+            if not isinstance(data, dict):
+                raise TypeError(
+                    "Persisted state blob is not a JSON object "
+                    f"(got {type(data).__name__}) — refusing partial write"
+                )
+            data.update(kv)
+            await storage.set_app_setting(self._STATE_KEY, json.dumps(data))
+        except Exception as e:
+            logger.error(f"[Coordinator] Failed to persist fields {sorted(kv)}: {e}")
+
+    async def _restore_state(self) -> None:
+        """Reload restart-critical state. Positions (with stops) are re-registered
+        with the risk monitor so defense resumes; the daily count resets on a new
+        calendar day. Best-effort — a corrupt/missing blob starts clean."""
+        try:
+            from services.storage_service import get_storage_service
+
+            storage = await get_storage_service()
+            blob = await storage.get_app_setting(self._STATE_KEY)
+            if not blob:
+                return
+            data = json.loads(blob)
+
+            # Positions + stops → re-register with the risk monitor.
+            self._state.positions = [
+                ManagedPosition.model_validate(p) for p in data.get("positions", [])
+            ]
+            for position in self._state.positions:
+                self.risk_monitor.add_position(position)
+
+            # Queued trades.
+            self._state.trade_queue = [
+                QueuedTrade.model_validate(t) for t in data.get("trade_queue", [])
+            ]
+
+            # Watch list (P2 SSOT prep) — restored in whatever status it was
+            # persisted in (ACTIVE/CONVERTED/REMOVED), so a CONVERTED entry
+            # stays CONVERTED across a restart instead of reverting to
+            # ACTIVE and becoming re-discussable.
+            self._state.watch_list = [
+                WatchedStock.model_validate(w) for w in data.get("watch_list", [])
+            ]
+
+            # Daily count — reset on a new calendar day. `_daily_count_day`도
+            # 여기서 오늘로 맞춰야, 복원 직후 첫 읽기/쓰기에서
+            # `_maybe_reset_daily_trades()`가 방금 복원한 값을 다시 지워버리지
+            # 않는다 — 재시작이 이 in-memory day의 유일한 초기화 지점이다.
+            if data.get("daily_count_date") == date.today().isoformat():
+                self._state.daily_trades_count = int(data.get("daily_trades_count", 0))
+            else:
+                self._state.daily_trades_count = 0
+            self._daily_count_day = date.today()
+
+            # Tracked orders (F3): TRACKING orders resume so the scheduler poll
+            # can pick up their post-fill. A TRACKING order whose trade_date
+            # has rolled over (restarted on a later day) is expired instead —
+            # nothing placed on a prior session can still fill. Log-only, no
+            # notification, to avoid a restart notification storm.
+            self.fill_tracker = PendingOrderTracker.from_payload(
+                data.get("tracked_orders", [])
+            )
+            stale = self.fill_tracker.expire_stale(today=date.today().strftime("%Y%m%d"))
+            if stale:
+                logger.info(
+                    f"[Coordinator] Expired {len(stale)} stale tracked orders on restore"
+                )
+
+            # F3 review M1c: restoring while the KRX session is CLOSED — the
+            # post-close ka10076 snapshot is final, so run ONE last poll (a
+            # fill that landed while the backend was down still becomes a
+            # defended position) and expire whatever remains. Kills overnight
+            # 30s polling and next-day tracking against reused ord_nos.
+            # Expiry here is log-only (no alerts — restart storm prevention).
+            if self.fill_tracker.tracking():
+                market_open = self._market_hours.get_market_session(
+                    MarketType.KRX
+                ).is_open
+                if not market_open:
+                    await self._poll_tracked_fills()
+                    closed_out = self.fill_tracker.expire_stale(today=None)
+                    if closed_out:
+                        logger.info(
+                            f"[Coordinator] Expired {len(closed_out)} tracked "
+                            f"orders on restore (market closed)"
+                        )
+
+            # Risk params (T3): in-place setattr, NOT rebind — risk_params is
+            # reference-shared with PortfolioAgent/RiskMonitor/TradingState, so
+            # replacing the attribute would desync those holders from the
+            # coordinator's own copy.
+            rp = data.get("risk_params")
+            if rp:
+                for k, v in rp.items():
+                    if hasattr(self.risk_params, k):
+                        setattr(self.risk_params, k, v)
+
+            logger.info(
+                f"[Coordinator] Restored {len(self._state.positions)} positions, "
+                f"{len(self._state.trade_queue)} queued trades, "
+                f"{len(self._state.watch_list)} watched stocks, "
+                f"{len(self.fill_tracker.tracking())} tracked orders, "
+                f"daily_count={self._state.daily_trades_count}"
+            )
+        except Exception as e:
+            logger.error(f"[Coordinator] Failed to restore state: {e}")
+
+    async def _restore_strategy(self) -> None:
+        """Phase3: reload the active TradingStrategy from the
+        strategy_revisions ledger via the 'strategy:active_revision_id'
+        pointer (coordinator._strategy alone is in-memory and lost on
+        restart). Pointer invariant (strategy_orchestrator): the pointed
+        revision's strategy_json is always the strategy that WAS in effect,
+        so applying it verbatim is safe. Best-effort — a missing/empty
+        pointer, missing row, or corrupt json starts clean (mirrors
+        _restore_state's contract). Never re-persists on restore."""
+        try:
+            from services.storage_service import get_storage_service
+            from services.trading.strategy_orchestrator import (
+                ACTIVE_STRATEGY_REVISION_KEY,
+            )
+
+            storage = await get_storage_service()
+            revision_id = await storage.get_app_setting(ACTIVE_STRATEGY_REVISION_KEY)
+            if not revision_id:
+                return
+            row = await storage.get_strategy_revision(revision_id)
+            if not row or not row.get("strategy_json"):
+                return
+            strategy = TradingStrategy.model_validate_json(row["strategy_json"])
+            self.set_strategy(strategy)
+            logger.info(
+                f"[Coordinator] Strategy restored from revision {revision_id}"
+                f" ({strategy.name})"
+            )
+        except Exception as e:
+            logger.warning(f"[Coordinator] strategy restore failed: {e}")
+
+    def _schedule_persist(self) -> None:
+        """Fire-and-forget persist from a (possibly sync) mutator. No-op outside a
+        session, or without a running loop (a coordinator built in a unit test)."""
+        if not self._persistence_active:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._persist_state())
 
     # -------------------------------------------
     # Account & Price Data
@@ -670,13 +2596,20 @@ class ExecutionCoordinator:
             try:
                 # Fetch balance from Kiwoom
                 # AccountBalance is a Pydantic model with:
-                # - evlu_amt: 평가금액 (may include cash, so don't use directly)
+                # - evlu_amt: 유가잔고평가액 -- 주식 평가액 합계, 현금은
+                #   포함하지 않는다 (kt00004 응답의 tot_est_amt에서 파싱;
+                #   services/kiwoom/client.py의 파싱 주석 참고). 예수금까지
+                #   포함한 필드는 aset_evlt_amt로 별도이고 이 모델은 그걸
+                #   쓰지 않는다 -- 2026-08-07 리뷰로 정정: 이 주석이 예전에
+                #   "현금이 섞일 수 있다"고 반대로 적혀 있었다.
                 # - d2_ord_psbl_amt: D+2 주문가능금액 (available cash)
                 # - holdings: list of Holding with individual evlu_amt
                 # - total_value: property (evlu_amt + d2_ord_psbl_amt)
                 balance = await self._kiwoom.get_account_balance()
 
-                # Calculate stock value from holdings (not evlu_amt which may include cash)
+                # 보유종목별 evlu_amt를 합산한다 -- 위 집계 evlu_amt(이미
+                # 주식만, 현금 미포함)와 사실상 같은 값이지만, holdings
+                # 단위로 더해 개별 종목 데이터와 같은 소스를 쓴다.
                 # See kr_stocks.py line 968-970 for reference
                 stock_value = sum(h.evlu_amt for h in balance.holdings)
                 available_cash = balance.d2_ord_psbl_amt
@@ -698,20 +2631,491 @@ class ExecutionCoordinator:
                 total_stock_value=5_000_000,
             )
 
+        # DI2: reprice every open position from the live quote feed.
+        # `ManagedPosition.current_price` was only ever set once, at open
+        # (avg_price), so `unrealized_pnl = (current_price - avg_price) * qty`
+        # was permanently 0 and portfolio_agent's exposure math (which also
+        # reads current_price) drifted from the live total_equity refreshed
+        # just above. Do this every time account info is refreshed so both
+        # stay consistent.
+        await self._reprice_positions()
+
         self._state.last_updated = datetime.now()
 
-    async def _get_current_price(self, ticker: str) -> float:
-        """Get current price for a ticker."""
+    async def _reprice_positions(self) -> None:
+        """Update each open position's `current_price` from the live quote feed.
+
+        `_get_current_price` fails safe to 0/None on any broker error (see
+        test_current_price_feed.py) — that is a "no fresh quote" signal, not
+        a real price. Writing a fabricated 0 into a live position would zero
+        out unrealized_pnl and exposure math, which is worse than a stale
+        (but real) last-known price, so a falsy result SKIPS that position
+        and leaves current_price untouched (T2 stale-price contract).
+
+        Watch-list entries (P2 SSOT prep, 2026-07-14) get the same treatment:
+        `WatchedStock.current_price` was only ever set at registration time,
+        so the periodic opportunity check (`ChatCoordinator._detect_opportunity`'s
+        target-price proximity test) judged against a price that could be
+        hours or days stale. Only ACTIVE entries are repriced — a
+        CONVERTED/REMOVED entry's price is historical, not live.
+        """
+        for position in self._state.positions:
+            price = await self._get_current_price(position.ticker)
+            if not price:
+                continue
+            position.current_price = price
+            position.last_updated = datetime.now()
+
+        for watched in self._state.watch_list:
+            if watched.status != WatchStatus.ACTIVE:
+                continue
+            price = await self._get_current_price(watched.ticker)
+            if not price:
+                continue
+            watched.current_price = price
+            watched.last_checked = datetime.now()
+
+    def _log_market_gate_once(self, closed: bool) -> None:
+        """Log a market-gate state transition once (E2-2) — never every
+        sweep. Small per-file helper, duplicated across E2-1's gate points
+        (agent_chat coordinator/position_manager) and RiskMonitor's E2-2
+        gate by design — YAGNI, not worth a shared util for a handful of
+        call sites."""
+        if self._market_gate_closed == closed:
+            return
+        self._market_gate_closed = closed
+        if closed:
+            logger.info("[Coordinator] market_gate_closed")
+        else:
+            logger.info("[Coordinator] market_gate_reopened")
+
+    async def _refresh_watch_prices(self) -> None:
+        """Periodic, WATCH-only price sweep (monitoring-cadence-tuning arc,
+        MAIN BODY).
+
+        `_reprice_positions` above only refreshes watch-list entries when
+        `_refresh_account_info` runs — at coordinator `start()` and on each
+        trade approval. There was no periodic loop, so a WATCH entry's
+        `current_price` (compared against `target_entry_price` by
+        `ChatCoordinator._check_watch_list`) could go stale for an entire
+        session between trades. `_watch_refresh_loop` drives this on a
+        cadence derived from `compute_watch_ttl(W)` (W = ACTIVE watch count)
+        so the refresh rate scales with load instead of a fixed interval
+        that either starves responsiveness or blows the shared Kiwoom quote
+        budget.
+
+        Only ACTIVE entries are refreshed — CONVERTED/REMOVED prices are
+        historical. Same T2 stale-price contract as `_reprice_positions`: a
+        falsy quote (0/None, `_get_current_price`'s fail-safe "no fresh
+        data" signal) must never overwrite the last-known price. A single
+        ticker's fetch raising must not abort the sweep for the rest.
+
+        Held-ticker skip (whole-arc integration review finding, 2026-07-15):
+        RiskMonitor refreshes HELD positions on its own, much tighter
+        `compute_held_ttl` cadence (2-20s) against the SAME
+        `stock_info:<ticker>` cache key (one shared KiwoomClient). A ticker
+        that is BOTH held AND an ACTIVE watch entry (reachable —
+        `add_to_watch_list` has no held-position guard, and the analysis/
+        HITL approval route doesn't call `mark_watch_converted`) would get
+        its cache entry overwritten here with this loop's much longer
+        `compute_watch_ttl` TTL (10-60s), making RiskMonitor read a stale
+        price for up to that TTL and delaying stop-loss/take-profit
+        reaction. So held tickers are excluded from `active` up front — they
+        stay owned exclusively by RiskMonitor. `W` (fed into
+        `compute_watch_ttl`) is deliberately the ACTIVE-and-not-held count
+        (i.e. what this sweep actually fetches), not the raw ACTIVE count,
+        so the cadence reflects the real request load.
+        """
+        # E2-2: 장외에는 워치 가격 갱신 사이클 전체를 쉬게 한다(완전 idle
+        # 결정, E2-1/RiskMonitor와 동일 패턴). 장외엔 신규 진입/기회판정
+        # 자체가 무의미하므로 전체 skip이 안전. 큐 스케줄러/마감 엣지/체결
+        # 폴링/reconciler는 게이트 밖(요건대로 미변경) — 이 함수
+        # (_refresh_watch_prices)만 게이트.
+        if not is_krx_open_cached():
+            self._log_market_gate_once(closed=True)
+            return
+        self._log_market_gate_once(closed=False)
+
+        held_tickers = {p.ticker for p in self._state.positions}
+        active = [
+            w
+            for w in self._state.watch_list
+            if w.status == WatchStatus.ACTIVE and w.ticker not in held_tickers
+        ]
+        ttl = compute_watch_ttl(len(active))
+        for watched in active:
+            try:
+                price = await self._get_current_price(watched.ticker, ttl=ttl)
+            except Exception as e:
+                logger.error(
+                    f"[Coordinator] Watch refresh failed for {watched.ticker}: {e}"
+                )
+                continue
+            if not price:
+                continue
+            watched.current_price = price
+            watched.last_checked = datetime.now()
+
+    async def _watch_refresh_loop(self) -> None:
+        """Background loop driving `_refresh_watch_prices` on a cadence that
+        scales with the current ACTIVE watch count (monitoring-cadence-
+        tuning arc, MAIN BODY). Same lifecycle shape as
+        `_queue_scheduler_loop` — created in `start()`, cancelled in
+        `stop()`.
+        """
+        try:
+            while True:
+                try:
+                    await self._refresh_watch_prices()
+                except Exception as e:
+                    logger.error(f"[Coordinator] Watch refresh loop error: {e}")
+                active_count = sum(
+                    1
+                    for w in self._state.watch_list
+                    if w.status == WatchStatus.ACTIVE
+                )
+                await asyncio.sleep(compute_watch_ttl(active_count))
+        except asyncio.CancelledError:
+            pass
+
+    # 레짐 슬롯 상향 이전의 원래 값. **코디네이터 상태 블롭이 아니라 별도
+    # 키**다 -- `_persist_state()`는 블롭을 매번 처음부터 다시 만들기 때문에
+    # 거기 넣으면 다음 뮤테이션 한 번에 조용히 사라진다(그리고 baseline이
+    # 사라지면 되돌릴 방법이 영원히 없어진다).
+    _REGIME_BASELINE_KEY = "regime:slot_baseline"
+
+    async def _save_regime_slot_baseline(self) -> None:
+        """상향 **전** 값을 한 번만 적어 둔다. 이미 있으면 절대 덮어쓰지 않는다.
+
+        덮어쓰면 두 번째 상향이 첫 번째 상향값을 baseline으로 굳혀버려
+        "브랜치 이전 값으로 돌아간다"는 약속이 래칫으로 바뀐다.
+        """
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
+        if await storage.get_app_setting(self._REGIME_BASELINE_KEY):
+            return
+        await storage.set_app_setting(
+            self._REGIME_BASELINE_KEY,
+            json.dumps(
+                {
+                    "max_open_positions": int(self.risk_params.max_open_positions),
+                }
+            ),
+        )
+        logger.info(
+            f"[Coordinator] regime_slot_baseline_saved: "
+            f"max_open_positions={self.risk_params.max_open_positions}"
+        )
+
+    async def _restore_regime_slot_baseline(self, reason: str) -> Optional[dict]:
+        """슬롯 상향을 되돌린다 -- 실효 천장을 브랜치 이전 값으로 돌려놓는다.
+
+        **C-2 (2026-08-07 최종 리뷰)**: 슬롯 상향은 게이트 검사 8과 생사를
+        같이해야 한다. 검사 8이 구속력을 잃는 경우(킬스위치 off / 판정
+        부재·만료)에 상향만 남으면 실효 천장이 부풀어 있는데 그것을 상쇄할
+        기계가 하나도 없다 -- **장애나 비활성화가 노출도를 위로 여는** 형태가
+        된다. 운영자의 자연스러운 대응("이상하다 → 끄자")이 정확히 반대
+        결과를 낸다.
+
+        `min()`으로 내리기만 한다. 되돌리기가 어떤 경우에도 노출도를 **위로**
+        열어서는 안 되기 때문이다(운영자가 baseline보다 더 낮춰 둔 값을
+        복원이 도로 올리는 일도 없다).
+
+        2026-08-08: `max_single_position_pct`(종목당 상한)는 더 이상 여기서
+        다루지 않는다 -- 소유권이 전략 패널로 넘어갔고, 이 레짐 채널은 애초에
+        그 필드를 상향한 적이 없으므로(→ `apply_regime_slots`) 되돌릴 것도
+        없다. 기존 baseline 행에 `max_single_position_pct` 키가 남아 있어도
+        (이 수정 이전에 저장된 행) 무시한다 -- 참조하면 패널이 올려 둔 값이
+        조용히 깎인다.
+        """
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
+        raw = await storage.get_app_setting(self._REGIME_BASELINE_KEY)
+        if not raw:
+            # 한 번도 상향한 적이 없다 -- 되돌릴 것도 없다.
+            return None
+        baseline = json.loads(raw)
+        if not isinstance(baseline, dict):
+            raise TypeError(
+                f"regime slot baseline is not a JSON object "
+                f"(got {type(baseline).__name__})"
+            )
+
+        new_slots = min(
+            int(self.risk_params.max_open_positions),
+            int(baseline["max_open_positions"]),
+        )
+        changed = new_slots != int(self.risk_params.max_open_positions)
+        self.risk_params.max_open_positions = new_slots
+
+        if changed:
+            await self._persist_state()
+            logger.info(
+                f"[Coordinator] regime_slots_restored ({reason}): "
+                f"max_open_positions={new_slots}"
+            )
+        return {
+            "max_open_positions": new_slots,
+            "restored": True,
+            "reason": reason,
+        }
+
+    async def apply_regime_slots(self) -> Optional[dict]:
+        """슬롯 수를 게이트 검사 8의 구속력에 맞춘다. never-raise.
+
+        두 방향이 있다.
+
+        - **검사 8이 구속력을 가질 때**(킬스위치 on + 유효한 판정) 목표를
+          담을 수 있게 슬롯을 **올리기만 한다** -- 목표가 내려갔다고 줄이면
+          같은 금액을 더 적은 종목에 담게 되어 집중도가 오른다. 총량 축소는
+          전적으로 검사 8이 담당한다.
+        - **검사 8이 구속력을 잃을 때**(킬스위치 off / 판정 부재·만료) 상향을
+          되돌린다(C-2). 이 방향이 없으면 킬스위치가 롤백이 아니라 **완화
+          동작**이 된다 -- 상세는 `_restore_regime_slot_baseline` 참조.
+
+        조회 **예외**는 되돌리지 않는다. DB 오류에서는 게이트 검사 8이
+        fail-closed로 `deny`하므로 검사 8은 오히려 **더** 구속력이 세진다.
+        되돌려야 하는 것은 검사가 조용히 **스킵**되는 경우(`target is None`)뿐이다.
+
+        `GATE_PROTECTED_FIELDS`는 그대로 둔다. 그 봉인은 전략 패널의 자유
+        서술값을 막기 위한 것이고, 이 경로는 값이 3개뿐인 룩업(레짐 앵커
+        bull/neutral/bear)이라 드리프트가 구조적으로 불가능하다.
+
+        2026-08-08: `max_single_position_pct`(종목당 상한)는 더 이상 이
+        경로가 건드리지 않는다 -- 소유권이 전략 패널로 넘어갔다
+        (`strategy_apply.STRATEGY_MAPPED_FIELDS`). 이 대입은 애초에
+        불필요했다: `slots_for_target`은 `REGIME_PER_POSITION_PCT`를 기본
+        인자로 직접 받아 슬롯 수를 계산하지 `risk_params`를 읽지 않는다.
+        전에는 매일 밤 EOD 패널이 투표해 기록한 값을 다음날 08:05에
+        무조건 덮어써서, 거래 시간 동안 패널 값이 한 번도 유효하지
+        않았다(같은 리포의 반복 패턴 "만들어졌으나 닿지 않는다").
+        """
+        try:
+            # I-1 (2026-08-07 최종 리뷰): `_persistence_active=False`는 이
+            # 프로세스에서 `_restore_state()`가 한 번도 안 돌았다는 뜻이고,
+            # 그때 `self.risk_params`는 **`RiskParameters()` 기본값**이지 라이브
+            # 값이 아니다(도달 경로 실재: `resume_if_persisted()`가 저장된
+            # mode≠active/paused면 `_restore_state()` 없이 no-op한다). 그
+            # 상태에서 계산하면 `slots_for_target(..., current_max=기본값 5)`가
+            # 라이브 7을 못 보고, 쓰면 `_persist_fields(risk_params=...)`의
+            # 최상위-키 교체가 라이브 `max_trade_notional_pct` 10.0을 기본값
+            # 15.0으로(자율 게이트 검사 7의 안전 레일이 50% 완화) 리셋한다.
+            # **입력이 틀렸으므로 쓰기만 고칠 문제가 아니다** -- 통째로 건너뛰고
+            # 다음 `start()`(= `_restore_state()` 직후)의 화해에 맡긴다.
+            if not self._persistence_active:
+                logger.info(
+                    "[Coordinator] regime_slots_skipped: persistence inactive "
+                    "(risk_params are defaults, not live values)"
+                )
+                return None
+
+            if not get_settings().REGIME_EXPOSURE_ENABLED:
+                return await self._restore_regime_slot_baseline("kill_switch_off")
+
+            from services.trading.exposure_target import slots_for_target
+            from services.trading.regime_judge import get_effective_target
+
+            target = await get_effective_target()
+            if target is None:
+                return await self._restore_regime_slot_baseline(
+                    "judgment_absent_or_stale"
+                )
+
+            # 상향 전에 원래 값을 남긴다 -- 이 순서가 뒤집히면 되돌릴 값이
+            # 이미 상향된 값이 되어 baseline이 무의미해진다.
+            await self._save_regime_slot_baseline()
+
+            # `per_position_pct`는 기본 인자(`REGIME_PER_POSITION_PCT`)를
+            # 그대로 쓴다 -- `risk_params.max_single_position_pct`(패널
+            # 소유)를 읽지도, 쓰지도 않는다.
+            new_slots = slots_for_target(
+                target, current_max=int(self.risk_params.max_open_positions)
+            )
+            self.risk_params.max_open_positions = new_slots
+
+            # `_persistence_active`가 True인 것은 위에서 확인했다(= `_state`가
+            # `_restore_state()`를 거친 진짜 데이터). 그래서 전체 스냅샷이
+            # 안전하다 -- 2026-07-29의 "빈 스냅샷이 실 포지션 손절가를 덮어씀"
+            # 사고는 `_persistence_active=False`에서만 성립한다.
+            await self._persist_state()
+
+            logger.info(
+                f"[Coordinator] regime_slots_applied: target_pct={target} "
+                f"max_open_positions={new_slots}"
+            )
+            return {"max_open_positions": new_slots}
+        except Exception as e:
+            logger.warning(f"[Coordinator] apply_regime_slots failed: {e}")
+            return None
+
+    async def _record_exposure_shadow(self) -> None:
+        """목표 노출도를 계산해 1행 적는다. never-raise.
+
+        관측 전용 (2026-08-06). 이 메서드는 주문 수량·게이트·사이징을 일절
+        건드리지 않는다 -- 계산해서 기록만 한다.
+
+        2026-08-07: 계산을 레짐 앵커 + 일일 변화 한도 방식
+        (`compute_regime_target`)으로 교체했다 -- 왕복 표본 기반
+        M_evidence가 모의 시장에서 쌓인 것이라 안전장치로 기능하지
+        않았다. 이 메서드 자체는 여전히 기록만 한다 -- 게이트·슬롯
+        배선(Task 6~8)이 실제로 `target_pct`를 사이징에 물린다.
+        """
+        try:
+            if not is_krx_open_cached():
+                return
+
+            account = getattr(self._state, "account", None)
+            equity = float(getattr(account, "total_equity", 0) or 0)
+            if equity <= 0 or not math.isfinite(equity):
+                # 0으로 채운 행은 나중에 진짜 0과 구분되지 않는다.
+                return
+
+            stock_value = sum(
+                p.quantity * p.current_price for p in self._state.positions
+            )
+
+            # get_storage_service가 모듈 상단(:55)에도 import돼 있지만,
+            # 여기서 다시 지역 import하는 이유는 테스트가
+            # patch("services.storage_service.get_storage_service")로
+            # 원본 모듈의 속성을 갈아끼우기 때문이다 -- 함수 호출 시점에
+            # 다시 조회해야 그 패치가 반영된다. "죽은 코드"로 보고 지우면
+            # 이 메서드를 겨냥한 테스트가 깨진다.
+            from services.storage_service import get_storage_service
+            from services.trading.exposure_target import compute_regime_target
+            from services.trading.index_series import (
+                closes_to_returns,
+                evaluate_series_lag,
+                is_series_stale,
+            )
+
+            storage = await get_storage_service()
+            trade_date = datetime.now().strftime("%Y-%m-%d")
+
+            equity_peak_raw = await storage.get_equity_peak()
+            equity_peak = max(equity, float(equity_peak_raw or 0.0))
+
+            judgment = await storage.get_latest_regime_judgment()
+            regime_label = (judgment or {}).get("regime") or "bear"
+            prev_effective = (judgment or {}).get("prev_effective_pct")
+            actual_pct = stock_value / equity if equity > 0 else 0.0
+
+            closes = await storage.get_recent_index_closes(limit=21)
+            index_returns = closes_to_returns([c for _, c in closes])
+            series_stale = (
+                is_series_stale(closes[-1][0], datetime.now().date())
+                if closes
+                else False
+            )
+            # 거래일 기준 지연 -- 관측 신호일 뿐 배수는 안 바꾼다. 이 행이
+            # `/exposure`가 읽는 곳이라, 여기 안 실리면 폰에서 공백이
+            # 안 보인다.
+            series_lagging = (
+                evaluate_series_lag(closes[-1][0], datetime.now().date()).lagging
+                if closes
+                else False
+            )
+
+            target = compute_regime_target(
+                regime_label=regime_label,
+                prev_effective_pct=prev_effective,
+                seed_actual_pct=actual_pct,
+                index_returns=index_returns,
+                equity=equity,
+                equity_peak=equity_peak,
+                series_stale=series_stale,
+                series_lagging=series_lagging,
+                target_vol_pct=float(self.risk_params.target_vol_pct),
+                vol_multiplier_min=float(self.risk_params.vol_multiplier_min),
+            )
+
+            await storage.insert_exposure_shadow(
+                trade_date=trade_date,
+                target=target,
+                equity=equity,
+                stock_value=stock_value,
+                actual_pct=actual_pct,
+                n_round_trips=None,
+                e_base=None,
+                e_max=None,
+                equity_peak=equity_peak,
+            )
+        except Exception as e:
+            logger.warning(f"[Coordinator] exposure shadow record failed: {e}")
+
+    async def _exposure_shadow_loop(self) -> None:
+        """5분마다 `_record_exposure_shadow`를 돌린다.
+
+        `_watch_refresh_loop`/`_queue_scheduler_loop`와 같은 생명주기 --
+        start()에서 생성, stop()에서 취소.
+        """
+        try:
+            while True:
+                await self._record_exposure_shadow()
+                await asyncio.sleep(EXPOSURE_SHADOW_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            pass
+
+    async def _get_current_price(
+        self, ticker: str, ttl: Optional[float] = None
+    ) -> float:
+        """Get current price for a ticker.
+
+        `ttl`: optional cache-TTL override forwarded to
+        `KiwoomClient.get_stock_info` (monitoring-cadence-tuning arc). Used
+        by `RiskMonitor` (injected as this coordinator's `price_fetcher`) to
+        pass a held-position-count-derived TTL
+        (`services.trading.cadence.compute_held_ttl`) for its 1s poll of
+        held positions; callers that omit it (e.g. `_reprice_positions`)
+        keep today's prefix-default caching behavior unchanged.
+        """
         if self._kiwoom:
             try:
-                quote = await self._kiwoom.get_quote(ticker)
-                return quote.get("current_price", 0)
+                # KiwoomClient has no `get_quote` method (that was a
+                # never-implemented ghost API — live logs spammed "no
+                # attribute 'get_quote'" every RiskMonitor cycle, always
+                # returning 0 and silently disabling stop-loss/take-profit
+                # checks via the `current_price <= 0` guard). The real quote
+                # API is `get_stock_info` (ka10001), same one
+                # agents/tools/kr_market_data.py uses.
+                info = await self._kiwoom.get_stock_info(ticker, ttl=ttl)
+                return float(info.cur_prc)
             except Exception as e:
                 logger.error(f"[Coordinator] Failed to get price for {ticker}: {e}")
                 return 0
 
         # Simulation mode - return mock price
         return 50000  # 5만원
+
+    def _on_price_update(self, ticker: str, price: float) -> None:
+        """Price-sink for RiskMonitor's 1s poll (T1, MEDIUM finding A, review
+        2026-07-13).
+
+        RiskMonitor already fetches a fresh price for every watched ticker
+        once a second, via the very same `_get_current_price` injected above
+        as `price_fetcher` — but until this fix that fresh price was written
+        only to the monitor's own `WatchConfig.last_price` and discarded, so
+        `ManagedPosition.current_price` (and unrealized_pnl/exposure derived
+        from it) was only ever refreshed by `_reprice_positions`, itself only
+        called from `_refresh_account_info` at trade-decision time. Displayed
+        P&L/exposure went stale between decisions even though live price data
+        was already flowing. This callback closes that loop at the same 1s
+        cadence, independent of trade decisions.
+
+        Same T2 stale-price contract as `_reprice_positions`: a falsy price
+        (0/None — `_get_current_price`'s fail-safe signal for "no fresh
+        quote") must never overwrite a live position's last-known price.
+        """
+        if not price:
+            return
+        position = next(
+            (p for p in self._state.positions if p.ticker == ticker), None
+        )
+        if position is None:
+            return
+        position.current_price = price
+        position.last_updated = datetime.now()
 
     # -------------------------------------------
     # Alerts & Callbacks
@@ -726,8 +3130,48 @@ class ExecutionCoordinator:
         self._state_callback = callback
 
     async def _on_alert(self, alert: TradingAlert):
-        """Handle alert from risk monitor."""
-        self._state.pending_alerts.append(alert)
+        """Handle alert from risk monitor.
+
+        G-2 (gap discipline, spec docs/superpowers/specs/
+        2026-07-20-gap-discipline-design.md §N2): dedup by (ticker,
+        alert_type) — REPLACE the UNRESOLVED alert already sitting in
+        `_state.pending_alerts` for the same key with this new one, in
+        place, instead of appending a duplicate. Before this fix every
+        RiskMonitor alert (action_required or not) was appended here
+        unconditionally on every call, so a repeatedly-firing trigger (e.g.
+        a stop-loss re-evaluated on each 1s tick while the position stays
+        watched) grew this list without bound for the process lifetime.
+
+        G-2 review fix (2026-07-20): the FIRST version of this dedup
+        (skip-append instead of replace) introduced a fresh bug —
+        `RiskMonitor._add_alert` (risk_monitor.py) dedups the SAME
+        (ticker, alert_type) key by REPLACING the existing pending entry
+        with the new one (new id) on every tick, not skipping. Skip-append
+        here left `_state.pending_alerts` pinned to the FIRST tick's stale
+        id forever, while `GET /trading/alerts` (backed by
+        `risk_monitor.get_pending_alerts()`) always showed the latest id —
+        the two stores diverged. `handle_alert_action(latest_id, ...)` then
+        silently no-op'd (id not found in `_state.pending_alerts`) and the
+        stale entry could never be pruned, permanently blocking future
+        alerts for that key. Replacing in place (mirroring RiskMonitor's
+        own convention exactly) keeps both stores' ids in sync while still
+        capping the list at one entry per unresolved key. Once the existing
+        entry resolves (`alert.resolved = True`, or it is pruned — see
+        `handle_alert_action`'s cleanup below), a fresh alert for the same
+        key is appended as a new entry instead of replacing anything.
+        `self._alert_callback`/`_notify_state_change` still fire on every
+        call, deduped or not — only the list mutation is gated.
+        """
+        for idx, existing in enumerate(self._state.pending_alerts):
+            if (
+                not existing.resolved
+                and existing.ticker == alert.ticker
+                and existing.alert_type == alert.alert_type
+            ):
+                self._state.pending_alerts[idx] = alert
+                break
+        else:
+            self._state.pending_alerts.append(alert)
 
         if self._alert_callback:
             await self._alert_callback(alert)
@@ -773,68 +3217,114 @@ class ExecutionCoordinator:
             new_sl = data.get("stop_loss")
             if new_sl:
                 self.risk_monitor.update_stop_loss(alert.ticker, new_sl)
+                # Also update the ManagedPosition so the adjusted stop is what
+                # gets persisted — otherwise a restart reverts it to the old
+                # value stored on the position (review #4).
+                position = next(
+                    (p for p in self._state.positions if p.ticker == alert.ticker),
+                    None,
+                )
+                if position is not None:
+                    position.stop_loss = new_sl
+                    position.last_updated = datetime.now()
+                self._schedule_persist()
 
         elif action == "EXECUTE_STOP_LOSS" and alert.ticker:
             config = self.risk_monitor._watching.get(alert.ticker)
             if config:
-                # Update risk agent status - executing stop-loss
-                self._update_agent_status(
-                    "risk",
-                    AgentStatus.WORKING,
-                    task=f"Executing stop-loss for {config.stock_name or alert.ticker}",
-                    processing_stock=alert.ticker,
-                    processing_stock_name=config.stock_name,
-                    trade_details={
-                        "action": "STOP_LOSS",
-                        "quantity": config.quantity,
-                        "entry_price": config.entry_price,
-                        "stop_loss": config.stop_loss,
-                        "current_price": config.last_price,
-                    },
-                )
+                # S-3 review carry-over (S-2 in-flight guard, 5th SELL entry
+                # point): a user-confirmed alert click can race an
+                # autonomous defensive exit (RiskMonitor's AGENT_AUTO tick,
+                # or PositionManager) for the SAME ticker — same guard as
+                # _close_position/_reduce_position/
+                # _execute_order_from_monitor/on_trade_approved's SELL/
+                # REDUCE main path (see _close_position's docstring).
+                # Guard-denied: skip as a no-op — the position stays
+                # tracked/watched, the OTHER engine's exit already owns it.
+                if self._acquire_defensive_exit_guard(alert.ticker):
+                    try:
+                        # Update risk agent status - executing stop-loss
+                        self._update_agent_status(
+                            "risk",
+                            AgentStatus.WORKING,
+                            task=f"Executing stop-loss for {config.stock_name or alert.ticker}",
+                            processing_stock=alert.ticker,
+                            processing_stock_name=config.stock_name,
+                            trade_details={
+                                "action": "STOP_LOSS",
+                                "quantity": config.quantity,
+                                "entry_price": config.entry_price,
+                                "stop_loss": config.stop_loss,
+                                "current_price": config.last_price,
+                            },
+                        )
 
-                price = config.last_price or config.entry_price
-                order = OrderRequest(
-                    ticker=alert.ticker,
-                    stock_name=config.stock_name,
-                    side=OrderSide.SELL,
-                    quantity=config.quantity,
-                    price=price,
-                    reason="User-confirmed stop-loss",
-                )
-                await self._execute_order(order)
-                self._remove_position(alert.ticker)
+                        price = config.last_price or config.entry_price
+                        # L2 (spec D2): decision_id/session_id left unset (NULL) on
+                        # purpose — a user-confirmed alert action has no upstream
+                        # decision record to thread; NULL is the correct lineage
+                        # state here, not a gap to wire.
+                        order = OrderRequest(
+                            ticker=alert.ticker,
+                            stock_name=config.stock_name,
+                            side=OrderSide.SELL,
+                            quantity=config.quantity,
+                            price=price,
+                            # S-3 (survival discipline): MARKET, not the
+                            # OrderRequest default of LIMIT — same rationale
+                            # as _close_position's MARKET switch.
+                            order_type=OrderType.MARKET,
+                            reason="User-confirmed stop-loss",
+                        )
+                        result = await self._execute_order(order)
+                        # Track the ACTUAL fill — a rejected/unfilled sell keeps the
+                        # position under defense instead of orphaning it (review #8).
+                        self._apply_sell_fill(alert.ticker, result.filled_quantity, order=order, result=result)
+                    finally:
+                        self._release_defensive_exit_guard(alert.ticker)
 
         elif action == "EXECUTE_TAKE_PROFIT" and alert.ticker:
             config = self.risk_monitor._watching.get(alert.ticker)
             if config:
-                # Update risk agent status - executing take-profit
-                self._update_agent_status(
-                    "risk",
-                    AgentStatus.WORKING,
-                    task=f"Executing take-profit for {config.stock_name or alert.ticker}",
-                    processing_stock=alert.ticker,
-                    processing_stock_name=config.stock_name,
-                    trade_details={
-                        "action": "TAKE_PROFIT",
-                        "quantity": config.quantity,
-                        "entry_price": config.entry_price,
-                        "take_profit": config.take_profit,
-                        "current_price": config.last_price,
-                    },
-                )
+                # S-3 review carry-over — same in-flight guard as
+                # EXECUTE_STOP_LOSS above (see its comment for the full
+                # rationale).
+                if self._acquire_defensive_exit_guard(alert.ticker):
+                    try:
+                        # Update risk agent status - executing take-profit
+                        self._update_agent_status(
+                            "risk",
+                            AgentStatus.WORKING,
+                            task=f"Executing take-profit for {config.stock_name or alert.ticker}",
+                            processing_stock=alert.ticker,
+                            processing_stock_name=config.stock_name,
+                            trade_details={
+                                "action": "TAKE_PROFIT",
+                                "quantity": config.quantity,
+                                "entry_price": config.entry_price,
+                                "take_profit": config.take_profit,
+                                "current_price": config.last_price,
+                            },
+                        )
 
-                price = config.last_price or config.take_profit
-                order = OrderRequest(
-                    ticker=alert.ticker,
-                    stock_name=config.stock_name,
-                    side=OrderSide.SELL,
-                    quantity=config.quantity,
-                    price=price,
-                    reason="User-confirmed take-profit",
-                )
-                await self._execute_order(order)
-                self._remove_position(alert.ticker)
+                        price = config.last_price or config.take_profit
+                        # L2 (spec D2): decision_id/session_id left unset (NULL) —
+                        # same rationale as EXECUTE_STOP_LOSS above.
+                        order = OrderRequest(
+                            ticker=alert.ticker,
+                            stock_name=config.stock_name,
+                            side=OrderSide.SELL,
+                            quantity=config.quantity,
+                            price=price,
+                            # S-3: MARKET, not LIMIT — same rationale as
+                            # EXECUTE_STOP_LOSS above.
+                            order_type=OrderType.MARKET,
+                            reason="User-confirmed take-profit",
+                        )
+                        result = await self._execute_order(order)
+                        self._apply_sell_fill(alert.ticker, result.filled_quantity, order=order, result=result)
+                    finally:
+                        self._release_defensive_exit_guard(alert.ticker)
 
         elif action == "HOLD":
             # Do nothing, just acknowledge
@@ -846,28 +3336,615 @@ class ExecutionCoordinator:
 
         await self._notify_state_change()
 
-    async def _close_position(self, ticker: str):
-        """Close a position at market price."""
-        position = next(
-            (p for p in self._state.positions if p.ticker == ticker),
-            None
-        )
+    async def _close_position(
+        self,
+        ticker: str,
+        decision_id: Optional[str] = None,
+        _skip_inflight_guard: bool = False,
+        reason: Optional[str] = None,
+        defensive: bool = False,
+    ) -> Optional[OrderResult]:
+        """Close a position at market price.
 
+        Returns the OrderResult of the placed SELL (or None if there was no
+        position to close, or a concurrent defensive exit already owns this
+        ticker — see the guard note below) — P1 (2026-07-15) added this
+        return value so `_reduce_position` can delegate here when its own
+        oversell clamp collapses a partial request into a full close, and
+        still learn the ACTUAL filled quantity. Existing callers that ignore
+        the return value (`handle_alert_action`'s CLOSE_POSITION,
+        PositionManager's `_execute_close_position`) are unaffected.
+
+        `decision_id` (L2, spec D2): optional durable decision-ledger id
+        threaded into OrderRequest.session_id when the caller has one (e.g.
+        an agent-chat-discussed exit) — defaults to None, so every existing
+        call site (a user-initiated close via handle_alert_action, or a
+        `_reduce_position` delegation with no id of its own) is byte-for-byte
+        unchanged. NULL here is correct, not a gap, for callers with no
+        upstream decision to cite.
+
+        `reason` (Important 2, 최종 전체 브랜치 리뷰): the fill notification's
+        "경로"(source) field — defaults to "User-initiated close" for a
+        caller that has no more specific label of its own (`handle_alert_action`
+        CLOSE_POSITION, a genuine human tap). Before this fix EVERY caller
+        got that same hardcoded string, so PositionManager's autonomous
+        stop-loss/take-profit close (`_execute_close_position`, which passes
+        its own accurate label through this param) reported to the phone as
+        "사람이 한 것" — exactly the two fills this notification arc exists
+        to surface (07-24 stop-loss, 07-27 take-profit) arrived mislabeled.
+
+        S-2 review fix: guarded by the coordinator-wide in-flight
+        defensive-exit set (`_acquire_defensive_exit_guard`) so a concurrent
+        close from a DIFFERENT engine (RiskMonitor via
+        `_execute_order_from_monitor`, or another PositionManager tick) for
+        the SAME ticker is skipped as a no-op instead of doubling the sell.
+        `_skip_inflight_guard=True` is for `_reduce_position`'s OWN
+        delegation into this method when its oversell clamp collapses a
+        partial request into a full close — `_reduce_position` already holds
+        the guard for this ticker at that point, so re-acquiring here would
+        self-deny (the ticker is already "in flight", owned by the very call
+        that's delegating); skipping applies ONLY to that one internal call
+        site, never to an external caller.
+
+        `defensive` (2026-08-10, 089860 재제출 사고): True면 재제출 가드
+        G1/G2/G3(`_defensive_sell_suppression_reason`)를 적용한다. 이 메서드는
+        **두 번째 방어 엔진**(PositionManager 30초 틱 →
+        `_execute_close_position`)이 지나는 경로이자 동시에 **사람이 직접 누른
+        청산**(`handle_alert_action` CLOSE_POSITION, REST
+        `/api/trading/positions/{ticker}/close`)의 경로이기도 하다. 자율 방어만
+        억제하고 사람의 조작은 건드리지 않기 위해 호출자가 명시적으로 켠다 —
+        기본값 False라 사람 경로는 기존 동작 그대로다. 사람의 지시를 조용히
+        삼키는 것은 이 가드가 고치려는 결함보다 나쁘다.
+        """
+        if not _skip_inflight_guard and not self._acquire_defensive_exit_guard(ticker):
+            return None
+
+        try:
+            position = next(
+                (p for p in self._state.positions if p.ticker == ticker),
+                None
+            )
+
+            if not position:
+                logger.warning(f"[Coordinator] Position {ticker} not found")
+                return None
+
+            # 재제출 가드 — PositionManager(30초 틱)도 RiskMonitor(1초 틱)와
+            # 똑같이 미체결 SELL 위에 전량 청산을 다시 얹을 수 있다(같은
+            # 800033). 이 경로의 자율 게이트(`check_autonomy`)는 호출자인
+            # `_execute_close_position`에 있고 여기 도달했다면 이미 통과한
+            # 상태다. None 반환은 이 메서드에 **이미 존재하는** "스킵" 계약
+            # (in-flight 가드/포지션 없음)이라 호출자가 이미 다룬다 —
+            # `close_position_skipped_kept_monitored`로 로그하고 감시를
+            # 유지한다(무방비 방치가 아니다).
+            if defensive and self._defensive_sell_suppressed(
+                ticker, position, source="position_manager_close"
+            ) is not None:
+                return None
+
+            order = OrderRequest(
+                ticker=ticker,
+                stock_name=position.stock_name,
+                side=OrderSide.SELL,
+                quantity=position.quantity,
+                price=position.current_price,
+                # S-3 (survival discipline): defensive/user-initiated closes
+                # submit as MARKET, not the OrderRequest default of LIMIT —
+                # matches risk_monitor.py's existing _execute_stop_loss/
+                # _execute_take_profit convention (P2-4) so a gap/crash
+                # reports the true adverse fill instead of the (favorable)
+                # price captured above. `price` is kept as the mock/paper
+                # broker's fill-price fallback and the live Kiwoom fill-
+                # confirm's fallback_price — MARKET orders never actually
+                # send it to the broker (order_agent.py only tick-rounds/
+                # sends price for LIMIT).
+                order_type=OrderType.MARKET,
+                reason=reason or "User-initiated close",
+                session_id=decision_id,
+            )
+
+            if defensive:
+                self._note_defensive_sell_submitted(ticker)
+            result = await self._execute_order(order)
+            # Important 4: 브로커 거부는 예외가 아니라 정상 결과로 온다 —
+            # 아래 _apply_sell_fill의 filled_quantity<=0 가드는 무통지이므로
+            # 여기서 명시적으로 실패를 알린다.
+            self._handle_defensive_sell_rejection(position, order, result)
+            # Only drop/reduce tracking by the ACTUAL fill — a rejected or unfilled
+            # sell must keep the position under defense (A3).
+            self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+            # E1-3: a partial/unfilled defensive close still has broker-side
+            # exposure nothing is watching yet — register the remainder with the
+            # fill tracker (same helper on_trade_approved's BUY/SELL entries use,
+            # E1-1/E1-2) so the ka10076 poll can pick up the post-fill later.
+            # stop_loss/take_profit are None: this is an exit, not an entry with
+            # defense levels of its own to carry forward.
+            self._register_unfilled_sell(ticker, position, order, result)
+            return result
+        finally:
+            if not _skip_inflight_guard:
+                self._release_defensive_exit_guard(ticker)
+
+    async def _reduce_position(
+        self,
+        ticker: str,
+        quantity: int,
+        decision_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        defensive: bool = False,
+    ) -> Optional[OrderResult]:
+        """Place a SELL order for a SPECIFIC quantity — a partial reduce, not
+        a full close (P1, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+
+        `reason` (Important 2, 최종 전체 브랜치 리뷰): same source-label
+        threading as `_close_position` — forwarded to the delegated full
+        close below and used verbatim on the direct-partial order; defaults
+        to "Autonomous partial reduce" for a caller with no more specific
+        label (today's only caller, `_execute_reduce_position`, always
+        passes one).
+
+        `PositionManager._execute_reduce_position` is the (only) autonomous
+        caller today: it already passes the request through
+        `check_autonomy(SELL)` before reaching here, mirroring the existing
+        full-close pattern (`PositionManager._execute_close_position` gates,
+        then calls `_close_position`).
+
+        Oversell-proof against THIS coordinator's OWN tracked quantity. The
+        caller may be working off a separate ledger (PositionManager's
+        `MonitoredPosition`, distinct from this coordinator's
+        `ManagedPosition`) that can diverge from this one, so the clamp is
+        re-applied here rather than trusted from the caller: `sell_qty =
+        min(quantity, position.quantity)`. If that clamp collapses the
+        request into a full close (requested >= held), delegates to the
+        existing `_close_position` instead of duplicating its
+        position-removal/risk-monitor-stop cleanup.
+
+        `decision_id` (L2, spec D2): optional durable decision-ledger id,
+        threaded into OrderRequest.session_id (and passed through to the
+        delegated `_close_position` call below) — defaults to None so every
+        existing call site is byte-for-byte unchanged.
+
+        Returns the OrderResult of whichever order was actually placed (the
+        partial sell, or the delegated full close) so the caller can react to
+        the ACTUAL filled quantity — never the requested one — the same
+        choke-point discipline `_apply_sell_fill` already applies to every
+        other SELL path.
+
+        S-2 review fix: guarded by the coordinator-wide in-flight
+        defensive-exit set for the same dual-engine race `_close_position`
+        guards against (see its docstring) — acquired ONCE here at the top
+        and held across the delegated `_close_position(_skip_inflight_guard=
+        True)` call below, so the delegation never tries to re-acquire it.
+
+        `defensive` (2026-08-10, 089860 재제출 사고): 재제출 가드 G1/G2/G3를
+        적용한다 — `_close_position`과 같은 의미(그 docstring 참고). 오늘의
+        유일한 호출자(`PositionManager._execute_reduce_position`)는 자율
+        경로라 True를 넘기지만, 기본값은 `_close_position`과 대칭을 맞춰
+        False로 둔다(사람 경로가 나중에 생겨도 조용히 삼켜지지 않도록).
+        """
+        if not self._acquire_defensive_exit_guard(ticker):
+            return None
+
+        try:
+            position = next(
+                (p for p in self._state.positions if p.ticker == ticker), None
+            )
+            if not position:
+                logger.warning(f"[Coordinator] Position {ticker} not found for reduce")
+                return None
+
+            # 재제출 가드. 위임 분기(`_close_position`)로 내려가기 **전에**
+            # 한 번만 판정한다 — 위임 호출은 `defensive`를 그대로 넘기되
+            # 그쪽에서 다시 걸리지는 않는다(같은 판정을 두 번 하는 셈이고,
+            # 여기서 통과했으면 그쪽도 통과한다).
+            #
+            # ⚠️ **일시적** 억제(G2/G3)에서는 `None`을 돌려주면 안 된다.
+            # 호출자 `PositionManager._execute_reduce_position`의 `None` 분기는
+            # 오직 "코디네이터 원장에 포지션 없음"을 뜻해 🚨
+            # `_notify_reduce_ledger_desync`("...포지션이 없어 주문이 접수되지
+            # 않았습니다... 수동 확인이 필요합니다")를 발사하는데, 미체결
+            # SELL/쿨다운은 포지션이 멀쩡히 있는 상태라 사실과 다른 경보다.
+            # `filled<=0` 분기의 `_notify_reduce_unfilled`도 마찬가지다.
+            # 2026-07-28 ADD 유동성 캡이 정확히 이 결함이었고
+            # `ORDER_STATUS_REJECTED_LIQUIDITY_CAP`라는 **구별 가능한 반환**으로
+            # 봉합했다 — 같은 방식을 그대로 쓴다.
+            # (`_close_position`의 `None`은 원래부터 "스킵, 감시 유지"로 정확히
+            #  해석되고 있어 대칭이 깨진 곳은 reduce 하나다.)
+            #
+            # 🔴 단, **G1(`no_position`)은 예외로 기존 `None` 계약에 그대로
+            # 떨어뜨린다**(리뷰 2라운드 Important 1). 이 메서드는 `position`이
+            # None이면 이미 위에서 `None`을 돌려주므로, 여기까지 와서 G1이
+            # 발동하는 유일한 조건은 **원장에 포지션이 있는데 `quantity <= 0`**
+            # 이다. 그건 180초 안에 자동 해제되는 일시 상태가 아니라 **자가
+            # 치유되지 않는 진짜 원장 불일치**(PM은 116주, 코디네이터는 0주)이고,
+            # `_notify_reduce_ledger_desync`가 정확히 그것 때문에 존재한다.
+            # 브랜치 이전에도 `sell_qty = min(quantity, 0) <= 0` → `None` →
+            # desync 통지로 흘렀다. 허위 경보를 없애려다 **진짜 경보를 삼키면**
+            # 같은 계열의 실수를 반대 방향으로 반복하는 것이다.
+            suppressed = (
+                self._defensive_sell_suppressed(
+                    ticker, position, source="position_manager_reduce"
+                )
+                if defensive
+                else None
+            )
+            if suppressed == "no_position":
+                logger.warning(
+                    f"[Coordinator] Reduce for {ticker}: 원장에 포지션이 있으나 "
+                    f"수량이 0 이하다 — 자가 치유되지 않는 원장 불일치이므로 "
+                    f"기존 None 계약(desync 통지)으로 떨어뜨린다"
+                )
+                return None
+            if suppressed is not None:
+                return OrderResult(
+                    order_id="",
+                    ticker=ticker,
+                    side=OrderSide.SELL,
+                    requested_quantity=quantity,
+                    filled_quantity=0,
+                    avg_price=0,
+                    status=ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT,
+                    message=f"방어 매도 재제출 가드 — {suppressed}",
+                )
+
+            sell_qty = min(quantity, position.quantity)
+            if sell_qty <= 0:
+                logger.warning(
+                    f"[Coordinator] Reduce for {ticker} requested non-positive "
+                    f"sell quantity ({quantity} vs held {position.quantity})"
+                )
+                return None
+
+            if sell_qty >= position.quantity:
+                # Clamp collapses this into a full close — delegate rather than
+                # duplicate _close_position's removal/stop-cleanup logic. This
+                # call already holds the in-flight guard for `ticker` (acquired
+                # above), so tell _close_position to skip re-acquiring it —
+                # re-acquiring would self-deny (see _close_position's guard
+                # docstring) and a second release here would double-discard.
+                return await self._close_position(
+                    ticker, decision_id=decision_id, _skip_inflight_guard=True,
+                    reason=reason,
+                    # 재제출 가드도 그대로 넘긴다 — 위임된 쪽이 실제 제출
+                    # 지점이므로 G3 쿨다운 타임스탬프는 거기서 찍혀야 한다.
+                    defensive=defensive,
+                )
+
+            order = OrderRequest(
+                ticker=ticker,
+                stock_name=position.stock_name,
+                side=OrderSide.SELL,
+                quantity=sell_qty,
+                price=position.current_price,
+                # S-3: same MARKET rationale as _close_position above — a
+                # partial defensive reduce must report the true fill too.
+                order_type=OrderType.MARKET,
+                reason=reason or "Autonomous partial reduce",
+                session_id=decision_id,
+            )
+
+            if defensive:
+                self._note_defensive_sell_submitted(ticker)
+            result = await self._execute_order(order)
+            # Important 4: 브로커 거부는 예외가 아니라 정상 결과로 온다 —
+            # 아래 _apply_sell_fill의 filled_quantity<=0 가드는 무통지이므로
+            # 여기서 명시적으로 실패를 알린다.
+            self._handle_defensive_sell_rejection(position, order, result)
+            # Reconcile by the ACTUAL fill, not the requested quantity — same
+            # choke point every other SELL path uses (full → remove, partial →
+            # decrement, none → retain).
+            self._apply_sell_fill(ticker, result.filled_quantity, order=order, result=result)
+            # E1-3: register any unfilled remainder (see _close_position's same
+            # call for the full rationale) — the clamp-to-full-close branch above
+            # already gets this via the delegated _close_position call, so only
+            # this direct-partial branch needs its own call.
+            self._register_unfilled_sell(ticker, position, order, result)
+            return result
+        finally:
+            self._release_defensive_exit_guard(ticker)
+
+    async def _clamp_add_for_liquidity(
+        self, ticker: str, quantity: int, position: ManagedPosition
+    ) -> int:
+        """자율 ADD 수량을 유동성 천장 안으로 깎는다(총 포지션 기준).
+
+            allowed_notional = max(0, ADTV * SIZING_PARTICIPATION_PCT - 보유평가액)
+
+        **추가분이 아니라 총 포지션이 기준인 이유**: 추가분에만 캡을 걸면 매번
+        캡만큼 더 살 수 있어 천장을 영원히 넘는다. 라이브 실측(094840)에서
+        ADTV 5.3억 -> 캡 265만원인데 이미 1,729만원(6.5배)을 보유 중이었다 —
+        이 경우 허용 ADD는 0이어야 한다.
+
+        **ADTV 미상은 fail-open**(C1 `apply_liquidity_cap`과 동일 규약):
+        ADD는 이미 `check_autonomy(BUY)` 게이트를 통과한 요청이고, 여기서
+        fail-closed로 막으면 조회 실패가 곧 포지션 관리 정지가 된다. 대신
+        경고를 남겨 캡이 조용히 꺼진 것을 관측할 수 있게 한다.
+
+        never-raise — 유동성 조회 실패가 ADD 경로를 죽이면 안 된다.
+        """
+        from services.discovery.liquidity import liquidity_cap_value
+
+        try:
+            adtv = await self.portfolio_agent._resolve_adtv(ticker)
+        except Exception as e:
+            logger.warning(
+                f"[Coordinator] ADD 유동성 조회 실패 {ticker}: {e} — 캡 미적용"
+            )
+            return quantity
+
+        cap = liquidity_cap_value(adtv)
+        if cap is None:
+            logger.warning(
+                f"[Coordinator] ADD 유동성 캡 미적용 {ticker}: adtv_unknown"
+            )
+            return quantity
+
+        price = position.current_price or position.avg_price
+        # NaN 가드: `not price`도 `price <= 0`도 NaN을 통과시키고(NaN 비교는
+        # 항상 False), 그러면 아래 int(0.0/nan)이 ValueError를 던져 docstring의
+        # never-raise 계약이 깨진다.
+        if not price or not math.isfinite(price) or price <= 0:
+            logger.warning(
+                f"[Coordinator] ADD 유동성 캡 미적용 {ticker}: 가격 없음/비유한"
+            )
+            return quantity
+
+        held_notional = position.quantity * price
+        allowed = int(max(0.0, cap - held_notional) / price)
+
+        if allowed < quantity:
+            logger.info(
+                f"[Coordinator] ADD 유동성 캡 적용 {ticker}: "
+                f"{quantity}주 -> {allowed}주 "
+                f"(ADTV {adtv / 1e8:,.1f}억, 캡 {cap / 1e4:,.0f}만원, "
+                f"보유 {held_notional / 1e4:,.0f}만원)"
+            )
+        return min(quantity, allowed)
+
+    def _clamp_add_for_position_cap(
+        self, ticker: str, quantity: int, position: ManagedPosition
+    ) -> int:
+        """자율 ADD 수량을 단일 종목 천장 안으로 깎는다(총 포지션 기준).
+
+            allowed_notional = max(0, 천장 - 보유평가액)
+
+        천장은 진입 BUY가 쓰는 것과 **같은 함수**
+        (`PortfolioAgent._calculate_max_position_value`)에서 나온다 —
+        `max_single_position_pct` × risk_score 버킷, R-사이징 캡과 min 결합.
+        새 상한을 만드는 게 아니라, 이 경로만 지나가지 않던 기존 상한을
+        지나가게 하는 것이다.
+
+        유동성 캡은 여기 넣지 않는다 — 바로 위에서 이미 적용됐고, `adtv`를
+        넘기지 않으면 그 항은 fail-open으로 빠져 중복 계산되지 않는다.
+
+        **기준이 추가분이 아니라 총 포지션인 이유**는 유동성 캡과 같다:
+        추가분에만 걸면 매번 캡만큼 더 살 수 있어 천장을 영원히 넘는다.
+
+        never-raise — 사이징 계산 실패가 포지션 관리를 멈추면 안 된다.
+        계좌 평가액을 모르면 캡 미적용(fail-open, `_clamp_add_for_liquidity`의
+        adtv 미상 규약과 동일)이되 경고를 남겨 조용히 꺼진 것을 관측한다.
+        """
+        try:
+            account = getattr(self._state, "account", None)
+            total_equity = float(getattr(account, "total_equity", 0) or 0)
+            if total_equity <= 0 or not math.isfinite(total_equity):
+                logger.warning(
+                    f"[Coordinator] ADD 단일종목 상한 미적용 {ticker}: 계좌 평가액 없음"
+                )
+                return quantity
+
+            price = position.current_price or position.avg_price
+            if not price or not math.isfinite(price) or price <= 0:
+                logger.warning(
+                    f"[Coordinator] ADD 단일종목 상한 미적용 {ticker}: 가격 없음/비유한"
+                )
+                return quantity
+
+            cap = self.portfolio_agent._calculate_max_position_value(
+                total_equity=total_equity,
+                risk_score=position.risk_score or 5,
+                entry_price=price,
+                stop_loss=position.stop_loss,
+            )
+            if cap is None or not math.isfinite(cap):
+                logger.warning(
+                    f"[Coordinator] ADD 단일종목 상한 미적용 {ticker}: 천장 계산 불가"
+                )
+                return quantity
+
+            held_notional = position.quantity * price
+            allowed = int(max(0.0, cap - held_notional) / price)
+
+            if allowed < quantity:
+                logger.info(
+                    f"[Coordinator] ADD 단일종목 상한 적용 {ticker}: "
+                    f"{quantity}주 -> {allowed}주 "
+                    f"(천장 {cap / 1e4:,.0f}만원, 보유 {held_notional / 1e4:,.0f}만원)"
+                )
+            return min(quantity, allowed)
+        except Exception as e:
+            logger.warning(
+                f"[Coordinator] ADD 단일종목 상한 계산 실패 {ticker}: {e} — 캡 미적용"
+            )
+            return quantity
+
+    async def _add_to_position(
+        self, ticker: str, quantity: int, decision_id: Optional[str] = None
+    ) -> Optional[OrderResult]:
+        """Place a BUY order for a SPECIFIC quantity to increase an existing
+        position — the opposite side of `_reduce_position` (P2, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+
+        `PositionManager._execute_add_position` is the (only) autonomous
+        caller today: it already passes the request through
+        `check_autonomy(BUY)` — the SAME gate (master gate, market mode,
+        paper-only, daily-loss breaker, per-trade notional cap) the entry
+        BUY path (`on_trade_approved`) enforces — before reaching here.
+        max-open-positions is the one exception: an already-held ticker is
+        exempt from it (2026-08-05), since adding to a position cannot raise
+        the number of open positions.
+
+        Requires a matching position on THIS coordinator's OWN ledger
+        (`_state.positions`). The caller (PositionManager) works off a
+        SEPARATE ledger (`MonitoredPosition`) that can diverge from this
+        one — mirrors `_reduce_position`'s conservative contract: rather
+        than blindly opening an untracked position with unknown stop
+        levels, a divergent/desynced ledger is a no-op here (logged), same
+        as a reduce against a ticker this coordinator doesn't track.
+
+        On any real fill, reuses `_add_position`'s existing "average in"
+        merge (quantity summed, avg_price recomputed as the cost-weighted
+        average) — the exact same code path an entry BUY's
+        `on_trade_approved` already exercises, so this doesn't duplicate
+        that arithmetic.
+
+        `decision_id` (L2, spec D2): optional durable decision-ledger id,
+        threaded into OrderRequest.session_id — defaults to None so every
+        existing call site is byte-for-byte unchanged.
+
+        Returns the OrderResult of the placed order (or None if there's no
+        matching position to add to, or the requested quantity is
+        non-positive), so the caller can react to the ACTUAL filled
+        quantity — never the requested one.
+        """
+        position = next(
+            (p for p in self._state.positions if p.ticker == ticker), None
+        )
         if not position:
-            logger.warning(f"[Coordinator] Position {ticker} not found")
-            return
+            logger.warning(f"[Coordinator] Position {ticker} not found for add")
+            return None
+
+        if quantity <= 0:
+            logger.warning(
+                f"[Coordinator] Add for {ticker} requested non-positive "
+                f"quantity ({quantity})"
+            )
+            return None
+
+        # 일일 거래 상한 (2026-08-06). 검사는 `on_trade_approved`에, 증가는
+        # `_execute_order`에 있어 이 경로가 검사만 우회하고 있었다 — ADD가 한 번도
+        # 체결되지 않던 동안에는 무해했으나, 슬롯 상한 수정(같은 날 배포)으로 ADD가
+        # 실제로 나가기 시작하면 예산을 **소비하면서 상한은 안 받는** 상태가 된다.
+        # 실측 추정으로 보유 5종이 각자 3% 천장까지 25%씩 늘면 하루 약 12회로
+        # 상한 10을 넘고, 그 뒤 신규 진입 BUY가 막힌다.
+        #
+        # ⚠️ 검사는 여기(ADD 경로)에만 둔다. 공유 `_execute_order`에 넣으면 손절
+        # SELL까지 예산에 걸려 **예산 소진이 곧 방어 정지**가 된다 — 일일 손실
+        # 브레이커를 노출 증가 액션에만 걸도록 좁힌 것(S-1/D3)과 같은 이유다.
+        #
+        # 읽기 전에 lazy 롤오버를 태운다 — 안 태우면 어제 소진한 카운트가 오늘을
+        # 막는다(`on_trade_approved`의 검사도 같은 순서다).
+        self._maybe_reset_daily_trades()
+        if self._state.daily_trades_count >= self.risk_params.max_daily_trades:
+            logger.info(
+                f"[Coordinator] ADD 일일 상한 차단 {ticker}: "
+                f"{quantity}주 요청 -> 0주 "
+                f"({self._state.daily_trades_count}/"
+                f"{self.risk_params.max_daily_trades} 소진)"
+            )
+            return OrderResult(
+                order_id="",
+                ticker=ticker,
+                side=OrderSide.BUY,
+                requested_quantity=quantity,
+                filled_quantity=0,
+                avg_price=0,
+                status=ORDER_STATUS_REJECTED_DAILY_LIMIT,
+                message="일일 거래 상한 소진 — 내일 리셋된다",
+            )
+
+        # 유동성 캡 (2026-07-27 유동성 인지 아크 후속). 진입 BUY는 C1 사이징
+        # 캡(ADTV의 0.5%)을 받는데 이 ADD 경로만 우회하고 있었다 — 진입이
+        # 0.5%를 지켜도 추가매수가 천장을 넘는 유일한 exposure-increasing
+        # 경로였다. 기준은 추가분이 아니라 **총 포지션**이다: 추가분에만
+        # 캡을 걸면 매번 캡만큼 더 살 수 있어 천장을 영원히 넘는다.
+        if getattr(get_settings(), "LIQUIDITY_SIZING_CAP_ENABLED", True):
+            clamped = await self._clamp_add_for_liquidity(ticker, quantity, position)
+            if clamped <= 0:
+                # 원장 불일치(position not found)와 **구별되는** 결과를 돌려준다.
+                # 호출자(PositionManager._execute_add_position)는 None을 오직
+                # "코디네이터 원장에 포지션 없음"으로 해석해 🚨 desync 통지를
+                # 보내는데, 유동성 차단은 원장 문제가 아니라 정상 억제다.
+                # 이미 캡을 초과 보유한 종목은 ADD가 매번 0이 되므로, None을
+                # 돌려주면 토론 주기마다 허위 경보가 반복된다.
+                logger.warning(
+                    f"[Coordinator] ADD 유동성 차단 {ticker}: "
+                    f"{quantity}주 요청 -> 0주 (총 포지션이 이미 유동성 천장 초과)"
+                )
+                return OrderResult(
+                    order_id="",
+                    ticker=ticker,
+                    side=OrderSide.BUY,
+                    requested_quantity=quantity,
+                    filled_quantity=0,
+                    avg_price=0,
+                    status=ORDER_STATUS_REJECTED_LIQUIDITY_CAP,
+                    message="유동성 캡 — 총 포지션이 ADTV 참여율 상한을 초과",
+                )
+            quantity = clamped
+
+        # 단일 종목 상한 (2026-08-05). 진입 BUY는 `on_trade_approved` ->
+        # `calculate_allocation` -> `_calculate_max_position_value`로
+        # max_single_position_pct / risk_score 버킷 / R-사이징 캡을 전부
+        # 받는데, 이 ADD 경로만 `OrderRequest`를 직접 만들어 그 앞을 지나가지
+        # 않았다. 슬롯 상한이 ADD를 구조적으로 막고 있던 동안에는 무해했지만
+        # (2026-08-05에 그 브레이크를 풀었다), 그 뒤로는 노출을 키우는 유일한
+        # 경로가 총량 상한 없이 복리로 늘어난다 —
+        # `add_position_pct=0.25`라 재평가마다 ×1.25이고, 라이브 실측으로
+        # 하루 7회면 계좌의 약 13%가 한 종목에 실린다.
+        #
+        # 유동성 캡과 같은 규약: 기준은 추가분이 아니라 **총 포지션**이다.
+        clamped = self._clamp_add_for_position_cap(ticker, quantity, position)
+        if clamped <= 0:
+            logger.warning(
+                f"[Coordinator] ADD 단일종목 상한 차단 {ticker}: "
+                f"{quantity}주 요청 -> 0주 (총 포지션이 이미 상한 도달)"
+            )
+            return OrderResult(
+                order_id="",
+                ticker=ticker,
+                side=OrderSide.BUY,
+                requested_quantity=quantity,
+                filled_quantity=0,
+                avg_price=0,
+                status=ORDER_STATUS_REJECTED_POSITION_CAP,
+                message="단일 종목 상한 — 총 포지션이 계좌 비중 천장에 도달",
+            )
+        quantity = clamped
 
         order = OrderRequest(
             ticker=ticker,
             stock_name=position.stock_name,
-            side=OrderSide.SELL,
-            quantity=position.quantity,
+            side=OrderSide.BUY,
+            quantity=quantity,
             price=position.current_price,
-            reason="User-initiated close",
+            reason="Autonomous add-to-position",
+            session_id=decision_id,
         )
 
-        await self._execute_order(order)
-        self._remove_position(ticker)
+        result = await self._execute_order(order)
+        if result.filled_quantity > 0:
+            # Reuse the SAME average-in merge an entry BUY's
+            # on_trade_approved already exercises via _add_position — sums
+            # quantity, recomputes avg_price as the cost-weighted average
+            # against whatever this coordinator's ledger already tracked.
+            self._add_position(
+                ManagedPosition(
+                    ticker=ticker,
+                    stock_name=position.stock_name,
+                    quantity=result.filled_quantity,
+                    avg_price=result.avg_price,
+                    current_price=result.avg_price,
+                    stop_loss=position.stop_loss,
+                    take_profit=position.take_profit,
+                    stop_loss_mode=position.stop_loss_mode,
+                    status=PositionStatus.FILLED,
+                    risk_score=position.risk_score,
+                )
+            )
+
+        return result
 
     # -------------------------------------------
     # State Access
@@ -876,6 +3953,10 @@ class ExecutionCoordinator:
     @property
     def state(self) -> TradingState:
         """Get current trading state."""
+        # 외부 조회(상태 API, 포트폴리오 요약 등)가 게이트/증가/영속 호출 없이
+        # 하루의 첫 접근이 될 수도 있다 — 여기서도 롤오버를 확인해야 새 날의
+        # 첫 조회가 어제 카운트를 보여주지 않는다.
+        self._maybe_reset_daily_trades()
         return self._state
 
     @property
@@ -885,6 +3966,10 @@ class ExecutionCoordinator:
 
     def get_portfolio_summary(self) -> dict:
         """Get portfolio summary."""
+        # `self._state`를 직접 넘겨 `state` 프로퍼티(위)를 건너뛰므로 여기서도
+        # 롤오버를 확인해야 한다 — 그렇지 않으면 이 경로로만 조회할 때
+        # daily_trades가 새 날에도 어제 값으로 보인다.
+        self._maybe_reset_daily_trades()
         return self.portfolio_agent.get_portfolio_summary(self._state)
 
     def get_pending_alerts(self) -> List[TradingAlert]:
@@ -967,18 +4052,28 @@ class ExecutionCoordinator:
         take_profit: Optional[float],
         risk_score: int,
         reason: str,
+        autonomous: bool = False,
+        quantity: Optional[int] = None,
     ) -> QueuedTrade:
-        """Add a trade to the queue for later execution."""
+        """Add a trade to the queue for later execution.
+
+        quantity carries the size decided at queueing time. It MUST be preserved
+        for autonomous trades: the execution-time re-gate's notional cap denies
+        a BUY/ADD of unknown size (fail-closed), so dropping it would cancel
+        every queued autonomous buy — audit finding A5 (2026-07-12).
+        """
         queued_trade = QueuedTrade(
             session_id=session_id,
             ticker=ticker,
             stock_name=stock_name,
             action=action,
             entry_price=entry_price,
+            quantity=quantity,
             stop_loss=stop_loss,
             take_profit=take_profit,
             risk_score=risk_score,
             reason=reason,
+            autonomous=autonomous,
         )
 
         self._state.trade_queue.append(queued_trade)
@@ -997,6 +4092,7 @@ class ExecutionCoordinator:
         )
 
         logger.info(f"[Coordinator] Trade queued: {queued_trade.id}")
+        self._schedule_persist()
         return queued_trade
 
     def get_trade_queue(self, include_all: bool = False) -> List[QueuedTrade]:
@@ -1032,6 +4128,7 @@ class ExecutionCoordinator:
 
                 self._state.trade_queue.pop(i)
                 logger.info(f"[Coordinator] Trade dismissed from queue: {queue_id}")
+                self._schedule_persist()
                 return True
         return False
 
@@ -1050,11 +4147,26 @@ class ExecutionCoordinator:
                 )
 
                 logger.info(f"[Coordinator] Queued trade cancelled: {queue_id}")
+                self._schedule_persist()
                 return True
         return False
 
     async def process_trade_queue(self):
-        """Process pending trades in queue (call when market opens)."""
+        """Process pending trades in queue (call when market opens).
+
+        Re-entrancy-guarded: a second concurrent call returns immediately so a
+        trade already being processed is not executed twice.
+        """
+        if self._processing_queue:
+            logger.info("[Coordinator] process_trade_queue already running — skipping")
+            return
+        self._processing_queue = True
+        try:
+            await self._process_trade_queue_inner()
+        finally:
+            self._processing_queue = False
+
+    async def _process_trade_queue_inner(self):
         pending_trades = self.get_trade_queue()
         if not pending_trades:
             return
@@ -1075,6 +4187,30 @@ class ExecutionCoordinator:
                     details={"queue_id": trade.id},
                 )
 
+                # R3: autonomy-originated trades must pass the gate AGAIN at
+                # execution time — the verdict from queueing time is stale
+                # (mode may have been flipped to HITL, a limit may have tripped).
+                if trade.autonomous:
+                    from services.autonomy import check_autonomy
+
+                    gate = await check_autonomy(
+                        "kiwoom",
+                        action=trade.action,
+                        quantity=trade.quantity,
+                        entry_price=trade.entry_price,
+                    )
+                    if not gate.allowed:
+                        trade.status = QueueStatus.CANCELLED
+                        self._log_activity(
+                            ActivityType.TRADE_DEQUEUED,
+                            f"Queued autonomous trade cancelled by gate: {trade.action} "
+                            f"{trade.ticker} ({gate.check}: {gate.reason})",
+                            agent="order",
+                            ticker=trade.ticker,
+                            details={"queue_id": trade.id, "gate_check": gate.check},
+                        )
+                        continue
+
                 # Execute the trade
                 allocation = await self.on_trade_approved(
                     session_id=trade.session_id,
@@ -1086,6 +4222,8 @@ class ExecutionCoordinator:
                     take_profit=trade.take_profit,
                     risk_score=trade.risk_score,
                     quantity_override=trade.quantity,
+                    autonomous=trade.autonomous,
+                    queue_id=trade.id,
                 )
 
                 trade.allocation = allocation
@@ -1103,7 +4241,649 @@ class ExecutionCoordinator:
                 trade.error_message = str(e)
 
         self._complete_agent_task("order", True)
+        if self._persistence_active:
+            await self._persist_state()
         await self._notify_state_change()
+
+    async def _run_discovery_scan(self) -> bool:
+        """DS-5: trigger a discovery-mode background scan and wait for it to
+        finish, capped at a SC-2 dynamic, universe-proportional timeout (see
+        `_compute_discovery_scan_timeout_seconds`; floor/fallback
+        `_DISCOVERY_SCAN_TIMEOUT_SECONDS`, cap `_DISCOVERY_SCAN_TIMEOUT_
+        CAP_SECONDS` — spec §2 SC-2). Only ever called from
+        `_check_queue_on_market_open` behind the `settings.DISCOVERY_ENABLED`
+        kill switch.
+
+        Never raises — every branch below is defensive and returns False on
+        anything but a clean scan-session status of ScanStatus.COMPLETED, so
+        a stuck/erroring/never-started scan degrades to "skip promotion for
+        today" rather than breaking the market-close scheduler tick.
+
+        Completion detection is polling-based (`get_progress().status`,
+        `_DISCOVERY_SCAN_POLL_INTERVAL_SECONDS` apart) because
+        BackgroundScanner exposes no awaitable completion signal — this is
+        the same public surface (`get_progress()`/`start_scan()`/
+        `stop_scan()`) app/api/routes/scanner.py's own status endpoints
+        already use, no reach into scanner internals.
+
+        On timeout, `stop_scan()` is called so the scanner doesn't keep
+        chewing through the universe (and holding the shared Kiwoom rate
+        budget) long after the EOD chain has moved on without it (spec §3:
+        "스캔 태스크는 stop 시도").
+        """
+        scanner = await get_background_scanner()
+
+        # Important (DS-5 review fix): `start_scan()` is a silent no-op when
+        # a scan of ANY mode is already in flight (scanner.py:371-373 --
+        # `if self._running: logger.warning(...); return`, no exception, no
+        # signal). The OLD guard below (`get_progress().status != RUNNING`)
+        # ran only AFTER calling start_scan, so it could not tell "my scan
+        # just started" apart from "someone else's manual scan was already
+        # RUNNING and start_scan() silently no-op'd" -- both look like
+        # status==RUNNING, and the old code would go on to poll a manual
+        # scan it never started to completion and report scan_ok=True for
+        # today's discovery, even though nothing discovery-specific ever
+        # ran. Checking the scanner's own `is_running` BEFORE calling
+        # start_scan at all closes that gap: a busy scanner (manual or
+        # otherwise) skips the trigger entirely rather than being mistaken
+        # for this call's own scan.
+        if scanner.is_running:
+            logger.warning(
+                "[Coordinator] discovery_scan_skipped_scanner_busy — a scan "
+                "is already running; skipping today's discovery scan trigger"
+            )
+            return False
+
+        try:
+            await scanner.start_scan(mode="discovery", notify_progress=False)
+        except Exception as e:
+            logger.warning(f"[Coordinator] Discovery scan failed to start: {e}")
+            return False
+
+        progress_after_start = scanner.get_progress()
+        if progress_after_start.status != ScanStatus.RUNNING:
+            logger.warning(
+                "[Coordinator] Discovery scan did not start (scanner busy?) "
+                "— skipping today's discovery"
+            )
+            return False
+
+        # SC-2: read the universe size off the SAME progress snapshot used
+        # for the RUNNING confirmation above (no extra get_progress() call)
+        # — `start_scan()` has already synchronously set `total_stocks =
+        # len(stock_list)` by the time it returns (scanner.py), so this is
+        # never a stale/pre-scan read. `getattr` (not `.total_stocks`
+        # directly) tolerates progress objects that don't carry the field at
+        # all, which folds into the same "universe unavailable" fallback
+        # path as a real 0/None reading.
+        universe = getattr(progress_after_start, "total_stocks", None)
+        timeout_seconds = _compute_discovery_scan_timeout_seconds(universe)
+
+        async def _poll_until_not_running() -> None:
+            while scanner.get_progress().status == ScanStatus.RUNNING:
+                await asyncio.sleep(_DISCOVERY_SCAN_POLL_INTERVAL_SECONDS)
+
+        try:
+            await asyncio.wait_for(
+                _poll_until_not_running(), timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[Coordinator] Discovery scan timed out after "
+                f"{timeout_seconds}s (universe={universe}) — proceeding "
+                "with EOD chain, promotion skipped for today"
+            )
+            try:
+                # FI-1: reason="timeout" -- this stop still follows the
+                # scan's own notify_progress preference (start_scan(mode=
+                # "discovery", notify_progress=False) above), it just isn't
+                # unconditionally suppressed the way an FE-initiated manual
+                # stop is.
+                await scanner.stop_scan(reason="timeout")
+            except Exception as e:
+                logger.warning(f"[Coordinator] Discovery scan stop_scan cleanup failed: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"[Coordinator] Discovery scan wait failed: {e}")
+            return False
+
+        status = scanner.get_progress().status
+        if status != ScanStatus.COMPLETED:
+            logger.warning(
+                f"[Coordinator] Discovery scan ended with status={status} "
+                "— promotion skipped for today"
+            )
+            return False
+        return True
+
+    async def _check_queue_on_market_open(self) -> None:
+        """One scheduler tick: process the queue on a KRX closed→open transition,
+        and expire tracked orders on the inverse open→closed transition (F3).
+        The open→closed edge ALSO writes the day's durable EOD performance
+        snapshot (Phase1 Task 5/C3b — see .eod_snapshot.write_daily_snapshot),
+        after the fill poll/expiry so it reflects the final post-close ka10076
+        fills, and then runs the Phase2 EOD review chain (regime snapshot +
+        per-agent calibration + review report + regime FK backfill — see
+        .eod_orchestrator.run_eod_review), which reads that snapshot row so
+        it MUST run after it exists.
+
+        start() already drains the queue if the market is open at start time; this
+        covers the case where the system is started (or a trade is queued) while
+        the market is closed and the market opens later. Only the EDGE triggers —
+        an already-open market is not re-processed every tick. The execution-time
+        re-gate (R5-P0) re-checks autonomy safety when each queued trade runs.
+
+        The open→closed edge is the local signal for "nothing placed today can
+        fill any further" — KRX limit orders are day-valid and there is no
+        broker push telling us the session ended, so every still-TRACKING order
+        is expired and notified once, on the edge only (mirrors the open-edge
+        guard so a closed market doesn't re-notify every tick).
+        """
+        is_open = self._market_hours.get_market_session(MarketType.KRX).is_open
+        if is_open and not self._market_was_open and self.get_trade_queue():
+            logger.info("[Coordinator] Market opened — processing queued trades")
+            await self.process_trade_queue()
+        elif not is_open and self._market_was_open:
+            # F3 review HIGH: poll BEFORE expiring — the post-close ka10076
+            # snapshot is final and includes closing-auction fills; expiring
+            # first would drop a fill that landed on this very edge.
+            await self._poll_tracked_fills()
+            await self._expire_tracked_orders_on_market_close()
+
+            # DS-5: discovery scan trigger, behind the DISCOVERY_ENABLED
+            # kill switch — spec §3 chain order. off (default) means this
+            # whole block, AND the run_discovery_pipeline block below, are
+            # never entered at all: the remaining 8-step chain immediately
+            # below is byte-identical to before this feature existed.
+            # Whole-block try/except mirrors every other EOD step's
+            # never-raise contract even though `_run_discovery_scan` is
+            # already internally never-raise — defense in depth per spec.
+            discovery_scan_ok = False
+            if get_settings().DISCOVERY_ENABLED:
+                try:
+                    discovery_scan_ok = await self._run_discovery_scan()
+                except Exception as e:
+                    logger.warning(f"[Coordinator] Discovery scan step failed: {e}")
+
+            await write_daily_snapshot(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # T5c: 마감 1회
+            await run_eod_review(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase2 T4: EOD 리뷰(레짐/캘리브레이션/리포트+FK 백필)
+            await run_strategy_consensus(self, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # Phase3: EOD 전략 합의(리뷰 소비→TradingStrategy 갱신+버전 영속; 타임아웃/실패는 내부 소유)
+            await wait_for_pending_trade_fill_writes()  # Minor 2 (final review): drain in-flight fire-and-forget record_trade_fill tasks (placement-time fills scheduled just above via _poll_tracked_fills/_apply_sell_fill) before the EOD reconciler reads kr_stock_trades — otherwise a write still in flight looks "missing" to the diff and gets spuriously re-appended.
+            await reconcile_trade_ledger(self._kiwoom, await get_storage_service(), datetime.now().strftime("%Y-%m-%d"))  # E1-5: EOD 원장 대사 백스톱(ka10076 vs kr_stock_trades diff upsert; never-raise, 포지션 미변경)
+
+            # DS-5: discovery post-processing (backfill -> rank -> LLM
+            # review -> promote -> ledger, DS-3/DS-4 batched by
+            # run_discovery_pipeline), AFTER reconcile_trade_ledger and
+            # BEFORE the final notify step so _notify_eod_summary can pick
+            # up today's freshly-promoted candidates (mirrors the existing
+            # Important-1 strategy-section freshness refresh below).
+            if get_settings().DISCOVERY_ENABLED:
+                try:
+                    await run_discovery_pipeline(
+                        coordinator=self,
+                        storage=await get_storage_service(),
+                        scanner=await get_background_scanner(),
+                        trade_date=datetime.now().strftime("%Y-%m-%d"),
+                        scan_ok=discovery_scan_ok,
+                    )
+                except Exception as e:
+                    logger.warning(f"[Coordinator] Discovery pipeline invocation failed: {e}")
+
+            await self._notify_eod_summary(datetime.now().strftime("%Y-%m-%d"))  # E3-3: 장마감 요약 통지(Telegram+WS) — run_eod_review가 저장한 digest/narrative 재조회
+        self._market_was_open = is_open
+
+    async def _notify_eod_summary(self, trade_date: str) -> bool:
+        """E3-3: best-effort Telegram + WS notification of the day's EOD
+        digest/narrative, appended after the market-close chain's other
+        steps (write_daily_snapshot -> run_eod_review -> run_strategy_
+        consensus -> reconcile_trade_ledger, all untouched/unreordered
+        above this call in `_check_queue_on_market_open`).
+
+        Re-reads the digest/narrative that run_eod_review's own E3-1/E3-2
+        steps just computed and persisted (report_json's "digest"/
+        "narrative" keys, via `storage.get_eod_reviews(limit=1)`) rather
+        than recomputing either. This is deliberate: `run_eod_review`'s
+        own return contract is a bare bool ("chain completed"), not the
+        report dict -- changing that contract would touch its own
+        docstring/every existing caller and test that already depends on
+        the bool shape, which is more invasive than one extra read of a
+        row this same market-close tick just wrote.
+
+        Never-raise (one try/except for the whole step), mirroring every
+        other EOD chain step above it (write_daily_snapshot/
+        run_eod_review/run_strategy_consensus/reconcile_trade_ledger all
+        document the same contract): a Telegram/WS delivery failure must
+        never break the market-close scheduler tick, especially not after
+        reconcile_trade_ledger already completed its ledger backstop work
+        this same tick.
+
+        Important 1 (final review) — strategy-section freshness: `digest`
+        is assembled INSIDE `run_eod_review` (its E3-2 step), which runs
+        BEFORE `run_strategy_consensus` in `_check_queue_on_market_open`'s
+        chain. So the `digest["strategy"]` section `run_eod_review` computed
+        and persisted always reflects the PRIOR revision, never the new one
+        `run_strategy_consensus` just wrote this same tick — every automatic
+        close-of-day notification and the persisted `eod_review` row itself
+        was permanently one revision stale (spec §3 T8 wants the strategy
+        section to reflect the SAME-DAY consensus). Since this function is
+        the chain's LAST step (called after `run_strategy_consensus` AND
+        `reconcile_trade_ledger`), it re-fetches the digest's strategy
+        section here — via the same `eod_digest._build_strategy_section`
+        helper `run_eod_review` itself calls, so the shape is identical —
+        and, if it changed, patches `report["digest"]["strategy"]` and
+        re-persists via `save_eod_review` (INSERT OR REPLACE on trade_date,
+        so this updates the SAME row in place rather than accreting a
+        duplicate). Deliberately NOT re-running `narrate_eod_digest`
+        (no second LLM call this tick): the narrative's prose may reference
+        the prior stance, but it is already framed as "익일 적용 전략(EOD
+        합의)" rather than "오늘의 전략", so a one-revision-old narrative
+        text remains factually harmless even though the structured
+        `strategy` section it will be templated/broadcast alongside is now
+        current — this residual gap is intentionally out of scope here.
+        Best-effort: a failure in this refresh (storage read/write) is
+        logged and the ORIGINAL (possibly stale) digest is still sent
+        rather than dropping the notification entirely.
+
+        Stale guard (review fix): `get_eod_reviews(limit=1)` returns the
+        newest row by trade_date regardless of whether TODAY's
+        run_eod_review actually wrote one this tick. If run_eod_review
+        failed before reaching `save_eod_review` (its own try/except
+        swallows the failure and returns False -- see its docstring), the
+        newest row on disk is still YESTERDAY's, and without this check
+        this step would silently re-send yesterday's digest/narrative
+        relabeled as today's. Comparing the row's own `trade_date` to the
+        `trade_date` this call was invoked with catches that mismatch and
+        skips the send entirely rather than notifying with stale content.
+
+        Returns (E3-4 review fix): True once delivery is actually attempted
+        (past every guard above, WS broadcast reached -- Telegram too, if
+        `notifier.is_ready`), False when a guard skipped the send (no row
+        yet / stale row / no digest) or the whole step raised. This is
+        purely additive: the market-close edge
+        (`_check_queue_on_market_open`) still calls this fire-and-forget
+        and ignores the return value entirely (see
+        tests/test_services/test_f3_fill_tracking.py's E3-3 section, which
+        pins that call site and never inspects a return value) -- the new
+        bool exists so `POST /trading/eod-report/run` (E3-4) can report
+        whether its manual re-notify actually went out.
+        """
+        try:
+            storage = await get_storage_service()
+            reviews = await storage.get_eod_reviews(limit=1)
+            if not reviews:
+                return False
+
+            row_trade_date = reviews[0].get("trade_date")
+            if row_trade_date != trade_date:
+                logger.warning(
+                    f"[Coordinator] eod_summary_stale_skipped — requested "
+                    f"trade_date={trade_date} latest_row_trade_date={row_trade_date}"
+                )
+                return False
+
+            report = json.loads(reviews[0].get("report_json") or "{}")
+            digest = report.get("digest")
+            if not digest:
+                return False
+            narrative = report.get("narrative")
+
+            # Important 1 (final review): refresh the strategy section AFTER
+            # run_strategy_consensus has had a chance to write a new
+            # revision this same tick — see docstring above. Best-effort:
+            # any failure here falls back to the (possibly stale) digest
+            # already loaded, never blocks the notification.
+            try:
+                fresh_strategy = await _build_strategy_section(storage)
+                if fresh_strategy is not None and fresh_strategy != digest.get("strategy"):
+                    digest["strategy"] = fresh_strategy
+                    report["digest"] = digest
+                    await storage.save_eod_review(
+                        {"trade_date": trade_date, "report_json": json.dumps(report)}
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[Coordinator] EOD digest strategy refresh failed: {e}"
+                )
+
+            # DS-5: same freshness fix as the strategy-section refresh just
+            # above, for the `discovery` section — run_discovery_pipeline
+            # (services/discovery/orchestrator.py, DS-3/DS-4 backfill/rank/
+            # LLM-review/promote batch) runs even LATER in the market-close
+            # chain than run_strategy_consensus does (after
+            # reconcile_trade_ledger, right before this notify step), so the
+            # digest run_eod_review originally built above almost always
+            # predates today's actual discovery results entirely (nothing
+            # promoted/backfilled yet at that point in the same tick).
+            # Best-effort, same contract: any failure here falls back to the
+            # digest already loaded, never blocks the notification.
+            #
+            # Critical (DS-5 review fix): explicitly gated on
+            # DISCOVERY_ENABLED, matching every other discovery call site in
+            # this file (the scan trigger above and the pipeline invocation
+            # below). Before this fix the block ran unconditionally every
+            # day — off happened to stay harmless only because the ledger
+            # table is empty (build_eod_digest's null-tolerant fallback), an
+            # accident of data state, not a contract: "off" must mean this
+            # code path is never entered at all, not "entered but its
+            # output happens to be a no-op today".
+            if get_settings().DISCOVERY_ENABLED:
+                try:
+                    fresh_discovery = await _build_discovery_section(storage, trade_date)
+                    if fresh_discovery is not None and fresh_discovery != digest.get("discovery"):
+                        digest["discovery"] = fresh_discovery
+                        report["digest"] = digest
+                        await storage.save_eod_review(
+                            {"trade_date": trade_date, "report_json": json.dumps(report)}
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[Coordinator] EOD digest discovery refresh failed: {e}"
+                    )
+
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_daily_summary(digest, narrative)
+
+                # Task 7 (2026-08-13): 시각(HTML) 장마감 리포트. `digest`에는
+                # fills/realized/strategy_revisions 키가 없다(실물 확인 —
+                # build_eod_digest는 trade_date/watch/account/holdings/
+                # strategy/regime/discovery 7개만 돌려준다) — 그래서
+                # digest.get(...)이 아니라 eod_digest의 전용 수집기 3개를
+                # storage에서 직접 불러 조립한다. never-raise 계약: 이
+                # 블록이 실패해도 위 텍스트 요약은 이미 나간 뒤이므로 EOD
+                # 체인·통지 자체를 죽이면 안 된다(테스트로 고정).
+                try:
+                    from services.reports import build_and_send_report
+
+                    await build_and_send_report(
+                        "postmarket",
+                        digest.get("trade_date") or trade_date,
+                        fills=await _build_postmarket_fills(storage, trade_date),
+                        realized=await _build_postmarket_realized(storage, trade_date),
+                        revisions=await _build_postmarket_revisions(storage, trade_date),
+                    )
+                except Exception as e:
+                    logger.warning(f"[Coordinator] EOD visual report failed: {e}")
+
+            from app.api.routes.websocket import broadcast_eod_summary
+
+            await broadcast_eod_summary(digest, narrative)
+            return True
+        except Exception as e:
+            logger.warning(f"[Coordinator] EOD summary notification failed: {e}")
+            return False
+
+    async def _expire_tracked_orders_on_market_close(self) -> None:
+        """F3: expire every still-TRACKING order on the open→closed edge and
+        notify once per order via the coordinator's normal alert path."""
+        expired = self.fill_tracker.expire_stale(today=None)
+        if not expired:
+            return
+
+        logger.info(f"[Coordinator] Market closed — expired {len(expired)} tracked orders")
+        self._log_activity(
+            ActivityType.MARKET_CLOSED,
+            f"장 마감 — 미체결 추적 주문 {len(expired)}건 만료 처리",
+            agent="system",
+        )
+        for order in expired:
+            remaining = order.total_quantity - order.filled_quantity
+            await self._on_alert(
+                TradingAlert(
+                    id=str(uuid.uuid4())[:8],
+                    alert_type=AlertType.ORDER_FAILED,
+                    ticker=order.ticker,
+                    title="미체결 주문 만료",
+                    message=(
+                        f"{order.stock_name or order.ticker} 잔량 {remaining}주 — "
+                        f"장 마감으로 추적 종료 (ord_no={order.ord_no})"
+                    ),
+                    data={"ord_no": order.ord_no, "remaining": remaining},
+                )
+            )
+        self._schedule_persist()
+
+    async def _poll_tracked_fills(self) -> None:
+        """One scheduler tick: reconcile TRACKING orders against ka10076 fills.
+
+        Skips the broker call entirely when nothing is TRACKING (flow-control —
+        this runs every 30s alongside the queue-open check). ka10076 returns a
+        cumulative daily snapshot per order, so `apply_fills` diffs it against
+        each order's own accumulated fill and returns only the NEW portion —
+        re-polling an unchanged snapshot is a no-op (idempotent). A query
+        failure is logged and left for the next tick; tracked state does not
+        change on failure.
+        """
+        if not self.fill_tracker.tracking():
+            return
+        if self._kiwoom is None:
+            return
+
+        try:
+            fills = await self._kiwoom.get_filled_orders(use_cache=False)
+        except Exception as e:
+            logger.error(f"[Coordinator] Fill tracker poll failed: {e}")
+            return
+
+        deltas = self.fill_tracker.apply_fills(fills)
+        if not deltas:
+            return
+
+        for delta in deltas:
+            order = delta.order
+
+            # P1-1: record this post-fill discovery for /trades. `quantity`
+            # is the tracked order's full requested size; `executed_quantity`
+            # is just the NEW portion this poll tick uncovered (delta), since
+            # a single order can surface several of these rows across ticks.
+            if self._persistence_active:
+                order_status = getattr(order.status, "value", order.status)
+                record_trade_fill(
+                    stk_cd=order.ticker,
+                    stk_nm=order.stock_name or order.ticker,
+                    side=order.side,
+                    order_type="limit",
+                    price=delta.avg_fill_price,
+                    quantity=order.total_quantity,
+                    executed_quantity=delta.new_fill_qty,
+                    status="completed" if order_status == "filled" else "partial",
+                    order_id=order.ord_no,
+                    session_id=order.source_session_id,
+                    decision_id=order.source_session_id,
+                    entry_or_exit="entry" if order.side == "buy" else "exit",
+                )
+
+            # Important 3 (최종 전체 브랜치 리뷰): 이 폴이 발견하는 체결은
+            # `_record_fill_ledger`를 거치지 않는다(원장 기록은 위에서
+            # `record_trade_fill`을 직접 부른다 — 중복 방지) — 그래서
+            # 지연 체결(placed_pending_fill → 나중에 이 폴이 발견)이 전부
+            # 무통지였다. 자율 손절/익절도 지연 체결될 수 있어 실질적이다.
+            # 안전성: 이 델타는 이번 틱에 새로 발견된 "증분"만이라 —
+            # placement 시점 통지(있었다면)와 절대 겹치지 않는다. `order`
+            # (TrackedOrder)/`delta`(FillDelta)에는 OrderRequest.reason이
+            # 없으므로 "사후 체결 확인"으로 명시해, 이게 즉시체결이 아니라
+            # 나중에 발견된 체결이라는 것 자체를 경로로 남긴다.
+            synthetic_order = OrderRequest(
+                ticker=order.ticker,
+                stock_name=order.stock_name or order.ticker,
+                side=order.side,
+                quantity=delta.new_fill_qty,
+                price=order.limit_price,
+                reason="사후 체결 확인",
+                session_id=order.source_session_id,
+            )
+            synthetic_result = OrderResult(
+                order_id=order.ord_no,
+                ticker=order.ticker,
+                side=synthetic_order.side,
+                # requested_quantity는 주문 전체 수량 — cumulative filled이
+                # 아직 total에 못 미치면 "(부분)" 표시가 정직하게 붙는다.
+                requested_quantity=order.total_quantity,
+                filled_quantity=delta.new_fill_qty,
+                avg_price=delta.avg_fill_price,
+                status="filled" if order.filled_quantity >= order.total_quantity else "partial",
+            )
+
+            # E1-2: a SELL's fill delta must NOT flow into
+            # register_fill_as_position below — that call only ever GROWS a
+            # position, so an unguarded sell fill here would double-count it
+            # as a buy. Instead, reconcile the local position via the same
+            # helper `_apply_sell_fill` uses (decrement/remove + realized
+            # P&L; the ledger row was already recorded above, side-aware).
+            if order.side == "sell":
+                # 실현손익은 포지션이 줄어들기/사라지기 전에 계산해야
+                # 진입가를 읽을 수 있다 — _apply_sell_fill과 같은 이유
+                # (coordinator.py의 realized-P&L 클램프 주석 참고).
+                _pos = next(
+                    (p for p in self._state.positions if p.ticker == order.ticker), None
+                )
+                _pnl = None
+                _pnl_pct = None
+                if _pos is not None and _pos.avg_price and delta.avg_fill_price:
+                    _matched_qty = min(int(delta.new_fill_qty), int(_pos.quantity))
+                    _pnl = (float(delta.avg_fill_price) - float(_pos.avg_price)) * _matched_qty
+                    _pnl_pct = (float(delta.avg_fill_price) / float(_pos.avg_price) - 1.0) * 100.0
+                self._schedule_fill_notification(
+                    synthetic_order, synthetic_result, side="sell",
+                    realized_pnl=_pnl, realized_pnl_pct=_pnl_pct,
+                )
+
+                self._apply_sell_position_delta(
+                    order.ticker,
+                    delta.new_fill_qty,
+                    delta.avg_fill_price,
+                    order.source_session_id,
+                )
+
+                self._log_activity(
+                    ActivityType.POSITION_CLOSED,
+                    f"사후 매도 체결: {order.stock_name or order.ticker} "
+                    f"{delta.new_fill_qty}주 @ ₩{delta.avg_fill_price:,.0f}",
+                    agent="order",
+                    ticker=order.ticker,
+                    details={
+                        "ord_no": order.ord_no,
+                        "new_fill_qty": delta.new_fill_qty,
+                        "avg_fill_price": delta.avg_fill_price,
+                    },
+                )
+
+                await self._on_alert(
+                    TradingAlert(
+                        id=str(uuid.uuid4())[:8],
+                        alert_type=AlertType.ORDER_FILLED,
+                        ticker=order.ticker,
+                        title="사후 매도 체결 감지",
+                        message=(
+                            f"{order.stock_name or order.ticker} "
+                            f"{delta.new_fill_qty}주 @ ₩{delta.avg_fill_price:,.0f} "
+                            "매도 체결 확인"
+                        ),
+                        data={
+                            "ord_no": order.ord_no,
+                            "new_fill_qty": delta.new_fill_qty,
+                            "avg_fill_price": delta.avg_fill_price,
+                        },
+                    )
+                )
+            else:
+                # Important 3: 지연 체결된 BUY(가장 흔한 사례 — LIMIT 주문이
+                # 3폴×0.5초 창을 넘겨 pending으로 등록된 뒤 나중에 이 폴이
+                # 체결을 발견)도 placement 시점엔 통지가 없었으므로(Critical 1
+                # 수정으로 이제 pending은 의도적으로 무통지) 여기서 반드시
+                # 알려야 그 루프가 닫힌다.
+                self._schedule_fill_notification(
+                    synthetic_order, synthetic_result, side="buy",
+                )
+
+                await register_fill_as_position(
+                    self,
+                    ticker=order.ticker,
+                    stock_name=order.stock_name or order.ticker,
+                    quantity=delta.new_fill_qty,
+                    avg_price=delta.avg_fill_price,
+                    stop_loss=order.stop_loss,
+                    take_profit=order.take_profit,
+                    session_id=order.source_session_id,
+                    source="fill_tracker",
+                    # Match the placement-fill path's position semantics
+                    # (stop_loss_mode from risk params, risk from the proposal).
+                    stop_loss_mode=self.risk_params.stop_loss_mode,
+                    risk_score=order.risk_score,
+                )
+
+                self._log_activity(
+                    ActivityType.POSITION_OPENED,
+                    f"사후 체결: {order.stock_name or order.ticker} {delta.new_fill_qty}주 "
+                    f"@ ₩{delta.avg_fill_price:,.0f}",
+                    agent="order",
+                    ticker=order.ticker,
+                    details={
+                        "ord_no": order.ord_no,
+                        "new_fill_qty": delta.new_fill_qty,
+                        "avg_fill_price": delta.avg_fill_price,
+                        "stop_loss": order.stop_loss,
+                    },
+                )
+
+                stop_note = (
+                    f" — 손절 ₩{order.stop_loss:,.0f} 감시 시작" if order.stop_loss else ""
+                )
+                await self._on_alert(
+                    TradingAlert(
+                        id=str(uuid.uuid4())[:8],
+                        alert_type=AlertType.ORDER_FILLED,
+                        ticker=order.ticker,
+                        title="사후 체결 감지",
+                        message=(
+                            f"{order.stock_name or order.ticker} {delta.new_fill_qty}주 "
+                            f"@ ₩{delta.avg_fill_price:,.0f} 체결 확인{stop_note}"
+                        ),
+                        data={
+                            "ord_no": order.ord_no,
+                            "new_fill_qty": delta.new_fill_qty,
+                            "avg_fill_price": delta.avg_fill_price,
+                        },
+                    )
+                )
+
+            # Post-fill queue annotation: the queue item that originated this
+            # order (if any) gets a note appended — its status vocabulary is
+            # unchanged (design spec §4.1/§7). Shared by both sides.
+            if order.source_queue_id:
+                queued = next(
+                    (
+                        t
+                        for t in self._state.trade_queue
+                        if t.id == order.source_queue_id
+                    ),
+                    None,
+                )
+                if queued is not None:
+                    queued.reason = (
+                        f"{queued.reason} | 사후체결 {delta.new_fill_qty}주 "
+                        f"@{delta.avg_fill_price:,.0f}"
+                    )
+
+        self._schedule_persist()
+
+    async def _queue_scheduler_loop(self) -> None:
+        """Periodically check for the market-open transition until stopped."""
+        try:
+            while True:
+                await asyncio.sleep(self._queue_scheduler_interval)
+                try:
+                    await self._check_queue_on_market_open()
+                    await self._poll_tracked_fills()
+                    self._reconcile_tick_count += 1
+                    if self._reconcile_tick_count % 2 == 0:
+                        await reconcile(self)
+                except Exception as e:
+                    logger.error(f"[Coordinator] Queue scheduler error: {e}")
+        except asyncio.CancelledError:
+            pass
 
     # -------------------------------------------
     # Watch List Management
@@ -1123,6 +4903,7 @@ class ExecutionCoordinator:
         analysis_summary: str = "",
         key_factors: Optional[List[str]] = None,
         risk_score: int = 5,
+        source: str = "manual",
     ) -> WatchedStock:
         """
         Add a stock to the watch list for monitoring.
@@ -1140,6 +4921,11 @@ class ExecutionCoordinator:
             analysis_summary: Brief summary of analysis
             key_factors: Key factors from analysis
             risk_score: Risk score (1-10)
+            source: Provenance tag (DS-4) — 'manual' (default, every
+                pre-existing call site) or 'discovery' (regime-weighted
+                ranking auto-promotion, services/discovery/ranker.py). Drives
+                the watch-total-cap eviction gate: only 'discovery' entries
+                are ever auto-evicted.
 
         Returns:
             WatchedStock object
@@ -1162,9 +4948,11 @@ class ExecutionCoordinator:
             existing.analysis_summary = analysis_summary
             existing.key_factors = key_factors or []
             existing.risk_score = risk_score
+            existing.source = source
             existing.last_checked = datetime.now()
 
             logger.info(f"[Coordinator] Watch list updated: {ticker}")
+            self._schedule_persist()
             return existing
 
         # Create new watch list entry
@@ -1181,6 +4969,7 @@ class ExecutionCoordinator:
             analysis_summary=analysis_summary,
             key_factors=key_factors or [],
             risk_score=risk_score,
+            source=source,
         )
 
         self._state.watch_list.append(watched)
@@ -1200,6 +4989,7 @@ class ExecutionCoordinator:
         )
 
         logger.info(f"[Coordinator] Added to watch list: {watched.id}")
+        self._schedule_persist()
         return watched
 
     def get_watch_list(self) -> List[WatchedStock]:
@@ -1221,8 +5011,38 @@ class ExecutionCoordinator:
                 )
 
                 logger.info(f"[Coordinator] Removed from watch list: {watch_id}")
+                self._schedule_persist()
                 return True
         return False
+
+    def remove_discovery_watch(self, ticker: str) -> bool:
+        """Remove the ACTIVE discovery-sourced (`source == 'discovery'`) watch
+        entry for `ticker`, if any (DS-4 watch-total-cap eviction gate).
+
+        Manual entries (`source != 'discovery'`, the default for every
+        pre-DS-4 call site) are never touched even if `ticker` matches —
+        `services/discovery/ranker.py::promote_candidates` relies on this to
+        protect user-added names when evicting the lowest-scoring discovery
+        candidate to stay under the 30-item watch-total cap. Reuses
+        `remove_from_watch_list`'s status-flip + activity-log + persist path
+        rather than duplicating it.
+
+        Returns:
+            True if a matching discovery-sourced ACTIVE entry was found and
+            removed, False otherwise (no match, or the only match is manual).
+        """
+        watched = next(
+            (
+                w for w in self._state.watch_list
+                if w.ticker == ticker
+                and w.status == WatchStatus.ACTIVE
+                and getattr(w, "source", "manual") == "discovery"
+            ),
+            None,
+        )
+        if watched is None:
+            return False
+        return self.remove_from_watch_list(watched.id)
 
     def convert_watch_to_queue(
         self,
@@ -1290,6 +5110,49 @@ class ExecutionCoordinator:
             None
         )
 
+    def mark_watch_converted(self, ticker: str) -> bool:
+        """Mark the active watch-list entry for `ticker` as CONVERTED.
+
+        Used by the autonomous agent-chat path (`ChatCoordinator._execute_trade`)
+        WITHOUT going through `convert_watch_to_queue` — that path calls
+        `on_trade_approved` directly, so without this call the watch entry
+        stayed ACTIVE forever. The periodic watch-list check
+        (`ChatCoordinator._check_watch_list`) could then re-detect the same
+        "opportunity" and start a duplicate discussion/execution on the same
+        ticker (P2 funnel-consolidation audit finding, 2026-07-14).
+
+        Callers MUST gate this on `on_trade_approved`'s actual outcome, not
+        merely on having attempted a decision: `on_trade_approved` has non-
+        exception outcomes where no trade actually results (daily trade
+        limit reached, portfolio sizing to <=0 shares, or an order placed
+        but the broker filled 0 shares) — call this only when a trade
+        genuinely executed or was queued (a real position/queue entry
+        resulted), otherwise the watch entry must stay ACTIVE so the
+        opportunity can be re-evaluated later (T2 review gap, 2026-07-14;
+        see `services.agent_chat.coordinator._trade_actually_resulted`).
+
+        Returns False (no-op) when there is no active watch entry for the
+        ticker — a decision can legitimately originate outside the watch list.
+        """
+        watched = self.get_watched_stock(ticker)
+        if watched is None:
+            return False
+
+        watched.status = WatchStatus.CONVERTED
+        watched.triggered_at = datetime.now()
+
+        self._log_activity(
+            ActivityType.WATCH_CONVERTED,
+            f"Watch list auto-converted by autonomous execution: {watched.ticker}",
+            agent="system",
+            ticker=ticker,
+            details={"watch_id": watched.id},
+        )
+
+        logger.info(f"[Coordinator] Watch list auto-converted: {watched.id}")
+        self._schedule_persist()
+        return True
+
     # -------------------------------------------
     # Strategy Management
     # -------------------------------------------
@@ -1307,10 +5170,11 @@ class ExecutionCoordinator:
         """
         self._strategy = strategy
 
-        if strategy:
-            # Create strategy engine with LLM provider (if available)
-            self._strategy_engine = StrategyEngine(strategy, llm_provider=None)
+        # Phase4: 전략 노브 -> 공유 RiskParameters in-place 매핑 (해제=기본값 복귀).
+        # allowlist/클램프/denylist는 strategy_apply.py — 게이트 필드는 불변.
+        risk_param_changes = apply_strategy_to_risk_params(strategy, self.risk_params)
 
+        if strategy:
             self._log_activity(
                 ActivityType.STRATEGY_CHANGED,
                 f"Strategy set: {strategy.name} ({strategy.risk_tolerance.value})",
@@ -1320,136 +5184,19 @@ class ExecutionCoordinator:
                     "preset": strategy.preset.value,
                     "risk_tolerance": strategy.risk_tolerance.value,
                     "trading_style": strategy.trading_style.value,
+                    "risk_param_changes": {k: [v[0], v[1]] for k, v in risk_param_changes.items()},
                 },
             )
 
             logger.info(f"[Coordinator] Strategy set: {strategy.name}")
         else:
-            self._strategy_engine = None
-
             self._log_activity(
                 ActivityType.STRATEGY_CHANGED,
                 "Strategy cleared",
                 agent="system",
+                details={
+                    "risk_param_changes": {k: [v[0], v[1]] for k, v in risk_param_changes.items()},
+                },
             )
 
             logger.info("[Coordinator] Strategy cleared")
-
-    def get_strategy_engine(self) -> Optional[StrategyEngine]:
-        """Get the strategy engine instance."""
-        return self._strategy_engine
-
-    async def evaluate_with_strategy(
-        self,
-        ticker: str,
-        stock_name: str,
-        analysis_results: dict,
-        current_price: float,
-    ) -> dict:
-        """
-        Evaluate a trade using the current strategy.
-
-        Args:
-            ticker: Stock ticker
-            stock_name: Stock name
-            analysis_results: Analysis results from agents
-            current_price: Current stock price
-
-        Returns:
-            Entry decision dict with action, confidence, etc.
-        """
-        if not self._strategy_engine:
-            return {
-                "action": "SKIP",
-                "confidence": 0,
-                "rationale": "No strategy configured",
-            }
-
-        # Prepare account info
-        account_info = {
-            "total_equity": self._state.account.total_equity,
-            "available_cash": self._state.account.available_cash,
-            "total_stock_value": self._state.account.total_stock_value,
-            "positions": [p.model_dump() for p in self._state.positions],
-        }
-
-        # Update strategy agent status - working
-        self._update_agent_status(
-            "strategy",
-            AgentStatus.WORKING,
-            task=f"Evaluating entry for {stock_name or ticker}",
-            processing_stock=ticker,
-            processing_stock_name=stock_name,
-            analysis_summary={
-                "technical": analysis_results.get("technical", {}).get("signal", "N/A"),
-                "fundamental": analysis_results.get("fundamental", {}).get("signal", "N/A"),
-                "sentiment": analysis_results.get("sentiment", {}).get("signal", "N/A"),
-                "risk": analysis_results.get("risk", {}).get("level", "N/A"),
-            } if analysis_results else None,
-        )
-
-        try:
-            decision = await self._strategy_engine.evaluate_entry(
-                ticker=ticker,
-                stock_name=stock_name,
-                analysis_results=analysis_results,
-                current_price=current_price,
-                account_info=account_info,
-            )
-
-            self._log_activity(
-                ActivityType.STRATEGY_EVALUATED,
-                f"Strategy evaluation: {decision.action} (confidence: {decision.confidence}%)",
-                agent="strategy",
-                ticker=ticker,
-                details={
-                    "action": decision.action,
-                    "confidence": decision.confidence,
-                    "rationale": decision.rationale,
-                    "key_factors": decision.key_factors,
-                },
-            )
-
-            # Update strategy agent status - completed
-            self._update_agent_status(
-                "strategy",
-                AgentStatus.IDLE,
-                action=f"Decided: {decision.action} ({decision.confidence}%)",
-                processing_stock=ticker,
-                processing_stock_name=stock_name,
-                trade_details={
-                    "action": decision.action,
-                    "confidence": decision.confidence,
-                    "entry_price": decision.entry_price,
-                    "stop_loss": decision.stop_loss,
-                    "take_profit": decision.take_profit,
-                },
-                last_result={
-                    "success": True,
-                    "message": decision.rationale,
-                },
-            )
-            self._complete_agent_task("strategy", success=True)
-
-            return decision.model_dump()
-
-        except Exception as e:
-            logger.error(f"[Coordinator] Strategy evaluation failed: {e}")
-            # Update strategy agent status - error
-            self._update_agent_status(
-                "strategy",
-                AgentStatus.ERROR,
-                error=str(e),
-                processing_stock=ticker,
-                processing_stock_name=stock_name,
-                last_result={
-                    "success": False,
-                    "message": f"Strategy evaluation error: {e}",
-                },
-            )
-            self._complete_agent_task("strategy", success=False)
-            return {
-                "action": "SKIP",
-                "confidence": 0,
-                "rationale": f"Strategy evaluation error: {e}",
-            }

@@ -14,11 +14,8 @@ import type { Position } from '@/types';
 import type { MarketType } from '@/store';
 
 // Helper to format currency based on market type
-function formatCurrency(value: number, marketType: MarketType): string {
-  if (marketType === 'kiwoom' || marketType === 'coin') {
-    return `₩${value.toLocaleString('ko-KR')}`;
-  }
-  return `$${value.toFixed(2)}`;
+function formatCurrency(value: number, _marketType: MarketType): string {
+  return `₩${value.toLocaleString('ko-KR')}`;
 }
 
 interface PositionCardProps {
@@ -26,7 +23,7 @@ interface PositionCardProps {
   marketType?: MarketType;
 }
 
-export function PositionCard({ position, marketType = 'stock' }: PositionCardProps) {
+export function PositionCard({ position, marketType = 'kiwoom' }: PositionCardProps) {
   const {
     ticker,
     quantity,

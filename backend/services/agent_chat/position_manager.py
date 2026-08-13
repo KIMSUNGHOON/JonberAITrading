@@ -6,7 +6,8 @@ Triggers agent discussions for position management decisions.
 """
 
 import asyncio
-from datetime import datetime, timedelta
+import json
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Optional, Callable, Any
 
@@ -17,6 +18,7 @@ from services.agent_chat.models import (
     MarketContext,
     DecisionAction,
 )
+from services.trading.market_hours import is_krx_open_cached
 
 logger = structlog.get_logger()
 
@@ -38,6 +40,7 @@ class PositionEventType(str, Enum):
     HOLDING_PERIOD_LONG = "holding_long"       # Position held for extended period
     VOLATILITY_SPIKE = "volatility_spike"      # Sudden volatility increase
     NEWS_IMPACT = "news_impact"                # News affecting position
+    STRATEGIC_REEVAL = "strategic_reeval"      # Periodic/price-change proactive re-judgment (P3)
 
 
 # Korean translations for position events
@@ -82,6 +85,11 @@ POSITION_EVENT_KOREAN = {
         "name": "뉴스 영향",
         "description": "관련 뉴스가 포지션에 영향을 줄 수 있습니다. 상황을 모니터링 해주세요.",
     },
+    PositionEventType.STRATEGIC_REEVAL: {
+        "name": "전략 재평가",
+        "description": "일정 시간 경과 또는 유의미한 가격 변동으로 포지션을 능동적으로 재평가합니다 "
+                        "(추가매수/축소/청산/유지를 다시 판단합니다).",
+    },
 }
 
 
@@ -91,6 +99,59 @@ def get_event_korean(event_type: PositionEventType) -> dict:
         "name": event_type.value,
         "description": "",
     })
+
+
+def event_notify_enabled(event_type) -> bool:
+    """이 이벤트를 폰으로 보낼지. 기본은 체결성 이벤트만이다.
+
+    `_notify_event`가 원래 게이트를 전혀 거치지 않아 트레일링 갱신 같은
+    저가치 알림이 스팸으로 나갔다(07-30 2시간에 13건).
+    """
+    try:
+        from services.telegram.config import get_telegram_config
+
+        raw = getattr(get_telegram_config(), "TELEGRAM_NOTIFY_EVENT_KINDS", "") or ""
+        allowed = {k.strip() for k in raw.split(",") if k.strip()}
+        value = getattr(event_type, "value", str(event_type))
+        return value in allowed
+    except Exception as e:
+        # 설정을 못 읽으면 막는다 — 스팸이 무통지보다 나쁘다는 결정. 다만
+        # 원인 없이 조용히 막으면 "의도된 무음"과 "설정 오류로 인한 무음"을
+        # 구별할 수 없으므로 리뷰 지적대로 흔적은 남긴다.
+        logger.warning("event_notify_gate_failed", error=str(e))
+        return False
+
+
+# Minor review fix (S-2): `_execute_close_position`/`_execute_reduce_position`
+# pass one of these `reason` strings through. Used by
+# `_fallback_to_discussion_on_hitl_deny` to label its reconstructed event
+# with the type that actually matches WHY the close/reduce was attempted,
+# instead of defaulting every non-take_profit reason to STOP_LOSS_HIT.
+# "agent_decision"/"agent_decision_reduce"/"agent_decision_reduce_partial"
+# (a plain discussion SELL/REDUCE, not a mechanical stop trigger) are
+# intentionally absent here -- they fall through to the caller's
+# STRATEGIC_REEVAL default.
+_EXIT_REASON_TO_EVENT_TYPE: Dict[str, PositionEventType] = {
+    "stop_loss": PositionEventType.STOP_LOSS_HIT,
+    "take_profit": PositionEventType.TAKE_PROFIT_HIT,
+}
+
+
+# 통지 광역화 최종 전체 브랜치 리뷰 Important 2: `_execute_close_position`/
+# `_execute_reduce_position`이 이미 갖고 있는 `reason` 상수를 체결 통지의
+# "경로"(source) 필드로 사람이 읽을 수 있게 매핑한다. 이전에는
+# `trading_coord._close_position`이 호출자와 무관하게 reason을
+# "User-initiated close"로 하드코딩해, 이 통지 아크가 드러내려던 07-24 자율
+# 손절·07-27 자율 익절 체결이 전부 폰에 "사람이 한 것"으로 표시됐다(스펙 A2가
+# 요구하는 자율/승인/방어청산 구분과 정반대). 알려지지 않은 reason은
+# "사람이 아니다"라는 사실만은 안전하게 보존해 "방어청산"으로 강등한다.
+_EXIT_REASON_TO_SOURCE_LABEL: Dict[str, str] = {
+    "stop_loss": "방어청산(손절)",
+    "take_profit": "방어청산(익절)",
+    "agent_decision": "자율(에이전트 합의)",
+    "agent_decision_reduce": "자율(에이전트 합의)",
+    "agent_decision_reduce_partial": "자율(에이전트 합의)",
+}
 
 
 class PositionAction(str, Enum):
@@ -129,9 +190,79 @@ class MonitoredPosition(BaseModel):
     last_check: datetime = Field(default_factory=datetime.now)
     last_discussion: Optional[datetime] = None
 
+    # Provenance (L3, 2026-07-19,
+    # docs/superpowers/specs/2026-07-19-decision-lineage-design.md Task L3):
+    # the durable agent_chat_decisions.id of the discussion that established
+    # this position's ENTRY, when one exists. Set once at add_position()
+    # time and never overwritten by a later merge/update (mirrors
+    # ExecutionCoordinator._add_position's analysis_session_id, whose own
+    # merge branch never touches it either once a position already exists).
+    # In-memory only (pydantic model, no schema/persistence needed here) — a
+    # broker-sync-discovered position (sync_from_account) has no discussion
+    # behind it, so this stays None. That is the normal, expected case (spec
+    # D2), not a gap.
+    entry_decision_id: Optional[str] = None
+
+    # Strategic re-evaluation tracking (P3, 2026-07-15,
+    # docs/superpowers/plans/2026-07-15-position-mgmt-execution.md). When
+    # this position was last proactively re-judged (interval OR
+    # price-change trigger — see PositionManager._check_strategic_reeval)
+    # and the price it was measured against. Seeded at add_position() time
+    # (monitoring-start baseline, so a freshly-synced position doesn't
+    # immediately fire) and reset every time a strategic re-eval fires.
+    last_reeval_at: Optional[datetime] = None
+    last_reeval_price: Optional[float] = None
+
     # Event tracking
     events_triggered: List[str] = Field(default_factory=list)
     discussion_count: int = 0
+
+    # Daily discussion-cap rollover (2026-08-04, third instance of the
+    # pattern in `agents/llm/router.py`'s `_maybe_reset_day()` /
+    # `services/trading/coordinator.py`'s `_maybe_reset_daily_trades()`).
+    # Which calendar day `discussion_count` currently belongs to. Nothing
+    # schedules a reset -- a long-running process that crosses midnight
+    # without restarting must still start counting fresh the next day, or
+    # `max_discussions_per_position` silently becomes permanent (2026-08-04
+    # live incident: 4/5 positions hit the cap ~12:53 and got zero strategic
+    # re-evaluation for the rest of the session). Every read/write site
+    # calls `PositionManager._maybe_reset_discussion_count(position)` first
+    # -- see that method's docstring for the full touch-point list and why,
+    # unlike the coordinator fix, there is no persist/restore leg to guard
+    # here (`discussion_count` is not persisted at all).
+    # `lambda: date.today()`, not the bare `date.today` bound method: the
+    # bound method resolves `datetime.date.today` once at class-definition
+    # time and is immune to `monkeypatch.setattr(position_manager, "date",
+    # ...)` in tests, whereas the lambda re-looks-up the module-level `date`
+    # name (LOAD_GLOBAL) on every call, matching how `_maybe_reset_
+    # discussion_count`'s own `date.today()` call already behaves.
+    discussion_count_date: date = Field(default_factory=lambda: date.today())
+
+    # Set once when an autonomous defensive close is blocked by the gate, so the
+    # human is notified once per denied episode instead of every monitor cycle
+    # (the *_HIT events are not de-duped). Reset when the gate next allows.
+    close_gate_denied_notified: bool = False
+
+    # 통지 광역화 Task 7 리뷰 Important 2: close_gate_denied_notified와 동일한
+    # 이유로 필요하다 — 유동성 캡에 막힌 종목은 토론 주기마다 ADD가 매번
+    # 0주로 클램프되므로, 래치 없이 매번 통지하면 캡을 초과 보유한 종목이
+    # 채널을 매 토론 주기마다 도배한다. 캡에 안 걸린 다음 시도에서 리셋.
+    liquidity_cap_blocked_notified: bool = False
+
+    # S-5 (survival discipline, 2026-07-19,
+    # docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2):
+    # timestamp of the FIRST tick this position's take-profit was reached
+    # (current_price >= take_profit) -- fire-once (a later tick where it's
+    # still true does NOT overwrite it) and never reset once set, even after
+    # price falls back below take_profit. Deliberately separate from the
+    # TAKE_PROFIT_HIT event, which intentionally keeps refiring every tick
+    # it's still true (existing semantics, unchanged by this task). Drives
+    # `_apply_take_profit_lock_in`'s breakeven+lock-in stop ratchet on a
+    # post-TP retracement. Included in the persisted stops overlay blob (see
+    # `_persist_stops`/`restore_stop_overlay`) so a restart mid-retracement
+    # doesn't forget a profit was ever reached; a pre-S-5 blob simply has no
+    # such key, which restores as None (backward compatible).
+    take_profit_reached_at: Optional[datetime] = None
 
     @property
     def unrealized_pnl(self) -> float:
@@ -201,17 +332,133 @@ class PositionManagerConfig(BaseModel):
     default_trailing_pct: float = 5.0
     trailing_activation_pct: float = 5.0  # Activate trailing after 5% gain
 
+    # S-5 (survival discipline, 2026-07-19,
+    # docs/superpowers/specs/2026-07-19-survival-discipline-design.md §2):
+    # fraction of the take-profit's profit distance above entry (avg_price)
+    # to lock in as a raised stop-loss once take_profit has been reached at
+    # least once and price has since retraced back below it. 0.3 = lock in
+    # 30% of the (take_profit - entry) gain, e.g. entry 70,000 / TP 77,000
+    # -> lock-in stop = 70,000 * (1 + 0.3 * 0.1) = 72,100.
+    trailing_lock_in_ratio: float = 0.3
+
     # Discussion limits
-    min_discussion_interval_minutes: int = 30
-    max_discussions_per_position: int = 5
+    min_discussion_interval_minutes: int = 15
+    max_discussions_per_position: int = 8
+
+    # Discussion timeout bound (2026-08-04). `_trigger_discussion` awaits
+    # `start_manual_discussion(..., wait=True)` inline with no timeout, and
+    # that chain is the ONLY thing standing between `_monitor_loop` and the
+    # next check cycle -- one slow discussion stalls monitoring for every
+    # position, not just the one being discussed. Measured live: discussions
+    # averaged 262s (median 217s, max 651s), and the loop was blocked ~40%
+    # of a session.
+    #
+    # 600, not 900: 900 equals min_discussion_interval_minutes (15min) in
+    # seconds, so it would collide with that cooldown boundary, AND today's
+    # observed maximum was 651s -- 900 would never have fired against real
+    # data. 600 would have cut exactly one of today's 39 position
+    # discussions, bounding the worst-case monitoring stall at ~10 minutes
+    # instead of unbounded.
+    discussion_timeout_seconds: float = Field(
+        default=600,
+        gt=0,
+        description="Max seconds to wait for a triggered agent discussion "
+                     "(_trigger_discussion -> start_manual_discussion("
+                     "wait=True)) before giving up via asyncio.wait_for and "
+                     "resuming position monitoring.",
+    )
 
     # Holding period
     long_holding_days: int = 30
 
-    # Auto-execution settings
-    auto_execute_stop_loss: bool = False
+    # Auto-execution settings.
+    #
+    # S-2 (survival discipline, spec docs/superpowers/specs/
+    # 2026-07-19-survival-discipline-design.md §2, decision D1):
+    # auto_execute_stop_loss now defaults to True — a stop-loss is never
+    # optional risk reduction, so an AUTONOMOUS account must not silently
+    # sit at a breached stop waiting for a human click. This is safe for a
+    # HITL account too: the autonomy gate re-checked inside
+    # `_execute_close_position`/`_execute_reduce_position` denies with
+    # check="market_mode" whenever the account isn't actually autonomous,
+    # and that specific denial now falls back to the SAME agent-discussion
+    # path pre-S-2 HITL behavior used (see `_execute_close_position`'s deny
+    # branch) — so HITL accounts keep getting a debate + notification, not
+    # silence. auto_execute_take_profit stays False (decision D2 —
+    # profit-taking remains discussion-gated, unchanged).
+    auto_execute_stop_loss: bool = True
     auto_execute_take_profit: bool = False
     auto_update_trailing: bool = True
+
+    # ADD (increase) sizing policy (P2, 2026-07-15,
+    # docs/superpowers/plans/2026-07-15-position-mgmt-execution.md). An
+    # autonomous decision to ADD to an already-held position sizes the buy
+    # as a percentage of the CURRENTLY held quantity —
+    # round(held_quantity * add_position_pct) — rather than trusting a
+    # free-text quantity from the discussion. Conservative default: at most
+    # a quarter of the current holding per ADD decision (mirrors the
+    # conservatism of max_single_position_pct=0.15 and the 8% default
+    # stop/take distances in services.trading.models.RiskParameters).
+    add_position_pct: float = Field(
+        default=0.25,
+        ge=0.0, le=1.0,
+        description="Fraction of the currently held quantity to buy on an "
+                     "autonomous ADD decision (e.g. 0.25 = add 25% of "
+                     "current holding). 0 disables autonomous ADD sizing.",
+    )
+
+    # Strategic re-evaluation trigger (P3, 2026-07-15,
+    # docs/superpowers/plans/2026-07-15-position-mgmt-execution.md Task P3).
+    # The 30s loop above only reacts to DEFENSIVE conditions (stop/take
+    # proximity, big P&L swings, long holding). Without this, a held
+    # position is never proactively re-judged for ADD/REDUCE — it's only
+    # ever reacted to. When NO defensive event fires this cycle, a position
+    # becomes due for a STRATEGIC_REEVAL event (see
+    # PositionManager._check_strategic_reeval) once EITHER: enough
+    # wall-clock time has passed since its last re-eval, OR its price has
+    # moved enough since that re-eval's price baseline. STRATEGIC_REEVAL
+    # then flows through the SAME min_discussion_interval_minutes /
+    # max_discussions_per_position throttle as defensive events, so this
+    # bounds LLM-discussion volume/cost exactly like the existing events do
+    # — it does not bypass or duplicate that throttle.
+    #
+    # 30 -> 49 (2026-08-05, live incident on both 2026-08-04 and
+    # 2026-08-05): at 30 minutes, max_discussions_per_position's 8-per-day
+    # budget is exhausted 240 minutes after open -- ALL five held positions
+    # hit 8/8 by 12:55:50 today and then got ZERO strategic re-evaluation
+    # for the remaining 2h35m to the 15:30 close, while the watch-list
+    # control group (not subject to this per-position cap) kept being
+    # discussed all afternoon. Not an LLM failure, not throughput -- purely
+    # the interval front-loading the fixed daily budget into the morning.
+    # 49 is chosen so 8 * 49 = 392 minutes spans (with margin) the full
+    # 390-minute KRX session, spreading the same eight re-evaluations
+    # across the whole day instead of burning them by lunch. Total
+    # discussion volume, and therefore LLM cost, is unchanged ($0.088/
+    # discussion measured 2026-08-05) -- only the spacing changes. Does not
+    # collide with min_discussion_interval_minutes (15) or
+    # discussion_timeout_seconds (600s = 10min), both well below it. See
+    # TestStrategicReevalConfig::test_daily_cap_cannot_exhaust_before_
+    # session_close, which pins this cap-vs-session-length invariant
+    # instead of the raw number.
+    reeval_interval_minutes: int = Field(
+        default=49,
+        ge=1,
+        description="Minutes since a position's last strategic re-eval "
+                     "before it becomes due again (periodic trigger). Must "
+                     "satisfy max_discussions_per_position * "
+                     "reeval_interval_minutes >= the KRX session length "
+                     "(390 minutes) or the daily discussion cap exhausts "
+                     "before close -- see the comment above and "
+                     "TestStrategicReevalConfig in test_position_manager.py.",
+    )
+    reeval_price_change_pct: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="Absolute price move (%) from the last re-eval's price "
+                     "baseline that makes a position due for strategic "
+                     "re-eval immediately, independent of the interval "
+                     "timer (change-based trigger).",
+    )
 
 
 # -------------------------------------------
@@ -254,12 +501,32 @@ class PositionManager:
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
+        # Stop-persistence single-writer state (T7 review C1). One DB write at
+        # a time; stale scheduled writes dropped by generation; identical
+        # payloads skipped. See _persist_stops.
+        self._persist_lock = asyncio.Lock()
+        self._persist_generation = 0
+        self._last_persisted_payload: Optional[str] = None
+
         # Callbacks
         self._on_event_callbacks: List[Callable] = []
         self._on_decision_callbacks: List[Callable] = []
 
         # Chat coordinator reference (set by coordinator)
         self._chat_coordinator = None
+
+        # Discussion-timeout notification latch (2026-08-04) -- dedups
+        # repeated Telegram alerts for the same ticker while it keeps timing
+        # out. Instance-scoped (unlike coordinator._alert_llm_failure's
+        # module-global set): a discussion timeout is intrinsically
+        # per-position, not a shared cause many tickers hit at once, and
+        # instance scope means a fresh PositionManager() in tests starts
+        # clean with no manual latch-clear needed between tests.
+        self._discussion_timeout_notified: set = set()
+
+        # E2-1: market-gate last-known state, for the transition-only log
+        # helper below (None = not yet observed this process).
+        self._market_gate_closed: Optional[bool] = None
 
         logger.info(
             "position_manager_initialized",
@@ -324,6 +591,7 @@ class PositionManager:
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
+        entry_decision_id: Optional[str] = None,
     ) -> MonitoredPosition:
         """
         Add a position to monitor.
@@ -337,6 +605,10 @@ class PositionManager:
             stop_loss: Stop-loss price
             take_profit: Take-profit price
             trailing_stop_pct: Trailing stop percentage
+            entry_decision_id: durable agent_chat_decisions.id that decided
+                this entry (L3) — optional, defaults to None so every
+                existing call site (sync_from_account, direct test/manual
+                calls) is byte-for-byte unchanged.
 
         Returns:
             Created MonitoredPosition
@@ -350,11 +622,20 @@ class PositionManager:
             stop_loss=stop_loss,
             take_profit=take_profit,
             trailing_stop_pct=trailing_stop_pct,
+            entry_decision_id=entry_decision_id,
             highest_price=current_price or avg_price,
             lowest_price=current_price or avg_price,
+            # Strategic re-eval baseline starts at monitoring-start (P3) —
+            # NOT None — so a position that just began being monitored
+            # (fresh entry, or re-synced from the broker on restart) doesn't
+            # immediately count as "due" and fire a re-eval discussion on
+            # the very next 30s tick.
+            last_reeval_at=datetime.now(),
+            last_reeval_price=current_price or avg_price,
         )
 
         self._positions[ticker] = position
+        self._schedule_persist_stops()
 
         logger.info(
             "position_added",
@@ -371,12 +652,26 @@ class PositionManager:
         self,
         ticker: str,
         quantity: Optional[int] = None,
+        avg_price: Optional[float] = None,
         current_price: Optional[float] = None,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
         trailing_stop_pct: Optional[float] = None,
+        trailing_stop_price: Optional[float] = None,
+        entry_decision_id: Optional[str] = None,
     ) -> Optional[MonitoredPosition]:
-        """Update a monitored position."""
+        """Update a monitored position.
+
+        ``avg_price`` (P2, 2026-07-15): distinct from ``current_price`` — the
+        cost basis. 원가 단일화 아크(2026-07-31) 이후로는 더 이상 ADD의
+        가중평균 merge(`_execute_add_position`) 혼자 이 인자를 넘기지 않는다
+        — 지금은 넷이다: ADD 외에 체결 미러의 merge 분기
+        (`position_registration.register_fill_as_position`), 브로커 대사
+        (`reconciler._fix_positions`), 그리고 `sync_from_account`의 기존
+        포지션 갱신 분기. 넷 다 "관측된 새 원가로 절대 치환"이라는 동일
+        의미로 이 인자를 쓴다 — 증분 합산이 필요하면(ADD·체결 미러처럼)
+        호출부가 미리 가중평균을 계산해서 넘긴다.
+        """
         if ticker not in self._positions:
             return None
 
@@ -384,6 +679,9 @@ class PositionManager:
 
         if quantity is not None:
             position.quantity = quantity
+
+        if avg_price is not None:
+            position.avg_price = avg_price
 
         if current_price is not None:
             position.current_price = current_price
@@ -401,7 +699,18 @@ class PositionManager:
         if trailing_stop_pct is not None:
             position.trailing_stop_pct = trailing_stop_pct
 
+        if trailing_stop_price is not None:
+            # S-5 bug fix: previously `_check_trailing_stop` assigned this
+            # attribute directly, bypassing this method entirely (and thus
+            # `_schedule_persist_stops`). Now routed through here like every
+            # other stop-level field.
+            position.trailing_stop_price = trailing_stop_price
+
+        if entry_decision_id is not None:
+            position.entry_decision_id = entry_decision_id
+
         position.last_check = datetime.now()
+        self._schedule_persist_stops()
 
         return position
 
@@ -409,17 +718,37 @@ class PositionManager:
         """Remove a position from monitoring."""
         if ticker in self._positions:
             del self._positions[ticker]
+            self._schedule_persist_stops()
+            # Review fix (2026-08-04): `_discussion_timeout_notified` is
+            # ticker-keyed and was only ever cleared by that SAME ticker's
+            # next successful discussion. Without this, sell -> re-buy the
+            # same ticker inherits the old position's latch state -- the new
+            # position's first timeout would be silently deduped against an
+            # alert that was actually about a completely different holding.
+            self._discussion_timeout_notified.discard(ticker)
             logger.info("position_removed", ticker=ticker)
             return True
         return False
 
     def get_position(self, ticker: str) -> Optional[MonitoredPosition]:
         """Get a specific position."""
-        return self._positions.get(ticker)
+        position = self._positions.get(ticker)
+        # Backs GET /positions/{ticker} -- an external read of
+        # `discussion_count` can be the day's first touch for this
+        # position, so the rollover must run here too (see
+        # `_maybe_reset_discussion_count`'s docstring).
+        if position is not None:
+            self._maybe_reset_discussion_count(position)
+        return position
 
     def get_all_positions(self) -> List[MonitoredPosition]:
         """Get all monitored positions."""
-        return list(self._positions.values())
+        positions = list(self._positions.values())
+        # Backs GET /positions (and get_summary()) -- same reasoning as
+        # get_position above, for every position in the list.
+        for position in positions:
+            self._maybe_reset_discussion_count(position)
+        return positions
 
     # -------------------------------------------
     # Monitoring Loop
@@ -437,16 +766,48 @@ class PositionManager:
                 logger.error("position_monitor_error", error=str(e))
                 await asyncio.sleep(5)
 
+    def _log_market_gate_once(self, closed: bool) -> None:
+        """Log a market-gate state transition once (E2-1) — never every
+        cycle. Small per-file helper shared by this file's two gate points
+        (_check_all_positions, _check_strategic_reeval); duplicated in
+        coordinator.py by design — YAGNI, not worth a shared util."""
+        if self._market_gate_closed == closed:
+            return
+        self._market_gate_closed = closed
+        if closed:
+            logger.info("market_gate_closed", component="position_manager")
+        else:
+            logger.info("market_gate_reopened", component="position_manager")
+
     async def _check_all_positions(self) -> None:
         """Check all positions for events."""
+        # E2: 장외에는 자동 토론/감시 사이클 전체를 쉬게 한다(완전 idle 결정).
+        # 방어 감시(손절/익절 등) 포함 전체 skip — 장외엔 체결 불가라 안전.
+        if not is_krx_open_cached():
+            self._log_market_gate_once(closed=True)
+            return
+        self._log_market_gate_once(closed=False)
+
         if not self._positions:
             return
 
-        # Update prices first
-        await self._update_prices()
+        # Update prices first. get_kr_stock_info now returns None on any
+        # fetch failure instead of a fabricated random-mock price (CRITICAL
+        # safety fix, 2026-07-14) — stale_tickers collects positions whose
+        # price could NOT be refreshed this cycle, so the stop-loss/take-
+        # profit check below is skipped for them rather than evaluated
+        # against a random number that could trigger a real defensive sell.
+        stale_tickers = await self._update_prices()
 
         # Check each position
         for ticker, position in list(self._positions.items()):
+            if ticker in stale_tickers:
+                logger.warning(
+                    "position_check_skipped_stale_price",
+                    ticker=ticker,
+                    current_price=position.current_price,
+                )
+                continue
             try:
                 await self._check_position(position)
             except Exception as e:
@@ -456,8 +817,16 @@ class PositionManager:
                     error=str(e),
                 )
 
-    async def _update_prices(self) -> None:
-        """Update current prices for all positions."""
+    async def _update_prices(self) -> set:
+        """Update current prices for all positions.
+
+        Returns the set of tickers whose price could NOT be refreshed this
+        cycle (get_kr_stock_info returned None/incomplete data, i.e. a real
+        fetch failure — never a fabricated mock price since the 2026-07-14
+        CRITICAL fix). Callers must skip stop-loss/take-profit evaluation
+        for those tickers this cycle and keep the last known price.
+        """
+        stale: set = set()
         try:
             from agents.tools.kr_market_data import get_kr_stock_info
 
@@ -467,15 +836,25 @@ class PositionManager:
                     if info and "cur_prc" in info:
                         new_price = info["cur_prc"]
                         self.update_position(ticker, current_price=new_price)
+                    else:
+                        stale.add(ticker)
+                        logger.warning(
+                            "price_update_stale",
+                            ticker=ticker,
+                            reason="fetch_returned_none_or_incomplete",
+                        )
                 except Exception as e:
+                    stale.add(ticker)
                     logger.warning(
                         "price_update_failed",
                         ticker=ticker,
                         error=str(e),
                     )
         except ImportError:
-            # Fallback: prices not updated
-            pass
+            # Fallback: prices not updated for anyone this cycle.
+            stale.update(self._positions.keys())
+
+        return stale
 
     async def _check_position(self, position: MonitoredPosition) -> None:
         """Check a single position for events."""
@@ -512,22 +891,43 @@ class PositionManager:
             )
 
             if tp_distance_pct <= 0:
-                # Take-profit hit
+                # Take-profit hit. Auto-execution stays OFF here
+                # (auto_execute_take_profit defaults False, decision D2,
+                # unchanged by S-5) -- this is a pure bookkeeping mark, not
+                # an execution trigger. Fire-once (S-5): an already-set
+                # timestamp is left alone, even though the *_HIT event below
+                # intentionally keeps refiring every tick this stays true
+                # (existing semantics -- spec §1).
+                if position.take_profit_reached_at is None:
+                    position.take_profit_reached_at = datetime.now()
+
                 events.append(self._create_event(
                     position, PositionEventType.TAKE_PROFIT_HIT,
                     position.take_profit,
                     f"익절가 도달: ₩{position.current_price:,.0f} >= ₩{position.take_profit:,.0f}",
                     auto_execute=self.config.auto_execute_take_profit,
                 ))
-            elif tp_distance_pct <= self.config.take_profit_warning_pct:
-                # Approaching take-profit
-                if PositionEventType.TAKE_PROFIT_NEAR.value not in position.events_triggered:
-                    events.append(self._create_event(
-                        position, PositionEventType.TAKE_PROFIT_NEAR,
-                        tp_distance_pct,
-                        f"익절가 근접: {tp_distance_pct:.1f}% 거리",
-                    ))
-                    position.events_triggered.append(PositionEventType.TAKE_PROFIT_NEAR.value)
+            else:
+                if tp_distance_pct <= self.config.take_profit_warning_pct:
+                    # Approaching take-profit
+                    if PositionEventType.TAKE_PROFIT_NEAR.value not in position.events_triggered:
+                        events.append(self._create_event(
+                            position, PositionEventType.TAKE_PROFIT_NEAR,
+                            tp_distance_pct,
+                            f"익절가 근접: {tp_distance_pct:.1f}% 거리",
+                        ))
+                        position.events_triggered.append(PositionEventType.TAKE_PROFIT_NEAR.value)
+
+                # S-5: profit-lock trailing after a take-profit retracement.
+                # `tp_distance_pct > 0` here means current_price < take_profit
+                # -- once take_profit has been reached at least once
+                # (take_profit_reached_at set), every tick it stays below TP
+                # is a candidate to ratchet the stop up toward
+                # breakeven+lock-in. This only ever raises the STOP; it never
+                # sells -- profit-taking EXECUTION stays discussion-gated
+                # (D2/auto_execute_take_profit unchanged).
+                if position.take_profit_reached_at is not None:
+                    self._apply_take_profit_lock_in(position, events)
 
         # Check significant gain/loss
         pnl_pct = position.unrealized_pnl_pct
@@ -573,9 +973,189 @@ class PositionManager:
                 ))
                 position.events_triggered.append(PositionEventType.HOLDING_PERIOD_LONG.value)
 
+        # Strategic re-evaluation trigger (P3, 2026-07-15,
+        # docs/superpowers/plans/2026-07-15-position-mgmt-execution.md Task
+        # P3). Everything above is DEFENSIVE — it reacts to a threat that's
+        # already crystallizing. This is the proactive counterpart: only
+        # when NOTHING defensive fired this cycle do we check whether the
+        # position is due for a periodic/change-based strategic re-judgment
+        # (ADD/REDUCE/HOLD/SELL), so one tick never double-triggers both a
+        # defensive AND a strategic discussion (dedup — the defensive event
+        # takes priority; the throttle below still bounds cross-tick
+        # firing).
+        if not events:
+            reeval_event = self._check_strategic_reeval(position)
+            if reeval_event:
+                events.append(reeval_event)
+
         # Process events
         for event in events:
             await self._handle_event(event, position)
+
+    def _check_strategic_reeval(self, position: MonitoredPosition) -> Optional[PositionEvent]:
+        """Return a STRATEGIC_REEVAL event if `position` is due for a
+        proactive strategic re-evaluation, else None (P3).
+
+        Hybrid OR trigger: due once EITHER enough wall-clock time has
+        passed since the last re-eval (``reeval_interval_minutes``), OR the
+        price has moved far enough from the last re-eval's price baseline
+        (``reeval_price_change_pct``). Only ever called from
+        `_check_position` when no defensive event fired this cycle.
+
+        The returned event flows through the exact same
+        `_handle_event` -> `_should_trigger_discussion` -> `_trigger_discussion`
+        -> `_apply_decision` chain the defensive events already use, so the
+        resulting ADD/REDUCE/HOLD/SELL decision reaches the SAME real,
+        gated execution paths (P0/P1/P2) — this method only decides
+        WHETHER a re-eval discussion is due, never how it executes.
+
+        The time/price baseline is reset here, at detection time,
+        regardless of whether the downstream discussion throttle
+        (`_should_trigger_discussion`) ends up allowing an actual
+        discussion this cycle. Otherwise a throttled position would
+        re-detect "due" on every single 30s monitor tick until the throttle
+        window passes — spamming the event log/Telegram once per
+        `check_interval_seconds` instead of once per
+        `reeval_interval_minutes`/price-move, and burning the interval
+        immediately rather than preserving it for the next attempt.
+        """
+        # E2: 장외에는 자동 토론/감시 사이클 전체를 쉬게 한다(완전 idle 결정).
+        if not is_krx_open_cached():
+            self._log_market_gate_once(closed=True)
+            return None
+        self._log_market_gate_once(closed=False)
+
+        now = datetime.now()
+
+        interval_due = (
+            position.last_reeval_at is None
+            or (now - position.last_reeval_at)
+            >= timedelta(minutes=self.config.reeval_interval_minutes)
+        )
+
+        price_change_pct = 0.0
+        price_due = False
+        if position.last_reeval_price:
+            price_change_pct = (
+                abs(position.current_price - position.last_reeval_price)
+                / position.last_reeval_price
+                * 100
+            )
+            price_due = price_change_pct >= self.config.reeval_price_change_pct
+
+        if not (interval_due or price_due):
+            return None
+
+        if price_due:
+            message = (
+                f"전략 재평가(가격변동): {price_change_pct:.1f}% 변동 "
+                f"(기준 ₩{position.last_reeval_price:,.0f} → "
+                f"현재 ₩{position.current_price:,.0f})"
+            )
+            trigger_value = price_change_pct
+        else:
+            elapsed_minutes = (
+                (now - position.last_reeval_at).total_seconds() / 60
+                if position.last_reeval_at is not None else 0.0
+            )
+            message = f"전략 재평가(주기): 마지막 재평가 이후 {elapsed_minutes:.0f}분 경과"
+            trigger_value = elapsed_minutes
+
+        # Reset baseline NOW (see docstring) — before the event even reaches
+        # _handle_event/the discussion throttle.
+        position.last_reeval_at = now
+        position.last_reeval_price = position.current_price
+
+        return self._create_event(
+            position,
+            PositionEventType.STRATEGIC_REEVAL,
+            trigger_value,
+            message,
+        )
+
+    def _apply_take_profit_lock_in(
+        self, position: MonitoredPosition, events: List[PositionEvent]
+    ) -> None:
+        """Ratchet the stop-loss up to a breakeven+lock-in level after a
+        take-profit retracement (S-5, docs/superpowers/specs/
+        2026-07-19-survival-discipline-design.md §2 D2/S-5).
+
+        Only meaningful once `position.take_profit_reached_at` is set (the
+        caller in `_check_position` already gates on that) -- current price
+        being below take_profit is the caller's other precondition. Computes:
+
+            new_stop = max(current stop_loss, entry * (1 + lock_in_ratio * (tp - entry) / entry))
+
+        i.e. locks in `trailing_lock_in_ratio` (default 30%) of the take
+        profit's gain distance above the entry price (avg_price) -- never
+        below the position's CURRENT stop (the `max()`: a stop this hook, or
+        anything else, has already raised can never be lowered by it).
+
+        Routed through `update_position` so both `_stops_sane` (reject an
+        insane level outright rather than apply it -- mirrors the
+        `_apply_decision` HOLD/ADD stop-adjustment path) and
+        `_schedule_persist_stops` (survive a restart) apply -- the SAME fix
+        applied to `_check_trailing_stop` below for the pre-existing
+        trailing stop, which had the identical direct-assignment bug.
+
+        No-op guarded: recomputes to the exact same value every tick the
+        retracement condition holds (it only depends on avg_price/
+        take_profit/config, never on the fluctuating current_price), so once
+        applied this returns immediately on every subsequent tick without
+        calling `update_position` (and rescheduling a persist) again.
+
+        Observability (G-3, spec docs/superpowers/specs/
+        2026-07-20-gap-discipline-design.md §2): a successful ratchet logs
+        `take_profit_lock_in_applied` and appends a TRAILING_STOP_UPDATE
+        event into the caller's `events` list -- the SAME event type and
+        `requires_discussion=False` convention `_check_trailing_stop` below
+        already uses for its own stop-loss raise (this hook is the
+        semantically identical "raise the stop, never sell" ratchet, just
+        triggered by a take-profit retracement instead of a new high). No
+        new PositionEventType needed; the message text is what
+        distinguishes a lock-in raise from a %-trailing raise in event
+        history/notifications.
+        """
+        if position.avg_price <= 0 or position.take_profit is None:
+            return
+
+        profit_distance_ratio = (
+            (position.take_profit - position.avg_price) / position.avg_price
+        )
+        lock_in_price = position.avg_price * (
+            1 + self.config.trailing_lock_in_ratio * profit_distance_ratio
+        )
+
+        current_stop = position.stop_loss if position.stop_loss is not None else 0.0
+        new_stop = max(current_stop, lock_in_price)
+
+        if new_stop == position.stop_loss:
+            return  # nothing would change -- skip the update_position round-trip
+
+        if not self._stops_sane(position.current_price, new_stop, None):
+            logger.warning(
+                "take_profit_lock_in_rejected",
+                ticker=position.ticker,
+                candidate_stop=new_stop,
+                current_price=position.current_price,
+            )
+            return
+
+        self.update_position(position.ticker, stop_loss=new_stop)
+
+        logger.info(
+            "take_profit_lock_in_applied",
+            ticker=position.ticker,
+            old_stop=current_stop,
+            new_stop=new_stop,
+        )
+
+        events.append(self._create_event(
+            position, PositionEventType.TRAILING_STOP_UPDATE,
+            new_stop,
+            f"익절 후 락인 스탑 상향: ₩{current_stop:,.0f} → ₩{new_stop:,.0f}",
+            requires_discussion=False,
+        ))
 
     async def _check_trailing_stop(
         self,
@@ -595,11 +1175,38 @@ class PositionManager:
             new_trailing_price > position.trailing_stop_price
         ):
             old_price = position.trailing_stop_price
-            position.trailing_stop_price = new_trailing_price
 
-            # Also update stop-loss if trailing stop is higher
-            if position.stop_loss is None or new_trailing_price > position.stop_loss:
-                position.stop_loss = new_trailing_price
+            # S-5 bug fix (docs/superpowers/specs/
+            # 2026-07-19-survival-discipline-design.md §1/§2): both of these
+            # used to be direct attribute assignments
+            # (`position.trailing_stop_price = ...` / `position.stop_loss =
+            # ...`), bypassing BOTH the `_stops_sane` sanity gate AND
+            # `_schedule_persist_stops` -- a raised trailing stop-loss
+            # silently vanished on the next restart. Routed through
+            # `update_position` now, mirroring the `_apply_decision`
+            # stop-setting path (~L1827/`_apply_take_profit_lock_in` above).
+            # `trailing_stop_price` is a pure internal tracking value (not a
+            # live order level), so it always updates on this branch same as
+            # before; the actual stop_loss raise is additionally
+            # sanity-gated -- if the current price has already fallen
+            # through the computed level, the raise is skipped (existing
+            # stop_loss kept) rather than creating an immediate
+            # stop_loss_hit spin.
+            update_kwargs: Dict[str, float] = {"trailing_stop_price": new_trailing_price}
+
+            raise_stop = position.stop_loss is None or new_trailing_price > position.stop_loss
+            if raise_stop:
+                if self._stops_sane(position.current_price, new_trailing_price, None):
+                    update_kwargs["stop_loss"] = new_trailing_price
+                else:
+                    logger.warning(
+                        "trailing_stop_raise_rejected",
+                        ticker=position.ticker,
+                        candidate_stop=new_trailing_price,
+                        current_price=position.current_price,
+                    )
+
+            self.update_position(position.ticker, **update_kwargs)
 
             if old_price:
                 events.append(self._create_event(
@@ -680,8 +1287,46 @@ class PositionManager:
         # Send Telegram notification
         await self._notify_event(event)
 
+    def _maybe_reset_discussion_count(self, position: MonitoredPosition) -> None:
+        """Lazy-rolls `position.discussion_count` onto a new calendar day.
+
+        Mirrors `services.trading.coordinator.ExecutionCoordinator.
+        _maybe_reset_daily_trades()` / `agents.llm.router.LLMRouter.
+        _maybe_reset_day()` -- same lazy-reset shape (checked at every touch
+        point, no scheduled job), applied per-position since each
+        `MonitoredPosition` carries its own cap.
+
+        Must be called before EVERY read or write of `discussion_count`:
+        the gate (`_should_trigger_discussion`), the increment
+        (`_trigger_discussion`), and both external accessors
+        (`get_position`/`get_all_positions`, which back the
+        `GET /positions` and `GET /positions/{ticker}` API routes). Skipping
+        any one of these lets a stale cap silently become permanent for that
+        position -- the exact 2026-08-04 incident this closes (4 of 5 live
+        positions hit `max_discussions_per_position` around 12:53 and got
+        zero strategic re-evaluation for the rest of the session, with no
+        notification to anyone).
+
+        Unlike the coordinator's `daily_trades_count`, `discussion_count` is
+        NOT persisted anywhere -- `_persist_stops`/`restore_stop_overlay`
+        only ever serialize stop levels (stop_loss/take_profit/
+        trailing_stop_pct/take_profit_reached_at), never this field. So
+        there is no restore-path date-stamping trap to guard here (the trap
+        that made yesterday's `daily_trades_count` bug survive a restart): a
+        process restart already re-creates every position via
+        `sync_from_account` -> `add_position`, whose default
+        `discussion_count=0` is fresh regardless of date. The only gap this
+        closes is a long-running process crossing midnight without ever
+        restarting.
+        """
+        today = date.today()
+        if position.discussion_count_date != today:
+            position.discussion_count_date = today
+            position.discussion_count = 0
+
     def _should_trigger_discussion(self, position: MonitoredPosition) -> bool:
         """Check if a discussion should be triggered."""
+        self._maybe_reset_discussion_count(position)
         # Check max discussions
         if position.discussion_count >= self.config.max_discussions_per_position:
             return False
@@ -711,18 +1356,85 @@ class PositionManager:
         )
 
         try:
-            # Start discussion via coordinator
-            session = await self._chat_coordinator.start_manual_discussion(
-                ticker=position.ticker,
-                stock_name=position.stock_name,
+            # Start discussion via coordinator. wait=True: block until the
+            # debate completes — session.decision is read right below, so the
+            # async default (returns a still-running session, decision=None)
+            # would make _apply_decision dead code.
+            #
+            # Bounded (2026-08-04) with asyncio.wait_for: this await was the
+            # ONLY thing between `_monitor_loop` and the next check cycle for
+            # EVERY monitored position, not just this one, and it had no
+            # timeout at all -- see discussion_timeout_seconds on
+            # PositionManagerConfig for the measured numbers behind 600s.
+            session = await asyncio.wait_for(
+                self._chat_coordinator.start_manual_discussion(
+                    ticker=position.ticker,
+                    stock_name=position.stock_name,
+                    wait=True,
+                ),
+                timeout=self.config.discussion_timeout_seconds,
             )
 
+            # Reset-then-increment (not just reset-then-check in the gate
+            # above): the awaited discussion can span the timeout window
+            # (up to discussion_timeout_seconds, default 600s) and cross
+            # midnight itself, so re-checking the day right here is what
+            # keeps a discussion that started late on day N from stacking
+            # onto day N's stale count once it resolves on day N+1.
+            self._maybe_reset_discussion_count(position)
             position.discussion_count += 1
             position.last_discussion = datetime.now()
+            self._discussion_timeout_notified.discard(position.ticker)
 
-            # Handle decision
+            # Handle decision. session.id is the REAL, persisted
+            # agent_chat_decisions.id (decision_log.persist_session writes
+            # it verbatim as decision_id on both the decision and vote
+            # rows) — the only place a genuine discussion-issued exit
+            # decision id exists (L3, spec
+            # docs/superpowers/specs/2026-07-19-decision-lineage-design.md).
             if session.decision:
-                await self._apply_decision(position, session.decision)
+                await self._apply_decision(
+                    position, session.decision, decision_id=session.id
+                )
+
+        except asyncio.TimeoutError:
+            # Caught BEFORE the generic `except Exception` below on purpose:
+            # asyncio.TimeoutError IS an Exception subclass, so that handler
+            # alone already keeps a timeout from propagating into
+            # `_monitor_loop` -- but it would do so SILENTLY (no
+            # _alert_llm_failure-style notice exists for a plain timeout,
+            # only for LLMAllBackendsFailed inside coordinator.py).
+            #
+            # Review fix (2026-08-04, final branch review): a timeout used
+            # to leave BOTH `discussion_count` and `last_discussion`
+            # untouched, on the theory that a failed discussion shouldn't
+            # consume the day's budget. Confirmed against the real
+            # coordinator that this has a second effect that matters more --
+            # `_should_trigger_discussion` reads `last_discussion` for its
+            # cooldown, so leaving it untouched meant a chronically slow
+            # position retried every 30s (the next monitor tick) with NO
+            # backoff: stall 600s, cancel, stall 600s again, forever. That's
+            # not a cosmetic loop -- this IS the monitor loop carrying the
+            # TIGHTER of the two stop-loss engines, so a permanently-retrying
+            # timeout is a permanently-stalled defensive stop, and each
+            # cancelled discussion also burns ~15 paid LLM calls.
+            #
+            # So the two fields now split: `last_discussion` IS set here
+            # (throttles the next attempt via `min_discussion_interval_minutes`,
+            # same as a normal discussion) but `discussion_count` is
+            # deliberately still left alone -- a failed discussion must not
+            # consume `max_discussions_per_position`'s daily budget, only the
+            # existing count would've silently prevented any FUTURE
+            # discussion this ticker.
+            position.last_discussion = datetime.now()
+            logger.error(
+                "position_discussion_timeout",
+                ticker=position.ticker,
+                timeout_seconds=self.config.discussion_timeout_seconds,
+            )
+            await self._alert_discussion_timeout(
+                position, self.config.discussion_timeout_seconds
+            )
 
         except Exception as e:
             logger.error(
@@ -730,6 +1442,58 @@ class PositionManager:
                 ticker=position.ticker,
                 error=str(e),
             )
+
+    async def _alert_discussion_timeout(
+        self, position: MonitoredPosition, timeout_seconds: float
+    ) -> None:
+        """토론이 제한시간을 넘겨 강제 종료됐음을 폰으로 알린다. Best-effort —
+        통지 실패가 감시 루프를 죽여선 안 된다.
+
+        `coordinator._alert_llm_failure`의 claim-then-back-out 래치
+        (services/agent_chat/coordinator.py, TOCTOU 봉합 2026-08-03)와 같은
+        장치를 쓴다: dedup 체크와 `add(ticker)`가 맞닿아 있어(둘 사이에
+        `await`가 없다) 다른 코루틴이 끼어들 틈이 없다. 발송이 실제로
+        실패/미확인으로 끝나는 모든 경로에서는 `finally`가 claim을
+        되돌려(취소 포함 — `except Exception`은 `asyncio.CancelledError`를
+        잡지 않으므로 그대로 전파된다) 다음 타임아웃에서 재시도된다.
+
+        키는 원인 문자열이 아니라 **ticker** — LLM 전멸처럼 여러 종목이
+        동시에 같은 사유를 공유하는 장애가 아니라(감시 루프는 포지션을
+        순차 처리한다), 토론 타임아웃은 종목별로 독립적이다. 그래서 모듈
+        전역 집합 대신 인스턴스 스코프(`self._discussion_timeout_notified`)
+        — 테스트마다 새 PositionManager()가 자동으로 깨끗한 래치를 갖는다
+        (coordinator 테스트처럼 수동 `.clear()`가 필요 없다).
+        """
+        ticker = position.ticker
+        if ticker in self._discussion_timeout_notified:
+            return
+        self._discussion_timeout_notified.add(ticker)  # claim (동기, 위 dedup과 맞닿아 있음)
+
+        committed = False
+        try:
+            from services.telegram import get_telegram_notifier
+            from services.telegram.formatting import stock_label
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                logger.warning("discussion_timeout_alert_notifier_not_ready", ticker=ticker)
+                return
+            label = stock_label(getattr(position, "stock_name", None), ticker)
+            sent = await notifier.send_message(
+                f"⏱️ 포지션 토론 제한시간 초과 ({timeout_seconds:.0f}s)\n"
+                f"{label}\n"
+                f"→ 이번 주기 결정은 내려지지 않았습니다. 감시는 계속됩니다.",
+                parse_mode=None,
+            )
+            if sent:
+                committed = True  # 발송이 확인된 유일한 경로 — 여기서만 래치를 유지한다
+            else:
+                logger.warning("discussion_timeout_alert_not_sent", ticker=ticker)
+        except Exception as e:  # noqa: BLE001 — 통지는 절대 감시 루프를 깨뜨리지 않는다
+            logger.warning("discussion_timeout_alert_failed", ticker=ticker, error=str(e))
+        finally:
+            if not committed:
+                self._discussion_timeout_notified.discard(ticker)
 
     async def _auto_execute_event(
         self,
@@ -743,29 +1507,169 @@ class PositionManager:
             event_type=event.event_type.value,
         )
 
+        # decision_id intentionally omitted here (defaults to None):
+        # mechanical stop-loss/take-profit auto-execution has no upstream
+        # discussion decision to cite — spec D2 says NULL is correct here,
+        # not a gap. Do not thread one in.
         try:
             if event.event_type == PositionEventType.STOP_LOSS_HIT:
                 await self._execute_close_position(position, "stop_loss")
             elif event.event_type == PositionEventType.TAKE_PROFIT_HIT:
                 await self._execute_close_position(position, "take_profit")
         except Exception as e:
+            # 리뷰 Critical (2026-07-30): 이 except는 사실상 도달 불가능하다
+            # — 아래에서 부르는 `_execute_close_position`이 자기 자신의
+            # try/except로 모든 예외를 삼키고 절대 re-raise하지 않기
+            # 때문이다(그 메서드의 except 참고). 통지는 예외가 실제로
+            # 착지하는 그쪽에서 보낸다. 여기 로그는 향후 그 계약이
+            # 바뀌더라도 조용히 사라지지 않도록 남겨두는 방어망이다.
             logger.error(
                 "auto_execute_failed",
                 ticker=event.ticker,
                 error=str(e),
             )
 
+    async def _alert_execution_failed(self, position, reason: str, error: Exception) -> None:
+        """집행 실패를 폰으로 알린다. Best-effort — 통지 실패가 집행 경로를
+        죽여선 안 된다.
+
+        `reason`은 호출자(`_execute_close_position`)가 이미 갖고 있는
+        문자열 상수(`"stop_loss"`/`"take_profit"`/`"agent_decision"`/
+        `"agent_decision_reduce"`)다. 예전에는 `event.event_type`을 문자열로
+        바꿔 `"STOP_LOSS" in str(...)` 부분 문자열로 판별했는데(리뷰 Minor),
+        이는 event_type이 정확히 두 가지뿐이라 우연히 안전했을 뿐 — 세 번째
+        auto_execute 이벤트 타입이 생기면 조용히 "익절"로 오분류된다. 여기는
+        정확한 문자열 상수와의 직접 비교이고, 알려지지 않은 reason은
+        "익절"로 잘못 단정하지 않고 중립적인 "청산"으로 표시한다.
+        """
+        try:
+            from services.telegram import get_telegram_notifier
+            from services.telegram.formatting import stock_label
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                return
+            kind = {"stop_loss": "손절", "take_profit": "익절"}.get(reason, "청산")
+            label = stock_label(
+                getattr(position, "stock_name", None), getattr(position, "ticker", "")
+            )
+            await notifier.send_message(
+                f"⛔ 자동 {kind} 집행 실패\n"
+                f"{label}\n"
+                f"사유: {type(error).__name__}: {error}\n"
+                f"→ 포지션이 무방비입니다. 수동으로 확인하세요.",
+                parse_mode=None,
+            )
+        except Exception as e:
+            logger.error("execution_failure_alert_failed", error=str(e))
+
+    async def _alert_execution_blocked(self, position, check: str, detail: str) -> None:
+        """집행이 차단됐음을 알린다(실패와 구별 — 시스템은 정상이나 정책이 막았다)."""
+        try:
+            from services.telegram import get_telegram_notifier
+            from services.telegram.formatting import stock_label
+
+            notifier = await get_telegram_notifier()
+            if not notifier.is_ready:
+                return
+            label = stock_label(
+                getattr(position, "stock_name", None), getattr(position, "ticker", "")
+            )
+            await notifier.send_message(
+                f"⛔ 자동 집행 차단 ({check})\n{label}\n{detail}",
+                parse_mode=None,
+            )
+        except Exception as e:
+            logger.error("execution_blocked_alert_failed", error=str(e))
+
     async def _execute_close_position(
         self,
         position: MonitoredPosition,
         reason: str,
+        decision_id: Optional[str] = None,
     ) -> None:
-        """Execute position close via trading coordinator."""
+        """Execute an autonomous defensive close via the trading coordinator.
+
+        Stop-loss / take-profit / agent-decision SELLs are autonomous actions, so
+        they MUST pass the shared autonomy gate — the same one the offensive BUY
+        path enforces (master env → mode → paper-only → daily-loss breaker).
+        Before this fix the close went straight to the broker, bypassing the gate
+        entirely (audit A2, 2026-07-12). A denied close leaves the position
+        monitored so a human can act on it.
+        """
         try:
+            from services.autonomy import check_autonomy
+
+            gate = await check_autonomy(
+                "kiwoom",
+                action="SELL",
+                quantity=position.quantity,
+                entry_price=position.current_price,
+            )
+            if not gate.allowed:
+                logger.warning(
+                    "defensive_close_gate_denied",
+                    ticker=position.ticker,
+                    reason=reason,
+                    check=gate.check,
+                    gate_reason=gate.reason,
+                )
+                # Notify once per denied episode, not on every monitor cycle —
+                # the *_HIT events re-fire each cycle and the denied position
+                # stays monitored, so an un-throttled notice would flood the
+                # channel (matches the gate's once-per-day breaker throttle).
+                if not position.close_gate_denied_notified:
+                    position.close_gate_denied_notified = True
+                    await self._notify_close_gate_denied(position, reason, gate.reason)
+                # S-2 HITL fallback: a market_mode denial (account not
+                # actually autonomous) escalates to the same discussion path
+                # any other position event uses — see
+                # `_fallback_to_discussion_on_hitl_deny`.
+                await self._fallback_to_discussion_on_hitl_deny(position, reason, gate)
+                return
+
+            # Gate allowed: clear the denied-notice latch so a future denial for
+            # this position notifies again.
+            position.close_gate_denied_notified = False
+
             from app.dependencies import get_trading_coordinator
             trading_coord = await get_trading_coordinator()
 
-            await trading_coord._close_position(position.ticker)
+            result = await trading_coord._close_position(
+                position.ticker, decision_id=decision_id,
+                # Important 2: 이 청산이 실제로 왜 일어났는지(손절/익절/에이전트
+                # 합의) 정확한 "경로" 라벨을 넘긴다 — 미전달 시 코디네이터의
+                # 기본값("User-initiated close")으로 떨어지는데, 그 기본값은
+                # handle_alert_action의 진짜 사람 조작 전용이다.
+                reason=_EXIT_REASON_TO_SOURCE_LABEL.get(reason, "방어청산"),
+                # 2026-08-10 재제출 가드(089860): 이 호출은 **자율 방어 매도**다
+                # — 같은 종목의 미체결 SELL 위에 전량 청산을 다시 얹으면 브로커가
+                # 800033(매도가능수량 부족)으로 거부한다. 코디네이터의 G1/G2/G3를
+                # 켠다. `_close_position`은 사람이 직접 누른 청산
+                # (handle_alert_action/REST)과 **같은 메서드**라 기본값은 False이고,
+                # 자율 경로만 여기서 명시적으로 켠다.
+                defensive=True,
+            )
+
+            if result is None:
+                # N3 (spec docs/superpowers/specs/2026-07-20-gap-discipline-
+                # design.md §2 G-3): the coordinator returns None when it
+                # SKIPPED this close outright -- a concurrent in-flight
+                # defensive exit already owns this ticker (S-2 guard), or
+                # the position was already gone broker-side -- NOT when an
+                # order was placed and merely unfilled/rejected (that still
+                # returns an OrderResult). Dropping PM's own watch here
+                # would leave a monitoring gap until the next
+                # add_position/reconciler pass (up to ~60s) with nothing
+                # else defending the position in the meantime. Keep
+                # watching; the owning engine (or the next monitor tick)
+                # handles it.
+                logger.warning(
+                    "close_position_skipped_kept_monitored",
+                    ticker=position.ticker,
+                    reason=reason,
+                )
+                return
 
             # Remove from monitoring
             self.remove_position(position.ticker)
@@ -782,13 +1686,783 @@ class PositionManager:
                 ticker=position.ticker,
                 error=str(e),
             )
+            # 리뷰 Critical (2026-07-30): 실제 집행 실패(check_autonomy 또는
+            # trading_coord._close_position이 던지는 예외)는 전부 여기서
+            # 잡힌다 — 게이트 거부/스킵 분기는 각각 return으로 여기 오기
+            # 전에 빠지므로 건드리지 않는다. `_auto_execute_event`의
+            # try/except에 통지를 달았던 최초 구현은 이 메서드가 절대
+            # re-raise하지 않아 도달 불가능했다(테스트가
+            # `_execute_close_position` 자체를 통째로 모킹해 이 catch를
+            # 우회했기 때문에 통과했을 뿐). 손절 집행 실패는 포지션을
+            # 무방비로 남긴다 — 조치 지시를 함께 담는다.
+            await self._alert_execution_failed(position, reason, e)
+
+    async def _notify_close_gate_denied(
+        self, position: MonitoredPosition, reason: str, gate_reason: str
+    ) -> None:
+        """Best-effort Telegram notice when the autonomy gate blocks a defensive
+        close — the human must know a stop-loss/take-profit did NOT execute and
+        the position is still open."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚫 자율 청산 게이트 거부 ({position.ticker}, {reason}): {gate_reason}. "
+                    f"포지션은 유지되며 수동 조치가 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "close_gate_denied_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _fallback_to_discussion_on_hitl_deny(
+        self,
+        position: MonitoredPosition,
+        reason: str,
+        gate,
+    ) -> None:
+        """S-2 HITL fallback (spec docs/superpowers/specs/2026-07-19-
+        survival-discipline-design.md §2, decision D1).
+
+        `auto_execute_stop_loss` now defaults to True (autonomous mode must
+        never sit at a breached stop), but a HITL account's autonomous
+        defensive SELL/REDUCE is still correctly denied by the autonomy gate
+        on every monitor tick (check_autonomy re-reads the live mode — see
+        `_execute_close_position`/`_execute_reduce_position`). Before this
+        fix that denial was notify-only: a HITL account would never again
+        see the pre-S-2 discussion/notification UX for a stopped-out
+        position, just a repeated (latched-once) Telegram notice with no
+        path to act. This restores it by escalating to the SAME
+        agent-discussion path any other position event uses
+        (`_trigger_discussion`), so a human still gets a debate + a real
+        chance to decide.
+
+        Deliberately scoped to `gate.check == "market_mode"` only:
+        paper-only / daily-loss-breaker / master-gate denials are hard stops
+        the existing notify-only branch already covers correctly — those are
+        not "ask a human" situations, escalating them would just be noise.
+
+        Reuses the EXISTING discussion throttle
+        (`_should_trigger_discussion` — max_discussions_per_position /
+        min_discussion_interval_minutes) unconditionally, so this is not a
+        new spam vector: a position stuck at its stop price still gets at
+        most one discussion per interval, exactly like any other event
+        (independent of the caller's own once-per-episode notify latch).
+        This also bounds the recursion risk from a discussion re-deciding
+        SELL/REDUCE (which routes back through `_apply_decision` into this
+        SAME close/reduce path, and could re-deny with the SAME
+        `market_mode` check): `_trigger_discussion` sets
+        `position.last_discussion` to "now" BEFORE `_apply_decision` even
+        runs, so any same-tick re-entry into this method is blocked by
+        `_should_trigger_discussion`'s interval check, not by call depth —
+        no infinite loop.
+        """
+        if gate.check != "market_mode":
+            return
+        if not self._should_trigger_discussion(position):
+            return
+
+        # Minor review fix (S-2): reconstructed event_type must reflect the
+        # ACTUAL trigger, not default every non-take_profit reason to
+        # STOP_LOSS_HIT. `_execute_close_position`/`_execute_reduce_position`
+        # pass `reason` through as one of "stop_loss", "take_profit", or an
+        # "agent_decision*" family (a plain discussion SELL/REDUCE, not a
+        # mechanical stop trigger) — the latter maps to STRATEGIC_REEVAL, the
+        # closest existing event type for "a decision is being re-applied",
+        # so the reconstructed event's log/notification accurately describes
+        # what actually happened.
+        event_type = _EXIT_REASON_TO_EVENT_TYPE.get(
+            reason, PositionEventType.STRATEGIC_REEVAL
+        )
+        event = self._create_event(
+            position,
+            event_type,
+            position.current_price,
+            f"자율 매도 게이트 거부(HITL 모드, {reason}) — 토론 재개: {gate.reason}",
+        )
+        logger.info(
+            "hitl_deny_discussion_fallback",
+            ticker=position.ticker,
+            reason=reason,
+        )
+        await self._trigger_discussion(event, position)
+
+    @staticmethod
+    def _stops_sane(
+        current_price: Optional[float],
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+    ) -> bool:
+        """Sanity-validate proposed stop levels against the current price (P0-2).
+
+        Insane iff: price unknown/non-positive (cannot validate → fail-closed),
+        stop_loss at-or-above the current price (stop_loss_hit would fire on the
+        very next monitor cycle — the 2026-07-12 15:40 CPU-spin hang), or
+        take_profit at-or-below the current price (instant take-profit storm).
+
+        Shared by BOTH stop-setting paths: agent-decision stops
+        (_apply_decision) and blob restore (restore_stop_overlay).
+        """
+        if not current_price or current_price <= 0:
+            return False
+        if stop_loss is not None and stop_loss >= current_price:
+            return False
+        if take_profit is not None and take_profit <= current_price:
+            return False
+        return True
+
+    async def _notify_decision_stops_rejected(
+        self,
+        position: MonitoredPosition,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+    ) -> None:
+        """Best-effort Telegram notice when a discussion decision proposed an
+        insane stop level — the human must know the stop change was NOT applied
+        and the existing stops remain in force."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                parts = []
+                if stop_loss is not None:
+                    parts.append(f"손절 ₩{stop_loss:,.0f}")
+                if take_profit is not None:
+                    parts.append(f"익절 ₩{take_profit:,.0f}")
+                await notifier.send_message(
+                    f"⚠️ 결정 스탑 기각 ({position.ticker}): {' / '.join(parts)} — "
+                    f"현재가 ₩{position.current_price:,.0f} 기준 sanity 위반 "
+                    f"(손절 ≥ 현재가 또는 익절 ≤ 현재가). 기존 스탑 유지."
+                )
+        except Exception as e:
+            logger.warning(
+                "decision_stops_rejected_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_reduce_not_executed(
+        self, position: MonitoredPosition, requested_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a discussion decided REDUCE
+        (partial close) but the requested quantity clamps to zero or less
+        against the currently monitored quantity (P1, 2026-07-15) — e.g. the
+        position is already effectively closed on this manager's own ledger.
+        Distinct from `_notify_reduce_gate_denied` (a real, executable
+        request blocked by the autonomy gate, not a quantity problem)."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"⏸ 부분청산 미실행 ({position.ticker}): "
+                    f"에이전트가 {requested_quantity}주 축소를 결정했으나 유효 매도 수량이 "
+                    f"0 이하로 계산되어 미실행. 보유 수량 {position.quantity}주 그대로 유지됩니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "reduce_not_executed_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_reduce_gate_denied(
+        self, position: MonitoredPosition, requested_quantity: int, gate_reason: str
+    ) -> None:
+        """Best-effort Telegram notice when the autonomy gate blocks a
+        quantity-specified partial REDUCE (P1, 2026-07-15) — mirrors
+        `_notify_close_gate_denied` for the full-close path. The human must
+        know the reduce did NOT execute and the position quantity is
+        unchanged."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚫 자율 부분매도 게이트 거부 ({position.ticker}, "
+                    f"{requested_quantity}주): {gate_reason}. "
+                    f"보유 수량 {position.quantity}주 그대로 유지되며 수동 조치가 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "reduce_gate_denied_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_reduce_ledger_desync(
+        self, position: MonitoredPosition, requested_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a gate-allowed partial REDUCE
+        finds NO matching position on the trading coordinator's own ledger
+        (P1/P2 review MEDIUM, 2026-07-15) — a genuine desync between this
+        manager's `_positions` and `ExecutionCoordinator._state.positions`,
+        not a quantity or gate problem. Previously this branch only logged a
+        warning, leaving the operator with no out-of-band signal that the
+        two ledgers have diverged."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚨 부분청산 실패 — 코디네이터 원장 불일치 ({position.ticker}): "
+                    f"에이전트가 {requested_quantity}주 축소를 결정했으나 코디네이터 "
+                    f"원장에 해당 종목 포지션이 없어 주문이 접수되지 않았습니다. "
+                    f"이 매니저의 보유 수량({position.quantity}주)과 코디네이터 원장이 "
+                    f"어긋났을 수 있어 수동 확인이 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "reduce_ledger_desync_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_reduce_unfilled(
+        self, position: MonitoredPosition, requested_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a gate-allowed, coordinator-placed
+        partial REDUCE order fills zero shares (P1/P2 review MEDIUM,
+        2026-07-15). The order was accepted but nothing executed — the
+        position quantity is left unchanged and the operator needs to know
+        the reduce did NOT happen."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"⏸ 부분청산 미체결 ({position.ticker}): "
+                    f"{requested_quantity}주 매도 주문이 게이트를 통과해 접수되었으나 "
+                    f"체결되지 않았습니다. 보유 수량 {position.quantity}주 그대로 "
+                    f"유지됩니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "reduce_unfilled_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _execute_reduce_position(
+        self,
+        position: MonitoredPosition,
+        requested_quantity: int,
+        reason: str,
+        decision_id: Optional[str] = None,
+    ) -> None:
+        """Execute a quantity-specified partial sell via the trading
+        coordinator (P1, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+
+        Replaces P0's "부분청산 미지원" notification with real execution: a
+        partial REDUCE now places an ACTUAL SELL order for the requested
+        quantity (not the full position), through the SAME autonomy gate
+        (`check_autonomy`) the full-close path (`_execute_close_position`)
+        already enforces — master gate, market mode, paper-only, daily-loss
+        breaker, notional cap.
+
+        Oversell-proof at two layers: clamped here against this manager's own
+        tracked quantity before the gate check (so the gate never evaluates a
+        request larger than what this manager believes is held), and
+        re-clamped inside `ExecutionCoordinator._reduce_position` against ITS
+        OWN tracked quantity — a separate ledger that can diverge from this
+        one. Either clamp collapsing the request into a full close delegates
+        to the existing full-close machinery rather than duplicating it.
+
+        On any real fill, the monitored quantity is decremented by the
+        ACTUAL filled amount (not the requested one) — this is now backed by
+        a real broker order, unlike the P0-removed silent shadow-ledger
+        decrement.
+        """
+        try:
+            from services.autonomy import check_autonomy
+
+            clamped_quantity = min(requested_quantity, position.quantity)
+            if clamped_quantity <= 0:
+                logger.warning(
+                    "reduce_requested_non_positive",
+                    ticker=position.ticker,
+                    requested_quantity=requested_quantity,
+                    current_quantity=position.quantity,
+                )
+                await self._notify_reduce_not_executed(position, requested_quantity)
+                return
+
+            gate = await check_autonomy(
+                "kiwoom",
+                action="SELL",
+                quantity=clamped_quantity,
+                entry_price=position.current_price,
+            )
+            if not gate.allowed:
+                logger.warning(
+                    "partial_reduce_gate_denied",
+                    ticker=position.ticker,
+                    reason=reason,
+                    check=gate.check,
+                    gate_reason=gate.reason,
+                )
+                await self._notify_reduce_gate_denied(
+                    position, clamped_quantity, gate.reason
+                )
+                # S-2 HITL fallback (mirrors _execute_close_position's).
+                await self._fallback_to_discussion_on_hitl_deny(position, reason, gate)
+                return
+
+            from app.dependencies import get_trading_coordinator
+            from services.trading.coordinator import (
+                ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT,
+            )
+
+            trading_coord = await get_trading_coordinator()
+            result = await trading_coord._reduce_position(
+                position.ticker, clamped_quantity, decision_id=decision_id,
+                # Important 2: _execute_close_position과 동일한 이유로 정확한
+                # 경로 라벨을 넘긴다 — 미전달 시 코디네이터 기본값
+                # ("Autonomous partial reduce")로 떨어진다.
+                reason=_EXIT_REASON_TO_SOURCE_LABEL.get(reason, "방어청산"),
+                # 2026-08-10 재제출 가드 — `_execute_close_position`과 같은 이유
+                # (자율 경로). 미체결 SELL이 예약한 수량 위에 축소를 또 내면
+                # 브로커가 거부한다.
+                defensive=True,
+            )
+
+            if result is None:
+                # Coordinator had no matching position (a divergent/desynced
+                # ledger, or a zero/negative clamp on its own side) — nothing
+                # was placed. Leave this manager's quantity untouched rather
+                # than guess at what happened.
+                logger.warning(
+                    "partial_reduce_no_coordinator_position",
+                    ticker=position.ticker,
+                )
+                await self._notify_reduce_ledger_desync(position, clamped_quantity)
+                return
+
+            if result.status == ORDER_STATUS_SUPPRESSED_DEFENSIVE_RESUBMIT:
+                # 재제출 가드(G1/G2/G3)가 억제했다 — 원장은 멀쩡하고 주문도
+                # 실패하지 않았다. 정상 동작이므로 **통지하지 않는다**:
+                # `_notify_reduce_ledger_desync`("포지션이 없어…수동 확인이
+                # 필요합니다")도 `_notify_reduce_unfilled`도 전부 사실과 다르다.
+                # 2026-07-28 ADD 유동성 캡 선례와 같은 처리다 — 다만 그쪽은
+                # "차단" 통지를 래치와 함께 보냈고 여기는 아예 보내지 않는다:
+                # 억제 사유(미체결 SELL/쿨다운)는 최대 3분 안에 저절로 풀리는
+                # 일시적 상태라 사람이 할 조치가 없고, 코디네이터가 이미
+                # `defensive_sell_suppressed` WARNING을 에피소드당 1회 남긴다.
+                # 억제된 것은 재량적 부분 축소이지 손절이 아니다(손절은
+                # `_execute_close_position` 경로).
+                logger.info(
+                    "partial_reduce_suppressed_by_resubmit_guard",
+                    ticker=position.ticker,
+                    requested_quantity=clamped_quantity,
+                    detail=result.message,
+                )
+                return
+
+            filled = result.filled_quantity
+            if filled <= 0:
+                logger.warning(
+                    "partial_reduce_unfilled",
+                    ticker=position.ticker,
+                    requested_quantity=clamped_quantity,
+                )
+                await self._notify_reduce_unfilled(position, clamped_quantity)
+                return
+
+            new_quantity = position.quantity - filled
+            if new_quantity <= 0:
+                # The ACTUAL fill consumed this manager's whole tracked
+                # quantity (e.g. the coordinator's own clamp collapsed this
+                # into a real full close on its side) — mirror
+                # _execute_close_position's cleanup.
+                self.remove_position(position.ticker)
+                logger.info(
+                    "position_reduced_to_full_close",
+                    ticker=position.ticker,
+                    filled=filled,
+                )
+            else:
+                self.update_position(position.ticker, quantity=new_quantity)
+                logger.info(
+                    "position_reduced",
+                    ticker=position.ticker,
+                    filled=filled,
+                    remaining=new_quantity,
+                )
+
+        except Exception as e:
+            logger.error(
+                "execute_reduce_position_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+            # 최종 전체 브랜치 리뷰 Important 4와 같은 결의 갭(형제 메서드):
+            # `_execute_close_position`은 Task 7에서 자기 except에
+            # `_alert_execution_failed`를 달았는데(check_autonomy/
+            # trading_coord._close_position 예외를 여기서 진짜로 잡는다),
+            # 이 메서드는 예외 발생 지점(check_autonomy/
+            # trading_coord._reduce_position)이 정확히 같은 모양인데도 로그만
+            # 남기고 끝났다 — 부분청산 시도가 무방비로 실패해도 무통지였다.
+            await self._alert_execution_failed(position, reason, e)
+
+    async def _notify_add_not_executed(
+        self, position: MonitoredPosition, computed_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a discussion decided ADD
+        (increase position) but the sizing policy
+        (``add_position_pct`` × held quantity) computes to zero or less —
+        e.g. a very small existing holding (P2, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+        Superseded P0's "no execution path exists" notice now that ADD has
+        real execution — this is the sizing-clamps-to-zero case, distinct
+        from `_notify_add_gate_denied` (a real, executable request blocked
+        by the autonomy gate, not a sizing problem)."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"⏸ 추가매수 미실행 ({position.ticker}): "
+                    f"에이전트가 추가매수(ADD)를 결정했으나 사이징 결과 매수 수량이 "
+                    f"{computed_quantity}주로 계산되어(보유 {position.quantity}주 기준) "
+                    f"미실행되었습니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "add_not_executed_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_add_gate_denied(
+        self, position: MonitoredPosition, add_quantity: int, gate_reason: str
+    ) -> None:
+        """Best-effort Telegram notice when the autonomy gate blocks an
+        autonomous ADD (percentage-of-holding BUY) — mirrors
+        `_notify_reduce_gate_denied` for the exposure-increasing side (P2,
+        2026-07-15). The human must know the add did NOT execute and the
+        position quantity is unchanged."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚫 자율 추가매수 게이트 거부 ({position.ticker}, "
+                    f"{add_quantity}주): {gate_reason}. "
+                    f"보유 수량 {position.quantity}주 그대로 유지됩니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "add_gate_denied_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_add_ledger_desync(
+        self, position: MonitoredPosition, add_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a gate-allowed ADD finds NO
+        matching position on the trading coordinator's own ledger (P1/P2
+        review MEDIUM, 2026-07-15) — mirrors
+        `_notify_reduce_ledger_desync` for the exposure-increasing side. A
+        genuine desync between this manager's `_positions` and
+        `ExecutionCoordinator._state.positions`, not a sizing or gate
+        problem."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"🚨 추가매수 실패 — 코디네이터 원장 불일치 ({position.ticker}): "
+                    f"에이전트가 {add_quantity}주 추가매수를 결정했으나 코디네이터 "
+                    f"원장에 해당 종목 포지션이 없어 주문이 접수되지 않았습니다. "
+                    f"이 매니저의 보유 수량({position.quantity}주)과 코디네이터 원장이 "
+                    f"어긋났을 수 있어 수동 확인이 필요합니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "add_ledger_desync_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _notify_add_unfilled(
+        self, position: MonitoredPosition, add_quantity: int
+    ) -> None:
+        """Best-effort Telegram notice when a gate-allowed, coordinator-placed
+        ADD (BUY) order fills zero shares (P1/P2 review MEDIUM,
+        2026-07-15) — mirrors `_notify_reduce_unfilled`. The order was
+        accepted but nothing executed — the position quantity/avg_price is
+        left unchanged and the operator needs to know the add did NOT
+        happen."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                await notifier.send_message(
+                    f"⏸ 추가매수 미체결 ({position.ticker}): "
+                    f"{add_quantity}주 매수 주문이 게이트를 통과해 접수되었으나 "
+                    f"체결되지 않았습니다. 보유 수량 {position.quantity}주 그대로 "
+                    f"유지됩니다."
+                )
+        except Exception as e:
+            logger.warning(
+                "add_unfilled_notify_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
+
+    async def _execute_add_position(
+        self,
+        position: MonitoredPosition,
+        add_quantity: int,
+        reason: str,
+        decision_id: Optional[str] = None,
+    ) -> None:
+        """Execute a percentage-of-holding ADD (increase) via the trading
+        coordinator (P2, 2026-07-15,
+        docs/superpowers/plans/2026-07-15-position-mgmt-execution.md).
+
+        Replaces P0's "추가매수 미실행 — 보류" notify-only stand-in with real
+        execution: an ADD decision now places an ACTUAL BUY order for
+        ``add_quantity`` — computed by the caller as
+        ``round(held_quantity * add_position_pct)``, a percentage of the
+        CURRENTLY held quantity, NOT the discussion's own free-text quantity
+        — through the SAME autonomy gate (`check_autonomy`) the full-close /
+        partial-reduce SELL paths already enforce: master gate, market mode,
+        paper-only, daily-loss breaker, and — because this is a BUY/ADD —
+        the per-trade notional cap.
+
+        ONE check differs from the entry BUY path (2026-08-05):
+        max-open-positions is exempted when the ticker is already held,
+        because buying more of a position you already have cannot raise the
+        number of open positions. The gate decides that from its own
+        holdings lookup — see check 6 in `services/autonomy/gate.py`.
+        Everything else is the same safety level as `on_trade_approved`.
+
+        On any real fill, the monitored quantity is incremented by the
+        ACTUAL filled amount (never the requested one) and avg_entry_price
+        is recomputed as the cost-weighted average of the old holding and
+        the new fill — the same average-in math
+        `ExecutionCoordinator._add_position` already applies on its own
+        (separate) ledger for an entry BUY.
+        """
+        try:
+            if add_quantity <= 0:
+                logger.warning(
+                    "add_quantity_non_positive",
+                    ticker=position.ticker,
+                    add_quantity=add_quantity,
+                )
+                await self._notify_add_not_executed(position, add_quantity)
+                return
+
+            from services.autonomy import check_autonomy
+
+            gate = await check_autonomy(
+                "kiwoom",
+                action="BUY",
+                quantity=add_quantity,
+                entry_price=position.current_price,
+                # 슬롯 상한(max_open_positions) 면제용 (2026-08-05). action은
+                # 계속 "BUY"다 — 진입 BUY와 **동일한** 안전(브레이커·명목캡·
+                # 코디네이터 활성)을 그대로 받겠다는 기존 의도를 바꾸지
+                # 않는다. 다만 그 중 슬롯 점검만은 추가매수에 무의미하다:
+                # 이미 보유한 티커를 더 사도 보유 종목 수는 늘지 않는다.
+                # 게이트가 보유 목록을 직접 조회해 판정하므로 여기서 티커를
+                # 넘기는 것은 "면제해 달라"는 주장이 아니라 판정 대상을
+                # 알려주는 것이다.
+                ticker=position.ticker,
+            )
+            if not gate.allowed:
+                logger.warning(
+                    "add_gate_denied",
+                    ticker=position.ticker,
+                    reason=reason,
+                    check=gate.check,
+                    gate_reason=gate.reason,
+                )
+                await self._notify_add_gate_denied(
+                    position, add_quantity, gate.reason
+                )
+                return
+
+            from app.dependencies import get_trading_coordinator
+            from services.trading.coordinator import (
+                ORDER_STATUS_REJECTED_DAILY_LIMIT,
+                ORDER_STATUS_REJECTED_LIQUIDITY_CAP,
+                ORDER_STATUS_REJECTED_POSITION_CAP,
+            )
+
+            trading_coord = await get_trading_coordinator()
+            result = await trading_coord._add_to_position(
+                position.ticker, add_quantity, decision_id=decision_id
+            )
+
+            if result is None:
+                # Coordinator had no matching position (a divergent/desynced
+                # ledger) — nothing was placed. Leave this manager's
+                # quantity/avg untouched rather than guess at what happened
+                # (mirrors _execute_reduce_position's same-shaped guard).
+                logger.warning(
+                    "add_no_coordinator_position",
+                    ticker=position.ticker,
+                )
+                await self._notify_add_ledger_desync(position, add_quantity)
+                return
+
+            if result.status == ORDER_STATUS_REJECTED_LIQUIDITY_CAP:
+                # 유동성 천장에 막혀 0주 — 원장은 멀쩡하다. desync 통지를
+                # 보내면 안 된다(이미 캡을 초과 보유한 종목은 ADD가 매번
+                # 0이라 토론 주기마다 허위 🚨가 반복되고, 진짜 desync 신호를
+                # 덮는다). 정상 억제이므로 desync 취급은 하지 않되, 실패와
+                # 구별되는 "차단" 통지는 한다 — 단, `close_gate_denied_notified`와
+                # 같은 이유로 래치를 건다(리뷰 Important 2): 캡을 초과
+                # 보유한 종목은 이 분기가 토론 주기마다 재진입하므로,
+                # 래치가 없으면 매번 재통지돼 채널이 도배된다.
+                logger.info(
+                    "add_blocked_by_liquidity_cap",
+                    ticker=position.ticker,
+                    requested=add_quantity,
+                    held_quantity=position.quantity,
+                )
+                if not position.liquidity_cap_blocked_notified:
+                    position.liquidity_cap_blocked_notified = True
+                    await self._alert_execution_blocked(
+                        position,
+                        "유동성 캡",
+                        "주문 수량이 0으로 클램프됐습니다. "
+                        "→ 조치 불필요: 정책이 의도대로 추가매수를 억제했습니다"
+                        "(시스템 이상 아님). 기존 포지션은 정상 보유 중입니다.",
+                    )
+                return
+
+            if result.status == ORDER_STATUS_REJECTED_POSITION_CAP:
+                # 단일 종목 천장에 막혀 0주 (2026-08-05). 위 유동성 분기와
+                # 완전히 같은 성격이다 — 원장은 멀쩡하고 정책이 의도대로
+                # 억제한 것이므로 desync도 "미체결"도 아니다. 천장에 도달한
+                # 종목은 이 분기가 재평가마다 재진입하므로 같은 래치를
+                # 공유한다(래치를 나누면 두 천장이 번갈아 걸릴 때 각각
+                # 한 번씩, 결국 두 배로 통지된다).
+                logger.info(
+                    "add_blocked_by_position_cap",
+                    ticker=position.ticker,
+                    requested=add_quantity,
+                    held_quantity=position.quantity,
+                )
+                if not position.liquidity_cap_blocked_notified:
+                    position.liquidity_cap_blocked_notified = True
+                    await self._alert_execution_blocked(
+                        position,
+                        "단일 종목 상한",
+                        "주문 수량이 0으로 클램프됐습니다. "
+                        "→ 조치 불필요: 이 종목이 계좌 비중 천장에 도달해 "
+                        "정책이 추가매수를 억제했습니다(시스템 이상 아님). "
+                        "기존 포지션은 정상 보유 중입니다.",
+                    )
+                return
+
+            if result.status == ORDER_STATUS_REJECTED_DAILY_LIMIT:
+                # 일일 거래 상한 소진 (2026-08-06). 앞의 두 거절과 달리 이것은
+                # **포트폴리오 전역** 조건이라 종목마다 통지하면 같은 사실이
+                # 보유 종목 수만큼 간다. 게다가 소진 상태는 daily_trades로
+                # 이미 조회 가능하고 내일 자동 리셋되므로 운영자가 할 일이
+                # 없다 — 로그만 남기고 통지하지 않는다.
+                #
+                # 이 분기가 없으면 아래 `filled <= 0`으로 떨어져 "미체결"로
+                # 오분류되고, 그 경로는 래치가 없어 재평가마다 통지가 반복된다.
+                logger.info(
+                    "add_blocked_by_daily_limit",
+                    ticker=position.ticker,
+                    requested=add_quantity,
+                )
+                return
+
+            # 이번엔 캡에 걸리지 않고 여기까지 왔다 — 다음 차단 시 다시
+            # 통지되도록 래치를 푼다(`close_gate_denied_notified`가 게이트
+            # 통과 시 리셋되는 것과 동일한 패턴).
+            position.liquidity_cap_blocked_notified = False
+
+            filled = result.filled_quantity
+            if filled <= 0:
+                logger.warning(
+                    "add_unfilled",
+                    ticker=position.ticker,
+                    requested_quantity=add_quantity,
+                )
+                await self._notify_add_unfilled(position, add_quantity)
+                return
+
+            old_quantity = position.quantity
+            old_avg_price = position.avg_price
+            new_quantity = old_quantity + filled
+            new_avg_price = (
+                (old_quantity * old_avg_price) + (filled * result.avg_price)
+            ) / new_quantity
+
+            self.update_position(
+                position.ticker, quantity=new_quantity, avg_price=new_avg_price
+            )
+
+            logger.info(
+                "position_added_to",
+                ticker=position.ticker,
+                filled=filled,
+                new_quantity=new_quantity,
+                new_avg_price=new_avg_price,
+            )
+
+        except Exception as e:
+            logger.error(
+                "execute_add_position_failed",
+                ticker=position.ticker,
+                error=str(e),
+            )
 
     async def _apply_decision(
         self,
         position: MonitoredPosition,
         decision,
+        decision_id: Optional[str] = None,
     ) -> None:
-        """Apply a decision from agent discussion to the position."""
+        """Apply a decision from agent discussion to the position.
+
+        P1 (2026-07-15, docs/superpowers/plans/2026-07-15-position-mgmt-execution.md
+        Task P1): partial REDUCE now has a real execution path
+        (`_execute_reduce_position`) — it places a quantity-specified SELL
+        through the SAME autonomy gate (`check_autonomy`) the full-close path
+        already enforces, then updates the monitored quantity by the ACTUAL
+        filled amount (oversell-proof, clamped against both this manager's
+        and the coordinator's own tracked quantity). This replaces P0's
+        notify-only "부분청산 미지원" stand-in
+        (docs/superpowers/audits/2026-07-14-autonomous-position-mgmt-audit.md).
+        The full-close REDUCE path (new_quantity <= 0 -> _execute_close_position)
+        and plain SELL are real execution and remain unaffected.
+
+        P2 (2026-07-15, Task P2): ADD now also has a real execution path
+        (`_execute_add_position`) — the buy quantity is sized as a
+        configurable percentage of the CURRENTLY held quantity
+        (``round(position.quantity * config.add_position_pct)``), then
+        placed through the SAME autonomy gate (`check_autonomy(BUY)`) the
+        SELL paths already enforce — same safety level as the entry BUY path
+        EXCEPT max-open-positions, which an already-held ticker is exempt
+        from as of 2026-08-05 (see `_execute_add_position`). A sizing result
+        of zero or less keeps P0's not-executed notice (no buy execution
+        attempted, no gate call).
+        """
         from services.agent_chat.models import DecisionAction
 
         logger.info(
@@ -799,24 +2473,93 @@ class PositionManager:
 
         try:
             if decision.action == DecisionAction.SELL:
-                await self._execute_close_position(position, "agent_decision")
+                await self._execute_close_position(
+                    position, "agent_decision", decision_id=decision_id
+                )
 
             elif decision.action == DecisionAction.REDUCE:
                 # Partial close - calculate quantity
                 if decision.quantity:
-                    # Update position quantity
                     new_quantity = position.quantity - decision.quantity
                     if new_quantity <= 0:
-                        await self._execute_close_position(position, "agent_decision_reduce")
+                        # Full close: the REAL executing path. Unchanged.
+                        await self._execute_close_position(
+                            position, "agent_decision_reduce", decision_id=decision_id
+                        )
                     else:
-                        self.update_position(position.ticker, quantity=new_quantity)
+                        # Partial reduce: real execution path (P1,
+                        # 2026-07-15) — a quantity-specified SELL through the
+                        # SAME autonomy gate the full-close path uses.
+                        # Replaces P0's notify-only stand-in.
+                        await self._execute_reduce_position(
+                            position, decision.quantity, "agent_decision_reduce_partial",
+                            decision_id=decision_id,
+                        )
 
             elif decision.action in (DecisionAction.HOLD, DecisionAction.ADD):
-                # Update stops if provided
-                if decision.stop_loss:
-                    self.update_position(position.ticker, stop_loss=decision.stop_loss)
-                if decision.take_profit:
-                    self.update_position(position.ticker, take_profit=decision.take_profit)
+                if decision.action == DecisionAction.ADD:
+                    # P2 (2026-07-15): ADD now has a real execution path — a
+                    # BUY sized as a percentage of the CURRENTLY held
+                    # quantity (config.add_position_pct), gated the SAME way
+                    # the SELL paths already are (check_autonomy). The
+                    # stop/take adjustment below still applies same as for
+                    # HOLD regardless of the add's own outcome.
+                    add_qty = round(position.quantity * self.config.add_position_pct)
+                    await self._execute_add_position(
+                        position, add_qty, "agent_decision_add", decision_id=decision_id
+                    )
+
+                # Update stops if provided — after sanity validation (P0-2a).
+                new_stop = decision.stop_loss or None
+                new_take = decision.take_profit or None
+                if new_stop is not None or new_take is not None:
+                    if not self._stops_sane(position.current_price, new_stop, new_take):
+                        # Root cause of the 2026-07-12 15:40 hang: a decision
+                        # set stop_loss 1,993,680 ABOVE the price 1,845,000 →
+                        # stop_loss_hit fired every monitor cycle → CPU spin.
+                        # An insane proposal is rejected wholesale; existing
+                        # stops are kept and the human is notified.
+                        logger.warning(
+                            "decision_stops_rejected",
+                            ticker=position.ticker,
+                            stop_loss=new_stop,
+                            take_profit=new_take,
+                            current_price=position.current_price,
+                        )
+                        await self._notify_decision_stops_rejected(
+                            position, new_stop, new_take
+                        )
+                    else:
+                        if new_stop is not None:
+                            # 손절 단조성(2026-07-28): 에이전트 결정은 손절을
+                            # **올리기만** 할 수 있다. 익절 락인(`max(...)`)과
+                            # 트레일링(`raise_stop`) 경로는 이미 같은 규율을
+                            # 강제하는데 이 경로만 무제한이었다.
+                            #
+                            # 라이브 사고(094840): 30분 주기 재평가마다 LLM이
+                            # 현재가 기준으로 손절을 새로 제안했고, 주가가
+                            # 빠지자 손절이 따라 내려갔다(12,492→12,238→12,173).
+                            # R-사이징은 손절 거리로 수량을 정하므로, 수량이
+                            # 고정된 채 손절만 넓어지면 리스크가 그대로 커진다
+                            # (실측 +56%, 손익비 2.36→1.19).
+                            #
+                            # "손절을 시장 반대 방향으로 옮기지 않는다"는 매매
+                            # 규율을 코드로 고정한다. 상향(이익 보호)은 허용.
+                            if position.stop_loss is None or new_stop > position.stop_loss:
+                                self.update_position(position.ticker, stop_loss=new_stop)
+                            else:
+                                logger.info(
+                                    "decision_stop_not_lowered",
+                                    ticker=position.ticker,
+                                    current_stop=position.stop_loss,
+                                    proposed_stop=new_stop,
+                                    current_price=position.current_price,
+                                )
+                        if new_take is not None:
+                            # 익절은 단조성 대상이 아니다 — 하향은 "빨리 팔자"라
+                            # 손실 위험을 키우지 않고, 손절이 고정되면 손익비는
+                            # 자동으로 보호된다.
+                            self.update_position(position.ticker, take_profit=new_take)
 
             # Notify decision callbacks
             for callback in self._on_decision_callbacks:
@@ -844,6 +2587,9 @@ class PositionManager:
             if not telegram.is_ready:
                 return
 
+            if not event_notify_enabled(event.event_type):
+                return
+
             event_emoji = {
                 PositionEventType.STOP_LOSS_HIT: "🔴",
                 PositionEventType.STOP_LOSS_NEAR: "⚠️",
@@ -855,6 +2601,7 @@ class PositionManager:
                 PositionEventType.HOLDING_PERIOD_LONG: "📅",
                 PositionEventType.VOLATILITY_SPIKE: "⚡",
                 PositionEventType.NEWS_IMPACT: "📰",
+                PositionEventType.STRATEGIC_REEVAL: "🔄",
             }
 
             emoji = event_emoji.get(event.event_type, "📋")
@@ -960,10 +2707,17 @@ class PositionManager:
                     continue
 
                 if holding.stk_cd in self._positions:
-                    # Update existing
+                    # Update existing.
+                    # 원가 단일화 최종 리뷰 item2: quantity/current_price만
+                    # 밀어넣고 avg_price를 빠뜨리면 "148주 원가가 185주에
+                    # 그대로 적용"되는 정확히 그 결함이 여기서도 재현된다 —
+                    # reconciler.py 모듈독스트링이 드리프트 원인으로 지목하는
+                    # 함수가 바로 이 sync_from_account다. 브로커 값을 그대로
+                    # 절대 치환한다(reconciler의 브로커=진실 원칙과 동일).
                     self.update_position(
                         ticker=holding.stk_cd,
                         quantity=holding.hldg_qty,
+                        avg_price=holding.avg_buy_prc,
                         current_price=holding.cur_prc,
                     )
                 else:
@@ -989,6 +2743,389 @@ class PositionManager:
 
         except Exception as e:
             logger.error("position_sync_failed", error=str(e))
+
+    # -------------------------------------------
+    # Stop-Level Persistence (F3 Task 7)
+    # -------------------------------------------
+    #
+    # Stop-loss / take-profit / trailing-stop levels lived only in memory, so a
+    # backend restart silently dropped all of them — the operator had to
+    # manually re-register stops after every restart before defense resumed.
+    # These levels are agent-chat's own data (the broker doesn't know them), so
+    # local state IS the source of truth to persist — mirrors the R5-P1
+    # ExecutionCoordinator._persist_state/_schedule_persist pattern
+    # (services/trading/coordinator.py).
+
+    _STOPS_KEY = "agent_chat:position_manager_state"
+
+    def _schedule_persist_stops(self) -> None:
+        """Fire-and-forget persist from a (possibly sync) mutator. No-op without
+        a running event loop — e.g. a PositionManager built directly in a unit
+        test, or a sync caller invoked outside any async context (reconciler /
+        sync_from_account call add/update/remove_position synchronously). Never
+        raises.
+
+        Each scheduled write carries the generation current at schedule time;
+        a write that reaches the lock after a newer one was scheduled is stale
+        and gets dropped (see _persist_stops)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._persist_generation += 1
+        generation = self._persist_generation
+        try:
+            loop.create_task(self._persist_stops(generation=generation))
+        except Exception as e:
+            logger.warning("position_manager_persist_schedule_failed", error=str(e))
+
+    async def _persist_stops(self, generation: Optional[int] = None) -> None:
+        """Persist stop levels for all currently-monitored positions.
+
+        Single-writer discipline (T7 review C1): every DB write happens under
+        one lock and the payload is serialized UNDER that lock, so a write can
+        never carry state older than its critical-section entry and writes land
+        in critical-section order. Additionally:
+        - generation guard: a scheduled write whose captured generation is
+          older than the newest scheduled one is dropped (its successor carries
+          fresher state);
+        - dirty-check: a payload identical to the last-written one is skipped.
+
+        Without this, two set_app_setting calls — each opening its own
+        aiosqlite connection — could land out of order, letting the None-stops
+        blob scheduled by sync_from_account silently revert the stops that
+        restore_stop_overlay had just saved.
+
+        ``generation=None`` marks a direct (never-stale) call: tests and
+        restore_stop_overlay's corrective save.
+
+        Best-effort — never raises, since it also runs from the fire-and-forget
+        hook above where there is nothing to catch the exception.
+        """
+        try:
+            from services.storage_service import get_storage_service
+
+            async with self._persist_lock:
+                if generation is not None and generation < self._persist_generation:
+                    return  # stale scheduled write — a newer one is pending/done
+                payload = json.dumps({
+                    "stops": {
+                        ticker: {
+                            "stop_loss": position.stop_loss,
+                            "take_profit": position.take_profit,
+                            "trailing_stop_pct": position.trailing_stop_pct,
+                            # S-5: schema extension. isoformat/None -- a
+                            # pre-S-5 blob simply lacks this key, which
+                            # `.get()` on restore reads back as None (see
+                            # restore_stop_overlay), matching a fresh
+                            # position's own default.
+                            "take_profit_reached_at": (
+                                position.take_profit_reached_at.isoformat()
+                                if position.take_profit_reached_at is not None
+                                else None
+                            ),
+                        }
+                        for ticker, position in self._positions.items()
+                    }
+                })
+                if payload == self._last_persisted_payload:
+                    return
+                storage = await get_storage_service()
+                await storage.set_app_setting(self._STOPS_KEY, payload)
+                self._last_persisted_payload = payload
+        except Exception as e:
+            logger.error("position_manager_persist_failed", error=str(e))
+
+    async def _notify_restore_stops_dropped(
+        self,
+        ticker: str,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+        current_price: Optional[float],
+    ) -> None:
+        """Best-effort Telegram notice when a restart-restore blob entry fails
+        _stops_sane and is dropped (P0-2b/M1) — mirrors
+        _notify_decision_stops_rejected. Without this, a position could come
+        back up from a restart with NO stop-loss/take-profit protection and
+        nothing would surface that silently to the human."""
+        try:
+            from services.telegram import get_telegram_notifier
+
+            notifier = await get_telegram_notifier()
+            if notifier.is_ready:
+                sl = f"{stop_loss:,.0f}" if stop_loss is not None else "-"
+                tp = f"{take_profit:,.0f}" if take_profit is not None else "-"
+                price = f"{current_price:,.0f}" if current_price else "알수없음"
+                await notifier.send_message(
+                    f"⚠️ 복원 스탑 기각: {ticker} 손절 {sl}/익절 {tp} — "
+                    f"현재가 {price} 기준 무효, 보호 미설정 상태"
+                )
+        except Exception as e:
+            logger.warning(
+                "restore_stops_dropped_notify_failed",
+                ticker=ticker,
+                error=str(e),
+            )
+
+    @staticmethod
+    def _restore_stop_is_structurally_insane(
+        current_price: Optional[float],
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+    ) -> bool:
+        """Restore-path-only sanity gate (G-1/D1, extended D1b — docs/
+        superpowers/specs/2026-07-20-gap-discipline-design.md §0) —
+        deliberately NOT `_stops_sane`, which stays byte-invariant for the
+        intraday stop-SETTING paths (`_apply_decision`,
+        `_apply_take_profit_lock_in`, `_check_trailing_stop`): a stop or
+        take-profit being newly set at-or-through the current price must
+        still be rejected there, or it fires stop_loss_hit/take_profit_hit
+        on the very same tick (the 2026-07-12 15:40 CPU-spin hang this repo
+        already fixed once).
+
+        A RESTORED level is different: it is not being newly set, it already
+        existed and survived a restart. The 2026-07-20 00:02 incident
+        (`restore_stops_insane_dropped ticker=000660 stop_loss=1,807,923
+        current_price=1,782,000`) showed the old shared `_stops_sane` gate
+        dropping an already-raised protective stop just because a pre-open
+        gap pushed price through it — discarding real discipline instead of
+        enforcing it. D1: a gap-through stop is not corrupted data, it's the
+        ordinary shape stop discipline takes at a gap open. Preserve it
+        verbatim; `_check_position`'s existing STOP_LOSS_HIT detection (fully
+        unchanged by this method) fires on it normally on the next monitor
+        tick, exactly like any other price crossing.
+
+        D1b (this method, 2026-07-20 follow-up): the SAME reasoning extends
+        to a restored take_profit gapping through the current price
+        (`take_profit <= current_price`) — G-1 originally kept that shape
+        classified as structurally insane (drop the WHOLE entry, including
+        its accompanying stop_loss and S-5 lock-in trigger), which was an
+        asymmetry: a favorable gap-up lost its protective stop while an
+        adverse gap-through-stop kept it. Take-profit has no auto-sell
+        behind it either way (`auto_execute_take_profit=False`,
+        `take_profit_mode=user_approval` — TAKE_PROFIT_HIT only ever opens a
+        discussion or marks `take_profit_reached_at`), so preserving it is
+        harmless and keeps the S-5 lock-in ratchet chain alive. See
+        `restore_stop_overlay` for the accompanying `gap_through_tp_restored`
+        log, symmetric with `gap_through_stop_restored` below.
+
+        Classification (only two ways an entry is dropped now — everything
+        else, INCLUDING stop_loss at-or-above current_price and take_profit
+        at-or-below current_price, restores normally):
+        - current_price unknown/non-positive: cannot validate at all,
+          fail-closed.
+        - stop_loss and take_profit both set with stop_loss >= take_profit:
+          the two saved levels contradict each other independent of the
+          current price — never a legitimate gap, always corrupted data
+          (this also catches a gap-through-shaped stop_loss or take_profit
+          whose paired level sits on the wrong side of it, which would
+          otherwise look like a preservable gap).
+        """
+        if not current_price or current_price <= 0:
+            return True
+        if (
+            stop_loss is not None
+            and take_profit is not None
+            and stop_loss >= take_profit
+        ):
+            return True
+        return False
+
+    async def restore_stop_overlay(self) -> int:
+        """Restore persisted stop levels onto currently-monitored positions.
+
+        Meant to be called once, right after `sync_from_account()`, so
+        `self._positions` already reflects the current broker holdings:
+        - A ticker in the blob that is no longer held is dropped (never
+          resurrected as a position) — the final re-save below rewrites the
+          blob from `self._positions`, which naturally excludes it.
+        - A ticker still held has its stop fields restored ONLY where the
+          field is currently None — a value already set this session (by a
+          fresher broker sync or a manual update) wins over the stale blob.
+        - An entry that is structurally insane per
+          `_restore_stop_is_structurally_insane` (P0-2b: polluted/stale
+          blob — NOT the same gate as `_stops_sane`, see that method's
+          docstring) is skipped entirely and its values dropped from the
+          blob by the re-save.
+        - An entry whose stop_loss alone is at-or-above the current price
+          (a pre-open gap ran through an already-raised stop) is preserved
+          verbatim instead of dropped (G-1/D1) — a `gap_through_stop_restored`
+          info log fires and the normal monitor loop fires STOP_LOSS_HIT on
+          it next tick, same as any other price crossing.
+        - An entry whose take_profit alone is at-or-below the current price
+          (a favorable gap-up ran through an already-set target) is likewise
+          preserved verbatim, accompanying stop_loss included (D1b) — a
+          `gap_through_tp_restored` info log fires and the normal monitor
+          loop fires TAKE_PROFIT_HIT on it next tick (still no auto-sell —
+          auto_execute_take_profit stays False), keeping the S-5 lock-in
+          ratchet chain intact for a later retracement.
+
+        Returns the number of tickers whose stops were restored.
+        """
+        # Final-review CRITICAL (C1): sync_from_account's add_position calls
+        # (synchronous, called right before this coroutine with no yield in
+        # between per ChatCoordinator.start()) schedule fire-and-forget
+        # None-stops persists. Those pending writers get their FIRST chance
+        # to run at this coroutine's own first await — if one reached the DB
+        # before the read just below, we'd read an all-None blob, "restore"
+        # nothing, and the unconditional re-save at the end would cement
+        # that loss. Bumping the generation HERE, before any await, retires
+        # every writer scheduled before this call synchronously (no
+        # interleaving is possible before the first await) — the same
+        # generation-check gate _persist_stops already applies (~L1209).
+        self._persist_generation += 1
+        try:
+            from services.storage_service import get_storage_service
+
+            # Belt-and-braces (verified): do NOT additionally hold
+            # _persist_lock across this read. A writer that is already
+            # mid-critical-section when this call starts (e.g. sleeping
+            # inside its own `async with self._persist_lock` before its DB
+            # write, as in the sibling delayed-WRITE race test below) has
+            # already passed its generation check — serializing this read
+            # behind that lock would make it wait for that stale write to
+            # LAND and release the lock first, so the read would observe the
+            # very corruption this fix prevents, one step removed. The
+            # generation bump above is what closes the race: a writer
+            # scheduled before this point is retired by the check inside its
+            # own `_persist_stops` (~L1209) regardless of DB timing. The
+            # corrective `_persist_stops()` call below still goes through the
+            # lock and always wins because generation=None is never stale.
+            storage = await get_storage_service()
+            blob = await storage.get_app_setting(self._STOPS_KEY)
+            if not blob:
+                return 0
+
+            data = json.loads(blob)
+            stops = data.get("stops") or {}
+            if not stops:
+                return 0
+
+            restored = 0
+            for ticker, saved in stops.items():
+                position = self._positions.get(ticker)
+                if position is None:
+                    # Not among the synced holdings — no resurrection; dropped
+                    # from the blob by the unconditional re-save below.
+                    continue
+
+                saved_stop = saved.get("stop_loss")
+                saved_take = saved.get("take_profit")
+                current_price = position.current_price
+                restored_this_ticker = False
+
+                if self._restore_stop_is_structurally_insane(
+                    current_price, saved_stop, saved_take
+                ):
+                    # Structural violation (P0-2b: polluted/stale blob) —
+                    # see `_restore_stop_is_structurally_insane`'s docstring
+                    # for the exact classification. Skip stop_loss/
+                    # take_profit/trailing_stop_pct entirely; the re-save
+                    # below drops the insane values from the blob.
+                    # take_profit_reached_at is handled separately below,
+                    # independent of this drop (G-1).
+                    logger.warning(
+                        "restore_stops_insane_dropped",
+                        ticker=ticker,
+                        stop_loss=saved_stop,
+                        take_profit=saved_take,
+                        current_price=current_price,
+                    )
+                    await self._notify_restore_stops_dropped(
+                        ticker, saved_stop, saved_take, current_price
+                    )
+                else:
+                    # G-1/D1: a saved stop_loss at-or-above the current price
+                    # is a pre-open gap that ran through an already-raised
+                    # stop, not corrupted data — preserve it verbatim and let
+                    # `_check_position`'s ordinary STOP_LOSS_HIT detection
+                    # (unchanged) fire on it the next monitor tick.
+                    if (
+                        saved_stop is not None
+                        and current_price is not None
+                        and saved_stop >= current_price
+                    ):
+                        logger.info(
+                            "gap_through_stop_restored",
+                            ticker=ticker,
+                            stop_loss=saved_stop,
+                            current_price=current_price,
+                        )
+
+                    # D1b: the symmetric favorable case — a saved take_profit
+                    # at-or-below the current price is a gap-up that ran
+                    # through an already-set target, not corrupted data.
+                    # Preserve it verbatim and let `_check_position`'s
+                    # ordinary TAKE_PROFIT_HIT detection (unchanged, and
+                    # still no auto-sell — auto_execute_take_profit=False)
+                    # fire on it the next monitor tick, which is also what
+                    # keeps the S-5 lock-in ratchet chain alive on a later
+                    # retracement.
+                    if (
+                        saved_take is not None
+                        and current_price is not None
+                        and saved_take <= current_price
+                    ):
+                        logger.info(
+                            "gap_through_tp_restored",
+                            ticker=ticker,
+                            take_profit=saved_take,
+                            current_price=current_price,
+                        )
+
+                    kwargs: Dict[str, float] = {}
+                    if position.stop_loss is None and saved_stop is not None:
+                        kwargs["stop_loss"] = saved_stop
+                    if position.take_profit is None and saved_take is not None:
+                        kwargs["take_profit"] = saved_take
+                    if (
+                        position.trailing_stop_pct is None
+                        and saved.get("trailing_stop_pct") is not None
+                    ):
+                        kwargs["trailing_stop_pct"] = saved["trailing_stop_pct"]
+
+                    if kwargs:
+                        self.update_position(ticker, **kwargs)
+                        restored_this_ticker = True
+
+                # take_profit_reached_at (S-5, independent since G-1): a
+                # plain bookkeeping timestamp, not a live order level --
+                # restored unconditionally, regardless of whether the
+                # stop_loss/take_profit fields above were structurally
+                # dropped, preserved as a gap-through, or restored normally
+                # (the field has no sanity concept of its own — it never
+                # bears on "was TP ever reached in the past"). A pre-S-5
+                # blob has no such key -- `saved.get(...)` is None -> no-op,
+                # field stays None exactly like a fresh position's default
+                # (backward compatible).
+                if (
+                    position.take_profit_reached_at is None
+                    and saved.get("take_profit_reached_at") is not None
+                ):
+                    try:
+                        position.take_profit_reached_at = datetime.fromisoformat(
+                            saved["take_profit_reached_at"]
+                        )
+                        restored_this_ticker = True
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "restore_take_profit_reached_at_invalid",
+                            ticker=ticker,
+                            value=saved.get("take_profit_reached_at"),
+                        )
+
+                if restored_this_ticker:
+                    restored += 1
+
+            # Unconditional re-save: reflects the restores above and drops any
+            # blob ticker no longer present in self._positions.
+            await self._persist_stops()
+
+            logger.info("position_manager_stops_restored", count=restored)
+            return restored
+        except Exception as e:
+            logger.error("position_manager_restore_failed", error=str(e))
+            return 0
 
 
 # -------------------------------------------

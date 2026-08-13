@@ -10,7 +10,8 @@
     "lint:fix": "eslint . --ext ts,tsx --fix",
     "format": "prettier --write \"src/**/*.{ts,tsx,css,json}\"",
     "test": "vitest",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "lint:colors": "node scripts/check-trading-colors.mjs"
   },
   "dependencies": {
     "@tailwindcss/typography": "^0.5.19",
@@ -22,6 +23,8 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
+    "react-mosaic-component": "^7.0.0-beta0",
+    "react-router-dom": "^7.18.1",
     "tailwind-merge": "^2.5.0",
     "zustand": "^5.0.0"
   },

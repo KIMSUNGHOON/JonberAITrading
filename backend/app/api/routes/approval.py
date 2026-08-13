@@ -4,17 +4,16 @@ HITL Approval API Routes
 Endpoints for human-in-the-loop trade approval workflow.
 """
 
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Optional
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
 
-from agents.graph.coin_trading_graph import get_coin_trading_graph
 from agents.graph.kr_stock_graph import get_kr_stock_trading_graph
-from agents.graph.trading_graph import get_trading_graph
-from app.api.routes.analysis import get_active_sessions
-from app.api.routes.coin import get_coin_sessions
-from app.api.routes.kr_stocks import get_kr_stock_sessions
+from app.api.routes._autonomy_injector import maybe_schedule_auto_approve
 from app.api.schemas.approval import (
     ApprovalRequest,
     ApprovalResponse,
@@ -23,6 +22,15 @@ from app.api.schemas.approval import (
     PendingProposalSummary,
 )
 from app.dependencies import get_trading_coordinator
+from services.session_manager import (
+    KIND_ANALYSIS,
+    MarketType,
+    SessionStatus,
+    commit_session_state,
+    commit_session_status,
+    get_session_manager,
+    mirror_session_status,
+)
 from services.telegram import get_telegram_notifier
 from app.api.routes.websocket import (
     broadcast_trade_executed,
@@ -39,35 +47,249 @@ router = APIRouter()
 # Approval Endpoints
 # -------------------------------------------
 
+# Per-session decision serialization. submit_decision clears
+# state["awaiting_approval"] at its START but only mirrors the final SM status
+# at its END — during a long resume (e.g. a reject-triggered re-analysis) the
+# session still lists as awaiting on the operations board (which reads the SM
+# status), so a second decision could arrive mid-flight (e.g. a cancel from a
+# reloaded tab; the FE double-submit guard is client-local). Un-serialized,
+# that cancel returned 200 "cancelled" via the zombie-cancel branch, and the
+# ORIGINAL in-flight call then finished and overwrote the SM mirror with
+# "running"/"completed" — silently orphaning the cancel (or executing a trade
+# the user was told was cancelled). The lock makes the second caller wait and
+# observe the true post-resume state. Lock entries are refcount-pruned on
+# release so the dict stays bounded by in-flight sessions, not total sessions.
+_decision_locks: dict[str, asyncio.Lock] = {}
+_decision_lock_refs: dict[str, int] = {}
 
-@router.post("/decide", response_model=ApprovalResponse)
-async def submit_approval(request: ApprovalRequest):
+
+@asynccontextmanager
+async def _session_decision_lock(session_id: str):
+    lock = _decision_locks.setdefault(session_id, asyncio.Lock())
+    _decision_lock_refs[session_id] = _decision_lock_refs.get(session_id, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        # Safe prune: refcount covers holders AND waiters — it only reaches 0
+        # when nobody else holds a reference to this lock, so popping it can
+        # never strand a waiter on a discarded lock (a later caller simply
+        # creates a fresh one). No await between release and this decrement,
+        # so no interleaving window.
+        remaining = _decision_lock_refs[session_id] - 1
+        if remaining:
+            _decision_lock_refs[session_id] = remaining
+        else:
+            del _decision_lock_refs[session_id]
+            _decision_locks.pop(session_id, None)
+
+
+async def submit_decision(
+    session_id: str,
+    decision: str,
+    feedback: str | None = None,
+    modifications: dict | None = None,
+    actor: str = "user",
+    expected_proposal_id: str | None = None,
+):
     """
-    Submit approval decision for a pending trade proposal.
+    Apply an approval decision and resume the LangGraph workflow from the
+    approval interrupt.
 
-    This resumes the LangGraph workflow from the approval interrupt.
+    Extracted from the /decide route (R3) so the autonomy injector can submit
+    decisions programmatically with actor='system'. Raises the same
+    HTTPExceptions as the route; the route is a thin wrapper (actor='user').
 
-    Args:
-        request: Approval decision with session_id and decision
+    Decisions for the same session are serialized by a per-session lock (see
+    _decision_locks above). The autonomy injector calls this only from a
+    detached asyncio task after its grace sleep — never from within this call
+    chain — so the lock cannot deadlock.
 
-    Returns:
-        Updated status after decision is processed
+    expected_proposal_id (system actor only, CRITICAL/F4b): the autonomy
+    injector's grace-window timer already checks the proposal id BEFORE
+    calling this function, but that check runs OUTSIDE the per-session lock.
+    A reject -> re-analysis cycle can replace state["trade_proposal"] with a
+    NEW id in the window between that outside check and the timer actually
+    acquiring the lock here — see _submit_decision_locked, which re-validates
+    the pin AFTER the lock is held, closing that TOCTOU race. Never passed
+    (stays None) for actor='user'.
     """
-    # Search all session types: US stock, coin, and Korean stock
-    stock_sessions = get_active_sessions()
-    coin_sessions = get_coin_sessions()
-    kr_stock_sessions = get_kr_stock_sessions()
-    session = stock_sessions.get(request.session_id) or coin_sessions.get(request.session_id) or kr_stock_sessions.get(request.session_id)
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {request.session_id} not found",
+    async with _session_decision_lock(session_id):
+        return await _submit_decision_locked(
+            session_id, decision, feedback, modifications, actor, expected_proposal_id
         )
 
-    state = session["state"]
+
+async def _submit_decision_locked(
+    session_id: str,
+    decision: str,
+    feedback: str | None = None,
+    modifications: dict | None = None,
+    actor: str = "user",
+    expected_proposal_id: str | None = None,
+):
+    # P2-5 (session-SSOT): the SessionManager (SM / "C") is now the SOLE
+    # session store for /decide -- no legacy in-memory dict ("B") merged
+    # lookup, no restart-recovery adoption fallback (that helper function
+    # was deleted by this task). By the time P2-3/P2-4 landed, the KR/coin
+    # producers had already stopped writing to B on the awaiting-approval
+    # path, so B was empty on every single call here and this function
+    # silently fell through to the SM-backed fallback every time anyway --
+    # going SM-only just makes that the one and only path instead of a
+    # fallback.
+    sm = await get_session_manager()
+    sm_session = await sm.get_session(session_id)
+
+    if sm_session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {session_id} not found",
+        )
+
+    # Live reference, not a to_legacy_dict() snapshot: sm.get_session()
+    # returns the exact AnalysisSession object the SessionManager holds in
+    # its own _sessions dict, so mutating `state` here (or calling
+    # sm.update_state / commit_session_state) reaches the real SM row
+    # directly -- there is no separate copy left to fall out of sync.
+    # sm_session.status is read live throughout this function for the same
+    # reason: any commit_session_status/mirror_session_status call (here or
+    # from a concurrent caller sharing this same object) mutates
+    # sm_session.status in place.
+    state = sm_session.state
+
+    # CRITICAL (F4b t1): re-validate the pinned proposal id INSIDE the lock.
+    # The injector's outside pre-check (see _autonomy_injector) can pass,
+    # then a reject -> re-analysis replaces state["trade_proposal"] with a
+    # NEW id before this stale timer actually acquires the per-session lock.
+    # Without this check, that timer would approve a proposal the user never
+    # saw. Scoped to actor in ('system', 'telegram') only -- user decisions
+    # never pin an id and this must never affect the user-facing /decide
+    # route. 'telegram' (TG-3, spec F1) reuses this exact pin: a remote
+    # approve/reject button also only pins "the exact proposal it showed" --
+    # the callback handler (services/telegram/callbacks.py) does its own
+    # outside-the-lock live-id prefix check before calling submit_decision,
+    # and this is the same TOCTOU-closing re-check inside the lock the
+    # injector already relies on, now shared by both system and telegram
+    # actors. actor=='system' behavior is byte-for-byte unchanged (it's
+    # still in the tuple).
+    if actor in ("system", "telegram") and expected_proposal_id is not None:
+        current_proposal_id = (state.get("trade_proposal") or {}).get("id")
+        if current_proposal_id != expected_proposal_id:
+            logger.info(
+                "auto_approve_stood_down_inside_lock",
+                session_id=session_id,
+                scheduled_for=expected_proposal_id,
+                current=current_proposal_id,
+                reason="proposal_changed",
+            )
+            return {"status": "stood_down", "reason": "proposal_changed"}
+
+        # F4b IMPORTANT-1 (belt-and-braces): the pin above only catches a
+        # REPLACED proposal (reject -> re-analysis). A route that flips the
+        # SM status without replacing the proposal or clearing
+        # state["awaiting_approval"] (the coin cancel route's bug, fixed
+        # alongside this -- see coin/analysis.py cancel route) would sail
+        # through the pin check unchanged and fall into the live approve
+        # path below, executing an order and overwriting the cancelled
+        # status. Checking sm_session.status here closes the whole class for
+        # BOTH markets against ANY status-only mutation, present or future,
+        # not just the one bug this audit found.
+        if sm_session.status != SessionStatus.AWAITING_APPROVAL:
+            logger.info(
+                "auto_approve_stood_down_inside_lock",
+                session_id=session_id,
+                scheduled_for=expected_proposal_id,
+                session_status=sm_session.status.value,
+                reason="not_awaiting",
+            )
+            return {"status": "stood_down", "reason": "not_awaiting"}
+
+    # General restart-adoption-equivalent guard: state["awaiting_approval"]
+    # can be stale-True even though the SM's own status has already moved
+    # past AWAITING_APPROVAL -- e.g. a cancel/other-terminal path that flips
+    # sm_session.status without clearing state (the "coin cancel route" bug
+    # F4b IMPORTANT-1 fixed above, present or future). Pre-P2-5, this exact
+    # shape was refused by the (now-deleted) restart-recovery adoption
+    # helper's own gate (actor-agnostic, ran for every /decide call since B
+    # was always empty) -- deleting that function does not remove the need
+    # for the check,
+    # since resuming the graph off a stale True flag here would replay a
+    # decision against a session the SM already considers settled. Placed
+    # AFTER the F4b block above so a matching system-actor pin still gets
+    # F4b's graceful stand-down dict instead of this hard 404 -- by the time
+    # we reach here, either F4b already returned (actor=='system' with a
+    # matching id) or this is the actor-agnostic fallback (chiefly the
+    # user-facing /decide route, which never pins an id).
+    if state.get("awaiting_approval") and sm_session.status != SessionStatus.AWAITING_APPROVAL:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {session_id} not found",
+        )
 
     if not state.get("awaiting_approval"):
+        if decision == "cancelled":
+            # Masquerade guard (P0-4): if this session's last recorded
+            # decision was "approved", awaiting_approval=False does NOT mean
+            # "safely settled" the way it does for a plain
+            # stale-flag/reject/cancel zombie below -- it can also mean
+            # approve resumed the graph, the execution node placed a broker
+            # order, and the process died (or a concurrent cancel raced in)
+            # before the final status commit at the end of the resume ran.
+            # In that window a real broker position may already exist.
+            # Returning 200 "cancelled" here would tell the user a possibly-
+            # executed trade was cleanly cancelled. Refuse instead -- no
+            # state mutation, no status mirror -- and make the caller
+            # confirm the actual fill before treating it as dead.
+            if state.get("approval_status") == "approved":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="실행 중일 수 있어 취소 불가 — 체결 확인 필요",
+                )
+            # I4 (F4b T4 extension): a session already TERMINAL (completed or
+            # error) has already run to its real outcome -- regardless of
+            # which decision got it there (approved AND modified both leave
+            # sm_session.status == COMPLETED; a re-analysis that blew up
+            # leaves ERROR). A late cancel arriving after that (e.g. from a
+            # reloaded tab, or racing the I3 lock) must not flip a settled
+            # outcome back to CANCELLED -- that would misreport an executed
+            # trade as never-happened, or erase a genuine failure record.
+            # Checked after the narrower approved-branch above (which has
+            # its own, more specific "확인 필요" message for the maybe-
+            # mid-flight shape); this one is a plain "already done" refusal.
+            # cancelled itself is intentionally NOT included here --
+            # re-cancelling an already-cancelled session is a harmless
+            # idempotent no-op, handled by the zombie-tolerance branch
+            # below.
+            if sm_session.status in (SessionStatus.COMPLETED, SessionStatus.ERROR):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="이미 처리됨 — 취소 불가",
+                )
+            # Cancel-zombie tolerance: the operations board lists a session
+            # as actionable off the SM row (sm_session.status ==
+            # AWAITING_APPROVAL -- checked above), but
+            # state["awaiting_approval"] can be stale/False (reject ->
+            # re-analysis cycles and mirror races desync the flag from the
+            # sm truth). Approve/reject/modified must stay fail-closed
+            # (strictness pinned above/below), but cancel executes nothing
+            # -- there is no unsafe resume to guard against -- so it must
+            # always succeed. This is a pure termination mark: no graph
+            # resume.
+            state["approval_status"] = "cancelled"
+            state["awaiting_approval"] = False
+            state.pop("auto_approve_at", None)
+            await mirror_session_status(session_id, SessionStatus.CANCELLED)
+            logger.info(
+                "approval_cancel_stale_flag_tolerated",
+                session_id=session_id,
+            )
+            return ApprovalResponse(
+                session_id=session_id,
+                decision=decision,
+                status=SessionStatus.CANCELLED.value,
+                message="Analysis cancelled by user.",
+                execution_status="cancelled",
+            )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Session is not awaiting approval",
@@ -76,8 +298,8 @@ async def submit_approval(request: ApprovalRequest):
     # Log state BEFORE approval to verify analysis results exist
     logger.info(
         "approval_state_before",
-        session_id=request.session_id,
-        decision=request.decision,
+        session_id=session_id,
+        decision=decision,
         has_technical=state.get("technical_analysis") is not None,
         has_fundamental=state.get("fundamental_analysis") is not None,
         has_sentiment=state.get("sentiment_analysis") is not None,
@@ -85,51 +307,117 @@ async def submit_approval(request: ApprovalRequest):
         state_keys=list(state.keys()),
     )
 
-    # Update state with approval decision
-    state["approval_status"] = request.decision
-    state["user_feedback"] = request.feedback
-    state["awaiting_approval"] = False
+    # P1-5 review fix (Important A): commit-first ordering. The decision is
+    # committed to the SM BEFORE it is treated as applied -- previously a
+    # separate legacy-dict copy was mutated first, so a failed commit left
+    # the session wedged: the local copy already said "decided" while the SM
+    # still showed AWAITING_APPROVAL (the SM never heard), and a retry hit
+    # the "not awaiting approval" 400 instead of being cleanly retryable.
+    # P2-5: `state` IS sm_session.state (the SM's own live dict), so
+    # commit_session_state's update_state call is the ONLY write needed
+    # here -- there is no separate local copy left to re-apply
+    # decision_updates to afterward (the old "B mutation" block is gone).
+    # Modifications are computed against a COPY of the proposal so the
+    # commit is the single point where state["trade_proposal"] actually
+    # changes.
+    updated_proposal = None
+    if decision == "modified" and state.get("trade_proposal"):
+        updated_proposal = dict(state["trade_proposal"])
+        if modifications:
+            for key, value in modifications.items():
+                if key in updated_proposal:
+                    updated_proposal[key] = value
 
-    # Apply modifications if provided (proposal is now a dict)
-    if request.decision == "modified" and request.modifications:
-        proposal = state.get("trade_proposal")
-        if proposal:
-            for key, value in request.modifications.items():
-                if key in proposal:
-                    proposal[key] = value
-                    logger.debug(
-                        "proposal_modified",
-                        session_id=request.session_id,
-                        field=key,
-                        value=value,
-                    )
+    decision_updates = {
+        "approval_status": decision,
+        "user_feedback": feedback,
+        "awaiting_approval": False,
+        "approval_actor": actor,
+        # A decision voids any pending autonomous-approval countdown (R3).
+        "auto_approve_at": None,
+    }
+    if updated_proposal is not None:
+        decision_updates["trade_proposal"] = updated_proposal
 
-    # Resume graph execution - select appropriate graph based on session type
-    if request.session_id in kr_stock_sessions:
-        graph = get_kr_stock_trading_graph()
-    elif request.session_id in coin_sessions:
-        graph = get_coin_trading_graph()
-    else:
-        graph = get_trading_graph()
-    config = {"configurable": {"thread_id": request.session_id}}
+    try:
+        await commit_session_state(session_id, decision_updates)
+    except Exception as e:
+        logger.critical(
+            "approval_decision_writethrough_failed",
+            session_id=session_id,
+            decision=decision,
+            error=str(e),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="approval state could not be persisted — retry",
+        )
+
+    # Resume graph execution - select appropriate graph based on session type.
+    #
+    # P2 (spec §P2, review CRITICAL): market discrimination must come from the
+    # SM record's market_type, NOT legacy-dict (B) membership. sm_session was
+    # already fetched above and is guaranteed non-None (the 404 branch
+    # returned earlier otherwise) -- fail-closed (no guessing) for any
+    # market_type this branch doesn't recognize.
+    #
+    # Task 3 (코인 스택 제거, 2026-08-01): MarketType은 이제 KIWOOM 하나뿐이다
+    # -- 예전에는 "인식은 되지만 코인이라 아직 거절"(410)과 "아예 모르는
+    # 시장"(400) 두 단으로 나뉘어 있었으나, 인식 가능한 값이 KIWOOM 하나로
+    # 줄어든 지금은 그 구분 자체가 사라졌다. 단일 가드로 합친다: KIWOOM이
+    # 아닌 모든 값(과거 coin 세션, 혹은 열거형 파싱에 실패해 원본 문자열로
+    # 남은 레거시 행 -- services/session_manager.py._row_to_session 참고)은
+    # 동일하게 410로 거절하고, KR 그래프는 절대 선택되지 않는다.
+    if sm_session.market_type != MarketType.KIWOOM:
+        market_label = (
+            sm_session.market_type.value
+            if isinstance(sm_session.market_type, MarketType)
+            else sm_session.market_type
+        )
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=f"지원하지 않는 시장입니다: {market_label}",
+        )
+    graph = get_kr_stock_trading_graph()
+    market = "kiwoom"
+    config = {"configurable": {"thread_id": session_id}}
 
     execution_status = None
 
+    # Inject the human decision INTO the persisted graph checkpoint, THEN resume
+    # with astream(None). Passing the dict to astream() instead RESTARTS the graph
+    # from its entry node (re-running the whole analysis) rather than resuming from
+    # the approval interrupt — so aupdate_state + astream(None) is the correct
+    # LangGraph resume, and it also lets should_continue_*_execution see
+    # approval_status (the old astream(None)-without-update routed to 'end').
+    resume_update = {
+        "approval_status": decision,
+        "user_feedback": feedback,
+        "awaiting_approval": False,
+        "approval_actor": actor,
+    }
+
     try:
-        # Continue from interrupt with updated state
+        await graph.aupdate_state(config, resume_update)
+        # Continue from the interrupt (decision already applied to graph
+        # state). `state` IS sm_session.state (live), so sm.update_state is
+        # the single write per node: it applies node_output to state,
+        # flushes to SQLite (sync for critical keys, debounced otherwise),
+        # and notifies WS subscribers all in one call (P2-5: replaces the
+        # old `state.update(node_output)` + `mirror_session_state(...)`
+        # pair -- there is no separate local copy left to update first).
         async for event in graph.astream(None, config):
             for node_name, node_output in event.items():
                 if node_name != "__end__":
-                    if isinstance(node_output, dict):
-                        state.update(node_output)
-                    session["last_node"] = node_name
+                    state_updates = node_output if isinstance(node_output, dict) else {}
+                    await sm.update_state(session_id, state_updates, last_node=node_name)
 
         # Track allocation result for response message
         allocation_rationale = None
 
         # Update session status based on decision
-        if request.decision == "approved":
-            session["status"] = "completed"
+        if decision == "approved":
+            final_status = SessionStatus.COMPLETED
             execution_status = state.get("execution_status", "completed")
 
             # Connect to auto-trading system
@@ -138,9 +426,12 @@ async def submit_approval(request: ApprovalRequest):
                 try:
                     coordinator = await get_trading_coordinator()
 
-                    # Get ticker and stock name from session
-                    ticker = session.get("stk_cd") or session.get("ticker") or session.get("market")
-                    stock_name = session.get("stk_nm") or session.get("stock_name")
+                    # Ticker/display-name: sourced from the SM row's own
+                    # market-specific fields (only one of stk_cd/market is
+                    # populated depending on market_type; korean_name covers
+                    # the coin shape stk_nm never had).
+                    ticker = sm_session.stk_cd or sm_session.ticker or sm_session.market
+                    stock_name = sm_session.stk_nm or sm_session.korean_name
 
                     # Extract proposal data
                     action = proposal.get("action", "HOLD")
@@ -153,7 +444,7 @@ async def submit_approval(request: ApprovalRequest):
                         synthesis = state.get("synthesis", {})
 
                         coordinator.add_to_watch_list(
-                            session_id=request.session_id,
+                            session_id=session_id,
                             ticker=ticker,
                             stock_name=stock_name,
                             signal=technical.get("signal", "hold"),
@@ -169,63 +460,141 @@ async def submit_approval(request: ApprovalRequest):
 
                         logger.info(
                             "watch_list_added",
-                            session_id=request.session_id,
+                            session_id=session_id,
                             ticker=ticker,
                             stock_name=stock_name,
                         )
                         allocation_rationale = f"Added {stock_name or ticker} to Watch List"
 
-                    # Handle BUY/SELL actions - send to trade queue
-                    elif action in ("BUY", "SELL") and ticker:
-                        allocation = await coordinator.on_trade_approved(
-                            session_id=request.session_id,
-                            ticker=ticker,
-                            stock_name=stock_name,
-                            action=action,
-                            entry_price=proposal.get("entry_price", 0),
-                            stop_loss=proposal.get("stop_loss"),
-                            take_profit=proposal.get("take_profit"),
-                            risk_score=int(proposal.get("risk_score", 5) * 10),  # Convert 0-1 to 1-10
-                            quantity_override=proposal.get("quantity"),
+                    # Handle BUY/SELL/ADD/REDUCE - the graph execution node is the
+                    # SOLE executor: should_continue_*_execution -> "execute" already
+                    # placed the order above (mock-gated by KIWOOM_IS_MOCK / Upbit
+                    # paper mode). The coordinator is intentionally NOT called here to
+                    # avoid double execution.
+                    elif action in ("BUY", "SELL", "ADD", "REDUCE") and ticker:
+                        exec_status = state.get("execution_status", "completed")
+                        allocation_rationale = (
+                            f"{action} executed via trading graph ({exec_status})"
                         )
 
-                        # Store rationale for response message
-                        allocation_rationale = allocation.rationale
-
                         logger.info(
-                            "auto_trading_connected",
-                            session_id=request.session_id,
+                            "graph_execution_result",
+                            session_id=session_id,
                             ticker=ticker,
                             action=action,
-                            quantity=allocation.quantity,
-                            rationale=allocation.rationale,
+                            execution_status=exec_status,
                         )
 
                 except Exception as e:
                     logger.error(
                         "auto_trading_connection_failed",
-                        session_id=request.session_id,
+                        session_id=session_id,
                         error=str(e),
                     )
                     # Don't fail the approval, just log the error
 
-        elif request.decision == "rejected":
-            # Re-analysis requested - session continues running
-            session["status"] = "running"
-            execution_status = "re_analyzing"
-        elif request.decision == "cancelled":
+        elif decision == "rejected":
+            # Re-analysis requested. The resume above ran the graph back to
+            # either the approval interrupt (new proposal awaiting) or the
+            # end.
+            new_proposal_awaiting = bool(
+                state.get("awaiting_approval") and not state.get("approval_status")
+            )
+            if new_proposal_awaiting:
+                # 재분석이 새 제안으로 다시 인터럽트에 도달 — status를 producer
+                # 경로와 동일하게 정합시키고 injector를 재암한다 (B3; 기존
+                # 제안 ID 피닝이 이중 승인을 방지). 게이트 deny/hitl이면
+                # maybe_schedule_auto_approve가 아무것도 쓰지 않는다(plain HITL).
+                #
+                # P1-5 review fix (Important B): commit-first ordering --
+                # commit_session_status(AWAITING_APPROVAL) must land (1
+                # retry) BEFORE the timer is scheduled. The pre-fix code
+                # scheduled the 60s auto-approve timer unconditionally,
+                # ahead of the shared final-status commit far below -- if
+                # THAT commit then failed, the timer was already armed
+                # against an SM row that never learned about this
+                # transition: a live violation of the core invariant ("SM
+                # 기록 실패 시 schedule 절대 금지"), since a brief SM
+                # recovery could let the timer fire an autonomous order for
+                # a transition nobody could see. market already resolved
+                # from sm_session.market_type at the graph-selection site
+                # above -- reused here, no re-derivation.
+                last_error: Optional[Exception] = None
+                for _attempt in range(2):
+                    try:
+                        await commit_session_status(session_id, SessionStatus.AWAITING_APPROVAL)
+                        last_error = None
+                        break
+                    except Exception as e:
+                        last_error = e
+                if last_error is not None:
+                    logger.critical(
+                        "approval_rearm_writethrough_failed",
+                        session_id=session_id,
+                        error=str(last_error),
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="approval state could not be persisted — retry",
+                    )
+
+                final_status = SessionStatus.AWAITING_APPROVAL
+                execution_status = "awaiting_approval"
+                # P2-6: maybe_schedule_auto_approve resolves the session
+                # itself via a live sm.get_session() call -- no snapshot or
+                # view object to pass here at all (retires the P2-5
+                # _SmSessionView shim, which existed only to bridge this
+                # call site's still-dict-shaped call).
+                await maybe_schedule_auto_approve(session_id, market)
+            else:
+                final_status = SessionStatus.RUNNING
+                execution_status = "re_analyzing"
+        elif decision == "cancelled":
             # User cancelled the workflow
-            session["status"] = "cancelled"
+            final_status = SessionStatus.CANCELLED
             execution_status = "cancelled"
         else:
             # modified
-            session["status"] = "completed"
+            final_status = SessionStatus.COMPLETED
             execution_status = state.get("execution_status", "completed")
+
+        # Belt-and-braces on top of the per-session lock (which serializes
+        # decisions within this process): if approval_status was flipped to
+        # "cancelled" underneath the resume (direct state mutation from another
+        # worker sharing this state dict), preserve the cancel instead of
+        # overwriting the final status with running/completed.
+        if decision != "cancelled" and state.get("approval_status") == "cancelled":
+            logger.warning(
+                "approval_final_status_preserves_concurrent_cancel",
+                session_id=session_id,
+                decision=decision,
+            )
+            final_status = SessionStatus.CANCELLED
+            execution_status = "cancelled"
+
+        # Commit the final status to the SessionManager (completed/running/
+        # cancelled). P1-5: write-through -- for a decision that may already
+        # have executed a broker order (approved/modified), a silently
+        # swallowed commit failure here would leave the SM showing a stale
+        # AWAITING_APPROVAL status for a session that is actually done.
+        try:
+            await commit_session_status(session_id, final_status)
+        except Exception as e:
+            logger.critical(
+                "approval_final_status_writethrough_failed",
+                session_id=session_id,
+                status=final_status.value,
+                error=str(e),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="approval state could not be persisted — retry",
+            )
 
         # Log state AFTER approval to verify analysis results are preserved
         logger.info(
             "approval_state_after",
-            session_id=request.session_id,
+            session_id=session_id,
             has_technical=state.get("technical_analysis") is not None,
             has_fundamental=state.get("fundamental_analysis") is not None,
             has_sentiment=state.get("sentiment_analysis") is not None,
@@ -235,20 +604,20 @@ async def submit_approval(request: ApprovalRequest):
 
         logger.info(
             "approval_processed",
-            session_id=request.session_id,
-            final_status=session["status"],
+            session_id=session_id,
+            final_status=final_status.value,
             execution_status=execution_status,
         )
 
         # Send notifications (Telegram + WebSocket)
         proposal = state.get("trade_proposal", {})
-        ticker = session.get("stk_cd") or session.get("ticker") or session.get("market", "")
-        stock_name = session.get("stk_nm") or session.get("stock_name", ticker)
+        ticker = sm_session.stk_cd or sm_session.ticker or sm_session.market or ""
+        stock_name = sm_session.stk_nm or sm_session.korean_name or ticker
         action = proposal.get("action", "BUY")
 
         # WebSocket broadcast for real-time UI updates
         try:
-            if request.decision == "approved":
+            if decision == "approved":
                 if action == "WATCH":
                     technical = state.get("technical_analysis", {})
                     await broadcast_watch_added(
@@ -257,18 +626,41 @@ async def submit_approval(request: ApprovalRequest):
                         signal=technical.get("signal", "hold"),
                         confidence=technical.get("confidence", 0.5),
                         current_price=proposal.get("entry_price", 0),
-                        session_id=request.session_id,
+                        session_id=session_id,
                     )
                 elif action in ("BUY", "SELL"):
-                    # Check if trade was queued or executed immediately
-                    if allocation_rationale and "queued" in allocation_rationale.lower():
+                    # I5: honest wording keyed off the graph's real
+                    # execution_status (set above at the top of this
+                    # decision=='approved' branch) instead of the previous
+                    # "queued" substring check on allocation_rationale, which
+                    # never actually matched anything allocation_rationale
+                    # produces (it always reads "... executed via trading
+                    # graph (<status>)") -- so BUY/SELL always fell through to
+                    # broadcast_trade_executed/send_trade_executed even when
+                    # the order only placed and never confirmed a fill, or
+                    # outright failed. Never claim a fill that didn't happen.
+                    if execution_status == "placed_pending_fill":
+                        order_response = state.get("order_response") or {}
+                        ord_no = order_response.get("ord_no")
                         await broadcast_trade_queued(
                             ticker=ticker,
                             stock_name=stock_name,
                             action=action,
                             quantity=proposal.get("quantity", 0),
                             price=proposal.get("entry_price", 0),
-                            session_id=request.session_id,
+                            expected_execution=(
+                                f"접수, 체결 대기 (주문번호: {ord_no})"
+                                if ord_no
+                                else "접수, 체결 대기"
+                            ),
+                            session_id=session_id,
+                        )
+                    elif execution_status == "failed":
+                        await broadcast_trade_rejected(
+                            ticker=ticker,
+                            stock_name=stock_name,
+                            reason=state.get("error") or "주문 실행 실패",
+                            session_id=session_id,
                         )
                     else:
                         await broadcast_trade_executed(
@@ -278,14 +670,14 @@ async def submit_approval(request: ApprovalRequest):
                             quantity=proposal.get("quantity", 0),
                             price=proposal.get("entry_price", 0),
                             total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
-                            session_id=request.session_id,
+                            session_id=session_id,
                         )
-            elif request.decision == "rejected":
+            elif decision == "rejected":
                 await broadcast_trade_rejected(
                     ticker=ticker,
                     stock_name=stock_name,
-                    reason=request.feedback,
-                    session_id=request.session_id,
+                    reason=feedback,
+                    session_id=session_id,
                 )
         except Exception as we:
             logger.warning("websocket_broadcast_failed", error=str(we))
@@ -294,7 +686,7 @@ async def submit_approval(request: ApprovalRequest):
         try:
             telegram = await get_telegram_notifier()
             if telegram.is_ready:
-                if request.decision == "approved":
+                if decision == "approved":
                     # WATCH action sends watch list notification
                     if action == "WATCH":
                         technical = state.get("technical_analysis", {})
@@ -308,61 +700,109 @@ async def submit_approval(request: ApprovalRequest):
                             target_price=int(proposal.get("entry_price", 0)) if proposal.get("entry_price") else None,
                             risk_score=int(risk.get("risk_score", 5)),
                         )
-                    # BUY/SELL actions send trade executed notification
+                    # BUY/SELL actions: honest wording keyed off execution_status
+                    # (see the matching WS branch above for why -- same
+                    # "queued" dead-check replaced).
                     elif action in ("BUY", "SELL"):
-                        await telegram.send_trade_executed(
-                            ticker=ticker,
-                            stock_name=stock_name,
-                            action=action,
-                            quantity=proposal.get("quantity", 0),
-                            price=proposal.get("entry_price", 0),
-                            total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
-                        )
-                elif request.decision == "rejected":
+                        if execution_status == "placed_pending_fill":
+                            order_response = state.get("order_response") or {}
+                            await telegram.send_trade_pending(
+                                ticker=ticker,
+                                stock_name=stock_name,
+                                action=action,
+                                quantity=proposal.get("quantity", 0),
+                                ord_no=order_response.get("ord_no"),
+                            )
+                        elif execution_status == "failed":
+                            await telegram.send_trade_rejected(
+                                ticker=ticker,
+                                stock_name=stock_name,
+                                reason=state.get("error") or "주문 실행 실패",
+                            )
+                        else:
+                            # 정정(2026-07-30 리뷰): 이 브랜치는 그래프 실행
+                            # 노드(agents/graph/kr_stock_nodes/execution.py)가
+                            # 직접 record_trade_fill을 호출하는 경로다(위
+                            # 461행 주석대로 코디네이터는 이중 실행을 피하려고
+                            # 여기서 의도적으로 호출되지 않는다) —
+                            # ExecutionCoordinator._record_fill_ledger를 전혀
+                            # 거치지 않으므로 여기서 지우면 HITL 승인 체결이
+                            # 무통지가 된다. 제거했던 호출을 복원한다.
+                            await telegram.send_trade_executed(
+                                ticker=ticker,
+                                stock_name=stock_name,
+                                action=action,
+                                quantity=proposal.get("quantity", 0),
+                                price=proposal.get("entry_price", 0),
+                                total_amount=proposal.get("quantity", 0) * proposal.get("entry_price", 0),
+                                source="HITL 승인",
+                            )
+                elif decision == "rejected":
                     await telegram.send_trade_rejected(
                         ticker=ticker,
                         stock_name=stock_name,
-                        reason=request.feedback or "User rejected the proposal",
+                        reason=feedback or "User rejected the proposal",
                     )
         except Exception as te:
             logger.warning("telegram_notification_failed", error=str(te))
 
+    except HTTPException:
+        # P1-5: a deliberate fail-loud raise (SM write-through failures
+        # above) must propagate with its own status/detail -- the generic
+        # handler below must not rewrap it into a 500.
+        raise
     except Exception as e:
         logger.error(
             "approval_processing_failed",
-            session_id=request.session_id,
+            session_id=session_id,
             error=str(e),
         )
-        session["status"] = "error"
-        session["error"] = str(e)
+        await mirror_session_status(session_id, SessionStatus.ERROR, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process approval: {str(e)}",
         )
 
     # Build response message
-    if request.decision == "approved":
+    if decision == "approved":
         if allocation_rationale and "watch list" in allocation_rationale.lower():
             message = f"{allocation_rationale}"
-        elif allocation_rationale and "queued" in allocation_rationale.lower():
-            message = f"Trade approved. {allocation_rationale}"
+        # I5: honest wording off the real execution_status -- replaces a
+        # "queued" substring check that never matched (allocation_rationale
+        # never contains that word), which meant this always fell through to
+        # "executed successfully" regardless of whether the order filled.
+        elif execution_status == "placed_pending_fill":
+            message = "Trade approved and order placed — fill pending confirmation."
+        elif execution_status == "failed":
+            message = "Trade approved but execution failed."
         else:
             message = "Trade approved and executed successfully."
-    elif request.decision == "rejected":
+    elif decision == "rejected":
         message = "Trade rejected. Re-analyzing with your feedback..."
-    elif request.decision == "cancelled":
+    elif decision == "cancelled":
         message = "Analysis cancelled by user."
     else:  # modified
         message = "Trade modified and executed with changes."
 
     return ApprovalResponse(
-        session_id=request.session_id,
-        decision=request.decision,
-        status=session["status"],
+        session_id=session_id,
+        decision=decision,
+        status=final_status.value,
         message=message,
         execution_status=execution_status,
     )
 
+
+@router.post("/decide", response_model=ApprovalResponse)
+async def submit_approval(request: ApprovalRequest):
+    """HITL decide endpoint — thin wrapper over submit_decision (actor='user')."""
+    return await submit_decision(
+        request.session_id,
+        request.decision,
+        feedback=request.feedback,
+        modifications=request.modifications,
+        actor="user",
+    )
 
 @router.get("/pending", response_model=PendingApprovalsResponse)
 async def list_pending_approvals():
@@ -372,11 +812,16 @@ async def list_pending_approvals():
     Returns:
         List of pending approvals with trade proposal details
     """
-    # Combine all session types: US stock, coin, and Korean stock
-    stock_sessions = get_active_sessions()
-    coin_sessions = get_coin_sessions()
-    kr_stock_sessions = get_kr_stock_sessions()
-    all_sessions = {**stock_sessions, **coin_sessions, **kr_stock_sessions}
+    # P1 (session-SSOT): the SessionManager is the sole read source --
+    # legacy in-memory dicts were retired in P3-1.
+    # P4-1: kind='analysis' only -- a discussion (or other non-analysis
+    # producer) session sharing the SM store must never be listed as a
+    # pending trade approval here.
+    sm = await get_session_manager()
+    sm_sessions = await sm.get_all_sessions(kind=KIND_ANALYSIS)
+    all_sessions = {
+        sid: s.to_legacy_dict() for sid, s in sm_sessions.items()
+    }
     pending = []
 
     for session_id, session in all_sessions.items():
@@ -437,11 +882,10 @@ async def get_pending_approval(session_id: str):
     Returns:
         Detailed trade proposal and analyses
     """
-    # Search all session types: US stock, coin, and Korean stock
-    stock_sessions = get_active_sessions()
-    coin_sessions = get_coin_sessions()
-    kr_stock_sessions = get_kr_stock_sessions()
-    session = stock_sessions.get(session_id) or coin_sessions.get(session_id) or kr_stock_sessions.get(session_id)
+    # P1 (session-SSOT): SM-only lookup -- see list_pending_approvals above
+    # for the same read path.
+    sm = await get_session_manager()
+    session = await sm.get_session_dict(session_id)
 
     if not session:
         raise HTTPException(

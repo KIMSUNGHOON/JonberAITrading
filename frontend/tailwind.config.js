@@ -7,27 +7,39 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Trading colors
-        'bull': {
-          DEFAULT: '#22c55e',
-          light: '#4ade80',
-          dark: '#16a34a',
-        },
-        'bear': {
-          DEFAULT: '#ef4444',
-          light: '#f87171',
-          dark: '#dc2626',
-        },
-        // Dark theme colors
-        'surface': {
-          DEFAULT: '#1e1e2e',
-          light: '#2a2a3e',
-          dark: '#141420',
-        },
-        'border': {
-          DEFAULT: '#3a3a4e',
-          light: '#4a4a5e',
-        },
+        // ── Dense Terminal Shell: single dark ramp ──
+        canvas: '#0b0e11',   // app background
+        card: '#161a1f',     // panels / blotters / tables
+        elevated: '#1c222a', // modals, popovers, hover rows
+        hairline: '#242c37', // 1px borders & dividers
+        ink: '#e8ecf1',      // primary text
+        muted: '#7b8794',    // secondary text / labels / axis
+        dim: '#565e6b',      // tertiary / disabled / placeholder
+        accent: '#f0b90b',   // the ONE accent — focus ring, active tab, primary CTA
+        // Trading direction tokens — use for directional P&L TEXT (never a raw
+        // green/red badge fill that could misread). Status/level tints
+        // (bg-up/warn/down + /NN opacity) are OK.
+        up: '#0ecb81',       // price up (Western green=up)
+        down: '#f6465d',     // price down
+        warn: '#f0a63a',     // genuine warnings only — NOT hold
+        info: '#4b9fff',
+        // Migration aliases — keep names alive so 353 raw green/red + 250 surface
+        // sites don't break in one commit; per-file cleanup lands after.
+        'bull': { DEFAULT: '#0ecb81', light: '#0ecb81', dark: '#0ecb81' },
+        'bear': { DEFAULT: '#f6465d', light: '#f6465d', dark: '#f6465d' },
+        'surface': { DEFAULT: '#161a1f', light: '#1c222a', dark: '#0b0e11' },
+        'border': { DEFAULT: '#242c37', light: '#242c37' },
+      },
+      borderRadius: {
+        // Collapse radius globally to a 6px cap (de-card): rounded-xl/2xl soften
+        // with ZERO per-file edits.
+        DEFAULT: '4px',
+        sm: '3px',
+        md: '4px',
+        lg: '6px',
+        xl: '6px',
+        '2xl': '6px',
+        '3xl': '6px',
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],

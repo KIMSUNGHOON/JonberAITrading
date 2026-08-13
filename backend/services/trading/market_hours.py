@@ -1,18 +1,16 @@
 """
 Market Hours Service
 
-Provides market open/close time checking for different markets.
-Supports Korean stocks (KRX) and cryptocurrency (24/7).
+Provides market open/close time checking for Korean stocks (KRX).
 
 Updated to use dynamic KRX holiday data from KRXHolidayService.
 
 Also provides KRX tick size (호가 단위) calculation functions.
 """
 
-from datetime import datetime, time, date, timedelta
+from datetime import datetime, time, date, timedelta, timezone
 from enum import Enum
 from typing import NamedTuple, Optional, Set
-import pytz
 
 import structlog
 
@@ -22,9 +20,6 @@ logger = structlog.get_logger()
 class MarketType(str, Enum):
     """Supported market types"""
     KRX = "krx"          # Korea Exchange (Korean stocks)
-    CRYPTO = "crypto"    # Cryptocurrency (24/7)
-    NYSE = "nyse"        # New York Stock Exchange
-    NASDAQ = "nasdaq"    # NASDAQ
 
 
 class MarketSession(NamedTuple):
@@ -36,9 +31,20 @@ class MarketSession(NamedTuple):
     message: str
 
 
-# Korea timezone
-KST = pytz.timezone("Asia/Seoul")
-EST = pytz.timezone("America/New_York")
+# Korea timezone — stdlib 고정 오프셋을 쓴다.
+#
+# pytz 객체(`pytz.timezone("Asia/Seoul")`)를 쓰면 안 된다. pytz는 `tzinfo=`나
+# `.replace(tzinfo=...)`로 직접 붙이는 용법을 지원하지 않고, 그렇게 붙이면 그 존의
+# **최초 역사적 오프셋**인 LMT `+08:28`이 적용된다. 이 파일은 경계 시각을
+# `datetime.combine(..., tzinfo=KST)`로 만들기 때문에 정확히 그 함정에 빠져,
+# 2026-08-03 라이브에서 `next_close`가 `15:30+08:28`로 나가고 카운트다운이 32분
+# 초과됐다(`datetime.now(KST)`만 멀쩡했던 이유는 pytz가 `fromutc()`는 제대로
+# 구현하기 때문이다).
+#
+# 고정 오프셋이 안전한 이유: 한국은 1988년 이후 서머타임이 없다. 그리고 이 관용구는
+# `services/kiwoom/auth.py`·`services/kiwoom/models.py`가 이미 쓰고 있어 레포 전체가
+# 하나로 통일된다.
+KST = timezone(timedelta(hours=9))
 
 
 class MarketHoursService:
@@ -47,54 +53,106 @@ class MarketHoursService:
 
     Supports:
     - KRX: 09:00-15:30 KST (Mon-Fri, excluding holidays)
-    - Crypto: 24/7
-    - NYSE/NASDAQ: 09:30-16:00 EST (Mon-Fri, excluding holidays)
 
     Note: KRX holidays are now dynamically loaded from KRXHolidayService.
     Fallback to hardcoded holidays if service is unavailable.
     """
 
-    # Fallback Korean public holidays (used when KRXHolidayService unavailable)
-    FALLBACK_HOLIDAYS = {
-        # 2025
-        date(2025, 1, 1),   # New Year
-        date(2025, 1, 28),  # Lunar New Year
-        date(2025, 1, 29),
-        date(2025, 1, 30),
-        date(2025, 3, 1),   # Independence Movement Day
-        date(2025, 5, 5),   # Children's Day
-        date(2025, 5, 6),   # Buddha's Birthday (substitute)
-        date(2025, 6, 6),   # Memorial Day
-        date(2025, 8, 15),  # Liberation Day
-        date(2025, 10, 3),  # National Foundation Day
-        date(2025, 10, 5),  # Chuseok Eve
-        date(2025, 10, 6),  # Chuseok
-        date(2025, 10, 7),  # Chuseok
-        date(2025, 10, 8),  # Substitute
-        date(2025, 10, 9),  # Hangul Day
-        date(2025, 12, 25), # Christmas
-        date(2025, 12, 31), # Year End
-        # 2026
-        date(2026, 1, 1),   # New Year
-        date(2026, 2, 16),  # Lunar New Year
-        date(2026, 2, 17),
-        date(2026, 2, 18),
-        date(2026, 3, 1),   # Independence Movement Day
-        date(2026, 5, 5),   # Children's Day
-        date(2026, 5, 24),  # Buddha's Birthday
-        date(2026, 6, 6),   # Memorial Day
-        date(2026, 8, 15),  # Liberation Day
-        date(2026, 9, 24),  # Chuseok
-        date(2026, 9, 25),
-        date(2026, 9, 26),
-        date(2026, 10, 3),  # National Foundation Day
-        date(2026, 10, 9),  # Hangul Day
-        date(2026, 12, 25), # Christmas
-        date(2026, 12, 31), # Year End
-    }
+    # KRXHolidayService를 못 쓸 때만 쓰이는 폴백 휴장일 집합.
+    #
+    # ⚠️ 예전에는 여기에 날짜를 **손으로 적은 사본**이 있었고, krx_holiday의
+    # 하드코딩 표와 **똑같은 결손**을 갖고 있었다(2026-08-11 실측):
+    #   2026-03-02 · 2026-05-25 · 2026-08-17 · 2026-10-05 (대체공휴일 전부)
+    #   2025-03-03 (삼일절 대체공휴일)
+    # 사본이 둘이면 어긋날 때 어느 쪽이 맞는지 알 수 없고, 실제로 둘 다
+    # 같은 방식으로 틀려 있었다. 그래서 사본을 없애고 **같은 규칙 엔진에서
+    # 파생**시킨다.
+    #
+    # import는 **함수 안에서** 한다 -- 아래 `_get_holiday_service`가 순환
+    # import를 피하려 그러는 것과 같은 자리다.
+    #
+    # ⚠️ 지연의 효과를 정확히 적어 둔다: `from services.krx_holiday.fetcher
+    # import ...`도 패키지 `__init__`을 먼저 실행하므로 **apscheduler를
+    # 피하지는 못한다**(초판 주석이 이 메커니즘을 틀리게 적었다). 실제
+    # 효과는 import 시점을 모듈 로드에서 **첫 사용 시점으로 미루는 것**이고,
+    # 그래서 순환 import가 성립하지 않는다.
+    _fallback_cache: Optional[Set[date]] = None
+
+    @classmethod
+    def fallback_years(cls) -> list:
+        """폴백이 파생할 연도 창 -- **오늘을 따라 움직인다**.
+
+        예전에는 krx_holiday의 손입력 표 키(2024·2025·2026 고정)를 그대로
+        썼다. 그 표가 계산으로 바뀐 지금 그 목록은 존재하지 않고, 설령
+        있었어도 2027년 1월에 창이 통째로 말라붙었을 것이다.
+
+        `올해-1 ~ 올해+2`인 이유: 폴백은 프로세스 수명 동안 한 번만
+        파생되므로 연말에 기동해도 다음 해가 들어 있어야 하고(+2),
+        직전 해는 EOD 소급 조회가 밟는다(-1).
+        """
+        this_year = datetime.now(KST).year
+        return list(range(this_year - 1, this_year + 3))
+
+    @classmethod
+    def fallback_holidays(cls) -> Set[date]:
+        """폴백 휴장일 -- krx_holiday의 규칙 엔진에서 1회 파생 후 캐시.
+
+        ⚠️ **실패는 캐시하지 않는다.** 예전에는 `except`를 지나서도 캐시에
+        빈 집합이 들어가, 일시적 실패 한 번이 프로세스 수명 내내 폴백
+        휴장일을 비웠다(휴장일 0개 = 모든 평일이 거래일). 실패해도 예외는
+        내지 않는다 -- 그 경우 주말 규칙만 남고 호출자는 계속 동작한다.
+
+        ⚠️ **연도 루프는 한 해씩 격리한다.** 창이 음력 계산 상한(2050)을
+        넘기 시작하는 2049년부터는 창의 마지막 해가 반드시 실패하는데,
+        하나의 try로 묶여 있으면 그 한 해 때문에 폴백 **전체**가 빈 집합이
+        된다. 부분 달력을 조용히 내지 않는다는 원칙은 **한 연도 안**에서
+        지켜지는 것이고, 창은 원래부터 일부 연도만 담는다.
+        """
+        if cls._fallback_cache is not None:
+            return cls._fallback_cache
+
+        derived: Set[date] = set()
+        failed: list = []
+        try:
+            from services.krx_holiday.fetcher import KRXHolidayFetcher
+
+            fetcher = KRXHolidayFetcher()
+            for year in cls.fallback_years():
+                try:
+                    derived.update(h.date for h in fetcher._get_known_holidays(year))
+                except Exception as e:
+                    failed.append(f"{year}: {e}")
+        except Exception as e:
+            logger.error(
+                "market_hours_fallback_holidays_unavailable",
+                error=str(e),
+                hint="휴장일 폴백이 비었다 -- 주말 규칙만 적용된다. "
+                     "캐시하지 않으므로 다음 호출에서 재시도한다.",
+            )
+            return derived  # 캐시하지 않는다 -- 다음 호출에서 다시 시도
+
+        if failed:
+            logger.error(
+                "market_hours_fallback_year_unavailable",
+                years=failed,
+                hint="해당 연도의 휴장일이 폴백에서 빠졌다 -- 그 해 평일은 "
+                     "전부 거래일로 보인다. 나머지 연도는 정상 파생됐다.",
+            )
+
+        if not derived:
+            logger.error(
+                "market_hours_fallback_holidays_unavailable",
+                error="; ".join(failed) or "no years derived",
+                hint="휴장일 폴백이 비었다 -- 주말 규칙만 적용된다. "
+                     "캐시하지 않으므로 다음 호출에서 재시도한다.",
+            )
+            return derived  # 캐시하지 않는다
+
+        cls._fallback_cache = derived
+        return cls._fallback_cache
 
     def __init__(self):
-        self._holiday_cache: Set[date] = set(self.FALLBACK_HOLIDAYS)
+        self._holiday_cache: Set[date] = set(self.fallback_holidays())
         self._holiday_service = None
         self._holiday_service_checked = False
 
@@ -180,12 +238,8 @@ class MarketHoursService:
         """
         now = datetime.now(KST)
 
-        if market == MarketType.CRYPTO:
-            return self._get_crypto_session(now)
-        elif market == MarketType.KRX:
+        if market == MarketType.KRX:
             return self._get_krx_session(now)
-        elif market in (MarketType.NYSE, MarketType.NASDAQ):
-            return self._get_us_session(now, market)
         else:
             return MarketSession(
                 is_open=False,
@@ -198,16 +252,6 @@ class MarketHoursService:
     def is_market_open(self, market: MarketType) -> bool:
         """Quick check if market is currently open."""
         return self.get_market_session(market).is_open
-
-    def _get_crypto_session(self, now: datetime) -> MarketSession:
-        """Crypto market is always open."""
-        return MarketSession(
-            is_open=True,
-            current_time=now,
-            next_open=None,
-            next_close=None,
-            message="Cryptocurrency market is open 24/7"
-        )
 
     def _get_krx_session(self, now: datetime) -> MarketSession:
         """
@@ -288,63 +332,6 @@ class MarketHoursService:
             next_open=None,
             next_close=today_close,
             message=f"Market open. Closes at 15:30 KST ({self._time_until(now, today_close)} remaining)"
-        )
-
-    def _get_us_session(self, now: datetime, market: MarketType) -> MarketSession:
-        """
-        US market trading hours:
-        - Regular session: 09:30-16:00 EST
-        """
-        now_est = now.astimezone(EST)
-        today = now_est.date()
-        weekday = now_est.weekday()
-
-        # Weekend check
-        if weekday >= 5:
-            next_monday = today + timedelta(days=(7 - weekday))
-            next_open = datetime.combine(next_monday, time(9, 30), tzinfo=EST)
-            return MarketSession(
-                is_open=False,
-                current_time=now,
-                next_open=next_open.astimezone(KST),
-                next_close=None,
-                message=f"{market.value.upper()} closed (Weekend)"
-            )
-
-        market_open = time(9, 30)
-        market_close = time(16, 0)
-        current_time = now_est.time()
-
-        if current_time < market_open:
-            next_open = datetime.combine(today, market_open, tzinfo=EST)
-            return MarketSession(
-                is_open=False,
-                current_time=now,
-                next_open=next_open.astimezone(KST),
-                next_close=None,
-                message=f"{market.value.upper()} opens at 09:30 EST"
-            )
-
-        if current_time > market_close:
-            next_day = today + timedelta(days=1)
-            while next_day.weekday() >= 5:
-                next_day += timedelta(days=1)
-            next_open = datetime.combine(next_day, market_open, tzinfo=EST)
-            return MarketSession(
-                is_open=False,
-                current_time=now,
-                next_open=next_open.astimezone(KST),
-                next_close=None,
-                message=f"{market.value.upper()} closed (After hours)"
-            )
-
-        today_close = datetime.combine(today, market_close, tzinfo=EST)
-        return MarketSession(
-            is_open=True,
-            current_time=now,
-            next_open=None,
-            next_close=today_close.astimezone(KST),
-            message=f"{market.value.upper()} open. Closes at 16:00 EST"
         )
 
     def _time_until(self, now: datetime, target: datetime) -> str:
@@ -554,3 +541,38 @@ def get_market_hours_service() -> MarketHoursService:
     if _market_hours_service is None:
         _market_hours_service = MarketHoursService()
     return _market_hours_service
+
+
+# -------------------------------------------
+# KRX open TTL cache (E2-1)
+# -------------------------------------------
+# Shared no-op-cycle gate consumed by services/agent_chat/coordinator.py
+# (_check_watch_list) and services/agent_chat/position_manager.py
+# (_check_strategic_reeval, _check_all_positions) — and, per E2-2, the
+# RiskMonitor 1s loop. Those call sites would otherwise re-derive market
+# state (weekday/holiday/session-time math) on every tick; a short
+# monotonic TTL keeps that cheap without ever going stale for more than
+# ttl_seconds.
+
+_krx_open_cache: dict = {"at": 0.0, "value": False}
+
+
+def is_krx_open_cached(ttl_seconds: float = 30.0) -> bool:
+    """KRX 개장 여부의 TTL 캐시 판정 (E2 no-op-cycle 게이트 공용).
+
+    RiskMonitor의 1s 루프까지 이 판정을 쓰므로 매 호출 공휴일 서비스를
+    재조회하지 않도록 monotonic TTL로 묶는다. 판정 소스는
+    get_market_hours_service().is_market_open(MarketType.KRX) 단일.
+    """
+    import time
+    now = time.monotonic()
+    if now - _krx_open_cache["at"] > ttl_seconds:
+        _krx_open_cache["value"] = get_market_hours_service().is_market_open(MarketType.KRX)
+        _krx_open_cache["at"] = now
+    return _krx_open_cache["value"]
+
+
+def _reset_krx_open_cache() -> None:
+    """테스트 전용: 캐시 무효화."""
+    _krx_open_cache["at"] = 0.0
+

@@ -4,20 +4,13 @@ Settings API Routes
 Endpoints for managing application settings including API keys.
 """
 
-import os
 from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
 
-from app.api.schemas.settings import (
-    SettingsResponse,
-    UpbitApiKeyRequest,
-    UpbitApiKeyResponse,
-    UpbitApiKeyStatus,
-    UpbitValidateResponse,
-)
+from app.api.schemas.settings import SettingsResponse
 from app.api.schemas.kr_stocks import (
     KiwoomApiKeyRequest,
     KiwoomApiKeyResponse,
@@ -25,20 +18,12 @@ from app.api.schemas.kr_stocks import (
     KiwoomValidationResponse,
 )
 from app.config import settings
-from services.upbit import UpbitClient
 
 logger = structlog.get_logger()
 router = APIRouter()
 
 # In-memory storage for runtime API keys (not persisted across restarts)
 # For production, use secure storage (environment variables, secrets manager, etc.)
-_runtime_upbit_keys: dict[str, Optional[str]] = {
-    "access_key": None,
-    "secret_key": None,
-    "last_validated": None,
-    "is_valid": None,
-}
-
 _runtime_kiwoom_keys: dict[str, Optional[str]] = {
     "app_key": None,
     "secret_key": None,
@@ -49,35 +34,11 @@ _runtime_kiwoom_keys: dict[str, Optional[str]] = {
 }
 
 
-def get_upbit_access_key() -> Optional[str]:
-    """Get Upbit access key from runtime storage or environment."""
-    return _runtime_upbit_keys.get("access_key") or settings.UPBIT_ACCESS_KEY
-
-
-def get_upbit_secret_key() -> Optional[str]:
-    """Get Upbit secret key from runtime storage or environment."""
-    return _runtime_upbit_keys.get("secret_key") or settings.UPBIT_SECRET_KEY
-
-
 def mask_key(key: Optional[str]) -> Optional[str]:
     """Mask API key for display (show first 4 chars + ****)."""
     if not key or len(key) < 8:
         return None
     return f"{key[:4]}****{key[-4:]}"
-
-
-def get_upbit_status() -> UpbitApiKeyStatus:
-    """Get current Upbit API key status."""
-    access_key = get_upbit_access_key()
-    is_configured = bool(access_key and get_upbit_secret_key())
-
-    return UpbitApiKeyStatus(
-        is_configured=is_configured,
-        access_key_masked=mask_key(access_key) if access_key else None,
-        trading_mode=settings.UPBIT_TRADING_MODE,
-        is_valid=_runtime_upbit_keys.get("is_valid"),
-        last_validated=_runtime_upbit_keys.get("last_validated"),
-    )
 
 
 # -------------------------------------------
@@ -91,10 +52,9 @@ async def get_settings_status():
     Get current application settings status.
 
     Returns:
-        Settings status including API key configurations
+        Settings status (LLM provider/model, market data mode)
     """
     return SettingsResponse(
-        upbit=get_upbit_status(),
         llm_provider=settings.LLM_PROVIDER,
         llm_model=settings.LLM_MODEL,
         market_data_mode=settings.MARKET_DATA_MODE,
@@ -102,114 +62,52 @@ async def get_settings_status():
 
 
 # -------------------------------------------
-# Upbit API Key Endpoints
+# Trading Mode (Autonomous | HITL) — R3
 # -------------------------------------------
 
-
-@router.get("/upbit", response_model=UpbitApiKeyStatus)
-async def get_upbit_api_status():
-    """
-    Get Upbit API key configuration status.
-
-    Returns:
-        API key status with masked key for security
-    """
-    return get_upbit_status()
+from typing import Literal
+from pydantic import BaseModel
 
 
-@router.post("/upbit", response_model=UpbitApiKeyResponse)
-async def update_upbit_api_keys(request: UpbitApiKeyRequest):
-    """
-    Update Upbit API keys.
+class TradingModeResponse(BaseModel):
+    """Per-market trading mode + the autonomy master gate state."""
+    kiwoom: Literal["hitl", "autonomous"]
+    master_enabled: bool
 
-    Keys are stored in runtime memory. For persistence across restarts,
-    set UPBIT_ACCESS_KEY and UPBIT_SECRET_KEY in environment variables.
 
-    Args:
-        request: New API keys
+class TradingModeUpdate(BaseModel):
+    """Set one market's trading mode."""
+    market: Literal["kiwoom"]
+    mode: Literal["hitl", "autonomous"]
 
-    Returns:
-        Success status and updated configuration
-    """
-    logger.info("upbit_api_keys_updated")
 
-    # Store in runtime
-    _runtime_upbit_keys["access_key"] = request.access_key
-    _runtime_upbit_keys["secret_key"] = request.secret_key
-    _runtime_upbit_keys["is_valid"] = None  # Reset validation
-    _runtime_upbit_keys["last_validated"] = None
+async def _trading_mode_response() -> TradingModeResponse:
+    from services.storage_service import get_storage_service
 
-    return UpbitApiKeyResponse(
-        success=True,
-        message="API keys updated. Use /settings/upbit/validate to verify.",
-        status=get_upbit_status(),
+    storage = await get_storage_service()
+    return TradingModeResponse(
+        kiwoom=await storage.get_app_setting("trading_mode:kiwoom", "hitl"),
+        master_enabled=settings.AUTONOMY_ENABLED,
     )
 
 
-@router.post("/upbit/validate", response_model=UpbitValidateResponse)
-async def validate_upbit_api_keys():
-    """
-    Validate Upbit API keys by attempting to fetch account info.
-
-    Returns:
-        Validation result with account count if successful
-    """
-    access_key = get_upbit_access_key()
-    secret_key = get_upbit_secret_key()
-
-    if not access_key or not secret_key:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="API keys not configured. Set keys first.",
-        )
-
-    try:
-        async with UpbitClient(access_key=access_key, secret_key=secret_key) as client:
-            accounts = await client.get_accounts()
-
-            # Update validation status
-            _runtime_upbit_keys["is_valid"] = True
-            _runtime_upbit_keys["last_validated"] = datetime.now(timezone.utc)
-
-            logger.info("upbit_api_keys_validated", account_count=len(accounts))
-
-            return UpbitValidateResponse(
-                is_valid=True,
-                message=f"API keys validated. Found {len(accounts)} account(s).",
-                account_count=len(accounts),
-            )
-
-    except Exception as e:
-        _runtime_upbit_keys["is_valid"] = False
-        _runtime_upbit_keys["last_validated"] = datetime.now(timezone.utc)
-
-        logger.error("upbit_api_keys_invalid", error=str(e))
-
-        return UpbitValidateResponse(
-            is_valid=False,
-            message=f"API key validation failed: {str(e)}",
-            account_count=None,
-        )
+@router.get("/trading-mode", response_model=TradingModeResponse)
+async def get_trading_mode():
+    """Get per-market Autonomous|HITL mode (persisted; default hitl)."""
+    return await _trading_mode_response()
 
 
-@router.delete("/upbit")
-async def clear_upbit_api_keys():
-    """
-    Clear Upbit API keys from runtime storage.
+@router.put("/trading-mode", response_model=TradingModeResponse)
+async def set_trading_mode(update: TradingModeUpdate):
+    """Set one market's trading mode. The autonomy gate additionally requires
+    AUTONOMY_ENABLED and paper mode — this toggle alone never enables live
+    autonomous trading."""
+    from services.storage_service import get_storage_service
 
-    Note: This only clears runtime keys. Environment variables remain unchanged.
-
-    Returns:
-        Success confirmation
-    """
-    _runtime_upbit_keys["access_key"] = None
-    _runtime_upbit_keys["secret_key"] = None
-    _runtime_upbit_keys["is_valid"] = None
-    _runtime_upbit_keys["last_validated"] = None
-
-    logger.info("upbit_api_keys_cleared")
-
-    return {"message": "API keys cleared from runtime storage."}
+    storage = await get_storage_service()
+    await storage.set_app_setting(f"trading_mode:{update.market}", update.mode)
+    logger.info("trading_mode_updated", market=update.market, mode=update.mode)
+    return await _trading_mode_response()
 
 
 # -------------------------------------------
@@ -371,82 +269,3 @@ async def clear_kiwoom_api_keys():
     return {"message": "Kiwoom API keys cleared from runtime storage."}
 
 
-# -------------------------------------------
-# Cache Statistics Endpoints
-# -------------------------------------------
-
-
-@router.get("/cache/stats")
-async def get_cache_stats():
-    """
-    Get cache statistics for all cache layers.
-
-    Returns:
-        Cache statistics including L1 (memory) and L2 (Redis) stats
-    """
-    from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
-
-    stats = {
-        "kiwoom": None,
-        "multi_tier": None,
-        "redis_url_configured": bool(settings.REDIS_URL),
-    }
-
-    # Kiwoom cache stats
-    try:
-        client = await get_shared_kiwoom_client_async()
-        if client and hasattr(client, '_cache'):
-            stats["kiwoom"] = client._cache.stats
-    except Exception as e:
-        logger.warning("Failed to get Kiwoom cache stats", error=str(e))
-
-    # Multi-tier cache stats
-    try:
-        from services.cache import get_cache_service
-        cache = await get_cache_service()
-        stats["multi_tier"] = cache.get_stats().to_dict()
-    except Exception as e:
-        logger.warning("Failed to get multi-tier cache stats", error=str(e))
-
-    return stats
-
-
-@router.post("/cache/clear")
-async def clear_cache(pattern: str = "*"):
-    """
-    Clear cache entries matching pattern.
-
-    Args:
-        pattern: Key pattern to match (default: "*" clears all)
-
-    Returns:
-        Number of entries cleared
-    """
-    cleared = 0
-
-    # Clear Kiwoom cache
-    try:
-        from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
-        client = await get_shared_kiwoom_client_async()
-        if client and hasattr(client, '_cache'):
-            if pattern == "*":
-                cleared += await client._cache.clear_async()
-            else:
-                # Clear matching keys
-                for key in list(client._cache._cache.keys()):
-                    if pattern in key:
-                        await client._cache.delete_async(key)
-                        cleared += 1
-    except Exception as e:
-        logger.warning("Failed to clear Kiwoom cache", error=str(e))
-
-    # Clear multi-tier cache
-    try:
-        from services.cache import get_cache_service
-        cache = await get_cache_service()
-        cleared += await cache.clear(pattern)
-    except Exception as e:
-        logger.warning("Failed to clear multi-tier cache", error=str(e))
-
-    logger.info("cache_cleared", pattern=pattern, cleared=cleared)
-    return {"pattern": pattern, "cleared": cleared}

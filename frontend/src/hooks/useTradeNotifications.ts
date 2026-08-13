@@ -6,6 +6,7 @@
  */
 
 import { useEffect, useRef, useCallback, useState } from 'react';
+import { ManagedSocket } from '@/api/wsCore';
 
 // -------------------------------------------
 // Types
@@ -17,13 +18,18 @@ export type TradeNotificationType =
   | 'trade_rejected'
   | 'watch_added'
   | 'stop_loss_triggered'
-  | 'take_profit_triggered';
+  | 'take_profit_triggered'
+  | 'eod_summary';
 
 export interface TradeNotification {
   type: TradeNotificationType;
   data: {
-    ticker: string;
-    stock_name: string;
+    // eod_summary (E3-5) carries no ticker/position -- it's an account-wide
+    // broadcast (see broadcast_eod_summary in app/api/routes/websocket.py),
+    // so these two are optional rather than the historical "always present"
+    // assumption of the other 6 types.
+    ticker?: string;
+    stock_name?: string;
     action?: string;
     quantity?: number;
     price?: number;
@@ -39,9 +45,57 @@ export interface TradeNotification {
     pnl?: number;
     pnl_percent?: number;
     session_id?: string;
+    // eod_summary-only fields (E3-5). See broadcast_eod_summary's FE
+    // contract docstring for the exact shape.
+    trade_date?: string;
+    headline?: string;
+    has_narrative?: boolean;
     timestamp: string;
   };
 }
+
+/**
+ * Single source of truth for "every known TradeNotificationType" — the WS
+ * dispatch allowlist in `handleMessage` below consumes this array instead of
+ * hardcoding a second, independently-maintained list. Before this fix the
+ * two lists could silently drift apart: the type union type-checks on its
+ * own, so adding an 8th type to `TradeNotificationType` without also
+ * remembering to touch the allowlist compiled cleanly while silently
+ * dropping every real WS frame of the new type (exactly what happened with
+ * `eod_summary` during E3-5 review).
+ *
+ * `as const satisfies readonly TradeNotificationType[]` keeps each element's
+ * literal type (needed for the exhaustiveness check right below) while still
+ * verifying every element is a valid TradeNotificationType.
+ */
+export const ALL_NOTIFICATION_TYPES = [
+  'trade_executed',
+  'trade_queued',
+  'trade_rejected',
+  'watch_added',
+  'stop_loss_triggered',
+  'take_profit_triggered',
+  'eod_summary',
+] as const satisfies readonly TradeNotificationType[];
+
+// Compile-time drift guard, the OTHER direction from the `satisfies` above:
+// catches a new TradeNotificationType member that was never added to
+// ALL_NOTIFICATION_TYPES. `_MissingTypes` is `never` iff every union member
+// is covered; the `[X] extends [never]` tuple wrapping avoids TS's
+// distributive-conditional-over-never special case (a naked
+// `X extends never ? ... : ...` always collapses to `never` when X IS
+// `never`, which would defeat this check). If a type ever goes missing,
+// `_ExhaustivenessCheck` resolves to a descriptive tuple instead of `true`,
+// and the `const` assignment below fails to compile.
+type _MissingNotificationTypes = Exclude<TradeNotificationType, (typeof ALL_NOTIFICATION_TYPES)[number]>;
+type _ExhaustivenessCheck = [_MissingNotificationTypes] extends [never]
+  ? true
+  : ['ALL_NOTIFICATION_TYPES is missing member(s) of TradeNotificationType:', _MissingNotificationTypes];
+// Exported (not just a bare local) so tsc's noUnusedLocals doesn't flag this
+// compile-time-only assertion as dead code — the value is always literally
+// `true` at runtime; its only job is to fail `tsc --noEmit` if the type
+// above ever resolves to the "missing member" branch.
+export const ALL_NOTIFICATION_TYPES_ARE_EXHAUSTIVE: _ExhaustivenessCheck = true;
 
 export interface UseTradeNotificationsOptions {
   onNotification?: (notification: TradeNotification) => void;
@@ -72,10 +126,7 @@ export function useTradeNotifications(
     autoConnect = true,
   } = options;
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const pingIntervalRef = useRef<number | null>(null);
-  const reconnectAttemptsRef = useRef(0);
-  const isClosingRef = useRef(false);
+  const socketRef = useRef<ManagedSocket | null>(null);
 
   const [isConnected, setIsConnected] = useState(false);
   const [notifications, setNotifications] = useState<TradeNotification[]>([]);
@@ -91,52 +142,21 @@ export function useTradeNotifications(
     onDisconnectRef.current = onDisconnect;
   }, [onNotification, onConnect, onDisconnect]);
 
-  const getWebSocketUrl = useCallback(() => {
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = import.meta.env.VITE_WS_URL || `${wsProtocol}//${window.location.host}`;
-    return `${wsHost}/ws/trade-notifications`;
-  }, []);
-
-  const startPingInterval = useCallback(() => {
-    if (pingIntervalRef.current) {
-      clearInterval(pingIntervalRef.current);
-    }
-    pingIntervalRef.current = window.setInterval(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send('ping');
-      }
-    }, 25000);
-  }, []);
-
-  const stopPingInterval = useCallback(() => {
-    if (pingIntervalRef.current) {
-      clearInterval(pingIntervalRef.current);
-      pingIntervalRef.current = null;
-    }
-  }, []);
-
-  const handleMessage = useCallback((event: MessageEvent) => {
-    if (event.data === 'pong') return;
-
+  // Heartbeat replies are swallowed by the core.
+  const handleMessage = useCallback((raw: string) => {
     try {
-      const message = JSON.parse(event.data);
+      const message = JSON.parse(raw);
 
       // Skip heartbeat and connected messages
       if (message.type === 'heartbeat' || message.type === 'connected') {
         return;
       }
 
-      // Handle trade notification types
-      const notificationTypes: TradeNotificationType[] = [
-        'trade_executed',
-        'trade_queued',
-        'trade_rejected',
-        'watch_added',
-        'stop_loss_triggered',
-        'take_profit_triggered',
-      ];
-
-      if (notificationTypes.includes(message.type)) {
+      // Handle trade notification types — consumes the shared
+      // ALL_NOTIFICATION_TYPES constant (see its docstring above) rather
+      // than a second hardcoded list, so this allowlist can't drift out of
+      // sync with TradeNotificationType again.
+      if (ALL_NOTIFICATION_TYPES.includes(message.type)) {
         const notification: TradeNotification = {
           type: message.type,
           data: message.data,
@@ -150,78 +170,44 @@ export function useTradeNotifications(
     }
   }, []);
 
-  const handleReconnect = useCallback(() => {
-    const maxAttempts = 10;
-    const baseDelay = 1000;
-
-    if (reconnectAttemptsRef.current >= maxAttempts) {
-      console.error('[TradeNotifications] Max reconnection attempts reached');
-      return;
-    }
-
-    const delay = Math.min(baseDelay * Math.pow(2, reconnectAttemptsRef.current), 30000);
-    console.log(`[TradeNotifications] Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1})`);
-
-    setTimeout(() => {
-      reconnectAttemptsRef.current++;
-      connect();
-    }, delay);
-  }, []);
-
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+    if (socketRef.current?.isConnected()) {
       console.warn('[TradeNotifications] Already connected');
       return;
     }
 
-    isClosingRef.current = false;
-    const url = getWebSocketUrl();
-    console.log('[TradeNotifications] Connecting to:', url);
+    // Drop any stale socket (e.g. one still backing off) before replacing it.
+    socketRef.current?.disconnect();
 
-    try {
-      const ws = new WebSocket(url);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        console.log('[TradeNotifications] Connected');
-        reconnectAttemptsRef.current = 0;
+    // Policy values preserved from the pre-core implementation:
+    // max 10 attempts, 1s base delay, 30s backoff cap, 25s heartbeat.
+    const socket = new ManagedSocket({
+      path: '/ws/trade-notifications',
+      label: 'TradeNotifications',
+      maxReconnectAttempts: 10,
+      baseReconnectDelayMs: 1000,
+      reconnectCapMs: 30000,
+      pingIntervalMs: 25000,
+      onOpen: () => {
         setIsConnected(true);
-        startPingInterval();
         onConnectRef.current?.();
-      };
-
-      ws.onclose = (event) => {
-        console.log('[TradeNotifications] Disconnected:', event.code, event.reason);
-        stopPingInterval();
+      },
+      onClose: () => {
         setIsConnected(false);
         onDisconnectRef.current?.();
+      },
+      onMessage: handleMessage,
+    });
 
-        if (!isClosingRef.current) {
-          handleReconnect();
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error('[TradeNotifications] Error:', error);
-      };
-
-      ws.onmessage = handleMessage;
-    } catch (error) {
-      console.error('[TradeNotifications] Connection error:', error);
-      handleReconnect();
-    }
-  }, [getWebSocketUrl, startPingInterval, stopPingInterval, handleMessage, handleReconnect]);
+    socketRef.current = socket;
+    socket.connect();
+  }, [handleMessage]);
 
   const disconnect = useCallback(() => {
-    isClosingRef.current = true;
-    stopPingInterval();
-
-    if (wsRef.current) {
-      wsRef.current.close(1000, 'Client disconnect');
-      wsRef.current = null;
-    }
+    socketRef.current?.disconnect();
+    socketRef.current = null;
     setIsConnected(false);
-  }, [stopPingInterval]);
+  }, []);
 
   const clearNotifications = useCallback(() => {
     setNotifications([]);
@@ -274,6 +260,11 @@ export function formatNotificationMessage(notification: TradeNotification): stri
     case 'take_profit_triggered':
       return `${name} 익절 발동 @ ${data.trigger_price?.toLocaleString()}원 (수익: ${data.pnl_percent?.toFixed(1)}%)`;
 
+    case 'eod_summary':
+      // 계정 단위 브로드캐스트 -- ticker/stock_name이 없으므로 위 `name`은
+      // 쓰지 않는다. 제목("장마감 요약")+본문(headline)을 한 줄로 합성.
+      return `장마감 요약${data.trade_date ? ` (${data.trade_date})` : ''}: ${data.headline ?? '데이터 없음'}`;
+
     default:
       return `${name}: 알림`;
   }
@@ -294,6 +285,9 @@ export function getNotificationSeverity(
     case 'stop_loss_triggered':
     case 'trade_rejected':
       return 'warning';
+
+    case 'eod_summary':
+      return 'info';
 
     default:
       return 'info';

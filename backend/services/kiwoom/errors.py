@@ -51,6 +51,22 @@ class KiwoomErrorCode:
     RATE_LIMIT_EXCEEDED = -903
 
 
+# 실서버가 반환하는 양수 return_code 체계 (공식 Kiwoom-REST-API kiwoom/core/errors.py).
+# 위 KiwoomErrorCode의 음수 값들은 이 클라이언트가 합성하는 내부 코드로,
+# 서버 응답에는 존재하지 않는다 — 서버 코드 분류는 반드시 아래 세트로 판정한다.
+RATE_LIMIT_CODES = frozenset({1700})
+INVALID_TOKEN_CODES = frozenset({8003, 8005, 8006, 8009, 8015, 8016})
+INVALID_CREDENTIAL_CODES = frozenset({8001, 8002, 8011, 8012})
+MODE_MISMATCH_CODES = frozenset({8030, 8031})
+
+# 유량(rate-limit) 초과를 전용 코드(1700/-903)가 아니라 일반 코드(예: 5)로
+# 감싸고 실제 사유를 return_msg에 중첩해 반환하는 경우를 식별하는 메시지
+# 마커 (is_token_expired와 동일한 중첩 패턴). 오탐 방지를 위해 이 두
+# 문구만 사용한다 — 다른 코드-5 오류(예: 종목코드 오류)와 겹치지 않는
+# 명확한 유량초과 전용 표현.
+RATE_LIMIT_MSG_MARKERS = ("유량", "허용된 요청 개수")
+
+
 # 에러 코드 -> 메시지 매핑
 ERROR_MESSAGES: dict[int, str] = {
     KiwoomErrorCode.SUCCESS: "정상 처리되었습니다",
@@ -117,6 +133,43 @@ class KiwoomError(Exception):
         super().__init__(error_str)
 
     @property
+    def is_rate_limit(self) -> bool:
+        """레이트리밋 에러인지 확인 (서버 1700/-903, 또는 유량초과를 일반
+        코드(예: 5)로 감싸고 실제 사유를 return_msg에 중첩해 반환하는
+        경우 — is_token_expired와 동일한 중첩 패턴)."""
+        if self.code in RATE_LIMIT_CODES or self.code == KiwoomErrorCode.RATE_LIMIT_EXCEEDED:
+            return True
+        msg = self.message or ""
+        return any(marker in msg for marker in RATE_LIMIT_MSG_MARKERS)
+
+    @property
+    def is_token_expired(self) -> bool:
+        """토큰 만료/무효 — 재발급 후 재시도 대상.
+
+        Kiwoom는 토큰 무효를 최상위 return_code로 주기도 하지만(8005 등),
+        일반 인증실패 코드(예: 3)로 감싸고 실제 8005를 return_msg 문자열에
+        중첩해 반환하기도 한다(라이브 관측:
+        "인증에 실패했습니다[8005:Token이 유효하지 않습니다]"). 후자를 코드로만
+        판정하면 놓쳐 client._request의 재발급-재시도가 안 떠 죽은 토큰이 무한
+        전송된다. 따라서 코드뿐 아니라 메시지에 중첩된 토큰-무효 코드/문구도
+        감지한다. (오탐이 나더라도 재발급-재시도 1회는 멱등·무해.)
+        """
+        if self.code in INVALID_TOKEN_CODES or self.code == KiwoomErrorCode.TOKEN_EXPIRED:
+            return True
+        msg = self.message or ""
+        # 메시지에 중첩된 토큰-무효 코드(예: "[8005:...]")
+        if any(str(code) in msg for code in INVALID_TOKEN_CODES):
+            return True
+        # 코드 없이 문구만 오는 경우 대비
+        token_phrases = (
+            "Token이 유효하지 않",
+            "토큰이 유효하지 않",
+            "유효하지 않은 접근토큰",
+            "접근토큰이 만료",
+        )
+        return any(p in msg for p in token_phrases)
+
+    @property
     def is_retryable(self) -> bool:
         """재시도 가능한 에러인지 확인"""
         retryable_codes = {
@@ -126,12 +179,16 @@ class KiwoomError(Exception):
             KiwoomErrorCode.RATE_LIMIT_EXCEEDED,
             KiwoomErrorCode.SYSTEM_ERROR,
         }
-        return self.code in retryable_codes
+        return self.code in retryable_codes or self.is_rate_limit or self.is_token_expired
 
     @property
     def is_auth_error(self) -> bool:
-        """인증 관련 에러인지 확인"""
-        return -199 <= self.code <= -100
+        """인증 관련 에러인지 확인 (서버 8001-8016 또는 내부 합성 코드)"""
+        return (
+            self.code in INVALID_TOKEN_CODES
+            or self.code in INVALID_CREDENTIAL_CODES
+            or -199 <= self.code <= -100
+        )
 
     @property
     def is_order_error(self) -> bool:

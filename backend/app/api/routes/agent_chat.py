@@ -16,9 +16,12 @@ from services.agent_chat import (
     get_chat_coordinator,
     ChatSession,
     AgentMessage,
+    MessageType,
     SessionStatus,
     DecisionAction,
 )
+from services.agent_chat.coordinator import register_room_created_hook
+from services.agent_chat.models import DEFAULT_AGENT_WEIGHTS
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/agent-chat", tags=["Agent Group Chat"])
@@ -91,11 +94,16 @@ class CoordinatorStatusResponse(BaseModel):
     total_sessions: int
     check_interval_minutes: int
     max_concurrent_discussions: int
+    # Additive (P1-3 loop-liveness): timestamp of the last executed watch-list
+    # tick. is_running alone can't tell a healthy loop from a dead scheduler
+    # that never reset its running flag — the FE compares this against
+    # check_interval_minutes to detect staleness. None until the first tick.
+    last_check_at: Optional[str] = None
 
 
 class StartCoordinatorRequest(BaseModel):
     """Request to start the coordinator."""
-    check_interval_minutes: int = Field(default=5, ge=1, le=60)
+    check_interval_minutes: int = Field(default=1, ge=1, le=60)
     max_concurrent_discussions: int = Field(default=3, ge=1, le=10)
 
 
@@ -104,21 +112,12 @@ class StartCoordinatorRequest(BaseModel):
 # -------------------------------------------
 
 
-def _session_to_summary(session: ChatSession) -> dict:
-    """Convert session to summary dict."""
-    return {
-        "id": session.id,
-        "ticker": session.ticker,
-        "stock_name": session.stock_name,
-        "status": session.status.value,
-        "started_at": session.started_at.isoformat() if session.started_at else None,
-        "ended_at": session.ended_at.isoformat() if session.ended_at else None,
-        "total_messages": len(session.all_messages),
-        "total_rounds": len(session.rounds),
-        "consensus_level": session.consensus_level,
-        "decision_action": session.decision.action.value if session.decision else None,
-        "decision_confidence": session.decision.confidence if session.decision else None,
-    }
+# Phase4: models.py DEFAULT_AGENT_WEIGHTS에서 파생(드리프트 클래스 제거,
+# final-review Fix4) — 세션 실가중(session.agent_weights, 캘리브레이션 틸트)
+# 이 있으면 그것이 우선이고, 이 dict는 세션에 접근할 수 없는 호출부의
+# 폴백으로만 쓰인다. moderator는 투표하지 않으므로 DEFAULT_AGENT_WEIGHTS에
+# 키가 없다 — 여기서만 0.0으로 명시 추가.
+_AGENT_WEIGHTS = {t.value: w for t, w in DEFAULT_AGENT_WEIGHTS.items()} | {"moderator": 0.0}
 
 
 def _session_to_detail(session: ChatSession) -> dict:
@@ -153,30 +152,45 @@ def _session_to_detail(session: ChatSession) -> dict:
             }
             for m in session.all_messages
         ],
-        "votes": [
-            {
-                "agent_type": v.agent_type.value,
-                "vote": v.vote.value,
-                "confidence": v.confidence,
-                "weight": v.weight,
-                "weighted_score": v.weighted_score,
-                "reasoning": v.reasoning,
-            }
-            for v in session.votes
-        ],
+        "votes": [_vote_to_dict(v, session.agent_weights) for v in session.votes],
         "consensus_level": session.consensus_level,
-        "decision": {
-            "action": session.decision.action.value,
-            "confidence": session.decision.confidence,
-            "consensus_level": session.decision.consensus_level,
-            "entry_price": session.decision.entry_price,
-            "stop_loss": session.decision.stop_loss,
-            "take_profit": session.decision.take_profit,
-            "quantity": session.decision.quantity,
-            "key_factors": session.decision.key_factors,
-            "dissenting_opinions": session.decision.dissenting_opinions,
-            "rationale": session.decision.rationale,
-        } if session.decision else None,
+        "decision": _decision_to_dict(session.decision) if session.decision else None,
+    }
+
+
+def _vote_to_dict(vote, weights: Optional[dict] = None) -> dict:
+    """Convert a vote to the dict shape the FE expects (REST detail + WS frame).
+
+    Phase4: `weights` is the session's real (possibly calibration-tilted)
+    agent_weights when the caller has access to the session; a session-real
+    weight always wins over the static `_AGENT_WEIGHTS` mirror fallback.
+    """
+    weight = (weights or {}).get(vote.agent_type.value)
+    if weight is None:
+        weight = _AGENT_WEIGHTS.get(vote.agent_type.value, 0.25)
+    return {
+        "agent_type": vote.agent_type.value,
+        "vote": vote.vote.value,
+        "confidence": vote.confidence,
+        "weight": weight,
+        "weighted_score": round(weight * vote.confidence, 4),
+        "reasoning": vote.reasoning,
+    }
+
+
+def _decision_to_dict(decision) -> dict:
+    """Convert a decision to the dict shape the FE expects (REST detail + WS frame)."""
+    return {
+        "action": decision.action.value,
+        "confidence": decision.confidence,
+        "consensus_level": decision.consensus_level,
+        "entry_price": decision.entry_price,
+        "stop_loss": decision.stop_loss,
+        "take_profit": decision.take_profit,
+        "quantity": decision.quantity,
+        "key_factors": decision.key_factors,
+        "dissenting_opinions": decision.dissenting_opinions,
+        "rationale": decision.rationale,
     }
 
 
@@ -208,12 +222,21 @@ async def get_coordinator_status():
     """
     coordinator = await get_chat_coordinator()
 
+    # Defensive isinstance check: test doubles (MagicMock) auto-vivify any
+    # attribute access, so `getattr(..., None)` isn't enough to detect "never
+    # ticked" — only a real datetime should ever be serialized.
+    last_tick = getattr(coordinator, "_last_tick", None)
+    last_check_at = last_tick.isoformat() if isinstance(last_tick, datetime) else None
+
     return CoordinatorStatusResponse(
         is_running=coordinator._running,
         active_discussions=len(coordinator._active_rooms),
-        total_sessions=len(coordinator._session_history),
+        # P4-4 (session-ssot): the durable ledger count, not the retired
+        # in-memory _session_history's len().
+        total_sessions=await coordinator.count_total_sessions(),
         check_interval_minutes=coordinator.check_interval,
         max_concurrent_discussions=coordinator.max_concurrent,
+        last_check_at=last_check_at,
     )
 
 
@@ -281,8 +304,9 @@ async def start_discussion(request: StartDiscussionRequest):
     """
     Start a manual discussion for a stock.
 
-    Triggers agents to analyze and discuss the stock immediately.
-    The discussion runs synchronously and returns the completed session.
+    The discussion runs in the BACKGROUND and this returns immediately with
+    the session id — connect to /agent-chat/ws/{session_id} (or poll the
+    session detail) to follow it live.
     """
     try:
         coordinator = await get_chat_coordinator()
@@ -304,7 +328,7 @@ async def start_discussion(request: StartDiscussionRequest):
             stock_name=session.stock_name,
             status=session.status.value,
             started_at=session.started_at.isoformat() if session.started_at else "",
-            message=f"Discussion completed for {request.stock_name}",
+            message=f"Discussion started for {request.stock_name}",
         )
 
     except ValueError as e:
@@ -357,10 +381,13 @@ async def get_sessions(
         List of session summaries
     """
     coordinator = await get_chat_coordinator()
-    sessions = coordinator.get_session_history(limit=limit, ticker=ticker)
+    # P4-4 (session-ssot): the coordinator now returns pre-built summary
+    # dicts (merged SM + ledger) -- a ledger-only row has no full ChatSession
+    # to build one from without parsing its transcript JSON per list row.
+    sessions = await coordinator.get_session_history(limit=limit, ticker=ticker)
 
     return {
-        "sessions": [_session_to_summary(s) for s in sessions],
+        "sessions": sessions,
         "count": len(sessions),
     }
 
@@ -373,7 +400,7 @@ async def get_session_detail(session_id: str):
     Includes all messages, votes, and decision details.
     """
     coordinator = await get_chat_coordinator()
-    session = coordinator.get_session_by_id(session_id)
+    session = await coordinator.get_session_by_id(session_id)
 
     if not session:
         raise HTTPException(
@@ -392,7 +419,7 @@ async def get_session_messages(session_id: str):
     Returns messages in chronological order.
     """
     coordinator = await get_chat_coordinator()
-    session = coordinator.get_session_by_id(session_id)
+    session = await coordinator.get_session_by_id(session_id)
 
     if not session:
         raise HTTPException(
@@ -414,7 +441,7 @@ async def get_session_decision(session_id: str):
     Returns decision details including rationale and key factors.
     """
     coordinator = await get_chat_coordinator()
-    session = coordinator.get_session_by_id(session_id)
+    session = await coordinator.get_session_by_id(session_id)
 
     if not session:
         raise HTTPException(
@@ -473,13 +500,19 @@ class ConnectionManager:
                 del self.active_connections[session_id]
 
     async def send_message(self, session_id: str, message: dict):
-        """Send a message to all clients watching a session."""
-        if session_id in self.active_connections:
-            for connection in self.active_connections[session_id]:
-                try:
-                    await connection.send_json(message)
-                except Exception:
-                    pass
+        """Send a message to all clients watching a session.
+
+        Iterates a COPY (a disconnecting client mutates the live list mid-await)
+        and prunes sockets whose send fails so dead entries don't accumulate.
+        """
+        dead: list[WebSocket] = []
+        for connection in list(self.active_connections.get(session_id, [])):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                dead.append(connection)
+        for connection in dead:
+            self.disconnect(connection, session_id)
 
     async def broadcast_status(self, session_id: str, status: str, session: dict):
         """Broadcast status change to all clients."""
@@ -494,12 +527,59 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+def _wire_room_to_websocket(room) -> None:
+    """
+    Wire a ChatRoom's callbacks to the WS ConnectionManager.
+
+    Registered as a room-created hook so EVERY room (watch-list auto path and
+    manual /discuss) pushes frames in the exact shapes the FE hook
+    (useAgentChatWebSocket) already expects: 'message' (+ a derived 'vote'
+    frame on VOTE messages) and 'status_change' (+ a derived 'decision' frame
+    once DECIDED — session.finalize runs before the DECIDED emit).
+    """
+    session_id = room.session.id
+
+    async def _forward_message(message) -> None:
+        await manager.send_message(session_id, {
+            "type": "message",
+            "session_id": session_id,
+            "message": _message_to_dict(message),
+        })
+        # Votes are emitted as chat messages; the vote itself is already in
+        # session.votes at this point — derive the dedicated 'vote' frame.
+        if message.message_type == MessageType.VOTE and room.session.votes:
+            await manager.send_message(session_id, {
+                "type": "vote",
+                "session_id": session_id,
+                "vote": _vote_to_dict(room.session.votes[-1], room.session.agent_weights),
+            })
+
+    async def _forward_status(status, session) -> None:
+        await manager.broadcast_status(
+            session_id, status.value, _session_to_detail(session)
+        )
+        if status == SessionStatus.DECIDED and session.decision:
+            await manager.send_message(session_id, {
+                "type": "decision",
+                "session_id": session_id,
+                "decision": _decision_to_dict(session.decision),
+            })
+
+    room.on_message(_forward_message)
+    room.on_status_change(_forward_status)
+
+
+# Every ChatRoom created from now on streams to the WS.
+register_room_created_hook(_wire_room_to_websocket)
+
+
 @router.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     """
     WebSocket endpoint for real-time session updates.
 
     Connect to receive:
+    - An immediate status_change snapshot of the session (if it exists)
     - New messages as they're generated
     - Status changes (analyzing, discussing, voting, decided)
     - Final decision announcement
@@ -507,6 +587,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await manager.connect(websocket, session_id)
 
     try:
+        # Send an initial snapshot so a client that connects mid-discussion —
+        # or just after the final frame — starts from the current state instead
+        # of waiting for the next emit (the FE suppresses its REST poll while
+        # the socket is connected).
+        try:
+            coordinator = await get_chat_coordinator()
+            session = await coordinator.get_session_by_id(session_id)
+            if session is not None:
+                await websocket.send_json({
+                    "type": "status_change",
+                    "session_id": session_id,
+                    "status": session.status.value,
+                    "session": _session_to_detail(session),
+                })
+        except Exception as e:
+            logger.warning("agent_chat_ws_snapshot_failed", session_id=session_id, error=str(e))
+
         while True:
             # Keep connection alive
             data = await websocket.receive_text()
@@ -532,31 +629,32 @@ async def get_agent_info():
     Returns agent types and their roles.
     """
     from services.agent_chat import AgentType
+    from services.agent_chat.models import DEFAULT_AGENT_WEIGHTS
 
     agents = [
         {
             "type": AgentType.TECHNICAL.value,
             "name": "기술적 분석가",
             "description": "차트 패턴, 기술적 지표 분석",
-            "weight": 0.25,
+            "weight": DEFAULT_AGENT_WEIGHTS[AgentType.TECHNICAL],
         },
         {
             "type": AgentType.FUNDAMENTAL.value,
             "name": "펀더멘털 분석가",
             "description": "재무제표, 밸류에이션 분석",
-            "weight": 0.25,
+            "weight": DEFAULT_AGENT_WEIGHTS[AgentType.FUNDAMENTAL],
         },
         {
             "type": AgentType.SENTIMENT.value,
             "name": "시장 심리 분석가",
             "description": "뉴스, 시장 심리 분석",
-            "weight": 0.20,
+            "weight": DEFAULT_AGENT_WEIGHTS[AgentType.SENTIMENT],
         },
         {
             "type": AgentType.RISK.value,
             "name": "리스크 관리자",
             "description": "리스크 평가, 포지션 사이징",
-            "weight": 0.30,
+            "weight": DEFAULT_AGENT_WEIGHTS[AgentType.RISK],
         },
         {
             "type": AgentType.MODERATOR.value,

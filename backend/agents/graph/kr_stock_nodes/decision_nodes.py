@@ -6,6 +6,7 @@ Contains Risk Assessment, Strategic Decision, Human Approval, and Re-analyze nod
 
 import time
 import uuid
+from typing import Optional
 
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -21,12 +22,18 @@ from agents.graph.kr_stock_state import (
     get_all_kr_stock_analyses,
     kr_stock_analysis_dict_to_context_string,
 )
+from agents.graph.decision_policy import decide_action, position_feasible_set
+from agents.llm.tasks import DECISION_SCHEMA, TaskType
 from agents.llm_provider import get_llm_provider
 from agents.prompts import (
     KR_STOCK_RISK_ASSESSOR_PROMPT,
     KR_STOCK_STRATEGIC_DECISION_PROMPT,
 )
+from app.config import settings
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
+from services.discovery.liquidity import adtv_median
+from services.trading.r_sizing import apply_liquidity_cap, r_cap_value
+from services.trading.strategy_consensus import clamp_knob
 from .helpers import (
     _get_stk_cd_safely,
     _calculate_kr_stock_risk_score,
@@ -37,6 +44,85 @@ from .helpers import (
 )
 
 logger = structlog.get_logger()
+
+
+async def _get_active_strategy():
+    """활성 TradingStrategy 조회 (best-effort — 실패/없음=None, 그래프 노드를
+    절대 막지 않는다). lazy import는 agent_chat coordinator와 동일 패턴."""
+    try:
+        from app.dependencies import get_trading_coordinator
+
+        return (await get_trading_coordinator()).get_strategy()
+    except Exception:
+        return None
+
+
+async def _get_risk_budget_pct() -> float:
+    """활성 RiskParameters.risk_budget_pct 조회 (best-effort — 실패/
+    coordinator 미가동 시 모델 기본값, 그래프 노드를 절대 막지 않는다).
+    lazy import는 _get_active_strategy와 동일 패턴 — S-4(생존 규율) R 캡이
+    strategy_apply의 전략-적응/수동 PUT 값과 동일한 SSOT(공유 RiskParameters
+    인스턴스)를 읽도록 한다."""
+    from services.trading.models import RiskParameters
+
+    default = RiskParameters.model_fields["risk_budget_pct"].default
+    try:
+        from app.dependencies import get_trading_coordinator
+
+        coordinator = await get_trading_coordinator()
+        return coordinator.risk_params.risk_budget_pct
+    except Exception:
+        return default
+
+
+async def _get_account_equity() -> Optional[float]:
+    """C1(유동성 인지) 유동성 skip-floor 전용 계좌 총평가액 조회 (best-effort
+    — 실패/coordinator 미가동 시 None, 그래프 노드를 절대 막지 않는다).
+
+    r_sizing.SKIP_MIN_EQUITY_PCT는 정의상 "계좌의 1%"다. 이 경로의 R-cap은
+    의도적으로 orderable_amount(가용현금)를 자본 베이스로 쓰지만(기존 주석
+    참조), skip-floor까지 그 베이스를 따라가면 계좌가 상당 부분 투자돼
+    가용현금이 작을 때 floor가 비례해 낮아져 사실상 무력화된다(리뷰
+    Important3) — 그래서 이 조회만 별도로 분리한다. lazy import는
+    _get_active_strategy와 동일 패턴.
+
+    ⚠️ 예외를 삼키되 **로그는 남긴다**(최종 리뷰 Blocking3): 이 함수가 None을
+    반환하면 호출부가 0.0으로 대체하고, `apply_liquidity_cap`의 skip-floor
+    분기는 `equity > 0`이 선행 조건이라 **분기 자체가 평가되지 않고 통과**한다
+    — T6 리뷰가 살리려던 floor가 무발동으로 되돌아간다. 같은 커밋이 ADTV 실패
+    에는 경고를 명시적으로 붙였으므로 여기만 무로그면 원칙의 비대칭이다."""
+    try:
+        from app.dependencies import get_trading_coordinator
+
+        coordinator = await get_trading_coordinator()
+        return float(coordinator._state.account.total_equity)
+    except Exception as e:
+        logger.warning("liquidity_skip_equity_unavailable", error=str(e))
+        return None
+
+
+def _strategy_stop_params(strategy, risk_score: float) -> tuple[float, float, float]:
+    """전략 exit/sizing 노브 + risk_score 감산 → (stop_pct 분율, take_pct 분율,
+    max_position_pct 퍼센트). 고리스크(>=0.5)는 손절 거리 확대(완화, ×1.15 캡
+    0.50 — 레거시 5%→8% 방향 준용), 익절 보수(×0.8 플로어 0.01), 포지션 축소
+    (×0.6 — 기존 5.0→3.0 비율 준용).
+
+    Phase4 최종리뷰 Fix2: 전략 원본 노브는 `clamp_knob`로 KNOB_BOUNDS 클램프한
+    뒤 사용 — 수동 PUT /strategy가 Pydantic 필드 범위(예: stop_loss_pct 0.50)
+    까지 허용해도, T2(strategy_apply)와 다른 무클램프 수치가 이 그래프 경로에
+    유입되지 않도록 한다."""
+    base_stop = clamp_knob("stop_loss_pct", strategy.exit_conditions.stop_loss_pct)
+    base_take = clamp_knob("take_profit_pct", strategy.exit_conditions.take_profit_pct)
+    base_position = (
+        clamp_knob("max_position_pct", strategy.position_sizing.max_position_pct) * 100.0
+    )
+    if risk_score < 0.5:
+        return base_stop, base_take, base_position
+    return (
+        min(0.50, base_stop * 1.15),
+        max(0.01, base_take * 0.8),
+        base_position * 0.6,
+    )
 
 
 async def kr_stock_risk_assessment_node(state: dict) -> dict:
@@ -71,9 +157,17 @@ async def kr_stock_risk_assessment_node(state: dict) -> dict:
     # Calculate risk score
     risk_score = _calculate_kr_stock_risk_score(analyses, market_data)
 
-    # Korean stock stop-loss calculation (typically 5-8%)
-    stop_loss_pct = 0.05 if risk_score < 0.5 else 0.08
-    take_profit_pct = 0.10 if risk_score < 0.5 else 0.08
+    # Korean stock stop-loss calculation — 활성 전략이 있으면 전략 노브,
+    # 없으면 기존 하드코딩(5-8%) 유지 (Phase4).
+    strategy = await _get_active_strategy()
+    if strategy is not None:
+        stop_loss_pct, take_profit_pct, max_position_pct = _strategy_stop_params(
+            strategy, risk_score
+        )
+    else:
+        stop_loss_pct = 0.05 if risk_score < 0.5 else 0.08
+        take_profit_pct = 0.10 if risk_score < 0.5 else 0.08
+        max_position_pct = 5.0 if risk_score < 0.5 else 3.0
 
     result = KRStockAnalysisResult(
         agent_type="risk",
@@ -86,7 +180,7 @@ async def kr_stock_risk_assessment_node(state: dict) -> dict:
         key_factors=_extract_key_factors(response),
         signals={
             "risk_score": risk_score,
-            "max_position_pct": 5.0 if risk_score < 0.5 else 3.0,
+            "max_position_pct": max_position_pct,
             "suggested_stop_loss": int(current_price * (1 - stop_loss_pct)),
             "suggested_take_profit": int(current_price * (1 + take_profit_pct)),
         },
@@ -138,6 +232,7 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
     stk_cd = _get_stk_cd_safely(state, "strategic_decision")
     stk_nm = state.get("stk_nm", stk_cd)
     llm = get_llm_provider()
+    strategy = await _get_active_strategy()
 
     logger.info("node_started", node="kr_stock_strategic_decision", stk_cd=stk_cd)
 
@@ -178,14 +273,31 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
     ]
 
     logger.debug("llm_request", node="kr_stock_strategic_decision")
-    response = await llm.generate(messages)
 
-    # Determine action considering existing position
-    action = _signal_to_action_with_position(
+    # Phase 3: the LLM decides the action (structured), guarded by position
+    # feasibility, with the existing rule signal as the fallback.
+    rule_action = _signal_to_action_with_position(
         signal=consensus_signal,
         has_position=has_position,
         position_pnl_pct=position_pnl_pct,
     )
+    action, response, decision_source, bull_case, bear_case = await decide_action(
+        llm,
+        messages,
+        trade_action_cls=TradeAction,
+        rule_action=rule_action,
+        feasible=position_feasible_set(has_position),
+        decision_schema=DECISION_SCHEMA,
+        task=TaskType.STRATEGIC_DECISION,
+    )
+    if not response:
+        response = (
+            f"[룰 기반 결정] 컨센서스 {consensus_signal.value} → {action.value} (LLM 실패)"
+        )
+    if bull_case is None:
+        bull_case = _extract_bull_case(response)
+    if bear_case is None:
+        bear_case = _extract_bear_case(response)
 
     logger.info(
         "kr_stock_action_determined",
@@ -194,7 +306,40 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         has_position=has_position,
         position_pnl_pct=position_pnl_pct,
         action=action.value,
+        decision_source=decision_source,
     )
+
+    # T2 MAJOR hard-gate: when market data could not be fetched this cycle
+    # (market_data_stale set by the data-collection node — get_kr_* returned
+    # None instead of fabricating random-mock data, CRITICAL fix 2026-07-14),
+    # the analyses/consensus above ran on empty/neutral defaults with a
+    # fabricated-absent price ("현재가: 0원"). An actionable proposal from that
+    # context could be auto-approved by the 60s autonomy injector and — for a
+    # real held position — execute a real SELL/REDUCE (which uses the position's
+    # REAL quantity) on absent data. Force any actionable trade to HOLD
+    # (no-trade) with floored confidence, as an override AFTER the LLM/consensus
+    # produced its action, so stale data can NEVER yield an auto-executable
+    # proposal. HOLD/WATCH/AVOID are already no-trade and pass through unchanged.
+    if state.get("market_data_stale") and action in (
+        TradeAction.BUY,
+        TradeAction.ADD,
+        TradeAction.SELL,
+        TradeAction.REDUCE,
+    ):
+        logger.warning(
+            "kr_stock_decision_hard_gated_stale",
+            stk_cd=stk_cd,
+            original_action=action.value,
+        )
+        stale_note = (
+            f"[시세 데이터 불가로 결정 보류] 시세 조회 실패(stale)로 원래 제안 "
+            f"{action.value}을(를) HOLD로 강제 전환했습니다. 신뢰할 수 있는 "
+            f"현재가 없이는 매매를 실행하지 않습니다."
+        )
+        action = TradeAction.HOLD
+        decision_source = "stale_hard_gate"
+        avg_confidence = min(avg_confidence, 0.1)
+        response = f"{stale_note}\n\n{response}"
 
     # Get risk parameters
     risk = state.get("risk_assessment", {})
@@ -203,6 +348,21 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
     market_data = state.get("market_data", {})
     current_price = market_data.get("cur_prc", 0)
     position_size_pct = float(risk_signals.get("max_position_pct", 5.0))
+
+    # S-4 (생존 규율, decision D4): stop_loss/take_profit 산출을 수량 계산
+    # 앞으로 재배치 — 산식·폴백 자체는 완전히 불변(byte-identical), R 캡이
+    # Proposal이 실제로 갖게 될 그 stop_loss 값을 그대로 수량 계산에서 쓸 수
+    # 있도록 순서만 바뀐다.
+    suggested_stop_loss = risk_signals.get(
+        "suggested_stop_loss",
+        int(current_price * (1 - strategy.exit_conditions.stop_loss_pct))
+        if strategy else int(current_price * 0.95),
+    )
+    suggested_take_profit = risk_signals.get(
+        "suggested_take_profit",
+        int(current_price * (1 + strategy.exit_conditions.take_profit_pct))
+        if strategy else int(current_price * 1.10),
+    )
 
     # Calculate quantity based on action type and available balance
     quantity = 0
@@ -214,6 +374,103 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
 
             # Calculate quantity: (orderable * position_size%) / price
             investment_amount = int(orderable_amount * position_size_pct / 100)
+
+            # S-4: R 기반 사이징 — 예산 risk_budget_pct%(계좌 적응 [0.25,1.5])
+            # ÷ 손절거리 캡을 기존 notional 캡과 min() 결합(더 작은 쪽 채택).
+            # r_cap_value 가드(거리<0.5% 등) 미충족 시 None -> 기존 값 유지.
+            # equity는 이 사이징 경로가 애초에 쓰는 가용현금(orderable_amount)
+            # 기준 — portfolio_agent의 계좌 총평가액 기준과는 이 경로가 원래
+            # 갖고 있던 로컬 자본 베이스가 다르므로 의도적으로 그대로 둔다
+            # (spec §1 "(a) 가용현금×pct").
+            risk_budget_pct = await _get_risk_budget_pct()
+            r_cap = r_cap_value(
+                equity=orderable_amount,
+                risk_budget_pct=risk_budget_pct,
+                entry_price=current_price,
+                stop_price=suggested_stop_loss,
+            )
+            if r_cap is not None and r_cap < investment_amount:
+                logger.debug(
+                    "kr_stock_r_cap_applied",
+                    stk_cd=stk_cd,
+                    investment_amount=investment_amount,
+                    r_cap=r_cap,
+                    risk_budget_pct=risk_budget_pct,
+                )
+                investment_amount = int(r_cap)
+
+            # C1(유동성 인지): R-cap 결합 직후 유동성 참여율 캡을 적용한다.
+            # 캡 바인딩 자체(liq_cap vs base_cap)의 notional 베이스는 이 경로가
+            # 원래 쓰는 orderable_amount(가용현금) 그대로 — r_cap_value와 동일
+            # 기준. 다만 apply_liquidity_cap의 skip-floor 비교(SKIP_MIN_EQUITY_PCT)는
+            # r_sizing.py 정의상 "계좌의 1%"이므로 orderable_amount가 아니라
+            # 계좌 총평가액을 별도로 넘긴다 — 리뷰 Important3: 계좌가 상당 부분
+            # 투자돼 가용현금이 작을 때 orderable_amount 기준이면 floor가
+            # 비례해 낮아져 사실상 무력화된다(라이브가 그 상태였다). ADTV
+            # 재조회는 별도 try/except로 감싼다(never-raise) — 실패해도 R-cap
+            # 까지 산정된 investment_amount를 그대로 살리고 캡만 건너뛴다
+            # (fail-open); 바깥 큰 try에 맡기면 ADTV 조회 실패만으로 quantity가
+            # 통째로 0이 되어버린다. adtv_median의 import는 모듈 스코프로 옮겼다
+            # (inner try 안에서 하면 import 실패가 outer try로 새어 나가
+            # investment_amount 전체를 0으로 만들 수 있었다).
+            #
+            # 킬스위치(LIQUIDITY_SIZING_CAP_ENABLED, 설계 §6): off면 ADTV를
+            # 구하지 않고 None을 넘겨 기존 fail-open 경로로 수렴한다
+            # (portfolio_agent._resolve_adtv와 동일 스위치·동일 결과).
+            # settings import는 adtv_median과 같은 이유로 모듈 스코프에 둔다 —
+            # 이 try 안에서 하면 import 실패가 outer except로 새어 나가
+            # investment_amount 전체를 0으로 만든다.
+            _adtv = None
+            if not getattr(settings, "LIQUIDITY_SIZING_CAP_ENABLED", True):
+                logger.warning("liquidity_sizing_cap_disabled", stk_cd=stk_cd)
+            else:
+                try:
+                    _adtv = adtv_median(await client.get_daily_chart_df(stk_cd))
+                except Exception as e:
+                    logger.warning("liquidity_adtv_fetch_failed", stk_cd=stk_cd, error=str(e))
+
+            _skip_equity = await _get_account_equity()
+            if _skip_equity is None or _skip_equity <= 0:
+                # ⚠️ 최종 리뷰 Blocking3: equity<=0이면 apply_liquidity_cap의
+                # skip-floor 분기(`equity > 0` 선행 조건)가 아예 평가되지 않고
+                # 통과한다 — floor가 무발동인 채로 주문이 나간다. 게다가
+                # 확률적 위험이 아니다: coordinator._state.account.total_equity
+                # 는 _refresh_account_info 전 기본값이 0이므로 배포 후
+                # /trading/start 재발행 전 구간에서는 예외조차 없이 float(0)이
+                # 그대로 흐른다. 사유가 "liquidity_cap"/None으로만 보여 배포
+                # 창에서 관측이 불가능했던 지점.
+                logger.warning(
+                    "liquidity_skip_floor_disabled",
+                    stk_cd=stk_cd, equity=_skip_equity,
+                )
+            investment_amount, _liq_reason = apply_liquidity_cap(
+                investment_amount, _adtv,
+                _skip_equity if _skip_equity is not None else 0.0,
+            )
+            investment_amount = int(investment_amount)
+            if _liq_reason in ("liquidity_cap", "liquidity_too_thin"):
+                logger.info(
+                    "liquidity_cap_applied",
+                    stk_cd=stk_cd, reason=_liq_reason,
+                    adtv=_adtv, investment_amount=investment_amount,
+                )
+            elif _liq_reason == "adtv_unknown":
+                # 리뷰 Important2(b): 캡이 전 주문에서 비활성인데 아무 로그도
+                # 없으면 데이터 품질 저하를 아무도 알아채지 못한다.
+                logger.warning(
+                    "liquidity_cap_adtv_unknown",
+                    stk_cd=stk_cd, investment_amount=investment_amount,
+                )
+            elif _liq_reason == "skip_floor_disabled":
+                # Blocking3: 캡 자체는 살아 있지만 skip-floor(과소포지션 진입
+                # 포기)만 빠진 상태 — 위 liquidity_skip_floor_disabled와 짝을
+                # 이뤄 "실제로 그 상태로 사이징이 끝났다"를 확정한다.
+                logger.warning(
+                    "liquidity_cap_without_skip_floor",
+                    stk_cd=stk_cd, adtv=_adtv,
+                    investment_amount=investment_amount,
+                )
+
             quantity = investment_amount // current_price
 
             logger.info(
@@ -248,13 +505,13 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
         action=action,
         quantity=quantity,
         entry_price=current_price,
-        stop_loss=risk_signals.get("suggested_stop_loss", int(current_price * 0.95)),
-        take_profit=risk_signals.get("suggested_take_profit", int(current_price * 1.10)),
+        stop_loss=suggested_stop_loss,
+        take_profit=suggested_take_profit,
         risk_score=float(risk_signals.get("risk_score", 0.5)),
         position_size_pct=position_size_pct,
         rationale=response,
-        bull_case=_extract_bull_case(response),
-        bear_case=_extract_bear_case(response),
+        bull_case=bull_case,
+        bear_case=bear_case,
         analyses=analyses,
     )
 
@@ -290,9 +547,12 @@ async def kr_stock_strategic_decision_node(state: dict) -> dict:
             # Build analysis summary
             analysis_summary = f"컨센서스: {consensus_signal.value} (신뢰도: {avg_confidence:.0%})"
 
-            # Add to watch list
+            # Add to watch list. `or`-fallback: the session_id KEY exists with
+            # value None when the route forgot to thread it (the dict.get
+            # default only covers a missing key) — None here failed WatchedStock
+            # validation and silently dropped every WATCH from the watch list.
             watched = coordinator.add_to_watch_list(
-                session_id=state.get("session_id", str(uuid.uuid4())),
+                session_id=state.get("session_id") or str(uuid.uuid4()),
                 ticker=stk_cd,
                 stock_name=stk_nm,
                 signal=consensus_signal.value,

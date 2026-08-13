@@ -3,7 +3,7 @@
  *
  * TradingView Lightweight Charts implementation.
  * Supports candlestick, moving averages, and volume.
- * Connects to real Upbit API for coin markets.
+ * Connects to the real Kiwoom API for Korean stocks.
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -12,14 +12,13 @@ import {
   type IChartApi,
   type ISeriesApi,
   type CandlestickData,
-  type HistogramData,
   type LineData,
   ColorType,
   CrosshairMode,
 } from 'lightweight-charts';
 import { Loader2 } from 'lucide-react';
 import type { TimeFrame } from '@/types';
-import { getCoinCandles, getKRStockCandles } from '@/api/client';
+import { getKRStockCandles } from '@/api/client';
 
 interface TradingChartProps {
   ticker: string;
@@ -55,8 +54,8 @@ export function TradingChart({
 
     const chart = createChart(containerRef.current, {
       layout: {
-        background: { type: ColorType.Solid, color: '#0f1419' },
-        textColor: '#9ca3af',
+        background: { type: ColorType.Solid, color: '#0b0e11' },
+        textColor: '#7b8794',
       },
       grid: {
         vertLines: { color: '#1f2937' },
@@ -138,56 +137,12 @@ export function TradingChart({
       setError(null);
 
       try {
-        // Check if ticker is a coin market (e.g., KRW-BTC)
-        const isCoinMarket = ticker.includes('-');
         // Check if ticker is a Korean stock (6-digit numeric code)
         const isKRStock = /^\d{6}$/.test(ticker);
 
         let candles: CandlestickData[];
 
-        if (isCoinMarket) {
-          // Fetch real data from Upbit API for coin markets
-          const intervalMap: Record<TimeFrame, string> = {
-            '1m': '1m',
-            '5m': '5m',
-            '15m': '15m',
-            '1h': '1h',
-            '1d': '1d',
-            '1w': '1w',
-            '1M': '1M',
-          };
-
-          const interval = intervalMap[timeframe] || '1d';
-          const response = await getCoinCandles(ticker, interval, 200);
-
-          // Check if we got valid data
-          if (!response.candles || response.candles.length === 0) {
-            throw new Error('No candle data available');
-          }
-
-          // Transform API response to lightweight-charts format
-          // Upbit returns newest first, so reverse for chronological order
-          const transformedCandles = response.candles
-            .filter((c) => c.datetime && c.open && c.high && c.low && c.close)
-            .map((c) => ({
-              time: Math.floor(new Date(c.datetime).getTime() / 1000) as any,
-              open: c.open,
-              high: c.high,
-              low: c.low,
-              close: c.close,
-              volume: c.volume,
-            }))
-            .reverse();
-
-          if (transformedCandles.length === 0) {
-            throw new Error('Invalid candle data received');
-          }
-
-          // Cache candle data for volume chart (avoid duplicate API call)
-          candleDataRef.current = transformedCandles;
-
-          candles = transformedCandles.map(({ volume, ...rest }) => rest);
-        } else if (isKRStock) {
+        if (isKRStock) {
           // Fetch real data from Kiwoom API for Korean stocks
           // Currently only daily candles are supported by Kiwoom API
           const response = await getKRStockCandles(ticker, 'D', 100);
@@ -220,9 +175,9 @@ export function TradingChart({
 
           candles = transformedCandles.map(({ volume, ...rest }) => rest);
         } else {
-          // Fall back to mock data for US stock tickers (not yet supported)
-          const data = generateMockData(ticker, timeframe);
-          candles = data.candles;
+          // No live data source for this ticker — render the honest error
+          // state instead of fabricated candles.
+          throw new Error('No chart data source for this symbol');
         }
 
         if (!isMounted || !chartRef.current || !candlestickSeriesRef.current) return;
@@ -328,11 +283,10 @@ export function TradingChart({
         volumeSeriesRef.current = volumeSeries;
       }
 
-      // Check if coin market or Korean stock - use cached data (already fetched for candlestick)
-      const isCoinMarket = ticker.includes('-');
+      // Korean stock - use cached data (already fetched for candlestick)
       const isKRStock = /^\d{6}$/.test(ticker);
 
-      if ((isCoinMarket || isKRStock) && candleDataRef.current.length > 0) {
+      if (isKRStock && candleDataRef.current.length > 0) {
         // Use cached candle data for volume (avoid duplicate API call)
         const volumeData = candleDataRef.current.map((c) => ({
           time: c.time,
@@ -343,10 +297,6 @@ export function TradingChart({
               : 'rgba(239, 68, 68, 0.5)',
         }));
         volumeSeriesRef.current?.setData(volumeData);
-      } else if (!isCoinMarket && !isKRStock) {
-        // Fall back to mock volume data for US stocks
-        const volumeData = generateVolumeData(ticker, timeframe);
-        volumeSeriesRef.current.setData(volumeData);
       }
     } else {
       if (volumeSeriesRef.current) {
@@ -379,93 +329,6 @@ export function TradingChart({
 // -------------------------------------------
 // Helper Functions
 // -------------------------------------------
-
-function generateMockData(
-  ticker: string,
-  timeframe: TimeFrame
-): { candles: CandlestickData[] } {
-  const candles: CandlestickData[] = [];
-  const now = new Date();
-
-  // Determine time interval based on timeframe
-  const intervals: Record<TimeFrame, number> = {
-    '1m': 60 * 1000,
-    '5m': 5 * 60 * 1000,
-    '15m': 15 * 60 * 1000,
-    '1h': 60 * 60 * 1000,
-    '1d': 24 * 60 * 60 * 1000,
-    '1w': 7 * 24 * 60 * 60 * 1000,
-    '1M': 30 * 24 * 60 * 60 * 1000,
-  };
-
-  const interval = intervals[timeframe];
-  const numCandles = 200;
-
-  // Generate price based on ticker hash for consistency
-  let basePrice = 100 + (ticker.charCodeAt(0) % 50) * 3;
-  let price = basePrice;
-
-  for (let i = numCandles - 1; i >= 0; i--) {
-    const time = Math.floor((now.getTime() - i * interval) / 1000);
-
-    // Random walk
-    const change = (Math.random() - 0.48) * 2;
-    const volatility = basePrice * 0.02;
-
-    const open = price;
-    const close = price + change * volatility;
-    const high = Math.max(open, close) + Math.random() * volatility * 0.5;
-    const low = Math.min(open, close) - Math.random() * volatility * 0.5;
-
-    candles.push({
-      time: time as any,
-      open: Number(open.toFixed(2)),
-      high: Number(high.toFixed(2)),
-      low: Number(low.toFixed(2)),
-      close: Number(close.toFixed(2)),
-    });
-
-    price = close;
-  }
-
-  return { candles };
-}
-
-function generateVolumeData(
-  ticker: string,
-  timeframe: TimeFrame
-): HistogramData[] {
-  const data: HistogramData[] = [];
-  const now = new Date();
-
-  const intervals: Record<TimeFrame, number> = {
-    '1m': 60 * 1000,
-    '5m': 5 * 60 * 1000,
-    '15m': 15 * 60 * 1000,
-    '1h': 60 * 60 * 1000,
-    '1d': 24 * 60 * 60 * 1000,
-    '1w': 7 * 24 * 60 * 60 * 1000,
-    '1M': 30 * 24 * 60 * 60 * 1000,
-  };
-
-  const interval = intervals[timeframe];
-  const numCandles = 200;
-  const baseVolume = 1000000 + (ticker.charCodeAt(0) % 10) * 500000;
-
-  for (let i = numCandles - 1; i >= 0; i--) {
-    const time = Math.floor((now.getTime() - i * interval) / 1000);
-    const volume = baseVolume * (0.5 + Math.random());
-    const isUp = Math.random() > 0.5;
-
-    data.push({
-      time: time as any,
-      value: volume,
-      color: isUp ? 'rgba(34, 197, 94, 0.5)' : 'rgba(239, 68, 68, 0.5)',
-    });
-  }
-
-  return data;
-}
 
 function calculateSMA(
   period: number,

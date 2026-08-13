@@ -23,9 +23,14 @@ langgraph>=0.2.0
 # -------------------------------------------
 # Data & Market
 # -------------------------------------------
-yfinance>=0.2.50
 pandas>=2.2.0
 numpy>=1.26.0
+yfinance>=1.0.0  # KOSPI(^KS11) index_series.py -- regime volatility input
+
+# 음력→양력 변환. krx_holiday/fetcher.py가 설날·부처님오신날·추석을 계산한다
+# (손입력 표를 대체). 순수 파이썬·의존성 0·유효 범위 ~2050.
+# ⚠️ 없으면 그 연도 달력이 저장되지 않고 untrusted로 남는다(부팅 시 ERROR).
+korean_lunar_calendar>=0.3.1
 
 # -------------------------------------------
 # Async & HTTP Client
@@ -51,13 +56,23 @@ tenacity>=9.0.0
 # -------------------------------------------
 # Telegram Notifications
 # -------------------------------------------
-python-telegram-bot>=20.0
+python-telegram-bot~=22.5
+
+# -------------------------------------------
+# Reports (HTML templates)
+# -------------------------------------------
+# services/reports/render.py -- 전이 의존으로만 깔려 있었다(2026-08-13
+# 최종 리뷰 Important 6). 재구축 시 사라지면 import 실패가 never-raise
+# 계약에 조용히 삼켜져 리포트 3종(premarket/postmarket/discovery)이
+# 전멸한다.
+jinja2>=3.1
 
 # -------------------------------------------
 # Testing
 # -------------------------------------------
 pytest>=8.0.0
 pytest-asyncio>=0.24.0
+pytest-timeout>=2.3.0
 pytest-cov>=5.0.0
 
 # -------------------------------------------

@@ -10,6 +10,7 @@ No external server required - uses embedded SQLite database.
 """
 
 import json
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -36,7 +37,7 @@ class StorageService:
     """
 
     def __init__(self, db_path: Optional[Path] = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialized = False
 
@@ -79,39 +80,624 @@ class StorageService:
                     )
                 """)
 
-                # Coin trades table
+                # KR stock trades table (P1-1: the /trades tab had no backing
+                # storage — nothing recorded a fill anywhere, and the route
+                # masked the missing methods as an empty list via
+                # `except AttributeError`). (2026-08-01 Upbit 제거: 이 표는
+                # 원래 coin_trades를 본떠 만들었다 — 그 원본과 coin_positions/
+                # coin_realized_pnl은 이제 이 파일에서 생성하지 않는다. 기존
+                # 운영 DB의 빈 coin_* 테이블 3개는 라이브 마이그레이션 위험을
+                # 피하기 위해 DROP하지 않고 그대로 남겨둔다.)
                 await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS coin_trades (
+                    CREATE TABLE IF NOT EXISTS kr_stock_trades (
                         id TEXT PRIMARY KEY,
                         session_id TEXT,
-                        market TEXT NOT NULL,
+                        stk_cd TEXT NOT NULL,
+                        stk_nm TEXT,
                         side TEXT NOT NULL,
                         order_type TEXT NOT NULL,
-                        price REAL NOT NULL,
-                        volume REAL NOT NULL,
-                        executed_volume REAL NOT NULL,
-                        fee REAL DEFAULT 0,
-                        total_krw REAL NOT NULL,
-                        state TEXT NOT NULL,
-                        order_uuid TEXT,
+                        price INTEGER NOT NULL,
+                        quantity INTEGER NOT NULL,
+                        executed_quantity INTEGER NOT NULL,
+                        fee INTEGER DEFAULT 0,
+                        total_krw INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        order_id TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
 
-                # Coin positions table
+                # KR realized P&L table (Phase1 Task 4/C3a: KR had no
+                # per-trade realized-P&L record anywhere — only the broker's
+                # day-level ka10074, ephemeral and not matched to entry/exit.
+                # Mirrors coin_realized_pnl's shape, plus entry/exit decision
+                # IDs and holding_period_seconds so a matched close can be
+                # attributed back to the agent-chat decision that opened it
+                # (see update_decision_outcome below) and to how long the
+                # position was held.
                 await conn.execute("""
-                    CREATE TABLE IF NOT EXISTS coin_positions (
-                        market TEXT PRIMARY KEY,
-                        currency TEXT NOT NULL,
-                        quantity REAL NOT NULL,
-                        avg_entry_price REAL NOT NULL,
-                        stop_loss REAL,
-                        take_profit REAL,
-                        session_id TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    CREATE TABLE IF NOT EXISTS kr_realized_pnl (
+                        id TEXT PRIMARY KEY,
+                        stk_cd TEXT NOT NULL,
+                        entry_price REAL,
+                        exit_price REAL,
+                        quantity INTEGER,
+                        realized_amount REAL,
+                        entry_decision_id TEXT,
+                        exit_decision_id TEXT,
+                        holding_period_seconds INTEGER,
+                        entry_at TIMESTAMP,
+                        exit_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Daily performance snapshot table (Phase1 Task 5/C3b): equity/
+                # realized-P&L/win-rate were only ever recomputed live from
+                # ka10074+kt00004, which have a rolling broker query window —
+                # a durable end-of-day row per trade_date survives past that
+                # window. trade_date is the PK so a snapshot exists at most
+                # once per day; the writer uses INSERT OR IGNORE so a second
+                # write on the same day is a no-op rather than clobbering the
+                # first (see save_daily_perf_snapshot below).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS daily_perf_snapshot (
+                        trade_date TEXT PRIMARY KEY,
+                        equity REAL,
+                        realized_pnl REAL,
+                        commission REAL,
+                        tax REAL,
+                        net_pnl REAL,
+                        win_trades INTEGER,
+                        loss_trades INTEGER,
+                        cumulative_return_pct REAL,
+                        regime_snapshot_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Regime snapshot table (Phase2 Task 2): the only durable
+                # market-wide artifact is the background scanner's
+                # scan_sessions breadth distribution (buy/sell/hold counts
+                # across the day's KOSPI/KOSDAQ sweep) — index/flow fetchers
+                # are a later phase. One row per compute_regime_snapshot
+                # call (services/trading/regime.py); id is NOT the
+                # trade_date so re-running the same day intentionally
+                # appends rather than overwrites, mirroring
+                # agent_calibration's accretion style above.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS regime_snapshot (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT,
+                        breadth_buy INTEGER,
+                        breadth_sell INTEGER,
+                        breadth_hold INTEGER,
+                        breadth_ratio REAL,
+                        regime_label TEXT,
+                        source TEXT DEFAULT 'scanner',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Discovery candidate ledger (DS-3): one row per ticker the
+                # discovery scan (DS-2) + regime-weighted ranking (DS-4)
+                # surfaced on a given trade_date, plus the durable slots
+                # this module backfills once enough trading days have
+                # elapsed (fwd_1d/5d/20d — see backfill_forward_returns in
+                # services/discovery/ledger.py). Accrete-style (id uuid PK,
+                # NOT trade_date) like regime_snapshot: re-running the same
+                # day's scan appends rather than overwrites. llm_verdict_json/
+                # skip_reason/fwd_1d/fwd_5d/fwd_20d are nullable — a fresh
+                # candidate row starts with all four NULL and gets filled in
+                # later (LLM verdict same-day; forward returns over the
+                # following trading days).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS discovery_candidates (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT,
+                        ticker TEXT,
+                        name TEXT,
+                        composite_score REAL,
+                        strategy_scores_json TEXT,
+                        regime_label TEXT,
+                        rank INTEGER,
+                        llm_verdict_json TEXT,
+                        promoted INTEGER,
+                        skip_reason TEXT,
+                        close_price REAL,
+                        fwd_1d REAL,
+                        fwd_5d REAL,
+                        fwd_20d REAL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # 승격 판단 재료 + LLM 근거 (2026-08-12). 기존 DB 파일에는
+                # CREATE TABLE IF NOT EXISTS가 no-op이라 ALTER로 붙인다.
+                # 이 컬럼 이전 행은 NULL로 남는다 -- "재료 없음"과 "기능
+                # 이전"은 trade_date로 구별한다(배포 2026-08-12).
+                #
+                # 왜 필요한가: 지금 원장은 composite와 skip_reason만 남기고
+                # LLM이 무엇을 근거로 통과/반려했는지는 통째로 버린다.
+                # 재료를 늘려도 그 효과를 사후에 측정할 수 없다.
+                await self._ensure_columns(
+                    conn,
+                    "discovery_candidates",
+                    {
+                        "per": "REAL",
+                        "pbr": "REAL",
+                        "market_cap": "INTEGER",
+                        "news_count": "INTEGER",
+                        "llm_rationale": "TEXT",
+                        "llm_confidence": "REAL",
+                    },
+                )
+
+                # App settings table (generic key-value; e.g. trading_mode:kiwoom)
+                # — runtime settings that must survive restarts (R3).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
+
+                # EOD review report table (Phase2 Task 3): the durable,
+                # structured end-of-day review assembled from the Phase1/
+                # Phase2 ledgers (daily_perf_snapshot/kr_realized_pnl/
+                # agent_calibration/regime_snapshot) — see
+                # services/trading/eod_review.py::build_eod_review. Stored as
+                # one opaque report_json blob rather than normalized columns
+                # since its shape is a nested aggregate, not a flat record.
+                # trade_date is the PK so re-running the same day's review
+                # (e.g. after a late fill correction) updates the existing
+                # row via INSERT OR REPLACE rather than accreting duplicates.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS eod_review (
+                        trade_date TEXT PRIMARY KEY,
+                        report_json TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Strategy revision ledger (Phase3: the adaptive
+                # TradingStrategy produced by the EOD strategy-consensus
+                # panel — and manual /trading/strategy edits — versioned
+                # durably; coordinator._strategy alone is in-memory and
+                # evaporates on restart). Accrete-style (id PK, one row per
+                # consensus run / manual set) like regime_snapshot; the
+                # "currently applied" revision is the app_settings
+                # 'strategy:active_revision_id' pointer, so restore never
+                # guesses. strategy_json is the FULL TradingStrategy dump —
+                # the strategy in effect AFTER this run (unchanged runs
+                # store the same content with changed=0).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS strategy_revisions (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT,
+                        source TEXT,
+                        stance TEXT,
+                        consensus_level REAL,
+                        changed INTEGER DEFAULT 0,
+                        strategy_json TEXT NOT NULL,
+                        parent_revision_id TEXT,
+                        rationale TEXT,
+                        votes_json TEXT,
+                        regime_snapshot_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Agent-chat decisions ledger (Phase1 C1: decisions/votes were
+                # in-memory-only and evaporated on restart). One row per
+                # decision reached by the agent-chat debate for a ticker;
+                # regime_snapshot_id/outcome_* are placeholders for later
+                # tasks (provenance/EOD outcome labeling) and stay unused here.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_chat_decisions (
+                        id TEXT PRIMARY KEY,
+                        ticker TEXT NOT NULL,
+                        stock_name TEXT,
+                        trade_date TEXT,
+                        status TEXT,
+                        action TEXT,
+                        confidence REAL,
+                        consensus_level REAL,
+                        rationale TEXT,
+                        dissenting_opinions TEXT,
+                        entry_price REAL,
+                        stop_loss REAL,
+                        take_profit REAL,
+                        position_pct REAL,
+                        news_sentiment TEXT,
+                        news_count INTEGER,
+                        behavioral_signals TEXT,
+                        market_sentiment TEXT,
+                        flow TEXT,
+                        regime_snapshot_id TEXT,
+                        outcome_realized_pnl REAL,
+                        outcome_label TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                # Per-agent votes backing a decision (technical/risk/sentiment/...).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_chat_votes (
+                        id TEXT PRIMARY KEY,
+                        decision_id TEXT NOT NULL,
+                        agent_type TEXT NOT NULL,
+                        vote TEXT,
+                        confidence REAL,
+                        reasoning TEXT,
+                        key_factors TEXT,
+                        suggested_position_pct REAL,
+                        suggested_stop_loss_pct REAL,
+                        suggested_take_profit_pct REAL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Discussion transcript ledger (session-ssot P4-3): a completed
+                # ChatSession's decision/vote summary lands in
+                # agent_chat_decisions/agent_chat_votes above, but the full
+                # message/round transcript (context/rounds/all_messages/votes/
+                # decision, i.e. ChatSession.model_dump(mode="json")) used to
+                # live only in the coordinator's in-memory history and
+                # SessionManager's TTL'd state -- evaporating on restart or
+                # TTL expiry. One row per session, additive to the existing
+                # ledger tables above (no column/semantic changes to either).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_chat_transcripts (
+                        session_id TEXT PRIMARY KEY,
+                        transcript_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                """)
+
+                # Per-agent calibration ledger (Phase2 Task 1): Phase1 backfills
+                # outcome_realized_pnl onto the entry decision but leaves
+                # outcome_label nullable and never scores which agent's vote
+                # was actually right — without that, adaptive strategy
+                # re-weighting (Phase 3) has no data to re-weight against.
+                # One row per agent_type per calibration run (as_of_date is
+                # NOT a PK/UNIQUE constraint — re-running for the same date
+                # simply appends a fresh snapshot row rather than overwriting,
+                # mirroring how this ledger accretes elsewhere in this file).
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_calibration (
+                        id TEXT PRIMARY KEY,
+                        agent_type TEXT,
+                        as_of_date TEXT,
+                        window_days INTEGER,
+                        decisions_scored INTEGER,
+                        correct INTEGER,
+                        accuracy REAL,
+                        avg_confidence REAL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # Slot contest ledger (portfolio instrumentation U2): when the
+                # portfolio is already at max_positions, the autonomy gate
+                # refuses a new BUY/ADD opportunity flat -- no comparison
+                # against what's already held is ever recorded anywhere. This
+                # table is recording-only (see services/agent_chat/
+                # slot_contest.py) -- it does not decide whether a swap would
+                # have been better, it just keeps the challenger's terms and
+                # a snapshot of the incumbents so that question is answerable
+                # later. Accrete-style (id uuid PK, NOT trade_date) like
+                # regime_snapshot/discovery_candidates: every refusal appends
+                # its own row.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS slot_contest (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        challenger_ticker TEXT NOT NULL,
+                        challenger_action TEXT,
+                        challenger_consensus REAL,
+                        challenger_confidence REAL,
+                        challenger_entry_price REAL,
+                        challenger_stop_loss REAL,
+                        challenger_take_profit REAL,
+                        incumbents_json TEXT NOT NULL
+                    )
+                """)
+
+                # slot_contest.gate_reason/open_positions_count (final review,
+                # Important-1, 2026-08-05): gate.py's max_positions check
+                # returns the SAME check name ("max_positions") whether
+                # positions_count_provider genuinely found the portfolio
+                # full OR merely raised while trying to count (a
+                # count-lookup error, not a full portfolio) -- with no
+                # reason column those two cases were permanently
+                # indistinguishable once written. `len(incumbents_json)`
+                # can't stand in either: the gate counts from the broker
+                # balance + pending BUYs (gate.py's
+                # _default_positions_count_provider) while incumbents_json
+                # comes from the in-memory PositionManager -- two sources
+                # with a history of divergence in this system, so a lagging
+                # PM can leave incumbents_json="[]" on a genuine refusal.
+                # gate_reason carries gate.reason verbatim -- self-diagnosing
+                # (an exception message vs. "open positions N >= limit M").
+                # open_positions_count carries the SAME broker-derived count
+                # gate.py itself would have computed (re-queried
+                # independently at the call site, never from `incumbents`),
+                # so comparing it against len(incumbents) becomes a free
+                # consistency check between the two sources.
+                await self._ensure_columns(
+                    conn,
+                    "slot_contest",
+                    {"gate_reason": "TEXT", "open_positions_count": "INTEGER"},
+                )
+
+                # exposure_shadow (포트폴리오 목표 노출도, 관측 단계,
+                # 2026-08-06): 5분마다 "공식이 말한 목표"와 "실제 비중"을 나란히
+                # 적는다. 이 단계에서는 기록만 하고 사이징에 연결하지 않는다 --
+                # 2~3주 뒤 slot_contest와 대조해 "슬롯이 거절된 순간 공식이
+                # 말한 여유가 얼마였는가"에 답하기 위한 재료다.
+                # accrete-style: 시각마다 자기 행을 덧붙인다.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS exposure_shadow (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        target_pct REAL NOT NULL,
+                        actual_pct REAL,
+                        equity REAL,
+                        stock_value REAL,
+                        m_regime REAL,
+                        m_vol REAL,
+                        m_evidence REAL,
+                        m_drawdown REAL,
+                        binding TEXT,
+                        degraded TEXT,
+                        index_vol_annualized REAL,
+                        index_vol_n INTEGER,
+                        n_round_trips INTEGER,
+                        e_base REAL,
+                        e_max REAL,
+                        equity_peak REAL
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_exposure_shadow_trade_date "
+                    "ON exposure_shadow(trade_date)"
+                )
+
+                # macro_snapshot (레짐 판정 입력, 2026-08-07)
+                # quotes_json = {ticker: {"chg_pct": float, "prev_close": float}}
+                # missing_json = 수신 실패 티커 리스트. 조용히 0을 채우지
+                # 않는다 -- 못 받은 것은 못 받았다고 남긴다.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS macro_snapshot (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL UNIQUE,
+                        quotes_json TEXT NOT NULL,
+                        missing_json TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_macro_snapshot_trade_date "
+                    "ON macro_snapshot(trade_date)"
+                )
+
+                # regime_judgment (LLM 레짐 판정 + 그 판정이 만든 목표, 2026-08-07)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS regime_judgment (
+                        id TEXT PRIMARY KEY,
+                        trade_date TEXT NOT NULL UNIQUE,
+                        regime TEXT NOT NULL,
+                        confidence REAL,
+                        rationale TEXT,
+                        key_drivers_json TEXT,
+                        anchor_target_pct REAL NOT NULL,
+                        effective_target_pct REAL NOT NULL,
+                        prev_effective_pct REAL,
+                        degraded_json TEXT,
+                        macro_snapshot_id TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_regime_judgment_trade_date "
+                    "ON regime_judgment(trade_date)"
+                )
+
+                # index_daily (변동성 계산 전용 지수 종가, 2026-08-07)
+                # 등락률을 저장하지 않는 이유: 레벨과 등락률을 따로 받아
+                # 대조하려던 것이 정확히 이번 사고의 원인이었다. 종가만
+                # 담고 수익률은 계산하면 어긋날 대상이 없다.
+                # trade_date가 PRIMARY KEY라 재수집이 구멍을 메운다.
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS index_daily (
+                        trade_date TEXT PRIMARY KEY,
+                        close      REAL NOT NULL,
+                        source     TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+
+                # exposure_shadow.e_base/e_max/equity_peak (리뷰 반영,
+                # 2026-08-06): e_base/e_max는 이전까지 호출자가 넘기지 않아
+                # 늘 함수 기본값이었고 행에도 없었다 -- 관측 기간 중 이
+                # 노브를 튜닝하면(그것이 이 관측 창의 목적이다) 그 시점
+                # 이전 행들이 전부 조용히 다른 의미가 되는데, 행에 값이
+                # 없으면 그 경계를 나중에 가려낼 수 없다. equity_peak은
+                # m_drawdown으로 역산 가능하지만 바닥 클램프(0.3)이거나
+                # m_drawdown==1.0인 두 경우(가장 캐봐야 할 경우들)에는
+                # 역산이 안 된다. CREATE TABLE에 이미 넣었지만, 이 세
+                # 컬럼이 추가되기 전에 이미 만들어진 DB 파일에는
+                # CREATE TABLE IF NOT EXISTS가 no-op이므로 ALTER로 채운다
+                # -- 이 프로젝트에 마이그레이션 메커니즘이 없다.
+                await self._ensure_columns(
+                    conn,
+                    "exposure_shadow",
+                    {"e_base": "REAL", "e_max": "REAL", "equity_peak": "REAL"},
+                )
+
+                # daily_perf_snapshot.stock_value: 현금 희석을 제거한 "주식
+                # 슬리브" 변동성으로 갈아타려면 일별 주식 평가액이 필요한데
+                # 지금 어디에도 없었다. write_daily_snapshot
+                # (services/trading/eod_snapshot.py)이 보유종목 평가금액
+                # 합계를 채운다(리뷰 반영, 2026-08-06 -- 이전까지는 컬럼만
+                # 있고 쓰는 곳이 없어 한 달 뒤 전량 NULL이 될 판이었다).
+                # 지금부터 쌓아 한 달 뒤 슬리브 변동성 계산에 쓴다.
+                await self._ensure_columns(
+                    conn,
+                    "daily_perf_snapshot",
+                    {"stock_value": "REAL"},
+                )
+
+                # agent_chat_decisions.agent_weights (Phase4 T4): persists the
+                # consensus weights (default or calibration-tilted) actually
+                # used to reach this decision, as a JSON TEXT blob — without
+                # this, post-hoc calibration analysis over historical
+                # decisions can't tell which weighting produced them.
+                await self._ensure_columns(
+                    conn,
+                    "agent_chat_decisions",
+                    {"agent_weights": "TEXT"},
+                )
+
+                # agent_chat_decisions.total_messages/total_rounds (session-ssot
+                # P4-3): additive count columns so a list view can show
+                # transcript size (P4-4) without parsing agent_chat_transcripts'
+                # JSON blob per row. serialize_session fills these for new
+                # rows; existing rows stay NULL (P4-4 falls back to 0).
+                await self._ensure_columns(
+                    conn,
+                    "agent_chat_decisions",
+                    {"total_messages": "INTEGER", "total_rounds": "INTEGER"},
+                )
+
+                # Trade <-> decision provenance (Phase1 C2): kr_stock_trades
+                # predates decision_id/strategy_id/entry_or_exit -- there is
+                # no migration mechanism in this project, so an
+                # already-deployed DB only ever gets these columns via this
+                # ALTER path on the next initialize(). (2026-08-01 Upbit
+                # 제거: coin_trades에 대한 동일 ALTER 호출은 이제 없다 —
+                # 그 테이블은 이 파일에서 더 이상 생성되지 않고, 기존 운영
+                # DB의 coin_trades는 0행이라 컬럼 추가가 의미 없다.)
+                await self._ensure_columns(
+                    conn,
+                    "kr_stock_trades",
+                    {
+                        "decision_id": "TEXT",
+                        "strategy_id": "TEXT",
+                        "entry_or_exit": "TEXT",
+                    },
+                )
+
+                # kr_stock_trades.tax/cost_source (U1, 체결 비용 기록):
+                # `record_trade_fill_async`의 `fee` 인자가 이전까지 어떤
+                # 호출자도 넘기지 않아 기존 103건 전부 fee=0이었다 — 수수료만
+                # 있고 매도 증권거래세는 어디에도 기록되지 않았다. tax는
+                # 수수료와 별개 금액(매도에만 붙는다), cost_source는 이 값이
+                # `compute_fill_cost` 모델 산정('model')인지 브로커가 준
+                # 체결 단위 수수료('broker')인지 구분한다.
+                await self._ensure_columns(
+                    conn,
+                    "kr_stock_trades",
+                    {"tax": "INTEGER DEFAULT 0", "cost_source": "TEXT"},
+                )
+
+                # kr_realized_pnl.fee/tax/net_amount/cost_source (순 실현손익,
+                # 2026-08-08): realized_amount는 (exit-entry)*qty 순수 gross라
+                # 수수료도 증권거래세도 빠져 있었다. 그 gross가 그대로
+                # agent_chat_decisions.outcome_realized_pnl로 백필돼
+                # calibration의 에이전트 정오답 채점 → 전략 재가중으로
+                # 흘러가, 비용을 못 넘긴 거래가 "승리"로 학습됐다(라이브
+                # 25행 중 1건이 실제로 부호를 뒤집는다: 005930 gross
+                # +22,008 → net -19,328). realized_amount(gross)는 그대로
+                # 두고 net을 나란히 적는다 — 두 단위가 모두 남아야 한다.
+                #
+                # 비용 기준은 앱 자체 모델(cost_model.compute_fill_cost:
+                # 편도 수수료 2bp + 매도 증권거래세 23bp = 왕복 0.27%)이다.
+                # 모의 브로커는 실제로 왕복 0.90%(수수료 편도 35bp)를
+                # 물리지만 그건 모의 서버 고유 요율이고 실전 키움(왕복
+                # ~0.19~0.23%)의 4.7배다 — 캘리브레이션이 학습해야 하는
+                # 것은 실전에서 일반화되는 문턱이므로 모의의 가혹한 요율이
+                # 아니라 실전에 가까운 모델을 쓴다. cost_source가 어느
+                # 쪽으로 계산됐는지 남기므로('model' = 정상 기록 경로,
+                # 'model_backfill' = scripts/backfill_net_realized_pnl.py의
+                # 일회성 마이그레이션), 나중에 브로커가 체결 단위 수수료를
+                # 주면 그 값으로 갈아탈 수 있다.
+                await self._ensure_columns(
+                    conn,
+                    "kr_realized_pnl",
+                    {
+                        "fee": "INTEGER DEFAULT 0",
+                        "tax": "INTEGER DEFAULT 0",
+                        "net_amount": "REAL",
+                        "cost_source": "TEXT",
+                    },
+                )
+
+                # Regime snapshot index/flow/sentiment 심화 (Phase5): breadth-only
+                # 로 만들어진 기존 db에 지수/수급/파생심리 컬럼을 ALTER로 추가.
+                await self._ensure_columns(
+                    conn,
+                    "regime_snapshot",
+                    {
+                        "index_kospi": "REAL",
+                        "index_kospi_chg_pct": "REAL",
+                        "index_kosdaq": "REAL",
+                        "index_kosdaq_chg_pct": "REAL",
+                        "foreign_net_amount": "REAL",
+                        "institution_net_amount": "REAL",
+                        "market_sentiment_label": "TEXT",
+                        "sentiment_score": "REAL",
+                    },
+                )
+
+                # Regime snapshot scan_coverage_pct (SC-3): what fraction of
+                # the day's universe the consumed scan_sessions row (SC-1's
+                # 'completed'-or-'partial' gate in regime.py) actually
+                # covered -- 100 for a full completion, completed/total*100
+                # for a partial one, None when there was no scan session for
+                # that day at all. Without this, a regime row computed from
+                # an 84%-complete scan is indistinguishable from one computed
+                # from a full sweep in any post-hoc audit.
+                await self._ensure_columns(
+                    conn,
+                    "regime_snapshot",
+                    {"scan_coverage_pct": "REAL"},
+                )
+
+                # agent_chat_decisions.decision_source/session_ref (L1,
+                # decision lineage restoration 2026-07-19): promotes this
+                # table to the durable ledger for BOTH the agent-chat debate
+                # path (existing rows, decision_source left NULL -- read
+                # consumers treat NULL as the 'agent_chat' fallback per spec
+                # D1, not backfilled) AND the LangGraph analysis/execution
+                # path (new rows via persist_analysis_decision,
+                # decision_source='analysis', session_ref=originating
+                # session id -- kept for traceability even though that
+                # session itself may later be GC'd; this row is what
+                # survives).
+                await self._ensure_columns(
+                    conn,
+                    "agent_chat_decisions",
+                    {"decision_source": "TEXT", "session_ref": "TEXT"},
+                )
+
+                # agent_chat_decisions.sizing_lineage (U3, 사이징 계보,
+                # 2026-08-05): 완료된 8회 왕복 거래에서 패자 평균 명목이
+                # 승자의 1.27배였다(등가중 +0.92% vs 자본가중 -0.39%) —
+                # risk_score 배수(1.0/0.7/0.5)와 유동성 참여율 캡 중
+                # 어느 쪽이 사이징을 눌렀는지 기록이 없어 원인을 분리할
+                # 수 없었다. PortfolioAgent._calculate_max_position_value의
+                # 선택적 lineage out-param(JSON: base_max/risk_factor/
+                # risk_bucket_cap/r_cap/liquidity_cap/binding)을 담는
+                # 자리 -- 계산 자체는 바꾸지 않는다, 기록만 한다.
+                await self._ensure_columns(
+                    conn,
+                    "agent_chat_decisions",
+                    {"sizing_lineage": "TEXT"},
+                )
 
                 # Create indexes for better query performance
                 await conn.execute(
@@ -126,26 +712,20 @@ class StorageService:
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at)"
                 )
+                # KR stock trades indexes (2026-08-01 Upbit 제거 이전에는
+                # coin_trades의 인덱스 세트를 본떠 만들었다 — 그 원본 인덱스
+                # 6개는 이제 이 파일에 없다)
                 await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_market ON coin_trades(market)"
+                    "CREATE INDEX IF NOT EXISTS idx_kr_stock_trades_stk_cd ON kr_stock_trades(stk_cd)"
                 )
                 await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_session ON coin_trades(session_id)"
+                    "CREATE INDEX IF NOT EXISTS idx_kr_stock_trades_created ON kr_stock_trades(created_at DESC)"
                 )
                 await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_created ON coin_trades(created_at DESC)"
+                    "CREATE INDEX IF NOT EXISTS idx_kr_stock_trades_stk_cd_created ON kr_stock_trades(stk_cd, created_at DESC)"
                 )
-                # Composite index for market + time sorting (frequently used together)
                 await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_market_created ON coin_trades(market, created_at DESC)"
-                )
-                # Index for state filtering
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_state ON coin_trades(state)"
-                )
-                # Index for side filtering (buy/sell statistics)
-                await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_trades_side ON coin_trades(side)"
+                    "CREATE INDEX IF NOT EXISTS idx_kr_stock_trades_session ON kr_stock_trades(session_id)"
                 )
 
                 # Additional indexes for common query patterns
@@ -153,13 +733,44 @@ class StorageService:
                     "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)"
                 )
                 await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_positions_quantity ON coin_positions(quantity)"
+                    "CREATE INDEX IF NOT EXISTS idx_kr_realized_pnl_stk_cd ON kr_realized_pnl(stk_cd)"
+                )
+
+                # Agent-chat ledger indexes (Phase1 C1)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_acd_ticker ON agent_chat_decisions(ticker)"
                 )
                 await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_positions_updated ON coin_positions(updated_at DESC)"
+                    "CREATE INDEX IF NOT EXISTS idx_acd_trade_date ON agent_chat_decisions(trade_date)"
                 )
                 await conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_coin_positions_session ON coin_positions(session_id)"
+                    "CREATE INDEX IF NOT EXISTS idx_acv_decision ON agent_chat_votes(decision_id)"
+                )
+
+                # Agent calibration ledger index (Phase2 Task 1)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ac_agent_type ON agent_calibration(agent_type)"
+                )
+
+                # Regime snapshot index (Phase2 Task 2)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_regime_snapshot_trade_date ON regime_snapshot(trade_date)"
+                )
+
+                # Strategy revision index (Phase3)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_strategy_revisions_trade_date"
+                    " ON strategy_revisions(trade_date)"
+                )
+
+                # Discovery candidate ledger indexes (DS-3)
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_discovery_candidates_trade_date"
+                    " ON discovery_candidates(trade_date)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_discovery_candidates_ticker"
+                    " ON discovery_candidates(ticker)"
                 )
 
                 await conn.commit()
@@ -168,6 +779,27 @@ class StorageService:
         except Exception as e:
             logger.error("storage_init_failed", error=str(e))
             raise
+
+    @staticmethod
+    async def _ensure_columns(
+        conn: "aiosqlite.Connection", table: str, cols: dict[str, str]
+    ) -> None:
+        """Add any of `cols` missing from `table` via ALTER TABLE ADD COLUMN.
+
+        This project has no migration mechanism -- CREATE TABLE IF NOT EXISTS
+        is a no-op against a table that already exists, so a column added to
+        the schema after a DB file was first created would otherwise never
+        appear on that file. Every column added this way must be nullable
+        (no DEFAULT/NOT NULL requirement), since SQLite's ADD COLUMN cannot
+        backfill existing rows with anything but a constant.
+        """
+        cursor = await conn.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cursor.fetchall()}
+        for name, col_type in cols.items():
+            if name not in existing:
+                await conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {col_type}"
+                )
 
     # -------------------------------------------
     # Session Management
@@ -403,6 +1035,51 @@ class StorageService:
             logger.error("checkpoint_delete_failed", session_id=session_id, error=str(e))
             return False
 
+    async def get_checkpoint_session_ids(self) -> list[tuple[str, str]]:
+        """
+        List every distinct session_id that currently owns checkpoint rows,
+        paired with the most recent write time across all of that
+        session_id's (session_id, thread_id) rows.
+
+        Session-SSOT P5-2: backs the orphan-checkpoint sweep in
+        session_manager.py. That sweep needs a "how long has this
+        checkpoint gone untouched" signal to apply a grace period before
+        reclaiming a checkpoint whose owning session is missing or
+        terminal -- rather than adding a schema column for this, it reuses
+        `checkpoints.created_at`, which already behaves as a de facto
+        last-write timestamp with ZERO migration: `save_checkpoint` above
+        uses `INSERT OR REPLACE`, and SQLite's REPLACE conflict-resolution
+        algorithm deletes the pre-existing (session_id, thread_id) row and
+        inserts a brand new one on every write. `created_at` is not one of
+        the columns that INSERT's column list specifies, so the new row
+        always takes the column's DEFAULT (CURRENT_TIMESTAMP) -- on every
+        save, not just the first. (Verified empirically, not just inferred
+        from the CREATE TABLE text -- see the P5-2 task report.)
+
+        Returns:
+            List of (session_id, last_written_at) tuples. last_written_at
+            is the raw SQLite TIMESTAMP string (e.g. "2026-07-17
+            09:00:00"), parseable via datetime.fromisoformat. Empty list on
+            any failure (best-effort read, matching this module's other
+            list_* methods).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    """
+                    SELECT session_id, MAX(created_at)
+                    FROM checkpoints
+                    GROUP BY session_id
+                    """
+                )
+                rows = await cursor.fetchall()
+                return [(row[0], row[1]) for row in rows]
+        except Exception as e:
+            logger.error("checkpoint_session_ids_get_failed", error=str(e))
+            return []
+
     # -------------------------------------------
     # Cache Operations
     # -------------------------------------------
@@ -506,18 +1183,29 @@ class StorageService:
             logger.error("cleanup_failed", error=str(e))
             return 0
 
-    # -------------------------------------------
-    # Coin Trading Operations
-    # -------------------------------------------
-
-    async def save_coin_trade(self, trade: dict[str, Any]) -> bool:
+    async def save_kr_realized_pnl(self, record: dict[str, Any]) -> bool:
         """
-        Save a coin trade record.
+        Persist a matched entry/exit realized-P&L record for a KR stock
+        close/reduce.
+
+        (Phase1 Task 4/C3a: KR had no per-trade realized-P&L record at all —
+        only the broker's day-level ka10074, ephemeral and unmatched to a
+        specific entry. Minimal entry/exit/qty/realized shape, plus
+        entry/exit decision IDs and holding_period_seconds. Derived/display
+        record only — the broker ledger (ka10074) remains the source of
+        truth for KR realized P&L math.)
+
+        `realized_amount` stays GROSS ((exit-entry)*qty). fee/tax/net_amount
+        carry the cost-adjusted unit alongside it (2026-08-08) — the two
+        units live side by side rather than one replacing the other. Callers
+        that omit them leave net_amount NULL, which every consumer must read
+        as "legacy row, fall back to realized_amount".
 
         Args:
-            trade: Trade data dictionary with keys:
-                - id, session_id, market, side, order_type, price,
-                - volume, executed_volume, fee, total_krw, state, order_uuid
+            record: dict with keys id, stk_cd, entry_price, exit_price,
+                quantity, realized_amount, and optionally
+                entry_decision_id/exit_decision_id/holding_period_seconds/
+                entry_at/exit_at/created_at/fee/tax/net_amount/cost_source.
 
         Returns:
             True if saved successfully
@@ -528,45 +1216,241 @@ class StorageService:
             async with aiosqlite.connect(str(self.db_path)) as conn:
                 await conn.execute(
                     """
-                    INSERT INTO coin_trades
-                    (id, session_id, market, side, order_type, price, volume,
-                     executed_volume, fee, total_krw, state, order_uuid, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO kr_realized_pnl
+                    (id, stk_cd, entry_price, exit_price, quantity,
+                     realized_amount, entry_decision_id, exit_decision_id,
+                     holding_period_seconds, entry_at, exit_at, created_at,
+                     fee, tax, net_amount, cost_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        trade["id"],
-                        trade.get("session_id"),
-                        trade["market"],
-                        trade["side"],
-                        trade["order_type"],
-                        trade["price"],
-                        trade["volume"],
-                        trade["executed_volume"],
-                        trade.get("fee", 0),
-                        trade["total_krw"],
-                        trade["state"],
-                        trade.get("order_uuid"),
-                        trade.get("created_at", datetime.now()),
+                        record["id"],
+                        record["stk_cd"],
+                        record.get("entry_price"),
+                        record.get("exit_price"),
+                        record.get("quantity"),
+                        record.get("realized_amount"),
+                        record.get("entry_decision_id"),
+                        record.get("exit_decision_id"),
+                        record.get("holding_period_seconds"),
+                        record.get("entry_at"),
+                        record.get("exit_at"),
+                        record.get("created_at", datetime.now()),
+                        record.get("fee", 0),
+                        record.get("tax", 0),
+                        record.get("net_amount"),
+                        record.get("cost_source"),
                     ),
                 )
                 await conn.commit()
-                logger.debug("coin_trade_saved", trade_id=trade["id"])
+                logger.debug(
+                    "kr_realized_pnl_saved",
+                    stk_cd=record["stk_cd"],
+                    realized_amount=record.get("realized_amount"),
+                )
                 return True
         except Exception as e:
-            logger.error("coin_trade_save_failed", trade_id=trade.get("id"), error=str(e))
+            logger.error(
+                "kr_realized_pnl_save_failed",
+                stk_cd=record.get("stk_cd"),
+                error=str(e),
+            )
             return False
 
-    async def get_coin_trades(
+    async def get_kr_realized_pnl(
         self,
-        market: Optional[str] = None,
+        stk_cd: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
+        """Get realized KR stock P&L records, newest first, optionally
+        filtered by stk_cd."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                if stk_cd:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM kr_realized_pnl
+                        WHERE stk_cd = ?
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (stk_cd, limit, offset),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM kr_realized_pnl
+                        ORDER BY created_at DESC
+                        LIMIT ? OFFSET ?
+                        """,
+                        (limit, offset),
+                    )
+
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("kr_realized_pnl_get_failed", error=str(e))
+            return []
+
+    # -------------------------------------------
+    # Daily Performance Snapshot (Phase1 Task 5/C3b)
+    # -------------------------------------------
+
+    async def save_daily_perf_snapshot(self, record: dict[str, Any]) -> bool:
         """
-        Get coin trade history.
+        Persist one end-of-day performance snapshot row.
+
+        Uses INSERT OR IGNORE against the trade_date PRIMARY KEY: a second
+        write for a trade_date that already has a row is a silent no-op
+        rather than an overwrite or an error — durable "at most once per
+        day" semantics without needing a separate existence check.
 
         Args:
-            market: Filter by market code (optional)
+            record: dict with keys trade_date, equity, realized_pnl,
+                commission, tax, net_pnl, win_trades, loss_trades,
+                cumulative_return_pct, and optionally regime_snapshot_id,
+                stock_value.
+
+        Returns:
+            True if the statement executed successfully (including when the
+            row already existed and the insert was ignored).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR IGNORE INTO daily_perf_snapshot
+                    (trade_date, equity, realized_pnl, commission, tax,
+                     net_pnl, win_trades, loss_trades, cumulative_return_pct,
+                     regime_snapshot_id, stock_value)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["trade_date"],
+                        record.get("equity"),
+                        record.get("realized_pnl"),
+                        record.get("commission"),
+                        record.get("tax"),
+                        record.get("net_pnl"),
+                        record.get("win_trades"),
+                        record.get("loss_trades"),
+                        record.get("cumulative_return_pct"),
+                        record.get("regime_snapshot_id"),
+                        record.get("stock_value"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "daily_perf_snapshot_saved",
+                    trade_date=record.get("trade_date"),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "daily_perf_snapshot_save_failed",
+                trade_date=record.get("trade_date"),
+                error=str(e),
+            )
+            return False
+
+    async def get_daily_perf_snapshots(self, limit: int = 60) -> list[dict[str, Any]]:
+        """Get daily performance snapshots, newest first by trade_date."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM daily_perf_snapshot
+                    ORDER BY trade_date DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("daily_perf_snapshots_get_failed", error=str(e))
+            return []
+
+    # -------------------------------------------
+    # KR Stock Trading Operations (P1-1)
+    # -------------------------------------------
+
+    async def add_kr_stock_trade(self, record: dict[str, Any]) -> bool:
+        """
+        Save a KR stock trade record (a confirmed fill).
+
+        Args:
+            record: Trade data dictionary with keys:
+                - id, session_id, stk_cd, stk_nm, side, order_type, price,
+                - quantity, executed_quantity, fee, total_krw, status, order_id
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO kr_stock_trades
+                    (id, session_id, stk_cd, stk_nm, side, order_type, price,
+                     quantity, executed_quantity, fee, total_krw, status, order_id, created_at,
+                     decision_id, strategy_id, entry_or_exit, tax, cost_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"],
+                        record.get("session_id"),
+                        record["stk_cd"],
+                        record.get("stk_nm"),
+                        record["side"],
+                        record["order_type"],
+                        record["price"],
+                        record["quantity"],
+                        record["executed_quantity"],
+                        record.get("fee", 0),
+                        record["total_krw"],
+                        record["status"],
+                        record.get("order_id"),
+                        record.get("created_at", datetime.now()),
+                        record.get("decision_id"),
+                        record.get("strategy_id"),
+                        record.get("entry_or_exit"),
+                        record.get("tax", 0),
+                        record.get("cost_source"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug("kr_stock_trade_saved", trade_id=record["id"])
+                return True
+        except Exception as e:
+            logger.error(
+                "kr_stock_trade_save_failed", trade_id=record.get("id"), error=str(e)
+            )
+            return False
+
+    async def get_kr_stock_trades(
+        self,
+        stk_cd: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        Get KR stock trade history, newest first.
+
+        Args:
+            stk_cd: Filter by stock code (optional)
             limit: Maximum records to return
             offset: Offset for pagination
 
@@ -579,20 +1463,20 @@ class StorageService:
             async with aiosqlite.connect(str(self.db_path)) as conn:
                 conn.row_factory = aiosqlite.Row
 
-                if market:
+                if stk_cd:
                     cursor = await conn.execute(
                         """
-                        SELECT * FROM coin_trades
-                        WHERE market = ?
+                        SELECT * FROM kr_stock_trades
+                        WHERE stk_cd = ?
                         ORDER BY created_at DESC
                         LIMIT ? OFFSET ?
                         """,
-                        (market.upper(), limit, offset),
+                        (stk_cd, limit, offset),
                     )
                 else:
                     cursor = await conn.execute(
                         """
-                        SELECT * FROM coin_trades
+                        SELECT * FROM kr_stock_trades
                         ORDER BY created_at DESC
                         LIMIT ? OFFSET ?
                         """,
@@ -602,53 +1486,122 @@ class StorageService:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error("coin_trades_get_failed", error=str(e))
+            logger.error("kr_stock_trades_get_failed", error=str(e))
             return []
 
-    async def get_coin_trade(self, trade_id: str) -> Optional[dict[str, Any]]:
-        """Get a single trade by ID."""
+    async def get_kr_stock_trade(self, trade_id: str) -> Optional[dict[str, Any]]:
+        """Get a single KR stock trade by ID."""
         await self.initialize()
 
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
                 conn.row_factory = aiosqlite.Row
                 cursor = await conn.execute(
-                    "SELECT * FROM coin_trades WHERE id = ?",
+                    "SELECT * FROM kr_stock_trades WHERE id = ?",
                     (trade_id,),
                 )
                 row = await cursor.fetchone()
                 return dict(row) if row else None
         except Exception as e:
-            logger.error("coin_trade_get_failed", trade_id=trade_id, error=str(e))
+            logger.error("kr_stock_trade_get_failed", trade_id=trade_id, error=str(e))
             return None
 
-    async def get_coin_trades_count(self, market: Optional[str] = None) -> int:
-        """Get total count of trades for pagination."""
+    async def get_kr_stock_trades_count(self, stk_cd: Optional[str] = None) -> int:
+        """Get total count of KR stock trades for pagination."""
         await self.initialize()
 
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
-                if market:
+                if stk_cd:
                     cursor = await conn.execute(
-                        "SELECT COUNT(*) FROM coin_trades WHERE market = ?",
-                        (market.upper(),),
+                        "SELECT COUNT(*) FROM kr_stock_trades WHERE stk_cd = ?",
+                        (stk_cd,),
                     )
                 else:
-                    cursor = await conn.execute("SELECT COUNT(*) FROM coin_trades")
+                    cursor = await conn.execute("SELECT COUNT(*) FROM kr_stock_trades")
                 row = await cursor.fetchone()
                 return row[0] if row else 0
         except Exception as e:
-            logger.error("coin_trades_count_failed", error=str(e))
+            logger.error("kr_stock_trades_count_failed", error=str(e))
             return 0
 
-    async def save_coin_position(self, position: dict[str, Any]) -> bool:
+    # -------------------------------------------
+    # App Settings (persisted key-value)
+    # -------------------------------------------
+
+    async def get_app_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Get a persisted app setting (e.g. 'trading_mode:kiwoom')."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            async with conn.execute(
+                "SELECT value FROM app_settings WHERE key = ?", (key,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else default
+
+    async def set_app_setting(self, key: str, value: str) -> None:
+        """Set (upsert) a persisted app setting."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            await conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, value),
+            )
+            await conn.commit()
+        logger.debug("app_setting_saved", key=key)
+
+    # -------------------------------------------
+    # Agent-Chat Decisions Ledger (Phase1 C1)
+    # -------------------------------------------
+
+    async def save_agent_chat_decision(
+        self, decision: dict[str, Any], votes: list[dict[str, Any]]
+    ) -> bool:
         """
-        Save or update a coin position.
+        Persist an agent-chat decision plus its backing per-agent votes.
+
+        (Phase1 C1: decisions/votes were in-memory-only and evaporated on
+        restart. Mirrors add_kr_stock_trade's shape — a single connection/
+        transaction covers the decision row and all vote rows so a decision
+        never persists without its votes or vice versa.)
 
         Args:
-            position: Position data with keys:
-                - market, currency, quantity, avg_entry_price,
-                - stop_loss, take_profit, session_id
+            decision: dict with keys id, ticker, stock_name, trade_date,
+                status, action, confidence, consensus_level, rationale,
+                dissenting_opinions (list), entry_price, stop_loss,
+                take_profit, position_pct, news_sentiment, news_count,
+                behavioral_signals (dict), market_sentiment (dict/None),
+                flow (dict/None), agent_weights (dict/None — Phase4:
+                consensus weights actually used, JSON-serialized),
+                total_messages/total_rounds (int/None — session-ssot P4-3:
+                transcript size, for a list view that shouldn't have to
+                parse agent_chat_transcripts' JSON blob per row).
+                decision_source/session_ref (str/None — L1, decision
+                lineage restoration: 'analysis' + originating session id
+                for LangGraph-path decisions written via
+                persist_analysis_decision; omitted/None for the normal
+                agent-chat debate path, which leaves both columns NULL —
+                read consumers treat NULL decision_source as 'agent_chat').
+                sizing_lineage (dict/None — U3, 사이징 계보: which cap
+                (risk_bucket_cap/r_cap/liquidity_cap) actually bound this
+                decision's position sizing, from
+                PortfolioAgent._calculate_max_position_value's optional
+                `lineage` out-param, JSON-serialized the same way
+                agent_weights/behavioral_signals are. No current caller
+                populates this yet — the column and this write-path exist
+                so a future call site that has both the lineage dict and
+                this decision's id can populate it without a further
+                storage_service.py change).
+            votes: list of dicts with keys decision_id, agent_type, vote,
+                confidence, reasoning, key_factors (list),
+                suggested_position_pct, suggested_stop_loss_pct,
+                suggested_take_profit_pct.
 
         Returns:
             True if saved successfully
@@ -659,39 +1612,270 @@ class StorageService:
             async with aiosqlite.connect(str(self.db_path)) as conn:
                 await conn.execute(
                     """
-                    INSERT OR REPLACE INTO coin_positions
-                    (market, currency, quantity, avg_entry_price, stop_loss,
-                     take_profit, session_id, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?,
-                            COALESCE((SELECT created_at FROM coin_positions WHERE market = ?), ?),
-                            ?)
+                    INSERT INTO agent_chat_decisions
+                    (id, ticker, stock_name, trade_date, status, action,
+                     confidence, consensus_level, rationale, dissenting_opinions,
+                     entry_price, stop_loss, take_profit, position_pct,
+                     news_sentiment, news_count, behavioral_signals,
+                     market_sentiment, flow, agent_weights,
+                     total_messages, total_rounds, decision_source, session_ref,
+                     sizing_lineage)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        position["market"],
-                        position["currency"],
-                        position["quantity"],
-                        position["avg_entry_price"],
-                        position.get("stop_loss"),
-                        position.get("take_profit"),
-                        position.get("session_id"),
-                        position["market"],
-                        datetime.now(),
-                        datetime.now(),
+                        decision["id"],
+                        decision["ticker"],
+                        decision.get("stock_name"),
+                        decision.get("trade_date"),
+                        decision.get("status"),
+                        decision.get("action"),
+                        decision.get("confidence"),
+                        decision.get("consensus_level"),
+                        decision.get("rationale"),
+                        json.dumps(decision["dissenting_opinions"])
+                        if decision.get("dissenting_opinions") is not None
+                        else None,
+                        decision.get("entry_price"),
+                        decision.get("stop_loss"),
+                        decision.get("take_profit"),
+                        decision.get("position_pct"),
+                        decision.get("news_sentiment"),
+                        decision.get("news_count"),
+                        json.dumps(decision["behavioral_signals"])
+                        if decision.get("behavioral_signals") is not None
+                        else None,
+                        json.dumps(decision["market_sentiment"])
+                        if decision.get("market_sentiment") is not None
+                        else None,
+                        json.dumps(decision["flow"])
+                        if decision.get("flow") is not None
+                        else None,
+                        json.dumps(decision["agent_weights"])
+                        if decision.get("agent_weights") is not None
+                        else None,
+                        decision.get("total_messages"),
+                        decision.get("total_rounds"),
+                        # L1: 'agent_chat' path never sets these -- both land
+                        # NULL, which read consumers treat as the
+                        # 'agent_chat' fallback (spec D1). Only
+                        # persist_analysis_decision passes them explicitly.
+                        decision.get("decision_source"),
+                        decision.get("session_ref"),
+                        # U3: no existing caller sets this yet (see docstring
+                        # above) -- lands NULL, identical to every row
+                        # written before this column existed.
+                        json.dumps(decision["sizing_lineage"])
+                        if decision.get("sizing_lineage") is not None
+                        else None,
                     ),
                 )
+
+                for v in votes:
+                    await conn.execute(
+                        """
+                        INSERT INTO agent_chat_votes
+                        (id, decision_id, agent_type, vote, confidence, reasoning,
+                         key_factors, suggested_position_pct,
+                         suggested_stop_loss_pct, suggested_take_profit_pct)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(uuid.uuid4()),
+                            v["decision_id"],
+                            v["agent_type"],
+                            v.get("vote"),
+                            v.get("confidence"),
+                            v.get("reasoning"),
+                            json.dumps(v["key_factors"])
+                            if v.get("key_factors") is not None
+                            else None,
+                            v.get("suggested_position_pct"),
+                            v.get("suggested_stop_loss_pct"),
+                            v.get("suggested_take_profit_pct"),
+                        ),
+                    )
+
                 await conn.commit()
-                logger.debug("coin_position_saved", market=position["market"])
+                logger.debug(
+                    "agent_chat_decision_saved",
+                    decision_id=decision.get("id"),
+                    ticker=decision.get("ticker"),
+                    vote_count=len(votes),
+                )
                 return True
         except Exception as e:
             logger.error(
-                "coin_position_save_failed",
-                market=position.get("market"),
+                "agent_chat_decision_save_failed",
+                decision_id=decision.get("id"),
                 error=str(e),
             )
             return False
 
-    async def get_coin_positions(self) -> list[dict[str, Any]]:
-        """Get all open coin positions."""
+    async def get_agent_chat_decisions(
+        self,
+        ticker: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        source: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Get agent-chat decisions, newest first, optionally filtered by
+        ticker and/or decision_source.
+
+        Args:
+            source: filters on decision_source (L1: 'agent_chat' or
+                'analysis'). NULL rows (every row written before L1, and
+                every agent_chat-path row since -- that path never sets the
+                column) are matched under 'agent_chat' via
+                COALESCE(decision_source, 'agent_chat'), per spec D1's
+                stated fallback interpretation. Default None returns every
+                row regardless of source -- byte-identical to pre-L1
+                callers.
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                clauses = []
+                params: list[Any] = []
+                if ticker:
+                    clauses.append("ticker = ?")
+                    params.append(ticker)
+                if source:
+                    clauses.append("COALESCE(decision_source, 'agent_chat') = ?")
+                    params.append(source)
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+                cursor = await conn.execute(
+                    f"""
+                    SELECT * FROM agent_chat_decisions
+                    {where}
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (*params, limit, offset),
+                )
+
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("agent_chat_decisions_get_failed", error=str(e))
+            return []
+
+    async def count_agent_chat_decisions(self, ticker: Optional[str] = None) -> int:
+        """
+        Count agent_chat_decisions rows, optionally filtered by ticker.
+
+        session-ssot P4-4: the durable/permanent session count the agent-chat
+        `/status` endpoint's `total_sessions` field now reports (the retired
+        in-memory `_session_history` list's `len()` used to serve this and
+        evaporated on restart; the ledger is the sole, permanent source now).
+
+        Returns:
+            Row count, or 0 on any storage error (failure-harmless -- a
+            counting outage must never 500 the status endpoint).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                if ticker:
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM agent_chat_decisions WHERE ticker = ?",
+                        (ticker,),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM agent_chat_decisions"
+                    )
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error("agent_chat_decisions_count_failed", error=str(e))
+            return 0
+
+    async def update_decision_outcome(
+        self, decision_id: Optional[str], realized_pnl: float
+    ) -> bool:
+        """
+        Backfill the realized P&L outcome of an already-recorded agent-chat
+        decision (Phase1 Task 4/C3a).
+
+        Called once the position that decision opened is matched-closed
+        (see save_kr_realized_pnl / trade_log.record_kr_realized_pnl_async),
+        so a decision's eventual real-world outcome can be attributed back
+        to it for later analysis.
+
+        Args:
+            decision_id: agent_chat_decisions.id to update. A falsy value
+                (None/"") is a NORMAL input — e.g. a mechanical stop/take-
+                profit close, a user-approved alert action, or a rebalance
+                liquidation legitimately have no originating decision to
+                cite (spec D2) — so it is short-circuited outright rather
+                than issued as a `WHERE id = NULL` query (which SQL never
+                matches, silently no-opping the UPDATE while still paying
+                for a connection).
+            realized_pnl: realized P&L amount to record.
+
+        Returns:
+            True only when the UPDATE actually matched and updated exactly
+            one row. False in every other case — a falsy `decision_id` (no
+            UPDATE attempted), a `decision_id` that matched no row
+            (rowcount == 0, e.g. a monitor-driven stop/take-profit close
+            with no originating decision — legitimate, not an error), or a
+            storage exception. Every False-returning path (except the
+            exception path, which already logs its own
+            `decision_outcome_update_failed` error) logs a
+            `decision_outcome_update_missed` warning carrying decision_id/
+            realized_pnl (L4) — previously a non-matching UPDATE returned
+            True unconditionally, making a real lineage gap indistinguishable
+            from a genuine backfill.
+        """
+        if not decision_id:
+            logger.warning(
+                "decision_outcome_update_missed",
+                decision_id=decision_id,
+                realized_pnl=realized_pnl,
+                reason="missing_decision_id",
+            )
+            return False
+
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "UPDATE agent_chat_decisions SET outcome_realized_pnl = ? WHERE id = ?",
+                    (realized_pnl, decision_id),
+                )
+                await conn.commit()
+
+                if cursor.rowcount == 0:
+                    logger.warning(
+                        "decision_outcome_update_missed",
+                        decision_id=decision_id,
+                        realized_pnl=realized_pnl,
+                        reason="no_matching_row",
+                    )
+                    return False
+
+                logger.debug(
+                    "decision_outcome_updated",
+                    decision_id=decision_id,
+                    realized_pnl=realized_pnl,
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "decision_outcome_update_failed",
+                decision_id=decision_id,
+                error=str(e),
+            )
+            return False
+
+    async def get_agent_chat_votes(self, decision_id: str) -> list[dict[str, Any]]:
+        """Get all per-agent votes backing a decision."""
         await self.initialize()
 
         try:
@@ -699,91 +1883,1483 @@ class StorageService:
                 conn.row_factory = aiosqlite.Row
                 cursor = await conn.execute(
                     """
-                    SELECT * FROM coin_positions
-                    WHERE quantity > 0
-                    ORDER BY updated_at DESC
-                    """
+                    SELECT * FROM agent_chat_votes
+                    WHERE decision_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (decision_id,),
                 )
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
         except Exception as e:
-            logger.error("coin_positions_get_failed", error=str(e))
+            logger.error(
+                "agent_chat_votes_get_failed", decision_id=decision_id, error=str(e)
+            )
             return []
 
-    async def get_coin_position(self, market: str) -> Optional[dict[str, Any]]:
-        """Get a single position by market."""
+    # -------------------------------------------
+    # Agent-Chat Transcripts Ledger (session-ssot P4-3)
+    # -------------------------------------------
+
+    async def save_agent_chat_transcript(
+        self, session_id: str, transcript_json: str
+    ) -> bool:
+        """
+        Persist the full discussion transcript (ChatSession.model_dump(mode=
+        "json"), JSON-encoded by the caller) for a completed session.
+
+        INSERT OR REPLACE so re-persisting the same session_id (a session
+        that somehow completes twice, or a retry) is idempotent rather than
+        erroring on the PRIMARY KEY. Independent of
+        save_agent_chat_decision -- decision_log.persist_session calls both
+        in separate try/except blocks so a failure in one never blocks or
+        rolls back the other.
+
+        Args:
+            session_id: ChatSession.id -- same id agent_chat_decisions.id
+                uses for the same session, so callers can join the two.
+            transcript_json: pre-serialized JSON string (the full
+                ChatSession dump), not a dict -- mirrors how other *_json
+                columns in this file are already-serialized TEXT blobs.
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO agent_chat_transcripts
+                    (session_id, transcript_json, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (session_id, transcript_json, datetime.now().isoformat()),
+                )
+                await conn.commit()
+                logger.debug("agent_chat_transcript_saved", session_id=session_id)
+                return True
+        except Exception as e:
+            logger.error(
+                "agent_chat_transcript_save_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return False
+
+    async def get_agent_chat_transcript(self, session_id: str) -> Optional[str]:
+        """Get the persisted transcript JSON for a session, or None if this
+        session was never persisted (or storage errors)."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                async with conn.execute(
+                    "SELECT transcript_json FROM agent_chat_transcripts"
+                    " WHERE session_id = ?",
+                    (session_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    return row[0] if row else None
+        except Exception as e:
+            logger.error(
+                "agent_chat_transcript_get_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return None
+
+    async def update_decision_label(self, decision_id: str, label: str) -> bool:
+        """
+        Backfill the outcome_label ("correct"/"incorrect"/"flat") of an
+        already-recorded agent-chat decision (Phase2 Task 1).
+
+        Called by services/trading/calibration.py::label_and_calibrate once
+        a decision's outcome_realized_pnl has been judged. Mirrors
+        update_decision_outcome's shape/semantics exactly (a decision_id
+        with no matching row is not treated as an error).
+
+        Args:
+            decision_id: agent_chat_decisions.id to update
+            label: "correct", "incorrect", or "flat"
+
+        Returns:
+            True if the UPDATE executed successfully (including a no-op
+            match), False on any exception.
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE agent_chat_decisions SET outcome_label = ? WHERE id = ?",
+                    (label, decision_id),
+                )
+                await conn.commit()
+                logger.debug(
+                    "decision_label_updated", decision_id=decision_id, label=label
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "decision_label_update_failed",
+                decision_id=decision_id,
+                error=str(e),
+            )
+            return False
+
+    async def update_decision_sizing_lineage(
+        self, decision_id: Optional[str], sizing_lineage: dict
+    ) -> bool:
+        """
+        Backfill agent_chat_decisions.sizing_lineage for an already-recorded
+        decision (U3, 사이징 계보, 2026-08-05).
+
+        `PortfolioAgent._calculate_max_position_value`'s lineage dict is
+        computed synchronously inside `calculate_allocation`, well before
+        any decision row necessarily exists — it travels out on
+        `AllocationPlan.sizing_lineage` and is only attributable to a
+        specific `agent_chat_decisions` row once the caller
+        (`ExecutionCoordinator.on_trade_approved`) reaches the point where
+        the order is placed and its `session_id` (== `agent_chat_decisions.
+        id` for the agent-chat path, per `decision_log.serialize_session`)
+        is in scope. This mirrors `update_decision_label`'s shape exactly —
+        a `decision_id` with no matching row (e.g. a manually-approved
+        trade with no originating agent-chat decision, or a queued trade
+        whose session_id predates this column) is not treated as an error,
+        same convention as `update_decision_outcome`.
+
+        Args:
+            decision_id: agent_chat_decisions.id to update. A falsy value
+                is short-circuited outright (same rationale as
+                update_decision_outcome's guard) rather than issued as a
+                `WHERE id = NULL` query.
+            sizing_lineage: the lineage dict (base_max/risk_factor/
+                risk_bucket_cap/r_cap/liquidity_cap/binding) to JSON-encode
+                and store.
+
+        Returns:
+            True if the UPDATE executed successfully (including a no-op
+            match), False on a falsy decision_id or any exception.
+        """
+        if not decision_id:
+            return False
+
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE agent_chat_decisions SET sizing_lineage = ? WHERE id = ?",
+                    (json.dumps(sizing_lineage), decision_id),
+                )
+                await conn.commit()
+                logger.debug(
+                    "decision_sizing_lineage_updated", decision_id=decision_id
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "decision_sizing_lineage_update_failed",
+                decision_id=decision_id,
+                error=str(e),
+            )
+            return False
+
+    # -------------------------------------------
+    # Agent Calibration Ledger (Phase2 Task 1)
+    # -------------------------------------------
+
+    async def save_agent_calibration(self, record: dict[str, Any]) -> bool:
+        """
+        Persist one per-agent calibration snapshot row.
+
+        (Phase2 Task 1: per-agent accuracy/avg_confidence over a trailing
+        window, computed by services/trading/calibration.py::
+        label_and_calibrate from the agent_chat_decisions/agent_chat_votes
+        ledger.)
+
+        Args:
+            record: dict with keys id, agent_type, as_of_date, window_days,
+                decisions_scored, correct, accuracy, avg_confidence.
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO agent_calibration
+                    (id, agent_type, as_of_date, window_days, decisions_scored,
+                     correct, accuracy, avg_confidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"],
+                        record.get("agent_type"),
+                        record.get("as_of_date"),
+                        record.get("window_days"),
+                        record.get("decisions_scored"),
+                        record.get("correct"),
+                        record.get("accuracy"),
+                        record.get("avg_confidence"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "agent_calibration_saved",
+                    agent_type=record.get("agent_type"),
+                    accuracy=record.get("accuracy"),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "agent_calibration_save_failed",
+                agent_type=record.get("agent_type"),
+                error=str(e),
+            )
+            return False
+
+    async def get_agent_calibration(
+        self, as_of_date: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Get agent calibration rows, newest first, optionally filtered by
+        as_of_date."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                if as_of_date:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM agent_calibration
+                        WHERE as_of_date = ?
+                        ORDER BY created_at DESC, rowid DESC
+                        """,
+                        (as_of_date,),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        """
+                        SELECT * FROM agent_calibration
+                        ORDER BY created_at DESC, rowid DESC
+                        """
+                    )
+
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("agent_calibration_get_failed", error=str(e))
+            return []
+
+    # -------------------------------------------
+    # Regime Snapshot (Phase2 Task 2)
+    # -------------------------------------------
+
+    async def save_regime_snapshot(self, record: dict[str, Any]) -> bool:
+        """
+        Persist one daily market-regime snapshot row.
+
+        (Phase2 Task 2: computed by services/trading/regime.py::
+        compute_regime_snapshot from the background scanner's
+        scan_sessions breadth distribution — the only durable market-wide
+        artifact in this codebase.)
+
+        Args:
+            record: dict with keys id, trade_date, breadth_buy,
+                breadth_sell, breadth_hold, breadth_ratio, regime_label,
+                and optionally source (defaults to 'scanner').
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO regime_snapshot
+                    (id, trade_date, breadth_buy, breadth_sell, breadth_hold,
+                     breadth_ratio, regime_label, source,
+                     index_kospi, index_kospi_chg_pct, index_kosdaq,
+                     index_kosdaq_chg_pct, foreign_net_amount,
+                     institution_net_amount, market_sentiment_label, sentiment_score,
+                     scan_coverage_pct)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"], record.get("trade_date"),
+                        record.get("breadth_buy"), record.get("breadth_sell"),
+                        record.get("breadth_hold"), record.get("breadth_ratio"),
+                        record.get("regime_label"), record.get("source", "scanner"),
+                        record.get("index_kospi"), record.get("index_kospi_chg_pct"),
+                        record.get("index_kosdaq"), record.get("index_kosdaq_chg_pct"),
+                        record.get("foreign_net_amount"),
+                        record.get("institution_net_amount"),
+                        record.get("market_sentiment_label"),
+                        record.get("sentiment_score"),
+                        record.get("scan_coverage_pct"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "regime_snapshot_saved",
+                    trade_date=record.get("trade_date"),
+                    regime_label=record.get("regime_label"),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "regime_snapshot_save_failed",
+                trade_date=record.get("trade_date"),
+                error=str(e),
+            )
+            return False
+
+    async def get_regime_snapshots(self, limit: int = 60) -> list[dict[str, Any]]:
+        """Get regime snapshots, newest first by created_at."""
         await self.initialize()
 
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
                 conn.row_factory = aiosqlite.Row
                 cursor = await conn.execute(
-                    "SELECT * FROM coin_positions WHERE market = ?",
-                    (market.upper(),),
+                    """
+                    SELECT * FROM regime_snapshot
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("regime_snapshots_get_failed", error=str(e))
+            return []
+
+    # -------------------------------------------
+    # EOD Review Report (Phase2 Task 3)
+    # -------------------------------------------
+
+    async def save_eod_review(self, record: dict[str, Any]) -> bool:
+        """
+        Persist one end-of-day review report row.
+
+        (Phase2 Task 3: the assembled report from
+        services/trading/eod_review.py::build_eod_review. Uses
+        INSERT OR REPLACE against the trade_date PRIMARY KEY so re-running
+        the same day's review — e.g. after a late fill correction — updates
+        the existing row rather than accreting a duplicate.)
+
+        Args:
+            record: dict with keys trade_date, report_json (a JSON string).
+
+        Returns:
+            True if saved successfully
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO eod_review (trade_date, report_json)
+                    VALUES (?, ?)
+                    """,
+                    (
+                        record["trade_date"],
+                        record.get("report_json"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "eod_review_saved", trade_date=record.get("trade_date")
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "eod_review_save_failed",
+                trade_date=record.get("trade_date"),
+                error=str(e),
+            )
+            return False
+
+    async def get_eod_reviews(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Get EOD review reports, newest first by trade_date."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM eod_review
+                    ORDER BY trade_date DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("eod_reviews_get_failed", error=str(e))
+            return []
+
+    # -------------------------------------------
+    # Strategy Revisions (Phase3 Task 1)
+    # -------------------------------------------
+
+    async def save_strategy_revision(self, record: dict[str, Any]) -> bool:
+        """Persist one strategy revision row (Phase3 — EOD consensus run or
+        manual /trading/strategy edit). Accrete-style; the active revision is
+        the app_settings 'strategy:active_revision_id' pointer, not a flag
+        here. Failure-harmless: returns False, never raises (market-close
+        edge caller).
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO strategy_revisions
+                    (id, trade_date, source, stance, consensus_level, changed,
+                     strategy_json, parent_revision_id, rationale, votes_json,
+                     regime_snapshot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["id"],
+                        record.get("trade_date"),
+                        record.get("source"),
+                        record.get("stance"),
+                        record.get("consensus_level"),
+                        1 if record.get("changed") else 0,
+                        record["strategy_json"],
+                        record.get("parent_revision_id"),
+                        record.get("rationale"),
+                        record.get("votes_json"),
+                        record.get("regime_snapshot_id"),
+                    ),
+                )
+                await conn.commit()
+                logger.debug(
+                    "strategy_revision_saved",
+                    revision_id=record.get("id"),
+                    trade_date=record.get("trade_date"),
+                    stance=record.get("stance"),
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                "strategy_revision_save_failed",
+                revision_id=record.get("id"),
+                error=str(e),
+            )
+            return False
+
+    async def get_strategy_revisions(self, limit: int = 30) -> list[dict[str, Any]]:
+        """Strategy revisions, newest first (created_at DESC, rowid DESC
+        tie-break so same-second inserts stay insertion-ordered)."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM strategy_revisions
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("strategy_revisions_get_failed", error=str(e))
+            return []
+
+    async def get_strategy_revision(self, revision_id: str) -> Optional[dict[str, Any]]:
+        """Single strategy revision by id, or None."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM strategy_revisions WHERE id = ?",
+                    (revision_id,),
                 )
                 row = await cursor.fetchone()
                 return dict(row) if row else None
         except Exception as e:
-            logger.error("coin_position_get_failed", market=market, error=str(e))
+            logger.error(
+                "strategy_revision_get_failed", revision_id=revision_id, error=str(e)
+            )
             return None
 
-    async def update_coin_position(
-        self, market: str, updates: dict[str, Any]
-    ) -> bool:
+    # -------------------------------------------
+    # Discovery Candidate Ledger (DS-3)
+    # -------------------------------------------
+
+    async def save_discovery_candidates(self, rows: list[dict[str, Any]]) -> bool:
         """
-        Update specific fields of a position.
+        Persist one batch of discovery-scan candidate rows (one day's
+        regime-weighted ranking output from DS-4).
+
+        Each row is assigned a fresh uuid PK if it doesn't already carry
+        an "id" (mutates the dict in place so the caller can see which id
+        landed where). Accrete-style like regime_snapshot: trade_date is
+        NOT unique, so re-running the same day's scan appends rather than
+        overwrites. strategy_scores_json/llm_verdict_json may be passed
+        as either a dict (auto-serialized here) or an already-JSON string.
 
         Args:
-            market: Market code
-            updates: Dict of fields to update
+            rows: list of dicts with keys trade_date, ticker, name,
+                composite_score, strategy_scores_json, regime_label, rank,
+                llm_verdict_json (optional), promoted, skip_reason
+                (optional), close_price. fwd_1d/fwd_5d/fwd_20d are never
+                set here — see update_discovery_forward_returns /
+                services/discovery/ledger.py::backfill_forward_returns.
 
         Returns:
-            True if updated successfully
+            True if the batch was saved successfully (or rows was empty).
+        """
+        if not rows:
+            return True
+
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                data = []
+                for row in rows:
+                    row_id = row.get("id") or str(uuid.uuid4())
+                    row["id"] = row_id
+
+                    strategy_scores = row.get("strategy_scores_json")
+                    if strategy_scores is not None and not isinstance(strategy_scores, str):
+                        strategy_scores = json.dumps(strategy_scores, ensure_ascii=False)
+
+                    llm_verdict = row.get("llm_verdict_json")
+                    if llm_verdict is not None and not isinstance(llm_verdict, str):
+                        llm_verdict = json.dumps(llm_verdict, ensure_ascii=False)
+
+                    data.append((
+                        row_id,
+                        row.get("trade_date"),
+                        row.get("ticker"),
+                        row.get("name"),
+                        row.get("composite_score"),
+                        strategy_scores,
+                        row.get("regime_label"),
+                        row.get("rank"),
+                        llm_verdict,
+                        row.get("promoted"),
+                        row.get("skip_reason"),
+                        row.get("close_price"),
+                        # 승격 판단 재료 + LLM 근거 (2026-08-12). 없으면
+                        # NULL -- 수집 실패가 원장 기록 자체를 막으면
+                        # "무엇을 놓쳤는지"조차 남지 않는다.
+                        row.get("per"),
+                        row.get("pbr"),
+                        row.get("market_cap"),
+                        row.get("news_count"),
+                        row.get("llm_rationale"),
+                        row.get("llm_confidence"),
+                    ))
+
+                await conn.executemany(
+                    """
+                    INSERT INTO discovery_candidates
+                    (id, trade_date, ticker, name, composite_score,
+                     strategy_scores_json, regime_label, rank, llm_verdict_json,
+                     promoted, skip_reason, close_price,
+                     per, pbr, market_cap, news_count,
+                     llm_rationale, llm_confidence)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    data,
+                )
+                await conn.commit()
+                logger.debug("discovery_candidates_saved", count=len(rows))
+                return True
+        except Exception as e:
+            logger.error("discovery_candidates_save_failed", error=str(e))
+            return False
+
+    async def get_discovery_candidates(
+        self,
+        trade_date: Optional[str] = None,
+        ticker: Optional[str] = None,
+        trade_dates: Optional[list[str]] = None,
+        since_trade_date: Optional[str] = None,
+        unfilled_fwd_only: bool = False,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """
+        Query discovery_candidates rows, newest first, optionally filtered.
+
+        Args:
+            trade_date: exact "YYYY-MM-DD" match, if given.
+            ticker: exact ticker match, if given.
+            trade_dates: exact "YYYY-MM-DD" IN-match against a set of
+                dates, if given (e.g. services/discovery/ledger.py::
+                backfill_forward_returns scoping to exactly the 1/5/20-
+                trading-day-ago dates — pushed down to SQL so `limit`
+                below is a safety net, not the primary bound).
+            since_trade_date: "YYYY-MM-DD" lower bound (inclusive), if
+                given — trade_date >= this value.
+            unfilled_fwd_only: if True, restrict to rows where at least
+                one of fwd_1d/fwd_5d/fwd_20d is still NULL AND
+                close_price IS NOT NULL — a NULL close_price row (quality-
+                filter-excluded at scan time) can never be backfilled (see
+                backfill_forward_returns' own `if not close_price: continue`
+                skip) so it isn't a real "unfilled" candidate; including it
+                here only wastes the query's `limit` budget on rows that
+                will forever stay NULL.
+            limit: max rows to return.
+
+        Returns:
+            List of row dicts (empty on any storage error).
         """
         await self.initialize()
 
-        allowed_fields = {"quantity", "avg_entry_price", "stop_loss", "take_profit"}
-        update_fields = {k: v for k, v in updates.items() if k in allowed_fields}
-
-        if not update_fields:
-            return False
-
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
-                set_clause = ", ".join(f"{k} = ?" for k in update_fields)
-                values = list(update_fields.values()) + [datetime.now(), market.upper()]
+                conn.row_factory = aiosqlite.Row
 
-                await conn.execute(
+                clauses = []
+                params: list[Any] = []
+                if trade_date:
+                    clauses.append("trade_date = ?")
+                    params.append(trade_date)
+                if trade_dates:
+                    placeholders = ",".join("?" * len(trade_dates))
+                    clauses.append(f"trade_date IN ({placeholders})")
+                    params.extend(trade_dates)
+                if since_trade_date:
+                    clauses.append("trade_date >= ?")
+                    params.append(since_trade_date)
+                if ticker:
+                    clauses.append("ticker = ?")
+                    params.append(ticker)
+                if unfilled_fwd_only:
+                    clauses.append(
+                        "((fwd_1d IS NULL OR fwd_5d IS NULL OR fwd_20d IS NULL)"
+                        " AND close_price IS NOT NULL)"
+                    )
+
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                params.append(limit)
+
+                cursor = await conn.execute(
                     f"""
-                    UPDATE coin_positions
-                    SET {set_clause}, updated_at = ?
-                    WHERE market = ?
+                    SELECT * FROM discovery_candidates
+                    {where}
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
                     """,
-                    values,
+                    params,
                 )
-                await conn.commit()
-                logger.debug("coin_position_updated", market=market)
-                return True
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
         except Exception as e:
-            logger.error("coin_position_update_failed", market=market, error=str(e))
-            return False
+            logger.error("discovery_candidates_get_failed", error=str(e))
+            return []
 
-    async def delete_coin_position(self, market: str) -> bool:
-        """Delete a position (when closed)."""
+    async def count_promoted_discovery_candidates(self, trade_date: str) -> int:
+        """Count rows in discovery_candidates for `trade_date` with
+        promoted=1. Used by ranker.promote_candidates to seed the per-
+        trade_date regime daily cap so the cap holds across MULTIPLE same-day
+        pipeline runs (manual POST /trading/discovery/run + the scheduler's
+        market-close-edge run). A dedicated COUNT (not get_discovery_
+        candidates + client-side count) is required because that method is
+        newest-first + LIMIT-bounded and could miss an earlier run's promoted
+        rows behind a large later batch. Fails OPEN (0) on any storage error
+        — the caller must never block promotion on a lookup failure."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM discovery_candidates "
+                    "WHERE trade_date = ? AND promoted = 1",
+                    (trade_date,),
+                )
+                row = await cursor.fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+        except Exception as e:
+            logger.error(
+                "discovery_promoted_count_failed", trade_date=trade_date, error=str(e)
+            )
+            return 0
+
+    async def update_discovery_forward_returns(
+        self,
+        id: str,
+        fwd_1d: Optional[float] = None,
+        fwd_5d: Optional[float] = None,
+        fwd_20d: Optional[float] = None,
+    ) -> bool:
+        """
+        Backfill one candidate's forward-return slot(s).
+
+        A None argument leaves that column untouched. COALESCE also
+        refuses to overwrite a slot that's already non-NULL — a slot,
+        once filled, keeps its first recorded value forever. Callers are
+        expected to only pass a value for a slot they've just determined
+        is newly-elapsed (services/discovery/ledger.py::
+        backfill_forward_returns already checks this before calling), so
+        this is a defensive no-clobber guarantee, not the primary guard.
+
+        Args:
+            id: discovery_candidates.id to update.
+            fwd_1d/fwd_5d/fwd_20d: forward-return values to record, or
+                None to leave that slot alone.
+
+        Returns:
+            True if the UPDATE executed successfully (including when no
+            row matched id, or none of the three args were given).
+        """
         await self.initialize()
 
         try:
             async with aiosqlite.connect(str(self.db_path)) as conn:
                 await conn.execute(
-                    "DELETE FROM coin_positions WHERE market = ?",
-                    (market.upper(),),
+                    """
+                    UPDATE discovery_candidates
+                    SET fwd_1d = COALESCE(fwd_1d, ?),
+                        fwd_5d = COALESCE(fwd_5d, ?),
+                        fwd_20d = COALESCE(fwd_20d, ?)
+                    WHERE id = ?
+                    """,
+                    (fwd_1d, fwd_5d, fwd_20d, id),
                 )
                 await conn.commit()
-                logger.debug("coin_position_deleted", market=market)
+                logger.debug("discovery_forward_returns_updated", id=id)
                 return True
         except Exception as e:
-            logger.error("coin_position_delete_failed", market=market, error=str(e))
+            logger.error(
+                "discovery_forward_returns_update_failed", id=id, error=str(e)
+            )
             return False
+
+    # -------------------------------------------
+    # Regime FK Backfill (Phase2 Task 4)
+    # -------------------------------------------
+
+    async def backfill_regime_id(self, trade_date: str, regime_snapshot_id: str) -> None:
+        """
+        Backfill `regime_snapshot_id` onto the day's `daily_perf_snapshot`
+        row AND every `agent_chat_decisions` row for that trade_date.
+
+        (Phase2 Task 4: both FKs were left nullable by Phase1/Task2 since
+        the regime snapshot is only computed AFTER the day's decisions and
+        performance snapshot already exist — this is the tail step of
+        services/trading/eod_orchestrator.py::run_eod_review, called once
+        the regime_snapshot row itself has been saved.)
+
+        Failure-harmless: any error is logged and swallowed (never raises)
+        — this runs off the live market-close scheduler tick.
+
+        Args:
+            trade_date: "YYYY-MM-DD" to backfill.
+            regime_snapshot_id: id of the regime_snapshot row to attach.
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE daily_perf_snapshot SET regime_snapshot_id = ? "
+                    "WHERE trade_date = ?",
+                    (regime_snapshot_id, trade_date),
+                )
+                await conn.execute(
+                    "UPDATE agent_chat_decisions SET regime_snapshot_id = ? "
+                    "WHERE trade_date = ?",
+                    (regime_snapshot_id, trade_date),
+                )
+                await conn.commit()
+                logger.debug(
+                    "regime_id_backfilled",
+                    trade_date=trade_date,
+                    regime_snapshot_id=regime_snapshot_id,
+                )
+        except Exception as e:
+            logger.error(
+                "regime_id_backfill_failed",
+                trade_date=trade_date,
+                error=str(e),
+            )
+            return
+
+    async def backfill_market_context(
+        self, trade_date: str, sentiment_json: str, flow_json: str
+    ) -> None:
+        """그날 모든 agent_chat_decisions의 예약 슬롯(market_sentiment/flow)에
+        시장전체 심리·수급 JSON을 박제(EOD 백필 — regime_snapshot_id와 동일 패턴).
+        Phase1이 write-time None으로 남긴 슬롯을 EOD가 채운다. 실패-무해."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    "UPDATE agent_chat_decisions "
+                    "SET market_sentiment = ?, flow = ? WHERE trade_date = ?",
+                    (sentiment_json, flow_json, trade_date),
+                )
+                await conn.commit()
+        except Exception as e:
+            logger.error("backfill_market_context_failed",
+                         trade_date=trade_date, error=str(e))
+
+    # -------------------------------------------
+    # Slot Contest Ledger (portfolio instrumentation U2)
+    # -------------------------------------------
+
+    async def insert_slot_contest(
+        self,
+        *,
+        id: str,
+        trade_date: str,
+        challenger_ticker: str,
+        challenger_action: Optional[str] = None,
+        challenger_consensus: Optional[float] = None,
+        challenger_confidence: Optional[float] = None,
+        challenger_entry_price: Optional[float] = None,
+        challenger_stop_loss: Optional[float] = None,
+        challenger_take_profit: Optional[float] = None,
+        incumbents_json: str = "[]",
+        gate_reason: Optional[str] = None,
+        open_positions_count: Optional[int] = None,
+    ) -> bool:
+        """Record one slot-full refusal (a challenger denied because
+        max_positions was already reached) plus a snapshot of the
+        incumbents it was refused in favor of. Recording only -- this
+        never judges whether a swap would have been better.
+
+        gate_reason/open_positions_count (final review, Important-1,
+        2026-08-05): gate_reason is gate.reason verbatim -- the only way to
+        tell a genuine "portfolio full" refusal apart from a
+        positions_count_provider lookup error, both of which land here
+        under check="max_positions". open_positions_count is the
+        broker-derived count from the SAME provider gate.py itself used,
+        re-queried independently at the call site (never derived from
+        `incumbents_json`) -- comparing it to len(incumbents) is a free
+        consistency check between the gate's count source and the
+        PositionManager's.
+
+        Best-effort like add_kr_stock_trade above: on any storage error
+        this logs and returns False rather than raising. The caller,
+        services.agent_chat.slot_contest.record_slot_contest, wraps this
+        call in its own try/except regardless -- this method's own
+        except is a second, independent line of defense, not the only
+        one guarding the autonomy-gate refusal path this observes.
+        """
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO slot_contest
+                    (id, trade_date, challenger_ticker, challenger_action,
+                     challenger_consensus, challenger_confidence,
+                     challenger_entry_price, challenger_stop_loss,
+                     challenger_take_profit, incumbents_json,
+                     gate_reason, open_positions_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        id,
+                        trade_date,
+                        challenger_ticker,
+                        challenger_action,
+                        challenger_consensus,
+                        challenger_confidence,
+                        challenger_entry_price,
+                        challenger_stop_loss,
+                        challenger_take_profit,
+                        incumbents_json,
+                        gate_reason,
+                        open_positions_count,
+                    ),
+                )
+                await conn.commit()
+                logger.debug("slot_contest_saved", ticker=challenger_ticker)
+                return True
+        except Exception as e:
+            logger.error(
+                "slot_contest_save_failed", ticker=challenger_ticker, error=str(e)
+            )
+            return False
+
+    # -------------------------------------------
+    # Exposure Shadow (portfolio target exposure, observation-only)
+    # -------------------------------------------
+
+    async def insert_exposure_shadow(
+        self,
+        *,
+        trade_date: str,
+        target,            # TargetExposure — 순환 import를 피해 타입 힌트 생략
+        equity: float,
+        stock_value: float,
+        actual_pct: float,
+        n_round_trips: Optional[int],
+        e_base: Optional[float] = None,
+        e_max: Optional[float] = None,
+        equity_peak: Optional[float] = None,
+    ) -> bool:
+        """목표 노출도 1행을 적는다. 실패-무해 — False만 돌려주고 raise 안 한다.
+
+        `degraded`는 콤마로 join해 저장한다. 리스트가 비면 빈 문자열이다
+        (NULL과 구별된다 -- NULL은 "기록 안 됨", 빈 문자열은 "저하 없음").
+
+        `e_base`/`e_max`/`equity_peak`은 이 행을 만든 계산에 실제로 쓰인
+        값을 그대로 넘겨야 한다 -- 함수 기본값에 의존하면 나중에 어떤
+        값이 실제로 쓰였는지 알 길이 없다(리뷰 반영, 2026-08-06). 선택
+        인자로 둔 것은 순수하게 하위호환 때문이다: 넘기지 않으면 NULL로
+        남는다("몰랐다"는 NULL로 남지, 임의로 추정하지 않는다).
+
+        `n_round_trips`는 nullable이다 -- 조회 실패로 계산에는 대체값
+        (EVIDENCE_TARGET_TRIPS)을 넣었더라도 이 컬럼에는 None을 넘겨야
+        한다. 대체값을 그대로 저장하면 `AVG(n_round_trips)` 같은 사후
+        집계가 측정값과 대체값을 구분 못 하고 섞인다(리뷰 반영,
+        2026-08-06).
+
+        `m_regime`/`m_evidence` 컬럼은 2026-08-07(레짐 인지 노출도 개편)부터
+        항상 NULL이다 -- `TargetExposure`에서 두 필드가 사라졌다(레짐
+        배수는 폐기, 증거 배수는 왕복 표본이 모의 시장에서 쌓인 것이라
+        안전장치로 기능하지 못해 제거). 그 정보는 사라진 게 아니라
+        `regime_judgment` 테이블(`regime`/`anchor_target_pct`/
+        `effective_target_pct`/`degraded`)로 더 온전하게 옮겨갔다 --
+        그쪽이 권위 있는 출처다. 컬럼 자체는 SQLite에서 지우는 비용을
+        치를 이유가 없어 남겨뒀지만, 값은 반드시 `None`이어야 한다 --
+        `0`을 넣으면 "배수가 0이었다"로 오독돼 사후 분석이 오염된다.
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO exposure_shadow
+                    (id, trade_date, target_pct, actual_pct, equity, stock_value,
+                     m_regime, m_vol, m_evidence, m_drawdown, binding, degraded,
+                     index_vol_annualized, index_vol_n, n_round_trips,
+                     e_base, e_max, equity_peak)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        trade_date,
+                        target.target_pct,
+                        actual_pct,
+                        equity,
+                        stock_value,
+                        None,   # m_regime — regime_judgment로 이전, 2026-08-07
+                        target.m_vol,
+                        None,   # m_evidence — 안전장치로 기능 못해 폐기, 2026-08-07
+                        target.m_drawdown,
+                        target.binding,
+                        ",".join(target.degraded),
+                        target.index_vol_annualized,
+                        target.index_vol_n,
+                        n_round_trips,
+                        e_base,
+                        e_max,
+                        equity_peak,
+                    ),
+                )
+                await conn.commit()
+            return True
+        except Exception as e:
+            logger.warning("exposure_shadow_insert_failed", error=str(e))
+            return False
+
+    async def get_exposure_shadow(self, trade_date: str) -> list[dict]:
+        """해당 거래일의 목표 노출도 행을 시각순으로 돌려준다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM exposure_shadow WHERE trade_date = ? "
+                    "ORDER BY created_at",
+                    (trade_date,),
+                )
+                return [dict(row) for row in await cursor.fetchall()]
+        except Exception as e:
+            logger.warning("exposure_shadow_read_failed", error=str(e))
+            return []
+
+    async def get_latest_exposure_shadow(self) -> Optional[dict]:
+        """가장 최근 목표 노출도 행(날짜 무관). 없으면 None.
+
+        08:30 브리핑 시점에는 오늘 행이 없다 -- 장중에만 쌓이기 때문이다.
+        그래서 날짜로 거르지 않고 최근 1행을 돌려주되, 호출자가 `created_at`을
+        함께 표시해 "언제 값인지"를 드러내야 한다. 어제 값을 오늘 값인 척
+        보여주는 것이 이 메서드의 실패 모드다.
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM exposure_shadow ORDER BY created_at DESC LIMIT 1"
+                )
+                row = await cursor.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            # 삼키지 않는다 -- 삼키면 "행이 아직 없다"(정상)와 "조회가 실패했다"
+            # (비정상)가 둘 다 None이 되어 호출자가 구별할 수 없다. 이 메서드의
+            # 계약: None = 행 없음, 예외 = 조회 실패.
+            logger.warning("latest_exposure_shadow_read_failed", error=str(e))
+            raise
+
+    # -------------------------------------------
+    # Macro Snapshot (regime judgment input, 2026-08-07)
+    # -------------------------------------------
+
+    async def insert_macro_snapshot(
+        self, *, trade_date: str, quotes: dict, missing: list[str]
+    ) -> bool:
+        """매크로 스냅샷 1행. 같은 날짜 재수집은 덮어쓴다(UNIQUE + REPLACE).
+        실패-무해 — False만 돌려주고 raise 안 한다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO macro_snapshot
+                    (id, trade_date, quotes_json, missing_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        trade_date,
+                        json.dumps(quotes, ensure_ascii=False),
+                        json.dumps(missing or [], ensure_ascii=False),
+                    ),
+                )
+                await conn.commit()
+            return True
+        except Exception as e:
+            logger.warning("macro_snapshot_insert_failed", error=str(e))
+            return False
+
+    async def get_macro_snapshot(self, trade_date: str) -> Optional[dict]:
+        """행 없으면 None. **DB 오류는 raise한다** — 호출자가 '없음'과
+        '못 읽음'을 구별할 수 있어야 한다(2026-08-06 /exposure 사고)."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT quotes_json, missing_json, created_at FROM macro_snapshot "
+                "WHERE trade_date = ?",
+                (trade_date,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "quotes": json.loads(row["quotes_json"]),
+            "missing": json.loads(row["missing_json"] or "[]"),
+            "created_at": row["created_at"],
+        }
+
+    async def get_recent_macro_returns(
+        self, ticker: str, limit: int = 20
+    ) -> Optional[list[float]]:
+        """최근 `limit`일의 해당 티커 chg_pct를 **시간 오름차순**으로.
+        `annualized_vol`이 `sample[-window:]`를 취하므로 순서가 뒤집히면
+        '최근 20일'이 '가장 오래된 20일'이 된다. 행이 없으면 []이고,
+        **DB 오류는 raise한다**."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT quotes_json FROM macro_snapshot "
+                "ORDER BY trade_date DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        out: list[float] = []
+        for row in reversed(rows):  # DESC로 뽑아 뒤집어 오름차순으로 만든다
+            q = json.loads(row["quotes_json"]).get(ticker)
+            if q is None:
+                continue
+            v = q.get("chg_pct")
+            if v is not None:
+                out.append(float(v))
+        return out
+
+    # -------------------------------------------
+    # Regime Judgment (LLM 레짐 판정 + 목표 노출도, 2026-08-07)
+    # -------------------------------------------
+
+    async def insert_regime_judgment(
+        self,
+        *,
+        trade_date: str,
+        regime: str,
+        confidence: Optional[float],
+        rationale: Optional[str],
+        key_drivers: Optional[list],
+        anchor_target_pct: float,
+        effective_target_pct: float,
+        prev_effective_pct: Optional[float],
+        degraded: Optional[list],
+        macro_snapshot_id: Optional[str] = None,
+    ) -> bool:
+        """레짐 판정 1행. 같은 날 재판정은 덮어쓴다. 실패-무해."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO regime_judgment
+                    (id, trade_date, regime, confidence, rationale,
+                     key_drivers_json, anchor_target_pct, effective_target_pct,
+                     prev_effective_pct, degraded_json, macro_snapshot_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        trade_date,
+                        regime,
+                        confidence,
+                        rationale,
+                        json.dumps(key_drivers or [], ensure_ascii=False),
+                        anchor_target_pct,
+                        effective_target_pct,
+                        prev_effective_pct,
+                        json.dumps(degraded or [], ensure_ascii=False),
+                        macro_snapshot_id,
+                    ),
+                )
+                await conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"insert_regime_judgment failed: {e}")
+            return False
+
+    async def get_latest_regime_judgment(self) -> Optional[dict]:
+        """가장 최근 trade_date의 판정. 행 없으면 None, **DB 오류는 raise**."""
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                """
+                SELECT trade_date, regime, confidence, rationale,
+                       key_drivers_json, anchor_target_pct, effective_target_pct,
+                       prev_effective_pct, degraded_json, created_at
+                FROM regime_judgment ORDER BY trade_date DESC LIMIT 1
+                """
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "trade_date": row["trade_date"],
+            "regime": row["regime"],
+            "confidence": row["confidence"],
+            "rationale": row["rationale"],
+            "key_drivers": json.loads(row["key_drivers_json"] or "[]"),
+            "anchor_target_pct": row["anchor_target_pct"],
+            "effective_target_pct": row["effective_target_pct"],
+            "prev_effective_pct": row["prev_effective_pct"],
+            "degraded": json.loads(row["degraded_json"] or "[]"),
+            "created_at": row["created_at"],
+        }
+
+    async def upsert_index_daily(
+        self, rows: list[tuple[str, float]], source: str
+    ) -> int:
+        """지수 종가를 upsert하고 쓴 행 수를 돌려준다. 실패-무해(0 반환).
+
+        `INSERT OR REPLACE`라 같은 `trade_date` 재수집이 덮어쓴다 --
+        이것이 구멍 자가치유의 근거다. 프로세스가 며칠 내려가 있어도
+        다음 수집이 창 전체를 다시 쓴다.
+        """
+        if not rows:
+            return 0
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                await conn.executemany(
+                    "INSERT OR REPLACE INTO index_daily (trade_date, close, source) "
+                    "VALUES (?, ?, ?)",
+                    [(d, float(c), source) for d, c in rows],
+                )
+                await conn.commit()
+            return len(rows)
+        except Exception as e:
+            logger.warning(f"upsert_index_daily failed: {e}")
+            return 0
+
+    async def get_recent_index_closes(
+        self, limit: int = 21
+    ) -> list[tuple[str, float]]:
+        """최근 `limit`개 (trade_date, close)를 **시간 오름차순**으로.
+
+        기본 21인 이유: 20개 수익률을 만들려면 종가가 21개 필요하다
+        (`VOL_WINDOW=20`).
+
+        행이 없으면 `[]`. **DB 오류는 raise한다** -- 호출자가 '없음'과
+        '못 읽음'을 구별해야 한다(2026-08-06 /exposure 사고).
+        """
+        await self.initialize()
+        async with aiosqlite.connect(str(self.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT trade_date, close FROM index_daily "
+                "ORDER BY trade_date DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        return [(r["trade_date"], float(r["close"])) for r in reversed(rows)]
+
+    async def get_day_rollup(self, trade_date: str) -> Optional[dict]:
+        """하루 요약 — 결정 수·체결 수·실현손익·슬롯 거절 수.
+
+        `kr_realized_pnl`은 거래 단위가 아니라 부분체결 슬라이스이고
+        `stk_cd='ALL'` 백필 행이 섞여 있다. 합계를 낼 때 백필을 빼지 않으면
+        계좌 조정액이 당일 손익으로 잡힌다.
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                async def scalar(sql: str, default=0):
+                    cur = await conn.execute(sql, (trade_date,))
+                    row = await cur.fetchone()
+                    return (row[0] if row and row[0] is not None else default)
+
+                decisions = await scalar(
+                    "SELECT COUNT(*) FROM agent_chat_decisions "
+                    "WHERE date(created_at,'+9 hours') = ?"
+                )
+                fills = await scalar(
+                    "SELECT COUNT(*) FROM kr_stock_trades "
+                    "WHERE date(created_at,'+9 hours') = ?"
+                )
+                realized = await scalar(
+                    "SELECT COALESCE(SUM(realized_amount), 0) FROM kr_realized_pnl "
+                    "WHERE date(created_at,'+9 hours') = ? AND stk_cd != 'ALL'",
+                    0.0,
+                )
+                refusals = await scalar(
+                    "SELECT COUNT(*) FROM slot_contest "
+                    "WHERE date(created_at,'+9 hours') = ?"
+                )
+            return dict(
+                trade_date=trade_date,
+                decisions=decisions,
+                fills=fills,
+                realized_pnl=float(realized),
+                slot_refusals=refusals,
+            )
+        except Exception as e:
+            logger.warning("day_rollup_read_failed", error=str(e), trade_date=trade_date)
+            return None
+
+    async def get_slot_contest_rollup(self, trade_date: str) -> list[dict]:
+        """슬롯 거절을 종목별로 접는다 — 건수·최고 합의·처음/마지막 시각."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT challenger_ticker AS ticker, COUNT(*) AS count, "
+                    "  MAX(challenger_consensus) AS max_consensus, "
+                    "  MIN(time(created_at,'+9 hours')) AS first, "
+                    "  MAX(time(created_at,'+9 hours')) AS last "
+                    "FROM slot_contest WHERE date(created_at,'+9 hours') = ? "
+                    "GROUP BY challenger_ticker ORDER BY count DESC",
+                    (trade_date,),
+                )
+                return [dict(r) for r in await cursor.fetchall()]
+        except Exception as e:
+            logger.warning("slot_contest_rollup_failed", error=str(e))
+            return []
+
+    async def get_ticker_day_decisions(self, ticker: str, trade_date: str) -> list[dict]:
+        """해당 종목의 그날 결정을 시각순으로."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT datetime(created_at,'+9 hours') AS created_at, action, "
+                    "  consensus_level, sizing_lineage "
+                    "FROM agent_chat_decisions "
+                    "WHERE ticker = ? AND date(created_at,'+9 hours') = ? "
+                    "ORDER BY created_at",
+                    (ticker, trade_date),
+                )
+                return [dict(r) for r in await cursor.fetchall()]
+        except Exception as e:
+            logger.warning("ticker_day_decisions_failed", error=str(e), ticker=ticker)
+            return []
+
+    async def get_ticker_day_decisions_full(
+        self, ticker: str, trade_date: str
+    ) -> list[dict]:
+        """해당 종목의 그날 결정을 **전 컬럼** 시각순으로.
+
+        `get_ticker_day_decisions`는 4개 컬럼만 돌려준다 — 리포트는 votes를
+        잇기 위한 `id`와 `behavioral_signals`·`news_*`가 필요하다.
+        `created_at`은 UTC이므로 KST 거래일로 거른다.
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM agent_chat_decisions "
+                    "WHERE ticker = ? AND date(created_at,'+9 hours') = ? "
+                    "ORDER BY created_at",
+                    (ticker, trade_date),
+                )
+                return [dict(r) for r in await cursor.fetchall()]
+        except Exception as e:
+            logger.warning(
+                "ticker_day_decisions_full_failed", error=str(e), ticker=ticker
+            )
+            return []
+
+    async def get_ticker_day_fills(self, ticker: str, trade_date: str) -> int:
+        """해당 종목의 그날 체결 건수."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM kr_stock_trades "
+                    "WHERE stk_cd = ? AND date(created_at,'+9 hours') = ?",
+                    (ticker, trade_date),
+                )
+                row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+        except Exception as e:
+            logger.warning("ticker_day_fills_failed", error=str(e), ticker=ticker)
+            return 0
+
+    async def get_recent_index_returns(
+        self, limit: int = 20
+    ) -> Optional[list[float]]:
+        """최근 `limit` 거래일의 KOSPI 일별 등락률(%). 오래된 것부터.
+
+        기록이 아직 없어 결과가 진짜로 비어 있으면 `[]`(유효한 데이터 --
+        "지수 이력이 짧다"). 조회 자체가 실패하면 `None`을 돌려준다 --
+        `[]`로 뭉개면 호출자(`_record_exposure_shadow`)가 "이력이 짧다"와
+        "조회가 실패했다"를 구분할 수 없다. 이 파일의 다른 세 노출도 조회
+        헬퍼(get_latest_regime_label/count_round_trips/get_equity_peak)와
+        같은 규약이다(리뷰 반영, 2026-08-06)."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT index_kospi_chg_pct FROM regime_snapshot "
+                    "WHERE index_kospi_chg_pct IS NOT NULL "
+                    "ORDER BY trade_date DESC LIMIT ?",
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+            return [float(r[0]) for r in reversed(rows)]
+        except Exception as e:
+            logger.warning("index_returns_read_failed", error=str(e))
+            return None
+
+    async def get_latest_regime_label(self) -> Optional[str]:
+        """가장 최근 레짐 라벨. 아직 기록이 없거나 조회 자체가 실패하면
+        None -- "레짐 미기록"과 "neutral 레짐"은 서로 다른 사실이고,
+        여기서 뭉개면 나중에 구분할 수 없다(리뷰 반영, 2026-08-06).
+        호출자(`_record_exposure_shadow`)가 None을 감지해 'neutral'로
+        치환하고 `degraded`에 `regime_read_failed`를 남긴다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT regime_label FROM regime_snapshot "
+                    "ORDER BY trade_date DESC LIMIT 1"
+                )
+                row = await cursor.fetchone()
+            return row[0] if row and row[0] else None
+        except Exception as e:
+            logger.warning("regime_label_read_failed", error=str(e))
+            return None
+
+    async def count_round_trips(self) -> Optional[int]:
+        """완료된 왕복 거래 수.
+
+        `kr_realized_pnl`의 행은 거래가 아니라 **부분체결 슬라이스**이고
+        `stk_cd='ALL'`인 계좌 백필 행이 섞여 있다. (stk_cd, entry_at)로 접고
+        백필을 제외해야 실제 왕복 수가 나온다 -- 접지 않으면 22, 접으면 8이다.
+
+        조회 자체가 실패하면 None을 돌려준다 -- 0은 "아직 왕복이 없다"는
+        유효한 결과이고 None은 "셀 수 없었다"는 뜻이라 서로 다르다(리뷰
+        반영, 2026-08-06). 0으로 뭉개면 호출자가 증거 부족(m_evidence 바닥
+        클램프)과 조회 실패를 구분할 수 없다."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT stk_cd, entry_at FROM kr_realized_pnl "
+                    "  WHERE stk_cd != 'ALL' GROUP BY stk_cd, entry_at"
+                    ")"
+                )
+                row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+        except Exception as e:
+            logger.warning("round_trip_count_failed", error=str(e))
+            return None
+
+    async def get_equity_peak(self) -> Optional[float]:
+        """일별 스냅샷 중 최고 자산. 스냅샷이 아직 없으면 0.0(유효한 결과 --
+        첫 관측이라 낙폭 배수가 중립인 게 맞다), 조회 자체가 실패하면
+        None을 돌려준다(리뷰 반영, 2026-08-06)."""
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                cursor = await conn.execute(
+                    "SELECT MAX(equity) FROM daily_perf_snapshot"
+                )
+                row = await cursor.fetchone()
+            return float(row[0]) if row and row[0] else 0.0
+        except Exception as e:
+            logger.warning("equity_peak_read_failed", error=str(e))
+            return None
+
+    async def get_slot_contests(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Read back slot_contest rows, newest first. Empty list on any
+        storage error (read-side mirror of get_kr_stock_trades above)."""
+        await self.initialize()
+
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """
+                    SELECT * FROM slot_contest
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("slot_contests_get_failed", error=str(e))
+            return []
 
     # -------------------------------------------
     # Health Check

@@ -249,43 +249,42 @@ async def create_order(request: KRStockOrderRequest):
     client = await get_shared_kiwoom_client_async()
 
     try:
-        from services.kiwoom import OrderRequest as KiwoomOrderRequest, OrderType
-
-        order_type = OrderType.BUY if request.side == "buy" else OrderType.SELL
-        if request.ord_type == "market":
-            order_type = (
-                OrderType.MARKET_BUY
-                if request.side == "buy"
-                else OrderType.MARKET_SELL
-            )
-
-        kiwoom_request = KiwoomOrderRequest(
-            stk_cd=request.stk_cd,
-            order_type=order_type,
-            quantity=request.quantity,
-            price=request.price or 0,
+        from services.execution import (
+            KiwoomExecutionAdapter,
+            ExecutionSide,
+            ExecutionOrderType,
         )
 
-        order = await client.place_order(kiwoom_request)
+        result = await KiwoomExecutionAdapter(client).place(
+            ticker=request.stk_cd,
+            side=ExecutionSide.BUY if request.side == "buy" else ExecutionSide.SELL,
+            qty=request.quantity,
+            price=request.price,
+            order_type=(
+                ExecutionOrderType.MARKET
+                if request.ord_type == "market"
+                else ExecutionOrderType.LIMIT
+            ),
+        )
 
         logger.info(
             "order_created",
-            order_id=order.order_id,
+            order_id=result.order_id,
             stk_cd=request.stk_cd,
             side=request.side,
         )
 
         return KRStockOrderResponse(
-            order_id=order.order_id,
+            order_id=result.order_id,
             stk_cd=request.stk_cd,
-            stk_nm=order.stk_nm if hasattr(order, "stk_nm") else None,
+            stk_nm=None,
             side=request.side,
             ord_type=request.ord_type,
             price=request.price,
             quantity=request.quantity,
             executed_quantity=0,
             remaining_quantity=request.quantity,
-            status="pending",
+            status="pending" if result.success else "rejected",
             created_at=datetime.now(timezone.utc),
         )
 
@@ -332,17 +331,25 @@ async def cancel_order(order_id: str):
     client = await get_shared_kiwoom_client_async()
 
     try:
-        result = await client.cancel_order(order_id)
+        # kt10003은 종목코드가 필수 — 미체결 목록에서 주문번호로 찾는다.
+        pending = await client.get_pending_orders()
+        target = next((o for o in pending if o.ord_no == order_id), None)
+        if target is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"미체결 주문을 찾을 수 없습니다: {order_id}",
+            )
 
-        logger.info("order_cancelled", order_id=order_id)
+        # qty=0 → 잔량 전부 취소 (kt10003 스펙)
+        await client.cancel_order(org_ord_no=order_id, stk_cd=target.stk_cd)
+
+        logger.info("order_cancelled", order_id=order_id, stk_cd=target.stk_cd)
 
         return KRStockOrderCancelResponse(
             order_id=order_id,
-            stk_cd=result.stk_cd if hasattr(result, "stk_cd") else "000000",
+            stk_cd=target.stk_cd,
             status="cancelled",
-            cancelled_quantity=result.cancelled_quantity
-            if hasattr(result, "cancelled_quantity")
-            else 0,
+            cancelled_quantity=target.rmn_qty,
         )
 
     except HTTPException:

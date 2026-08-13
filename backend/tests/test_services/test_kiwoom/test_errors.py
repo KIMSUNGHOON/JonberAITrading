@@ -111,6 +111,38 @@ class TestKiwoomError:
         error = KiwoomError(code=KiwoomErrorCode.INVALID_STOCK_CODE)
         assert error.is_retryable is False
 
+    def test_is_token_expired_nested_code_in_message(self):
+        # 라이브 관측: Kiwoom가 최상위 return_code=3(일반 인증실패)로 감싸고
+        # 실제 8005를 return_msg에 중첩해 반환 → 코드만 보면 놓친다.
+        error = KiwoomError(
+            code=3,
+            message="인증에 실패했습니다[8005:Token이 유효하지 않습니다]",
+        )
+        assert error.is_token_expired is True
+        assert error.is_retryable is True
+
+    def test_is_token_expired_phrase_only(self):
+        # 코드 없이 문구만 오는 경우도 감지
+        error = KiwoomError(code=3, message="Token이 유효하지 않습니다")
+        assert error.is_token_expired is True
+
+    def test_is_token_expired_false_for_unrelated_error(self):
+        # 오탐 방지: 토큰과 무관한 에러는 False
+        error = KiwoomError(
+            code=KiwoomErrorCode.INVALID_STOCK_CODE,
+            message="잘못된 종목코드입니다",
+        )
+        assert error.is_token_expired is False
+
+    def test_from_response_nested_8005_is_token_expired(self):
+        # from_response 경로(실 응답 형태) end-to-end
+        response = {
+            "return_code": 3,
+            "return_msg": "인증에 실패했습니다[8005:Token이 유효하지 않습니다]",
+        }
+        error = KiwoomError.from_response(response, api_id="kt00001")
+        assert error.is_token_expired is True
+
     def test_is_auth_error_true(self):
         error = KiwoomError(code=KiwoomErrorCode.TOKEN_EXPIRED)
         assert error.is_auth_error is True
@@ -126,6 +158,38 @@ class TestKiwoomError:
     def test_is_order_error_false(self):
         error = KiwoomError(code=KiwoomErrorCode.TOKEN_EXPIRED)
         assert error.is_order_error is False
+
+
+class TestKiwoomErrorRateLimitCode5:
+    """코드 5(일반 오류)로 감싸 유량초과를 반환하는 라이브 관측 패턴.
+
+    Kiwoom는 유량(rate-limit) 초과를 전용 코드(1700/-903)가 아니라 일반
+    코드 5로 감싸고, 실제 사유를 return_msg에 중첩해 반환하는 경우가 있다
+    (is_token_expired와 동일한 중첩 패턴). 코드만 보면 놓쳐 재시도가 뜨지
+    않고 발굴 유니버스가 15종목 폴백으로 축소된다.
+    """
+
+    def test_code5_with_유량_marker_is_rate_limit(self):
+        error = KiwoomError(
+            code=5,
+            message="허용된 요청 개수를 초과하였습니다[1700:허용된 API 요청 개수를 초과하였습니다. 유량=1, API ID=ka10099]",
+        )
+        assert error.is_rate_limit is True
+        assert error.is_retryable is True
+
+    def test_code5_without_marker_not_rate_limit(self):
+        error = KiwoomError(code=5, message="종목코드 오류입니다")
+        assert error.is_rate_limit is False
+
+    def test_existing_1700_still_rate_limit(self):
+        assert KiwoomError(code=1700, message="x").is_rate_limit is True
+
+    def test_rate_limit_exceeded_negative_code(self):
+        assert KiwoomError(code=KiwoomErrorCode.RATE_LIMIT_EXCEEDED, message="x").is_rate_limit is True
+
+    def test_허용된요청개수_marker_alt(self):
+        error = KiwoomError(code=5, message="허용된 요청 개수를 초과했습니다")
+        assert error.is_rate_limit is True
 
 
 class TestKiwoomAuthError:

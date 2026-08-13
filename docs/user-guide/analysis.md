@@ -17,7 +17,6 @@ JonberAI Trading의 분석 기능은 4개의 전문 AI 에이전트가 병렬로
 1. 좌측 사이드바에서 **Analysis** 메뉴 선택
 2. 종목 입력란에 종목 코드 입력
    - 한국 주식: `005930` (삼성전자)
-   - 암호화폐: `KRW-BTC`
 3. **Analyze** 버튼 클릭
 
 ### API 사용
@@ -27,11 +26,6 @@ JonberAI Trading의 분석 기능은 4개의 전문 AI 에이전트가 병렬로
 curl -X POST http://localhost:8000/api/kr-stocks/analyze \
   -H "Content-Type: application/json" \
   -d '{"stk_cd": "005930"}'
-
-# 암호화폐 분석
-curl -X POST http://localhost:8000/api/coin/analyze \
-  -H "Content-Type: application/json" \
-  -d '{"market": "KRW-BTC"}'
 ```
 
 ---

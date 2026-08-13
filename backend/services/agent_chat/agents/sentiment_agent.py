@@ -8,6 +8,7 @@ Participates in group discussions with sentiment analysis perspective.
 from typing import List, Optional
 
 import structlog
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from services.agent_chat.agents.base_agent import BaseDiscussionAgent
 from services.agent_chat.models import (
@@ -18,6 +19,7 @@ from services.agent_chat.models import (
     MessageType,
     VoteType,
 )
+from services.agent_chat.vote_schema import VOTE_SCHEMA
 
 logger = structlog.get_logger()
 
@@ -74,6 +76,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
 
 ### 가격 모멘텀
 - 전일 대비: {price_change_pct:+.2f}%
+{us_market_context}
 
 ---
 
@@ -124,6 +127,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
 - 뉴스 감성: {news_sentiment}
 - 분석 뉴스: {news_count}건
 - 가격 모멘텀: {price_change_pct:+.2f}%
+{us_market_context}
 
 ---
 
@@ -139,7 +143,13 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
 형식:
 투표: [투표 옵션]
 신뢰도: [0-100]%
-근거: [핵심 심리 요인]"""
+근거: [핵심 심리 요인]
+
+응답은 다음 키를 가진 JSON 객체로도 반환하세요:
+- "vote": strong_buy / buy / hold / sell / strong_sell / abstain 중 하나
+- "confidence": 0.0~1.0 사이 숫자
+- "reasoning": 투표 근거 (한국어)
+- "key_factors": 핵심 근거 문자열 배열"""
 
     async def analyze(self, context: MarketContext) -> AgentMessage:
         """Present initial sentiment analysis."""
@@ -155,9 +165,10 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             price_change_pct=context.price_change_pct,
             news_sentiment=context.news_sentiment or "분석 중",
             news_count=context.news_count or 0,
+            us_market_context=context.us_market_context or "",
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         confidence = self._parse_confidence(response)
 
         # Adjust confidence based on data availability
@@ -171,9 +182,6 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             data={
                 "news_sentiment": context.news_sentiment,
                 "news_count": context.news_count,
-                "momentum": "positive" if context.price_change_pct > 2 else (
-                    "negative" if context.price_change_pct < -2 else "neutral"
-                ),
             },
         )
 
@@ -205,7 +213,7 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             price_change_pct=context.price_change_pct,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         msg_type = MessageType.OPINION
         if "동의" in response or "지지" in response:
@@ -242,9 +250,32 @@ class SentimentDiscussionAgent(BaseDiscussionAgent):
             news_sentiment=context.news_sentiment or "N/A",
             news_count=context.news_count or 0,
             price_change_pct=context.price_change_pct,
+            us_market_context=context.us_market_context or "",
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        messages = [
+            SystemMessage(content=self._effective_system_prompt()),
+            HumanMessage(content=prompt),
+        ]
+        data = await self._structured_vote(messages, schema=VOTE_SCHEMA)
+        if data is not None:
+            try:
+                confidence = float(data["confidence"])
+                # Preserve the no-news confidence cap (same rule as the regex
+                # fallback below): sentiment is unreliable without news data.
+                if not context.news_sentiment or context.news_count == 0:
+                    confidence = min(confidence, 0.5)
+                return AgentVote(
+                    agent_type=self.agent_type,
+                    vote=VoteType(str(data["vote"]).strip().lower()),
+                    confidence=confidence,
+                    reasoning=data.get("reasoning") or "",
+                    key_factors=data.get("key_factors") or [],
+                )
+            except (ValueError, KeyError, TypeError):
+                pass  # malformed structured payload (incl. null confidence) -> regex fallback
+
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         vote_type = self._parse_vote(response)
         confidence = self._parse_confidence(response)

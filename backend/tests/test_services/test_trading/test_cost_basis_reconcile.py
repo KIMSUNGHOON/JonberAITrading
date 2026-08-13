@@ -1,0 +1,476 @@
+"""원가 단일화 C1(2026-07-31): reconciler가 수량뿐 아니라 원가도 브로커에 맞춘다.
+
+_fix_quantities는 quantity != broker_qty일 때만 진입해 수량과 current_price만
+고쳤다. 그런데 07-31 라이브 실측에서 089860·317400은 **수량이 맞는 상태에서
+원가만** 어긋나 있었다(-0.370%, +0.120%) — 현 조건으로는 영원히 교정되지 않는다.
+
+임계 0.1%는 브로커 avg_buy_prc가 int라(kiwoom/models.py:202) 생기는 주당 최대
+0.5원 절삭을 불일치로 오판하지 않기 위한 값이다.
+"""
+
+import logging
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from services.trading.models import ManagedPosition
+from services.trading.reconciler import ReconcileReport, _fix_positions
+
+pytestmark = pytest.mark.asyncio
+
+
+def _holding(ticker="089860", qty=185, avg=38_091, cur=38_750, stk_nm=None):
+    h = MagicMock()
+    h.stk_cd = ticker
+    h.hldg_qty = qty
+    h.avg_buy_prc = avg
+    h.cur_prc = cur
+    # stk_nm 미지정 시 MagicMock 자동생성 속성(항상 truthy, 티커와 다름)으로
+    # 남는다 -- 기존 테스트는 전부 이 기본값에 의존하지 않으므로(이름 비교
+    # 대상 포지션이 이미 실명이라 가드에서 걸러진다) 하위호환이다.
+    if stk_nm is not None:
+        h.stk_nm = stk_nm
+    return h
+
+
+def _coordinator(position):
+    c = MagicMock()
+    c.state.positions = [position] if position else []
+    c.risk_monitor = MagicMock()
+    c._schedule_persist = MagicMock()
+    c._on_alert = AsyncMock()
+    return c
+
+
+def _managed(ticker="089860", qty=185, avg=37_950.0, cur=38_750.0,
+             stop_loss=None, take_profit=None):
+    return ManagedPosition(
+        ticker=ticker, stock_name="롯데렌탈",
+        quantity=qty, avg_price=avg, current_price=cur,
+        stop_loss=stop_loss, take_profit=take_profit,
+    )
+
+
+def _pm(position=None):
+    pm = MagicMock()
+    pm.get_position = MagicMock(return_value=position)
+    pm.update_position = MagicMock()
+    return pm
+
+
+async def test_cost_basis_fixed_when_quantity_already_matches():
+    """07-31 실측 케이스 — 수량은 맞고 원가만 0.37% 어긋난다."""
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=37_950.0)
+    pm = _pm(pm_pos)
+    report = ReconcileReport()
+
+    await _fix_positions(coordinator, pm, {"089860": _holding()}, report)
+
+    assert pos.avg_price == 38_091.0, "coordinator 원가가 브로커 값이 된다"
+    assert report.cost_basis_fixed == 1
+    kwargs = pm.update_position.call_args.kwargs
+    assert kwargs["avg_price"] == 38_091.0, "PM 원가도 브로커 값이 된다"
+
+
+async def test_quantity_and_cost_both_fixed():
+    """148주 원가가 185주에 적용된 상태 — 둘 다 교정된다."""
+    pos = _managed(qty=148, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=148, avg_price=37_950.0))
+    report = ReconcileReport()
+
+    await _fix_positions(coordinator, pm, {"089860": _holding(qty=185)}, report)
+
+    assert pos.quantity == 185
+    assert pos.avg_price == 38_091.0
+    assert report.quantity_fixed == 1
+    assert report.cost_basis_fixed == 1
+
+
+async def test_below_threshold_not_fixed():
+    """0.05% 편차는 브로커 int 절삭 범위라 교정하지 않는다."""
+    pos = _managed(qty=185, avg=38_072.0)  # 38,091 대비 -0.0499%
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=38_072.0))
+    report = ReconcileReport()
+
+    await _fix_positions(coordinator, pm, {"089860": _holding()}, report)
+
+    assert pos.avg_price == 38_072.0, "임계 미만은 그대로 둔다"
+    assert report.cost_basis_fixed == 0
+
+
+async def test_stops_are_never_recalculated():
+    """원가를 고쳐도 손절·익절은 건드리지 않는다(이 아크의 소급 원칙)."""
+    pos = _managed(qty=185, avg=37_950.0, stop_loss=36_425.0, take_profit=41_462.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=37_950.0))
+    report = ReconcileReport()
+
+    await _fix_positions(coordinator, pm, {"089860": _holding()}, report)
+
+    assert pos.stop_loss == 36_425.0
+    assert pos.take_profit == 41_462.0
+    assert "stop_loss" not in pm.update_position.call_args.kwargs or \
+        pm.update_position.call_args.kwargs.get("stop_loss") is None
+
+
+async def test_no_position_is_noop():
+    """대응 포지션이 없으면 아무것도 하지 않는다(고아 채택은 별도 단계 소관)."""
+    coordinator = _coordinator(None)
+    pm = _pm(None)
+    report = ReconcileReport()
+
+    await _fix_positions(coordinator, pm, {"089860": _holding()}, report)
+
+    assert report.cost_basis_fixed == 0
+    pm.update_position.assert_not_called()
+
+
+async def test_zero_broker_avg_is_ignored():
+    """브로커 평단이 0이면 교정하지 않는다 — 원가를 0으로 만들면 안 된다."""
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=37_950.0))
+    report = ReconcileReport()
+
+    await _fix_positions(coordinator, pm, {"089860": _holding(avg=0)}, report)
+
+    assert pos.avg_price == 37_950.0
+    assert report.cost_basis_fixed == 0
+
+
+# ---------------------------------------------------------------
+# C3: 원가 정합성 감시
+# ---------------------------------------------------------------
+
+
+async def test_drift_sends_alert_once():
+    """편차를 발견하면 알리고, 같은 종목은 다시 알리지 않는다."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=37_950.0))
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+        # 두 번째 패스도 여전히 재통지 후보다: pm은 MagicMock이라
+        # `pm.update_position(...)` 호출이 `pm_pos.avg_price`를 실제로
+        # 바꾸지 않는다 — PM은 매 패스 "37,950 vs 브로커 38,091"로 계속
+        # 드리프트된 것처럼 보여 `cost_fixed`가 다시 True가 된다(coordinator
+        # 쪽은 실제 ManagedPosition이라 첫 패스에서 이미 38,091로 고쳐졌다).
+        # 즉 이 케이스에서 두 번째 패스가 재발송되지 않는 이유는 "이미
+        # 교정돼서"가 아니라 "래치가 아직 걸려 있어서"다 — 원가가 실제로
+        # 임계 이내로 확인돼 래치가 풀리는 경로는
+        # test_drift_alert_relatches_after_episode_resolves가 별도로 검증한다.
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    notifier.send_message.assert_awaited_once()
+    body = notifier.send_message.await_args.args[0]
+    assert "089860" in body
+    assert "원가" in body
+
+
+async def test_alert_never_raises():
+    """통지 실패가 교정 경로를 깨뜨리지 않는다."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=37_950.0))
+    report = ReconcileReport()
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(side_effect=RuntimeError("telegram down"))):
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, report)
+
+    assert pos.avg_price == 38_091.0, "통지가 터져도 교정은 완료된다"
+    assert report.cost_basis_fixed == 1
+
+
+async def test_no_alert_below_threshold():
+    """임계 미만이면 알리지 않는다 — 오탐 방지."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=38_072.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=38_072.0))
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    notifier.send_message.assert_not_awaited()
+
+
+async def test_drift_alert_relatches_after_episode_resolves():
+    """래치는 영구가 아니라 에피소드당 1회다 — 드리프트가 해소되면 풀리고,
+    같은 종목이 나중에 다시 드리프트하면 재통지한다.
+
+    position_manager.py의 close_gate_denied_notified/liquidity_cap_blocked_notified와
+    같은 형태: 가드 조건을 통과하면(=원가가 임계 이내로 확인되면) 플래그를
+    되돌린다. pm은 MagicMock이라 `update_position` 호출이 pm_pos를 실제로
+    바꾸지 않으므로, "해소"를 흉내 내려면 두 엔진의 값을 테스트에서 직접
+    맞춰줘야 한다.
+    """
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=37_950.0)
+    pm = _pm(pm_pos)
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        # 1패스 — 드리프트 발견 → 교정 → 통지 1회.
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+        assert notifier.send_message.await_count == 1
+        assert "089860" in R._COST_DRIFT_NOTIFIED
+
+        # 두 엔진 모두 브로커 값으로 실제로 맞춰졌다고 가정한다(pm은 mock이라
+        # update_position이 pm_pos를 안 바꾸므로 여기서 직접 맞춘다) —
+        # 이 상태에서 다음 패스는 "임계 이내로 확인됨"이어야 한다.
+        pos.avg_price = 38_091.0
+        pm_pos.avg_price = 38_091.0
+
+        # 2패스 — 원가가 임계 이내로 확인됨 → 통지 없음, 래치 해제.
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+        assert notifier.send_message.await_count == 1, "해소된 패스는 재통지하지 않는다"
+        assert "089860" not in R._COST_DRIFT_NOTIFIED, "임계 이내 확인 시 래치가 풀린다"
+
+        # 새 체결이 평단을 다시 밀어냈다 — 완전히 새로운 드리프트 에피소드.
+        pos.avg_price = 37_500.0
+        pm_pos.avg_price = 37_500.0
+
+        # 3패스 — 같은 종목이 다시 드리프트 → 재통지.
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    assert notifier.send_message.await_count == 2, "해소 후 재발한 드리프트는 다시 알려야 한다"
+
+
+# ---------------------------------------------------------------
+# 최종 리뷰 item3(Minor): 알림/래치는 '교정 성공'과 독립이어야 하고, 래치
+# 해제는 비교된 모든 엔진이 임계 이내일 때만 일어나야 한다(이전엔 한쪽만
+# 확인돼도 풀리는 OR였다).
+# ---------------------------------------------------------------
+
+
+async def test_persistently_failing_pm_still_alerts_despite_fix_failure():
+    """PM만 드리프트한 상태에서 pm.update_position이 매번 예외를 던지면
+    (coordinator는 이미 브로커 값과 일치, 교정 영구 실패) — 리뷰 실측으로는
+    3연속 패스에 cost_fixed=0, alerts=0, latch=[]였다(사람이 들어야 할
+    순간에 조용했다). drift_detected를 cost_fixed와 분리한 뒤에는 교정
+    실패와 무관하게 드리프트가 실재하는 한 최소 1회는 통지되고, 미해소인
+    동안 래치가 유지된다(에피소드가 아직 안 끝났으므로 반복 재통지는 아님
+    — 반복 통지 억제는 원래 설계다. 로그는 매 패스 남는다 — item6 별도
+    검증)."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=38_091.0)  # coordinator는 이미 브로커 값과 일치
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=37_950.0)  # PM만 0.37% 드리프트
+    pm = _pm(pm_pos)
+    pm.update_position = MagicMock(side_effect=RuntimeError("PM 잠김"))
+
+    reports = []
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        for _ in range(3):
+            report = ReconcileReport()
+            await _fix_positions(coordinator, pm, {"089860": _holding()}, report)
+            reports.append(report)
+
+    assert all(r.cost_basis_fixed == 0 for r in reports), (
+        "PM 교정은 매 패스 계속 실패한다 — cost_fixed는 절대 True가 되지 않는다"
+    )
+    assert notifier.send_message.await_count >= 1, (
+        "교정이 실패해도 드리프트가 실재하는 한 최소 1회는 통지돼야 한다 "
+        "(이전엔 cost_fixed=False라 alerts=0으로 조용히 묻혔다)"
+    )
+    assert "089860" in R._COST_DRIFT_NOTIFIED, "미해소 드리프트는 래치가 유지된다"
+
+
+async def test_latch_requires_all_compared_engines_in_tolerance():
+    """coordinator는 임계 이내, PM은 드리프트 — 이전엔 coordinator 쪽만 보고
+    `cost_in_tolerance=True`가 돼(OR) 래치가 풀렸다. 지금은 비교된 엔진
+    전부가 임계 이내여야 풀린다."""
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    R._COST_DRIFT_NOTIFIED.add("089860")  # 이전 에피소드에서 이미 통지됨
+
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=38_091.0)  # coordinator: 임계 이내
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=37_950.0)  # PM: 0.37% 드리프트
+    pm = _pm(pm_pos)
+    pm.update_position = MagicMock(side_effect=RuntimeError("PM 잠김"))
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    assert "089860" in R._COST_DRIFT_NOTIFIED, (
+        "coordinator만 임계 이내라고 래치를 풀면 안 된다 — PM 쪽 미해소 "
+        "드리프트가 아직 남아있다"
+    )
+
+
+# ---------------------------------------------------------------
+# 최종 리뷰 item6(Minor): C3의 "로그" 반쪽 — 래치가 텔레그램을 잠근 뒤에도
+# 반복되는 드리프트는 로그에 흔적을 남겨야 한다(래치는 텔레그램 전용).
+# ---------------------------------------------------------------
+
+
+async def test_drift_log_emitted_every_pass_even_when_telegram_latched(caplog):
+    from services.trading import reconciler as R
+
+    R._COST_DRIFT_NOTIFIED.clear()
+    notifier = MagicMock()
+    notifier.is_ready = True
+    notifier.send_message = AsyncMock(return_value=True)
+
+    pos = _managed(qty=185, avg=37_950.0)
+    coordinator = _coordinator(pos)
+    pm = _pm(MagicMock(quantity=185, avg_price=37_950.0))
+
+    with patch("services.telegram.get_telegram_notifier",
+               new=AsyncMock(return_value=notifier)):
+        with caplog.at_level(logging.WARNING, logger="services.trading.reconciler"):
+            # 1패스 — 드리프트 발견, 통지 1회, 래치 걸림.
+            await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+            # 2패스 — pm은 MagicMock이라 pm_pos.avg_price가 안 바뀌므로 여전히
+            # 드리프트로 보인다. 래치는 걸려 있어 텔레그램은 조용해야 하지만
+            # 로그는 남아야 한다.
+            await _fix_positions(coordinator, pm, {"089860": _holding()}, ReconcileReport())
+
+    assert notifier.send_message.await_count == 1, "래치는 텔레그램만 잠근다"
+    drift_logs = [r for r in caplog.records if "cost drift 089860" in r.message]
+    assert len(drift_logs) == 2, "로그는 래치와 무관하게 드리프트를 발견한 모든 패스에 남는다"
+
+
+# ---------------------------------------------------------------
+# Task 13(종목명 표시): 진입 경로가 이름을 못 구해 stock_name이 티커
+# 코드로 남은 기존(비고아) 포지션을 브로커 stk_nm으로 자가치유한다.
+# 라이브 실측: 004370 포지션의 stock_name이 '004370'(코드 그대로)이었다.
+# ---------------------------------------------------------------
+
+
+def _managed_unnamed(ticker="089860", qty=185, avg=38_091.0, cur=38_750.0):
+    """진입 경로가 이름을 못 구해 stock_name에 티커가 그대로 들어간 상태."""
+    return ManagedPosition(
+        ticker=ticker, stock_name=ticker,
+        quantity=qty, avg_price=avg, current_price=cur,
+    )
+
+
+async def test_name_backfilled_from_broker_when_stock_name_is_ticker():
+    """coordinator·PM 양쪽 다 stock_name이 티커 그대로 — 브로커 stk_nm으로 채운다."""
+    pos = _managed_unnamed()
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=38_091.0, stock_name="089860")
+    pm = _pm(pm_pos)
+    report = ReconcileReport()
+
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈")}, report
+    )
+
+    assert pos.stock_name == "롯데렌탈", "coordinator 쪽 이름이 채워진다"
+    assert pm_pos.stock_name == "롯데렌탈", "PM 쪽 이름도 채워진다"
+    assert report.name_fixed == 1
+
+
+async def test_name_backfilled_when_missing_entirely():
+    """stock_name이 빈 문자열(이름을 아예 못 구한 경우)도 채워진다."""
+    pos = ManagedPosition(
+        ticker="089860", stock_name="",
+        quantity=185, avg_price=38_091.0, current_price=38_750.0,
+    )
+    coordinator = _coordinator(pos)
+    pm = _pm(None)
+    report = ReconcileReport()
+
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈")}, report
+    )
+
+    assert pos.stock_name == "롯데렌탈"
+    assert report.name_fixed == 1
+
+
+async def test_correct_name_is_never_overwritten():
+    """이미 올바른 이름은 브로커 값과 달라도(예: 사용자가 넣은 별칭이 아니라
+    단순 소스 차이) 절대 덮지 않는다 — ⚠️ 지시사항: 정상 이름 위에 덮어쓰기 금지."""
+    pos = _managed(qty=185, avg=37_950.0)  # stock_name="롯데렌탈" (이미 정상)
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=37_950.0, stock_name="롯데렌탈")
+    pm = _pm(pm_pos)
+    report = ReconcileReport()
+
+    # 브로커 이름이 다르게 와도(오타/별칭 등 극단 케이스) 이미 정상인 이름은 유지.
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈주식회사")}, report
+    )
+
+    assert pos.stock_name == "롯데렌탈", "이미 올바른 이름은 덮지 않는다"
+    assert pm_pos.stock_name == "롯데렌탈"
+    assert report.name_fixed == 0
+
+
+async def test_name_backfill_is_noop_without_a_position():
+    """대응 포지션이 없으면 아무것도 하지 않는다(고아 채택은 별도 단계 소관)."""
+    coordinator = _coordinator(None)
+    pm = _pm(None)
+    report = ReconcileReport()
+
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈")}, report
+    )
+
+    assert report.name_fixed == 0
+
+
+async def test_name_fix_emits_position_correction_alert():
+    """이름만 고쳐도(수량·원가는 그대로) "포지션 보정" 알림이 나가고, 메시지에
+    종목명 항목이 포함된다."""
+    pos = _managed_unnamed()
+    coordinator = _coordinator(pos)
+    pm = _pm(None)
+    report = ReconcileReport()
+
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈")}, report
+    )
+
+    coordinator._on_alert.assert_awaited_once()
+    alert = coordinator._on_alert.call_args.args[0]
+    assert "종목명(롯데렌탈)" in alert.message

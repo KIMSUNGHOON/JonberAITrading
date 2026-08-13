@@ -8,6 +8,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, AsyncMock
 
+import aiosqlite
+
 from services.session_manager import (
     SessionManager,
     AnalysisSession,
@@ -45,7 +47,20 @@ def clean_db():
 @pytest.fixture
 async def session_manager(clean_db):
     """Create a fresh SessionManager for testing."""
-    with patch("services.session_manager.DB_PATH", TEST_DB_PATH):
+    # P5-1: update_status/remove_session/cleanup_expired_sessions now fire a
+    # checkpoint-GC hook (services.session_manager._on_terminal_transition)
+    # that calls the REAL storage_service singleton unless patched -- that
+    # singleton points at the production backend/data/storage.db by default,
+    # which a live dev server may have open concurrently. Stub it out so
+    # this test file never touches that file.
+    fake_storage = AsyncMock()
+    fake_storage.delete_checkpoints = AsyncMock(return_value=True)
+
+    async def _fake_get_storage_service():
+        return fake_storage
+
+    with patch("services.session_manager.DB_PATH", TEST_DB_PATH), \
+         patch("services.session_manager.get_storage_service", _fake_get_storage_service):
         manager = SessionManager()
         await manager.initialize()
         yield manager
@@ -72,29 +87,34 @@ class TestAnalysisSession:
     def test_session_to_dict(self):
         session = AnalysisSession(
             session_id="test-123",
-            market_type=MarketType.COIN,
-            ticker="KRW-BTC",
-            display_name="비트코인",
-            market="KRW-BTC",
-            korean_name="비트코인",
+            market_type=MarketType.KIWOOM,
+            ticker="005930",
+            display_name="삼성전자",
+            stk_cd="005930",
+            stk_nm="삼성전자",
         )
         d = session.to_dict()
         assert d["session_id"] == "test-123"
-        assert d["market_type"] == "coin"
-        assert d["ticker"] == "KRW-BTC"
-        assert d["korean_name"] == "비트코인"
+        assert d["market_type"] == "kiwoom"
+        assert d["ticker"] == "005930"
+        assert d["stk_nm"] == "삼성전자"
 
-    def test_session_to_legacy_dict_stock(self):
+    def test_session_to_legacy_dict_non_kiwoom_has_no_extra_fields(self):
+        """코인 스택 제거(2026-08-01) 이후 to_legacy_dict()의 분기는 KIWOOM
+        하나뿐이다 -- 다른(레거시/미지원) market_type은 base dict에 아무
+        market-specific 필드도 얹지 않는다는 계약을 그대로 지킨다(무조건
+        실행으로 바뀌지 않았음을 확인)."""
         session = AnalysisSession(
             session_id="test-123",
-            market_type=MarketType.STOCK,
-            ticker="AAPL",
-            display_name="Apple Inc",
+            market_type="coin",  # _row_to_session의 열거형 파싱 실패 폴백과 동일 모양
+            ticker="KRW-BTC",
+            display_name="비트코인",
         )
         d = session.to_legacy_dict()
-        assert d["ticker"] == "AAPL"
         assert "stk_cd" not in d
+        assert "stk_nm" not in d
         assert "market" not in d
+        assert "korean_name" not in d
 
     def test_session_to_legacy_dict_kiwoom(self):
         session = AnalysisSession(
@@ -108,19 +128,6 @@ class TestAnalysisSession:
         d = session.to_legacy_dict()
         assert d["stk_cd"] == "005930"
         assert d["stk_nm"] == "삼성전자"
-
-    def test_session_to_legacy_dict_coin(self):
-        session = AnalysisSession(
-            session_id="test-123",
-            market_type=MarketType.COIN,
-            ticker="KRW-BTC",
-            display_name="비트코인",
-            market="KRW-BTC",
-            korean_name="비트코인",
-        )
-        d = session.to_legacy_dict()
-        assert d["market"] == "KRW-BTC"
-        assert d["korean_name"] == "비트코인"
 
 
 class TestSessionManager:
@@ -152,13 +159,13 @@ class TestSessionManager:
         """Test session retrieval."""
         await session_manager.create_session(
             session_id="test-002",
-            market_type=MarketType.COIN,
-            ticker="KRW-BTC",
-            display_name="비트코인",
+            market_type=MarketType.KIWOOM,
+            ticker="000660",
+            display_name="SK하이닉스",
         )
         session = await session_manager.get_session("test-002")
         assert session is not None
-        assert session.ticker == "KRW-BTC"
+        assert session.ticker == "000660"
 
     @pytest.mark.asyncio
     async def test_get_session_not_found(self, session_manager):
@@ -171,9 +178,9 @@ class TestSessionManager:
         """Test status update."""
         await session_manager.create_session(
             session_id="test-003",
-            market_type=MarketType.STOCK,
-            ticker="AAPL",
-            display_name="Apple",
+            market_type=MarketType.KIWOOM,
+            ticker="005930",
+            display_name="삼성전자",
         )
         await session_manager.update_status("test-003", SessionStatus.COMPLETED)
         session = await session_manager.get_session("test-003")
@@ -184,9 +191,9 @@ class TestSessionManager:
         """Test status update with error."""
         await session_manager.create_session(
             session_id="test-004",
-            market_type=MarketType.STOCK,
-            ticker="AAPL",
-            display_name="Apple",
+            market_type=MarketType.KIWOOM,
+            ticker="005930",
+            display_name="삼성전자",
         )
         await session_manager.update_status("test-004", SessionStatus.ERROR, error="Test error")
         session = await session_manager.get_session("test-004")
@@ -216,28 +223,29 @@ class TestSessionManager:
         """Test getting all sessions."""
         await session_manager.create_session(
             session_id="test-010",
-            market_type=MarketType.STOCK,
-            ticker="AAPL",
-            display_name="Apple",
+            market_type=MarketType.KIWOOM,
+            ticker="005930",
+            display_name="삼성전자",
         )
         await session_manager.create_session(
             session_id="test-011",
-            market_type=MarketType.COIN,
-            ticker="KRW-BTC",
-            display_name="비트코인",
+            market_type=MarketType.KIWOOM,
+            ticker="000660",
+            display_name="SK하이닉스",
         )
         sessions = await session_manager.get_all_sessions()
         assert len(sessions) == 2
 
     @pytest.mark.asyncio
     async def test_get_all_sessions_filtered_by_market(self, session_manager):
-        """Test getting sessions filtered by market type."""
-        await session_manager.create_session(
-            session_id="test-020",
-            market_type=MarketType.STOCK,
-            ticker="AAPL",
-            display_name="Apple",
-        )
+        """market_type 필터는 KIWOOM이 아닌(레거시/미지원) 세션을 제외한다.
+
+        코인 스택 제거(2026-08-01) 이후 create_session()으로는 KIWOOM만 만들
+        수 있다 -- 필터가 실제로 걸러낸다는 걸 보이려면
+        _row_to_session()의 열거형 파싱 실패 폴백(원본 문자열 보존,
+        MarketType 인스턴스화하지 않음)이 재시작 시 남길 수 있는 레거시 세션
+        모양을 내부 딕셔너리에 직접 주입한다.
+        """
         await session_manager.create_session(
             session_id="test-021",
             market_type=MarketType.KIWOOM,
@@ -250,17 +258,68 @@ class TestSessionManager:
             ticker="000660",
             display_name="SK하이닉스",
         )
+        session_manager._sessions["test-020"] = AnalysisSession(
+            session_id="test-020",
+            market_type="coin",
+            ticker="KRW-BTC",
+            display_name="비트코인",
+        )
         kiwoom_sessions = await session_manager.get_all_sessions(market_type=MarketType.KIWOOM)
         assert len(kiwoom_sessions) == 2
+        assert "test-020" not in kiwoom_sessions
+
+    @pytest.mark.asyncio
+    async def test_row_to_session_unparseable_market_type_falls_back_to_raw_string(
+        self, session_manager
+    ):
+        """_row_to_session()을 직접 먹인다 -- 위 테스트를 포함해 이 파일의
+        다른 테스트들은 전부 AnalysisSession을 손수 만들어 폴백의 "결과
+        모양"만 흉내 낸다. 이 테스트는 실제 SQLite 행을 INSERT하고 SELECT해
+        얻은 aiosqlite.Row를 _row_to_session()에 그대로 넣어 파싱 경로
+        자체를 검증한다 -- 같은 관례를 쓰는
+        tests/test_services/test_session_kind.py::
+        test_row_to_session_null_kind_falls_back_to_analysis 참고.
+
+        재시작마다 _load_active_sessions()가 통과하는 바로 그 경로다: 동결
+        이전에 만들어진 market_type='coin' 행이 sessions.db에 남아 있으면
+        MarketType(row["market_type"])가 ValueError를 던지는데, 여기서
+        죽으면 KIWOOM 세션까지 통째로 로드에 실패한다.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(TEST_DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO analysis_sessions
+                (session_id, market_type, ticker, display_name, status,
+                 created_at, updated_at, state_json, kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("legacy-coin-1", "coin", "KRW-BTC", "비트코인",
+                 "awaiting_approval", now, now, "{}", "analysis"),
+            )
+            await db.commit()
+
+        async with aiosqlite.connect(TEST_DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM analysis_sessions WHERE session_id = ?",
+                ("legacy-coin-1",),
+            ) as cursor:
+                row = await cursor.fetchone()
+
+        session = session_manager._row_to_session(row)
+        assert session.market_type == "coin"  # ValueError 없이 원본 문자열 보존
+        assert session.session_id == "legacy-coin-1"
+        assert session.ticker == "KRW-BTC"
 
     @pytest.mark.asyncio
     async def test_remove_session(self, session_manager):
         """Test session removal."""
         await session_manager.create_session(
             session_id="test-030",
-            market_type=MarketType.STOCK,
-            ticker="AAPL",
-            display_name="Apple",
+            market_type=MarketType.KIWOOM,
+            ticker="005930",
+            display_name="삼성전자",
         )
         result = await session_manager.remove_session("test-030")
         assert result is True
@@ -279,9 +338,9 @@ class TestSessionManager:
         # Create a completed session with old timestamp
         session = await session_manager.create_session(
             session_id="test-040",
-            market_type=MarketType.STOCK,
-            ticker="AAPL",
-            display_name="Apple",
+            market_type=MarketType.KIWOOM,
+            ticker="005930",
+            display_name="삼성전자",
         )
         # Manually set old created_at and completed status
         session.created_at = datetime.now(timezone.utc) - COMPLETED_SESSION_TTL - timedelta(hours=1)
@@ -290,9 +349,9 @@ class TestSessionManager:
         # Create a running session (should not be removed)
         await session_manager.create_session(
             session_id="test-041",
-            market_type=MarketType.STOCK,
-            ticker="MSFT",
-            display_name="Microsoft",
+            market_type=MarketType.KIWOOM,
+            ticker="000660",
+            display_name="SK하이닉스",
         )
 
         removed = await session_manager.cleanup_expired_sessions()
@@ -311,9 +370,9 @@ class TestSessionManager:
         )
         await session_manager.create_session(
             session_id="test-051",
-            market_type=MarketType.COIN,
-            ticker="KRW-BTC",
-            display_name="비트코인",
+            market_type=MarketType.KIWOOM,
+            ticker="000660",
+            display_name="SK하이닉스",
         )
         await session_manager.update_status("test-051", SessionStatus.COMPLETED)
 
@@ -321,8 +380,7 @@ class TestSessionManager:
         assert stats["total_sessions"] == 2
         assert stats["session_counts"]["running"] == 1
         assert stats["session_counts"]["completed"] == 1
-        assert stats["market_counts"]["kiwoom"] == 1
-        assert stats["market_counts"]["coin"] == 1
+        assert stats["market_counts"]["kiwoom"] == 2
 
 
 class TestConcurrencyControl:
@@ -405,13 +463,13 @@ class TestBackwardCompatibility:
 
             await register_session(
                 session_id="compat-003",
-                market_type="stock",
-                ticker="AAPL",
-                display_name="Apple",
+                market_type="kiwoom",
+                ticker="005930",
+                display_name="삼성전자",
             )
             session = await get_session("compat-003")
             assert session is not None
-            assert session["ticker"] == "AAPL"
+            assert session["stk_cd"] == "005930"
 
     @pytest.mark.asyncio
     async def test_remove_session_wrapper(self, clean_db):
@@ -454,25 +512,32 @@ class TestBackwardCompatibility:
 
     @pytest.mark.asyncio
     async def test_get_sessions_by_market_wrapper(self, clean_db):
-        """Test get_sessions_by_market wrapper."""
+        """Test get_sessions_by_market wrapper.
+
+        코인 스택 제거(2026-08-01) 이후 register_session()의 market_type
+        파싱-실패 폴백은 KIWOOM으로 갈음한다 -- 더는 "stock"/"coin" 같은
+        문자열로 다른 market을 흉내 낼 수 없으므로, 필터는 실제로 등록된
+        두 KIWOOM 세션을 모두 돌려준다는 것만 확인한다.
+        """
         with patch("services.session_manager.DB_PATH", TEST_DB_PATH):
             import services.session_manager as sm
             sm._session_manager = None
 
             await register_session(
                 session_id="compat-007",
-                market_type="stock",
-                ticker="AAPL",
-                display_name="Apple",
-            )
-            await register_session(
-                session_id="compat-008",
                 market_type="kiwoom",
                 ticker="005930",
                 display_name="삼성전자",
             )
+            await register_session(
+                session_id="compat-008",
+                market_type="kiwoom",
+                ticker="000660",
+                display_name="SK하이닉스",
+            )
             kiwoom_sessions = await get_sessions_by_market("kiwoom")
-            assert len(kiwoom_sessions) == 1
+            assert len(kiwoom_sessions) == 2
+            assert "compat-007" in kiwoom_sessions
             assert "compat-008" in kiwoom_sessions
 
     @pytest.mark.asyncio

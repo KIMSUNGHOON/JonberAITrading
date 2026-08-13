@@ -73,6 +73,34 @@ class TestKiwoomClientParsers:
     def test_parse_float_empty(self):
         assert KiwoomClient._parse_float("") == 0.0
 
+    # --- _parse_float: Kiwoom 부호 규약 (--N=음수 이중부호) ---
+    def test_parse_float_double_minus_is_negative(self):
+        assert KiwoomClient._parse_float("--35") == -35.0
+        assert KiwoomClient._parse_float("--3206") == -3206.0
+
+    def test_parse_float_single_plus_stripped(self):
+        assert KiwoomClient._parse_float("+122068") == 122068.0
+
+    def test_parse_float_single_minus_kept(self):
+        assert KiwoomClient._parse_float("-2") == -2.0
+        assert KiwoomClient._parse_float("-1.22") == -1.22
+
+    def test_parse_float_plus_decimal(self):
+        assert KiwoomClient._parse_float("+2.50") == 2.5
+
+    def test_parse_float_plain_and_comma(self):
+        assert KiwoomClient._parse_float("123") == 123.0
+        assert KiwoomClient._parse_float("+55,000") == 55000.0
+
+    def test_parse_float_none_empty_lone_sign(self):
+        assert KiwoomClient._parse_float(None) == 0.0
+        assert KiwoomClient._parse_float("") == 0.0
+        assert KiwoomClient._parse_float("-") == 0.0
+
+    def test_parse_float_numeric_passthrough(self):
+        assert KiwoomClient._parse_float(55000) == 55000.0
+        assert KiwoomClient._parse_float(-55000) == -55000.0
+
 
 class TestKiwoomClientInit:
     """Test client initialization"""
@@ -159,6 +187,37 @@ class TestKiwoomClientStockInfo:
 
             assert info.stk_cd == "005930"
 
+    @pytest.mark.asyncio
+    async def test_get_stock_info_passes_explicit_ttl_to_cache(
+        self, client, mock_stock_response
+    ):
+        """Dynamic held-position TTL (monitoring-cadence-tuning arc): when a
+        caller passes `ttl=`, it must be forwarded to `cache.set` so held
+        lookups can use a TTL derived from `compute_held_ttl(N)` instead of
+        the hardcoded 3.0s `stock_info` prefix default."""
+        with patch.object(client, '_request', new_callable=AsyncMock) as mock_request, \
+                patch.object(client._cache, 'set') as mock_cache_set:
+            mock_request.return_value = mock_stock_response
+
+            await client.get_stock_info("005930", ttl=7.0)
+
+            assert mock_cache_set.call_args.kwargs.get("ttl") == 7.0
+
+    @pytest.mark.asyncio
+    async def test_get_stock_info_no_ttl_keeps_prefix_default(
+        self, client, mock_stock_response
+    ):
+        """Regression guard: a caller passing NO ttl must behave exactly as
+        before — `cache.set` still receives `ttl=None` so the cache falls
+        back to the `stock_info` prefix default (3.0s)."""
+        with patch.object(client, '_request', new_callable=AsyncMock) as mock_request, \
+                patch.object(client._cache, 'set') as mock_cache_set:
+            mock_request.return_value = mock_stock_response
+
+            await client.get_stock_info("005930")
+
+            assert mock_cache_set.call_args.kwargs.get("ttl") is None
+
 
 class TestKiwoomClientOrderbook:
     """Test get_orderbook method"""
@@ -173,20 +232,20 @@ class TestKiwoomClientOrderbook:
 
     @pytest.mark.asyncio
     async def test_get_orderbook_success(self, client):
-        """Test successful orderbook retrieval"""
+        """Test successful orderbook retrieval (공식 스펙 키 — 시세.md ka10004)"""
         response = {
             "return_code": 0,
             "output": {
-                "sell_hoga_1": 55100,
-                "sell_hoga_qty_1": 1000,
-                "sell_hoga_2": 55200,
-                "sell_hoga_qty_2": 2000,
-                "buy_hoga_1": 55000,
-                "buy_hoga_qty_1": 1500,
-                "buy_hoga_2": 54900,
-                "buy_hoga_qty_2": 2500,
-                "tot_sell_qty": 50000,
-                "tot_buy_qty": 60000
+                "sel_fpr_bid": "55100",
+                "sel_fpr_req": "1000",
+                "sel_2th_pre_bid": "55200",
+                "sel_2th_pre_req": "2000",
+                "buy_fpr_bid": "55000",
+                "buy_fpr_req": "1500",
+                "buy_2th_pre_bid": "54900",
+                "buy_2th_pre_req": "2500",
+                "tot_sel_req": "50000",
+                "tot_buy_req": "60000"
             }
         }
 
@@ -333,25 +392,22 @@ class TestKiwoomClientAccountBalance:
 
     @pytest.mark.asyncio
     async def test_get_account_balance(self, client):
-        """Test get_account_balance"""
-        # 실제 API 응답 필드명 사용 (문서와 실제 응답이 다름)
+        """Test get_account_balance (공식 스펙 키 — 계좌.md kt00004)"""
         response = {
             "return_code": 0,
-            "tot_pur_amt": 10000000,       # 총매입금액 (pchs_amt)
-            "aset_evlt_amt": 11000000,     # 자산평가금액 (evlu_amt)
-            "lspft_amt": 1000000,          # 손익금액 (evlu_pfls_amt)
-            "lspft_rt": 10.0,              # 손익률 (evlu_pfls_rt)
-            "d2_entra": 5000000,           # D+2 예수금 (d2_ord_psbl_amt)
-            "stk_acnt_evlt_prst": [        # 보유종목 (output2)
+            "tot_pur_amt": "10000000",     # 총매입금액 (pchs_amt)
+            "tot_est_amt": "11000000",     # 유가잔고평가액 (evlu_amt)
+            "d2_entra": "5000000",         # D+2 추정예수금 (d2_ord_psbl_amt)
+            "stk_acnt_evlt_prst": [
                 {
-                    "stk_cd": "005930",
+                    "stk_cd": "A005930",
                     "stk_nm": "삼성전자",
-                    "hldg_qty": 100,
-                    "pchs_avg_pric": 50000,
-                    "prpr": 55000,
-                    "evlt_amt": 5500000,
-                    "evlt_lspft_amt": 500000,
-                    "evlt_lspft_rt": 10.0
+                    "rmnd_qty": "100",
+                    "avg_prc": "50000",
+                    "cur_prc": "55000",
+                    "evlt_amt": "5500000",
+                    "pl_amt": "500000",
+                    "pl_rt": "10.0"
                 }
             ]
         }
@@ -363,8 +419,37 @@ class TestKiwoomClientAccountBalance:
 
             assert balance.pchs_amt == 10000000
             assert balance.evlu_amt == 11000000
+            assert balance.evlu_pfls_amt == 1000000  # 평가 - 매입
             assert len(balance.holdings) == 1
-            assert balance.holdings[0].stk_cd == "005930"
+            assert balance.holdings[0].stk_cd == "005930"  # A 접두사 스트립
+            assert balance.holdings[0].hldg_qty == 100
+            assert balance.holdings[0].avg_buy_prc == 50000
+
+    @pytest.mark.asyncio
+    async def test_get_account_balance_fresh_fetch_bypasses_stored_snapshot(self, client):
+        """use_cache=False는 30s TTL 스냅샷을 우회해 재조회한다 —
+        get_filled_orders와 동일 패턴 (F3 t6 리뷰 M1: 리컨실러는 체결 폴
+        직후의 최신 잔고를 봐야 하며, 스테일 스냅샷은 방금 등록된 포지션을
+        '외부 매도'로 오판해 제거한다)."""
+        response = {
+            "return_code": 0,
+            "tot_pur_amt": "10000000",
+            "tot_est_amt": "11000000",
+            "d2_entra": "5000000",
+            "stk_acnt_evlt_prst": [],
+        }
+
+        with patch.object(client, '_request', new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = response
+
+            await client.get_account_balance()  # 스냅샷 저장
+            assert mock_request.call_count == 1
+
+            await client.get_account_balance()  # 기본값: 저장분 반환, 재조회 없음
+            assert mock_request.call_count == 1
+
+            await client.get_account_balance(use_cache=False)  # 리컨실러 경로: 재조회
+            assert mock_request.call_count == 2
 
 
 class TestKiwoomClientOrders:
@@ -380,21 +465,21 @@ class TestKiwoomClientOrders:
 
     @pytest.mark.asyncio
     async def test_get_pending_orders(self, client):
-        """Test get_pending_orders"""
+        """Test get_pending_orders (공식 스펙 키 — 계좌.md ka10075, 리스트 키 oso)"""
         response = {
             "return_code": 0,
-            "output": [
+            "oso": [
                 {
                     "ord_no": "123456",
-                    "stk_cd": "005930",
+                    "stk_cd": "A005930",
                     "stk_nm": "삼성전자",
-                    "ord_qty": 100,
-                    "ord_uv": 55000,
-                    "ccld_qty": 50,
-                    "rmn_qty": 50,
-                    "ord_dt": "20241220",
-                    "ord_tm": "143000",
-                    "buy_sell_tp": "1"
+                    "ord_qty": "100",
+                    "ord_pric": "55000",
+                    "cntr_qty": "50",
+                    "oso_qty": "50",
+                    "tm": "143000",
+                    "trde_tp": "2",
+                    "io_tp_nm": "+매수"
                 }
             ]
         }
@@ -406,24 +491,24 @@ class TestKiwoomClientOrders:
 
             assert len(orders) == 1
             assert orders[0].ord_no == "123456"
+            assert orders[0].ord_uv == 55000
             assert orders[0].rmn_qty == 50
+            assert orders[0].buy_sell_tp == "1"  # 소비자 계약: 1=매수
 
     @pytest.mark.asyncio
     async def test_get_filled_orders(self, client):
-        """Test get_filled_orders"""
+        """Test get_filled_orders (공식 스펙 키 — 계좌.md ka10076, 리스트 키 cntr)"""
         response = {
             "return_code": 0,
-            "output": [
+            "cntr": [
                 {
                     "ord_no": "123456",
-                    "stk_cd": "005930",
+                    "stk_cd": "A005930",
                     "stk_nm": "삼성전자",
-                    "ccld_qty": 100,
-                    "ccld_uv": 55000,
-                    "ccld_amt": 5500000,
-                    "ccld_dt": "20241220",
-                    "ccld_tm": "143000",
-                    "buy_sell_tp": "1"
+                    "cntr_qty": "100",
+                    "cntr_pric": "55000",
+                    "ord_tm": "143000",
+                    "io_tp_nm": "+매수"
                 }
             ]
         }
@@ -434,7 +519,8 @@ class TestKiwoomClientOrders:
             orders = await client.get_filled_orders()
 
             assert len(orders) == 1
-            assert orders[0].ccld_amt == 5500000
+            assert orders[0].ccld_amt == 5500000  # cntr_qty * cntr_pric
+            assert orders[0].buy_sell_tp == "1"
 
     @pytest.mark.asyncio
     async def test_place_buy_order(self, client):

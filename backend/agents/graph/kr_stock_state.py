@@ -18,14 +18,7 @@ from pydantic import BaseModel, Field
 # -------------------------------------------
 
 
-class SignalType(str, Enum):
-    """Trading signal types."""
-
-    STRONG_BUY = "strong_buy"
-    BUY = "buy"
-    HOLD = "hold"
-    SELL = "sell"
-    STRONG_SELL = "strong_sell"
+from agents.graph.state_base import SignalType  # shared (P4 consolidation)
 
 
 class TradeAction(str, Enum):
@@ -236,13 +229,7 @@ class KRStockPosition(BaseModel):
 # -------------------------------------------
 
 
-def append_list(current: list, new: list) -> list:
-    """Append new items to existing list."""
-    if current is None:
-        current = []
-    if new is None:
-        new = []
-    return current + new
+from agents.graph.state_base import append_list  # shared (P4 consolidation)
 
 
 # -------------------------------------------
@@ -274,6 +261,13 @@ class KRStockTradingState(TypedDict, total=False):
     chart_df: Optional[list[dict]]  # Daily chart data as list of dicts
     orderbook: Optional[dict]  # Orderbook data
 
+    # Data quality marker (CRITICAL safety fix, 2026-07-14): True when one or
+    # more of market_data/chart_df/orderbook could NOT be fetched this cycle
+    # (get_kr_* returned None) and the graph proceeded with safe empty
+    # defaults instead of crashing or substituting fabricated mock data.
+    # Downstream nodes/consumers should treat a stale run as low-confidence.
+    market_data_stale: bool
+
     # Portfolio context (NEW - fetched during data collection)
     existing_position: Optional[dict]  # User's current position in this stock
     portfolio_summary: Optional[dict]  # Overall portfolio summary
@@ -293,6 +287,7 @@ class KRStockTradingState(TypedDict, total=False):
     # HITL state
     awaiting_approval: bool
     approval_status: Optional[str]
+    approval_actor: Optional[str]  # 'user' | 'system' — R3 audit trail
     user_feedback: Optional[str]
 
     # Re-analysis state
@@ -368,6 +363,7 @@ def create_kr_stock_initial_state(
         # HITL state
         "awaiting_approval": False,
         "approval_status": None,
+        "approval_actor": None,
         "user_feedback": None,
 
         # Re-analysis state

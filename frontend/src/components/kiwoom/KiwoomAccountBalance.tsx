@@ -8,6 +8,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Wallet, TrendingUp, TrendingDown, RefreshCw, AlertCircle, Banknote, PiggyBank, Clock } from 'lucide-react';
 import { getKRStockAccount } from '@/api/client';
+import { pnlColor } from '@/utils/pnl';
 import type { KRStockAccountResponse } from '@/types';
 
 // Rate limit retry configuration
@@ -94,15 +95,15 @@ export function KiwoomAccountBalance() {
     return (
       <div className="card animate-pulse">
         <div className="flex items-center gap-3 mb-4">
-          <div className="w-10 h-10 bg-surface rounded-lg" />
+          <div className="w-10 h-10 bg-elevated rounded-lg" />
           <div className="flex-1">
-            <div className="h-4 bg-surface rounded w-24 mb-2" />
-            <div className="h-3 bg-surface rounded w-16" />
+            <div className="h-4 bg-elevated rounded w-24 mb-2" />
+            <div className="h-3 bg-elevated rounded w-16" />
           </div>
         </div>
         <div className="grid grid-cols-2 gap-4">
-          <div className="h-16 bg-surface rounded" />
-          <div className="h-16 bg-surface rounded" />
+          <div className="h-16 bg-elevated rounded" />
+          <div className="h-16 bg-elevated rounded" />
         </div>
       </div>
     );
@@ -118,7 +119,7 @@ export function KiwoomAccountBalance() {
             API 요청 대기 중... (재시도 {retryCount}/{MAX_RETRIES})
           </span>
         </div>
-        <div className="mt-2 text-xs text-gray-500">
+        <div className="mt-2 text-xs text-dim">
           요청 한도 초과로 잠시 대기 중입니다.
         </div>
       </div>
@@ -128,7 +129,7 @@ export function KiwoomAccountBalance() {
   if (error) {
     return (
       <div className="card">
-        <div className="flex items-center gap-2 text-red-400">
+        <div className="flex items-center gap-2 text-down">
           <AlertCircle size={18} />
           <span className="text-sm">{error}</span>
         </div>
@@ -145,7 +146,7 @@ export function KiwoomAccountBalance() {
   if (!account) return null;
 
   const totalAssets = account.cash.deposit + account.total_eval_amount;
-  const pnlColor = account.total_profit_loss >= 0 ? 'text-red-400' : 'text-blue-400';
+  const totalPnlColor = pnlColor(account.total_profit_loss);
   const PnlIcon = account.total_profit_loss >= 0 ? TrendingUp : TrendingDown;
 
   return (
@@ -157,25 +158,25 @@ export function KiwoomAccountBalance() {
             <Wallet size={20} />
           </div>
           <div>
-            <h3 className="font-semibold">계좌 정보</h3>
-            <p className="text-xs text-gray-500">한국투자증권</p>
+            <h3 className="font-semibold">계좌 요약</h3>
+            <p className="text-xs text-dim">키움증권</p>
           </div>
         </div>
         <button
           onClick={() => fetchAccount()}
-          className="p-1.5 hover:bg-surface rounded-lg transition-colors"
+          className="p-1.5 hover:bg-elevated rounded-lg transition-colors"
           title="새로고침"
           aria-label="Refresh account"
         >
-          <RefreshCw size={16} className={`text-gray-400 ${isLoading ? 'animate-spin' : ''}`} />
+          <RefreshCw size={16} className={`text-muted ${isLoading ? 'animate-spin' : ''}`} />
         </button>
       </div>
 
       {/* Total Assets */}
       <div className="p-4 bg-gradient-to-r from-blue-600/20 to-purple-600/20 rounded-lg">
-        <div className="text-sm text-gray-400 mb-1">총 자산</div>
-        <div className="text-2xl font-bold">{formatKRW(totalAssets)}원</div>
-        <div className={`flex items-center gap-1 mt-1 ${pnlColor}`}>
+        <div className="text-xs text-muted mb-1">총 자산</div>
+        <div className="text-lg font-bold tabular-nums">{formatKRW(totalAssets)}원</div>
+        <div className={`flex items-center gap-1 mt-1 tabular-nums ${totalPnlColor}`}>
           <PnlIcon size={14} />
           <span className="text-sm">
             {account.total_profit_loss >= 0 ? '+' : ''}{formatKRW(account.total_profit_loss)}원
@@ -187,52 +188,29 @@ export function KiwoomAccountBalance() {
       {/* Cash & Stock Balance */}
       <div className="grid grid-cols-2 gap-3">
         {/* Cash Balance */}
-        <div className="p-3 bg-surface rounded-lg">
+        <div className="p-3 bg-elevated rounded-lg">
           <div className="flex items-center gap-2 mb-2">
-            <Banknote size={16} className="text-green-400" />
-            <span className="text-xs text-gray-400">예수금</span>
+            <Banknote size={16} className="text-green-400" /> {/* color-ok: cash category icon, not directional */}
+            <span className="text-xs text-muted">예수금</span>
           </div>
-          <div className="font-semibold">{formatKRW(account.cash.deposit)}원</div>
-          <div className="text-xs text-gray-500 mt-1">
+          <div className="font-semibold tabular-nums">{formatKRW(account.cash.deposit)}원</div>
+          <div className="text-xs text-dim mt-1 tabular-nums">
             주문가능: {formatKRW(account.cash.orderable_amount)}원
           </div>
         </div>
 
         {/* Stock Value */}
-        <div className="p-3 bg-surface rounded-lg">
+        <div className="p-3 bg-elevated rounded-lg">
           <div className="flex items-center gap-2 mb-2">
             <PiggyBank size={16} className="text-purple-400" />
-            <span className="text-xs text-gray-400">주식 평가</span>
+            <span className="text-xs text-muted">주식 평가</span>
           </div>
-          <div className="font-semibold">{formatKRW(account.total_eval_amount)}원</div>
-          <div className="text-xs text-gray-500 mt-1">
+          <div className="font-semibold tabular-nums">{formatKRW(account.total_eval_amount)}원</div>
+          <div className="text-xs text-dim mt-1">
             {account.holdings.length}종목 보유
           </div>
         </div>
       </div>
-
-      {/* Holdings Summary */}
-      {account.holdings.length > 0 && (
-        <div className="space-y-2">
-          <div className="text-sm font-medium text-gray-400">보유 종목</div>
-          <div className="max-h-40 overflow-y-auto space-y-1">
-            {account.holdings.map((holding) => (
-              <div
-                key={holding.stk_cd}
-                className="flex items-center justify-between p-2 bg-surface rounded-lg text-sm"
-              >
-                <div>
-                  <span className="font-medium">{holding.stk_nm}</span>
-                  <span className="text-xs text-gray-500 ml-2">{holding.quantity}주</span>
-                </div>
-                <div className={holding.profit_loss >= 0 ? 'text-red-400' : 'text-blue-400'}>
-                  {holding.profit_loss >= 0 ? '+' : ''}{holding.profit_loss_rate.toFixed(2)}%
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }

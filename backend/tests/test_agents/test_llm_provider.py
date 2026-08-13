@@ -49,6 +49,7 @@ class TestLLMProviderInit:
 class TestLLMProviderHealthCheck:
     """Tests for LLM provider health check."""
 
+    @pytest.mark.slow
     @pytest.mark.asyncio
     async def test_health_check_returns_dict(self):
         """Health check should return dictionary."""
@@ -60,6 +61,7 @@ class TestLLMProviderHealthCheck:
         assert "status" in result
         reset_llm_provider()
 
+    @pytest.mark.slow
     @pytest.mark.asyncio
     async def test_health_check_status_values(self):
         """Health check status should be valid value."""
@@ -74,6 +76,7 @@ class TestLLMProviderHealthCheck:
 class TestLLMProviderGenerate:
     """Tests for LLM provider generate method."""
 
+    @pytest.mark.slow
     @pytest.mark.asyncio
     async def test_generate_with_empty_messages(self):
         """Generate with empty messages should handle gracefully."""

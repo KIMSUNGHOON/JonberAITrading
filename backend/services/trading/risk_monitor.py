@@ -11,6 +11,8 @@ import uuid
 from datetime import datetime
 from typing import Optional, Dict, List, Callable, Awaitable
 
+from .cadence import compute_held_ttl
+from .market_hours import is_krx_open_cached
 from .models import (
     ManagedPosition,
     StopLossMode,
@@ -20,6 +22,7 @@ from .models import (
     RiskParameters,
     OrderRequest,
     OrderSide,
+    OrderType,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,26 +40,55 @@ class RiskMonitor:
     - Auto-execute based on mode settings
     """
 
+    # T3 (MEDIUM finding B, review 2026-07-13): absolute cap on consecutive
+    # sudden-move re-arms, expressed as a multiple of
+    # `risk_params.sudden_move_cooldown_ticks`. A ticker whose tick-to-tick
+    # move keeps qualifying as "sudden" would otherwise re-arm the cooldown
+    # forever and never reach the ordinary N-tick recovery path — this is
+    # the circuit breaker for that circuit breaker, guaranteeing recovery
+    # even if the move never stabilizes.
+    ABSOLUTE_COOLDOWN_CAP_MULTIPLIER = 3
+
     def __init__(
         self,
         risk_params: Optional[RiskParameters] = None,
-        price_fetcher: Optional[Callable[[str], Awaitable[float]]] = None,
+        price_fetcher: Optional[Callable[..., Awaitable[float]]] = None,
         alert_sender: Optional[Callable[[TradingAlert], Awaitable[None]]] = None,
-        order_executor: Optional[Callable[[OrderRequest], Awaitable[None]]] = None,
+        order_executor: Optional[Callable[[OrderRequest], Awaitable[bool]]] = None,
+        price_sink: Optional[Callable[[str, float], None]] = None,
     ):
         """
         Initialize Risk Monitor.
 
         Args:
             risk_params: Risk parameters
-            price_fetcher: Async function to get current price
+            price_fetcher: Async function to get current price. Called as
+                `price_fetcher(ticker, ttl=compute_held_ttl(len(watching)))`
+                for each held-position tick (monitoring-cadence-tuning arc)
+                — the fetcher must accept an optional `ttl` keyword and
+                forward it to its own cache layer.
             alert_sender: Async function to send alerts
-            order_executor: Async function to execute orders
+            order_executor: Async function to execute orders. Returns bool
+                (G-2) — True only when an order was actually submitted;
+                False when the caller's autonomy gate denied it or a
+                concurrent in-flight guard skipped it. _execute_stop_loss/
+                _execute_take_profit use this to avoid generating a false
+                "Executed" alert for a no-op call.
+            price_sink: Optional callback(ticker, price) invoked every tick
+                right after a fresh price is fetched (T1, MEDIUM finding A).
+                Decoupled from the monitor's own stop-loss/take-profit logic
+                so a live 1s price feed can be mirrored back into an
+                external tracker (ExecutionCoordinator's ManagedPosition)
+                without this monitor knowing anything about it. The sink
+                owns its own "stale price" contract — this monitor calls it
+                unconditionally with whatever `price_fetcher` returned,
+                including a fail-safe 0.
         """
         self.risk_params = risk_params or RiskParameters()
         self._get_price = price_fetcher
         self._send_alert = alert_sender
         self._execute_order = order_executor
+        self._price_sink = price_sink
 
         # Monitoring state
         self._watching: Dict[str, WatchConfig] = {}
@@ -67,6 +99,14 @@ class RiskMonitor:
         # Alert history
         self._alerts: List[TradingAlert] = []
         self._pending_alerts: List[TradingAlert] = []
+
+        # E2-2: market-gate last-known state, for the transition-only log
+        # helper below (None = not yet observed this process). Same
+        # no-op-cycle pattern as E2-1 (agent_chat coordinator/
+        # position_manager) — market_hours.is_krx_open_cached() is a 30s
+        # monotonic-TTL cache, so gating this 1s loop's per-cycle work is a
+        # dict lookup, not a re-derivation of market state every tick.
+        self._market_gate_closed: Optional[bool] = None
 
     async def start(self):
         """Start the risk monitoring loop."""
@@ -159,17 +199,35 @@ class RiskMonitor:
             del self._watching[ticker]
             logger.info(f"[RiskMonitor] Stopped watching {ticker}")
 
-    def update_stop_loss(self, ticker: str, new_stop_loss: float):
-        """Update stop-loss for a position."""
+    def update_stop_loss(self, ticker: str, new_stop_loss: float) -> bool:
+        """
+        Update stop-loss for a position.
+
+        Returns:
+            True if `ticker` is being watched and the update was applied,
+            False otherwise (T7 review C1 — callers, e.g. the SL/TP API
+            route, must be able to tell a real update apart from a no-op
+            instead of assuming success unconditionally).
+        """
         if ticker in self._watching:
             self._watching[ticker].stop_loss = new_stop_loss
             logger.info(f"[RiskMonitor] Updated {ticker} stop-loss to {new_stop_loss}")
+            return True
+        return False
 
-    def update_take_profit(self, ticker: str, new_take_profit: float):
-        """Update take-profit for a position."""
+    def update_take_profit(self, ticker: str, new_take_profit: float) -> bool:
+        """
+        Update take-profit for a position.
+
+        Returns:
+            True if `ticker` is being watched and the update was applied,
+            False otherwise (see `update_stop_loss`).
+        """
         if ticker in self._watching:
             self._watching[ticker].take_profit = new_take_profit
             logger.info(f"[RiskMonitor] Updated {ticker} take-profit to {new_take_profit}")
+            return True
+        return False
 
     async def _monitor_loop(self):
         """Main monitoring loop."""
@@ -183,8 +241,31 @@ class RiskMonitor:
                 logger.exception(f"[RiskMonitor] Error in monitor loop: {e}")
                 await asyncio.sleep(5)
 
+    def _log_market_gate_once(self, closed: bool) -> None:
+        """Log a market-gate state transition once (E2-2) — never every
+        tick of the 1s monitor loop. Small per-file helper, duplicated
+        across E2-1's gate points (agent_chat coordinator/position_manager)
+        by design — YAGNI, not worth a shared util for a handful of call
+        sites."""
+        if self._market_gate_closed == closed:
+            return
+        self._market_gate_closed = closed
+        if closed:
+            logger.info("[RiskMonitor] market_gate_closed")
+        else:
+            logger.info("[RiskMonitor] market_gate_reopened")
+
     async def _check_all_positions(self):
         """Check all watched positions."""
+        # E2-2: 장외에는 1s 감시 사이클 전체를 쉬게 한다(완전 idle 결정, E2-1
+        # 과 동일 패턴). 방어 감시(손절/익절/급변동) 포함 전체 skip — 장외엔
+        # 체결 불가라 안전. `while self._running` / `asyncio.sleep(1)` /
+        # CancelledError 루프 구조 자체는 무변경, 사이클 작업부만 게이트.
+        if not is_krx_open_cached():
+            self._log_market_gate_once(closed=True)
+            return
+        self._log_market_gate_once(closed=False)
+
         if not self._watching:
             return
 
@@ -199,7 +280,14 @@ class RiskMonitor:
         # Get current price
         if self._get_price:
             try:
-                current_price = await self._get_price(ticker)
+                # Monitoring-cadence-tuning arc: TTL scales with the number
+                # of held positions (`compute_held_ttl`) so this 1s poll's
+                # responsiveness/cost tradeoff adapts to load N instead of a
+                # hardcoded cache TTL either starving responsiveness (N
+                # small) or blowing the request budget (N large).
+                current_price = await self._get_price(
+                    ticker, ttl=compute_held_ttl(len(self._watching))
+                )
             except Exception as e:
                 logger.warning(f"[RiskMonitor] Failed to get price for {ticker}: {e}")
                 return
@@ -207,25 +295,102 @@ class RiskMonitor:
             # Simulation: use last known price
             current_price = config.last_price
 
+        # T1 (MEDIUM finding A, review 2026-07-13): this 1s poll already
+        # fetches a fresh price for every watched ticker — previously that
+        # price was written only to `config.last_price` below and
+        # discarded, so an external tracker (ExecutionCoordinator's
+        # ManagedPosition.current_price, and unrealized P&L/exposure
+        # derived from it) went stale between trade decisions. Feed it back
+        # unconditionally via the decoupled price_sink so both stay fresh
+        # at the same cadence; the sink owns the "no 0/None overwrite"
+        # contract, not this monitor.
+        if self._price_sink:
+            try:
+                self._price_sink(ticker, current_price)
+            except Exception as e:
+                logger.warning(f"[RiskMonitor] price_sink failed for {ticker}: {e}")
+
         if current_price <= 0:
             return
 
         # Calculate price change
         change_pct = ((current_price - config.entry_price) / config.entry_price) * 100
 
-        # Check for sudden moves
+        # Tick-to-tick move, used both to DETECT a new sudden move and to
+        # judge whether an in-progress per-ticker cooldown has stabilized.
+        tick_change_pct = 0.0
         if config.last_price > 0:
-            sudden_change = abs(
+            tick_change_pct = abs(
                 (current_price - config.last_price) / config.last_price * 100
             )
-            if sudden_change >= self.risk_params.sudden_move_threshold_pct:
-                await self._handle_sudden_move(ticker, config, current_price, change_pct)
+            if tick_change_pct >= self.risk_params.sudden_move_threshold_pct:
+                # M1 (C2 audit 2026-07-13): pause THIS ticker only — does
+                # NOT touch _trading_mode or any other watched ticker. The
+                # old code called the GLOBAL pause() here, which froze
+                # stop-loss/take-profit checks for the entire book over one
+                # ticker's dead-candle.
+                #
+                # T3 (MEDIUM finding B, review 2026-07-13): a ticker whose
+                # tick-to-tick move keeps qualifying as "sudden" on EVERY
+                # tick re-enters this branch every time and re-arms the
+                # cooldown below before it can ever count down — its
+                # stop-loss/take-profit defense would never resume under a
+                # perpetual move. `sudden_move_ticks_in_cooldown` counts
+                # consecutive ticks spent here (across re-arms — NOT reset
+                # by them) and is a circuit breaker for the circuit
+                # breaker: once it exceeds the absolute cap, defense is
+                # force-resumed regardless of the ongoing move.
+                config.sudden_move_ticks_in_cooldown += 1
+                absolute_cap = (
+                    self.risk_params.sudden_move_cooldown_ticks
+                    * self.ABSOLUTE_COOLDOWN_CAP_MULTIPLIER
+                )
+                if config.sudden_move_ticks_in_cooldown > absolute_cap:
+                    logger.warning(
+                        f"[RiskMonitor] {ticker} force-recovered from "
+                        f"sudden-move cooldown after "
+                        f"{config.sudden_move_ticks_in_cooldown} consecutive "
+                        f"ticks (absolute cap {absolute_cap}) — "
+                        "stop-loss/take-profit resumed despite continued "
+                        "volatility"
+                    )
+                    config.sudden_move_cooldown_ticks = 0
+                    config.sudden_move_ticks_in_cooldown = 0
+                    config.last_price = current_price
+                    # Fall through to stop-loss/take-profit evaluation
+                    # below instead of returning — guaranteed recovery,
+                    # not another skip.
+                else:
+                    await self._handle_sudden_move(ticker, config, current_price, change_pct)
+                    config.last_price = current_price
+                    return
+
+        # This ticker is cooling down from its OWN prior sudden move.
+        # Auto-recovers after N monitor ticks OR once price stabilizes
+        # (volatility at/under sudden_move_stabilization_pct) — no human
+        # RESUME required.
+        if config.sudden_move_cooldown_ticks > 0:
+            config.sudden_move_cooldown_ticks -= 1
+            stabilized = tick_change_pct <= self.risk_params.sudden_move_stabilization_pct
+            if config.sudden_move_cooldown_ticks > 0 and not stabilized:
                 config.last_price = current_price
                 return
+            config.sudden_move_cooldown_ticks = 0
+            config.sudden_move_ticks_in_cooldown = 0
+            logger.info(
+                f"[RiskMonitor] {ticker} sudden-move cooldown cleared "
+                f"({'price stabilized' if stabilized else 'tick-count elapsed'}); "
+                "stop-loss/take-profit resumed automatically"
+            )
+            # Fall through: re-evaluate stop-loss/take-profit with the
+            # current price in this same tick.
 
         config.last_price = current_price
 
-        # Skip trigger checks if paused
+        # Manual/global kill-switch (ExecutionCoordinator.pause()/resume(),
+        # the alert "RESUME" action) — unrelated to the per-ticker
+        # sudden-move cooldown above. Still intentionally gates ALL tickers
+        # when an operator explicitly pauses the whole book.
         if self._trading_mode == TradingMode.PAUSED:
             return
 
@@ -244,7 +409,17 @@ class RiskMonitor:
         current_price: float,
         change_pct: float,
     ):
-        """Handle sudden price movement."""
+        """Handle sudden price movement.
+
+        Pauses stop-loss/take-profit checks for THIS ticker only, via
+        `config.sudden_move_cooldown_ticks` (M1, C2 audit 2026-07-13). This
+        deliberately does NOT call the global `pause()` — that API is kept
+        as a separate manual/operator kill-switch (ExecutionCoordinator.
+        pause()/resume(), the alert "RESUME" action), which still legitimately
+        gates every ticker when invoked explicitly. The per-ticker cooldown
+        set here auto-clears in `_check_position` after N monitor ticks or
+        once price stabilizes — no human action required.
+        """
         direction = "up" if change_pct > 0 else "down"
         alert_type = AlertType.SUDDEN_MOVE_UP if change_pct > 0 else AlertType.SUDDEN_MOVE_DOWN
 
@@ -253,10 +428,12 @@ class RiskMonitor:
             f"{change_pct:+.1f}% ({current_price})"
         )
 
-        # Pause trading
-        await self.pause(f"Sudden {direction} move in {ticker}: {change_pct:+.1f}%")
+        # Per-ticker pause + auto-recovery — NOT the global pause().
+        config.sudden_move_cooldown_ticks = self.risk_params.sudden_move_cooldown_ticks
 
-        # Create alert
+        # Create alert. "RESUME" is intentionally omitted: recovery is now
+        # automatic and per-ticker, and the global resume() would not clear
+        # this ticker's cooldown anyway.
         alert = TradingAlert(
             id=str(uuid.uuid4())[:8],
             alert_type=alert_type,
@@ -271,7 +448,7 @@ class RiskMonitor:
                 "direction": direction,
             },
             action_required=True,
-            options=["RESUME", "CLOSE_POSITION", "ADJUST_STOP_LOSS"],
+            options=["CLOSE_POSITION", "ADJUST_STOP_LOSS"],
         )
 
         await self._add_alert(alert)
@@ -290,7 +467,19 @@ class RiskMonitor:
             f"{loss_pct:.1f}% loss ({current_price} <= {config.stop_loss})"
         )
 
-        if config.stop_loss_mode == StopLossMode.AGENT_AUTO:
+        # S-2 (survival discipline, spec docs/superpowers/specs/
+        # 2026-07-19-survival-discipline-design.md §1/§2): read the LIVE
+        # risk_params.stop_loss_mode, NOT config.stop_loss_mode (a
+        # per-position snapshot taken once at add_position time — see
+        # WatchConfig below). Before this fix a runtime mode change (PUT
+        # /trading/risk-params) never reached ALREADY-watched positions,
+        # only newly-added ones — an asymmetry _handle_take_profit below did
+        # NOT have (it already read self.risk_params.take_profit_mode
+        # live). config.stop_loss_mode itself is kept for backward
+        # compatibility (add_position's per-position override param,
+        # restore/reconciler snapshots) — it is simply no longer the
+        # execute-vs-alert source of truth.
+        if self.risk_params.stop_loss_mode == StopLossMode.AGENT_AUTO:
             # Auto-execute
             await self._execute_stop_loss(ticker, config, current_price)
         else:
@@ -376,22 +565,52 @@ class RiskMonitor:
             side=OrderSide.SELL,
             quantity=config.quantity,
             price=current_price,
+            # P2-4 Task P2: defensive exits must submit as MARKET, not the
+            # OrderRequest default of LIMIT (models.py). A LIMIT order sent
+            # at the trigger price records a fill at that (favorable) price
+            # if the mock/live broker fills it there — understating real
+            # gap/crash risk. MARKET makes the broker report the true
+            # adverse fill via ka10076, so the KR ledger stays broker-truth
+            # (no app-side synthetic slippage added here — this is an
+            # order-construction fix, correct in live too, not a sim).
+            order_type=OrderType.MARKET,
             reason="Stop-loss auto-execution",
+            # L2 (spec D2): decision_id/session_id left unset (NULL) on
+            # purpose — a mechanical stop-loss has no upstream decision
+            # record to thread; NULL is the correct lineage state here, not
+            # a gap to wire.
         )
 
         try:
-            await self._execute_order(order)
-            self.remove_position(ticker)
+            # The order executor (coordinator) reconciles position tracking with
+            # the ACTUAL fill (remove on full, reduce on partial, keep on none) —
+            # do NOT unconditionally remove here or it clobbers a re-registered
+            # partial remainder / a retained unfilled position (review #5b).
+            #
+            # G-2 (gap discipline, spec docs/superpowers/specs/
+            # 2026-07-20-gap-discipline-design.md §N2): the executor now
+            # returns bool — True only when an order was actually SUBMITTED
+            # (autonomy gate allowed + in-flight guard acquired). Before this
+            # fix the return value was ignored, so a gate-denied or
+            # in-flight-skipped stop-loss (a silent no-op at the coordinator)
+            # still generated a "Stop-Loss Executed" alert below — falsely,
+            # and unconditionally on every 1s tick for as long as the price
+            # stayed under the stop. The coordinator's own gate-denied notice
+            # (Telegram, latched once per episode) already tells the human
+            # nothing executed — no alert is substituted here for the False
+            # case.
+            submitted = await self._execute_order(order)
 
-            alert = TradingAlert(
-                id=str(uuid.uuid4())[:8],
-                alert_type=AlertType.ORDER_FILLED,
-                ticker=ticker,
-                title=f"Stop-Loss Executed: {ticker}",
-                message=f"Sold {config.quantity} shares at ₩{current_price:,.0f}",
-                action_required=False,
-            )
-            await self._add_alert(alert)
+            if submitted:
+                alert = TradingAlert(
+                    id=str(uuid.uuid4())[:8],
+                    alert_type=AlertType.ORDER_FILLED,
+                    ticker=ticker,
+                    title=f"Stop-Loss Executed: {ticker}",
+                    message=f"Sold {config.quantity} shares at ₩{current_price:,.0f}",
+                    action_required=False,
+                )
+                await self._add_alert(alert)
 
         except Exception as e:
             logger.error(f"[RiskMonitor] Stop-loss execution failed: {e}")
@@ -424,32 +643,66 @@ class RiskMonitor:
             side=OrderSide.SELL,
             quantity=config.quantity,
             price=current_price,
+            # P2-4 Task P2: see _execute_stop_loss — MARKET so the broker
+            # reports the true fill instead of the (favorable) trigger price.
+            order_type=OrderType.MARKET,
             reason="Take-profit auto-execution",
+            # L2 (spec D2): decision_id/session_id left unset (NULL) on
+            # purpose — same rationale as _execute_stop_loss above.
         )
 
         try:
-            await self._execute_order(order)
-            self.remove_position(ticker)
+            # See _execute_stop_loss: the executor reconciles by actual fill; do
+            # not unconditionally remove here (review #5b).
+            #
+            # G-2 (gap discipline, spec docs/superpowers/specs/
+            # 2026-07-20-gap-discipline-design.md §N2): same bool-return gate
+            # as _execute_stop_loss above — no false "Executed" alert when
+            # nothing was actually submitted.
+            submitted = await self._execute_order(order)
 
-            alert = TradingAlert(
-                id=str(uuid.uuid4())[:8],
-                alert_type=AlertType.ORDER_FILLED,
-                ticker=ticker,
-                title=f"Take-Profit Executed: {ticker}",
-                message=f"Sold {config.quantity} shares at ₩{current_price:,.0f}",
-                action_required=False,
-            )
-            await self._add_alert(alert)
+            if submitted:
+                alert = TradingAlert(
+                    id=str(uuid.uuid4())[:8],
+                    alert_type=AlertType.ORDER_FILLED,
+                    ticker=ticker,
+                    title=f"Take-Profit Executed: {ticker}",
+                    message=f"Sold {config.quantity} shares at ₩{current_price:,.0f}",
+                    action_required=False,
+                )
+                await self._add_alert(alert)
 
         except Exception as e:
             logger.error(f"[RiskMonitor] Take-profit execution failed: {e}")
 
     async def _add_alert(self, alert: TradingAlert):
-        """Add and send alert."""
+        """Add and send alert.
+
+        Dedup by (ticker, alert_type): `_pending_alerts` previously grew
+        unboundedly for the process lifetime because every `action_required`
+        alert was appended unconditionally on each 1s monitor tick and
+        resolved alerts were never removed (live `pending_alerts_count` was
+        observed at 1542). If an UNRESOLVED pending alert already exists for
+        the same (ticker, alert_type), replace it in place instead of
+        appending a duplicate — at most one such alert stays pending per key.
+        A different alert_type for the same ticker is tracked separately,
+        and once the prior alert for a key is resolved a fresh one may be
+        added again. `self._alerts` (full history) is unaffected — every
+        call is still appended there.
+        """
         self._alerts.append(alert)
 
         if alert.action_required:
-            self._pending_alerts.append(alert)
+            for idx, existing in enumerate(self._pending_alerts):
+                if (
+                    not existing.resolved
+                    and existing.ticker == alert.ticker
+                    and existing.alert_type == alert.alert_type
+                ):
+                    self._pending_alerts[idx] = alert
+                    break
+            else:
+                self._pending_alerts.append(alert)
 
         if self._send_alert:
             try:
@@ -511,3 +764,24 @@ class WatchConfig:
         self.take_profit = take_profit
         self.stop_loss_mode = stop_loss_mode
         self.last_price = last_price
+
+        # M1 (C2 audit 2026-07-13): remaining monitor ticks this ticker's
+        # OWN stop-loss/take-profit checks stay paused after a sudden move.
+        # 0 = not paused. Set by RiskMonitor._handle_sudden_move, decremented
+        # and auto-cleared by RiskMonitor._check_position — per-ticker only,
+        # independent of the global _trading_mode.
+        self.sudden_move_cooldown_ticks: int = 0
+
+        # T3 (MEDIUM finding B, review 2026-07-13): consecutive ticks spent
+        # in the sudden-move branch since the cooldown FIRST armed, counting
+        # across re-arms (a perpetual mover never resets this by re-arming
+        # `sudden_move_cooldown_ticks` above). Reset to 0 whenever the
+        # ticker actually recovers — via the ordinary tick-count/
+        # stabilization path in `_check_position`, or via the absolute-cap
+        # force-recovery itself. Guarantees this ticker's defense resumes
+        # even under a move that never qualifies as "stabilized".
+        self.sudden_move_ticks_in_cooldown: int = 0
+
+    @property
+    def is_sudden_move_paused(self) -> bool:
+        return self.sudden_move_cooldown_ticks > 0

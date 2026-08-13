@@ -7,7 +7,6 @@ Endpoints for position management:
 - POST /positions/{stk_cd}/close - Close position
 """
 
-import uuid
 from datetime import datetime, timezone
 
 import structlog
@@ -18,7 +17,6 @@ from app.api.schemas.kr_stocks import (
     KRStockPosition,
     KRStockPositionListResponse,
 )
-from app.config import settings
 from app.core.kiwoom_singleton import get_shared_kiwoom_client_async
 from .helpers import check_kiwoom_api_keys
 
@@ -31,21 +29,29 @@ async def get_positions():
     """
     Get all open positions with real-time P&L.
 
+    Source: broker account balance holdings (kt00004, `get_account_balance()`)
+    — the SAME source Operations '보유' reads (app/api/routes/trading.py,
+    mapping mirrored from kr_stocks/orders.py:63-76), so the two surfaces can
+    never diverge on quantity/avg/current price/P&L for the same holding.
+
+    Previously this endpoint called `storage.get_kr_stock_positions()`, a
+    method that has never existed on StorageService — there is no KR
+    position writer anywhere in the backend. Every call raised
+    AttributeError, which was caught and silently turned into an empty list,
+    so KR positions were ALWAYS empty regardless of actual broker holdings.
+
+    On broker fetch failure this degrades honestly to an empty portfolio
+    (logged, not raised) rather than fabricating positions or non-zero
+    totals.
+
     Returns:
         List of positions with portfolio summary
     """
-    from services.storage_service import get_storage_service
-
-    storage = await get_storage_service()
-
-    # Try to get positions from storage first
     try:
-        positions_data = await storage.get_kr_stock_positions()
-    except AttributeError:
-        # If method doesn't exist yet, return empty
-        positions_data = []
-
-    if not positions_data:
+        client = await get_shared_kiwoom_client_async()
+        balance = await client.get_account_balance()
+    except Exception as e:
+        logger.error("failed_to_fetch_kr_positions", error=str(e))
         return KRStockPositionListResponse(
             positions=[],
             total_value_krw=0,
@@ -53,56 +59,39 @@ async def get_positions():
             total_pnl_pct=0,
         )
 
-    # Get current prices
-    client = await get_shared_kiwoom_client_async()
-    price_map = {}
-
-    try:
-        for p in positions_data:
-            try:
-                info = await client.get_stock_info(p["stk_cd"])
-                if info:
-                    price_map[p["stk_cd"]] = info.cur_prc
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning("failed_to_fetch_prices_for_positions", error=str(e))
-
     positions = []
     total_value = 0
     total_pnl = 0
     total_cost = 0
 
-    for p in positions_data:
-        stk_cd = p["stk_cd"]
-        quantity = p["quantity"]
-        avg_entry = p["avg_entry_price"]
-        current_price = price_map.get(stk_cd, avg_entry)
+    for h in balance.holdings:
+        quantity = h.hldg_qty
+        avg_entry = h.avg_buy_prc
 
-        position_value = quantity * current_price
-        position_cost = quantity * avg_entry
-        unrealized_pnl = position_value - position_cost
-        unrealized_pnl_pct = (
-            (unrealized_pnl / position_cost * 100) if position_cost > 0 else 0
-        )
-
-        total_value += position_value
-        total_cost += position_cost
-        total_pnl += unrealized_pnl
+        total_value += h.evlu_amt
+        total_pnl += h.evlu_pfls_amt
+        total_cost += quantity * avg_entry
 
         positions.append(
             KRStockPosition(
-                stk_cd=stk_cd,
-                stk_nm=p["stk_nm"],
+                stk_cd=h.stk_cd,
+                stk_nm=h.stk_nm,
                 quantity=quantity,
                 avg_entry_price=avg_entry,
-                current_price=current_price,
-                unrealized_pnl=unrealized_pnl,
-                unrealized_pnl_pct=unrealized_pnl_pct,
-                stop_loss=p.get("stop_loss"),
-                take_profit=p.get("take_profit"),
-                session_id=p.get("session_id"),
-                created_at=p["created_at"],
+                current_price=h.cur_prc,
+                # Broker-computed P&L (kt00004) — same fields Operations
+                # '보유' reads directly off the Holding model
+                # (trading.py:1391-1398). Pass-through, not independently
+                # recomputed, so the two surfaces can never disagree.
+                unrealized_pnl=h.evlu_pfls_amt,
+                unrealized_pnl_pct=h.evlu_pfls_rt,
+                # SL/TP for KR positions stays coordinator-managed (Operations
+                # '보유' enrichment + PUT .../stop-loss|take-profit, P1-T7) —
+                # out of scope here; this list endpoint doesn't own it.
+                stop_loss=None,
+                take_profit=None,
+                session_id=None,
+                created_at=datetime.now(timezone.utc),
             )
         )
 
@@ -121,66 +110,74 @@ async def get_position(stk_cd: str):
     """
     Get a single position by stock code with real-time P&L.
 
+    Source: broker account balance holdings (kt00004, `get_account_balance()`)
+    — the SAME lookup and field mapping as GET /positions (list, above), just
+    filtered to one ticker. Previously this called
+    `storage.get_kr_stock_position()`, a method that has never existed on
+    StorageService, so every lookup 404'd even for a ticker the list endpoint
+    (and Operations '보유') showed as held. Not held in the broker balance ->
+    honest 404, never a fabricated position.
+
     Args:
         stk_cd: Stock code
 
     Returns:
         Position details with current P&L
     """
-    from services.storage_service import get_storage_service
-
-    storage = await get_storage_service()
-
     try:
-        position = await storage.get_kr_stock_position(stk_cd)
-    except AttributeError:
-        position = None
+        client = await get_shared_kiwoom_client_async()
+        balance = await client.get_account_balance()
+    except Exception as e:
+        logger.error("failed_to_fetch_kr_position", stk_cd=stk_cd, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"포지션 조회 실패: {str(e)}",
+        )
 
-    if not position:
+    holding = next((h for h in balance.holdings if h.stk_cd == stk_cd), None)
+    if holding is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"{stk_cd} 포지션을 찾을 수 없습니다",
         )
 
-    # Get current price
-    current_price = position["avg_entry_price"]
-    client = await get_shared_kiwoom_client_async()
-
-    try:
-        info = await client.get_stock_info(stk_cd)
-        if info:
-            current_price = info.cur_prc
-    except Exception as e:
-        logger.warning("failed_to_fetch_ticker", stk_cd=stk_cd, error=str(e))
-
-    quantity = position["quantity"]
-    avg_entry = position["avg_entry_price"]
-    position_value = quantity * current_price
-    position_cost = quantity * avg_entry
-    unrealized_pnl = position_value - position_cost
-    unrealized_pnl_pct = (
-        (unrealized_pnl / position_cost * 100) if position_cost > 0 else 0
-    )
-
     return KRStockPosition(
-        stk_cd=stk_cd,
-        stk_nm=position["stk_nm"],
-        quantity=quantity,
-        avg_entry_price=avg_entry,
-        current_price=current_price,
-        unrealized_pnl=int(unrealized_pnl),
-        unrealized_pnl_pct=unrealized_pnl_pct,
-        stop_loss=position.get("stop_loss"),
-        take_profit=position.get("take_profit"),
-        session_id=position.get("session_id"),
-        created_at=position["created_at"],
+        stk_cd=holding.stk_cd,
+        stk_nm=holding.stk_nm,
+        quantity=holding.hldg_qty,
+        avg_entry_price=holding.avg_buy_prc,
+        current_price=holding.cur_prc,
+        # Broker-computed P&L (kt00004), pass-through like the list handler
+        # — same reasoning as get_positions() above.
+        unrealized_pnl=holding.evlu_pfls_amt,
+        unrealized_pnl_pct=holding.evlu_pfls_rt,
+        stop_loss=None,
+        take_profit=None,
+        session_id=None,
+        created_at=datetime.now(timezone.utc),
     )
 
 
 @router.post("/positions/{stk_cd}/close", response_model=KRStockOrderResponse)
 async def close_position(stk_cd: str):
     """
-    Close a position by selling all holdings at market price.
+    Close a position by selling the full held quantity at market price.
+
+    A KR "position" is broker balance (kt00004 `get_account_balance()`), NOT
+    a storage row — there is no KR position writer anywhere in the backend,
+    so deleting a storage row here was architecturally wrong (and dead code:
+    `storage.get_kr_stock_position` / `delete_kr_stock_position` don't exist,
+    always AttributeError'd). Closing = looking up the held quantity from the
+    same broker balance the list/single-GET handlers use (but with
+    `use_cache=False` — a full close must sell against CURRENT holdings, not
+    a <=30s-stale cached snapshot that would understate a concurrent ADD and
+    leave a partial position silently open), then placing a full-quantity
+    market SELL through the single execution path
+    (`KiwoomExecutionAdapter`, the exact primitive `orders.py` create_order's
+    live branch uses) — never a locally fabricated success response.
+    Mock-vs-live is handled inside the Kiwoom client itself (KIWOOM_IS_MOCK
+    base URL, see services/execution/adapters.py), so paper mode hits
+    Kiwoom's mock server like every other order.
 
     Args:
         stk_cd: Stock code to close
@@ -188,104 +185,72 @@ async def close_position(stk_cd: str):
     Returns:
         Order response from the sell order
     """
-    from services.storage_service import get_storage_service
-
     check_kiwoom_api_keys()
 
-    storage = await get_storage_service()
+    client = await get_shared_kiwoom_client_async()
 
     try:
-        position = await storage.get_kr_stock_position(stk_cd)
-    except AttributeError:
-        position = None
+        # use_cache=False: this is the full-close quantity, so it must
+        # reflect CURRENT holdings, not a <=30s-stale cached snapshot
+        # (client.py:700-716) — a concurrent ADD in the last 30s would
+        # otherwise yield a smaller stale qty, and "close full position"
+        # would silently leave a partial position open.
+        balance = await client.get_account_balance(use_cache=False)
+    except Exception as e:
+        logger.error(
+            "failed_to_fetch_kr_position_for_close", stk_cd=stk_cd, error=str(e)
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"포지션 조회 실패: {str(e)}",
+        )
 
-    if not position:
+    holding = next((h for h in balance.holdings if h.stk_cd == stk_cd), None)
+    if holding is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"{stk_cd} 포지션을 찾을 수 없습니다",
         )
 
-    quantity = position["quantity"]
+    quantity = holding.hldg_qty
     if quantity <= 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"{stk_cd} 포지션 수량이 0입니다",
         )
 
-    # Check trading mode
-    is_mock = getattr(settings, "KIWOOM_IS_MOCK", True)
-
-    if is_mock:
-        logger.info(
-            "mock_trade_close_position",
-            stk_cd=stk_cd,
-            quantity=quantity,
-        )
-
-        # Get current price
-        client = await get_shared_kiwoom_client_async()
-        current_price = position["avg_entry_price"]
-        try:
-            info = await client.get_stock_info(stk_cd)
-            if info:
-                current_price = info.cur_prc
-        except Exception:
-            pass
-
-        # Delete position
-        try:
-            await storage.delete_kr_stock_position(stk_cd)
-        except AttributeError:
-            pass
-
-        return KRStockOrderResponse(
-            order_id=f"mock-close-{uuid.uuid4()}",
-            stk_cd=stk_cd,
-            stk_nm=position["stk_nm"],
-            side="sell",
-            ord_type="market",
-            price=current_price,
-            quantity=quantity,
-            executed_quantity=quantity,
-            remaining_quantity=0,
-            status="completed",
-            created_at=datetime.now(timezone.utc),
-        )
-
-    # Live trading
-    client = await get_shared_kiwoom_client_async()
-
     try:
-        from services.kiwoom import OrderRequest as KiwoomOrderRequest, OrderType
-
-        kiwoom_request = KiwoomOrderRequest(
-            stk_cd=stk_cd,
-            order_type=OrderType.MARKET_SELL,
-            quantity=quantity,
-            price=0,
+        from services.execution import (
+            KiwoomExecutionAdapter,
+            ExecutionSide,
+            ExecutionOrderType,
         )
 
-        order = await client.place_order(kiwoom_request)
+        result = await KiwoomExecutionAdapter(client).place(
+            ticker=stk_cd,
+            side=ExecutionSide.SELL,
+            qty=quantity,
+            price=None,
+            order_type=ExecutionOrderType.MARKET,
+        )
 
-        # Delete position on success
-        try:
-            await storage.delete_kr_stock_position(stk_cd)
-        except AttributeError:
-            pass
-
-        logger.info("position_closed", stk_cd=stk_cd, order_id=order.order_id)
+        logger.info("position_closed", stk_cd=stk_cd, order_id=result.order_id)
 
         return KRStockOrderResponse(
-            order_id=order.order_id,
+            order_id=result.order_id,
             stk_cd=stk_cd,
-            stk_nm=position["stk_nm"],
+            stk_nm=holding.stk_nm,
             side="sell",
             ord_type="market",
             price=None,
             quantity=quantity,
             executed_quantity=0,
             remaining_quantity=quantity,
-            status="pending",
+            # KRStockOrderResponse.status has no "rejected" literal (only
+            # pending/partial/completed/cancelled) — "cancelled" is the
+            # honest fit for "the broker did not accept this order",
+            # never a fabricated "pending"/"completed" success.
+            status="pending" if result.success else "cancelled",
             created_at=datetime.now(timezone.utc),
         )
 

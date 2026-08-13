@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% import "_position.html" as pc %}
+{% block title %}장마감 리포트{% endblock %}
+{% block eyebrow %}Post-Market Report{% endblock %}
+{% block heading %}장마감 리포트<br>{{ ctx.trade_date }}{% endblock %}
+{% block body %}
+<div class="pad">
+
+  <section>
+    <h2>오늘 무슨 일이 있었나</h2>
+    {% set fills = ctx.extra.get('fills') %}
+    {% if fills %}
+    <table>
+      {% for f in fills %}
+      <tr><td class="muted num">{{ f.time }} {{ f.ticker }} {{ f.side }}</td>
+          <td class="num">{{ f.quantity }}주 @{{ f.price|krw }}
+            {% if f.reason %}<span class="muted">· {{ f.reason }}</span>{% endif %}</td></tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <div class="muted">체결 0건</div>
+    {% endif %}
+  </section>
+
+  {% if ctx.extra.get('realized') %}
+  <section>
+    <h2>실현손익</h2>
+    <table>
+      {% for r in ctx.extra.realized %}
+      <tr><td class="muted">{{ r.ticker }} {{ r.quantity }}주
+            {%- if r.slices and r.slices > 1 %} <span style="opacity:.7">({{ r.slices }}건)</span>{% endif %}</td>
+          <td class="num {{ 'up' if r.net >= 0 else 'down' }}">{{ r.net|krw }}</td></tr>
+      {% endfor %}
+    </table>
+  </section>
+  {% endif %}
+
+  <section>
+    <h2>보유 {{ ctx.positions|length }}종 · 오늘 토론 종합</h2>
+    {% for p in ctx.positions %}{{ pc.position_card(p) }}{% endfor %}
+    {% if not ctx.positions %}<div class="muted">보유 없음</div>{% endif %}
+  </section>
+
+  {% if ctx.extra.get('revisions') %}
+  <section>
+    <h2>전략 개정</h2>
+    <p class="note">패널이 오늘 바꾼 노브. 방향이 흐름을 말한다.</p>
+    <table>
+      {% for r in ctx.extra.revisions %}
+      <tr><td class="muted">{{ r.knob }}</td>
+          <td class="num">{{ r.before|num(4) }}
+            {{ '↓' if r.after < r.before else ('↑' if r.after > r.before else '·') }}
+            <b>{{ r.after|num(4) }}</b></td></tr>
+      {% endfor %}
+    </table>
+  </section>
+  {% endif %}
+
+</div>
+{% endblock %}

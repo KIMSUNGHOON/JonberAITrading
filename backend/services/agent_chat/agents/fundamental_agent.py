@@ -8,6 +8,7 @@ Participates in group discussions with fundamental analysis perspective.
 from typing import List, Optional
 
 import structlog
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from services.agent_chat.agents.base_agent import BaseDiscussionAgent
 from services.agent_chat.models import (
@@ -18,6 +19,7 @@ from services.agent_chat.models import (
     MessageType,
     VoteType,
 )
+from services.agent_chat.vote_schema import VOTE_SCHEMA
 
 logger = structlog.get_logger()
 
@@ -140,7 +142,13 @@ PER: {per}배 / PBR: {pbr}배
 형식:
 투표: [투표 옵션]
 신뢰도: [0-100]%
-근거: [핵심 밸류에이션 근거]"""
+근거: [핵심 밸류에이션 근거]
+
+응답은 다음 키를 가진 JSON 객체로도 반환하세요:
+- "vote": strong_buy / buy / hold / sell / strong_sell / abstain 중 하나
+- "confidence": 0.0~1.0 사이 숫자
+- "reasoning": 투표 근거 (한국어)
+- "key_factors": 핵심 근거 문자열 배열"""
 
     async def analyze(self, context: MarketContext) -> AgentMessage:
         """Present initial fundamental analysis."""
@@ -163,7 +171,7 @@ PER: {per}배 / PBR: {pbr}배
             position_info=position_info,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         confidence = self._parse_confidence(response)
 
         return self._create_message(
@@ -206,7 +214,7 @@ PER: {per}배 / PBR: {pbr}배
             pbr=context.pbr or "N/A",
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
 
         msg_type = MessageType.OPINION
         if "동의" in response or "맞습니다" in response:
@@ -245,18 +253,30 @@ PER: {per}배 / PBR: {pbr}배
             eps=context.eps or 0,
         )
 
-        response = await self._call_llm(self.system_prompt, prompt)
+        messages = [
+            SystemMessage(content=self._effective_system_prompt()),
+            HumanMessage(content=prompt),
+        ]
+        data = await self._structured_vote(messages, schema=VOTE_SCHEMA)
+        if data is not None:
+            try:
+                return AgentVote(
+                    agent_type=self.agent_type,
+                    vote=VoteType(str(data["vote"]).strip().lower()),
+                    confidence=float(data["confidence"]),
+                    reasoning=data.get("reasoning") or "",
+                    key_factors=data.get("key_factors") or [],
+                )
+            except (ValueError, KeyError, TypeError):
+                pass  # malformed structured payload (incl. null confidence) -> regex fallback
 
-        vote_type = self._parse_vote(response)
-        confidence = self._parse_confidence(response)
-        key_factors = self._extract_key_factors(response)
-
+        response = await self._call_llm(self._effective_system_prompt(), prompt)
         return AgentVote(
             agent_type=self.agent_type,
-            vote=vote_type,
-            confidence=confidence,
+            vote=self._parse_vote(response),
+            confidence=self._parse_confidence(response),
             reasoning=response,
-            key_factors=key_factors,
+            key_factors=self._extract_key_factors(response),
         )
 
     def _format_position_info(self, context: MarketContext) -> str:

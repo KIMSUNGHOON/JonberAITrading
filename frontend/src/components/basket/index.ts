@@ -1,1 +1,0 @@
-export { BasketWidget } from './BasketWidget';

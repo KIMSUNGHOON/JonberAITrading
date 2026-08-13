@@ -1,0 +1,262 @@
+"""포트폴리오 목표 노출도 — 순수 계산 (레짐 인지 노출도 제어, 2026-08-07).
+
+설계: docs/superpowers/specs/2026-08-06-portfolio-exposure-observation-design.md
+
+이 모듈은 DB도 API도 모른다. 입력을 받아 목표 노출도와 그 성분을 돌려줄 뿐이다.
+호출자가 어떤 값을 넣었는지, 결과를 어디에 쓸지는 관심 밖이다 — 그래야 테스트가
+실제 계산을 검증하고 목(mock)을 검증하지 않는다.
+
+이 결과는 이제 사이징 구속력이 있다 -- 게이트 검사 8(목표 노출도 상한)이
+`target_pct`를 실제 매수 상한으로 쓴다. 2026-08-06까지는 관측 전용
+(`compute_target_exposure`, M_evidence 기반)이었으나, 왕복 표본이 모의
+시장에서 쌓인 것이라 안전장치로 기능하지 못해 레짐 앵커 + 일일 변화
+한도 방식(`compute_regime_target`)으로 대체됐다.
+"""
+
+from __future__ import annotations
+
+import math
+import statistics
+from dataclasses import dataclass, field
+from typing import Optional
+
+# 레짐 앵커 — 목표 주식 비중(분율). 사용자 결정(2026-08-07):
+# 강세면 현금 20%, 약세면 45%. 중간은 그 사이.
+REGIME_ANCHORS: dict[str, float] = {"bull": 0.80, "neutral": 0.65, "bear": 0.55}
+
+# 판정 1회당 목표가 움직일 수 있는 폭. LLM의 단 한 번의 판정이 계좌
+# 절반을 움직이는 것을 막는다. 8.55%에서 시작하면 4거래일에 55%에 닿는다.
+DAILY_TARGET_DELTA_MAX: float = 0.15
+
+# 종목당 상한(분율, 고정). 목표 ÷ 이 값 = 필요 슬롯 수.
+REGIME_PER_POSITION_PCT: float = 0.05
+
+# 이보다 오래된 판정은 없는 것으로 취급한다(역일).
+JUDGMENT_MAX_AGE_DAYS: int = 5
+
+# 목표 상한 — bull 앵커와 같다. 배수는 깎기만 하므로 이 위로는 못 간다.
+TARGET_CEILING: float = 0.80
+
+# 노출도 하한. 방어 배수가 아무리 눌러도 완전히 0이 되지는 않게 한다.
+EXPOSURE_FLOOR: float = 0.02
+
+# 낙폭 배수의 기울기와 바닥. 고점 대비 10% 빠지면 0.7배.
+DRAWDOWN_SLOPE: float = 3.0
+DRAWDOWN_FLOOR: float = 0.3
+
+# 변동성 배수. 목표·실측·게이트 경계는 **전부 퍼센트 단위**다 — 목표만 소수로
+# 두면 배수가 100배 틀어진다.
+TARGET_VOL_PCT: float = 18.0
+VOL_WINDOW: int = 20
+VOL_MIN_SAMPLES: int = 5
+VOL_MULTIPLIER_MIN: float = 0.5
+# **축소 전용**(2026-08-07 최종 리뷰, C-1). 이 계약은 "앵커 테이블이 목표를
+# 정하고 배수는 그것을 깎기만 한다"(설계 §3 U3)이다. 배수가 1.0을 넘으면
+# 앵커가 상한이 아니라 출발점이 되어 사용자가 승인한 값(강세 80/횡보 65/
+# 약세 55)을 넘어선다.
+#
+# 이전 값 1.5는 **모의 KOSPI**(실현 연변동성 112%) 기준으로 잡힌
+# `TARGET_VOL_PCT=18.0`과 짝이었다. 실물 SPY의 20일 실현변동성은 통상
+# 9~15%라 `18.0 / 11` ≈ 1.6이 되어 배수가 상한 1.5로 **포화**한다. 그러면
+# `bear 0.55×1.5=0.825→천장 0.80`, `neutral 0.65×1.5→0.80`,
+# `bull 0.80×1.5→0.80`으로 **세 레짐이 같은 값**이 되어 LLM 판정이 결과에
+# 도달하지 못한다. 더 나쁜 흡수 상태도 생긴다 — 목표가 내려가려면
+# `(prev-0.15)×m_vol < prev`, 즉 `prev < 0.15·m_vol/(m_vol-1)`이라
+# `m_vol=1.5`면 목표가 45%를 넘는 순간 bear 판정이 목표를 1bp도 못 낮춘다.
+#
+# `TARGET_VOL_PCT`/`VOL_MULTIPLIER_MIN`은 이후 전략 패널 노브가 됐다
+# (2026-08-07 변동성 방어 정정, 하드 바운드 [10,40]/[0.2,0.8]). 위생
+# 게이트([5,60] 밖이면 무시)는 실제 KOSPI 변동성(최근 101.7%)을 거부해
+# **같은 아크에서 삭제됐다** — 여기 남겨둔다는 서술은 더 이상 사실이
+# 아니다. `annualized_vol()`은 그대로다 — 축소 방향(고변동성 → 1.0
+# 미만)에서는 이 상수들이 여전히 의미 있게 동작한다(연 30% → 0.6배).
+VOL_MULTIPLIER_MAX: float = 1.0
+
+TRADING_DAYS_PER_YEAR: int = 250
+
+
+@dataclass
+class TargetExposure:
+    """목표 노출도와 그것을 만든 성분들.
+
+    `binding`/`degraded`가 있는 이유는 숫자만 남기면 몇 주 뒤 "왜 이 값이었나"를
+    풀 수 없기 때문이다. `PortfolioAgent._calculate_max_position_value`의
+    `lineage` out-param과 같은 계열이다.
+    """
+
+    target_pct: float
+    m_vol: float
+    m_drawdown: float
+    binding: str
+    anchor_pct: float
+    prev_effective_pct: Optional[float] = None
+    degraded: list[str] = field(default_factory=list)
+    index_vol_annualized: Optional[float] = None
+    index_vol_n: int = 0
+
+
+def _drawdown_multiplier(equity: float, equity_peak: float) -> float:
+    if not equity_peak or equity_peak <= 0 or not math.isfinite(equity_peak):
+        return 1.0
+    drawdown = max(0.0, (equity_peak - equity) / equity_peak)
+    return max(DRAWDOWN_FLOOR, 1.0 - DRAWDOWN_SLOPE * drawdown)
+
+
+def annualized_vol(
+    index_returns: list[float], window: int = VOL_WINDOW
+) -> tuple[Optional[float], int]:
+    """최근 `window`개 등락률(%)의 표본표준편차 × √250, 그리고 사용한 표본 수.
+
+    표본이 `VOL_MIN_SAMPLES` 미만이면 (None, 실제 표본 수)를 돌려준다 —
+    표본 수는 부족해도 기록에는 남아야 한다.
+    """
+    usable = [r for r in (index_returns or []) if r is not None and math.isfinite(r)]
+    sample = usable[-window:]
+    n = len(sample)
+    if n < VOL_MIN_SAMPLES:
+        return None, n
+    sd = statistics.stdev(sample)
+    vol = sd * math.sqrt(TRADING_DAYS_PER_YEAR)
+    if not math.isfinite(vol):
+        return None, n
+    return vol, n
+
+
+def compute_regime_target(
+    *,
+    regime_label: str,
+    prev_effective_pct: Optional[float],
+    seed_actual_pct: float,
+    index_returns: list[float],
+    equity: float,
+    equity_peak: float,
+    series_stale: bool = False,
+    series_lagging: Optional[bool] = False,
+    target_vol_pct: float = TARGET_VOL_PCT,
+    vol_multiplier_min: float = VOL_MULTIPLIER_MIN,
+) -> TargetExposure:
+    """레짐 라벨에서 목표 주식 비중(분율)을 만든다.
+
+        ramped    = clamp(anchor, prev - 0.15, prev + 0.15)
+        effective = clamp(ramped × M_vol × M_drawdown, 0.02, 0.80)
+
+    **한도는 앵커에만 걸고 배수는 그 뒤에 곱한다** — 방어(낙폭·변동성)는
+    일일 한도보다 빠르게 줄일 수 있어야 하기 때문이다.
+
+    `prev_effective_pct`가 None이면(최초 실행) `seed_actual_pct`를 직전값으로
+    쓴다. 이후에는 **직전 목표**를 잇는다 — 익절로 실제 비중이 떨어졌다고
+    목표까지 따라 내려가면 안 된다.
+    """
+    degraded: list[str] = []
+
+    anchor = REGIME_ANCHORS.get(regime_label)
+    if anchor is None:
+        # 모르는 라벨에서 중간값을 고르지 않는다. 가장 보수적인 앵커를 쓴다 --
+        # 조회/파싱 실패가 노출도를 위로 여는 것이 이 리포의 알려진 함정이다.
+        anchor = REGIME_ANCHORS["bear"]
+        degraded.append("regime_unknown")
+
+    prev = prev_effective_pct if prev_effective_pct is not None else seed_actual_pct
+    ramped = max(prev - DAILY_TARGET_DELTA_MAX,
+                 min(anchor, prev + DAILY_TARGET_DELTA_MAX))
+
+    vol_ann, vol_n = annualized_vol(index_returns)
+    if vol_ann is None:
+        # ⚠️ **열화 폴백은 범위의 방어적인 끝이다**(2026-08-11). 배수는
+        # 축소 전용(`VOL_MULTIPLIER_MAX = 1.0`)이라 `1.0`은 "전혀 깎지
+        # 않는다"는 뜻 -- 범위에서 **가장 관대한** 값이다. 예전엔 여기가
+        # 1.0이라, 지수 시계열을 못 읽었다는 이유만으로 목표 노출도가
+        # 15.1% → 30.2%로 **두 배**가 될 수 있었다(라이브 실측).
+        #
+        # 우리는 변동성을 **모르는** 것이지 **낮은** 것이 아니다. 모를 때
+        # 깎지 않는 선택은 "시장이 잠잠하다고 가정한다"와 같고, 이
+        # 시스템이 실제로 만난 KOSPI 연변동성은 101.78%였다. 이 리포의
+        # 원칙은 "어떤 실패도 노출도를 위로 열지 않는다"다.
+        #
+        # `min(VOL_MULTIPLIER_MAX, ...)`로 한 번 더 묶는 이유(리뷰 지적):
+        # `vol_multiplier_min`은 **외부 입력**이라 이 함수 혼자로는 그
+        # 범위를 알 수 없다. 클램프 없이 쓰면 노브가 1.0을 넘는 순간
+        # **열화일이 정상일보다 관대해진다**(정상 분기는 이미 상한에
+        # 묶여 있다) -- 실측으로 knob=1.5에서 bear 앵커 0.55가 천장
+        # 0.80까지 증폭됐다. 옛 폴백은 리터럴 `1.0`이라 구조적으로
+        # 불가능하던 사건이다. 라이브 도달 경로는 없지만(`models.py`의
+        # `Field(ge=0.2, le=0.8)` 외 3중 클램프), 폴백의 안전성이 **다른
+        # 파일의 선언이 아니라 이 함수 자체로** 보장돼야 한다.
+        m_vol = min(VOL_MULTIPLIER_MAX, vol_multiplier_min)
+        degraded.append("index_vol_insufficient")
+    elif series_stale:
+        # 시계열이 오래됐으면 값 자체를 못 믿는다. 위와 같은 이유로
+        # 하한(가장 방어적인 끝)으로 떨어뜨리되 축소 전용 천장 안에
+        # 머문다. 원값은 그대로 실어 보낸다.
+        m_vol = min(VOL_MULTIPLIER_MAX, vol_multiplier_min)
+        degraded.append("index_series_stale")
+    else:
+        # ⚠️ 위생 게이트를 두지 않는다. 2026-08-06에 넣은 [5, 60]이
+        # 실제 KOSPI 변동성(101.7%, 2년 중 상위 1.1%)을 거부해
+        # **방어가 가장 필요한 날에 정확히 꺼졌다**. "변동성이 크다"는
+        # 저하 사유가 아니라 배수가 반영해야 할 사실이다.
+        m_vol = min(VOL_MULTIPLIER_MAX,
+                    max(vol_multiplier_min, target_vol_pct / vol_ann))
+
+    # 지연(`index_daily` 최신 행이 직전 **거래일**보다 이전)은 **관측
+    # 신호일 뿐 배수를 바꾸지 않는다**. 거래일 하루 뒤진 것이 20일
+    # 변동성을 의미 있게 바꾸지 않기 때문이다. 배수를 바꾸는 것은
+    # `series_stale`(7역일)과 표본 부족(`vol_ann is None`) 둘뿐이고, 이
+    # 분리를 지키지 않으면 하루짜리 외부 공백이 노출도를 흔든다.
+    #
+    # 3-상태다: `True`=지연, `False`=최신(또는 검사 안 함 -- 기본값),
+    # `None`=달력을 못 읽어 **모름**. 모름을 "지연 아님"으로 접으면
+    # 달력이 죽은 날 공백이 영원히 안 보인다.
+    if series_lagging:
+        degraded.append("index_series_lagging")
+    elif series_lagging is None:
+        degraded.append("index_series_lag_unknown")
+
+    m_drawdown = _drawdown_multiplier(equity, equity_peak)
+
+    raw = ramped * m_vol * m_drawdown
+
+    # 무엇이 목표를 눌렀는지 하나만 고른다. 우선순위는 위에서부터다 --
+    # 일일 한도가 앵커를 못 따라가게 막았다면 그것이 이 행의 이야기이고,
+    # 아니면 더 작은 배수가, 아무것도 안 눌렀으면 앵커 그 자체다.
+    if ramped != anchor:
+        binding = "daily_limit"
+    elif min(m_vol, m_drawdown) < 1.0:
+        binding = "m_vol" if m_vol <= m_drawdown else "m_drawdown"
+    else:
+        binding = "anchor"
+
+    target = raw
+    if target > TARGET_CEILING:
+        target = TARGET_CEILING
+        binding = "ceiling"
+    elif target < EXPOSURE_FLOOR:
+        target = EXPOSURE_FLOOR
+        binding = "floor"
+
+    return TargetExposure(
+        target_pct=target,
+        m_vol=m_vol,
+        m_drawdown=m_drawdown,
+        binding=binding,
+        anchor_pct=anchor,
+        prev_effective_pct=prev,
+        degraded=degraded,
+        index_vol_annualized=vol_ann,
+        index_vol_n=vol_n,
+    )
+
+
+def slots_for_target(
+    target_pct: float,
+    current_max: int,
+    per_position_pct: float = REGIME_PER_POSITION_PCT,
+) -> int:
+    """목표를 담는 데 필요한 슬롯 수. **올리기만 한다.**
+
+    목표가 내려갔다고 슬롯을 줄이면 같은 금액을 더 적은 종목에 담게 되어
+    집중도가 오른다 -- 축소하려는 의도와 정반대다. 총량 축소는 전적으로
+    게이트 검사 8(목표 노출도 상한)이 담당한다.
+    """
+    needed = math.ceil(target_pct / per_position_pct) if per_position_pct > 0 else current_max
+    return max(current_max, int(needed))

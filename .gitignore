@@ -133,7 +133,6 @@ list-candles-seconds
 websocket-ticker
 websocket-trade
 rate-limits
-upbit-api-overview.html
 
 # SQLite database
 *.db
@@ -143,3 +142,12 @@ plans/
 
 # Old backend logs
 backend/2025-*
+
+# Official Kiwoom REST API reference clone (separate repo, not ours)
+Kiwoom-REST-API/
+
+# .env 백업 사본 (실 API 키 포함) — *.env 패턴이 .env.bak-* 를 못 잡는다
+.env.bak*
+
+# Telegram 시각 리포트 — 보유·계좌 정보 포함, 공개 리포에 올리면 안 됨
+backend/data/reports/
