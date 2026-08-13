@@ -97,12 +97,54 @@ def test_reports_collect_news_fetch_references_get_news_service():
 
 
 @pytest.mark.asyncio
-async def test_news_service_singleton_has_providers_registered():
+async def test_news_service_singleton_has_providers_registered(monkeypatch):
     """행동 가드 -- 위 구조 가드가 가리키는 그 함수(`app.dependencies.
-    get_news_service`)가 실제로 프로바이더를 등록한 서비스를 돌려주는지.
-    `search()`는 호출하지 않는다(네트워크 없음) -- `.providers`가 비어
-    있지 않음만 본다."""
-    from app.dependencies import get_news_service
+    get_news_service`)가, NAVER 자격증명이 있을 때 실제로 프로바이더를
+    등록하는지. `search()`는 호출하지 않는다(네트워크 없음) --
+    `.providers`가 비어 있지 않음만 본다.
 
-    svc = await get_news_service()
+    자격증명 유무는 gitignore된 `.env`에 달려 있고 `git worktree`는
+    `.env`를 복사하지 않는다 -- 이 프로젝트 규칙("전체 스위트는
+    워크트리에서 돌린다", `gotcha-tests-write-live-storage-db` 참고)을
+    따르면 실 `.env`에 의존하는 단언은 매번 실패해 C1과 무관한 노이즈를
+    기준선에 남긴다. C1의 본질은 "자격증명이 있을 때 실제로 등록되는가"
+    이지 "이 머신에 `.env`가 있는가"가 아니므로, `get_settings()`를
+    가짜 자격증명으로 monkeypatch해 그 본질만 검증한다."""
+    import app.dependencies as deps
+
+    class _FakeSettings:
+        NAVER_CLIENT_ID = "test-client-id"
+        NAVER_CLIENT_SECRET = "test-client-secret"
+        REDIS_URL = None
+
+    monkeypatch.setattr(deps, "get_settings", lambda: _FakeSettings())
+    # 싱글턴 캐시를 리셋 -- 안 하면 이 프로세스에서 먼저 만들어진(혹은
+    # 프로바이더 0개인) 인스턴스가 그대로 반환되어 monkeypatch가
+    # 무의미해진다. monkeypatch가 테스트 종료 시 원래 값으로 되돌려주므로
+    # 다른 테스트를 오염시키지 않는다.
+    monkeypatch.setattr(deps, "_news_service_instance", None)
+
+    svc = await deps.get_news_service()
     assert svc.providers, "뉴스 서비스에 프로바이더가 하나도 등록되지 않았다 (C1)"
+
+
+@pytest.mark.asyncio
+async def test_news_service_singleton_empty_credentials_yields_no_providers(
+    monkeypatch,
+):
+    """대조군 -- 자격증명이 없으면(워크트리의 진짜 상태) 프로바이더가
+    0개인 것 자체는 정상이라는 것을 문서화한다. 이 테스트가 검증하는
+    관계(있으면 등록/없으면 미등록)가 바로 위 테스트가 자격증명 유무와
+    무관하게 C1을 잡는 근거다."""
+    import app.dependencies as deps
+
+    class _FakeSettingsNoCreds:
+        NAVER_CLIENT_ID = None
+        NAVER_CLIENT_SECRET = None
+        REDIS_URL = None
+
+    monkeypatch.setattr(deps, "get_settings", lambda: _FakeSettingsNoCreds())
+    monkeypatch.setattr(deps, "_news_service_instance", None)
+
+    svc = await deps.get_news_service()
+    assert not svc.providers
