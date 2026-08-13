@@ -28,6 +28,21 @@ async def build_and_send_report(
     당일 토론을 그대로 보는 게 맞으므로 이 인자를 넘기지 않는다.
     """
     research_date = research_date or trade_date
+    # ⚠️ 킬스위치를 여기 첫 줄에서 검사한다 -- 예전엔 `TelegramNotifier.
+    # send_document` 안에서만 봐서, 게이트가 꺼져 있어도 Kiwoom 5회·뉴스
+    # 5회·파일 쓰기·prune을 전부 치른 뒤에야 발송 단계에서 False를 받았다
+    # (2026-08-13 최종 리뷰 Important 4). 이 레포의 다른 킬스위치
+    # (REGIME_EXPOSURE_ENABLED·DISCOVERY_ENABLED·US_SIGNAL_ENABLED)는 전부
+    # 진입 자체를 막으므로 여기도 맞춘다.
+    try:
+        from services.telegram.config import get_telegram_config
+
+        if not get_telegram_config().TELEGRAM_REPORT_HTML_ENABLED:
+            logger.info("report_html_disabled", kind=kind)
+            return False
+    except Exception as e:  # noqa: BLE001 -- 설정 조회 실패로 리포트를 죽이지 않는다
+        logger.warning("report_html_gate_check_failed", kind=kind, error=str(e))
+
     try:
         from services.reports import collect, delivery
         from services.reports.models import ReportContext

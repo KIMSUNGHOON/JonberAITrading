@@ -157,3 +157,30 @@ async def test_research_date_overrides_trade_date_for_attach_research(
     )
     assert captured["date"] == "2026-08-12"      # 토론 조회는 어제
     assert saved["trade_date"] == "2026-08-13"   # 표지는 오늘
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-13 최종 브랜치 리뷰 Important 4 -- TELEGRAM_REPORT_HTML_ENABLED가
+# TelegramNotifier.send_document 안에서만 검사돼, build_and_send_report는
+# Kiwoom 5회·뉴스 5회·파일 쓰기·prune을 전부 수행한 뒤 발송 단계에서야
+# False를 받는다. 이 레포의 다른 킬스위치(REGIME_EXPOSURE_ENABLED·
+# DISCOVERY_ENABLED·US_SIGNAL_ENABLED)는 전부 진입 자체를 막는다 -- 여기도
+# 첫 줄에서 게이트를 검사해 수집 함수가 호출조차 안 되게 한다.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_html_report_kill_switch_blocks_before_any_collection(monkeypatch):
+    from unittest.mock import AsyncMock
+    from services.telegram.config import TelegramConfig
+    from services import reports
+
+    off_config = TelegramConfig(TELEGRAM_REPORT_HTML_ENABLED=False)
+    monkeypatch.setattr("services.telegram.config.get_telegram_config",
+                        lambda: off_config)
+
+    spy = AsyncMock(return_value=[])
+    monkeypatch.setattr("services.reports.collect.collect_positions", spy)
+
+    assert await reports.build_and_send_report("premarket", "2026-08-13") is False
+    spy.assert_not_awaited()
