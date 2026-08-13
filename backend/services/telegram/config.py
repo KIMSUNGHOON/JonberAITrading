@@ -60,6 +60,10 @@ class TelegramConfig(BaseSettings):
         default=True,
         description="Send autonomous discovery promotion notifications (concise, one-way)"
     )
+    TELEGRAM_REPORT_HTML_ENABLED: bool = Field(
+        default=True,
+        description="개장전·개장후·발굴 알림에 모바일 HTML 상세 리포트를 첨부한다",
+    )
     # 체결 통지만 따로 끌 수 있게 한다 — TELEGRAM_NOTIFY_TRADE_ALERTS와 별도.
     TELEGRAM_NOTIFY_FILL_ENABLED: bool = Field(
         default=True, description="자율·승인 체결 통지 발송 여부"

@@ -13,7 +13,7 @@ from typing import Optional
 
 import structlog
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, NetworkError, TelegramError
 
 from services.telegram.config import get_telegram_config, TelegramConfig
 
@@ -191,6 +191,30 @@ class TelegramNotifier:
             text_head=text[:120],
             will_retry_plain=bool(is_parse_error and parse_mode),
         )
+        # 연결 자체가 성립하지 않은 실패(httpx.ConnectError)는 서버에 도달한
+        # 적이 없으므로 재시도해도 중복 발송이 되지 않는다. PTB는 이것을
+        # NetworkError '정확히 그 타입'으로 올린다.
+        #
+        # ⚠️ isinstance를 쓰면 안 된다 — BadRequest·TimedOut이 NetworkError의
+        # 하위라 각각의 기존 처리(평문 폴백 / 재시도 안 함)를 삼켜버린다.
+        if type(error) is NetworkError:
+            for attempt in (1, 2):
+                await asyncio.sleep(2)
+                _, retry_err = await self._send_chunks(
+                    chunks, parse_mode, reply_markup, start_index=sent_index
+                )
+                if retry_err is None:
+                    logger.warning(
+                        "telegram_send_connect_retry_ok",
+                        attempt=attempt,
+                        text_head=text[:120],
+                    )
+                    return True
+                if type(retry_err) is not NetworkError:
+                    break
+            logger.error("telegram_send_connect_retry_exhausted", text_head=text[:120])
+            return False
+
         if not (is_parse_error and parse_mode):
             return False
 
@@ -219,6 +243,39 @@ class TelegramNotifier:
         Use this for notifications that don't fit other specific methods.
         """
         return await self._send_message(text, parse_mode)
+
+    async def send_document(
+        self, content: bytes, filename: str, caption: str = ""
+    ) -> bool:
+        """HTML 리포트를 문서로 첨부 발송한다.
+
+        `_send_message`와 달리 청크 분할·Markdown 폴백이 없다 — 문서는
+        쪼갤 수 없고 파싱되지도 않는다. 실패는 로그만 남기고 False를
+        돌려준다: 리포트 첨부가 실패해도 앞서 나간 텍스트 알림은 이미
+        전달됐으므로 호출자가 죽을 이유가 없다.
+        """
+        if not self._config.TELEGRAM_REPORT_HTML_ENABLED:
+            return False
+        if not self._initialized or not self._bot:
+            return False
+
+        try:
+            await self._bot.send_document(
+                chat_id=self._config.TELEGRAM_CHAT_ID,
+                document=content,
+                filename=filename,
+                caption=caption or None,
+            )
+            logger.info("telegram_document_sent", filename=filename, size=len(content))
+            return True
+        except Exception as e:  # noqa: BLE001 -- 리포트가 알림을 죽이면 안 된다
+            logger.warning(
+                "telegram_document_failed",
+                filename=filename,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            return False
 
     # -------------------------------------------
     # Approval/Reject Inline Buttons (TG-3, spec F1)
