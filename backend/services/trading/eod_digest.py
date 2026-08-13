@@ -455,6 +455,194 @@ async def _build_discovery_section(
     }
 
 
+# ------------------------------------------------------------------
+# Postmarket 리포트 전용 수집기 (Task 7, 2026-08-13)
+#
+# `build_eod_digest`가 돌려주는 dict에는 fills/realized/strategy_revisions
+# 키가 아예 없다 -- 그 세 종류는 이 함수의 계약 밖이다(반환 shape은
+# trade_date/watch/account/holdings/strategy/regime/discovery 7개뿐,
+# 실물 확인: `grep -nE '"[a-z_]+":' eod_digest.py`). postmarket.html이
+# 필요로 하는 "오늘 체결/실현손익/전략개정 리스트"는 여기 세 함수로 별도
+# 조립해 coordinator.py가 `build_eod_digest`와 별개로 직접 호출한다 --
+# `build_eod_digest` 자체의 반환 계약은 넓히지 않는다(narrate_eod_digest·
+# FE·Telegram 텍스트 요약이 전부 그 계약을 그대로 읽어서, 넓히면 그만큼
+# 회귀 표면이 커진다).
+# ------------------------------------------------------------------
+
+# 하루치 체결/실현손익은 보통 한 자릿수~수십 건이라(2026-08 라이브 관측),
+# newest-first로 200행만 긁어 날짜 문자열로 거르는 것으로 충분하다 --
+# `kr_stock_trades`/`kr_realized_pnl` 둘 다 trade_date 컬럼이 없어 서버측
+# 날짜 필터가 없다(daily_perf_snapshot과 같은 scan-then-match 관례).
+_POSTMARKET_FILL_SCAN_LIMIT = 200
+_POSTMARKET_REALIZED_SCAN_LIMIT = 200
+
+
+async def _build_postmarket_fills(storage: Any, trade_date: str) -> list[dict[str, Any]]:
+    """그날 체결 목록(시각순) -- `kr_stock_trades`가 유일한 소스다(원장의
+    다른 어떤 표도 개별 체결의 시각/가격/수량을 이 해상도로 갖지 않는다).
+    이 모듈 docstring 29행의 경고("kr_stock_trades를 여기서 집계하지
+    말라")는 daily_realized_pnl 재계산 얘기다 -- 개별 체결을 나열하는
+    것은 그 경고가 막는 "재구성한 집계 숫자"가 아니라 이 표 본연의 용도다.
+
+    ⚠️ `kr_stock_trades.created_at`은 `agent_chat_decisions`와 달리 이미
+    KST 로컬시각이다(실물 대조: 2026-08-12 13:2x~13:3x대 체결 행이 그대로
+    장중 시각과 일치). `get_day_rollup`처럼 `date(created_at,'+9 hours')`를
+    적용하면 15시 이후 체결이 다음 날짜로 밀려버려 여기서는 쓰지 않고,
+    문자열 앞 10자리(YYYY-MM-DD)만 그대로 비교한다.
+
+    `reason`은 `entry_or_exit`(entry/exit 두 값뿐)에서만 파생한다 -- 손절/
+    익절/재량청산을 구분할 근거(포지션·의사결정 조인)가 이 테이블에
+    없어서, 확인 안 된 사유를 "손절"처럼 단정해 적으면 틀린 정보가 된다.
+
+    known limitation: 같은 체결이 드물게 두 행으로 중복 기록되는 결함이
+    별도로 있다(order_id+수량+가격 전부 일치가 진짜 중복) -- 이 함수는
+    그 중복을 걸러내지 않는다(별건으로 미수정, 여기서 손대지 않는다).
+    """
+    try:
+        rows = await storage.get_kr_stock_trades(limit=_POSTMARKET_FILL_SCAN_LIMIT)
+    except Exception as e:
+        logger.warning(f"[EODDigest] postmarket fills collect failed: {e}")
+        return []
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            created = str(row.get("created_at") or "")
+            if created[:10] != trade_date:
+                continue
+            out.append(
+                {
+                    "time": created[11:16],
+                    "ticker": row.get("stk_cd"),
+                    "side": (row.get("side") or "").upper(),
+                    "quantity": row.get("executed_quantity"),
+                    "price": row.get("price"),
+                    "reason": "청산" if row.get("entry_or_exit") == "exit" else None,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[EODDigest] postmarket fill row skipped: {e}")
+    out.sort(key=lambda f: f["time"])
+    return out
+
+
+async def _build_postmarket_realized(
+    storage: Any, trade_date: str
+) -> list[dict[str, Any]]:
+    """그날 실현손익(종목별) -- `kr_realized_pnl`에서 `net_amount`(수수료·
+    세금 차감 후)로 읽는다. `realized_amount`(gross)를 쓰면 실현이익을
+    과대계상한다(왕복비용 미차감 -- 실측 사례 gross 대비 순이익 43% 과대).
+    `net_amount`가 옛 행에 없으면(마이그레이션 이전) gross로 물러난다.
+    `stk_cd='ALL'` 행은 계좌 백필이지 거래가 아니다 -- `get_day_rollup`과
+    같은 관례로 제외한다.
+    """
+    try:
+        rows = await storage.get_kr_realized_pnl(limit=_POSTMARKET_REALIZED_SCAN_LIMIT)
+    except Exception as e:
+        logger.warning(f"[EODDigest] postmarket realized collect failed: {e}")
+        return []
+
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            if row.get("stk_cd") == "ALL":
+                continue
+            created = str(row.get("created_at") or "")
+            if created[:10] != trade_date:
+                continue
+            net = row.get("net_amount")
+            if net is None:
+                net = row.get("realized_amount")
+            out.append(
+                {
+                    "ticker": row.get("stk_cd"),
+                    "quantity": row.get("quantity"),
+                    "net": net,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[EODDigest] postmarket realized row skipped: {e}")
+    return out
+
+
+# knob 이름 -> strategy_json 안의 "section.field" 경로. strategy_apply.py의
+# STRATEGY_MAPPED_FIELDS/_source_values와 같은 8개 노브(그 allowlist가
+# "전략이 실제로 실효값에 도달하는 노브"의 SSOT -- GATE_PROTECTED 노브는
+# 일부러 뺐다, 전략이 못 움직이는 값의 변화를 "개정"으로 보여주면 오도).
+# exit_conditions 둘은 strategy_json에 분율(0~1)로 있다 -- default_stop_
+# loss_pct 같은 ×100 퍼센트 파생값이 아니라 원본 분율 그대로 보여준다
+# (리포트는 방향만 보이면 충분하고, 여기서 또 ×100 하면 strategy_apply.py
+# 로그의 숫자와 어긋나 보인다).
+_REVISION_KNOB_PATHS: dict[str, str] = {
+    "stop_loss_pct": "exit_conditions.stop_loss_pct",
+    "take_profit_pct": "exit_conditions.take_profit_pct",
+    "max_position_pct": "position_sizing.max_position_pct",
+    "min_cash_ratio": "position_sizing.min_cash_ratio",
+    "max_trade_notional_pct": "position_sizing.max_trade_notional_pct",
+    "risk_budget_pct": "position_sizing.risk_budget_pct",
+    "target_vol_pct": "position_sizing.target_vol_pct",
+    "vol_multiplier_min": "position_sizing.vol_multiplier_min",
+}
+
+
+def _dig(d: Optional[dict], path: str) -> Any:
+    cur: Any = d
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+async def _build_postmarket_revisions(
+    storage: Any, trade_date: str
+) -> list[dict[str, Any]]:
+    """오늘 전략 개정 -- 오늘자 최신 리비전과 그 직전 리비전을 노브별로
+    대조해 [{knob, before, after}]로 돌려준다(값 하나만 보여주면 "4일
+    연속 축소" 같은 흐름이 안 보인다 -- 방향 표시는 postmarket.html이
+    before<after로 판단하므로 여기는 원값 두 개만 정확히 내면 된다).
+
+    `changed=0`(오늘 EOD 합의가 돌긴 했지만 실제로는 아무것도 안 바꿈)
+    이거나 최신 행의 `trade_date`가 오늘이 아니면(합의가 아직 안 돌았거나
+    실패해 어제 이전 행이 최신) 빈 리스트 -- "오늘 무엇이 바뀌었나"이지
+    "현재 전략이 무엇인가"가 아니다(그건 이미 digest['strategy']가 보여
+    준다, `_build_strategy_section` 참고).
+    """
+    try:
+        rows = await storage.get_strategy_revisions(limit=2)
+    except Exception as e:
+        logger.warning(f"[EODDigest] postmarket revisions collect failed: {e}")
+        return []
+
+    if len(rows) < 2:
+        return []
+    latest, prev = rows[0], rows[1]
+    if latest.get("trade_date") != trade_date or not latest.get("changed"):
+        return []
+
+    try:
+        latest_json = json.loads(latest.get("strategy_json") or "{}")
+        prev_json = json.loads(prev.get("strategy_json") or "{}")
+    except Exception as e:
+        logger.warning(f"[EODDigest] postmarket revisions parse failed: {e}")
+        return []
+
+    out: list[dict[str, Any]] = []
+    for knob, path in _REVISION_KNOB_PATHS.items():
+        before = _dig(prev_json, path)
+        after = _dig(latest_json, path)
+        if before is None or after is None:
+            continue
+        try:
+            if abs(float(before) - float(after)) < 1e-9:
+                continue
+        except (TypeError, ValueError):
+            if before == after:
+                continue
+        out.append({"knob": knob, "before": before, "after": after})
+    return out
+
+
 _NARRATE_SYSTEM_PROMPT = (
     "당신은 한국 주식 자동매매 시스템의 장마감 브리핑 작성자입니다. "
     "아래 장마감 데이터(JSON)를 근거로 오늘 하루를 요약하는 한국어 브리핑을 "

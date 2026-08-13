@@ -52,7 +52,13 @@ from .eod_snapshot import write_daily_snapshot
 from .eod_orchestrator import run_eod_review
 from .strategy_orchestrator import run_strategy_consensus
 from .ledger_reconcile import reconcile_trade_ledger
-from .eod_digest import _build_strategy_section, _build_discovery_section
+from .eod_digest import (
+    _build_strategy_section,
+    _build_discovery_section,
+    _build_postmarket_fills,
+    _build_postmarket_realized,
+    _build_postmarket_revisions,
+)
 from services.storage_service import get_storage_service
 from app.config import get_settings
 from services.background_scanner.scanner import ScanStatus, get_background_scanner
@@ -4579,6 +4585,27 @@ class ExecutionCoordinator:
             notifier = await get_telegram_notifier()
             if notifier.is_ready:
                 await notifier.send_daily_summary(digest, narrative)
+
+                # Task 7 (2026-08-13): 시각(HTML) 장마감 리포트. `digest`에는
+                # fills/realized/strategy_revisions 키가 없다(실물 확인 —
+                # build_eod_digest는 trade_date/watch/account/holdings/
+                # strategy/regime/discovery 7개만 돌려준다) — 그래서
+                # digest.get(...)이 아니라 eod_digest의 전용 수집기 3개를
+                # storage에서 직접 불러 조립한다. never-raise 계약: 이
+                # 블록이 실패해도 위 텍스트 요약은 이미 나간 뒤이므로 EOD
+                # 체인·통지 자체를 죽이면 안 된다(테스트로 고정).
+                try:
+                    from services.reports import build_and_send_report
+
+                    await build_and_send_report(
+                        "postmarket",
+                        digest.get("trade_date") or trade_date,
+                        fills=await _build_postmarket_fills(storage, trade_date),
+                        realized=await _build_postmarket_realized(storage, trade_date),
+                        revisions=await _build_postmarket_revisions(storage, trade_date),
+                    )
+                except Exception as e:
+                    logger.warning(f"[Coordinator] EOD visual report failed: {e}")
 
             from app.api.routes.websocket import broadcast_eod_summary
 
