@@ -110,20 +110,21 @@ def make_news_fetch():
     `NewsArticle` 객체 그대로 돌려준다(리포트에 출처·발행시각·감성이
     필요하다) ②`attach_news`는 `fetch`가 돌려준 순서를 그대로 쓰고 자체
     정렬을 하지 않으므로, 여기서 최신순(`pub_date` 내림차순)을 보장한다.
-    서비스를 못 만들면 `None` -- 수집을 건너뛸 뿐 리포트는 계속 렌더된다.
+
+    ⚠️ `services/news/service.py`의 구 팩토리 함수를 인자 없이 부르면
+    안 된다 -- `naver_client_id`/`naver_client_secret`을 안 넘기면
+    프로바이더를 하나도 등록하지 않은 서비스가 조용히 반환되고(정의는
+    같은 파일 242-275행), 뒤이은 `search()`가 첫 줄에서
+    `NewsProviderError`로 죽는다(2026-08-13 최종 리뷰 Critical 1).
+    `app.dependencies.get_news_service()`가 `.env`의 `NAVER_CLIENT_ID`/
+    `NAVER_CLIENT_SECRET`과 캐시 매니저를 이미 제대로 붙인 싱글턴이므로
+    그것을 쓴다 -- 매 리포트마다 새로 만들 이유도 없다.
     """
-    try:
-        from services.news import create_news_service
-    except Exception as e:  # noqa: BLE001 -- import 실패도 "수집 불가"일 뿐
-        logger.warning("report_news_service_unavailable", error=str(e))
-        return None
-
-    holder: dict = {}
-
     async def _fetch(ticker: str):
-        if "svc" not in holder:
-            holder["svc"] = await create_news_service()
-        result = await holder["svc"].search_stock_news(stock_code=ticker, count=5)
+        from app.dependencies import get_news_service
+
+        svc = await get_news_service()
+        result = await svc.search_stock_news(stock_code=ticker, count=5)
         articles = list(getattr(result, "articles", None) or [])
         articles.sort(
             key=lambda a: getattr(a, "pub_date", None) or datetime.min, reverse=True
