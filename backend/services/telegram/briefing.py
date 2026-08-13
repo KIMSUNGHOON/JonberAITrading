@@ -806,7 +806,13 @@ async def send_morning_brief() -> bool:
             await build_and_send_report(
                 "premarket",
                 today,
-                regime=(data.regime or None),
+                # `data.regime`은 dict(정상) · None(아직 안 돌았음) ·
+                # `RegimeUnavailable()`(조회 실패, 3-상태 중 하나) 이렇게
+                # 세 형태일 수 있다. `RegimeUnavailable()`은 `__bool__`을
+                # 오버라이드하지 않은 평범한 객체라 truthy라서 `or None`이
+                # 걸러내지 못한다 — dict인지 명시로 확인해야 한다
+                # (2026-08-13 리뷰 Important, render.py에도 동일 가드 있음).
+                regime=(data.regime if isinstance(data.regime, dict) else None),
                 actual_exposure_pct=(data.exposure or {}).get("actual_pct"),
                 max_positions=data.max_positions,
                 max_single_position_pct=data.max_single_position_pct,

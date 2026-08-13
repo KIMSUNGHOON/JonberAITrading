@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -53,4 +54,16 @@ _KINDS = {"premarket", "postmarket", "discovery"}
 def render(ctx: ReportContext) -> str:
     if ctx.kind not in _KINDS:
         raise ValueError(f"unknown report kind: {ctx.kind}")
+    # ⚠️ 2026-08-13 리뷰(Important): `ctx.regime`이 `None`도 `dict`도 아닌
+    # truthy 객체(예: 조회 실패 센티널 `services.telegram.briefing.
+    # RegimeUnavailable`)로 들어오면, 템플릿의 `{% if ctx.regime %}`가
+    # "dict가 있다"로 오판해 `.confidence`/`.effective_target_pct` 같은
+    # 속성 접근을 시도한다. jinja2는 없는 속성을 `Undefined`로 접지만
+    # `Undefined * 100` 같은 산술에서 `UndefinedError`를 raise하므로,
+    # 그 레짐 조회가 실패한 바로 그날 리포트 전체가 죽는다. 호출자
+    # (`services.reports.build_and_send_report`)가 걸러주는 것에 기대지
+    # 않고 여기서 한 번 더 막는다 — premarket/postmarket/discovery
+    # 세 종류 템플릿이 전부 이 보장을 공유한다.
+    if ctx.regime is not None and not isinstance(ctx.regime, dict):
+        ctx = replace(ctx, regime=None)
     return _env.get_template(f"{ctx.kind}.html").render(ctx=ctx)

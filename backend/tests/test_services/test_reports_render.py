@@ -101,3 +101,26 @@ def test_missing_stop_loss_source_omits_none_parens():
     p = _full_position()
     p.stop_loss_source = None
     assert "(None)" not in render(_ctx([p]))
+
+
+def test_non_dict_regime_sentinel_does_not_break_render():
+    """`RegimeUnavailable()`(레짐 조회 **실패** 센티널, `services.telegram.
+    briefing`)은 `__bool__`을 오버라이드하지 않은 평범한 객체라 truthy지만
+    dict가 아니다. `premarket.html`의 `{% if ctx.regime %}`는 그것만으로
+    통과해 버려 `ctx.regime.confidence`(헤더 칩)·`ctx.regime.
+    effective_target_pct`("오늘의 제약")에서 속성 접근을 시도하고, jinja2는
+    dict가 아닌 객체에 없는 속성을 `Undefined`로 접었다가 산술 연산
+    (`Undefined * 100`)에서 `UndefinedError`를 raise한다 — 레짐 조회가
+    실패한 바로 그날, '오늘의 제약'이 가장 필요한 그날 리포트가 통째로
+    죽는다(2026-08-13 리뷰 Important).
+    """
+    from services.telegram.briefing import RegimeUnavailable
+
+    ctx = ReportContext(
+        kind="premarket", trade_date="2026-08-13",
+        generated_at="2026-08-13 08:30",
+        regime=RegimeUnavailable(),
+        positions=[_full_position()],
+    )
+    html = render(ctx)  # 예외 없이 성공해야 한다
+    assert "신뢰" not in html, "헤더 칩 블록이 non-dict 레짐으로 렌더되면 안 된다"
