@@ -845,6 +845,61 @@ async def test_notify_promotions_with_promotions_sends_both(monkeypatch):
     assert len(report_calls) == 1
 
 
+async def test_notify_promotions_candidate_list_respects_review_top_n_constant(
+    monkeypatch,
+):
+    """2026-08-13 최종 브랜치 리뷰 Minor 1 -- 리포트에 실릴 candidates
+    목록이 `candidates[:25]`로 하드코딩돼 있었다. `_LLM_REVIEW_TOP_N`
+    상수를 바꿔도 이 슬라이스는 조용히 어긋난다. 상수를 몽키패치해서
+    실제로 그 상수를 따르는지 확인한다(25개를 진짜로 만들 필요가
+    없다)."""
+    from services.discovery.ranker import Candidate, PromoteSummary
+
+    monkeypatch.setattr(orchestrator_module, "_LLM_REVIEW_TOP_N", 2)
+
+    async def _fake_get_telegram_notifier():
+        class _Notifier:
+            is_ready = False
+
+        return _Notifier()
+
+    import services.telegram as telegram_module
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+
+    report_calls: list[dict] = []
+
+    async def _fake_build_and_send_report(kind, trade_date, **ctx_extra):
+        report_calls.append({"kind": kind, "trade_date": trade_date, **ctx_extra})
+        return True
+
+    import services.reports as reports_module
+
+    monkeypatch.setattr(reports_module, "build_and_send_report", _fake_build_and_send_report)
+
+    candidates = [
+        Candidate(
+            ticker=f"00000{i}", name=f"종목{i}", trade_date="2026-08-13",
+            regime_label="neutral", threshold=0.55, daily_cap=5,
+            weights={"momentum": 0.25, "pullback": 0.25, "flow": 0.25, "meanrev": 0.25},
+            universe_fallback=False, quality_filter_passed=True,
+            raw_scores={"momentum": 0.5, "pullback": 0.5, "flow": 0.5, "meanrev": 0.5},
+            composite=0.5, rank=i, close_price=1_000.0,
+        )
+        for i in range(3)
+    ]
+    summary = PromoteSummary(
+        trade_date="2026-08-13", total_candidates=3, promoted=[], skipped={}
+    )
+
+    await orchestrator_module._notify_promotions(candidates, summary, "2026-08-13")
+
+    assert len(report_calls) == 1
+    assert len(report_calls[0]["candidates"]) == 2, (
+        "몽키패치한 _LLM_REVIEW_TOP_N=2를 따라야 한다 -- 하드코딩된 25면 3개가 다 실린다"
+    )
+
+
 # ---------------------------------------------------------------------------
 # ⑤ 마감 체인 편입 (coordinator.py::_check_queue_on_market_open) — spec §3
 #    삽입 순서: ①poll_fills ②expire → [DISCOVERY_ENABLED만: 스캔 트리거+대기]

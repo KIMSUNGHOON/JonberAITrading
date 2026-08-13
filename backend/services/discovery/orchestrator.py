@@ -226,7 +226,7 @@ async def _notify_promotions(candidates: Any, promote_summary: Any, trade_date: 
                     ),
                     "skip_reason": getattr(c, "skip_reason", None),
                 }
-                for c in candidates[:25]
+                for c in candidates[:_LLM_REVIEW_TOP_N]
             ],
         )
     except Exception as e:  # noqa: BLE001 -- 리포트가 발굴 파이프라인을 죽이면 안 된다
