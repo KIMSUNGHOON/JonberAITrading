@@ -6,7 +6,7 @@
 {% block subhead %}
   {% if ctx.regime %}
   <div style="margin-top:7px">
-    <span class="chip">{{ ctx.regime.regime }} · 신뢰 {{ (ctx.regime.confidence * 100)|num(0) }}%</span>
+    <span class="chip">{{ ctx.regime.regime }}{% if ctx.regime.confidence is not none %} · 신뢰 {{ (ctx.regime.confidence * 100)|num(0) }}%{% endif %}</span>
   </div>
   {% endif %}
 {% endblock %}

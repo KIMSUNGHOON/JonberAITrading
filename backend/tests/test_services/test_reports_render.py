@@ -124,3 +124,26 @@ def test_non_dict_regime_sentinel_does_not_break_render():
     )
     html = render(ctx)  # 예외 없이 성공해야 한다
     assert "신뢰" not in html, "헤더 칩 블록이 non-dict 레짐으로 렌더되면 안 된다"
+
+
+def test_null_confidence_does_not_break_render():
+    """2026-08-13 최종 브랜치 리뷰 Important 2 -- `regime_judgment.
+    confidence`는 nullable이고 실제로 `None`이 된다(`regime_judge.py:118`
+    LLM이 필드를 빠뜨렸을 때 / `:144` 직전 판정을 그대로 승계할 때 그
+    직전 값이 다시 `None`이었을 때). `premarket.html`의 헤더 칩은
+    `(ctx.regime.confidence * 100)|num(0)`인데, 곱셈이 `|num` 필터
+    (`TypeError`/`ValueError`만 잡는다) **이전에** 평가되므로
+    `None * 100`이 그 자리에서 `TypeError`를 던지고 jinja2가 이를 잡지
+    않아 `render()` 전체가 실패한다 -- `RegimeUnavailable` 센티널과 같은
+    계열의 두 번째 구멍이다. `effective_target_pct`는 판정이 성공한 행에서
+    절대 `None`이 될 수 없으므로(`regime_judge.py`: `effective is None`이면
+    행 자체를 안 쓴다) 여기서는 건드리지 않는다."""
+    ctx = ReportContext(
+        kind="premarket", trade_date="2026-08-13",
+        generated_at="2026-08-13 08:30",
+        regime={"regime": "bull", "confidence": None, "effective_target_pct": 0.0801},
+        positions=[_full_position()],
+    )
+    html = render(ctx)  # 예외 없이 성공해야 한다
+    assert "신뢰" not in html, "confidence가 None이면 신뢰 조각을 생략해야 한다"
+    assert "bull" in html, "레짐 라벨 자체는 confidence와 무관하게 나와야 한다"
