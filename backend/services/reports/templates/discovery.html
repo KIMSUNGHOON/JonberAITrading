@@ -6,7 +6,11 @@
 <div class="pad">
   <section>
     {% set cands = ctx.extra.get('candidates') or [] %}
-    <h2>승격 {{ cands|length }}종</h2>
+    {# `skip_reason`이 없는 것만 실제 승격이다 -- 차단된 후보까지 세면
+       "승격 {{ cands|length }}종"이 오해를 만든다(Task 9 fix 3). #}
+    {% set blocked = cands | selectattr('skip_reason') | list %}
+    {% set promoted = cands | rejectattr('skip_reason') | list %}
+    <h2>승격 {{ promoted|length }}종{% if blocked %} · 차단 {{ blocked|length }}종{% endif %}</h2>
     {% if not cands %}
     <div class="muted">승격 0종 — 문턱을 넘은 후보가 없었습니다.</div>
     {% endif %}

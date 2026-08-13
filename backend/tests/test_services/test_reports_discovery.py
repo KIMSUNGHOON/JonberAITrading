@@ -44,6 +44,28 @@ def test_no_candidates_says_so():
     assert "승격 0종" in html
 
 
+def test_title_counts_promoted_and_blocked_separately():
+    """제목이 `승격 {{ cands|length }}종`으로 차단된 후보까지 세면
+    오해를 만든다(Task 9 fix 3). `skip_reason`이 없는 것만 승격으로,
+    있는 것은 차단으로 따로 세야 한다."""
+    html = render(_ctx([
+        {
+            "ticker": "005930", "name": "삼성전자", "rank": 1, "composite": 0.62,
+            "strategies": {}, "skip_reason": None,
+        },
+        {
+            "ticker": "999999", "name": "정리매매종목", "rank": 5, "composite": 0.61,
+            "strategies": {}, "skip_reason": "market_warning:LIQUIDATION_TRADING",
+        },
+        {
+            "ticker": "888888", "name": "투자위험종목", "rank": 6, "composite": 0.58,
+            "strategies": {}, "skip_reason": "market_warning:INVESTMENT_RISK",
+        },
+    ]))
+    assert "승격 1종" in html
+    assert "차단 2종" in html
+
+
 @pytest.mark.asyncio
 async def test_discovery_report_skips_position_and_fundamentals_collection(monkeypatch):
     """레이트리밋 사고 방지 -- 발굴 승격 심사가 이미 top-25에 ka10001을
