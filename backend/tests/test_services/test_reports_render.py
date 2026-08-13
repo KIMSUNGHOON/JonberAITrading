@@ -80,3 +80,24 @@ def test_output_is_a_self_contained_document():
 def test_stop_loss_source_is_shown():
     """두 엔진이 다른 손절가를 든다 — 출처 없는 숫자는 오독을 만든다."""
     assert "coordinator" in render(_ctx([_full_position()]))
+
+
+def test_breached_stop_loss_bar_is_danger_not_leaked_negative_width():
+    """손절가 아래로 내려간 포지션 — 막대에 음수 width가 새면 브라우저가
+    이를 버리고 트랙 기본값(가득 참)으로 폴백해 '가장 안전'으로 보인다(teal 배경 그대로).
+    2026-08-12 손절 주문 3분할 미체결로 실제 발생한 상태.
+    올바른 표현은 막대를 가득(100%) 채우되 빨강(danger)으로 읽히게 하는 것이다."""
+    p = _full_position()
+    p.stop_loss = 5520.0
+    p.current_price = 5200.0  # 손절가 아래 — stop_margin_pct == -6.153...%
+    html = render(_ctx([p]))
+    assert "width:-" not in html
+    assert "이탈" in html
+    assert 'class="fill breached"' in html
+    assert "width:100%" in html
+
+
+def test_missing_stop_loss_source_omits_none_parens():
+    p = _full_position()
+    p.stop_loss_source = None
+    assert "(None)" not in render(_ctx([p]))
