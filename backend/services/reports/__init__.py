@@ -19,16 +19,29 @@ async def build_and_send_report(kind: str, trade_date: str, **ctx_extra) -> bool
         from services.reports import collect, delivery
         from services.reports.models import ReportContext
         from services.reports.render import render
-        from services.storage_service import get_storage_service
         from services.telegram import get_telegram_notifier
 
-        positions = await collect.collect_positions()
-        storage = await get_storage_service()
-        await collect.attach_research(positions, trade_date, storage)
-        await collect.attach_fundamentals(
-            positions, fetch=collect.make_fundamentals_fetch()
-        )
-        await collect.attach_news(positions, fetch=collect.make_news_fetch())
+        positions: list = []
+        if kind == "discovery":
+            # ⚠️ 발굴 리포트는 보유 종목을 렌더하지 않는다(discovery.html은
+            # ctx.extra["candidates"]만 쓴다) -- 그런데도 여기서 수집을
+            # 돌리면 레이트리밋 사고다. 발굴 파이프라인은 이 리포트를
+            # 만드는 바로 그 시각에 승격 심사로 Kiwoom ka10001을 top-25에
+            # 25회 이미 걸어 둔다. 같은 틱에 보유 종목 펀더멘탈로 5회를
+            # 더 걸면 Kiwoom 유량(~1.4 req/s)을 넘긴다 -- 2026-08-12에
+            # 바로 이 유형(ka10001 연속 호출)으로 유량 초과가 실제로
+            # 났다. "경로 하나 유지"보다 사고 재현 방지가 우선이다.
+            logger.info("report_discovery_skips_position_collection", kind=kind)
+        else:
+            from services.storage_service import get_storage_service
+
+            positions = await collect.collect_positions()
+            storage = await get_storage_service()
+            await collect.attach_research(positions, trade_date, storage)
+            await collect.attach_fundamentals(
+                positions, fetch=collect.make_fundamentals_fetch()
+            )
+            await collect.attach_news(positions, fetch=collect.make_news_fetch())
 
         ctx = ReportContext(
             kind=kind,

@@ -179,6 +179,45 @@ async def _notify_promotions(candidates: Any, promote_summary: Any, trade_date: 
             await notifier.send_discovery_promotion(
                 trade_date=trade_date, promoted=details, daily_cap_waiting=daily_cap_waiting
             )
+
+        # 발굴 시각 리포트(.html 첨부). ⚠️ `Candidate`에는 `strategy_scores`/
+        # `llm_rationale`/`llm_confidence` 필드가 없다(실물 확인:
+        # `grep -nE "class Candidate" -A 40 services/discovery/ranker.py`) --
+        # 전략별 점수는 `raw_scores`(dict, 키는 STRATEGIES =
+        # momentum/pullback/flow/meanrev), LLM 근거·신뢰는 `llm_verdict`
+        # dict(`{"suitable","confidence","rationale","risks"}`) 안에 있다.
+        # `getattr` 기본값이라 이름이 틀려도 예외 없이 빈 값으로 조용히
+        # 렌더될 뿐이라 여기서 틀리면 리뷰 없이는 못 잡는다.
+        try:
+            from services.reports import build_and_send_report
+
+            await build_and_send_report(
+                "discovery",
+                trade_date,
+                candidates=[
+                    {
+                        "ticker": c.ticker,
+                        "name": getattr(c, "name", None) or c.ticker,
+                        "rank": getattr(c, "rank", None),
+                        "composite": getattr(c, "composite", None),
+                        "strategies": getattr(c, "raw_scores", None) or {},
+                        "per": getattr(c, "per", None),
+                        "pbr": getattr(c, "pbr", None),
+                        "market_cap": getattr(c, "market_cap", None),
+                        "news_count": len(getattr(c, "news_headlines", None) or []),
+                        "llm_rationale": (getattr(c, "llm_verdict", None) or {}).get(
+                            "rationale"
+                        ),
+                        "llm_confidence": (getattr(c, "llm_verdict", None) or {}).get(
+                            "confidence"
+                        ),
+                        "skip_reason": getattr(c, "skip_reason", None),
+                    }
+                    for c in candidates[:25]
+                ],
+            )
+        except Exception as e:  # noqa: BLE001 -- 리포트가 발굴 파이프라인을 죽이면 안 된다
+            logger.warning("discovery_report_failed", trade_date=trade_date, error=str(e))
     except Exception as e:
         logger.warning("discovery_promotion_notify_failed", trade_date=trade_date, error=str(e))
 
