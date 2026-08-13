@@ -740,6 +740,112 @@ async def test_pipeline_telegram_not_ready_does_not_send(tmp_path, storage, coor
 
 
 # ---------------------------------------------------------------------------
+# ④c 승격 0건이어도 발굴 리포트는 나간다 — Task 9 fix 2.
+#
+# `_notify_promotions`가 `promote_summary.promoted`가 비면 early-return 해서
+# 승격 0건인 날엔 시각 리포트(`build_and_send_report`)까지 함께 사라졌다.
+# 스펙 원칙: "승격 0건이어도 실패가 아니다. 진짜 지표는 승격 수가 아니라
+# 원장 컬럼이 채워졌는지다. 차단된 종목을 숨기지 않는다." 텍스트 통지
+# (`send_discovery_promotion`)는 지금처럼 0건이면 안 보내는 게 맞으므로
+# 건드리지 않는다 -- 리포트만 always-on으로 옮긴다.
+#
+# `_notify_promotions`를 직접 호출해 파이프라인 전체(랭킹/LLM/승격) 없이
+# 이 함수 자체의 배선만 확인한다.
+# ---------------------------------------------------------------------------
+
+
+async def test_notify_promotions_zero_promotions_still_sends_report(monkeypatch):
+    """승격 0건 -> send_discovery_promotion은 호출되지 않지만
+    build_and_send_report는 호출된다."""
+    from services.discovery.ranker import PromoteSummary
+
+    text_calls: list[dict] = []
+
+    class _Notifier:
+        is_ready = True
+
+        async def send_discovery_promotion(self, **kwargs):
+            text_calls.append(kwargs)
+            return True
+
+    async def _fake_get_telegram_notifier():
+        return _Notifier()
+
+    import services.telegram as telegram_module
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+
+    report_calls: list[dict] = []
+
+    async def _fake_build_and_send_report(kind, trade_date, **ctx_extra):
+        report_calls.append({"kind": kind, "trade_date": trade_date, **ctx_extra})
+        return True
+
+    import services.reports as reports_module
+
+    monkeypatch.setattr(reports_module, "build_and_send_report", _fake_build_and_send_report)
+
+    summary = PromoteSummary(trade_date="2026-08-13", total_candidates=0, promoted=[], skipped={})
+
+    await orchestrator_module._notify_promotions([], summary, "2026-08-13")
+
+    assert text_calls == []
+    assert len(report_calls) == 1
+    assert report_calls[0]["kind"] == "discovery"
+    assert report_calls[0]["trade_date"] == "2026-08-13"
+    assert report_calls[0]["candidates"] == []
+
+
+async def test_notify_promotions_with_promotions_sends_both(monkeypatch):
+    """회귀 가드 -- 승격이 있을 때도 텍스트 통지와 리포트가 둘 다 나가야
+    한다(리포트를 always-on으로 옮기며 기존 승격 경로를 깨지 않았는지)."""
+    from services.discovery.ranker import Candidate, PromoteSummary
+
+    text_calls: list[dict] = []
+
+    class _Notifier:
+        is_ready = True
+
+        async def send_discovery_promotion(self, **kwargs):
+            text_calls.append(kwargs)
+            return True
+
+    async def _fake_get_telegram_notifier():
+        return _Notifier()
+
+    import services.telegram as telegram_module
+
+    monkeypatch.setattr(telegram_module, "get_telegram_notifier", _fake_get_telegram_notifier)
+
+    report_calls: list[dict] = []
+
+    async def _fake_build_and_send_report(kind, trade_date, **ctx_extra):
+        report_calls.append({"kind": kind, "trade_date": trade_date, **ctx_extra})
+        return True
+
+    import services.reports as reports_module
+
+    monkeypatch.setattr(reports_module, "build_and_send_report", _fake_build_and_send_report)
+
+    candidate = Candidate(
+        ticker="005930", name="삼성전자", trade_date="2026-08-13",
+        regime_label="neutral", threshold=0.55, daily_cap=5,
+        weights={"momentum": 0.25, "pullback": 0.25, "flow": 0.25, "meanrev": 0.25},
+        universe_fallback=False, quality_filter_passed=True,
+        raw_scores={"momentum": 0.9, "pullback": 0.5, "flow": 0.5, "meanrev": 0.5},
+        composite=0.6, rank=1, close_price=70_000.0,
+    )
+    summary = PromoteSummary(
+        trade_date="2026-08-13", total_candidates=1, promoted=["005930"], skipped={}
+    )
+
+    await orchestrator_module._notify_promotions([candidate], summary, "2026-08-13")
+
+    assert len(text_calls) == 1
+    assert len(report_calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # ⑤ 마감 체인 편입 (coordinator.py::_check_queue_on_market_open) — spec §3
 #    삽입 순서: ①poll_fills ②expire → [DISCOVERY_ENABLED만: 스캔 트리거+대기]
 #    → ③write_daily_snapshot ④run_eod_review ⑤run_strategy_consensus
