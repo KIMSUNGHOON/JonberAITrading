@@ -385,6 +385,37 @@ class TestHolidayServiceContract:
         assert not sent, "휴장일엔 수집조차 하지 않아야 한다"
 
 
+class TestVisualReportWiring:
+    """Task 6: send_morning_brief가 텍스트 발송 뒤 시각 리포트를 붙인다.
+
+    리포트 쪽 예외가 텍스트 브리핑의 성공 여부에 전파되면 안 된다 —
+    호출자는 이미 send_message를 마친 뒤다.
+    """
+
+    @pytest.mark.asyncio
+    async def test_report_failure_does_not_break_text_brief(
+        self, monkeypatch, isolated_storage_service
+    ):
+        """리포트가 죽어도 텍스트 브리핑은 성공으로 남아야 한다.
+
+        `isolated_storage_service`: `send_morning_brief`가 실제로 타는 경로
+        (`collect_brief`·`_collect_exposure_trend`)가 `get_storage_service()`
+        싱글턴을 그대로 부른다 — 이 픽스처 없이는 라이브 DB guard가 매번
+        tmp로 대신 리다이렉트해 주지만(안전은 하다), 근본은 여기서
+        명시적으로 격리하는 것이다.
+        """
+        from unittest.mock import AsyncMock
+        import services.telegram.briefing as b
+
+        notifier = AsyncMock(); notifier.is_ready = True
+        monkeypatch.setattr("services.telegram.get_telegram_notifier",
+                            AsyncMock(return_value=notifier))
+        monkeypatch.setattr("services.reports.build_and_send_report",
+                            AsyncMock(side_effect=RuntimeError("boom")))
+        assert await b.send_morning_brief() is True
+        notifier.send_message.assert_awaited_once()
+
+
 class TestScanPicksTheNewestEvent:
     """리뷰가 실측으로 잡았다 — grep 인자 순서 때문에 오래된 사유를 집었다."""
 

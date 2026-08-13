@@ -708,6 +708,44 @@ async def _scan_block_reason(ticker: str) -> Optional[str]:
         return None
 
 
+async def _collect_exposure_trend(days: int = 5) -> list[dict]:
+    """최근 N거래일 목표 노출도. 실패하면 빈 리스트 → 섹션이 통째로 빠진다.
+
+    ⚠️ `StorageService`에는 범용 `fetch_all`이 없다 — `get_ticker_day_
+    decisions_full` 등 기존 조회기와 같은 `aiosqlite.connect(db_path)`
+    패턴을 직접 쓴다.
+    """
+    try:
+        import aiosqlite
+
+        from services.storage_service import get_storage_service
+
+        storage = await get_storage_service()
+        async with aiosqlite.connect(str(storage.db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT trade_date, regime, effective_target_pct FROM regime_judgment "
+                "ORDER BY trade_date DESC LIMIT ?",
+                (days,),
+            )
+            rows = [dict(r) for r in await cursor.fetchall()]
+        rows = list(reversed(rows))
+        if not rows:
+            return []
+        top = max((r["effective_target_pct"] or 0) for r in rows) or 1
+        return [
+            {
+                "trade_date": r["trade_date"],
+                "regime": r["regime"],
+                "pct": (r["effective_target_pct"] or 0) * 100,
+                "width_pct": (r["effective_target_pct"] or 0) / top * 100,
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
 # -------------------------------------------
 # 08:30 자동 발송
 # -------------------------------------------
@@ -759,6 +797,26 @@ async def send_morning_brief() -> bool:
             log.warning("morning_brief_notifier_not_ready")
             return False
         await notifier.send_message(text)
+
+        # 리포트는 텍스트 발송 뒤에 붙는 부가물이다 — 여기서 무엇이
+        # 실패해도 위의 send_message는 이미 나갔다.
+        try:
+            from services.reports import build_and_send_report
+
+            await build_and_send_report(
+                "premarket",
+                today,
+                regime=(data.regime or None),
+                actual_exposure_pct=(data.exposure or {}).get("actual_pct"),
+                max_positions=data.max_positions,
+                max_single_position_pct=data.max_single_position_pct,
+                daily_trades=(data.trading or {}).get("daily_trades"),
+                max_daily_trades=(data.trading or {}).get("max_daily_trades"),
+                exposure_trend=await _collect_exposure_trend(),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("morning_brief_report_failed: %s", e)
+
         log.info("morning_brief_sent", extra={"chars": len(text)})
         return True
     except Exception as e:  # noqa: BLE001 -- 브리핑이 앱을 죽이면 안 된다

@@ -13,6 +13,41 @@
 {% block body %}
 <div class="pad">
   <section>
+    <h2>오늘의 제약</h2>
+    <p class="note">왜 살 수 있는지 / 못 사는지.</p>
+    <table>
+      <tr><td class="muted">목표 노출도</td>
+          <td class="num">{{ (ctx.regime.effective_target_pct * 100)|num(2) if ctx.regime else '—' }}%</td></tr>
+      <tr><td class="muted">실제 노출도</td>
+          <td class="num">{{ ctx.extra.get('actual_exposure_pct')|num(2) }}%</td></tr>
+      <tr><td class="muted">슬롯</td>
+          <td class="num">{{ ctx.positions|length }} / {{ ctx.extra.get('max_positions', '—') }}</td></tr>
+      <tr><td class="muted">종목당 상한</td>
+          <td class="num">{{ (ctx.extra.get('max_single_position_pct', 0) * 100)|num(2) }}%</td></tr>
+      <tr><td class="muted">일일 거래</td>
+          <td class="num">{{ ctx.extra.get('daily_trades', '—') }} / {{ ctx.extra.get('max_daily_trades', '—') }}</td></tr>
+    </table>
+  </section>
+
+  {% if ctx.extra.get('exposure_trend') %}
+  <section>
+    <h2>목표 노출도 추이</h2>
+    {% for row in ctx.extra.exposure_trend %}
+    <div style="display:grid;grid-template-columns:56px 1fr 56px;align-items:center;
+                gap:9px;margin-top:8px">
+      <div style="font-size:11px;color:var(--dim)">{{ row.trade_date[5:] }}<br>
+        <span style="font-size:9.5px">{{ row.regime }}</span></div>
+      <div class="track" style="height:18px">
+        <div class="fill" style="width:{{ row.width_pct }}%"></div>
+      </div>
+      <div class="num" style="font-size:12.5px;font-weight:700;text-align:right">
+        {{ row.pct|num(2) }}%</div>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  <section>
     <h2>보유 {{ ctx.positions|length }}종 리서치</h2>
     {% for p in ctx.positions %}{{ pc.position_card(p) }}{% endfor %}
     {% if not ctx.positions %}<div class="muted">보유 없음</div>{% endif %}
