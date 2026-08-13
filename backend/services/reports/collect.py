@@ -119,12 +119,20 @@ def make_news_fetch():
     `app.dependencies.get_news_service()`가 `.env`의 `NAVER_CLIENT_ID`/
     `NAVER_CLIENT_SECRET`과 캐시 매니저를 이미 제대로 붙인 싱글턴이므로
     그것을 쓴다 -- 매 리포트마다 새로 만들 이유도 없다.
+
+    ⚠️ 결함 2 (2026-08-13 postmarket 첫 실물) -- `search_stock_news`는
+    `stock_name`을 안 넘기면 `f"{stock_code} 주식"`으로 검색해 무관한
+    시장 전체 뉴스를 반환한다(`services/news/service.py:174-178`). 반드시
+    이름도 넘긴다. `services/discovery/orchestrator.py::_make_news_fetch`
+    와 같은 `_fetch(ticker, name)` 형태.
     """
-    async def _fetch(ticker: str):
+    async def _fetch(ticker: str, name: str):
         from app.dependencies import get_news_service
 
         svc = await get_news_service()
-        result = await svc.search_stock_news(stock_code=ticker, count=5)
+        result = await svc.search_stock_news(
+            stock_code=ticker, stock_name=name, count=5
+        )
         articles = list(getattr(result, "articles", None) or [])
         articles.sort(
             key=lambda a: getattr(a, "pub_date", None) or datetime.min, reverse=True
@@ -149,6 +157,17 @@ async def attach_research(
 
         p.discussion_count = len(decisions)
         latest = decisions[-1]
+
+        # 결함 1 (2026-08-13 postmarket 첫 실물: "004370 004370" 헤더) --
+        # 라이브 `ManagedPosition.stock_name`이 종목코드와 같아
+        # `collect_positions`가 name==ticker로 채워 놓는다.
+        # `agent_chat_decisions.stock_name`엔 제대로 된 한글명이 있으니
+        # name이 비었거나 ticker와 같을 때만 보정한다 -- 이미 옳은 이름을
+        # 덮어쓰지 않는다.
+        stock_name = (latest.get("stock_name") or "").strip()
+        if stock_name and (not p.name or p.name == p.ticker):
+            p.name = stock_name
+
         p.action = latest.get("action")
         p.consensus = latest.get("consensus_level")
         signals = _loads(latest.get("behavioral_signals"))
@@ -197,12 +216,29 @@ def _ago(when) -> str:
 
 
 async def attach_news(positions, *, fetch=None, max_items: int = 3) -> None:
-    """종목별 최신 뉴스를 붙인다. `fetch`가 None이면 조용히 스킵."""
+    """종목별 최신 뉴스를 붙인다. `fetch`가 None이면 조용히 스킵.
+
+    ⚠️ **순서 의존**: `build_and_send_report`는 `attach_research` →
+    `attach_fundamentals` → `attach_news` 순으로 부른다. `p.name`의
+    종목코드→한글명 보정은 `attach_research`에서 일어나므로, 여기 도착할
+    땐 이름이 이미 해석돼 있다고 가정한다. 이 순서가 바뀌면 아래 스킵
+    판단이 조용히 다시 깨진다.
+
+    이름을 못 구했으면(`p.name`이 비었거나 `p.ticker`와 같으면) 뉴스를
+    조회하지 않는다 -- `search_stock_news`가 이름 없이는 종목코드로
+    검색해(`f"{code} 주식"`) 무관한 시장 전체 뉴스를 그 종목 것으로
+    돌려준다(2026-08-13 postmarket 리포트 첫 실물: "004370 004370" 카드에
+    코스피 전체 뉴스가 붙었다). 틀린 뉴스가 빈 칸보다 나쁘다.
+    """
     if fetch is None:
         return
     for p in positions:
+        if not p.name or p.name == p.ticker:
+            p.news_error = "종목명 미해석 — 오검색 방지를 위해 뉴스 조회 스킵"
+            logger.warning("report_news_skipped_unresolved_name", ticker=p.ticker)
+            continue
         try:
-            articles = await fetch(p.ticker) or []
+            articles = await fetch(p.ticker, p.name) or []
         except Exception as e:  # noqa: BLE001
             p.news_error = str(e)
             logger.warning("report_news_failed", ticker=p.ticker, error=str(e))

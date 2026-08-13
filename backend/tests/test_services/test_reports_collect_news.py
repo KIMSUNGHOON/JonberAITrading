@@ -1,6 +1,7 @@
 """뉴스·펀더멘탈 수집 — 조회 실패가 리포트를 죽이지 않는다."""
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -26,7 +27,7 @@ async def test_attaches_news_newest_first_capped():
         for i in range(5)
     ]
 
-    async def fetch(ticker):
+    async def fetch(ticker, name):
         return articles
 
     p = _pos()
@@ -38,7 +39,7 @@ async def test_attaches_news_newest_first_capped():
 
 @pytest.mark.asyncio
 async def test_news_failure_records_reason_and_keeps_going():
-    async def fetch(ticker):
+    async def fetch(ticker, name):
         raise RuntimeError("quota exceeded")
 
     p1, p2 = _pos("028670"), _pos("004370")
@@ -52,6 +53,46 @@ async def test_news_fetch_none_is_a_silent_skip():
     p = _pos()
     await attach_news([p], fetch=None)
     assert p.news == [] and p.news_error is None
+
+
+@pytest.mark.asyncio
+async def test_news_fetch_receives_resolved_name():
+    """`stock_code 주식` 검색(쓰레기 결과)이 아니라 종목명으로 검색하도록
+    `fetch`에 이름을 넘긴다."""
+    calls = []
+
+    async def fetch(ticker, name):
+        calls.append((ticker, name))
+        return []
+
+    p = _pos()  # ticker="028670", name="팬오션"
+    await attach_news([p], fetch=fetch)
+    assert calls == [("028670", "팬오션")]
+
+
+@pytest.mark.asyncio
+async def test_unresolved_name_skips_news_fetch_entirely():
+    """결함 2 -- name==ticker(이름 미해석)면 뉴스를 조회하지 않는다.
+    종목코드로 검색하면 무관한 시장 전체 뉴스가 그 종목 것으로 둔갑한다
+    (실측: 2026-08-13 postmarket 리포트, "004370 004370" 카드에 코스피
+    전체 뉴스가 붙었다). fetch가 아예 불리지 않아야 한다."""
+    fetch = AsyncMock(return_value=[])
+    p = _pos("004370")
+    p.name = "004370"
+    await attach_news([p], fetch=fetch)
+    fetch.assert_not_called()
+    assert p.news == []
+    assert p.news_error
+
+
+@pytest.mark.asyncio
+async def test_blank_name_skips_news_fetch_entirely():
+    fetch = AsyncMock(return_value=[])
+    p = _pos("004370")
+    p.name = ""
+    await attach_news([p], fetch=fetch)
+    fetch.assert_not_called()
+    assert p.news_error
 
 
 @pytest.mark.asyncio

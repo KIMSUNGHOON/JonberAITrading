@@ -62,6 +62,17 @@ def test_missing_everything_still_renders():
     assert "토론 없음" in html
 
 
+def test_unresolved_name_position_still_renders():
+    """신규 편입 종목 + 이름 미해석(name==ticker, attach_research가 붙일
+    결정 행이 아직 없는 경우) -- 예외 없이 렌더돼야 한다."""
+    p = PositionResearch(
+        ticker="086790", name="086790", quantity=51, avg_price=1.0,
+        current_price=1.0, pnl_pct=0.0, stop_loss=None, stop_loss_source=None,
+    )
+    html = render(_ctx([p]))
+    assert "086790" in html
+
+
 def test_news_error_is_shown_not_hidden():
     p = _full_position()
     p.news, p.news_error = [], "quota exceeded"

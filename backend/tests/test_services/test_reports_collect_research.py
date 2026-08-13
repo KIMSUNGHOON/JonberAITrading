@@ -6,6 +6,16 @@ from unittest.mock import AsyncMock
 from services.reports.collect import attach_research
 from services.reports.models import PositionResearch
 
+
+def _unresolved_pos(ticker="004370") -> PositionResearch:
+    """`collect_positions`가 실제로 채우는 결함 상태 -- 라이브
+    `ManagedPosition.stock_name`이 종목코드와 같아 name==ticker가 된다
+    (2026-08-13 postmarket 리포트 첫 실물: "004370 004370" 헤더)."""
+    return PositionResearch(
+        ticker=ticker, name=ticker, quantity=25, avg_price=1.0,
+        current_price=1.0, pnl_pct=0.0, stop_loss=None, stop_loss_source=None,
+    )
+
 pytestmark = pytest.mark.usefixtures("isolated_storage_service")
 
 
@@ -96,3 +106,46 @@ async def test_malformed_behavioral_signals_is_ignored():
                    "behavioral_signals": "not json"}], []),
     )
     assert p.signals == {}
+
+
+@pytest.mark.asyncio
+async def test_name_equal_to_ticker_is_corrected_from_decision_stock_name():
+    """결함 1 -- 결정 행의 `stock_name`(제대로 된 한글명)으로 보정한다."""
+    p = _unresolved_pos()
+    decisions = [{"id": "d1", "action": "HOLD", "consensus_level": 0.7,
+                  "behavioral_signals": None, "stock_name": "농심"}]
+    await attach_research([p], "2026-08-13", _storage(decisions, []))
+    assert p.name == "농심"
+
+
+@pytest.mark.asyncio
+async def test_blank_name_is_corrected_from_decision_stock_name():
+    p = PositionResearch(
+        ticker="004370", name="", quantity=25, avg_price=1.0,
+        current_price=1.0, pnl_pct=0.0, stop_loss=None, stop_loss_source=None,
+    )
+    decisions = [{"id": "d1", "action": "HOLD", "consensus_level": 0.7,
+                  "behavioral_signals": None, "stock_name": "농심"}]
+    await attach_research([p], "2026-08-13", _storage(decisions, []))
+    assert p.name == "농심"
+
+
+@pytest.mark.asyncio
+async def test_already_correct_name_is_not_overwritten():
+    """이미 제대로 된 이름이 있으면 결정 행의 stock_name으로 덮지 않는다."""
+    p = _pos()  # name="팬오션"
+    decisions = [{"id": "d1", "action": "HOLD", "consensus_level": 0.7,
+                  "behavioral_signals": None, "stock_name": "이상한이름"}]
+    await attach_research([p], "2026-08-13", _storage(decisions, []))
+    assert p.name == "팬오션"
+
+
+@pytest.mark.asyncio
+async def test_name_correction_skipped_when_decision_stock_name_is_blank():
+    """덮어쓸 이름이 없으면 name==ticker 상태를 그대로 둔다 -- attach_news가
+    뒤에서 이 상태(name==ticker)를 보고 뉴스 조회를 스킵한다."""
+    p = _unresolved_pos()
+    decisions = [{"id": "d1", "action": "HOLD", "consensus_level": 0.7,
+                  "behavioral_signals": None, "stock_name": None}]
+    await attach_research([p], "2026-08-13", _storage(decisions, []))
+    assert p.name == "004370"
