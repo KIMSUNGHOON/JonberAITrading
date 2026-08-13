@@ -211,9 +211,25 @@ class TelegramNotifier:
                     )
                     return True
                 if type(retry_err) is not NetworkError:
+                    # 재시도 도중 실패 종류가 바뀌었다(전형적으로
+                    # BadRequest -- 연결은 됐는데 이번엔 Telegram이 요청
+                    # 자체를 거부했다). 이건 "재시도 소진"이 아니라 그
+                    # 실패 종류에 맞는 처리(파싱 실패면 평문 폴백)로
+                    # 낙하해야 한다 -- 여기서 곧장 return False하면 평문
+                    # 폴백에 영원히 도달하지 못한다(2026-08-13 최종 리뷰
+                    # Important 5, 실측 `plain_fallback_ok` 하루 25건 --
+                    # 예외 경로가 아니라 상시 경로다). `error`를 갱신해
+                    # 아래 `is_parse_error` 재계산에 반영한다.
+                    error = retry_err
                     break
-            logger.error("telegram_send_connect_retry_exhausted", text_head=text[:120])
-            return False
+            else:
+                logger.error(
+                    "telegram_send_connect_retry_exhausted", text_head=text[:120]
+                )
+                return False
+            # 위 break로 낙하한 경우에만 도달한다 -- 갱신된 error 기준으로
+            # 다시 판별해야 한다(최초 error는 NetworkError였다).
+            is_parse_error = isinstance(error, BadRequest)
 
         if not (is_parse_error and parse_mode):
             return False

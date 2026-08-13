@@ -117,3 +117,50 @@ async def test_multi_chunk_retry_progresses_and_never_resends_a_succeeded_chunk(
     assert sent_log == [CHUNK0, CHUNK1, CHUNK2], (
         f"청크가 정확히 한 번씩만 발송돼야 한다 — 실제: {sent_log}"
     )
+
+
+@pytest.mark.asyncio
+async def test_network_error_then_bad_request_on_retry_falls_back_to_plain(monkeypatch):
+    """2026-08-13 최종 브랜치 리뷰 Important 5 -- 재시도 중 실패 종류가
+    NetworkError에서 BadRequest(Markdown 파싱 실패)로 바뀌면, 재시도
+    루프가 `break`로 곧장 `return False`해 평문 폴백에 아예 도달하지
+    못했다. 08-13 실측에서 `plain_fallback_ok`가 하루 25건 나온 상시
+    경로인데, 그 경로가 NetworkError로 시작한 재시도 중에는 막혀 있었다.
+
+    시나리오: 최초 전송이 NetworkError -> 재시도 1회차가 BadRequest로
+    바뀜 -> `error`를 갱신해 기존 is_parse_error 분기로 낙하 -> 평문
+    재전송이 성공해야 한다."""
+    n = _notifier()
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    calls = {"n": 0}
+
+    async def _send(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise NetworkError("httpx.ConnectError: All connection attempts failed")
+        if calls["n"] == 2:
+            raise BadRequest("can't parse entities")
+        return None
+
+    n._bot.send_message = AsyncMock(side_effect=_send)
+
+    assert await n._send_message("hi", parse_mode="Markdown") is True
+    assert calls["n"] == 3, "연결 재시도(2) 뒤 평문 폴백(3)까지 도달해야 한다"
+
+
+@pytest.mark.asyncio
+async def test_network_error_retries_exhausted_still_returns_false(monkeypatch):
+    """회귀 가드 -- 두 번의 재시도가 전부 NetworkError로 끝나면(파싱
+    실패로 전환되지 않으면) 여전히 소진으로 취급해 False를 돌려줘야
+    한다(평문 폴백을 잘못 타면 안 된다 — parse_mode 없이 보낸 적이
+    없으므로 중복 발송 걱정은 없지만, 애초에 이 경로는 '연결 자체가
+    안 됐다'는 뜻이라 평문으로도 안 될 확률이 높다)."""
+    n = _notifier()
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    n._bot.send_message = AsyncMock(
+        side_effect=NetworkError("httpx.ConnectError: All connection attempts failed")
+    )
+
+    assert await n._send_message("hi", parse_mode="Markdown") is False
+    assert n._bot.send_message.await_count == 3  # 최초 1 + 재시도 2
