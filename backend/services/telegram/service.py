@@ -200,7 +200,7 @@ class TelegramNotifier:
         if type(error) is NetworkError:
             for attempt in (1, 2):
                 await asyncio.sleep(2)
-                _, retry_err = await self._send_chunks(
+                sent_index, retry_err = await self._send_chunks(
                     chunks, parse_mode, reply_markup, start_index=sent_index
                 )
                 if retry_err is None:

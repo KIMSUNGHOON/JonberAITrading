@@ -8,6 +8,8 @@
 isinstance로 판별하면 각각의 기존 처리를 삼켜버린다 — 정확한 타입 비교만
 안전하다.
 """
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock
 from telegram.error import BadRequest, NetworkError, TimedOut
@@ -72,3 +74,46 @@ async def test_bad_request_still_falls_back_to_plain():
 
     n._bot.send_message = AsyncMock(side_effect=_send)
     assert await n._send_message("hi", parse_mode="Markdown") is True
+
+
+@pytest.mark.asyncio
+async def test_multi_chunk_retry_progresses_and_never_resends_a_succeeded_chunk(monkeypatch):
+    """다중 청크 메시지가 재시도 도중 또 실패하면, 다음 재시도는 마지막으로
+    실패한 청크부터 재개해야 한다 — 이미 성공한 청크를 다시 보내면 중복
+    발송 사고다.
+
+    시나리오(리뷰에서 지적된 버그 재현): 3청크 메시지에서
+      1) 청크0 성공, 청크1에서 NetworkError
+      2) 1차 재시도: 청크1 성공, 청크2에서 다시 NetworkError
+      3) 2차 재시도: 청크2부터 재개해야 한다(청크1을 또 보내면 안 됨)
+
+    `_send_chunks`가 반환하는 진행 인덱스(`sent_index`)를 재시도 루프
+    안에서 갱신하지 않으면 2)에서 실패한 지점이 버려지고 3)이 다시
+    start_index=1로 재개돼 청크1이 두 번 발송된다.
+    """
+    n = _notifier()
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    CHUNK0, CHUNK1, CHUNK2 = "chunk-0-body", "chunk-1-body", "chunk-2-body"
+    monkeypatch.setattr(n, "_split_message", lambda text, max_length=4000: [CHUNK0, CHUNK1, CHUNK2])
+
+    call_counts: dict[str, int] = {}
+    sent_log: list[str] = []
+
+    async def _send(*a, **k):
+        text = k["text"]
+        call_counts[text] = call_counts.get(text, 0) + 1
+        # 청크1·청크2는 각각 "그 청크로는 처음 도달했을 때"만 실패한다 —
+        # 재전송(같은 청크의 두 번째 호출)은 항상 성공해, 버그가 있으면
+        # 그 재전송이 실제로 일어나 sent_log에 중복이 남는다.
+        if text in (CHUNK1, CHUNK2) and call_counts[text] == 1:
+            raise NetworkError("httpx.ConnectError: All connection attempts failed")
+        sent_log.append(text)
+        return None
+
+    n._bot.send_message = AsyncMock(side_effect=_send)
+
+    assert await n._send_message("무시됨(모킹된 _split_message가 대체)", parse_mode=None) is True
+    assert sent_log == [CHUNK0, CHUNK1, CHUNK2], (
+        f"청크가 정확히 한 번씩만 발송돼야 한다 — 실제: {sent_log}"
+    )
