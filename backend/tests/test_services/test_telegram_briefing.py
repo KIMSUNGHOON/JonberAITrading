@@ -415,6 +415,59 @@ class TestVisualReportWiring:
         assert await b.send_morning_brief() is True
         notifier.send_message.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_report_receives_previous_trading_day_as_research_date(
+        self, monkeypatch, isolated_storage_service
+    ):
+        """2026-08-13 최종 브랜치 리뷰 Critical 2 -- 표지 날짜(trade_date)는
+        오늘로 남고, 토론 조회 날짜(research_date)는 달력 -1일이 아니라
+        거래일 계산(`get_previous_trading_day`)으로 구해야 한다. 기존
+        `prev = date.today() - timedelta(days=1)`는 월요일 아침엔 일요일이
+        된다 -- 이 테스트는 FakeSvc가 실제 달력 -1일과 다른 값을 돌려주게
+        해서 그 계산 경로를 실제로 타는지 확인한다."""
+        from datetime import date
+        import services.telegram.briefing as b
+
+        naive_calendar_minus_one = date.today().toordinal() - 1
+        # FakeSvc가 돌려줄 "거래일"은 달력 -1일과 절대 겹치지 않는 날짜로
+        # 고정한다 -- 겹치면 이 테스트가 우연히 통과할 수 있다.
+        fake_prev = date.fromordinal(naive_calendar_minus_one - 3)
+
+        class FakeSvc:
+            def is_trading_day(self, d):
+                return True
+
+            def get_previous_trading_day(self, d):
+                return fake_prev
+
+        async def fake_get_svc():
+            return FakeSvc()
+
+        monkeypatch.setattr("services.krx_holiday.get_holiday_service", fake_get_svc,
+                            raising=False)
+
+        notifier = AsyncMock(); notifier.is_ready = True
+        monkeypatch.setattr("services.telegram.get_telegram_notifier",
+                            AsyncMock(return_value=notifier))
+
+        report_calls: list[dict] = []
+
+        async def _fake_build_and_send_report(kind, trade_date, **ctx_extra):
+            report_calls.append({"kind": kind, "trade_date": trade_date, **ctx_extra})
+            return True
+
+        monkeypatch.setattr("services.reports.build_and_send_report",
+                            _fake_build_and_send_report)
+
+        assert await b.send_morning_brief() is True
+        assert len(report_calls) == 1
+        assert report_calls[0]["trade_date"] == date.today().isoformat(), (
+            "표지 날짜는 오늘로 남아야 한다"
+        )
+        assert report_calls[0]["research_date"] == fake_prev.isoformat(), (
+            "토론 조회 날짜는 거래일 계산을 거쳐야 한다(달력 -1일이 아니라)"
+        )
+
 
 class TestScanPicksTheNewestEvent:
     """리뷰가 실측으로 잡았다 — grep 인자 순서 때문에 오래된 사유를 집었다."""

@@ -768,11 +768,12 @@ async def send_morning_brief() -> bool:
     try:
         from datetime import date, timedelta
 
+        holiday_svc = None
         try:
             from services.krx_holiday import get_holiday_service
 
-            svc = await get_holiday_service()
-            if not svc.is_trading_day(date.today()):
+            holiday_svc = await get_holiday_service()
+            if not holiday_svc.is_trading_day(date.today()):
                 log.info("morning_brief_skipped_non_business_day")
                 return False
         except Exception:
@@ -781,7 +782,18 @@ async def send_morning_brief() -> bool:
             log.warning("morning_brief_business_day_check_failed")
 
         today = date.today().isoformat()
-        prev = (date.today() - timedelta(days=1)).isoformat()
+        # ⚠️ 달력 -1일이 아니라 **직전 거래일**이어야 한다 -- 월요일 아침에
+        # `date.today() - timedelta(days=1)`는 일요일이 된다(2026-08-13
+        # 최종 리뷰 Critical 2). `holiday_svc`를 못 구했으면(위 except) 어쩔
+        # 수 없이 달력 계산으로 접는다 -- 브리핑 발송 자체를 막을 이유는
+        # 아니다.
+        if holiday_svc is not None:
+            try:
+                prev = holiday_svc.get_previous_trading_day(date.today()).isoformat()
+            except Exception:
+                prev = (date.today() - timedelta(days=1)).isoformat()
+        else:
+            prev = (date.today() - timedelta(days=1)).isoformat()
         try:
             data = await collect_brief(today, prev)
         except Exception:
@@ -806,6 +818,9 @@ async def send_morning_brief() -> bool:
             await build_and_send_report(
                 "premarket",
                 today,
+                # 표지 날짜(today)와 분리 -- 토론 조회는 직전 거래일 기준
+                # (스펙 §5-1, 2026-08-13 최종 리뷰 Critical 2).
+                research_date=prev,
                 # `data.regime`은 dict(정상) · None(아직 안 돌았음) ·
                 # `RegimeUnavailable()`(조회 실패, 3-상태 중 하나) 이렇게
                 # 세 형태일 수 있다. `RegimeUnavailable()`은 `__bool__`을

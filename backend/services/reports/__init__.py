@@ -2,19 +2,32 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 import structlog
 
 logger = structlog.get_logger(__name__)
 
 
-async def build_and_send_report(kind: str, trade_date: str, **ctx_extra) -> bool:
+async def build_and_send_report(
+    kind: str, trade_date: str, *, research_date: Optional[str] = None, **ctx_extra
+) -> bool:
     """리포트를 만들어 Telegram에 첨부 발송한다. **never-raise.**
 
     호출자는 이미 텍스트 알림을 보낸 뒤다 — 여기서 무엇이 실패하든
     사용자는 이미 핵심 정보를 받았다. 예외를 올리면 EOD 체인이나 발굴
     파이프라인이 리포트 때문에 죽는다.
+
+    `research_date`: 보유 종목 카드에 그날의 4에이전트 토론을 붙일 때
+    조회할 날짜. 표지에 찍히는 `trade_date`와 분리한다 — 개장전 리포트가
+    대표 사례다(2026-08-13 최종 리뷰 Critical 2): 08:30엔 agent-chat
+    코디네이터가 장외 idle이라 **오늘자** `agent_chat_decisions`는 항상
+    0행이고, `trade_date`로 토론을 조회하면 표지는 오늘인데 모든 카드가
+    매일 "토론 없음"으로 나간다(스펙 §5-1은 "어제 토론 기준"을 명시).
+    생략하면 `trade_date`로 폴백한다 — postmarket/discovery 호출부는
+    당일 토론을 그대로 보는 게 맞으므로 이 인자를 넘기지 않는다.
     """
+    research_date = research_date or trade_date
     try:
         from services.reports import collect, delivery
         from services.reports.models import ReportContext
@@ -37,7 +50,7 @@ async def build_and_send_report(kind: str, trade_date: str, **ctx_extra) -> bool
 
             positions = await collect.collect_positions()
             storage = await get_storage_service()
-            await collect.attach_research(positions, trade_date, storage)
+            await collect.attach_research(positions, research_date, storage)
             await collect.attach_fundamentals(
                 positions, fetch=collect.make_fundamentals_fetch()
             )
