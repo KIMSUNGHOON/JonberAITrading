@@ -3210,6 +3210,32 @@ class StorageService:
             logger.warning("ticker_day_decisions_failed", error=str(e), ticker=ticker)
             return []
 
+    async def get_ticker_day_decisions_full(
+        self, ticker: str, trade_date: str
+    ) -> list[dict]:
+        """해당 종목의 그날 결정을 **전 컬럼** 시각순으로.
+
+        `get_ticker_day_decisions`는 4개 컬럼만 돌려준다 — 리포트는 votes를
+        잇기 위한 `id`와 `behavioral_signals`·`news_*`가 필요하다.
+        `created_at`은 UTC이므로 KST 거래일로 거른다.
+        """
+        await self.initialize()
+        try:
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM agent_chat_decisions "
+                    "WHERE ticker = ? AND date(created_at,'+9 hours') = ? "
+                    "ORDER BY created_at",
+                    (ticker, trade_date),
+                )
+                return [dict(r) for r in await cursor.fetchall()]
+        except Exception as e:
+            logger.warning(
+                "ticker_day_decisions_full_failed", error=str(e), ticker=ticker
+            )
+            return []
+
     async def get_ticker_day_fills(self, ticker: str, trade_date: str) -> int:
         """해당 종목의 그날 체결 건수."""
         await self.initialize()
