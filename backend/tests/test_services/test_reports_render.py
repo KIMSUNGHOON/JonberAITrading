@@ -163,12 +163,29 @@ def test_null_confidence_does_not_break_render():
 
 
 def test_missing_max_single_position_pct_does_not_crash_render():
+    """`None`(값을 모른다)과 `0`(진짜 상한이 0%다)은 다른 사실이다 --
+    2026-08-13 Task 11 리뷰: `dash(0)`으로 `None`을 0으로 접으면 크래시는
+    막아도 "상한이 0%다"로 오독된다. `None`은 `dash` 필터와 같은 철학으로
+    '—'로 표시해야 한다(같은 표의 "슬롯"·"일일 거래" 줄과 동일)."""
     ctx = ReportContext(
         kind="premarket", trade_date="2026-08-13",
         generated_at="2026-08-13 08:30",
         positions=[], extra={"max_single_position_pct": None},
     )
     html = render(ctx)  # 예외 없이 성공해야 한다
+    assert "0.00%" not in html
+    assert "—" in html
+
+
+def test_zero_max_single_position_pct_is_shown_as_zero_not_placeholder():
+    """0은 '상한이 실제로 0%다'라는 유효한 값이다 -- None(값을 모름)과
+    같은 자리로 뭉개지면 안 된다."""
+    ctx = ReportContext(
+        kind="premarket", trade_date="2026-08-13",
+        generated_at="2026-08-13 08:30",
+        positions=[], extra={"max_single_position_pct": 0},
+    )
+    html = render(ctx)
     assert "0.00%" in html
 
 

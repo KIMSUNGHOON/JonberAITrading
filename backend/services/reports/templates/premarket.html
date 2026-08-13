@@ -22,8 +22,9 @@
           <td class="num">{{ ctx.extra.get('actual_exposure_pct')|num(2) }}%</td></tr>
       <tr><td class="muted">슬롯</td>
           <td class="num">{{ ctx.positions|length }} / {{ ctx.extra.get('max_positions')|dash }}</td></tr>
+      {% set _max_single_position_pct = ctx.extra.get('max_single_position_pct') %}
       <tr><td class="muted">종목당 상한</td>
-          <td class="num">{{ ((ctx.extra.get('max_single_position_pct')|dash(0)) * 100)|num(2) }}%</td></tr>
+          <td class="num">{{ ((_max_single_position_pct * 100)|num(2) ~ '%') if _max_single_position_pct is not none else '—' }}</td></tr>
       <tr><td class="muted">일일 거래</td>
           <td class="num">{{ ctx.extra.get('daily_trades')|dash }} / {{ ctx.extra.get('max_daily_trades')|dash }}</td></tr>
     </table>
