@@ -412,6 +412,82 @@ def guard_live_endpoints():
         Updater.start_polling = real_polling
 
 
+# -------------------------------------------
+# 라이브 리포트 디렉터리 가드 (2026-08-13)
+#
+# Task 7 리뷰 Critical 1 실측: `build_and_send_report`(services/reports/
+# __init__.py)는 텔레그램 준비 여부를 보기 **전에** 무조건
+# `delivery.prune_old_reports(delivery.REPORT_ROOT)` +
+# `delivery.save_report(delivery.REPORT_ROOT, ...)`를 호출한다.
+# `REPORT_ROOT`는 `backend/data/reports/`로 하드코딩된 모듈 상수다.
+# `_notify_eod_summary`가 이 함수를 배선(Task 7)하면서, `is_ready=True`로
+# 그 경로를 실호출하는 기존 테스트(예: test_f3_fill_tracking.py::
+# test_notify_eod_summary_refreshes_strategy_section_after_consensus)가
+# 이 부작용을 그대로 물려받아 **실제 `backend/data/reports/
+# postmarket-2026-08-13.html`을 가짜 데이터("보유 0종")로 덮어썼다**
+# (2026-08-13 리뷰에서 실측). `prune_old_reports`는 14일 지난 파일을
+# 지우므로, 고쳐지지 않으면 2주 뒤부터 실제 과거 리포트까지 조용히
+# 삭제하기 시작한다.
+#
+# `guard_live_databases`와 같은 이유로 autouse다 -- 개별 테스트가
+# `monkeypatch.setattr("services.reports.delivery.REPORT_ROOT", tmp_path)`
+# 를 직접 기억해서 넣어야 하는 규칙은 반드시 잊힌다(이 리포는 같은 종류의
+# 방심으로 이미 한 번 자율 토론 엔진을 3거래일 꺼뜨렸다 --
+# gotcha-tests-write-live-storage-db). `REPORT_ROOT`를 읽는 프로덕션
+# 호출부는 `delivery.REPORT_ROOT` 형태(모듈 속성의 지연 조회) 단 한 곳뿐이라
+# (실물 확인: grep -rn "REPORT_ROOT" services/) monkeypatch가 완전히
+# 가로챌 수 있다.
+#
+# 그래도 "조용히 안 걸리는 가드"는 가드 없음보다 나쁘므로, 리다이렉트에만
+# 기대지 않고 실제 `backend/data/reports/`의 *.html 파일 목록을 테스트
+# 전후로 스냅샷 비교한다 -- 하나라도 달라지면(생성이든 prune에 의한
+# 삭제든) 리다이렉트가 뚫렸다는 뜻이라 teardown에서 즉시 예외를 던져
+# 테스트를 실패시킨다(세션 끝 요약이 아니라 해당 테스트 자리에서 바로
+# 드러나야 놓치지 않는다).
+# -------------------------------------------
+
+_LIVE_REPORT_ROOT = Path(__file__).resolve().parent.parent / "data" / "reports"
+
+
+def _report_snapshot(root: Path) -> frozenset:
+    """`root`(디렉터리) 안의 *.html 파일명 집합. 없으면 빈 집합."""
+    if not root.is_dir():
+        return frozenset()
+    return frozenset(f.name for f in root.glob("*.html"))
+
+
+def _assert_no_report_drift(before: frozenset, after: frozenset, *, nodeid: str) -> None:
+    """`guard_live_report_root`의 핵심 판정 -- 별도 함수로 뺀 이유는
+    `test_report_root_guard.py`가 실제 `backend/data/reports/`를 단 한
+    바이트도 건드리지 않고 이 판정 로직 자체를 검증할 수 있게 하기
+    위해서다(가짜 before/after frozenset을 넣어서 검증한다)."""
+    if after == before:
+        return
+    added = sorted(after - before)
+    removed = sorted(before - after)
+    raise AssertionError(
+        "guard_live_report_root가 뚫렸다 -- "
+        f"{nodeid}가 실제 backend/data/reports/를 바꿨다 "
+        f"(추가={added}, 삭제={removed}). "
+        "services.reports.delivery.REPORT_ROOT 리다이렉트를 우회하는 "
+        "경로가 생긴 것이므로 원인을 찾아 고칠 것."
+    )
+
+
+@pytest.fixture(autouse=True)
+def guard_live_report_root(request, tmp_path_factory, monkeypatch):
+    """`services.reports.delivery.REPORT_ROOT`을 매 테스트 tmp로 리다이렉트
+    하고, 그럼에도 실제 `backend/data/reports/`가 바뀌면 즉시 실패시킨다."""
+    import services.reports.delivery as delivery_module
+
+    before = _report_snapshot(_LIVE_REPORT_ROOT)
+    sandbox = tmp_path_factory.mktemp("report-root-guard")
+    monkeypatch.setattr(delivery_module, "REPORT_ROOT", sandbox)
+    yield
+    after = _report_snapshot(_LIVE_REPORT_ROOT)
+    _assert_no_report_drift(before, after, nodeid=request.node.nodeid)
+
+
 _LINEAGE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "storage.db"
 _lineage_decisions_baseline: Optional[int] = None
 

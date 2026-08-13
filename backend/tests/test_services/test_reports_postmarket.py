@@ -46,6 +46,29 @@ def test_renders_with_no_extra_at_all():
     assert "팬오션" in render(_ctx())
 
 
+def test_realized_shows_slice_count_when_aggregated():
+    """리뷰 Critical 2: 부분체결 여러 건이 한 줄로 합쳐졌다는 사실을
+    숨기면 안 된다 -- slices>1이면 건수를 보여준다."""
+    html = render(_ctx(realized=[
+        {"ticker": "316140", "quantity": 549, "net": -198860.0, "slices": 4}]))
+    assert "549주" in html
+    assert "(4건)" in html
+
+
+def test_realized_hides_slice_count_for_single_slice():
+    """1건뿐이면 "(1건)"처럼 불필요한 잡음을 붙이지 않는다."""
+    html = render(_ctx(realized=[
+        {"ticker": "090430", "quantity": 2, "net": 20.0, "slices": 1}]))
+    assert "(1건)" not in html
+
+
+def test_realized_without_slices_key_still_renders():
+    """옛 호출자가 slices 없이 dict를 넘겨도(구 계약) 죽지 않는다."""
+    html = render(_ctx(realized=[{"ticker": "090430", "quantity": 2, "net": 20.0}]))
+    assert "090430" in html
+    assert "건)" not in html
+
+
 @pytest.mark.asyncio
 async def test_eod_chain_survives_report_failure(monkeypatch):
     """EOD 체인이 리포트 때문에 죽으면 그날 관측이 전부 날아간다."""

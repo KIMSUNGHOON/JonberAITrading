@@ -27,7 +27,8 @@
     <h2>실현손익</h2>
     <table>
       {% for r in ctx.extra.realized %}
-      <tr><td class="muted">{{ r.ticker }} {{ r.quantity }}주</td>
+      <tr><td class="muted">{{ r.ticker }} {{ r.quantity }}주
+            {%- if r.slices and r.slices > 1 %} <span style="opacity:.7">({{ r.slices }}건)</span>{% endif %}</td>
           <td class="num {{ 'up' if r.net >= 0 else 'down' }}">{{ r.net|krw }}</td></tr>
       {% endfor %}
     </table>

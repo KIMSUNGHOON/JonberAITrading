@@ -91,7 +91,7 @@ async def test_realized_uses_net_not_gross_and_excludes_all_backfill(
     out = await _build_postmarket_realized(storage, "2026-08-13")
 
     assert len(out) == 1
-    assert out[0] == {"ticker": "316140", "quantity": 183, "net": -173582.0}
+    assert out[0] == {"ticker": "316140", "quantity": 183, "net": -173582.0, "slices": 1}
 
 
 async def test_realized_falls_back_to_gross_when_net_missing(isolated_storage_service):
@@ -103,7 +103,51 @@ async def test_realized_falls_back_to_gross_when_net_missing(isolated_storage_se
         # net_amount 생략 -- 마이그레이션 이전 옛 행 흉내
     })
     out = await _build_postmarket_realized(storage, "2026-08-13")
-    assert out == [{"ticker": "090430", "quantity": 2, "net": 20.0}]
+    assert out == [{"ticker": "090430", "quantity": 2, "net": 20.0, "slices": 1}]
+
+
+async def test_realized_aggregates_multiple_slices_of_same_ticker(
+    isolated_storage_service,
+):
+    """리뷰 Critical 2 재현: `kr_realized_pnl`은 매도 체결 1건당 1행이라
+    부분체결로 나뉜 청산은 같은 종목이 여러 행으로 쌓인다(실측:
+    2026-08-12 316140 청산 183+183+92+91=549주, 4행). 합산 없이 그대로
+    내보내면 "정상 부분청산 4건"과 kr_stock_trades의 알려진 중복 기록
+    버그를 사람이 구별할 수 없다 -- 한 줄로 합치되 슬라이스 수는 남긴다.
+    """
+    storage = isolated_storage_service
+    slices = [
+        (183, -35496.0215308439), (183, -31826.3953938205),
+        (92, -67868.4169246648), (91, -63670.4169246648),
+    ]
+    for i, (qty, net) in enumerate(slices):
+        await storage.save_kr_realized_pnl({
+            "id": f"slice-{i}", "stk_cd": "316140", "entry_price": 34050,
+            "exit_price": 33106, "quantity": qty, "realized_amount": net + 1000,
+            "created_at": datetime(2026, 8, 13, 13, 25, i),
+            "fee": 400, "tax": 600, "net_amount": net, "cost_source": "model",
+        })
+    # 다른 종목 1건 -- 섞여 합산되면 안 된다
+    await storage.save_kr_realized_pnl({
+        "id": "other", "stk_cd": "090430", "entry_price": 100, "exit_price": 110,
+        "quantity": 2, "realized_amount": 20.0,
+        "created_at": datetime(2026, 8, 13, 10, 0, 0),
+        "fee": 0, "tax": 0, "net_amount": 20.0, "cost_source": "model",
+    })
+
+    out = await _build_postmarket_realized(storage, "2026-08-13")
+
+    by_ticker = {r["ticker"]: r for r in out}
+    assert len(out) == 2  # 316140 한 줄 + 090430 한 줄 -- 4행이 4줄로 새지 않는다
+
+    row = by_ticker["316140"]
+    assert row["quantity"] == 549  # 183+183+92+91
+    assert row["net"] == pytest.approx(sum(n for _, n in slices))
+    assert row["slices"] == 4  # 합쳐졌다는 사실 자체는 숨기지 않는다
+
+    assert by_ticker["090430"] == {
+        "ticker": "090430", "quantity": 2, "net": 20.0, "slices": 1,
+    }
 
 
 def _strategy_json(vol_multiplier_min: float, stop_loss_pct: float = 0.07) -> str:

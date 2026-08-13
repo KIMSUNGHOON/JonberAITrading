@@ -529,10 +529,26 @@ async def _build_postmarket_fills(storage: Any, trade_date: str) -> list[dict[st
 async def _build_postmarket_realized(
     storage: Any, trade_date: str
 ) -> list[dict[str, Any]]:
-    """그날 실현손익(종목별) -- `kr_realized_pnl`에서 `net_amount`(수수료·
-    세금 차감 후)로 읽는다. `realized_amount`(gross)를 쓰면 실현이익을
-    과대계상한다(왕복비용 미차감 -- 실측 사례 gross 대비 순이익 43% 과대).
-    `net_amount`가 옛 행에 없으면(마이그레이션 이전) gross로 물러난다.
+    """그날 실현손익(종목별, **합산**) -- `kr_realized_pnl`은 매도 체결
+    **1건당 1행**이다(`record_kr_realized_pnl_async`가 `_apply_sell_fill`
+    에서 체결마다 호출한다). 부분체결로 나뉜 청산은 같은 종목이 여러 행으로
+    쌓인다(2026-08-12 리뷰 실측: 316140 청산이 183+183+92+91=549주, 4행).
+
+    합산 없이 그대로 내보내면 사람이 리포트를 볼 때 "정상적인 부분청산
+    4건"과 `kr_stock_trades`의 알려진 중복 기록 버그
+    ([[finding-duplicate-fill-rows]], 같은 체결이 31초 간격으로 두 번
+    기록됨)를 구별할 수 없다(2026-08-13 리뷰 Critical 2). 그래서 종목별로
+    quantity/net을 더해 한 줄로 만들되, 합쳐졌다는 사실 자체는 숨기지
+    않는다 -- 슬라이스(원본 행) 개수를 `slices`에 남겨 템플릿이 2건 이상일
+    때만 "(N건)"을 붙인다.
+
+    `net_amount`(수수료·세금 차감 후)를 합산한다. `realized_amount`(gross)
+    를 쓰면 실현이익을 과대계상한다(왕복비용 미차감 -- 실측 사례 gross
+    대비 순이익 43% 과대). `net_amount`가 없는 행(마이그레이션 이전 옛
+    행)만 그 행에 한해 gross로 물러난다 -- 같은 종목의 다른 행이
+    `net_amount`를 갖고 있어도 섞어 합산한다(둘 다 "그 종목의 실현손익"
+    이라는 같은 단위이기 때문).
+
     `stk_cd='ALL'` 행은 계좌 백필이지 거래가 아니다 -- `get_day_rollup`과
     같은 관례로 제외한다.
     """
@@ -542,10 +558,12 @@ async def _build_postmarket_realized(
         logger.warning(f"[EODDigest] postmarket realized collect failed: {e}")
         return []
 
-    out: list[dict[str, Any]] = []
+    agg: dict[Any, dict[str, Any]] = {}
+    order: list[Any] = []
     for row in rows:
         try:
-            if row.get("stk_cd") == "ALL":
+            ticker = row.get("stk_cd")
+            if ticker == "ALL":
                 continue
             created = str(row.get("created_at") or "")
             if created[:10] != trade_date:
@@ -553,16 +571,19 @@ async def _build_postmarket_realized(
             net = row.get("net_amount")
             if net is None:
                 net = row.get("realized_amount")
-            out.append(
-                {
-                    "ticker": row.get("stk_cd"),
-                    "quantity": row.get("quantity"),
-                    "net": net,
-                }
-            )
+            qty = row.get("quantity") or 0
+            net = net or 0
+
+            if ticker not in agg:
+                agg[ticker] = {"ticker": ticker, "quantity": 0, "net": 0.0, "slices": 0}
+                order.append(ticker)
+            entry = agg[ticker]
+            entry["quantity"] += qty
+            entry["net"] += net
+            entry["slices"] += 1
         except Exception as e:
             logger.warning(f"[EODDigest] postmarket realized row skipped: {e}")
-    return out
+    return [agg[t] for t in order]
 
 
 # knob 이름 -> strategy_json 안의 "section.field" 경로. strategy_apply.py의
