@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}리포트{% endblock %} {{ ctx.trade_date }}</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  :root{
+    --ground:#0D1520; --surface:#141F2E; --sunk:#0A1017; --line:#1E2E42;
+    --ink:#E8EEF4; --muted:#7E92A8; --dim:#54677D;
+    --accent:#E8A33D;
+    --up:#F0554E; --down:#4A90E2;   /* 한국식: 상승 빨강 / 하락 파랑 */
+  }
+  html{background:var(--ground)}
+  body{margin:0 auto;max-width:460px;background:var(--ground);color:var(--ink);
+       font:400 14px/1.55 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",sans-serif;
+       -webkit-text-size-adjust:100%}
+  .pad{padding:0 18px}
+  .num{font-variant-numeric:tabular-nums}
+  header{padding:22px 18px 16px;border-bottom:1px solid var(--line)}
+  .eyebrow{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;
+           color:var(--accent);font-weight:600}
+  h1{margin:6px 0 0;font-size:24px;line-height:1.15;letter-spacing:-.02em;
+     font-weight:700;text-wrap:balance}
+  .chip{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;
+        font-weight:600;background:rgba(232,163,61,.14);color:var(--accent);
+        border:1px solid rgba(232,163,61,.3)}
+  section{padding:22px 0 0}
+  h2{margin:0 0 3px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+     color:var(--accent);font-weight:600}
+  .note{margin:0 0 10px;font-size:12px;color:var(--muted)}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:10px;
+        padding:12px 13px}
+  .track{height:6px;background:var(--sunk);border-radius:3px;overflow:hidden;margin-top:8px}
+  .fill{height:100%;background:linear-gradient(90deg,#1F5F5C,#37A89F)}
+  .fill.tight{background:linear-gradient(90deg,#8A6A1E,#E8A33D)}
+  .up{color:var(--up)} .down{color:var(--down)} .muted{color:var(--muted)}
+  .badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:10.5px;
+         font-weight:600;background:rgba(240,85,78,.16);color:var(--up)}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  td{padding:8px 0;border-bottom:1px solid var(--line)}
+  td:last-child{text-align:right;font-weight:600}
+  tr:last-child td{border-bottom:0}
+  footer{margin-top:24px;padding:14px 18px 24px;border-top:1px solid var(--line);
+         font-size:11px;color:var(--dim);line-height:1.6}
+  a{color:inherit;text-decoration:none}
+</style></head><body>
+<header>
+  <div class="eyebrow">{% block eyebrow %}Report{% endblock %}</div>
+  <h1>{% block heading %}{% endblock %}</h1>
+  {% block subhead %}{% endblock %}
+</header>
+{% block body %}{% endblock %}
+<footer>
+  생성 {{ ctx.generated_at }} · 거래일 {{ ctx.trade_date }}<br>
+  이 리포트는 자동 생성되었습니다. 숫자는 생성 시점 기준입니다.
+</footer>
+</body></html>

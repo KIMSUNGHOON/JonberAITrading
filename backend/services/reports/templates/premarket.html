@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% import "_position.html" as pc %}
+{% block title %}장전 브리핑{% endblock %}
+{% block eyebrow %}Pre-Market Brief{% endblock %}
+{% block heading %}장전 브리핑<br>{{ ctx.trade_date }}{% endblock %}
+{% block subhead %}
+  {% if ctx.regime %}
+  <div style="margin-top:7px">
+    <span class="chip">{{ ctx.regime.regime }} · 신뢰 {{ (ctx.regime.confidence * 100)|num(0) }}%</span>
+  </div>
+  {% endif %}
+{% endblock %}
+{% block body %}
+<div class="pad">
+  <section>
+    <h2>보유 {{ ctx.positions|length }}종 리서치</h2>
+    {% for p in ctx.positions %}{{ pc.position_card(p) }}{% endfor %}
+    {% if not ctx.positions %}<div class="muted">보유 없음</div>{% endif %}
+  </section>
+</div>
+{% endblock %}

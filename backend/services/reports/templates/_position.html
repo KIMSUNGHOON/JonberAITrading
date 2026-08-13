@@ -1,0 +1,71 @@
+{% macro position_card(p) %}
+<div class="card" style="margin-bottom:10px">
+  <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+    <div style="font-size:14px;font-weight:600">{{ p.name }}
+      <span style="font-size:10.5px;color:var(--dim);font-weight:400">{{ p.ticker }}</span>
+    </div>
+    <div style="font-size:14px;font-weight:700"
+         class="{{ 'up' if p.pnl_pct >= 0 else 'down' }}">{{ p.pnl_pct|pct }}</div>
+  </div>
+
+  <div class="muted num" style="font-size:11.5px;margin-top:4px">
+    {{ p.quantity }}주 · 평단 {{ p.avg_price|krw }} → 현재 {{ p.current_price|krw }}
+  </div>
+
+  {% if p.stop_margin_pct is not none %}
+  <div class="track">
+    <div class="fill {{ 'tight' if p.stop_margin_pct < 5 else '' }}"
+         style="width:{{ [p.stop_margin_pct * 6, 100]|min }}%"></div>
+  </div>
+  <div style="display:flex;justify-content:space-between;font-size:10.5px;
+              color:var(--dim);margin-top:4px" class="num">
+    <span>손절 {{ p.stop_loss|krw }} <span style="opacity:.7">({{ p.stop_loss_source }})</span></span>
+    <span{% if p.stop_margin_pct < 5 %} style="color:var(--accent)"{% endif %}>여유 {{ p.stop_margin_pct|num(2) }}%</span>
+  </div>
+  {% else %}
+  <div style="font-size:10.5px;color:var(--dim);margin-top:6px">손절가 없음</div>
+  {% endif %}
+
+  {% if p.discussion_count %}
+  <div style="margin-top:11px;padding-top:10px;border-top:1px solid var(--line);
+              font-size:12px">
+    오늘 토론 {{ p.discussion_count }}회 → <b>{{ p.action }}</b>
+    <span class="muted">합의 {{ (p.consensus * 100)|num(0) if p.consensus else '—' }}%</span>
+    {% if p.dissent_count %}<span class="badge">반대표 {{ p.dissent_count }}</span>{% endif %}
+  </div>
+
+  {% for v in p.votes %}
+  <div style="margin-top:8px;font-size:12px">
+    <span style="font-weight:600">{{ v.agent_type }}</span>
+    <span class="{{ 'up' if v.is_dissent else 'muted' }}">{{ v.vote|upper }}
+      {{ (v.confidence * 100)|num(0) }}%</span>
+    {% if v.is_dissent %}<span class="badge">반대표</span>{% endif %}
+    <div class="muted" style="margin-top:2px;line-height:1.45">{{ v.headline }}</div>
+  </div>
+  {% endfor %}
+  {% else %}
+  <div class="muted" style="margin-top:10px;font-size:12px">토론 없음</div>
+  {% endif %}
+
+  <div class="num" style="margin-top:11px;font-size:11px;color:var(--muted)">
+    {% if p.signals.get('rsi') %}RSI {{ p.signals.rsi|num(1) }} · {% endif %}
+    {% if p.signals.get('volume_ratio') %}거래량 {{ p.signals.volume_ratio|num(2) }}x · {% endif %}
+    {% if p.signals.get('trend') %}추세 {{ p.signals.trend }} · {% endif %}
+    PER {{ p.per|num(2) }} · PBR {{ p.pbr|num(2) }} · EPS {{ p.eps|num(0) }}
+  </div>
+
+  {% if p.news %}
+  <div style="margin-top:10px;padding-top:9px;border-top:1px solid var(--line)">
+    {% for n in p.news %}
+    <div style="margin-top:6px;font-size:11.5px">
+      <span class="muted">{{ n.source }} · {{ n.published }}</span>
+      {% if n.sentiment %}<span class="muted">· {{ n.sentiment }}</span>{% endif %}
+      <div style="line-height:1.4">{{ n.title }}</div>
+    </div>
+    {% endfor %}
+  </div>
+  {% elif p.news_error %}
+  <div class="muted" style="margin-top:9px;font-size:11px">뉴스 조회 실패</div>
+  {% endif %}
+</div>
+{% endmacro %}
