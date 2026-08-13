@@ -204,3 +204,26 @@ def test_missing_daily_trades_shows_placeholder_not_literal_none():
     html = render(ctx)
     assert "None" not in html
     assert "— / —" in html
+
+
+def test_jinja2_dependency_is_declared_not_just_installed():
+    """2026-08-13 최종 브랜치 리뷰 Important 6 -- `render.py`가 `jinja2`를
+    직접 import하는데(위 테스트들이 이미 그 경로를 실제로 태운다)
+    `backend/requirements.txt`·`environment.yml` 어디에도 선언돼 있지
+    않았다. 전이 의존(다른 패키지가 딸려 설치)으로만 깔려 있으면 환경을
+    재구축할 때 사라질 수 있고, 그러면 `render.py` import 실패가
+    `build_and_send_report`의 `except Exception`(never-raise 계약)에
+    조용히 삼켜져 premarket/postmarket/discovery 리포트 3종이 전멸한다.
+    `korean_lunar_calendar`의 같은 계열 가드(test_krx_holiday_calendar.py::
+    test_dependency_is_declared_not_just_installed)와 동일한 형태."""
+    from pathlib import Path
+
+    here = Path(__file__).resolve()
+    backend_dir = here.parents[2]
+    req = backend_dir / "requirements.txt"
+    assert req.exists(), req
+    declared = [
+        line for line in req.read_text(encoding="utf-8").splitlines()
+        if line.lstrip().lower().startswith("jinja2")
+    ]
+    assert declared, "backend/requirements.txt에 jinja2 선언이 없다"

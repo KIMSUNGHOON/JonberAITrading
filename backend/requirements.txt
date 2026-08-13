@@ -59,6 +59,15 @@ tenacity>=9.0.0
 python-telegram-bot~=22.5
 
 # -------------------------------------------
+# Reports (HTML templates)
+# -------------------------------------------
+# services/reports/render.py -- 전이 의존으로만 깔려 있었다(2026-08-13
+# 최종 리뷰 Important 6). 재구축 시 사라지면 import 실패가 never-raise
+# 계약에 조용히 삼켜져 리포트 3종(premarket/postmarket/discovery)이
+# 전멸한다.
+jinja2>=3.1
+
+# -------------------------------------------
 # Testing
 # -------------------------------------------
 pytest>=8.0.0
