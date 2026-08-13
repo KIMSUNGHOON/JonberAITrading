@@ -147,3 +147,60 @@ def test_null_confidence_does_not_break_render():
     html = render(ctx)  # 예외 없이 성공해야 한다
     assert "신뢰" not in html, "confidence가 None이면 신뢰 조각을 생략해야 한다"
     assert "bull" in html, "레짐 라벨 자체는 confidence와 무관하게 나와야 한다"
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-13 최종 브랜치 리뷰 Important 3 -- `ctx.extra.get(key, default)`는
+# 키가 **없을 때만** default를 쓴다. `collect_brief`의 코디네이터 블록이
+# `except Exception: pass`(briefing.py:453-456)라 예외가 나면
+# max_positions/max_single_position_pct가 키는 있되 값이 None으로 남는다.
+# `max_single_position_pct`는 곱셈(* 100) 안에 있어 I2와 같은 전체 렌더
+# 크래시로 이어지고, 나머지는 화면에 문자 그대로 "None"이 찍힌다.
+# ⚠️ `daily_trades=0`(오늘 아직 거래가 없음)은 흔한 정상 상태다 -- `or`로
+# 뭉개면 매일 장 시작 직후 "—"로 잘못 보인다. `actual_exposure_pct`(I1)는
+# 단위 함정이 있어 이번에 건드리지 않는다.
+# ---------------------------------------------------------------------------
+
+
+def test_missing_max_single_position_pct_does_not_crash_render():
+    ctx = ReportContext(
+        kind="premarket", trade_date="2026-08-13",
+        generated_at="2026-08-13 08:30",
+        positions=[], extra={"max_single_position_pct": None},
+    )
+    html = render(ctx)  # 예외 없이 성공해야 한다
+    assert "0.00%" in html
+
+
+def test_missing_max_positions_shows_placeholder_not_literal_none():
+    ctx = ReportContext(
+        kind="premarket", trade_date="2026-08-13",
+        generated_at="2026-08-13 08:30",
+        positions=[], extra={"max_positions": None},
+    )
+    html = render(ctx)
+    assert "/ None" not in html
+    assert "0 / —" in html
+
+
+def test_zero_daily_trades_is_shown_as_zero_not_placeholder():
+    """0은 '아직 거래 없음'이라는 정상 값이다 -- None(조회 실패)과 같은
+    자리로 뭉개지면 안 된다."""
+    ctx = ReportContext(
+        kind="premarket", trade_date="2026-08-13",
+        generated_at="2026-08-13 08:30",
+        positions=[], extra={"daily_trades": 0, "max_daily_trades": 10},
+    )
+    html = render(ctx)
+    assert "0 / 10" in html
+
+
+def test_missing_daily_trades_shows_placeholder_not_literal_none():
+    ctx = ReportContext(
+        kind="premarket", trade_date="2026-08-13",
+        generated_at="2026-08-13 08:30",
+        positions=[], extra={"daily_trades": None, "max_daily_trades": None},
+    )
+    html = render(ctx)
+    assert "None" not in html
+    assert "— / —" in html

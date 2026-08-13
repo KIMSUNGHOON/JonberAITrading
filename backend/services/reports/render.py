@@ -44,9 +44,25 @@ def _num(v, digits: int = 2) -> str:
         return "—"
 
 
+def _dash(v, placeholder="—"):
+    """`None`만 자리표시자로 접는다 -- `0`은 유효한 값이라 그대로 둔다.
+
+    ⚠️ `{{ ctx.extra.get(key, default) }}` 패턴은 **키가 없을 때만**
+    default를 쓴다. `daily_trades`처럼 항상 키가 넘어오는 값이 수집
+    실패로 `None`이 되면(그 키 자체는 여전히 존재) `.get`의 default가
+    적용되지 않아 화면에 문자 그대로 "None"이 찍힌다(2026-08-13 최종
+    리뷰 Important 3). Jinja 내장 `default` 필터는 `Undefined`만 잡고
+    실제 파이썬 `None`은 그대로 통과시키므로 못 쓴다. `x or placeholder`도
+    `0`(예: "오늘 아직 거래 없음")을 `None`과 똑같이 접어버려 못 쓴다 --
+    그래서 `None` 여부만 명시적으로 검사한다.
+    """
+    return placeholder if v is None else v
+
+
 _env.filters["krw"] = _krw
 _env.filters["pct"] = _pct
 _env.filters["num"] = _num
+_env.filters["dash"] = _dash
 
 _KINDS = {"premarket", "postmarket", "discovery"}
 
