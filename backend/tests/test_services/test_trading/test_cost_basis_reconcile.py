@@ -19,12 +19,17 @@ from services.trading.reconciler import ReconcileReport, _fix_positions
 pytestmark = pytest.mark.asyncio
 
 
-def _holding(ticker="089860", qty=185, avg=38_091, cur=38_750):
+def _holding(ticker="089860", qty=185, avg=38_091, cur=38_750, stk_nm=None):
     h = MagicMock()
     h.stk_cd = ticker
     h.hldg_qty = qty
     h.avg_buy_prc = avg
     h.cur_prc = cur
+    # stk_nm 미지정 시 MagicMock 자동생성 속성(항상 truthy, 티커와 다름)으로
+    # 남는다 -- 기존 테스트는 전부 이 기본값에 의존하지 않으므로(이름 비교
+    # 대상 포지션이 이미 실명이라 가드에서 걸러진다) 하위호환이다.
+    if stk_nm is not None:
+        h.stk_nm = stk_nm
     return h
 
 
@@ -370,3 +375,102 @@ async def test_drift_log_emitted_every_pass_even_when_telegram_latched(caplog):
     assert notifier.send_message.await_count == 1, "래치는 텔레그램만 잠근다"
     drift_logs = [r for r in caplog.records if "cost drift 089860" in r.message]
     assert len(drift_logs) == 2, "로그는 래치와 무관하게 드리프트를 발견한 모든 패스에 남는다"
+
+
+# ---------------------------------------------------------------
+# Task 13(종목명 표시): 진입 경로가 이름을 못 구해 stock_name이 티커
+# 코드로 남은 기존(비고아) 포지션을 브로커 stk_nm으로 자가치유한다.
+# 라이브 실측: 004370 포지션의 stock_name이 '004370'(코드 그대로)이었다.
+# ---------------------------------------------------------------
+
+
+def _managed_unnamed(ticker="089860", qty=185, avg=38_091.0, cur=38_750.0):
+    """진입 경로가 이름을 못 구해 stock_name에 티커가 그대로 들어간 상태."""
+    return ManagedPosition(
+        ticker=ticker, stock_name=ticker,
+        quantity=qty, avg_price=avg, current_price=cur,
+    )
+
+
+async def test_name_backfilled_from_broker_when_stock_name_is_ticker():
+    """coordinator·PM 양쪽 다 stock_name이 티커 그대로 — 브로커 stk_nm으로 채운다."""
+    pos = _managed_unnamed()
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=38_091.0, stock_name="089860")
+    pm = _pm(pm_pos)
+    report = ReconcileReport()
+
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈")}, report
+    )
+
+    assert pos.stock_name == "롯데렌탈", "coordinator 쪽 이름이 채워진다"
+    assert pm_pos.stock_name == "롯데렌탈", "PM 쪽 이름도 채워진다"
+    assert report.name_fixed == 1
+
+
+async def test_name_backfilled_when_missing_entirely():
+    """stock_name이 빈 문자열(이름을 아예 못 구한 경우)도 채워진다."""
+    pos = ManagedPosition(
+        ticker="089860", stock_name="",
+        quantity=185, avg_price=38_091.0, current_price=38_750.0,
+    )
+    coordinator = _coordinator(pos)
+    pm = _pm(None)
+    report = ReconcileReport()
+
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈")}, report
+    )
+
+    assert pos.stock_name == "롯데렌탈"
+    assert report.name_fixed == 1
+
+
+async def test_correct_name_is_never_overwritten():
+    """이미 올바른 이름은 브로커 값과 달라도(예: 사용자가 넣은 별칭이 아니라
+    단순 소스 차이) 절대 덮지 않는다 — ⚠️ 지시사항: 정상 이름 위에 덮어쓰기 금지."""
+    pos = _managed(qty=185, avg=37_950.0)  # stock_name="롯데렌탈" (이미 정상)
+    coordinator = _coordinator(pos)
+    pm_pos = MagicMock(quantity=185, avg_price=37_950.0, stock_name="롯데렌탈")
+    pm = _pm(pm_pos)
+    report = ReconcileReport()
+
+    # 브로커 이름이 다르게 와도(오타/별칭 등 극단 케이스) 이미 정상인 이름은 유지.
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈주식회사")}, report
+    )
+
+    assert pos.stock_name == "롯데렌탈", "이미 올바른 이름은 덮지 않는다"
+    assert pm_pos.stock_name == "롯데렌탈"
+    assert report.name_fixed == 0
+
+
+async def test_name_backfill_is_noop_without_a_position():
+    """대응 포지션이 없으면 아무것도 하지 않는다(고아 채택은 별도 단계 소관)."""
+    coordinator = _coordinator(None)
+    pm = _pm(None)
+    report = ReconcileReport()
+
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈")}, report
+    )
+
+    assert report.name_fixed == 0
+
+
+async def test_name_fix_emits_position_correction_alert():
+    """이름만 고쳐도(수량·원가는 그대로) "포지션 보정" 알림이 나가고, 메시지에
+    종목명 항목이 포함된다."""
+    pos = _managed_unnamed()
+    coordinator = _coordinator(pos)
+    pm = _pm(None)
+    report = ReconcileReport()
+
+    await _fix_positions(
+        coordinator, pm, {"089860": _holding(stk_nm="롯데렌탈")}, report
+    )
+
+    coordinator._on_alert.assert_awaited_once()
+    alert = coordinator._on_alert.call_args.args[0]
+    assert "종목명(롯데렌탈)" in alert.message

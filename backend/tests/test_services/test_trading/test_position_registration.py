@@ -261,6 +261,34 @@ async def test_optional_stop_mode_and_risk_score_thread_into_managed_position(mo
     assert pos2.risk_score is None
 
 
+async def test_missing_stock_name_does_not_raise_and_still_registers(monkeypatch):
+    """Task 13: 이름을 못 구한 경로(브로커/세션 조회 실패 등)라도 등록 자체가
+    실패하면 안 된다 — 이름 때문에 매매가 멈추는 것이 가장 나쁜 결과다.
+    빈 문자열이 stock_name으로 들어와도 예외 없이 양쪽 엔진에 등록된다."""
+    coordinator = _coordinator()
+    pm = _pm(existing=None)
+    monkeypatch.setattr(
+        "services.agent_chat.coordinator.get_chat_coordinator",
+        AsyncMock(return_value=_chat_coordinator(pm)),
+    )
+
+    await register_fill_as_position(
+        coordinator,
+        ticker="005930",
+        stock_name="",
+        quantity=10,
+        avg_price=70000.0,
+        stop_loss=66500.0,
+        take_profit=77000.0,
+    )
+
+    assert coordinator._add_position.call_count == 1
+    pos = coordinator._add_position.call_args.args[0]
+    assert pos.stock_name == ""
+    pm.add_position.assert_called_once()
+    assert pm.add_position.call_args.kwargs["stock_name"] == ""
+
+
 async def test_pm_lookup_failure_does_not_prevent_coordinator_registration(monkeypatch):
     coordinator = _coordinator()
     monkeypatch.setattr(

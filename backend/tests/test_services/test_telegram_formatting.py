@@ -78,11 +78,14 @@ def test_fmt_rel_time():
     assert fmt_rel_time(None) == "―"
 
 
-def test_stock_label_has_no_parens_and_no_duplication():
-    """'094840(094840)' 중복이 실제 EOD 렌더에 존재한다 — 폴백이 티커를 한 번만 쓴다."""
-    assert stock_label("슈프리마에이치큐", "094840") == "슈프리마에이치큐 094840"
+def test_stock_label_uses_parens_and_avoids_duplication():
+    """요구 형식은 `종목이름(티커번호)`. 이름이 없거나 티커와 같으면
+    `094840(094840)` 같은 자기중복 대신 `종목 094840`로 폴백 — 폴백이
+    티커를 한 번만 쓴다."""
+    assert stock_label("슈프리마에이치큐", "094840") == "슈프리마에이치큐(094840)"
     assert stock_label(None, "094840") == "종목 094840"
     assert stock_label("094840", "094840") == "종목 094840"
+    assert stock_label("슈프리마에이치큐", None) == "슈프리마에이치큐"
 
 
 def test_strip_markers_removes_unbalanced_llm_markup():

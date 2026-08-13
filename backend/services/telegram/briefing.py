@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from services.telegram.formatting import stock_label
+
 _NO_DATA = "조회 실패"
 _NOT_STARTED = "관측 시작 전"
 
@@ -215,8 +217,9 @@ def _brief_positions(d: BriefData) -> list[str]:
         return ["[보유]", "  없음"]
     lines = [f"[보유 {len(d.positions)}종]"]
     for p in d.positions:
+        label = stock_label(p.get("name"), p.get("ticker", "?"))
         lines.append(
-            f"  {p.get('ticker','?'):8} {p.get('quantity',0):>6}주"
+            f"  {label}  {p.get('quantity',0):>6}주"
             f"  {p.get('pnl_pct',0.0):+5.1f}%"
             f"  손절까지 {p.get('stop_gap_pct',0.0):4.1f}%"
         )
@@ -428,6 +431,7 @@ async def collect_brief(trade_date: str, prev_date: Optional[str] = None) -> Bri
         d.positions = [
             dict(
                 ticker=p.ticker,
+                name=p.stock_name,
                 quantity=p.quantity,
                 pnl_pct=(
                     (p.current_price - p.avg_price) / p.avg_price * 100

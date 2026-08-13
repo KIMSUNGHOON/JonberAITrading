@@ -94,6 +94,11 @@ class ReconcileReport(BaseModel):
     # 원가 단일화 C1(2026-07-31): 수량과 별개로 세는 이유는 07-31 실측에서
     # **수량은 맞고 원가만** 어긋난 종목이 둘이었기 때문이다.
     cost_basis_fixed: int = 0
+    # Task 13: 진입 경로가 이름을 못 구해 stock_name이 티커 코드로 남은
+    # 채 등록된 기존(비고아) 포지션을 브로커 stk_nm으로 채운 횟수. 고아
+    # 채택(_adopt_orphans)은 이미 holding.stk_nm을 쓰므로 이 카운터에
+    # 잡히지 않는다 — 이건 "이미 알려진 포지션의 잘못된 이름"만 센다.
+    name_fixed: int = 0
 
 
 def _find_position(positions, ticker: str) -> Optional[ManagedPosition]:
@@ -471,10 +476,40 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
                         # 실재했는지로만 판정하고, 교정 성공 여부와는 독립이다
                         # (리뷰 Minor item3).
 
+        # Task 13(종목명 표시): 브로커 응답에 이미 담긴 stk_nm으로 stock_name을
+        # 채운다 — 새 API 호출이 없다(이 함수는 이미 `holdings_by_ticker`로
+        # 브로커 스냅샷을 들고 있다). 진입 경로(agent-chat 자율 진입)가 이름을
+        # 못 구해 stock_name에 티커 코드가 그대로 등록되는 결함이 있었고(라이브
+        # 실측: 004370 포지션의 stock_name이 '004370'), 그 결함은 이 리컨실
+        # 패스가 매번 도는 한 다음 패스에서 자가치유된다. 이미 올바른 이름은
+        # 절대 덮지 않는다 — "없음" 또는 "이름이 티커와 동일"(stock_label과
+        # 동일 판정)일 때만 채운다. `_adopt_orphans`는 이미 holding.stk_nm으로
+        # 등록하므로 여기서 다시 손댈 게 없다 — 이 분기는 "이미 알고 있던(비고아)
+        # 포지션의 잘못된 이름"만 대상으로 한다.
+        broker_name = (getattr(holding, "stk_nm", "") or "").strip()
+        name_fixed = False
+        if broker_name and broker_name != ticker:
+            if coordinator_pos is not None and (
+                not coordinator_pos.stock_name or coordinator_pos.stock_name == ticker
+            ):
+                coordinator_pos.stock_name = broker_name
+                coordinator._schedule_persist()
+                name_fixed = True
+            if pm is not None:
+                pm_pos_for_name = pm.get_position(ticker)
+                if pm_pos_for_name is not None and (
+                    not pm_pos_for_name.stock_name
+                    or pm_pos_for_name.stock_name == ticker
+                ):
+                    pm_pos_for_name.stock_name = broker_name
+                    name_fixed = True
+
         if qty_fixed:
             report.quantity_fixed += 1
         if cost_fixed:
             report.cost_basis_fixed += 1
+        if name_fixed:
+            report.name_fixed += 1
 
         # 리뷰 Minor(최종 리뷰 item6): "로그" 반쪽 — 래치가 걸려 텔레그램이
         # 조용해진 뒤에도 반복되는 드리프트가 흔적을 남기도록, 래치와 무관하게
@@ -502,12 +537,14 @@ async def _fix_positions(coordinator, pm, holdings_by_ticker: dict, report: Reco
             # 자체는 try 밖에 둬도 never-raise를 깨지 않는다.
             _COST_DRIFT_NOTIFIED.discard(ticker)
 
-        if qty_fixed or cost_fixed:
+        if qty_fixed or cost_fixed or name_fixed:
             parts = []
             if qty_fixed:
                 parts.append(f"보유수량({broker_qty}주)")
             if cost_fixed:
                 parts.append(f"평균단가({broker_avg:,.0f}원)")
+            if name_fixed:
+                parts.append(f"종목명({broker_name})")
             await coordinator._on_alert(
                 TradingAlert(
                     id=str(uuid.uuid4())[:8],

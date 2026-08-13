@@ -235,6 +235,19 @@ async def test_positions_reports_position_count_when_source_succeeds(monkeypatch
     assert "SK하이닉스" in text
 
 
+async def test_positions_missing_name_falls_back_without_duplicating_ticker():
+    """Task 13: 이름을 못 구한 보유 종목도 `058610 (058610)` 같은 중복 없이
+    `종목 058610`로 접힌다."""
+    holding = SimpleNamespace(
+        ticker="058610", name="", quantity=10,
+        avg_price=1000.0, current_price=1010.0,
+        pnl=100.0, pnl_pct=1.0, stop_loss=None, take_profit=None,
+    )
+    line = commands._format_position_line(holding)
+    assert "종목 058610" in line
+    assert line.count("058610") == 1
+
+
 async def test_positions_falls_back_to_no_data_when_holdings_section_failed(monkeypatch):
     # /operations degrades a failed section to None (errors dict), never a
     # raised exception -- mirror that shape here.
@@ -395,6 +408,20 @@ async def test_format_pending_line_is_reusable_for_tg3(monkeypatch):
     assert "abcd1234" in line
     assert "삼성전자" in line
     assert "ADD" in line
+
+
+async def test_pending_line_missing_name_falls_back_without_duplicating_ticker():
+    """Task 13: /pending도 이름 없는 종목에서 티커 중복을 만들면 안 된다."""
+    item = SimpleNamespace(
+        session_id="abcd1234efgh", ticker="058610", name=None,
+        proposal={"action": "BUY"}, auto_approve_at="2026-07-17T10:05:00+09:00",
+        actionable=True,
+    )
+
+    line = commands._format_pending_line(item)
+
+    assert "종목 058610" in line
+    assert line.count("058610") == 1
 
 
 async def test_send_pending_button_wires_to_notifier_send_approval_request(monkeypatch):

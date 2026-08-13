@@ -1264,7 +1264,16 @@ class ChatCoordinator:
                 allocation = await trading_coord.on_trade_approved(
                     session_id=session.id,
                     ticker=ticker,
-                    stock_name=None,  # Will be looked up
+                    # Task 13 근원 규명: 이전엔 여기서 항상 None을 넘겼다("Will
+                    # be looked up"이라는 주석과 달리 실제 조회는 없었다) —
+                    # on_trade_approved 아래로 `stock_name or ticker` 폴백이
+                    # 여러 곳에 있어(coordinator.py 1521행 등) 결국 ManagedPosition
+                    # .stock_name에 티커 코드가 그대로 들어갔다(라이브 실측:
+                    # 004370 포지션의 stock_name이 '004370'). session은 이미
+                    # ChatSession.stock_name(필수 필드, _start_discussion이
+                    # 워치리스트/발굴 데이터로 채움)을 들고 있으므로 그걸 쓰면
+                    # 된다 — 새 API 호출이 필요 없다.
+                    stock_name=session.stock_name,
                     action=action,
                     entry_price=decision.entry_price,
                     stop_loss=decision.stop_loss,

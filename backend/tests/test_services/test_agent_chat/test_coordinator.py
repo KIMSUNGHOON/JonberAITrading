@@ -929,6 +929,26 @@ class TestAutonomousExecutionMarksWatchConverted:
         fake_trading_coord.mark_watch_converted.assert_called_once_with("005930")
 
     @pytest.mark.asyncio
+    async def test_execute_trade_forwards_session_stock_name(self, coordinator):
+        """Task 13 근원 규명: 이전엔 `stock_name=None`을 하드코딩해 넘기고
+        "Will be looked up"이라는 주석만 남긴 채 실제 조회가 없었다 -- 그
+        None이 on_trade_approved 아래로 흘러가 `stock_name or ticker`
+        폴백 지점들(coordinator.py)에서 결국 ManagedPosition.stock_name에
+        티커 코드가 그대로 등록됐다(라이브 실측: 004370 포지션의
+        stock_name이 '004370'). session은 이미 ChatSession.stock_name
+        (필수 필드, 워치리스트/발굴 데이터로 채워짐)을 들고 있으므로 그걸
+        그대로 넘기면 된다."""
+        allocation = _allocation(10, "정상 매수: 10주 매수 (risk-based sizing)")
+
+        fake_trading_coord = await self._run(coordinator, allocation)
+
+        kwargs = fake_trading_coord.on_trade_approved.call_args.kwargs
+        assert kwargs["stock_name"] == "삼성전자", (
+            "session.stock_name이 그대로 전달돼야 한다 — None을 넘기면 "
+            "안 된다"
+        )
+
+    @pytest.mark.asyncio
     async def test_execute_trade_marks_watch_converted_when_queued(self, coordinator):
         """A trade that gets queued (market closed / system paused-stopped)
         is a real, actionable outcome even though quantity=0 -- it must

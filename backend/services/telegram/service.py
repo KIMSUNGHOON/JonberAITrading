@@ -16,6 +16,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, NetworkError, TelegramError
 
 from services.telegram.config import get_telegram_config, TelegramConfig
+from services.telegram.formatting import stock_label
 
 logger = structlog.get_logger()
 
@@ -419,7 +420,7 @@ class TelegramNotifier:
         message = f"""
 {emoji} *거래 제안*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *행동:* {action}
 *진입가:* ₩{entry_price:,}
 *손절가:* {"₩" + f"{stop_loss:,}" if stop_loss else "미설정"}
@@ -500,7 +501,7 @@ _승인 대기 중..._
         message = f"""
 🟡 *거래 접수 — 체결 대기*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *행동:* {action}
 *수량:* {quantity:,}주
 *주문번호:* {ord_no or "확인 불가"}
@@ -524,7 +525,7 @@ _체결이 아직 확인되지 않았습니다._
         message = f"""
 ❌ *거래 거절*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *사유:* {reason or "사용자 거절"}
 
 ⏰ {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -556,7 +557,7 @@ _체결이 아직 확인되지 않았습니다._
         message = f"""
 👁️ *Watch List 등록*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *신호:* {signal_emoji} {signal.upper()}
 *신뢰도:* {confidence:.0%}
 *현재가:* ₩{current_price:,}
@@ -593,7 +594,7 @@ _모니터링 중..._
         message = f"""
 {emoji} *포지션 업데이트*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *보유:* {quantity:,}주
 *평균단가:* ₩{avg_price:,}
 *현재가:* ₩{current_price:,}
@@ -617,7 +618,7 @@ _모니터링 중..._
         message = f"""
 🚨 *손절가 도달*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *현재가:* ₩{trigger_price:,}
 *손절가:* ₩{stop_loss_price:,}
 
@@ -639,7 +640,7 @@ _모니터링 중..._
         message = f"""
 🎯 *목표가 도달*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *현재가:* ₩{trigger_price:,}
 *목표가:* ₩{take_profit_price:,}
 
@@ -664,7 +665,7 @@ _모니터링 중..._
         message = f"""
 🔍 *분석 시작*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *세션:* {session_id[:8]}...
 
 분석 진행 중...
@@ -688,7 +689,7 @@ _모니터링 중..._
         message = f"""
 {emoji} *분석 완료*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *추천:* {action}
 *신뢰도:* {confidence:.0%}
 
@@ -724,7 +725,7 @@ _모니터링 중..._
         message = f"""
 {agent_emoji} *{agent_type.title()} 분석 완료*
 
-*종목:* {stock_name} ({ticker})
+*종목:* {stock_label(stock_name, ticker)}
 *시그널:* {signal}
 *신뢰도:* {confidence:.0%}
 
@@ -984,10 +985,10 @@ _모니터링 중..._
         lines = []
         for w in watch[:10]:
             ticker = w.get("ticker") or "-"
-            name = w.get("stock_name") or ticker
+            label = stock_label(w.get("stock_name"), ticker)
             signal = str(w.get("signal") or "-").upper()
             gap = self._fmt_pct(w.get("gap_pct"))
-            lines.append(f"• {name}({ticker}) {signal} 갭 {gap}")
+            lines.append(f"• {label} {signal} 갭 {gap}")
         return "\n".join(lines)
 
     def _format_account_block(self, account: Optional[dict]) -> str:
@@ -1006,11 +1007,11 @@ _모니터링 중..._
         lines = []
         for h in holdings[:10]:
             ticker = h.get("ticker") or "-"
-            name = h.get("stock_name") or ticker
+            label = stock_label(h.get("stock_name"), ticker)
             qty = h.get("quantity") or 0
             pnl = self._fmt_krw(h.get("unrealized_pnl"))
             pnl_pct = self._fmt_pct(h.get("unrealized_pnl_pct"))
-            lines.append(f"• {name}({ticker}) {qty:,}주 손익 {pnl} ({pnl_pct})")
+            lines.append(f"• {label} {qty:,}주 손익 {pnl} ({pnl_pct})")
         return "\n".join(lines)
 
     def _format_strategy_block(self, strategy: Optional[dict]) -> str:
@@ -1036,10 +1037,10 @@ _모니터링 중..._
         lines = []
         for p in promoted[:10]:
             ticker = p.get("ticker") or "-"
-            name = p.get("name") or ticker
+            label = stock_label(p.get("name"), ticker)
             score = p.get("composite_score")
             score_text = f"{score:.1f}" if isinstance(score, (int, float)) else "―"
-            lines.append(f"• {name}({ticker}) 스코어 {score_text}")
+            lines.append(f"• {label} 스코어 {score_text}")
         return "\n".join(lines)
 
     @staticmethod

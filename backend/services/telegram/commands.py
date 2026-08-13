@@ -88,6 +88,7 @@ import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from services.telegram.formatting import stock_label
 from services.telegram.receiver import register_command
 
 logger = structlog.get_logger()
@@ -258,10 +259,10 @@ async def _fetch_operations(market: str = "kiwoom"):
 
 
 def _format_position_line(holding) -> str:
-    name = holding.name or holding.ticker
+    label = stock_label(holding.name, holding.ticker)
     sign = "+" if holding.pnl >= 0 else ""
     return (
-        f"• {name}({holding.ticker}) {holding.quantity:g}주 "
+        f"• {label} {holding.quantity:g}주 "
         f"평단 {holding.avg_price:,.0f} 현재 {holding.current_price:,.0f} "
         f"손익 {sign}{holding.pnl:,.0f} ({sign}{holding.pnl_pct:.2f}%)"
     )
@@ -294,11 +295,11 @@ def _format_pending_line(item) -> str:
     differs.
     """
     short_id = (item.session_id or "")[:8]
-    name = item.name or item.ticker
+    label = stock_label(item.name, item.ticker)
     proposal = item.proposal or {}
     action = proposal.get("action") or "-"
     auto_at = item.auto_approve_at or "-"
-    return f"• [{short_id}] {name}({item.ticker}) {action} 자동승인예정 {auto_at}"
+    return f"• [{short_id}] {label} {action} 자동승인예정 {auto_at}"
 
 
 async def _fetch_notifier():

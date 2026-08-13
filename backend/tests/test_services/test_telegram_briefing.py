@@ -82,6 +82,25 @@ class TestBriefExposure:
         assert "2026-08-06 15:25" in text, "언제 값인지가 붙어야 한다"
 
 
+class TestBriefPositions:
+    """Task 13: 장전 브리핑 보유 섹션이 티커만 찍던 것에 이름을 붙인다."""
+
+    def test_shows_name_and_ticker_in_parens(self):
+        text = format_brief(_brief(positions=[
+            dict(ticker="004370", name="농심", quantity=25, pnl_pct=1.2, stop_gap_pct=7.4),
+        ]))
+        assert "농심(004370)" in text
+
+    def test_missing_name_falls_back_without_duplicating_ticker(self):
+        """`name` 키가 없는(기존 데이터 형태) 포지션도 깨지지 않고, 티커가
+        중복 노출되지 않는다."""
+        text = format_brief(_brief(positions=[
+            dict(ticker="316140", quantity=402, pnl_pct=1.2, stop_gap_pct=7.4),
+        ]))
+        assert "종목 316140" in text
+        assert text.count("316140") == 1
+
+
 class TestBriefReadiness:
     def test_shows_daily_trade_reset(self):
         text = format_brief(_brief())

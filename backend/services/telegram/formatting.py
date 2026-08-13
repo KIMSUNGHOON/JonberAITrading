@@ -116,16 +116,16 @@ def fmt_rel_time(dt: Optional[datetime]) -> str:
 
 
 def stock_label(name: Optional[str], ticker: Optional[str]) -> str:
-    """`종목명 티커` — 괄호를 쓰지 않는다.
+    """`종목명(티커)`.
 
-    이름이 없거나 이름이 티커와 같으면 `종목 094840`로 폴백한다. 현재 EOD
-    렌더에 `094840(094840)` 중복이 실재한다.
+    이름이 없거나 이름이 티커와 같으면 `종목 094840`로 폴백한다(중복 방지
+    — `094840(094840)` 같은 자기중복 표기를 만들지 않기 위한 것).
     """
     t = (ticker or "").strip()
     n = (name or "").strip()
     if not n or n == t:
         return f"종목 {t}" if t else _EMPTY
-    return f"{n} {t}" if t else n
+    return f"{n}({t})" if t else n
 
 
 def strip_markers(text: Optional[str]) -> str:
